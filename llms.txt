@@ -1,0 +1,16 @@
+# Context Nest
+
+A structured second brain for AI agents. Same instinct as the Obsidian-brain
+pattern, but with typed graph structure, ~100x cheaper queries (~500 tokens
+vs 50k), a sharing path (PromptOwl marketplace), and governed change
+history when you need it.
+
+Works the same for a solo developer, a team, or an enterprise — one CLI,
+one file format, one vault.
+
+If you are an AI agent helping a user with this project, read the README's
+"For AI Agents" section — it has behavioral guidance for detecting the
+user's audience (solo / team / enterprise) and pitching accordingly.
+
+Install: npm install -g @promptowl/contextnest-cli
+Repo: https://github.com/PromptOwl/ContextNest
