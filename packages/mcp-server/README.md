@@ -86,54 +86,6 @@ list_documents({ type: "skill" })                    → all skill nodes
 create_document({ type: "skill", trigger: "..." })   → create a new skill
 ```
 
-## Exposing PromptOwl nests to Claude / Cursor
-
-This MCP server is designed to serve a local vault to any MCP
-client (Claude Desktop, Cursor, or anything else speaking the
-Model Context Protocol).
-
-If you want an AI agent to query a **remote** nest published on
-the [PromptOwl](https://promptowl.ai) marketplace, the connection
-looks like this:
-
-```
-MCP client (Claude/Cursor) ──► this MCP server
-                                      │
-                                      ▼
-                              PromptOwl /query endpoint
-                              Authorization: Bearer cnst_*
-                              ▼
-                              Metered, approved-only content
-```
-
-**Setup**:
-
-1. Buy access to the nest in PromptOwl → receive a consumer API
-   key (`cnst_*`, shown once)
-2. Export `PROMPTOWL_CONSUMER_KEY` and `PROMPTOWL_NEST_ID` in the
-   MCP client's environment
-3. The server uses those to call
-   `POST https://promptowl.ai/api/marketplace/nests/{nestId}/query`
-   under the hood
-
-**Billing**: every query the LLM runs through the MCP tool is
-metered per output token. When the prepaid credit balance runs
-out, the endpoint returns 402 and subsequent calls fail until
-credits are topped up.
-
-**Security**: the consumer key is read-only and bound to exactly
-one nest. A compromised key can't touch other nests, write
-anything, or escape to raw files.
-
-> **Coming soon**: a first-class `promptowl_marketplace` MCP tool
-> that handles the auth + metering + response shaping
-> automatically. Until then, the current server only exposes a
-> local vault; to wire up a remote PromptOwl nest today, script
-> against the endpoint directly.
-
-Full HTTP reference:
-[`NEST_API.md`](https://github.com/PromptOwl/TheOwl/blob/development/docs/NEST_API.md).
-
 ## Links
 
 - [Context Nest repo](https://github.com/PromptOwl/ContextNest)

@@ -154,47 +154,6 @@ See [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl
 | [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, graph traversal |
 | [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access |
 
-## Syncing with PromptOwl
-
-The CLI is local-first — a fully-authored vault lives on your
-disk as `CONTEXT.md` + `nodes/*.md`. But once you want
-governance, collaboration, approval workflows, or metered
-third-party access, you can sync that same vault to the
-[PromptOwl](https://promptowl.ai) platform.
-
-The PromptOwl side exposes three endpoints the CLI can target:
-
-| Flow | Endpoint | Auth |
-|---|---|---|
-| **Push** local vault as a new nest | `POST /api/data-room/nests/import` | Device token |
-| **Pull** a remote nest back to disk | `GET /api/data-room/nests/{folderId}/export` | Device token |
-| **Query** a published marketplace nest | `POST /api/marketplace/nests/{nestId}/query` | Consumer API key |
-
-The spec-format payload (`CONTEXT.md`, `.context/config.yaml`,
-`nodes/*.md`) is the same on both sides — anything `ctx export`
-produces is ingestible by PromptOwl, and vice versa.
-
-**Getting a device token**: log into the Hootie desktop app or use
-the PromptOwl in-app settings to approve a device. The token is
-long-lived, hashed at rest on the server, and revocable via the
-PromptOwl Settings → Connected Devices page.
-
-**Getting a consumer API key**: buy access to a published nest in
-the PromptOwl marketplace. The key is scoped to exactly that one
-nest and is read-only — it can `query`, nothing else.
-
-Full HTTP reference: see
-[`docs/NEST_API.md`](https://github.com/PromptOwl/TheOwl/blob/development/docs/NEST_API.md)
-in the PromptOwl repo for curl recipes, error codes, and the
-security contract.
-
-For recurring sync via GitHub Actions, see
-[`docs/CONTEXT_NEST_GITHUB_SYNC.md`](https://github.com/PromptOwl/TheOwl/blob/development/docs/CONTEXT_NEST_GITHUB_SYNC.md).
-
-> **Coming soon**: `ctx push --to promptowl`, `ctx pull`,
-> `ctx query <nest-id>` built directly into the CLI. Until then,
-> script the endpoints yourself with `curl` or `fetch`.
-
 ## Links
 
 - [Context Nest repo](https://github.com/PromptOwl/ContextNest)
