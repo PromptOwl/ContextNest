@@ -12,6 +12,52 @@ import type { ContextYaml, NestConfig, Pack } from "./types.js";
 const SECTION_BEGIN = "<!-- BEGIN CONTEXT NEST (auto-generated, do not edit this section) -->";
 const SECTION_END = "<!-- END CONTEXT NEST -->";
 
+/**
+ * Fallback maintenance directive used when `config.agent_maintenance_directive`
+ * is not set (e.g., vaults initialized before this field existed). Starter-
+ * specific directives shipped via `cli/src/starters/agent-config-base.ts`
+ * override this when present in config.
+ */
+const DEFAULT_MAINTENANCE_DIRECTIVE = `## Maintaining This Nest
+
+This project has a Context Nest vault. As the agent working with the user on
+this project, YOU are responsible for KEEPING IT USEFUL. This is not optional —
+without active maintenance the nest decays and the user loses the second-brain
+value they installed it for.
+
+Capture aggressively. Multiple nodes per session is normal and expected.
+Under-capture is the failure mode here, not over-capture.
+
+What to capture:
+
+- **Information you uncovered** about the codebase, the domain, or how things
+  actually work — anything the next session would benefit from knowing
+  without rediscovering.
+- **Decisions** the user makes (architectural, technical, product) and the
+  reasoning behind them. Even small ones.
+- **Gotchas, surprises, and tribal knowledge** — anything that took more
+  than a moment to figure out, anything the user said in passing that's
+  worth not losing.
+- **Answers** you and the user worked out together that would be useful
+  next time the same question comes up.
+- **References** the user shared (URLs, file paths, screenshots, pasted
+  threads) — anchor them in a node so they don't disappear into chat history.
+
+How to capture:
+
+- You do not need permission to capture. You may capture without asking.
+  Mention what you're capturing in passing if it's substantive — do not gate
+  the capture on a yes/no from the user.
+- Use \`ctx add nodes/<slug> --type document --title "<title>" --tags
+  "<tags>"\` to create. Write the body with the Write tool. Keep nodes tight —
+  100-300 words is usually plenty.
+- Show what you wrote only if asked, or if the content is ambiguous and
+  the user should review.
+- Every change is hash-chained and versioned silently. The user can inspect
+  or revert later. There is no cost to capturing too much; there is real
+  cost to capturing too little.
+`;
+
 export interface AgentConfigInput {
   config: NestConfig | null;
   contextYaml: ContextYaml;
@@ -100,6 +146,11 @@ function buildCoreInstructions(input: AgentConfigInput): string {
   lines.push('ctx query "#tag" --hops 3        # Deeper graph traversal');
   lines.push('ctx query "#tag" --full           # Load everything (large vaults)');
   lines.push("```");
+  lines.push("");
+
+  // Maintenance directive — read from config, fall back to default
+  const directive = config?.agent_maintenance_directive ?? DEFAULT_MAINTENANCE_DIRECTIVE;
+  lines.push(directive.trim());
   lines.push("");
 
   // Key documents (hubs)

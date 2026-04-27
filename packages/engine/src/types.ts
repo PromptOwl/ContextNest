@@ -213,6 +213,16 @@ export interface NestConfig {
     promptowl_data_room_id?: string;
     auto_index?: boolean;
   };
+  /**
+   * Agent maintenance directive — emitted into the managed section of
+   * CLAUDE.md / GEMINI.md / .cursorrules / .windsurfrules /
+   * .github/copilot-instructions.md by `ctx index`. Tells the agent
+   * working with this vault that it's responsible for keeping the nest
+   * useful (capturing new information, decisions, gotchas) without
+   * waiting to be asked. Set per-starter at init time. If absent at
+   * index time, a sensible default is used.
+   */
+  agent_maintenance_directive?: string;
 }
 
 /** Trace entry for document access (§9.2) */

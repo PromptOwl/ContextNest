@@ -6,7 +6,14 @@
  * that AI agents read from stdout to interactively generate a tailored CONTEXT.md.
  */
 
-import { getPostInitPrompt, getDeveloperPostInitPrompt, getPersonalPostInitPrompt } from "./agent-config-base.js";
+import {
+  getPostInitPrompt,
+  getDeveloperPostInitPrompt,
+  getPersonalPostInitPrompt,
+  getDefaultMaintenanceDirective,
+  getDeveloperMaintenanceDirective,
+  getPersonalMaintenanceDirective,
+} from "./agent-config-base.js";
 import type { PostInitPrompt } from "./agent-config-base.js";
 
 export interface StarterNode {
@@ -30,6 +37,12 @@ export interface Starter {
   nodes: StarterNode[];
   packs: StarterPack[];
   getPrompt(): PostInitPrompt;
+  /**
+   * Maintenance directive written to .context/config.yaml at init time.
+   * `ctx index` reads it and emits it into the agent config managed
+   * section so every session reminds the agent to keep the nest growing.
+   */
+  getMaintenanceDirective(): string;
 }
 
 // ─── Developer Starter ─────────────────────────────────────────────────────────
@@ -253,6 +266,9 @@ agent_instructions: >
   getPrompt() {
     return getDeveloperPostInitPrompt();
   },
+  getMaintenanceDirective() {
+    return getDeveloperMaintenanceDirective();
+  },
 };
 
 // ─── Executive Starter ──────────────────────────────────────────────────────────
@@ -457,6 +473,9 @@ agent_instructions: >
   ],
   getPrompt() {
     return getPostInitPrompt(this.id, this.description);
+  },
+  getMaintenanceDirective() {
+    return getDefaultMaintenanceDirective();
   },
 };
 
@@ -680,6 +699,9 @@ agent_instructions: >
   getPrompt() {
     return getPostInitPrompt(this.id, this.description);
   },
+  getMaintenanceDirective() {
+    return getDefaultMaintenanceDirective();
+  },
 };
 
 // ─── Team Starter ───────────────────────────────────────────────────────────────
@@ -879,6 +901,9 @@ agent_instructions: >
   ],
   getPrompt() {
     return getPostInitPrompt(this.id, this.description);
+  },
+  getMaintenanceDirective() {
+    return getDefaultMaintenanceDirective();
   },
 };
 
@@ -1111,6 +1136,9 @@ agent_instructions: >
   getPrompt() {
     return getPostInitPrompt(this.id, this.description);
   },
+  getMaintenanceDirective() {
+    return getDefaultMaintenanceDirective();
+  },
 };
 
 // ─── Personal Starter ──────────────────────────────────────────────────────────
@@ -1123,6 +1151,9 @@ const personal: Starter = {
   packs: [],
   getPrompt() {
     return getPersonalPostInitPrompt();
+  },
+  getMaintenanceDirective() {
+    return getPersonalMaintenanceDirective();
   },
 };
 

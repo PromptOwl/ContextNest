@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-engine",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "repository": { "type": "git", "url": "https://github.com/PromptOwl/ContextNest.git", "directory": "packages/engine" },
   "description": "Core engine for AI agent knowledge bases — selectors, versioning, graph traversal, integrity verification, and context management for LLMs",
   "homepage": "https://github.com/PromptOwl/ContextNest",
