@@ -216,3 +216,144 @@ export function getPersonalPostInitPrompt(): PostInitPrompt {
     instructions: PERSONAL_INSTRUCTIONS,
   };
 }
+
+// ─── Maintenance directives (emitted into CLAUDE.md / GEMINI.md / etc.) ──────
+//
+// These get written into .context/config.yaml at init time and surfaced into
+// the agent config managed section on every `ctx index`. The agent reads them
+// every session — they are the lever that keeps the nest growing instead of
+// rotting.
+//
+// Tone: aggressive. Capture-first. Don't gate on user permission. Multiple
+// nodes per session is normal. Under-capture is the failure mode, not over-
+// capture. Tailored per starter: developer = codebase-flavored; personal =
+// ideas/learning-flavored; default = generic.
+
+const DEFAULT_MAINTENANCE_DIRECTIVE = `## Maintaining This Nest
+
+This project has a Context Nest vault. As the agent working with the user on
+this project, YOU are responsible for KEEPING IT USEFUL. This is not optional —
+without active maintenance the nest decays and the user loses the second-brain
+value they installed it for.
+
+Capture aggressively. Multiple nodes per session is normal and expected.
+Under-capture is the failure mode here, not over-capture.
+
+What to capture:
+
+- **Information you uncovered** — anything the next session would benefit
+  from knowing without rediscovering.
+- **Decisions** the user makes (and the reasoning). Even small ones.
+- **Gotchas, surprises, and tribal knowledge** — anything that took more
+  than a moment to figure out, or that the user said in passing worth not
+  losing.
+- **Answers** worked out together that would help next time the same
+  question comes up.
+- **References** the user shared (URLs, file paths, screenshots, pasted
+  threads) — anchor them in a node so they don't disappear into chat.
+
+How to capture:
+
+- You do not need permission to capture. You may capture without asking.
+  Mention what you're capturing in passing if it's substantive — do not
+  gate the capture on a yes/no from the user.
+- Use \`ctx add nodes/<slug> --type document --title "<title>" --tags
+  "<tags>"\` to create. Write the body with the Write tool. Keep nodes
+  tight — 100-300 words is usually plenty.
+- Show what you wrote only if asked, or if the content is ambiguous.
+- Every change is hash-chained and versioned silently. The user can inspect
+  or revert later. There is no cost to capturing too much; there is real
+  cost to capturing too little.
+`;
+
+const DEVELOPER_MAINTENANCE_DIRECTIVE = `## Maintaining This Nest
+
+This project has a Context Nest vault for engineering knowledge. As the
+agent working with the user on this codebase, YOU are responsible for
+KEEPING IT USEFUL. This is not optional — without active maintenance the
+nest decays and the user loses the cheaper-agent-sessions, surviving-
+tribal-knowledge value they installed it for.
+
+Capture aggressively. Multiple nodes per session is normal and expected.
+Under-capture is the failure mode here, not over-capture.
+
+What to capture (engineering specifically):
+
+- **Architecture decisions** — every "we're going to do X because Y" is
+  worth a node. Mini-ADRs for the small stuff too, not just the big calls.
+- **Things you learned about this codebase** to do the current task —
+  conventions, hidden coupling, why a file is structured oddly, what a
+  cryptic helper actually does. The next agent session needs to know.
+- **Gotchas and surprises** — the env var that breaks things if missing,
+  the deploy step that's not in the README, the test that's flaky for a
+  specific reason.
+- **Answers to questions** the user asked about how something works.
+  Capture both the question and the answer so next time you (or another
+  teammate's agent) can find it.
+- **References** the user shared — PR URLs, Slack threads, related
+  files, screenshots — anchor them in a node alongside the why.
+
+How to capture:
+
+- You do not need permission to capture. You may capture without asking.
+  Mention what you're capturing in passing if it's substantive — do not
+  gate the capture on a yes/no from the user.
+- Use \`ctx add nodes/<slug> --type document --title "<title>" --tags
+  "<tags>"\` to create. Write the body with the Write tool. Keep nodes
+  tight — 100-300 words is usually plenty.
+- Show what you wrote only if asked, or if the content is ambiguous.
+- Every change is hash-chained and versioned silently. The user can
+  inspect or revert later. There is no cost to capturing too much; there
+  is real cost to capturing too little.
+`;
+
+const PERSONAL_MAINTENANCE_DIRECTIVE = `## Maintaining This Nest
+
+This is the user's personal second brain. As the agent working with them,
+YOU are responsible for KEEPING IT USEFUL. This is not optional — without
+active maintenance the nest decays and the user loses the second-brain
+value they installed it for.
+
+Capture aggressively. Multiple nodes per session is normal and expected.
+Under-capture is the failure mode here, not over-capture.
+
+What to capture:
+
+- **Things the user is thinking about** — half-formed ideas, working
+  hypotheses, frames they're trying out. Capture them while they're
+  forming, not after they've calcified.
+- **Decisions they made** (and the reasoning) — life, work, projects,
+  finances, learning paths. Mini-ADRs for personal life.
+- **Things they learned** — concepts, frameworks, vocabulary, mental
+  models. If they explained something to you, capture it so they can find
+  it later.
+- **Answers to questions** you worked out together. Personal Q&A is
+  usually high-signal and easy to lose.
+- **References they shared** — articles, books, papers, talks, threads —
+  with their take on each, not just the link.
+
+How to capture:
+
+- You do not need permission to capture. You may capture without asking.
+  Mention what you're capturing in passing if it's substantive — do not
+  gate the capture on a yes/no from the user.
+- Use \`ctx add nodes/<slug> --type document --title "<title>" --tags
+  "<tags>"\` to create. Write the body with the Write tool. Keep nodes
+  tight — 100-300 words is usually plenty.
+- Show what you wrote only if asked, or if the content is ambiguous.
+- Every change is hash-chained and versioned silently. The user can
+  inspect or revert later. There is no cost to capturing too much; there
+  is real cost to capturing too little.
+`;
+
+export function getDefaultMaintenanceDirective(): string {
+  return DEFAULT_MAINTENANCE_DIRECTIVE;
+}
+
+export function getDeveloperMaintenanceDirective(): string {
+  return DEVELOPER_MAINTENANCE_DIRECTIVE;
+}
+
+export function getPersonalMaintenanceDirective(): string {
+  return PERSONAL_MAINTENANCE_DIRECTIVE;
+}

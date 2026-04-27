@@ -144,6 +144,7 @@ export const nestConfigSchema = z.object({
       auto_index: z.boolean().optional(),
     })
     .optional(),
+  agent_maintenance_directive: z.string().optional(),
 });
 
 export const packSchema = z.object({

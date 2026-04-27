@@ -159,6 +159,14 @@ program
         process.exit(1);
       }
 
+      // Persist the starter's maintenance directive into config so
+      // `ctx index` can surface it into CLAUDE.md / GEMINI.md / etc.
+      const initialConfig = await storage.readConfig();
+      if (initialConfig) {
+        initialConfig.agent_maintenance_directive = starter.getMaintenanceDirective();
+        await storage.writeConfig(initialConfig);
+      }
+
       // Write starter nodes
       for (const node of starter.nodes) {
         await storage.writeDocument(node.path, node.content);
