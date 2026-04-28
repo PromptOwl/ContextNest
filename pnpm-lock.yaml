@@ -46,8 +46,8 @@ importers:
   packages/engine:
     dependencies:
       diff:
-        specifier: ^7.0.0
-        version: 7.0.0
+        specifier: ^8.0.3
+        version: 8.0.3
       fast-glob:
         specifier: ^3.3.0
         version: 3.3.3
@@ -675,8 +675,8 @@ packages:
   devlop@1.1.0:
     resolution: {integrity: sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA==}
 
-  diff@7.0.0:
-    resolution: {integrity: sha512-PJWHUb1RFevKCwaFA9RlG5tCd+FO5iRh9A8HEtkmBH2Li03iJriB6m6JIN4rGz3K3JLawI7/veA1xzRKP6ISBw==}
+  diff@8.0.3:
+    resolution: {integrity: sha512-qejHi7bcSD4hQAZE0tNAawRK1ZtafHDmMTMkrrIGgSLl7hTnQHmKCeB45xAcbfTqK2zowkM3j3bHt/4b/ARbYQ==}
     engines: {node: '>=0.3.1'}
 
   dunder-proto@1.0.1:
@@ -1960,7 +1960,7 @@ snapshots:
     dependencies:
       dequal: 2.0.3
 
-  diff@7.0.0: {}
+  diff@8.0.3: {}
 
   dunder-proto@1.0.1:
     dependencies:
