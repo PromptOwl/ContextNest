@@ -3,8 +3,8 @@
  * Supports both structured and Obsidian-compatible layouts (§1.1).
  */
 
-import { readFile, writeFile, mkdir, stat, readdir, unlink, rm } from "node:fs/promises";
-import { join, relative, extname, dirname, basename } from "node:path";
+import { readFile, writeFile, mkdir, stat, unlink, rm } from "node:fs/promises";
+import { join, dirname, basename } from "node:path";
 import fg from "fast-glob";
 import yaml from "js-yaml";
 import { parseDocument } from "./parser.js";
@@ -17,7 +17,7 @@ import type {
   Pack,
   ContextYaml,
 } from "./types.js";
-import { DocumentNotFoundError, ConfigError } from "./errors.js";
+import { DocumentNotFoundError } from "./errors.js";
 import { packSchema, documentHistorySchema, checkpointHistorySchema } from "./schemas.js";
 
 export type LayoutMode = "structured" | "obsidian";

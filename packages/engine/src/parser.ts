@@ -128,9 +128,7 @@ export function serializeDocument(node: ContextNode): string {
  * Per §1.5: SHA-256 of all content after the closing --- of frontmatter, including the leading newline.
  */
 export function getChecksumContent(rawContent: string): string {
-  const parsed = matter(rawContent);
-  // gray-matter's content is everything after frontmatter
-  // We need to include the leading newline
+  // Everything after closing frontmatter delimiter, including leading newline.
   const fmEnd = rawContent.indexOf("---", rawContent.indexOf("---") + 3);
   if (fmEnd === -1) return rawContent;
   return rawContent.slice(fmEnd + 3);

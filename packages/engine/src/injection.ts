@@ -4,7 +4,7 @@
  * and returns documents with trace entries.
  */
 
-import type { ContextNode, ResolvedResult, Checkpoint } from "./types.js";
+import type { ContextNode, ResolvedResult } from "./types.js";
 import { Resolver } from "./resolver.js";
 import { PackLoader } from "./packs.js";
 import { parseSelector } from "./selector/parser.js";

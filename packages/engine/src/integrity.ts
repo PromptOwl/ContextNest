@@ -3,7 +3,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { VersionEntry, Checkpoint, VerificationReport, DocumentHistory } from "./types.js";
+import type { Checkpoint, VerificationReport, DocumentHistory } from "./types.js";
 
 const GENESIS_SENTINEL = "contextnest:genesis:v1";
 

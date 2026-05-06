@@ -12,7 +12,6 @@ import type {
   ContextNode,
   ContextYaml,
   GraphQueryResult,
-  TraceEntry,
 } from "./types.js";
 import { NestStorage } from "./storage.js";
 import { Resolver } from "./resolver.js";
@@ -69,7 +68,7 @@ export class GraphQueryEngine {
     }
 
     // Full mode: existing behavior
-    return this.fullQuery(selector, options);
+    return this.fullQuery(selector);
   }
 
   private async graphQuery(
@@ -171,10 +170,7 @@ export class GraphQueryEngine {
   }
 
   /** Fallback: full-load mode (existing behavior) */
-  private async fullQuery(
-    selector: string,
-    options: GraphQueryOptions,
-  ): Promise<GraphQueryResult> {
+  private async fullQuery(selector: string): Promise<GraphQueryResult> {
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
     const checkpointHistory = await this.storage.readCheckpointHistory();

@@ -30,7 +30,7 @@ import {
   generateIndexMd,
   DocumentNotFoundError,
 } from "../index.js";
-import type { ContextNode, Frontmatter } from "../index.js";
+import type { ContextNode } from "../index.js";
 
 const FIXTURES = join(__dirname, "../../../../fixtures/minimal-vault");
 
@@ -819,7 +819,7 @@ describe("NestStorage.deleteDocument", () => {
   let tempStorage: NestStorage;
 
   beforeAll(async () => {
-    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { mkdtemp } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     tempVault = await mkdtemp(join(tmpdir(), "contextnest-delete-test-"));
     tempStorage = new NestStorage(tempVault);
