@@ -20,6 +20,11 @@ export function stripTagPrefix(tags: string[]): string[] {
   return tags.filter((tag) => typeof tag === "string").map((tag) => (tag.startsWith("#") ? tag.slice(1) : tag));
 }
 
+/** Predicate: document is in `published` status. */
+export function isPublished(node: ContextNode): boolean {
+  return node.frontmatter.status === "published";
+}
+
 /**
  * Parse a Context Nest document from its file content.
  * Returns the parsed ContextNode with validated frontmatter.

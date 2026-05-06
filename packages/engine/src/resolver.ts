@@ -5,7 +5,8 @@
 import MiniSearch from "minisearch";
 import type { ContextNode, ContextNestUri, Checkpoint } from "./types.js";
 import { extractSection } from "./inline.js";
-import { DocumentNotFoundError, FederationNotSupportedError } from "./errors.js";
+import { stripTagPrefix, isPublished } from "./parser.js";
+import { FederationNotSupportedError } from "./errors.js";
 
 export interface ResolverOptions {
   /** All documents in the vault */
@@ -34,8 +35,7 @@ export class Resolver {
       this.documents.set(doc.id, doc);
 
       // Build tag index
-      for (const tag of doc.frontmatter.tags || []) {
-        const normalized = tag.startsWith("#") ? tag.slice(1) : tag;
+      for (const normalized of stripTagPrefix(doc.frontmatter.tags || [])) {
         if (!this.tagIndex.has(normalized)) {
           this.tagIndex.set(normalized, new Set());
         }
@@ -51,7 +51,7 @@ export class Resolver {
     });
 
     const searchDocs = options.documents
-      .filter((d) => d.frontmatter.status === "published")
+      .filter(isPublished)
       .map((d) => ({
         id: d.id,
         title: d.frontmatter.title,
@@ -103,7 +103,7 @@ export class Resolver {
     const doc = this.documents.get(uri.path);
     if (!doc) return [];
 
-    if (!options.includeDrafts && doc.frontmatter.status !== "published") {
+    if (!options.includeDrafts && !isPublished(doc)) {
       return [];
     }
 
@@ -148,7 +148,7 @@ export class Resolver {
 
     return [...docIds]
       .map((id) => this.documents.get(id)!)
-      .filter((d) => options.includeDrafts || d.frontmatter.status === "published");
+      .filter((d) => options.includeDrafts || isPublished(d));
   }
 
   private resolveFolder(
@@ -160,7 +160,7 @@ export class Resolver {
       .filter(
         (d) =>
           (d.id.startsWith(prefix) || d.id.startsWith(uri.path)) &&
-          (options.includeDrafts || d.frontmatter.status === "published"),
+          (options.includeDrafts || isPublished(d)),
       );
   }
 
@@ -180,9 +180,7 @@ export class Resolver {
 
   /** Get all published documents */
   getPublishedDocuments(): ContextNode[] {
-    return [...this.documents.values()].filter(
-      (d) => d.frontmatter.status === "published",
-    );
+    return [...this.documents.values()].filter(isPublished);
   }
 
   /** Get all documents */

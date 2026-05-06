@@ -20,10 +20,11 @@ import { PackLoader } from "./packs.js";
 import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
-import { stripTagPrefix } from "./parser.js";
+import { isPublished } from "./parser.js";
+import { getLatestCheckpoint, getLatestCheckpointNumber } from "./checkpoint.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
-import { topologicalSortSources } from "./source-graph.js";
+import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
 
 export interface GraphQueryOptions {
@@ -110,7 +111,7 @@ export class GraphQueryEngine {
     const sourceNodes: ContextNode[] = [];
 
     for (const doc of docMap.values()) {
-      if (!options.includeDrafts && doc.frontmatter.status !== "published") {
+      if (!options.includeDrafts && !isPublished(doc)) {
         continue;
       }
       if (doc.frontmatter.type === "source") {
@@ -121,19 +122,11 @@ export class GraphQueryEngine {
     }
 
     // 5. Order source nodes topologically
-    let orderedSourceNodes: ContextNode[] = [];
-    if (sourceNodes.length > 0) {
-      const sortedIds = topologicalSortSources(sourceNodes);
-      const sourceMap = new Map(sourceNodes.map((n) => [n.id, n]));
-      orderedSourceNodes = sortedIds
-        .map((id) => sourceMap.get(id))
-        .filter((n): n is ContextNode => n !== undefined);
-    }
+    const orderedSourceNodes = orderSourceNodesTopologically(sourceNodes);
 
     // 6. Log traces
     const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint =
-      checkpointHistory?.checkpoints?.at(-1)?.checkpoint ?? 0;
+    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
 
     for (const doc of [...regularDocs, ...orderedSourceNodes]) {
       traceLogger.logAccess({
@@ -164,8 +157,8 @@ export class GraphQueryEngine {
       const docs = await this.storage.discoverDocuments();
       const config = await this.storage.readConfig();
       const checkpointHistory = await this.storage.readCheckpointHistory();
-      const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
-      const published = docs.filter((d) => d.frontmatter.status === "published");
+      const latestCheckpoint = getLatestCheckpoint(checkpointHistory);
+      const published = docs.filter(isPublished);
 
       const contextYaml = generateContextYaml(published, config, latestCheckpoint);
       await this.storage.writeContextYaml(contextYaml);
@@ -185,8 +178,7 @@ export class GraphQueryEngine {
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
     const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint =
-      checkpointHistory?.checkpoints?.at(-1)?.checkpoint ?? 0;
+    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
 
     const resolver = new Resolver({ documents: docs });
     const packLoader = new PackLoader(packs);
