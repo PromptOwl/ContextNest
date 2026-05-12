@@ -18,6 +18,7 @@ import {
   computeChainHash,
   computeCheckpointHash,
   canonicalJson,
+  verifyDocumentChain,
   buildRelationships,
   buildBacklinks,
   extractContextLinks,
@@ -29,6 +30,8 @@ import {
   generateContextYaml,
   generateIndexMd,
   DocumentNotFoundError,
+  publishDocument,
+  VersionManager,
 } from "../index.js";
 import type { ContextNode, Frontmatter } from "../index.js";
 
@@ -812,6 +815,121 @@ describe("Relationships", () => {
   });
 });
 
+// ─── Direct File Edit Detection Tests ────────────────────────────────────────
+
+describe("Direct File Edit Detection", () => {
+  let tempVault: string;
+  let tempStorage: NestStorage;
+  const docId = "nodes/edit-target";
+  const originalContent = `---
+title: "Edit Target"
+type: document
+status: draft
+version: 1
+---
+
+# Edit Target
+
+Original body.
+`;
+
+  beforeAll(async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    tempVault = await mkdtemp(join(tmpdir(), "contextnest-edit-test-"));
+    tempStorage = new NestStorage(tempVault);
+    await tempStorage.init("Edit Test Vault");
+
+    // Write current doc + keyframe + history (simulate committed v1)
+    await tempStorage.writeDocument(docId, originalContent);
+    await tempStorage.writeKeyframe(docId, 1, originalContent);
+
+    const contentHash = computeContentHash(originalContent);
+    const editedAt = "2026-01-01T00:00:00Z";
+    const editedBy = "test@test.com";
+    const chainHash = computeChainHash(null, contentHash, 1, editedBy, editedAt);
+
+    await tempStorage.writeHistory(docId, {
+      keyframe_interval: 10,
+      versions: [
+        {
+          version: 1,
+          keyframe: true,
+          edited_by: editedBy,
+          edited_at: editedAt,
+          content_hash: contentHash,
+          chain_hash: chainHash,
+        },
+      ],
+    });
+  });
+
+  afterAll(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(tempVault, { recursive: true });
+  });
+
+  it("current file hash matches history entry before any edit", async () => {
+    const doc = await tempStorage.readDocument(docId);
+    const currentHash = computeContentHash(doc.rawContent);
+    const history = await tempStorage.readHistory(docId);
+    expect(history).not.toBeNull();
+    const latest = history!.versions[history!.versions.length - 1];
+    expect(currentHash).toBe(latest.content_hash);
+  });
+
+  it("detects drift when current file edited directly on disk", async () => {
+    const { writeFile } = await import("node:fs/promises");
+    const filePath = join(tempVault, `${docId}.md`);
+
+    // Bypass engine: rewrite file directly with different body
+    const tamperedContent = originalContent.replace(
+      "Original body.",
+      "Tampered body — never went through writeDocument.",
+    );
+    await writeFile(filePath, tamperedContent, "utf-8");
+
+    const doc = await tempStorage.readDocument(docId);
+    const currentHash = computeContentHash(doc.rawContent);
+    const history = await tempStorage.readHistory(docId);
+    const latest = history!.versions[history!.versions.length - 1];
+
+    // Engine does NOT auto-update history. Drift exposed via hash compare.
+    expect(currentHash).not.toBe(latest.content_hash);
+  });
+
+  it("verifyDocumentChain still passes when only current file edited (keyframe untouched)", async () => {
+    // Drift in current file does NOT corrupt keyframe chain — they are decoupled.
+    const history = await tempStorage.readHistory(docId);
+    const report = verifyDocumentChain(docId, history!, (v) => {
+      // Synchronous read of keyframe — use the version we wrote in beforeAll
+      if (v === 1) return originalContent;
+      return null;
+    });
+    expect(report.valid).toBe(true);
+  });
+
+  it("verifyDocumentChain reports content_hash_mismatch when keyframe tampered", async () => {
+    const history = await tempStorage.readHistory(docId);
+    const report = verifyDocumentChain(docId, history!, (v) => {
+      // Simulate someone editing .versions/v1.md directly
+      if (v === 1) return originalContent.replace("Original body.", "Hacked.");
+      return null;
+    });
+    expect(report.valid).toBe(false);
+    expect(report.errors.some((e) => e.type === "content_hash_mismatch")).toBe(true);
+  });
+
+  it("verifyDocumentChain validates chain_hash on diff rows when keyframe content is unavailable", async () => {
+    // Regression: a stub readKeyframe returning null for every version must
+    // NOT cause cascading chain_hash_mismatch on subsequent diff rows.
+    // The chain_hash check uses stored content_hash and must run regardless.
+    const history = await tempStorage.readHistory(docId);
+    const report = verifyDocumentChain(docId, history!, () => null);
+    expect(report.errors.some((e) => e.type === "chain_hash_mismatch")).toBe(false);
+  });
+});
+
 // ─── deleteDocument Tests ────────────────────────────────────────────────────
 
 describe("NestStorage.deleteDocument", () => {
@@ -895,5 +1013,79 @@ version: 1
 
     const historyAfter = await tempStorage.readHistory("nodes/version-delete");
     expect(historyAfter).toBeNull();
+  });
+});
+
+// ─── publishDocument seed-on-first-publish (Bug 4) ─────────────────────────
+
+describe("publishDocument auto-seed for pre-existing frontmatter version", () => {
+  let tempVault: string;
+  let tempStorage: NestStorage;
+
+  beforeAll(async () => {
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    tempVault = await mkdtemp(join(tmpdir(), "cn-seed-"));
+    tempStorage = new NestStorage(tempVault);
+  });
+
+  afterAll(async () => {
+    const { rm } = await import("node:fs/promises");
+    await rm(tempVault, { recursive: true, force: true });
+  });
+
+  it("seeds pre-publish version when frontmatter.version > 1 and no history exists", async () => {
+    const docId = "nodes/migrated-doc";
+    const preBody = "# Migrated Doc\n\nOriginal pre-session body.\n";
+    const initial = `---
+title: Migrated Doc
+type: document
+status: published
+version: 3
+---
+
+${preBody}`;
+    await tempStorage.writeDocument(docId, initial);
+
+    await publishDocument(tempStorage, docId, {
+      editedBy: "tester@local",
+      note: "first session publish",
+    });
+
+    const history = await tempStorage.readHistory(docId);
+    expect(history).not.toBeNull();
+    const versions = history!.versions.map((v) => v.version).sort((a, b) => a - b);
+    expect(versions).toContain(3);
+    expect(versions).toContain(4);
+
+    const seedEntry = history!.versions.find((v) => v.version === 3);
+    expect(seedEntry?.edited_by).toBe("system:seed");
+    expect(seedEntry?.keyframe).toBe(true);
+
+    const vm = new VersionManager(tempStorage);
+    const v3Content = await vm.reconstructVersion(docId, 3);
+    expect(v3Content).toContain("Original pre-session body");
+  });
+
+  it("does NOT seed when frontmatter.version <= 1", async () => {
+    const docId = "nodes/fresh-doc";
+    const initial = `---
+title: Fresh Doc
+type: document
+status: draft
+---
+
+# Fresh Doc
+
+Body.
+`;
+    await tempStorage.writeDocument(docId, initial);
+
+    await publishDocument(tempStorage, docId, { editedBy: "tester@local" });
+
+    const history = await tempStorage.readHistory(docId);
+    expect(history!.versions.length).toBe(1);
+    expect(history!.versions[0].version).toBe(1);
+    expect(history!.versions[0].edited_by).toBe("tester@local");
   });
 });

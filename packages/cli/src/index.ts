@@ -74,56 +74,7 @@ function getStorage(): NestStorage {
 }
 
 async function regenerateIndex(storage: NestStorage): Promise<void> {
-  const docs = await storage.discoverDocuments();
-  const config = await storage.readConfig();
-  const checkpointHistory = await storage.readCheckpointHistory();
-  const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
-  const published = docs.filter((d) => d.frontmatter.status === "published");
-  const packs = await storage.readPacks();
-
-  const contextYaml = generateContextYaml(published, config, latestCheckpoint);
-  await storage.writeContextYaml(contextYaml);
-
-  // Generate INDEX.md for each folder
-  const folders = new Map<string, ContextNode[]>();
-  for (const doc of docs) {
-    const parts = doc.id.split("/");
-    const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-    if (!folders.has(folder)) folders.set(folder, []);
-    folders.get(folder)!.push(doc);
-  }
-
-  for (const [folder, folderDocs] of folders) {
-    if (folder === ".") continue;
-    const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-    const indexMd = generateIndexMd(folder, title, folderDocs);
-    await storage.writeIndexMd(folder, indexMd);
-  }
-
-  // Generate agent config files (CLAUDE.md, GEMINI.md, .cursorrules, etc.)
-  const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
-  const agentConfigs = generateAgentConfigs({
-    config,
-    contextYaml,
-    packs,
-    hasMcpServer,
-  });
-
-  for (const file of agentConfigs) {
-    const filePath = pathMod.join(storage.root, file.path);
-    await mkdir(pathMod.dirname(filePath), { recursive: true });
-
-    // Read existing content and merge — preserves user-authored sections
-    let existing: string | null = null;
-    try {
-      existing = await readFile(filePath, "utf-8");
-    } catch {
-      // File doesn't exist yet
-    }
-
-    const merged = mergeAgentConfig(existing, file.content);
-    await writeFile(filePath, merged, "utf-8");
-  }
+  await storage.regenerateIndex();
 }
 
 // ─── ctx init ──────────────────────────────────────────────────────────────────

@@ -34,6 +34,19 @@ export async function publishDocument(
   // Read current document
   let node = await storage.readDocument(docId);
 
+  const versionManager = new VersionManager(storage);
+
+  // Seed pre-publish snapshot when a doc carries an existing
+  // frontmatter.version (>1) but has no recorded history yet. Without this,
+  // its pre-publish body becomes permanently unreachable via read_version
+  // once we bump to the next number.
+  const existingHistory = await storage.readHistory(docId);
+  if (!existingHistory && (node.frontmatter.version || 0) > 1) {
+    await versionManager.createVersion(node, "system:seed", {
+      note: "Pre-publish snapshot (auto-seeded — no prior history)",
+    });
+  }
+
   // Bump version
   const currentVersion = node.frontmatter.version || 0;
   const newVersion = currentVersion + 1;
@@ -63,7 +76,6 @@ export async function publishDocument(
   const publishedAt = new Date().toISOString();
 
   // Create version entry with integrity hashes
-  const versionManager = new VersionManager(storage);
   const versionEntry = await versionManager.createVersion(node, options.editedBy, {
     note: options.note,
     publishedAt,
