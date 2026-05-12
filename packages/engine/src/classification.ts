@@ -125,7 +125,7 @@ export function extractManifestFromClaudeMd(
   claudeMdContent: string,
 ): ClassificationManifest | null {
   const fencedYamlBlocks = [
-    ...claudeMdContent.matchAll(/```ya?ml\s*\n([\s\S]*?)```/g),
+    ...claudeMdContent.matchAll(/```ya?ml[ \t]*\r?\n([\s\S]*?)```/g),
   ].map((m) => m[1]);
 
   for (const block of fencedYamlBlocks) {
