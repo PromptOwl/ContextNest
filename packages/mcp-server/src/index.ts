@@ -6,8 +6,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { join, dirname } from "node:path";
 import {
   NestStorage,
   Resolver,
@@ -19,19 +17,22 @@ import {
   validateDocument,
   parseSelector,
   evaluate,
-  verifyDocumentChain,
-  verifyCheckpointChain,
-  generateContextYaml,
-  generateAgentConfigs,
-  mergeAgentConfig,
   parseUri,
   detectCycles,
   serializeDocument,
   parseDocument,
   publishDocument,
-  generateIndexMd,
+  stageSuggestion,
+  listSuggestions,
+  approveSuggestion,
+  rejectSuggestion,
 } from "@promptowl/contextnest-engine";
-import type { ContextNode, Frontmatter } from "@promptowl/contextnest-engine";
+import type {
+  ContextNode,
+  Frontmatter,
+  GovernanceTier,
+  RbacHook,
+} from "@promptowl/contextnest-engine";
 
 // Resolve vault path from env or args
 const vaultPath = process.env.CONTEXTNEST_VAULT_PATH || process.argv[2] || process.cwd();
@@ -42,60 +43,17 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
-/**
- * Regenerate context.yaml and INDEX.md files after vault mutations.
- */
-async function regenerateIndex(): Promise<void> {
-  const docs = await storage.discoverDocuments();
-  const config = await storage.readConfig();
-  const checkpointHistory = await storage.readCheckpointHistory();
-  const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
-  const published = docs.filter((d) => d.frontmatter.status === "published");
-  const packs = await storage.readPacks();
+const regenerateIndex = () => storage.regenerateIndex();
 
-  const contextYaml = generateContextYaml(published, config, latestCheckpoint);
-  await storage.writeContextYaml(contextYaml);
-
-  // Generate INDEX.md for each folder
-  const folders = new Map<string, ContextNode[]>();
-  for (const doc of docs) {
-    const parts = doc.id.split("/");
-    const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-    if (!folders.has(folder)) folders.set(folder, []);
-    folders.get(folder)!.push(doc);
-  }
-
-  for (const [folder, folderDocs] of folders) {
-    if (folder === ".") continue;
-    const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-    const indexMd = generateIndexMd(folder, title, folderDocs);
-    await storage.writeIndexMd(folder, indexMd);
-  }
-
-  // Generate agent config files (CLAUDE.md, GEMINI.md, .cursorrules, etc.)
-  const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
-  const agentConfigs = generateAgentConfigs({
-    config,
-    contextYaml,
-    packs,
-    hasMcpServer,
-  });
-
-  for (const file of agentConfigs) {
-    const filePath = join(vaultPath, file.path);
-    await mkdir(dirname(filePath), { recursive: true });
-
-    let existing: string | null = null;
-    try {
-      existing = await readFile(filePath, "utf-8");
-    } catch {
-      // File doesn't exist yet
-    }
-
-    const merged = mergeAgentConfig(existing, file.content);
-    await writeFile(filePath, merged, "utf-8");
-  }
-}
+// Permissive RBAC stub — local single-user MCP context has no real identity
+// layer. All gates pass; engine still records the supplied `actor` in the
+// hash chain audit trail and suggestion meta. Real deploys inject a hook
+// backed by their identity provider (zone-classification-rbac-spec §4).
+const permissiveRbac: RbacHook = {
+  isCzar: () => true,
+  canIngest: () => true,
+  isDocOwner: () => true,
+};
 
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
@@ -502,25 +460,12 @@ server.tool(
 // ─── Tool: verify_integrity ────────────────────────────────────────────────────
 
 server.tool("verify_integrity", "Verify integrity of all hash chains in the vault", {}, async () => {
-  const allHistories = await storage.findAllHistories();
-  const checkpointHistory = await storage.readCheckpointHistory();
-  const errors: any[] = [];
-
-  for (const [docId, history] of allHistories) {
-    const report = verifyDocumentChain(docId, history, (_version) => null);
-    if (!report.valid) errors.push(...report.errors);
-  }
-
-  if (checkpointHistory) {
-    const report = verifyCheckpointChain(checkpointHistory.checkpoints, allHistories);
-    if (!report.valid) errors.push(...report.errors);
-  }
-
+  const report = await storage.verifyVaultIntegrity();
   return {
     content: [
       {
         type: "text" as const,
-        text: JSON.stringify({ valid: errors.length === 0, errors }, null, 2),
+        text: JSON.stringify(report, null, 2),
       },
     ],
   };
@@ -613,11 +558,13 @@ server.tool(
     }
 
     const tagList = tags ? tags.map((t) => (t.startsWith("#") ? t : `#${t}`)) : undefined;
+    // version omitted — publishDocument owns version assignment (spec §6:
+    // "version managed automatically by publish"). Pre-setting it caused
+    // create-with-publish to land on v=2 instead of v=1.
     const frontmatter: Frontmatter = {
       title,
       type,
       status: "draft",
-      version: 1,
       created_at: new Date().toISOString(),
       ...(tagList ? { tags: tagList } : {}),
     };
@@ -644,11 +591,23 @@ server.tool(
     const content = serializeDocument(node);
     await storage.writeDocument(id, content);
 
-    // Auto-publish: bump version, create version entry & checkpoint
-    const result = await publishDocument(storage, id, {
-      editedBy: "mcp@contextnest.local",
-      note: "Created via MCP server",
-    });
+    // Auto-publish: bump version, create version entry & checkpoint.
+    // If publish fails after writeDocument succeeded, roll back the file
+    // so the next create attempt isn't blocked by orphan state.
+    let result;
+    try {
+      result = await publishDocument(storage, id, {
+        editedBy: "mcp@contextnest.local",
+        note: "Created via MCP server",
+      });
+    } catch (err) {
+      try {
+        await storage.deleteDocument(id);
+      } catch {
+        // best-effort cleanup; surface original publish error regardless
+      }
+      throw err;
+    }
 
     await regenerateIndex();
 
@@ -813,6 +772,196 @@ server.tool(
               checkpoint: result.checkpointNumber,
               chain_hash: result.versionEntry.chain_hash,
               message: "Document published successfully",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ─── Tool: stage_drift_suggestion ──────────────────────────────────────────
+
+server.tool(
+  "stage_drift_suggestion",
+  "Capture an out-of-band edit (live file drifted from last-approved bytes) as a staged suggestion under _suggestions/. Does NOT modify the canonical document or hash chain. Pair with verify_integrity → approve_suggestion or reject_suggestion to resolve drift.",
+  {
+    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    actor: z.string().optional().describe("Opaque actor identity recorded in suggestion meta. Defaults to 'local-mcp'."),
+    note: z.string().optional().describe("Optional human note explaining the drift"),
+  },
+  async ({ path, actor, note }) => {
+    const id = path.replace(/\.md$/, "");
+    const node = await storage.readDocument(id);
+    const history = await storage.readHistory(id);
+    if (!history || history.versions.length === 0) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ error: `No version history for "${id}" — nothing to compare against` }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const latest = history.versions[history.versions.length - 1];
+    const approvedRaw = await new VersionManager(storage).reconstructVersion(id, latest.version);
+
+    const zone = node.frontmatter.zone;
+    const docTier: GovernanceTier = node.frontmatter.governance ?? "standard";
+
+    const result = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: approvedRaw,
+      proposedRawContent: node.rawContent,
+      source: "out-of-band-edit",
+      actor: actor ?? "local-mcp",
+      zone,
+      docTier,
+      note,
+    });
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              suggestion_id: result.meta.suggestion_id,
+              document_id: result.meta.document_id,
+              doc_tier: result.meta.doc_tier,
+              source: result.meta.source,
+              target_hash: result.meta.target_hash,
+              proposed_hash: result.meta.proposed_hash,
+              detected_at: result.meta.detected_at,
+              patch_path: result.patchPath,
+              meta_path: result.metaPath,
+              message: "Drift staged. Use approve_suggestion or reject_suggestion to resolve.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ─── Tool: list_suggestions ────────────────────────────────────────────────
+
+server.tool(
+  "list_suggestions",
+  "List all staged suggestions for a document",
+  { path: z.string().describe("Document path (e.g., 'nodes/api-design')") },
+  async ({ path }) => {
+    const id = path.replace(/\.md$/, "");
+    const metas = await listSuggestions(storage, id);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { document_id: id, count: metas.length, suggestions: metas },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ─── Tool: approve_suggestion ──────────────────────────────────────────────
+
+server.tool(
+  "approve_suggestion",
+  "Approve a staged suggestion: applies the patch, bumps version, writes new canonical bytes, archives the suggestion under _archive/approved/. Refuses if the chain head moved since staging (caller must re-stage).",
+  {
+    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    suggestion_id: z.string().describe("Suggestion ID from stage_drift_suggestion or list_suggestions"),
+    actor: z.string().optional().describe("Actor identity recorded as approver. Defaults to 'local-mcp'."),
+    comment: z.string().optional().describe("Optional approval comment recorded in the chain event"),
+  },
+  async ({ path, suggestion_id, actor, comment }) => {
+    const id = path.replace(/\.md$/, "");
+    const node = await storage.readDocument(id);
+    const zone = node.frontmatter.zone ?? "default";
+
+    const result = await approveSuggestion({
+      storage,
+      rbac: permissiveRbac,
+      documentId: id,
+      actor: actor ?? "local-mcp",
+      zone,
+      suggestionId: suggestion_id,
+      comment,
+    });
+
+    await regenerateIndex();
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              document_id: id,
+              version: result.versionEntry.version,
+              chain_hash: result.versionEntry.chain_hash,
+              chain_event_type: result.chainEvent.event_type,
+              archived_at: result.archivedAt,
+              message: "Suggestion approved. New version published; canonical file updated.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ─── Tool: reject_suggestion ───────────────────────────────────────────────
+
+server.tool(
+  "reject_suggestion",
+  "Reject a staged suggestion: archives the patch + meta under _archive/rejected/ and emits a chain event. Canonical document and hash chain head are untouched. Rejection reason is required for audit trail.",
+  {
+    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    suggestion_id: z.string().describe("Suggestion ID to reject"),
+    reason: z.string().describe("Rejection reason (required, non-empty)"),
+    actor: z.string().optional().describe("Actor identity recorded as rejector. Defaults to 'local-mcp'."),
+  },
+  async ({ path, suggestion_id, reason, actor }) => {
+    const id = path.replace(/\.md$/, "");
+    const node = await storage.readDocument(id);
+    const zone = node.frontmatter.zone ?? "default";
+
+    const result = await rejectSuggestion({
+      storage,
+      rbac: permissiveRbac,
+      documentId: id,
+      actor: actor ?? "local-mcp",
+      zone,
+      suggestionId: suggestion_id,
+      reason,
+    });
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              document_id: id,
+              chain_event_type: result.chainEvent.event_type,
+              archived_at: result.archivedAt,
+              rejection_reason: reason,
+              message: "Suggestion rejected. Canonical document unchanged; patch archived.",
             },
             null,
             2,

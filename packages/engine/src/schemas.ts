@@ -21,6 +21,55 @@ export const STATUSES = ["draft", "published"] as const;
 
 export const TRANSPORTS = ["mcp", "rest", "cli", "function"] as const;
 
+/** Governance tier enum (zone-classification-rbac-spec §1) */
+export const GOVERNANCE_TIERS = ["primary", "standard"] as const;
+
+/** Suggestion source enum (bridge-function-spec Story 3.1, Story 1.3) */
+export const SUGGESTION_SOURCES = [
+  "out-of-band-edit",
+  "remote-push",
+  "manual-suggestion",
+  "quarantine",
+] as const;
+
+/** Hash chain event taxonomy (zone-classification-rbac-spec §6, hootie-inbox-spec §8) */
+export const HASH_CHAIN_EVENT_TYPES = [
+  "primary.approved",
+  "primary.rejected",
+  "primary.rolled_back",
+  "primary.force_pushed",
+  "primary.force_push_acknowledged",
+  "standard.owner_approved",
+  "standard.owner_altered",
+  "standard.owner_rolled_back",
+  "dream.proposed",
+  "dream.approved",
+  "dream.rejected",
+  "dream.blocked_cross_zone",
+  "todo.delegated",
+  "zone.created",
+  "zone.deleted",
+  "czar.appointed",
+  "czar.removed",
+  "czar.vacancy_declared",
+  "permission.granted",
+  "permission.revoked",
+  "permission.self_granted",
+  "zone_challenge.raised",
+  "zone_challenge.resolved",
+  "reclassification.approved",
+  "reclassification.rejected",
+  "bridge_document.created",
+  "manifest.updated",
+  "platform_admin.toggle_changed",
+  "platform_admin.session_opened",
+  "platform_admin.session_closed",
+  "agent.zone_scope_assigned",
+] as const;
+
+/** Zone ID pattern: lowercase letter start, then alphanumeric / hyphen / underscore */
+export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
+
 /** Tag pattern: optional # prefix, then letter, then alphanumeric/underscore/hyphen (§13 rule 5) */
 export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -76,6 +125,11 @@ export const frontmatterSchema = z
     metadata: z.record(z.unknown()).optional(),
     source: sourceMetaSchema.optional(),
     skill: skillMetaSchema.optional(),
+    zone: z
+      .string()
+      .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
+      .optional(),
+    governance: z.enum(GOVERNANCE_TIERS).optional(),
   })
   .superRefine((data, ctx) => {
     // Rule 9: source block MUST be present when type is "source"
@@ -193,6 +247,50 @@ export const checkpointHistorySchema = z.object({
   checkpoints: z.array(checkpointSchema),
 });
 
+/**
+ * Suggestion metadata schema — persisted in `_suggestions/{doc}-...meta.yaml`
+ * alongside the patch file. One per staged drift (bridge-function-spec
+ * Story 3.1, hootie-inbox-spec §4.1).
+ */
+export const suggestionMetaSchema = z.object({
+  suggestion_id: z.string().min(1),
+  document_id: z.string().min(1),
+  zone: z
+    .string()
+    .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
+    .optional(),
+  doc_tier: z.enum(GOVERNANCE_TIERS),
+  source: z.enum(SUGGESTION_SOURCES),
+  actor: z.string().min(1),
+  detected_at: z.string().min(1),
+  target_hash: z.string().regex(CHECKSUM_PATTERN),
+  proposed_hash: z.string().regex(CHECKSUM_PATTERN),
+  patch_path: z.string().min(1),
+  note: z.string().optional(),
+});
+
+/**
+ * Hash chain event schema — every governance action emits one of these
+ * (zone-classification-rbac-spec §6, hootie-inbox-spec §8). Events are
+ * immutable; the chain is append-only.
+ */
+export const hashChainEventSchema = z.object({
+  event_id: z.string().min(1),
+  event_type: z.enum(HASH_CHAIN_EVENT_TYPES),
+  timestamp: z.string().min(1),
+  actor: z.string().min(1),
+  zone: z
+    .string()
+    .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
+    .optional(),
+  document_id: z.string().optional(),
+  resulting_hash: z.string().regex(CHECKSUM_PATTERN).optional(),
+  action_metadata: z.record(z.unknown()).optional(),
+  signature: z.string().optional(),
+});
+
 export type FrontmatterInput = z.input<typeof frontmatterSchema>;
 export type NestConfigInput = z.input<typeof nestConfigSchema>;
 export type PackInput = z.input<typeof packSchema>;
+export type SuggestionMetaInput = z.input<typeof suggestionMetaSchema>;
+export type HashChainEventInput = z.input<typeof hashChainEventSchema>;
