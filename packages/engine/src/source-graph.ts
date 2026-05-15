@@ -67,6 +67,22 @@ export function topologicalSortSources(
 }
 
 /**
+ * Order source nodes by topological sort, returning the actual ContextNodes.
+ * Empty input → empty output. Wraps `topologicalSortSources` so callers do not
+ * have to rebuild the id-to-node map themselves.
+ */
+export function orderSourceNodesTopologically(
+  sources: ContextNode[],
+): ContextNode[] {
+  if (sources.length === 0) return [];
+  const sortedIds = topologicalSortSources(sources);
+  const sourceMap = new Map(sources.map((n) => [n.id, n]));
+  return sortedIds
+    .map((id) => sourceMap.get(id))
+    .filter((n): n is ContextNode => n !== undefined);
+}
+
+/**
  * Detect cycles in the dependency graph.
  * Returns the first cycle found as an array of node IDs, or null if acyclic.
  */

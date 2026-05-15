@@ -4,6 +4,7 @@
  */
 
 import type { ContextNode } from "./types.js";
+import { isPublished } from "./parser.js";
 
 /**
  * Defensive date formatter for INDEX.md tables. `updated_at` SHOULD already
@@ -118,8 +119,8 @@ export function generateIndexMd(
   }
 
   // Statistics
-  const published = documents.filter((d) => d.frontmatter.status === "published").length;
-  const draft = documents.filter((d) => d.frontmatter.status !== "published").length;
+  const published = documents.filter(isPublished).length;
+  const draft = documents.filter((d) => !isPublished(d)).length;
   lines.push("## Statistics");
   lines.push("");
   lines.push(`- Total documents: ${documents.length}`);
