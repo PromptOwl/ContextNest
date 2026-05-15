@@ -6,12 +6,17 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
-    "clean": "pnpm -r clean"
+    "clean": "pnpm -r clean",
+    "prepublish": "pnpm -r build",
+    "version-packages": "changeset version && pnpm install --lockfile-only",
+    "release": "pnpm prepublish && changeset publish"
   },
   "devDependencies": {
+    "tsup": "^8.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
-    "tsup": "^8.0.0"
+    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/cli": "^2.31.0"
   },
   "engines": {
     "node": ">=20.0.0",
