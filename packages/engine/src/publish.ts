@@ -3,13 +3,12 @@
  * Ties together versioning, integrity, checkpoints, and index regeneration.
  */
 
-import { createHash } from "node:crypto";
 import type { ContextNode, VersionEntry } from "./types.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
-import { parseDocument, serializeDocument, getChecksumContent } from "./parser.js";
-import { normalizeForHash } from "./integrity.js";
+import { serializeDocument, getChecksumContent, isPublished } from "./parser.js";
+import { computeContentHash } from "./integrity.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -43,9 +42,7 @@ export async function publishDocument(
 
   // Compute document body checksum
   const serialized = serializeDocument(node);
-  const bodyContent = normalizeForHash(getChecksumContent(serialized));
-  const checksum = createHash("sha256").update(bodyContent, "utf-8").digest("hex");
-  node.frontmatter.checksum = `sha256:${checksum}`;
+  node.frontmatter.checksum = computeContentHash(getChecksumContent(serialized));
 
   // Re-serialize with updated frontmatter
   const finalContent = serializeDocument(node);
@@ -71,9 +68,7 @@ export async function publishDocument(
 
   // Gather all published documents for checkpoint
   const allDocs = await storage.discoverDocuments();
-  const publishedDocs = allDocs.filter(
-    (d) => d.frontmatter.status === "published",
-  );
+  const publishedDocs = allDocs.filter(isPublished);
 
   // Gather all document histories
   const histories = await storage.findAllHistories();

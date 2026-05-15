@@ -7,6 +7,7 @@ import type { SelectorNode } from "./parser.js";
 import type { ContextNode, Pack } from "../types.js";
 import { parseUri } from "../uri.js";
 import { Resolver } from "../resolver.js";
+import { stripTagPrefix } from "../parser.js";
 
 export interface EvaluatorOptions {
   resolver: Resolver;
@@ -67,9 +68,7 @@ async function evaluateNode(
 function evaluateTag(tag: string, docs: ContextNode[]): Set<string> {
   const result = new Set<string>();
   for (const doc of docs) {
-    const docTags = (doc.frontmatter.tags || []).map((t) =>
-      t.startsWith("#") ? t.slice(1) : t,
-    );
+    const docTags = stripTagPrefix(doc.frontmatter.tags || []);
     if (docTags.includes(tag)) {
       result.add(doc.id);
     }

@@ -4,12 +4,12 @@
  * and returns documents with trace entries.
  */
 
-import type { ContextNode, ResolvedResult, Checkpoint } from "./types.js";
+import type { ContextNode, ResolvedResult } from "./types.js";
 import { Resolver } from "./resolver.js";
 import { PackLoader } from "./packs.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluate } from "./selector/evaluator.js";
-import { topologicalSortSources } from "./source-graph.js";
+import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
 
 export interface InjectorOptions {
@@ -56,16 +56,7 @@ export class ContextInjector {
     }
 
     // Order source nodes topologically for hydration
-    let orderedSourceNodes: ContextNode[];
-    if (sourceNodes.length > 0) {
-      const sortedIds = topologicalSortSources(sourceNodes);
-      const sourceMap = new Map(sourceNodes.map((n) => [n.id, n]));
-      orderedSourceNodes = sortedIds
-        .map((id) => sourceMap.get(id))
-        .filter((n): n is ContextNode => n !== undefined);
-    } else {
-      orderedSourceNodes = [];
-    }
+    const orderedSourceNodes = orderSourceNodesTopologically(sourceNodes);
 
     // Log access traces for all returned documents
     for (const doc of [...regularDocs, ...orderedSourceNodes]) {
