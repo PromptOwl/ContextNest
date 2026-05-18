@@ -245,10 +245,7 @@ export class CheckpointManager {
       checkpoints: [],
     };
 
-    const previousCheckpoint =
-      history.checkpoints.length > 0
-        ? history.checkpoints[history.checkpoints.length - 1]
-        : null;
+    const previousCheckpoint = getLatestCheckpoint(history);
 
     const checkpointNumber = previousCheckpoint
       ? previousCheckpoint.checkpoint + 1

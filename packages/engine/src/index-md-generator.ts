@@ -4,6 +4,20 @@
  */
 
 import type { ContextNode } from "./types.js";
+import { isPublished } from "./parser.js";
+
+/**
+ * Defensive date formatter for INDEX.md tables. `updated_at` SHOULD already
+ * be normalized to a string by `parseDocument`, but if a caller hands us a
+ * Date or unexpected value we still want a date cell rather than a crash.
+ */
+function formatUpdatedDate(value: unknown, fallback: string): string {
+  if (value instanceof Date) return value.toISOString().split("T")[0];
+  if (typeof value === "string" && value.length > 0) {
+    return value.split("T")[0];
+  }
+  return fallback;
+}
 
 /**
  * Defensive date formatter for INDEX.md tables. `updated_at` SHOULD already
@@ -118,8 +132,8 @@ export function generateIndexMd(
   }
 
   // Statistics
-  const published = documents.filter((d) => d.frontmatter.status === "published").length;
-  const draft = documents.filter((d) => d.frontmatter.status !== "published").length;
+  const published = documents.filter(isPublished).length;
+  const draft = documents.filter((d) => !isPublished(d)).length;
   lines.push("## Statistics");
   lines.push("");
   lines.push(`- Total documents: ${documents.length}`);
