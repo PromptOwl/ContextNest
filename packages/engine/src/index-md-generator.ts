@@ -20,19 +20,6 @@ function formatUpdatedDate(value: unknown, fallback: string): string {
 }
 
 /**
- * Defensive date formatter for INDEX.md tables. `updated_at` SHOULD already
- * be normalized to a string by `parseDocument`, but if a caller hands us a
- * Date or unexpected value we still want a date cell rather than a crash.
- */
-function formatUpdatedDate(value: unknown, fallback: string): string {
-  if (value instanceof Date) return value.toISOString().split("T")[0];
-  if (typeof value === "string" && value.length > 0) {
-    return value.split("T")[0];
-  }
-  return fallback;
-}
-
-/**
  * Generate an INDEX.md for a folder.
  */
 export function generateIndexMd(
