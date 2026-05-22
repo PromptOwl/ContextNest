@@ -147,6 +147,24 @@ export function tokenize(input: string): Token[] {
               position: start,
             });
             break;
+          case "tag":
+            // `tag:#X` is the spec-documented alias for the bare `#X` form.
+            // The standard filterValue read stops at `#`, so rewind and re-read,
+            // consuming an optional leading `#`.
+            const tagRewindStart = pos - filterValue.length;
+            pos = tagRewindStart;
+            if (input[pos] === "#") pos++;
+            const tagValueStart = pos;
+            while (pos < input.length && /[a-zA-Z0-9_-]/.test(input[pos])) pos++;
+            if (pos === tagValueStart) {
+              throw new Error(`Invalid tag filter at position ${start}: expected tag name after "tag:"`);
+            }
+            tokens.push({
+              type: "TAG",
+              value: input.slice(tagValueStart, pos),
+              position: start,
+            });
+            break;
           default:
             throw new Error(`Unknown filter type "${word}" at position ${start}`);
         }
