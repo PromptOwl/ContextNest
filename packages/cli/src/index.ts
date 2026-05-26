@@ -32,8 +32,18 @@ import {
   detectCycles,
   serializeDocument,
   parseUri,
+  stageSuggestion,
+  listSuggestions,
+  approveSuggestion,
+  rejectSuggestion,
 } from "@promptowl/contextnest-engine";
-import type { ContextNode, Frontmatter, LayoutMode } from "@promptowl/contextnest-engine";
+import type {
+  ContextNode,
+  Frontmatter,
+  LayoutMode,
+  GovernanceTier,
+  RbacHook,
+} from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
@@ -74,57 +84,17 @@ function getStorage(): NestStorage {
 }
 
 async function regenerateIndex(storage: NestStorage): Promise<void> {
-  const docs = await storage.discoverDocuments();
-  const config = await storage.readConfig();
-  const checkpointHistory = await storage.readCheckpointHistory();
-  const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
-  const published = docs.filter((d) => d.frontmatter.status === "published");
-  const packs = await storage.readPacks();
-
-  const contextYaml = generateContextYaml(published, config, latestCheckpoint);
-  await storage.writeContextYaml(contextYaml);
-
-  // Generate INDEX.md for each folder
-  const folders = new Map<string, ContextNode[]>();
-  for (const doc of docs) {
-    const parts = doc.id.split("/");
-    const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-    if (!folders.has(folder)) folders.set(folder, []);
-    folders.get(folder)!.push(doc);
-  }
-
-  for (const [folder, folderDocs] of folders) {
-    if (folder === ".") continue;
-    const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-    const indexMd = generateIndexMd(folder, title, folderDocs);
-    await storage.writeIndexMd(folder, indexMd);
-  }
-
-  // Generate agent config files (CLAUDE.md, GEMINI.md, .cursorrules, etc.)
-  const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
-  const agentConfigs = generateAgentConfigs({
-    config,
-    contextYaml,
-    packs,
-    hasMcpServer,
-  });
-
-  for (const file of agentConfigs) {
-    const filePath = pathMod.join(storage.root, file.path);
-    await mkdir(pathMod.dirname(filePath), { recursive: true });
-
-    // Read existing content and merge — preserves user-authored sections
-    let existing: string | null = null;
-    try {
-      existing = await readFile(filePath, "utf-8");
-    } catch {
-      // File doesn't exist yet
-    }
-
-    const merged = mergeAgentConfig(existing, file.content);
-    await writeFile(filePath, merged, "utf-8");
-  }
+  await storage.regenerateIndex();
 }
+
+// Permissive RBAC stub for local CLI usage. Engine still records the
+// supplied actor in suggestion meta + chain events. Real deploys inject
+// a hook backed by their identity provider.
+const permissiveRbac: RbacHook = {
+  isCzar: () => true,
+  canIngest: () => true,
+  isDocOwner: () => true,
+};
 
 // ─── ctx init ──────────────────────────────────────────────────────────────────
 
@@ -1193,6 +1163,206 @@ program
       console.error(chalk.red(`Push failed: ${err.message}`));
       process.exit(1);
     }
+  });
+
+// ─── ctx drift ─────────────────────────────────────────────────────────────────
+// Out-of-band edit cleanup workflow (bridge-function-spec Story 3.1 / 3.2 / 3.3,
+// hootie-inbox-spec §4.1 / §4.2). Detect drift → stage as suggestion → Czar
+// approve / reject. Canonical document and hash chain are never mutated by
+// detection or staging; only approve_suggestion bumps the chain.
+
+const drift = program
+  .command("drift")
+  .description("Manage out-of-band edits (drift) via the suggestion workflow");
+
+drift
+  .command("scan")
+  .description("Scan vault for body drift (live file bytes != stored checksum)")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const report = await storage.verifyVaultIntegrity();
+    const driftErrors = report.errors.filter((e) => e.type === "body_drift");
+
+    if (opts.json) {
+      console.log(JSON.stringify({ valid: report.valid, drifted: driftErrors }, null, 2));
+      if (driftErrors.length > 0) process.exit(1);
+      return;
+    }
+
+    if (driftErrors.length === 0) {
+      console.log(chalk.green("No drift detected."));
+      return;
+    }
+
+    console.log(chalk.yellow(`${driftErrors.length} drifted document(s):\n`));
+    for (const err of driftErrors) {
+      console.log(`  ${chalk.red("✗")} ${err.document}`);
+      console.log(`      expected: ${chalk.dim(err.expected)}`);
+      console.log(`      actual:   ${chalk.dim(err.actual)}`);
+    }
+    console.log(
+      chalk.dim(
+        `\nResolve with:\n  ctx drift stage <path>\n  ctx drift list <path>\n  ctx drift approve <path> <suggestion-id>\n  ctx drift reject  <path> <suggestion-id> --reason "..."`,
+      ),
+    );
+    process.exit(1);
+  });
+
+drift
+  .command("stage <path>")
+  .description("Stage a drifted document as a suggestion under _suggestions/")
+  .option("-a, --actor <actor>", "Actor identity recorded in suggestion meta", "cli-user")
+  .option("-n, --note <note>", "Optional note explaining the drift")
+  .option("--json", "Output as JSON")
+  .action(async (path: string, opts) => {
+    const storage = getStorage();
+    const id = path.replace(/\.md$/, "");
+    const node = await storage.readDocument(id);
+    const history = await storage.readHistory(id);
+    if (!history || history.versions.length === 0) {
+      console.error(chalk.red(`No version history for "${id}" — nothing to compare against`));
+      process.exit(1);
+    }
+    const latest = history.versions[history.versions.length - 1];
+    const approvedRaw = await new VersionManager(storage).reconstructVersion(id, latest.version);
+
+    const zone = node.frontmatter.zone;
+    const docTier: GovernanceTier = node.frontmatter.governance ?? "standard";
+
+    const result = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: approvedRaw,
+      proposedRawContent: node.rawContent,
+      source: "out-of-band-edit",
+      actor: opts.actor,
+      zone,
+      docTier,
+      note: opts.note,
+    });
+
+    if (opts.json) {
+      console.log(JSON.stringify(result.meta, null, 2));
+      return;
+    }
+    console.log(chalk.green(`Staged suggestion ${chalk.bold(result.meta.suggestion_id)}`));
+    console.log(`  document:      ${id}`);
+    console.log(`  doc_tier:      ${result.meta.doc_tier}`);
+    console.log(`  source:        ${result.meta.source}`);
+    console.log(`  target_hash:   ${chalk.dim(result.meta.target_hash)}`);
+    console.log(`  proposed_hash: ${chalk.dim(result.meta.proposed_hash)}`);
+    console.log(`  patch:         ${chalk.dim(result.patchPath)}`);
+    console.log(
+      chalk.dim(
+        `\nNext:\n  ctx drift approve ${id} ${result.meta.suggestion_id}\n  ctx drift reject  ${id} ${result.meta.suggestion_id} --reason "..."`,
+      ),
+    );
+  });
+
+drift
+  .command("list <path>")
+  .description("List staged suggestions for a document")
+  .option("--json", "Output as JSON")
+  .action(async (path: string, opts) => {
+    const storage = getStorage();
+    const id = path.replace(/\.md$/, "");
+    const metas = await listSuggestions(storage, id);
+
+    if (opts.json) {
+      console.log(JSON.stringify({ document_id: id, count: metas.length, suggestions: metas }, null, 2));
+      return;
+    }
+    if (metas.length === 0) {
+      console.log(chalk.dim(`No staged suggestions for ${id}`));
+      return;
+    }
+    console.log(chalk.bold(`${metas.length} suggestion(s) for ${id}:\n`));
+    for (const m of metas) {
+      console.log(`  ${chalk.cyan(m.suggestion_id)}`);
+      console.log(`    source:        ${m.source}`);
+      console.log(`    doc_tier:      ${m.doc_tier}`);
+      console.log(`    actor:         ${m.actor}`);
+      console.log(`    detected_at:   ${m.detected_at}`);
+      console.log(`    target_hash:   ${chalk.dim(m.target_hash)}`);
+      console.log(`    proposed_hash: ${chalk.dim(m.proposed_hash)}`);
+      if (m.note) console.log(`    note:          ${m.note}`);
+      console.log();
+    }
+  });
+
+drift
+  .command("approve <path> <suggestionId>")
+  .description("Approve a staged suggestion: bumps version, writes new canonical bytes, archives")
+  .option("-a, --actor <actor>", "Actor identity recorded as approver", "cli-user")
+  .option("-c, --comment <comment>", "Optional approval comment recorded in chain event")
+  .option("--json", "Output as JSON")
+  .action(async (path: string, suggestionId: string, opts) => {
+    const storage = getStorage();
+    const id = path.replace(/\.md$/, "");
+    const node = await storage.readDocument(id);
+    const zone = node.frontmatter.zone ?? "default";
+
+    const result = await approveSuggestion({
+      storage,
+      rbac: permissiveRbac,
+      documentId: id,
+      actor: opts.actor,
+      zone,
+      suggestionId,
+      comment: opts.comment,
+    });
+
+    await regenerateIndex(storage);
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(chalk.green(`Approved ${chalk.bold(suggestionId)}`));
+    console.log(`  document:    ${id}`);
+    console.log(`  new version: v${result.versionEntry.version}`);
+    console.log(`  chain_hash:  ${chalk.dim(result.versionEntry.chain_hash)}`);
+    console.log(`  event:       ${result.chainEvent.event_type}`);
+    console.log(`  archived_at: ${chalk.dim(result.archivedAt)}`);
+  });
+
+drift
+  .command("reject <path> <suggestionId>")
+  .description("Reject a staged suggestion: archives without merge, emits chain event")
+  .requiredOption("-r, --reason <reason>", "Rejection reason (required for audit)")
+  .option("-a, --actor <actor>", "Actor identity recorded as rejector", "cli-user")
+  .option("--json", "Output as JSON")
+  .action(async (path: string, suggestionId: string, opts) => {
+    const storage = getStorage();
+    const id = path.replace(/\.md$/, "");
+    const node = await storage.readDocument(id);
+    const zone = node.frontmatter.zone ?? "default";
+
+    const result = await rejectSuggestion({
+      storage,
+      rbac: permissiveRbac,
+      documentId: id,
+      actor: opts.actor,
+      zone,
+      suggestionId,
+      reason: opts.reason,
+    });
+
+    if (opts.json) {
+      console.log(JSON.stringify({ ...result, rejection_reason: opts.reason }, null, 2));
+      return;
+    }
+    console.log(chalk.yellow(`Rejected ${chalk.bold(suggestionId)}`));
+    console.log(`  document:    ${id}`);
+    console.log(`  reason:      ${opts.reason}`);
+    console.log(`  event:       ${result.chainEvent.event_type}`);
+    console.log(`  archived_at: ${chalk.dim(result.archivedAt)}`);
+    console.log(
+      chalk.dim(
+        `\nNote: canonical file on disk still has the drifted bytes. To restore last-approved content, run:\n  ctx read-version ${id} <last-version> > ${id}.md`,
+      ),
+    );
   });
 
 // Parse and run
