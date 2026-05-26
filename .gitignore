@@ -6,4 +6,4 @@ local_vault
 .claude/
 CLAUDE.md
 .internal/
-config.bat
+.env
