@@ -15,9 +15,29 @@ export function normalizeTags(tags?: unknown[]): string[] | undefined {
   return valid.map((tag) => (tag.startsWith("#") ? tag : `#${tag}`));
 }
 
+/**
+ * Coerce a frontmatter date-field value to an ISO-8601 string.
+ *
+ * js-yaml (used by gray-matter) auto-parses unquoted ISO timestamps into
+ * JavaScript `Date` objects. The Frontmatter TypeScript type declares
+ * `created_at`/`updated_at` as `string`, so downstream code (e.g.
+ * `generateIndexMd` calling `.split("T")[0]`) crashes when given a Date.
+ * Normalize to string at parse time so all consumers see a uniform shape.
+ */
+function normalizeDateField(value: unknown): string | undefined {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string") return value;
+  return undefined;
+}
+
 /** Strip # prefix from tags (for context.yaml output per §5) */
 export function stripTagPrefix(tags: string[]): string[] {
   return tags.filter((tag) => typeof tag === "string").map((tag) => (tag.startsWith("#") ? tag.slice(1) : tag));
+}
+
+/** Predicate: document is in `published` status. */
+export function isPublished(node: ContextNode): boolean {
+  return node.frontmatter.status === "published";
 }
 
 /**
@@ -34,6 +54,15 @@ export function parseDocument(
   // Normalize tags to include # prefix
   if (parsed.data.tags) {
     parsed.data.tags = normalizeTags(parsed.data.tags);
+  }
+
+  // Coerce auto-parsed Date values back to ISO strings so the runtime shape
+  // matches the Frontmatter TypeScript type (see normalizeDateField).
+  if (parsed.data.updated_at !== undefined) {
+    parsed.data.updated_at = normalizeDateField(parsed.data.updated_at);
+  }
+  if (parsed.data.created_at !== undefined) {
+    parsed.data.created_at = normalizeDateField(parsed.data.created_at);
   }
 
   const frontmatter = parsed.data as Frontmatter;
@@ -123,9 +152,7 @@ export function serializeDocument(node: ContextNode): string {
  * Per §1.5: SHA-256 of all content after the closing --- of frontmatter, including the leading newline.
  */
 export function getChecksumContent(rawContent: string): string {
-  const parsed = matter(rawContent);
-  // gray-matter's content is everything after frontmatter
-  // We need to include the leading newline
+  // Everything after closing frontmatter delimiter, including leading newline.
   const fmEnd = rawContent.indexOf("---", rawContent.indexOf("---") + 3);
   if (fmEnd === -1) return rawContent;
   return rawContent.slice(fmEnd + 3);

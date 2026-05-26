@@ -1,0 +1,29 @@
+name: Security - PolinRider Scan
+
+on:
+  push:
+    branches:
+      - development
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  polinrider-scan:
+    name: PolinRider Malware Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run PolinRider scanner
+        run: |
+          chmod +x scripts/polinrider-scanner.sh
+          ./scripts/polinrider-scanner.sh "$GITHUB_WORKSPACE" --js-all

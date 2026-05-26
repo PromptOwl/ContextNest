@@ -24,6 +24,50 @@ export type Transport = "mcp" | "rest" | "cli" | "function";
 /** Federation modes (§4.0) */
 export type FederationMode = "none" | "federated" | "scoped";
 
+/** Governance tier (zone-classification-rbac-spec §1, §2.2) */
+export type GovernanceTier = "primary" | "standard";
+
+/** Origin of a staged suggestion (bridge-function-spec Story 3.1, Story 1.3) */
+export type SuggestionSource =
+  | "out-of-band-edit"
+  | "remote-push"
+  | "manual-suggestion"
+  | "quarantine";
+
+/** Hash chain event taxonomy (zone-classification-rbac-spec §6, hootie-inbox-spec §8) */
+export type HashChainEventType =
+  | "primary.approved"
+  | "primary.rejected"
+  | "primary.rolled_back"
+  | "primary.force_pushed"
+  | "primary.force_push_acknowledged"
+  | "standard.owner_approved"
+  | "standard.owner_altered"
+  | "standard.owner_rolled_back"
+  | "dream.proposed"
+  | "dream.approved"
+  | "dream.rejected"
+  | "dream.blocked_cross_zone"
+  | "todo.delegated"
+  | "zone.created"
+  | "zone.deleted"
+  | "czar.appointed"
+  | "czar.removed"
+  | "czar.vacancy_declared"
+  | "permission.granted"
+  | "permission.revoked"
+  | "permission.self_granted"
+  | "zone_challenge.raised"
+  | "zone_challenge.resolved"
+  | "reclassification.approved"
+  | "reclassification.rejected"
+  | "bridge_document.created"
+  | "manifest.updated"
+  | "platform_admin.toggle_changed"
+  | "platform_admin.session_opened"
+  | "platform_admin.session_closed"
+  | "agent.zone_scope_assigned";
+
 /** Source metadata block — present only on type: source nodes (§1.9.1) */
 export interface SourceMeta {
   transport: Transport;
@@ -72,6 +116,10 @@ export interface Frontmatter {
   metadata?: Record<string, unknown>;
   source?: SourceMeta;
   skill?: SkillMeta;
+  /** Zone ID (zone-classification-rbac-spec §2.1 Level 2 metadata override) */
+  zone?: string;
+  /** Governance tier (zone-classification-rbac-spec §1) */
+  governance?: GovernanceTier;
 }
 
 /** A parsed Context Nest document */
@@ -86,6 +134,75 @@ export interface ContextNode {
   body: string;
   /** Full raw file content */
   rawContent: string;
+  /**
+   * Set when live file bytes differ from the last-approved canonical content
+   * (bridge-function-spec Story 3.1, hootie-inbox-spec §4.2). When present,
+   * `frontmatter` and `body` reflect the approved state, NOT live bytes.
+   */
+  pendingChange?: PendingChange;
+}
+
+/**
+ * Captured drift between live file bytes and the last-approved canonical
+ * content. Surfaces on `ContextNode` and is durably represented in the
+ * `_suggestions/` patch + meta files (bridge-function-spec Story 3.1).
+ */
+export interface PendingChange {
+  suggestion_id: string;
+  detected_at: string;
+  source: SuggestionSource;
+  proposed_hash: string;
+}
+
+/**
+ * Suggestion metadata persisted alongside the patch file in
+ * `_suggestions/{doc}-{ts}-{hash}.meta.yaml`. One per staged change.
+ * (bridge-function-spec Story 3.1, hootie-inbox-spec §4.1)
+ */
+export interface SuggestionMeta {
+  suggestion_id: string;
+  document_id: string;
+  zone?: string;
+  doc_tier: GovernanceTier;
+  source: SuggestionSource;
+  actor: string;
+  detected_at: string;
+  /** Content hash of the last-approved canonical state (the chain head) */
+  target_hash: string;
+  /** Content hash of the proposed/drifted content */
+  proposed_hash: string;
+  /** Relative path to the patch file under `_suggestions/` */
+  patch_path: string;
+  note?: string;
+}
+
+/**
+ * Immutable governance event in the PESWG hash chain
+ * (zone-classification-rbac-spec §6, hootie-inbox-spec §8). Emitted ONLY on
+ * approval-class actions — never on drift detection or informational dismissal.
+ */
+export interface HashChainEvent {
+  event_id: string;
+  event_type: HashChainEventType;
+  timestamp: string;
+  actor: string;
+  zone?: string;
+  document_id?: string;
+  /** Resulting document chain hash, when the event mutates document state */
+  resulting_hash?: string;
+  action_metadata?: Record<string, unknown>;
+  signature?: string;
+}
+
+/**
+ * RBAC policy hook injected by the bridge layer. Engine stays identity-
+ * agnostic; the bridge supplies the real implementation
+ * (zone-classification-rbac-spec §4, Story 6.2).
+ */
+export interface RbacHook {
+  isCzar(actor: string, zoneId: string): boolean | Promise<boolean>;
+  canIngest(actor: string, zoneId: string): boolean | Promise<boolean>;
+  isDocOwner(actor: string, documentId: string): boolean | Promise<boolean>;
 }
 
 /** Relationship edge types (§5.1) */
@@ -337,11 +454,12 @@ export interface VerificationReport {
       | "content_hash_mismatch"
       | "chain_hash_mismatch"
       | "cross_chain_mismatch"
-      | "checkpoint_hash_mismatch";
+      | "checkpoint_hash_mismatch"
+      | "body_drift";
     document?: string;
     version?: number;
     checkpoint?: number;
-    expected: string;
+    expected: string | null;
     actual: string;
   }>;
 }

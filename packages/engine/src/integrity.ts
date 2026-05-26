@@ -3,7 +3,8 @@
  */
 
 import { createHash } from "node:crypto";
-import type { VersionEntry, Checkpoint, VerificationReport, DocumentHistory } from "./types.js";
+import type { Checkpoint, VerificationReport, DocumentHistory } from "./types.js";
+import { getChecksumContent } from "./parser.js";
 
 const GENESIS_SENTINEL = "contextnest:genesis:v1";
 
@@ -97,6 +98,134 @@ export function canonicalJson(obj: Record<string, unknown>): string {
 }
 
 /**
+ * Result of comparing live file bytes against a stored checksum.
+ *
+ * `drifted` is true only when a stored checksum exists and disagrees with
+ * the recomputed content hash. Legacy documents with no stored checksum
+ * report `drifted: false` (engine treats absence as "not yet tracked").
+ */
+export interface DriftReport {
+  drifted: boolean;
+  /** The checksum read from frontmatter, or null if the document has none */
+  storedHash: string | null;
+  /** SHA-256 of the current body content, normalized */
+  actualHash: string;
+}
+
+/**
+ * Pure drift detection. No I/O, no mutations.
+ *
+ * Caller hands in the live raw file content and the stored frontmatter
+ * checksum. Engine recomputes the body hash (same input as
+ * `publishDocument` writes — body only, normalized) and reports.
+ *
+ * This is the detection chokepoint for the spec's out-of-band edit case
+ * (bridge-function-spec Story 3.1, Story 2.1 "intercepts contradictory
+ * state during checkpointing"). The function itself does NOT stage a
+ * suggestion or mutate the chain — that is the job of the suggestions /
+ * approval modules wired in later steps.
+ */
+export function detectDrift(
+  rawContent: string,
+  storedChecksum: string | null | undefined,
+): DriftReport {
+  const actualHash = computeContentHash(getChecksumContent(rawContent));
+  if (!storedChecksum) {
+    return { drifted: false, storedHash: null, actualHash };
+  }
+  return {
+    drifted: actualHash !== storedChecksum,
+    storedHash: storedChecksum,
+    actualHash,
+  };
+}
+
+/** Input to `verifyRemoteDelta`. */
+export interface RemoteDeltaInput {
+  /** Document ID this delta targets (for error context only) */
+  documentId: string;
+  /** Raw bytes of the incoming document payload (frontmatter + body) */
+  rawContent: string;
+  /** Content hash the remote claims for `rawContent` */
+  declaredChecksum: string;
+  /**
+   * Previous chain head the remote believes it is building on. `null` =
+   * remote claims this is the first version (genesis case).
+   */
+  declaredPrevChainHash: string | null;
+  /**
+   * Local chain head currently known for this document. `null` = local has
+   * no record of this document yet (acceptable only when the remote also
+   * claims genesis).
+   */
+  localPrevChainHash: string | null;
+}
+
+/** Result of `verifyRemoteDelta`. Caller decides reject / quarantine / merge. */
+export interface RemoteDeltaVerification {
+  ok: boolean;
+  /** Engine-computed content hash for `rawContent` */
+  computedHash: string;
+  errors: Array<
+    | {
+        type: "content_hash_mismatch";
+        expected: string;
+        actual: string;
+      }
+    | {
+        type: "chain_break";
+        expectedPrevChainHash: string | null;
+        actualPrevChainHash: string | null;
+      }
+  >;
+}
+
+/**
+ * Verify a remote-pushed document delta before it is staged or persisted.
+ *
+ * Spec contract (bridge-function-spec §367, Success Criteria):
+ *   "Context can be pushed from desktop to cloud without corrupting hash
+ *    chain."
+ *
+ * Two checks:
+ *   1. Content hash — the remote's declared checksum must match the bytes
+ *      it sent (transport / tamper detection).
+ *   2. Chain continuity — the remote's `declaredPrevChainHash` must equal
+ *      the local chain head for the document; otherwise the chain has
+ *      forked and the caller must decide whether to quarantine the delta
+ *      (bridge-function-spec Story 1.3) or merge.
+ *
+ * The function never throws on verification failure — it returns a
+ * structured result so the bridge can route per spec (quarantine vs.
+ * three-way merge vs. reject). Wrap the result with `chainBreakErrorFrom`
+ * or check `ok` at the call site.
+ */
+export function verifyRemoteDelta(
+  input: RemoteDeltaInput,
+): RemoteDeltaVerification {
+  const errors: RemoteDeltaVerification["errors"] = [];
+  const computedHash = computeContentHash(getChecksumContent(input.rawContent));
+
+  if (computedHash !== input.declaredChecksum) {
+    errors.push({
+      type: "content_hash_mismatch",
+      expected: input.declaredChecksum,
+      actual: computedHash,
+    });
+  }
+
+  if (input.declaredPrevChainHash !== input.localPrevChainHash) {
+    errors.push({
+      type: "chain_break",
+      expectedPrevChainHash: input.localPrevChainHash,
+      actualPrevChainHash: input.declaredPrevChainHash,
+    });
+  }
+
+  return { ok: errors.length === 0, computedHash, errors };
+}
+
+/**
  * Verify the integrity of a document's version chain (§8.4 steps 2-3).
  */
 export function verifyDocumentChain(
@@ -109,31 +238,30 @@ export function verifyDocumentChain(
   let previousChainHash: string | null = null;
 
   for (const entry of history.versions) {
-    // Step 2: Re-compute content_hash
-    let actualContent: string;
+    // Step 2: Re-compute content_hash (skip silently if keyframe file
+    // missing — chain_hash check below still runs using stored content_hash).
+    let actualContent: string | null;
     if (entry.keyframe) {
-      const keyframeContent = readKeyframe(entry.version);
-      if (keyframeContent === null) {
-        // Can't verify without keyframe file
-        continue;
-      }
-      actualContent = keyframeContent;
+      actualContent = readKeyframe(entry.version);
     } else {
       actualContent = entry.diff || "";
     }
 
-    const expectedContentHash = computeContentHash(actualContent);
-    if (expectedContentHash !== entry.content_hash) {
-      errors.push({
-        type: "content_hash_mismatch",
-        document: docId,
-        version: entry.version,
-        expected: expectedContentHash,
-        actual: entry.content_hash,
-      });
+    if (actualContent !== null) {
+      const expectedContentHash = computeContentHash(actualContent);
+      if (expectedContentHash !== entry.content_hash) {
+        errors.push({
+          type: "content_hash_mismatch",
+          document: docId,
+          version: entry.version,
+          expected: expectedContentHash,
+          actual: entry.content_hash,
+        });
+      }
     }
 
-    // Step 3: Re-compute chain_hash
+    // Step 3: Re-compute chain_hash (always — uses stored content_hash so
+    // works even when keyframe material is unavailable).
     const expectedChainHash = computeChainHash(
       previousChainHash,
       entry.content_hash,
@@ -169,7 +297,10 @@ export function verifyCheckpointChain(
   let previousCheckpointHash: string | null = null;
 
   for (const cp of checkpoints) {
-    // Step 4: Cross-chain binding verification
+    // Step 4: Cross-chain binding verification.
+    // Skip rows where the current history entry post-dates the checkpoint —
+    // that means the document was deleted and recreated; the new identity
+    // is not the same as the one the checkpoint sealed.
     for (const [docPath, expectedChainHash] of Object.entries(cp.document_chain_hashes)) {
       const history = documentHistories.get(docPath);
       if (!history) continue;
@@ -177,6 +308,7 @@ export function verifyCheckpointChain(
       const version = cp.document_versions[docPath];
       const entry = history.versions.find((v) => v.version === version);
       if (!entry) continue;
+      if (entry.edited_at > cp.at) continue;
 
       if (entry.chain_hash !== expectedChainHash) {
         errors.push({

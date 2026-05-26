@@ -9,11 +9,18 @@ export type {
   Status,
   Transport,
   FederationMode,
+  GovernanceTier,
+  SuggestionSource,
+  HashChainEventType,
   SourceMeta,
   SkillInput,
   SkillMeta,
   Frontmatter,
   ContextNode,
+  PendingChange,
+  SuggestionMeta,
+  HashChainEvent,
+  RbacHook,
   EdgeType,
   RelationshipEdge,
   HubEntry,
@@ -49,7 +56,68 @@ export {
   IntegrityError,
   FederationNotSupportedError,
   ConfigError,
+  ZoneChallengeError,
+  QuarantineError,
+  UnauthorizedActionError,
+  ChainBreakError,
 } from "./errors.js";
+
+// RBAC
+export {
+  denyAllRbac,
+  requireCzar,
+  requireIngest,
+  requireDocOwner,
+  filterIngestibleZones,
+} from "./rbac.js";
+
+// Suggestions
+export {
+  stageSuggestion,
+  quarantineSuggestion,
+  listSuggestions,
+  readSuggestion,
+} from "./suggestions.js";
+export type {
+  StageSuggestionInput,
+  StageSuggestionResult,
+} from "./suggestions.js";
+
+// Approval
+export {
+  approveSuggestion,
+  rejectSuggestion,
+  rollbackDocument,
+  czarDirectEdit,
+} from "./approval.js";
+export type {
+  ApproveSuggestionInput,
+  ApprovalResult,
+  RejectSuggestionInput,
+  RejectionResult,
+  RollbackInput,
+  RollbackResult,
+  CzarDirectEditInput,
+  CzarDirectEditResult,
+} from "./approval.js";
+
+// Classification
+export {
+  parseClassificationManifest,
+  extractManifestFromClaudeMd,
+  classifyDocument,
+  detectZoneChallenge,
+  classificationManifestSchema,
+} from "./classification.js";
+export type {
+  FolderPattern,
+  ClassificationManifest,
+  ClassificationResult,
+  ContentSignal,
+  ClassifyInput,
+  ZoneChallenge,
+  ZoneChallengeInput,
+} from "./classification.js";
 
 // Schemas
 export {
@@ -60,11 +128,17 @@ export {
   documentHistorySchema,
   checkpointSchema,
   checkpointHistorySchema,
+  suggestionMetaSchema,
+  hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
   TRANSPORTS,
+  GOVERNANCE_TIERS,
+  SUGGESTION_SOURCES,
+  HASH_CHAIN_EVENT_TYPES,
   TAG_PATTERN,
   CHECKSUM_PATTERN,
+  ZONE_ID_PATTERN,
 } from "./schemas.js";
 
 // Parser
@@ -82,8 +156,8 @@ export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
 
 // Storage
-export { NestStorage } from "./storage.js";
-export type { LayoutMode } from "./storage.js";
+export { NestStorage, UNSTAGED_DRIFT_SENTINEL } from "./storage.js";
+export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
 
 // URI
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";
@@ -127,10 +201,35 @@ export {
   canonicalJson,
   verifyDocumentChain,
   verifyCheckpointChain,
+  detectDrift,
+  verifyRemoteDelta,
+} from "./integrity.js";
+export type {
+  DriftReport,
+  RemoteDeltaInput,
+  RemoteDeltaVerification,
 } from "./integrity.js";
 
 // Checkpoints
-export { CheckpointManager } from "./checkpoint.js";
+export {
+  CheckpointManager,
+  scanCheckpointDrift,
+  getLatestCheckpoint,
+  getLatestCheckpointNumber,
+} from "./checkpoint.js";
+export type {
+  CheckpointDriftScanInput,
+  CheckpointDriftScanResult,
+  DriftScanEntry,
+} from "./checkpoint.js";
+
+// Hygienist (background drift scanner)
+export { runHygienistScan } from "./hygienist.js";
+export type {
+  HygienistInput,
+  HygienistEntry,
+  HygienistResult,
+} from "./hygienist.js";
 
 // Publish
 export { publishDocument } from "./publish.js";
@@ -164,3 +263,6 @@ export type { AgentConfigInput, AgentConfigFile } from "./agent-configs.js";
 
 // Tracing
 export { TraceLogger } from "./tracing.js";
+
+// Chain event log (persistent governance audit trail)
+export { ChainEventLog } from "./chain-log.js";

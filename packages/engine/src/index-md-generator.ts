@@ -4,6 +4,20 @@
  */
 
 import type { ContextNode } from "./types.js";
+import { isPublished } from "./parser.js";
+
+/**
+ * Defensive date formatter for INDEX.md tables. `updated_at` SHOULD already
+ * be normalized to a string by `parseDocument`, but if a caller hands us a
+ * Date or unexpected value we still want a date cell rather than a crash.
+ */
+function formatUpdatedDate(value: unknown, fallback: string): string {
+  if (value instanceof Date) return value.toISOString().split("T")[0];
+  if (typeof value === "string" && value.length > 0) {
+    return value.split("T")[0];
+  }
+  return fallback;
+}
 
 /**
  * Generate an INDEX.md for a folder.
@@ -47,9 +61,7 @@ export function generateIndexMd(
       const type = doc.frontmatter.type || "document";
       const status = doc.frontmatter.status || "draft";
       const tags = (doc.frontmatter.tags || []).join(" ");
-      const updated = doc.frontmatter.updated_at
-        ? doc.frontmatter.updated_at.split("T")[0]
-        : now;
+      const updated = formatUpdatedDate(doc.frontmatter.updated_at, now);
       lines.push(`| [${title}](${uri}) | ${type} | ${status} | ${tags} | ${updated} |`);
     }
     lines.push("");
@@ -69,9 +81,7 @@ export function generateIndexMd(
       const server = doc.frontmatter.source?.server || "";
       const tools = (doc.frontmatter.source?.tools || []).join(", ");
       const tags = (doc.frontmatter.tags || []).join(" ");
-      const updated = doc.frontmatter.updated_at
-        ? doc.frontmatter.updated_at.split("T")[0]
-        : now;
+      const updated = formatUpdatedDate(doc.frontmatter.updated_at, now);
       lines.push(
         `| [${title}](${uri}) | ${transport} | ${server} | ${tools} | ${tags} | ${updated} |`,
       );
@@ -109,8 +119,8 @@ export function generateIndexMd(
   }
 
   // Statistics
-  const published = documents.filter((d) => d.frontmatter.status === "published").length;
-  const draft = documents.filter((d) => d.frontmatter.status !== "published").length;
+  const published = documents.filter(isPublished).length;
+  const draft = documents.filter((d) => !isPublished(d)).length;
   lines.push("## Statistics");
   lines.push("");
   lines.push(`- Total documents: ${documents.length}`);
