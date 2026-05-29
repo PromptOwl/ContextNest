@@ -1,16 +1,33 @@
 {
   "name": "@promptowl/contextnest-cli",
-  "version": "0.11.1",
-  "repository": { "type": "git", "url": "https://github.com/PromptOwl/ContextNest.git", "directory": "packages/cli" },
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PromptOwl/ContextNest.git",
+    "directory": "packages/cli"
+  },
   "description": "CLI for structured AI agent knowledge bases — versioned documents, deterministic queries, integrity verification, and MCP integration",
   "homepage": "https://github.com/PromptOwl/ContextNest",
   "author": "PromptOwl <hello@promptowl.ai> (https://promptowl.ai)",
-  "bugs": { "url": "https://github.com/PromptOwl/ContextNest/issues" },
+  "bugs": {
+    "url": "https://github.com/PromptOwl/ContextNest/issues"
+  },
   "keywords": [
-    "ai", "llm", "context", "knowledge-base", "mcp",
-    "rag", "ai-agents", "versioning", "claude",
-    "cursor", "windsurf", "copilot", "gemini",
-    "context-management", "markdown"
+    "ai",
+    "llm",
+    "context",
+    "knowledge-base",
+    "mcp",
+    "rag",
+    "ai-agents",
+    "versioning",
+    "claude",
+    "cursor",
+    "windsurf",
+    "copilot",
+    "gemini",
+    "context-management",
+    "markdown"
   ],
   "type": "module",
   "bin": {
@@ -35,6 +52,9 @@
     "tsup": "^8.0.0",
     "vitest": "^3.0.0"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "license": "AGPL-3.0"
 }

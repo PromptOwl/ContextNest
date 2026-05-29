@@ -218,20 +218,6 @@ function resolveZoneAndTier(
   return null;
 }
 
-/** Latest checkpoint object, or null if history empty/missing. */
-export function getLatestCheckpoint(
-  history: CheckpointHistory | null | undefined,
-): Checkpoint | null {
-  return history?.checkpoints?.at(-1) ?? null;
-}
-
-/** Latest checkpoint number, or 0 if history empty/missing. */
-export function getLatestCheckpointNumber(
-  history: CheckpointHistory | null | undefined,
-): number {
-  return getLatestCheckpoint(history)?.checkpoint ?? 0;
-}
-
 export class CheckpointManager {
   constructor(private storage: NestStorage) {}
 
