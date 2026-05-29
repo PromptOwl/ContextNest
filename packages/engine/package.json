@@ -42,7 +42,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "diff": "^7.0.0",
+    "diff": "^8.0.3",
     "fast-glob": "^3.3.0",
     "gray-matter": "^4.0.3",
     "js-yaml": "^4.1.0",
