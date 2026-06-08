@@ -4,6 +4,10 @@
 
 **by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
 
+[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-cli.svg)](https://www.npmjs.com/package/@promptowl/contextnest-cli)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
+
 Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) — turn scattered knowledge into a structured, queryable brain your AI agents can use. Same instinct as the Obsidian-brain pattern, but with typed graph structure, ~100× cheaper queries (~500 tokens vs 50k), a sharing path, and governed change history when you need it.
 
 ## Install
@@ -158,8 +162,8 @@ See [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl
 
 | Package | Description |
 |---------|-------------|
-| [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, graph traversal |
-| [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access |
+| [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, graph traversal |
+| [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access |
 
 ## Links
 
