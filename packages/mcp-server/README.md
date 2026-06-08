@@ -1,6 +1,10 @@
 # @promptowl/contextnest-mcp-server
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Supports all node types including documents, source nodes, and skill nodes.
+[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-mcp-server.svg)](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
+
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Supports all node types including documents, source nodes, and skill nodes. Exposes **19 tools** over stdio transport.
 
 ## Install
 
@@ -68,6 +72,19 @@ CONTEXTNEST_VAULT_PATH=/path/to/vault contextnest-mcp
 | `read_version` | Reconstruct a specific version of a document |
 | `verify_integrity` | Verify all hash chains in the vault |
 | `list_checkpoints` | List recent checkpoints |
+
+### Drift Governance
+
+When a live file drifts from its last-approved bytes, these tools capture and resolve the change without touching the canonical document or hash chain until approved:
+
+| Tool | Description |
+|------|-------------|
+| `stage_drift_suggestion` | Capture an out-of-band edit as a staged suggestion under `_suggestions/` (does not modify canonical doc or chain) |
+| `list_suggestions` | List all staged suggestions for a document |
+| `approve_suggestion` | Apply a staged suggestion: patch, bump version, write new canonical bytes, archive under `_archive/approved/` |
+| `reject_suggestion` | Reject a staged suggestion: archive under `_archive/rejected/`, emit a chain event (reason required for audit trail) |
+
+Typical flow: `verify_integrity` detects drift → `stage_drift_suggestion` → `list_suggestions` → `approve_suggestion` or `reject_suggestion`.
 
 ### Graph Traversal
 
