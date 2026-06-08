@@ -1,12 +1,24 @@
 # @promptowl/contextnest-mcp-server
 
+**Governed context for your AI agents — not memory.**
+
+**by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
+
 [![npm](https://img.shields.io/npm/v/@promptowl/contextnest-mcp-server.svg)](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Supports all node types including documents, source nodes, and skill nodes. Exposes **19 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **19 tools** over stdio transport.
 
 ## Install
+
+Run it directly, no install:
+
+```bash
+npx -y @promptowl/contextnest-mcp-server /path/to/your/vault
+```
+
+Or install globally:
 
 ```bash
 npm install -g @promptowl/contextnest-mcp-server
@@ -86,6 +98,16 @@ When a live file drifts from its last-approved bytes, these tools capture and re
 
 Typical flow: `verify_integrity` detects drift → `stage_drift_suggestion` → `list_suggestions` → `approve_suggestion` or `reject_suggestion`.
 
+### Selector Grammar
+
+The `resolve` tool takes a selector. One-liner:
+
+```
+#tag  type:X  status:X  pack:id  contextnest://path   ·   combine with + (AND)  | (OR)  - (NOT)  ( ) to group
+```
+
+Example: `resolve({ selector: "(#api | #auth) + status:published - #deprecated" })`. Full grammar in the [specification](https://github.com/PromptOwl/context-nest-spec).
+
 ### Graph Traversal
 
 The `resolve`, `search`, and `read_pack` tools support graph-aware queries:
@@ -103,13 +125,27 @@ list_documents({ type: "skill" })                    → all skill nodes
 create_document({ type: "skill", trigger: "..." })   → create a new skill
 ```
 
+## Ecosystem
+
+The MCP server is one of four ways into the same vault — same file format, same governed history:
+
+| | What it is | Get it |
+|---|---|---|
+| **CLI** (`ctx`) | Build and query the vault from the terminal | [`@promptowl/contextnest-cli`](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
+| **MCP server** | Agent access over the Model Context Protocol (this package) | [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **Engine** | Core library — parsing, storage, versioning, graph traversal | [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
+| **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
+
+Drop the server into any MCP-capable agent — Claude Desktop, Claude Code, Cursor, Gemini CLI, Windsurf — to plug the same vault into your IDE or chat client.
+
 ## Links
 
 - [Context Nest repo](https://github.com/PromptOwl/ContextNest)
 - [Specification](https://github.com/PromptOwl/context-nest-spec)
+- [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/)
 - [PromptOwl](https://promptowl.ai)
 - [Discord](https://discord.gg/fxcSQ5gq)
 
 ## License
 
-AGPL-3.0
+AGPL-3.0 — your files, your agent, your vault. No vendor lock-in. Commercial licensing available when you want to embed; contact [PromptOwl](https://promptowl.ai).
