@@ -50,7 +50,7 @@
   "devDependencies": {
     "typescript": "^5.7.0",
     "tsup": "^8.0.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.2.6"
   },
   "files": [
     "dist",
