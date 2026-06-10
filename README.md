@@ -2,7 +2,7 @@
 
 **A structured second brain for your AI agents. Start solo, scale safely.**
 
-**by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/ContextNest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
+**by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
 
 Context Nest turns scattered knowledge — your repos, docs, Slack threads, tribal know-how — into a structured, queryable brain your AI agents can use.
 
@@ -82,9 +82,9 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 
 | Package | Description | License |
 |---|---|---|
-| [`@promptowl/contextnest-cli`](https://www.npmjs.com/package/@promptowl/contextnest-cli) | Command-line tool (`ctx`) | AGPL-3.0 |
-| [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, integrity | AGPL-3.0 |
-| [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access | AGPL-3.0 |
+| [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) | Command-line tool (`ctx`) | AGPL-3.0 |
+| [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, integrity | AGPL-3.0 |
+| [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access | AGPL-3.0 |
 
 ## Prerequisites
 
@@ -379,7 +379,7 @@ ctx query "#api + status:published"       # Intersection
 
 ## MCP Server
 
-The MCP server exposes vault operations as tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 19 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -450,6 +450,15 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 | `delete_document` | Delete a document and its version history |
 | `publish_document` | Explicitly publish a document (bump version, create checkpoint) |
 
+**Drift governance tools** (resolve out-of-band edits without touching the canonical doc or hash chain until approved):
+
+| Tool | Description |
+|---|---|
+| `stage_drift_suggestion` | Capture a drifted live file as a staged suggestion under `_suggestions/` |
+| `list_suggestions` | List all staged suggestions for a document |
+| `approve_suggestion` | Apply a suggestion: patch, bump version, write new canonical bytes, archive |
+| `reject_suggestion` | Reject a suggestion: archive with required reason, emit a chain event |
+
 ---
 
 ## Development
@@ -480,9 +489,9 @@ ctx verify                         # 8. Verify integrity
 
 All packages are licensed under **AGPL-3.0**:
 
-- **CLI** ([`@promptowl/contextnest-cli`](https://www.npmjs.com/package/@promptowl/contextnest-cli)): **AGPL-3.0**
-- **Engine** ([`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine)): **AGPL-3.0**
-- **MCP Server** ([`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)): **AGPL-3.0**
+- **CLI** ([@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli)): **AGPL-3.0**
+- **Engine** ([@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine)): **AGPL-3.0**
+- **MCP Server** ([@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)): **AGPL-3.0**
 - **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard
 
 AGPL-3.0 ensures all improvements stay open source. You are free to use, modify, and distribute Context Nest, but modifications to the source must be shared under the same license. Commercial licensing is available from [PromptOwl](https://promptowl.ai) for organizations that need to embed or redistribute without AGPL obligations.

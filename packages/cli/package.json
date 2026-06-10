@@ -6,28 +6,18 @@
     "url": "https://github.com/PromptOwl/ContextNest.git",
     "directory": "packages/cli"
   },
-  "description": "CLI for structured AI agent knowledge bases — versioned documents, deterministic queries, integrity verification, and MCP integration",
+  "description": "CLI for governed, versioned, AI-ready context — versioned documents, deterministic queries, integrity verification, and MCP integration for AI agents",
   "homepage": "https://github.com/PromptOwl/ContextNest",
   "author": "PromptOwl <hello@promptowl.ai> (https://promptowl.ai)",
   "bugs": {
     "url": "https://github.com/PromptOwl/ContextNest/issues"
   },
   "keywords": [
-    "ai",
-    "llm",
-    "context",
-    "knowledge-base",
-    "mcp",
-    "rag",
-    "ai-agents",
-    "versioning",
-    "claude",
-    "cursor",
-    "windsurf",
-    "copilot",
-    "gemini",
-    "context-management",
-    "markdown"
+    "context", "governance", "mcp", "agents", "rag",
+    "ai", "llm", "knowledge-base", "versioning",
+    "claude", "cursor", "windsurf", "copilot",
+    "gemini", "markdown",
+    "contextnest", "context-engineering", "ai-context"
   ],
   "type": "module",
   "bin": {
