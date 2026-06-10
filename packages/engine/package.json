@@ -1,21 +1,25 @@
 {
   "name": "@promptowl/contextnest-engine",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
     "directory": "packages/engine"
   },
-  "description": "Core engine for AI agent knowledge bases — selectors, versioning, graph traversal, integrity verification, and context management for LLMs",
+  "description": "Core engine for governed, versioned, AI-ready context — selectors, hash-chain versioning, graph traversal, and integrity verification for LLMs and agents",
   "homepage": "https://github.com/PromptOwl/ContextNest",
   "author": "PromptOwl <hello@promptowl.ai> (https://promptowl.ai)",
   "bugs": {
     "url": "https://github.com/PromptOwl/ContextNest/issues"
   },
   "keywords": [
+    "context",
+    "governance",
+    "mcp",
+    "agents",
+    "rag",
     "ai",
     "llm",
-    "context",
     "knowledge-base",
     "versioning",
     "hash-chain",
@@ -23,8 +27,9 @@
     "selector",
     "graph-traversal",
     "markdown",
-    "ai-agents",
-    "context-management"
+    "contextnest",
+    "context-engineering",
+    "ai-context"
   ],
   "type": "module",
   "main": "dist/index.js",

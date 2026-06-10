@@ -1,30 +1,36 @@
 {
   "name": "@promptowl/contextnest-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
     "directory": "packages/mcp-server"
   },
-  "description": "MCP server for AI agent access to structured knowledge bases — works with Claude, Cursor, Gemini, Copilot, and Windsurf",
+  "description": "MCP server for governed, versioned, AI-ready context — gives Claude, Cursor, Gemini, Copilot, and Windsurf access to structured knowledge bases",
   "homepage": "https://github.com/PromptOwl/ContextNest",
   "author": "PromptOwl <hello@promptowl.ai> (https://promptowl.ai)",
   "bugs": {
     "url": "https://github.com/PromptOwl/ContextNest/issues"
   },
   "keywords": [
+    "context",
+    "governance",
     "mcp",
+    "agents",
+    "rag",
     "model-context-protocol",
-    "ai-agents",
+    "mcp-server",
     "claude",
     "claude-code",
     "cursor",
     "gemini",
+    "windsurf",
+    "copilot",
     "knowledge-base",
-    "context",
     "llm",
-    "mcp-server",
-    "ai-tools"
+    "contextnest",
+    "context-engineering",
+    "ai-context"
   ],
   "type": "module",
   "main": "dist/index.js",

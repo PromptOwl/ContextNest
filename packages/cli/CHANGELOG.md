@@ -1,5 +1,24 @@
 # @promptowl/contextnest-cli
 
+## 1.1.0
+
+### Minor Changes
+
+- Minor release: documentation and selector fixes.
+
+  ### Engine
+
+  - Selector lexer now supports the `tag:#X` atom (spec alias for `tag:X`), so hashtag-prefixed tag queries parse correctly.
+
+  ### Docs
+
+  - Updated README and package metadata (description, keywords) across the engine, CLI, and MCP server.
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @promptowl/contextnest-engine@1.1.0
+
 ## 1.0.0
 
 ### Major Changes

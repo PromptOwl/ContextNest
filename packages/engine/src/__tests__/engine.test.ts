@@ -295,6 +295,22 @@ describe("Selector Lexer", () => {
     expect(tokens[0].value).toBe("engineering");
   });
 
+  it("tokenizes tag:#X as a TAG (spec-documented alias)", () => {
+    const tokens = tokenize("tag:#engineering");
+    expect(tokens[0].type).toBe("TAG");
+    expect(tokens[0].value).toBe("engineering");
+  });
+
+  it("tokenizes tag:X (no leading hash) as a TAG", () => {
+    const tokens = tokenize("tag:engineering");
+    expect(tokens[0].type).toBe("TAG");
+    expect(tokens[0].value).toBe("engineering");
+  });
+
+  it("rejects tag: with no value", () => {
+    expect(() => tokenize("tag:")).toThrow("Invalid tag filter");
+  });
+
   it("tokenizes type filter", () => {
     const tokens = tokenize("type:document");
     expect(tokens[0].type).toBe("TYPE_FILTER");
