@@ -104,6 +104,8 @@ export class NestStorage {
         "context.yaml",
       ],
       dot: false,
+      // Skip unreadable directories rather than failing the whole crawl.
+      suppressErrors: true,
     });
 
     const nodes: ContextNode[] = [];
@@ -695,6 +697,8 @@ export class NestStorage {
     const packFiles = await fg("packs/**/*.yml", {
       cwd: this.root,
       dot: false,
+      // Skip unreadable directories rather than failing the whole crawl.
+      suppressErrors: true,
     });
     const packs: Pack[] = [];
     for (const file of packFiles.sort()) {
@@ -742,6 +746,9 @@ export class NestStorage {
     const historyFiles = await fg("**/.versions/*/history.yaml", {
       cwd: this.root,
       dot: true,
+      // Skip unreadable directories instead of crashing checkpoint rebuild
+      // on a single permission-denied dir under the vault root.
+      suppressErrors: true,
     });
 
     const histories = new Map<string, DocumentHistory>();
