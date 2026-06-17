@@ -60,6 +60,7 @@ export {
   QuarantineError,
   UnauthorizedActionError,
   ChainBreakError,
+  SupersededDocumentError,
 } from "./errors.js";
 
 // RBAC
@@ -149,6 +150,9 @@ export {
   normalizeTags,
   stripTagPrefix,
   getChecksumContent,
+  isPublished,
+  isSuperseded,
+  isRetrievable,
 } from "./parser.js";
 
 // Config

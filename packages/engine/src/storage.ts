@@ -82,8 +82,16 @@ export class NestStorage {
   /**
    * Discover all markdown documents in the vault.
    * Skips hidden directories (.-prefixed) and node_modules.
+   *
+   * By default, documents with `status: superseded` are EXCLUDED — they
+   * stay on disk for audit history but never surface to retrieval
+   * (CLI / MCP / community / desktop all inherit this). Callers that need
+   * the full set (integrity checks, hygienist, regenerateIndex, version
+   * audit) pass `{ includeSuperseded: true }`.
    */
-  async discoverDocuments(): Promise<ContextNode[]> {
+  async discoverDocuments(
+    options: { includeSuperseded?: boolean } = {},
+  ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
     let patterns: string[];
 
@@ -116,7 +124,8 @@ export class NestStorage {
       nodes.push(parseDocument(filePath, content, id));
     }
 
-    return nodes;
+    if (options.includeSuperseded) return nodes;
+    return nodes.filter((n) => n.frontmatter.status !== "superseded");
   }
 
   /**
@@ -209,7 +218,9 @@ export class NestStorage {
    * outside engine-managed blocks are preserved.
    */
   async regenerateIndex(): Promise<void> {
-    const docs = await this.discoverDocuments();
+    // Per-folder INDEX.md must list retired docs too so stewards can find
+    // them; context.yaml gets filtered to published only below.
+    const docs = await this.discoverDocuments({ includeSuperseded: true });
     const config = await this.readConfig();
     const checkpointHistory = await this.readCheckpointHistory();
     const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
@@ -289,7 +300,8 @@ export class NestStorage {
       if (!report.valid) errors.push(...report.errors);
     }
 
-    const liveDocs = await this.discoverDocuments();
+    // Integrity check must verify every doc on disk, including retired ones.
+    const liveDocs = await this.discoverDocuments({ includeSuperseded: true });
     for (const doc of liveDocs) {
       const drift = await this.detectDocumentDrift(doc.id);
       if (drift && drift.drifted) {

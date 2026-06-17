@@ -15,8 +15,14 @@ export type NodeType =
   | "reference"
   | "skill";
 
-/** Document status (§1.5) */
-export type Status = "draft" | "published";
+/** Document status (§1.5)
+ *
+ * `superseded` retires a node: stewards mark a doc superseded when a newer
+ * canonical version exists elsewhere. GraphQueryEngine excludes superseded
+ * docs from retrieval by default — they stay on disk for audit history but
+ * never surface to LLMs or `/context` callers.
+ */
+export type Status = "draft" | "published" | "superseded";
 
 /** Source transport protocol (§1.9.1) */
 export type Transport = "mcp" | "rest" | "cli" | "function";
