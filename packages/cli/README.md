@@ -2,7 +2,13 @@
 
 **A structured second brain for your AI agents. Start solo, scale safely.**
 
+**Governed context, not memory** — typed, versioned, hash-chained.
+
 **by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
+
+[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-cli.svg)](https://www.npmjs.com/package/@promptowl/contextnest-cli)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
 Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) — turn scattered knowledge into a structured, queryable brain your AI agents can use. Same instinct as the Obsidian-brain pattern, but with typed graph structure, ~100× cheaper queries (~500 tokens vs 50k), a sharing path, and governed change history when you need it.
 
@@ -111,6 +117,12 @@ Edge priorities:
 
 ## Selectors
 
+Grammar, one line:
+
+```
+#tag  type:X  status:X  pack:id  contextnest://path   ·   combine with + (AND)  | (OR)  - (NOT)  ( ) to group
+```
+
 ```bash
 ctx query "#engineering"                   # All docs with a tag
 ctx query "type:document"                  # All docs of a type
@@ -146,20 +158,28 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol:
+For direct AI agent access via the Model Context Protocol — **19 tools** over stdio (resolve, search, read/create/update/publish documents, drift governance, integrity verification, and more):
 
 ```bash
+# Run it directly, no install
+npx -y @promptowl/contextnest-mcp-server /path/to/your/vault
+
+# Or install globally
 npm install -g @promptowl/contextnest-mcp-server
 ```
 
-See [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) for setup instructions.
+See [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) for the full tool list and client setup (Claude Desktop, Claude Code, Cursor, Gemini CLI, Windsurf).
 
-## Related Packages
+## Ecosystem
 
-| Package | Description |
-|---------|-------------|
-| [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, graph traversal |
-| [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access |
+Four ways into the same vault — same file format, same governed history:
+
+| | What it is | Get it |
+|---|---|---|
+| **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
+| **MCP server** | Agent access over the Model Context Protocol — 19 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
+| **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 
 ## Links
 
