@@ -15,6 +15,34 @@ export interface PublishOptions {
   note?: string;
 }
 
+/**
+ * In-process serialization for publishes.
+ *
+ * `publishDocument` reads the current version, bumps it, appends to the
+ * per-doc history chain, and seals a checkpoint over ALL published docs.
+ * Two concurrent publishes (e.g. `Promise.all`) interleave these read /
+ * write steps, producing lost updates, colliding version numbers, and a
+ * sealed (version, chain_hash) pair that disagrees with the chain head —
+ * which then fails `verifyCheckpointChain`.
+ *
+ * A module-level promise chain forces every `publishDocument` call to run
+ * to completion before the next begins. Dependency-free and good enough for
+ * a single-process engine; cross-process safety would need a file lock.
+ */
+let publishLock: Promise<unknown> = Promise.resolve();
+
+function withPublishLock<T>(fn: () => Promise<T>): Promise<T> {
+  // Chain onto the previous publish regardless of whether it resolved or
+  // rejected, so one failed publish does not wedge the queue.
+  const run = publishLock.then(fn, fn);
+  // Keep the chain alive but swallow rejections on the lock handle itself.
+  publishLock = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 export interface PublishResult {
   node: ContextNode;
   versionEntry: VersionEntry;
@@ -26,6 +54,16 @@ export interface PublishResult {
  * create checkpoint, and regenerate context.yaml.
  */
 export async function publishDocument(
+  storage: NestStorage,
+  docId: string,
+  options: PublishOptions,
+): Promise<PublishResult> {
+  // Serialize the whole read → bump → version → checkpoint sequence so
+  // concurrent publishes cannot interleave and desync the chain.
+  return withPublishLock(() => publishDocumentInner(storage, docId, options));
+}
+
+async function publishDocumentInner(
   storage: NestStorage,
   docId: string,
   options: PublishOptions,

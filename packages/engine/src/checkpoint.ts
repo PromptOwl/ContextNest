@@ -10,8 +10,9 @@ import type {
   DocumentHistory,
   GovernanceTier,
   SuggestionMeta,
+  VerificationReport,
 } from "./types.js";
-import { computeCheckpointHash } from "./integrity.js";
+import { computeCheckpointHash, verifyDocumentChain } from "./integrity.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
@@ -19,6 +20,23 @@ import {
   classifyDocument,
   type ClassificationManifest,
 } from "./classification.js";
+
+/** A document excluded from a rebuild because its version chain is broken. */
+export interface SkippedDocument {
+  docId: string;
+  errors: VerificationReport["errors"];
+}
+
+/** Result of `rebuildCheckpointHistory`. */
+export interface RebuildCheckpointResult {
+  /** The rebuilt (and persisted) checkpoint history. */
+  history: CheckpointHistory;
+  /**
+   * Documents whose per-doc chain failed verification and were therefore
+   * NOT included in the rebuilt checkpoints. Empty when every chain is sound.
+   */
+  skippedDocuments: SkippedDocument[];
+}
 
 /** Latest checkpoint object, or null if history empty/missing. */
 export function getLatestCheckpoint(
@@ -252,19 +270,22 @@ export class CheckpointManager {
       : 1;
     const at = new Date().toISOString();
 
-    // Build document_versions map
+    // Build document_versions and document_chain_hashes from the SAME latest
+    // history entry per document. Deriving the sealed (version, chain_hash)
+    // pair from two different sources (frontmatter.version vs. history head)
+    // lets them disagree under rapid/concurrent publishes, which then fails
+    // cross-chain verification. Only fall back to frontmatter.version when a
+    // document has no history at all.
     const documentVersions: Record<string, number> = {};
-    for (const doc of publishedDocuments) {
-      documentVersions[doc.id] = doc.frontmatter.version || 1;
-    }
-
-    // Build document_chain_hashes from each document's latest chain_hash
     const documentChainHashes: Record<string, string> = {};
     for (const doc of publishedDocuments) {
       const docHistory = documentHistories.get(doc.id);
       if (docHistory && docHistory.versions.length > 0) {
         const latestEntry = docHistory.versions[docHistory.versions.length - 1];
+        documentVersions[doc.id] = latestEntry.version;
         documentChainHashes[doc.id] = latestEntry.chain_hash;
+      } else {
+        documentVersions[doc.id] = doc.frontmatter.version || 1;
       }
     }
 
@@ -301,9 +322,36 @@ export class CheckpointManager {
 
   /**
    * Rebuild checkpoint history from per-document history.yaml files (§7.3).
+   *
+   * Before replaying, each per-document chain is validated with
+   * `verifyDocumentChain`. Documents with a broken chain are NOT silently
+   * re-encoded into the rebuilt checkpoints (which would launder corruption
+   * into a fresh, internally-consistent-looking checkpoint chain) — they are
+   * excluded and reported in `skippedDocuments`.
+   *
+   * The replay is fully deterministic (sorted by published_at, then docId,
+   * then version), so running this twice over the same on-disk histories
+   * yields a byte-identical context_history.yaml.
    */
-  async rebuildCheckpointHistory(): Promise<CheckpointHistory> {
+  async rebuildCheckpointHistory(): Promise<RebuildCheckpointResult> {
     const allHistories = await this.storage.findAllHistories();
+
+    // Step 1: Validate each per-document chain. A document whose stored
+    // chain_hash sequence does not recompute is corrupt — exclude it rather
+    // than trusting (and re-sealing) its head into the checkpoint chain.
+    const skippedDocuments: SkippedDocument[] = [];
+    const validHistories = new Map<string, DocumentHistory>();
+    for (const [docId, history] of allHistories) {
+      // Pass a null keyframe reader: verifyDocumentChain still recomputes the
+      // chain_hash from the stored content_hash, which is what detects chain
+      // tampering. (Mirrors storage.verifyVaultIntegrity.)
+      const report = verifyDocumentChain(docId, history, () => null);
+      if (report.valid) {
+        validHistories.set(docId, history);
+      } else {
+        skippedDocuments.push({ docId, errors: report.errors });
+      }
+    }
 
     // Step 2: Collect all {docId, version, published_at} tuples
     const tuples: Array<{
@@ -313,7 +361,7 @@ export class CheckpointManager {
       chainHash: string;
     }> = [];
 
-    for (const [docId, history] of allHistories) {
+    for (const [docId, history] of validHistories) {
       for (const entry of history.versions) {
         if (entry.published_at) {
           tuples.push({
@@ -376,6 +424,6 @@ export class CheckpointManager {
     // Step 6: Write to .versions/context_history.yaml
     await this.storage.writeCheckpointHistory(history);
 
-    return history;
+    return { history, skippedDocuments };
   }
 }

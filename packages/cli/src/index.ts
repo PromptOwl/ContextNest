@@ -1076,8 +1076,20 @@ cpCmd
   .action(async () => {
     const storage = getStorage();
     const cm = new CheckpointManager(storage);
-    const history = await cm.rebuildCheckpointHistory();
+    const { history, skippedDocuments } = await cm.rebuildCheckpointHistory();
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
+    if (skippedDocuments.length > 0) {
+      console.log(
+        chalk.yellow(
+          `\nWarning: ${skippedDocuments.length} document(s) excluded due to broken version chains:`,
+        ),
+      );
+      for (const skipped of skippedDocuments) {
+        console.log(
+          chalk.yellow(`  ✗ ${skipped.docId}: ${skipped.errors.length} error(s)`),
+        );
+      }
+    }
   });
 
 // ─── ctx welcome ──────────────────────────────────────────────────────────────

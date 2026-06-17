@@ -37,6 +37,28 @@ import {
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
 
+/**
+ * Write a file atomically: write to a sibling temp file, then `rename` over
+ * the target. `rename` is atomic on the same filesystem, so a concurrent
+ * reader (or a crash mid-write) never observes a half-written history file —
+ * it sees either the old bytes or the new bytes. Used for the integrity
+ * chain files (history.yaml, context_history.yaml) where a torn write would
+ * corrupt the hash chain.
+ */
+async function writeFileAtomic(targetPath: string, content: string): Promise<void> {
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2)}.tmp`;
+  await writeFile(tmpPath, content, "utf-8");
+  try {
+    await rename(tmpPath, targetPath);
+  } catch (err) {
+    // Best-effort cleanup of the temp file if the rename failed.
+    await unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+}
+
 /** Options for `NestStorage.readDocument`. */
 export interface ReadDocumentOptions {
   /**
@@ -470,7 +492,7 @@ export class NestStorage {
     const historyDir = join(this.root, docDir, ".versions", docName);
     await mkdir(historyDir, { recursive: true });
     const content = yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(historyDir, "history.yaml"), content, "utf-8");
+    await writeFileAtomic(join(historyDir, "history.yaml"), content);
   }
 
   /**
@@ -641,7 +663,7 @@ export class NestStorage {
     const content =
       "# Auto-generated. Do not edit manually.\n" +
       yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(dir, "context_history.yaml"), content, "utf-8");
+    await writeFileAtomic(join(dir, "context_history.yaml"), content);
   }
 
   /**
