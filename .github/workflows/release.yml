@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  stable:
+    name: Stable release (tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Publish stable to npm
+        run: pnpm release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  nightly:
+    name: Nightly release (main)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Detect pending changesets
+        id: changesets
+        shell: bash
+        run: |
+          shopt -s nullglob
+          pending=0
+          for f in .changeset/*.md; do
+            base=$(basename "$f")
+            if [ "$base" != "README.md" ]; then
+              pending=1
+              break
+            fi
+          done
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          echo "Pending changesets: $pending"
+
+      - name: Version snapshot
+        if: steps.changesets.outputs.pending == '1'
+        run: pnpm exec changeset version --snapshot nightly
+
+      - name: Build packages
+        if: steps.changesets.outputs.pending == '1'
+        run: pnpm build
+
+      - name: Publish nightly to npm
+        if: steps.changesets.outputs.pending == '1'
+        run: pnpm exec changeset publish --tag nightly --no-git-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

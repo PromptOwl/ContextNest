@@ -339,6 +339,11 @@ gtag('event', 'vault_init', {
 
 /** Open the welcome HTML in the default browser */
 export function openInBrowser(filePath: string): void {
+  // Opt-out for CI / headless / tests where popping a browser is unwanted.
+  if (process.env.CONTEXTNEST_NO_BROWSER) {
+    return;
+  }
+
   const absPath = pathMod.resolve(filePath);
   const url = `file://${absPath.replace(/\\/g, "/")}`;
 
