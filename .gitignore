@@ -5,5 +5,4 @@ dist/
 .DS_Store
 local_vault
 .claude/
-CLAUDE.md
 .internal/
