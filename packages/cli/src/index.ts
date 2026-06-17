@@ -79,6 +79,15 @@ function getVaultRoot(): string {
   return process.cwd();
 }
 
+// Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
+// must NOT walk up the tree — initializing a vault is always a "create here"
+// operation. Walking up would resolve to an ancestor vault (e.g. a stray
+// ~/.context/config.yaml), causing init to operate on the wrong directory
+// (the "misresolved to home" bug). The explicit env override still wins.
+function getInitRoot(): string {
+  return process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
+}
+
 function getStorage(): NestStorage {
   return new NestStorage(getVaultRoot());
 }
@@ -117,7 +126,8 @@ program
       return;
     }
 
-    const storage = getStorage();
+    const root = getInitRoot();
+    const storage = new NestStorage(root);
     await storage.init(opts.name, opts.layout as LayoutMode);
 
     // Apply starter if specified
@@ -144,7 +154,7 @@ program
 
       // Write starter packs
       for (const pack of starter.packs) {
-        const packPath = pathMod.join(getVaultRoot(), "packs", `${pack.id}.yml`);
+        const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
         await fs.promises.mkdir(pathMod.dirname(packPath), { recursive: true });
         await fs.promises.writeFile(packPath, pack.content, "utf-8");
       }
@@ -160,7 +170,7 @@ program
       await regenerateIndex(storage);
 
       // Print results
-      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${getVaultRoot()}`));
+      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
       console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
       console.log(`  Created ${starter.nodes.length} documents:`);
       for (const node of starter.nodes) {
@@ -183,7 +193,7 @@ program
 
       // Generate and open welcome HTML
       const welcomePath = await generateWelcomeHtml({
-        vaultPath: getVaultRoot(),
+        vaultPath: root,
         vaultName: opts.name,
         starterName: starter.id,
         starterDisplayName: starter.name,
@@ -199,7 +209,7 @@ program
       openInBrowser(welcomePath);
       console.log(`  ${chalk.dim("Opened welcome page in browser: .context/welcome.html")}\n`);
     } else {
-      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${getVaultRoot()}\n`));
+      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}\n`));
       console.log(chalk.bold("  Choose a starter recipe to populate your vault:\n"));
       for (const s of listStarters()) {
         console.log(`    ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
@@ -228,7 +238,7 @@ This vault was initialized without a starter recipe. To help the user get starte
 
       // Generate and open welcome HTML (empty vault)
       const welcomePath = await generateWelcomeHtml({
-        vaultPath: getVaultRoot(),
+        vaultPath: root,
         vaultName: opts.name,
         starterName: null,
         starterDisplayName: null,
