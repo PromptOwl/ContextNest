@@ -931,11 +931,20 @@ program
     const storage = getStorage();
     const id = path.replace(/\.md$/, "");
 
-    const doc = await storage.readDocument(id);
-    await storage.deleteDocument(id);
-    await regenerateIndex(storage);
+    try {
+      const doc = await storage.readDocument(id);
+      await storage.deleteDocument(id);
+      await regenerateIndex(storage);
 
-    console.log(chalk.green(`Deleted ${id} (${doc.frontmatter.title})`));
+      console.log(chalk.green(`Deleted ${id} (${doc.frontmatter.title})`));
+    } catch (err) {
+      console.error(
+        chalk.red(
+          `Could not delete ${id}: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+      process.exitCode = 1;
+    }
   });
 
 // ─── ctx search ───────────────────────────────────────────────────────────────
@@ -1375,5 +1384,10 @@ drift
     );
   });
 
-// Parse and run
-program.parse();
+// Parse and run. parseAsync (not parse) so async command actions are awaited;
+// the catch turns any action rejection into a clean error + non-zero exit
+// instead of an unhandled promise rejection that crashes Node.
+program.parseAsync().catch((err) => {
+  console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+  process.exitCode = 1;
+});
