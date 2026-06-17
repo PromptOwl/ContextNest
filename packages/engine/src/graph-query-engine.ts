@@ -19,7 +19,7 @@ import { PackLoader } from "./packs.js";
 import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
-import { isPublished } from "./parser.js";
+import { isPublished, isRetrievable } from "./parser.js";
 import { getLatestCheckpoint, getLatestCheckpointNumber } from "./checkpoint.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
@@ -110,6 +110,11 @@ export class GraphQueryEngine {
     const sourceNodes: ContextNode[] = [];
 
     for (const doc of docMap.values()) {
+      // Superseded docs are never returned, even with includeDrafts. They
+      // stay on disk for audit history but the steward retired them.
+      if (!isRetrievable(doc)) {
+        continue;
+      }
       if (!options.includeDrafts && !isPublished(doc)) {
         continue;
       }
@@ -171,6 +176,8 @@ export class GraphQueryEngine {
 
   /** Fallback: full-load mode (existing behavior) */
   private async fullQuery(selector: string): Promise<GraphQueryResult> {
+    // discoverDocuments excludes superseded by default, so the resolver
+    // never sees retired docs (parity with the graph-mode filter above).
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
     const checkpointHistory = await this.storage.readCheckpointHistory();

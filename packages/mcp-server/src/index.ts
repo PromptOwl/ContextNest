@@ -26,6 +26,7 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  isSuperseded,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -642,12 +643,38 @@ server.tool(
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().optional().describe("New title"),
     tags: z.array(z.string()).optional().describe("New tags (replaces existing)"),
-    status: z.enum(["draft", "published"]).optional().describe("New status"),
+    status: z
+      .enum(["draft", "published", "superseded"])
+      .optional()
+      .describe("New status. 'superseded' retires the doc — no new published version is cut."),
     body: z.string().optional().describe("New markdown body content"),
   },
   async ({ path, title, tags, status, body }) => {
     const id = path.replace(/\.md$/, "");
     const doc = await storage.readDocument(id);
+
+    // Refuse content edits on retired docs unless the caller explicitly
+    // names a new status (revive to draft/published, or no-op retirement).
+    // Mirrors the engine guard in publish.ts and forces callers to declare
+    // intent before content changes land.
+    if (isSuperseded(doc) && status === undefined) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                error: `Document "${id}" is superseded — set status (draft|published|superseded) before further updates`,
+                code: "SUPERSEDED_DOCUMENT",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     // Update frontmatter fields
     if (title !== undefined) doc.frontmatter.title = title;
@@ -678,6 +705,30 @@ server.tool(
 
     const content = serializeDocument(doc);
     await storage.writeDocument(id, content);
+
+    // Retirement path — stewards mark a doc superseded. Don't run
+    // publishDocument (the engine guard would throw SUPERSEDED_DOCUMENT)
+    // and don't cut a new version: retirement is a metadata change, not
+    // a content release.
+    if (status === "superseded") {
+      await regenerateIndex();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id,
+                frontmatter: doc.frontmatter,
+                message: "Document retired (status: superseded). No new version cut.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
 
     // Auto-publish: bump version, create version entry & checkpoint
     const result = await publishDocument(storage, id, {

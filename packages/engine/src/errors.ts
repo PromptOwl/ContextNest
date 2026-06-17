@@ -147,6 +147,23 @@ export class UnauthorizedActionError extends ContextNestError {
  * (bridge-function-spec §367). The delta is rejected — caller decides
  * merge strategy.
  */
+/**
+ * Raised when `publishDocument` is called on a node whose frontmatter
+ * already says `status: superseded`. Republishing would silently resurrect
+ * a retired node into retrieval, so the engine refuses. Callers that
+ * genuinely intend to revive the doc must rewrite its status first (e.g.
+ * to draft) and then call publish.
+ */
+export class SupersededDocumentError extends ContextNestError {
+  constructor(public readonly documentId: string) {
+    super(
+      `Document "${documentId}" is superseded — change status before publishing`,
+      "SUPERSEDED_DOCUMENT",
+    );
+    this.name = "SupersededDocumentError";
+  }
+}
+
 export class ChainBreakError extends ContextNestError {
   constructor(
     public readonly documentId: string,

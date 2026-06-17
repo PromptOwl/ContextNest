@@ -409,7 +409,10 @@ program
       const id = path.replace(/\.md$/, "");
       docs = [await storage.readDocument(id)];
     } else {
-      docs = await storage.discoverDocuments();
+      // Validation is an audit path — retired docs still need to be
+      // checked for malformed frontmatter (storage.regenerateIndex,
+      // verifyVaultIntegrity, hygienist all use the same flag).
+      docs = await storage.discoverDocuments({ includeSuperseded: true });
     }
 
     let hasErrors = false;
@@ -663,7 +666,10 @@ program
   .description("Regenerate context.yaml and INDEX.md files")
   .action(async () => {
     const storage = getStorage();
-    const docs = await storage.discoverDocuments();
+    // Per-folder INDEX.md must list retired docs too so stewards can find
+    // them; context.yaml gets filtered to published-only below. Matches
+    // storage.regenerateIndex().
+    const docs = await storage.discoverDocuments({ includeSuperseded: true });
     const config = await storage.readConfig();
     const checkpointHistory = await storage.readCheckpointHistory();
     const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
