@@ -27,3 +27,5 @@ Replace `status: superseded` with a four-value canonical set + alias normalizati
 **Spec:** `CONTEXT_NEST_SPEC.md` §1.5 + new §1.5.1 document the lifecycle + alias rules.
 
 Legacy `status: superseded` on disk is auto-normalized to `draft` at parse time — no data migration required.
+
+**Error-code rename (downstream-visible).** The publish-guard error now reports `code: "REJECTED_DOCUMENT"` (was `"SUPERSEDED_DOCUMENT"`). Downstream code that branches on the error code must update its check. The deprecated `SupersededDocumentError` class is still exported but is never thrown after this release. Safe because no version with `SUPERSEDED_DOCUMENT` was ever published to npm.

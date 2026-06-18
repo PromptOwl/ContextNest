@@ -180,7 +180,6 @@ export class SupersededDocumentError extends ContextNestError {
  * (bridge-function-spec §367). The delta is rejected — caller decides
  * merge strategy.
  */
-
 export class ChainBreakError extends ContextNestError {
   constructor(
     public readonly documentId: string,
