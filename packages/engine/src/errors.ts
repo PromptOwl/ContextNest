@@ -142,17 +142,27 @@ export class UnauthorizedActionError extends ContextNestError {
 }
 
 /**
- * Raised when an incoming remote delta's `previous_chain_hash` does not
- * link to the local chain head for the target document
- * (bridge-function-spec §367). The delta is rejected — caller decides
- * merge strategy.
+ * Raised when `publishDocument` is called on a node whose frontmatter says
+ * `status: rejected`. Republishing would silently resurrect a retired node
+ * into retrieval, so the engine refuses. Callers that genuinely intend to
+ * revive the doc must rewrite its status first (e.g. to draft) and then
+ * call publish.
  */
+export class RejectedDocumentError extends ContextNestError {
+  constructor(public readonly documentId: string) {
+    super(
+      `Document "${documentId}" is rejected — change status before publishing`,
+      "REJECTED_DOCUMENT",
+    );
+    this.name = "RejectedDocumentError";
+  }
+}
+
 /**
- * Raised when `publishDocument` is called on a node whose frontmatter
- * already says `status: superseded`. Republishing would silently resurrect
- * a retired node into retrieval, so the engine refuses. Callers that
- * genuinely intend to revive the doc must rewrite its status first (e.g.
- * to draft) and then call publish.
+ * @deprecated The `superseded` status was removed. `publishDocument` now
+ * throws `RejectedDocumentError` for the equivalent silent-resurrection
+ * guard. This class is retained for back-compat with downstream importers
+ * and is never thrown by the current engine.
  */
 export class SupersededDocumentError extends ContextNestError {
   constructor(public readonly documentId: string) {
@@ -164,6 +174,12 @@ export class SupersededDocumentError extends ContextNestError {
   }
 }
 
+/**
+ * Raised when an incoming remote delta's `previous_chain_hash` does not
+ * link to the local chain head for the target document
+ * (bridge-function-spec §367). The delta is rejected — caller decides
+ * merge strategy.
+ */
 export class ChainBreakError extends ContextNestError {
   constructor(
     public readonly documentId: string,
