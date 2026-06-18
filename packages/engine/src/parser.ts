@@ -40,6 +40,20 @@ export function isPublished(node: ContextNode): boolean {
   return node.frontmatter.status === "published";
 }
 
+/** Predicate: document was retired by a steward (replaced by a newer canonical version). */
+export function isSuperseded(node: ContextNode): boolean {
+  return node.frontmatter.status === "superseded";
+}
+
+/**
+ * Retrieval predicate — true when the node should surface to LLMs / context
+ * APIs. Superseded nodes stay on disk for audit history but are filtered out
+ * of every retrieval path in GraphQueryEngine.
+ */
+export function isRetrievable(node: ContextNode): boolean {
+  return !isSuperseded(node);
+}
+
 /**
  * Parse a Context Nest document from its file content.
  * Returns the parsed ContextNode with validated frontmatter.

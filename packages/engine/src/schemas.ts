@@ -17,7 +17,7 @@ export const NODE_TYPES = [
   "skill",
 ] as const;
 
-export const STATUSES = ["draft", "published"] as const;
+export const STATUSES = ["draft", "published", "superseded"] as const;
 
 export const TRANSPORTS = ["mcp", "rest", "cli", "function"] as const;
 
