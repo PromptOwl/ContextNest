@@ -67,8 +67,8 @@ export class GraphQueryEngine {
       }
     }
 
-    // Full mode: existing behavior
-    return this.fullQuery(selector);
+    // Full mode: existing behavior, with the same retrieval gates applied.
+    return this.fullQuery(selector, options);
   }
 
   private async graphQuery(
@@ -110,8 +110,9 @@ export class GraphQueryEngine {
     const sourceNodes: ContextNode[] = [];
 
     for (const doc of docMap.values()) {
-      // Superseded docs are never returned, even with includeDrafts. They
-      // stay on disk for audit history but the steward retired them.
+      // Rejected + approved docs are never returned, even with includeDrafts.
+      // Rejected = terminal hide (steward retired). Approved = signed off
+      // but not yet live — surfaces only after publish.
       if (!isRetrievable(doc)) {
         continue;
       }
@@ -174,9 +175,12 @@ export class GraphQueryEngine {
     }
   }
 
-  /** Fallback: full-load mode (existing behavior) */
-  private async fullQuery(selector: string): Promise<GraphQueryResult> {
-    // discoverDocuments excludes superseded by default, so the resolver
+  /** Fallback: full-load mode (existing behavior, post-filtered by status). */
+  private async fullQuery(
+    selector: string,
+    options: GraphQueryOptions = {},
+  ): Promise<GraphQueryResult> {
+    // discoverDocuments excludes rejected by default, so the resolver
     // never sees retired docs (parity with the graph-mode filter above).
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
@@ -193,8 +197,23 @@ export class GraphQueryEngine {
 
     const result = await injector.inject(selector);
 
+    // Apply the same retrieval gates as graphQuery so approved/rejected
+    // never leak to LLMs, and drafts surface only when explicitly opted in.
+    const filteredDocs = result.documents.filter((doc) => {
+      if (!isRetrievable(doc)) return false;
+      if (!options.includeDrafts && !isPublished(doc)) return false;
+      return true;
+    });
+    const filteredSources = result.sourceNodes.filter((doc) => {
+      if (!isRetrievable(doc)) return false;
+      if (!options.includeDrafts && !isPublished(doc)) return false;
+      return true;
+    });
+
     return {
       ...result,
+      documents: filteredDocs,
+      sourceNodes: filteredSources,
       hopsUsed: 0,
       nodesTraversed: docs.length,
       mode: "full",

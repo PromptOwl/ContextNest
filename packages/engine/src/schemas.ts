@@ -17,7 +17,75 @@ export const NODE_TYPES = [
   "skill",
 ] as const;
 
-export const STATUSES = ["draft", "published", "superseded"] as const;
+export const STATUSES = [
+  "draft",
+  "pending_review",
+  "approved",
+  "published",
+  "rejected",
+] as const;
+
+/**
+ * Status aliases — synonyms from other tools or legacy values that the
+ * engine normalizes to canonical statuses at parse time. Lookup is
+ * case-insensitive (raw input is lowercased before matching).
+ *
+ * The disk format always stores canonical values. Aliased values found on
+ * disk are auto-canonicalized the next time the doc round-trips through
+ * `serializeDocument` or `ctx index`. Unknown values fall back to "draft".
+ *
+ * Mapping rationale:
+ *   - rejected: terminal hide. Never surfaces to LLM retrieval. Stewards
+ *     can revive by setting status back to draft/pending_review/approved/published.
+ *   - draft: hidden by default; surfaces via `includeDrafts: true`.
+ *     Legacy `superseded` lands here because retirement is no longer a
+ *     terminal state — stewards now decide explicitly whether to keep
+ *     the doc retrievable or reject it.
+ *   - pending_review: author submitted, awaiting reviewer sign-off. Hidden
+ *     from LLM but visible to stewards. `ready`/`reviewed`/`signed_off`
+ *     are NOT aliases here — those mean the review already happened.
+ *   - approved: hidden from LLM by default; intermediate gate before
+ *     publish. Reviewer has signed off but the doc is not yet live.
+ *   - published: only canonical status surfaced to LLM retrieval.
+ */
+export const STATUS_ALIASES: Record<string, (typeof STATUSES)[number]> = {
+  // → rejected
+  cancelled: "rejected",
+  canceled: "rejected",
+  archived: "rejected",
+  abandoned: "rejected",
+  deprecated: "rejected",
+  removed: "rejected",
+  // → draft
+  superseded: "draft",
+  todo: "draft",
+  pending: "draft",
+  wip: "draft",
+  new: "draft",
+  // → pending_review (submitted, awaiting reviewer sign-off; hidden from LLM)
+  review: "pending_review",
+  in_review: "pending_review",
+  "in-review": "pending_review",
+  under_review: "pending_review",
+  "under-review": "pending_review",
+  submitted: "pending_review",
+  needs_review: "pending_review",
+  "needs-review": "pending_review",
+  awaiting_review: "pending_review",
+  "awaiting-review": "pending_review",
+  // → approved (reviewer signed off; hidden from LLM until published)
+  ready: "approved",
+  reviewed: "approved",
+  accepted: "approved",
+  signed_off: "approved",
+  "signed-off": "approved",
+  // → published
+  active: "published",
+  live: "published",
+  released: "published",
+  final: "published",
+  shipped: "published",
+};
 
 export const TRANSPORTS = ["mcp", "rest", "cli", "function"] as const;
 

@@ -93,8 +93,8 @@ export async function scanCheckpointDrift(
   input: CheckpointDriftScanInput,
 ): Promise<CheckpointDriftScanResult> {
   // Checkpoint drift scan covers every doc including retired ones — a
-  // superseded file can still drift on disk and the steward needs to know.
-  const docs = await input.storage.discoverDocuments({ includeSuperseded: true });
+  // rejected file can still drift on disk and the steward needs to know.
+  const docs = await input.storage.discoverDocuments({ includeRetired: true });
   const entries: DriftScanEntry[] = [];
 
   for (const doc of docs) {

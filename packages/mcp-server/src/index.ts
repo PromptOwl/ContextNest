@@ -26,7 +26,8 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
-  isSuperseded,
+  isRejected,
+  normalizeStatus,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -182,14 +183,28 @@ server.tool(
   "List all documents with optional filters",
   {
     type: z.string().optional().describe("Filter by node type"),
-    status: z.string().optional().describe("Filter by status (draft/published)"),
+    status: z
+      .string()
+      .optional()
+      .describe(
+        "Filter by status. Canonical: draft | pending_review | approved | published | rejected. Aliases (cancelled, superseded, review, submitted, active, …) are normalized before matching.",
+      ),
     tag: z.string().optional().describe("Filter by tag"),
   },
   async ({ type, status, tag }) => {
-    let docs = await storage.discoverDocuments();
+    // includeRetired so callers can list rejected docs; default filter
+    // (rejected hidden) still applies only when status filter is not set
+    // to "rejected" — match below handles both cases.
+    let docs = await storage.discoverDocuments({ includeRetired: true });
 
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);
-    if (status) docs = docs.filter((d) => (d.frontmatter.status || "draft") === status);
+    if (status) {
+      const wanted = normalizeStatus(status);
+      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
+    } else {
+      // No explicit filter — preserve default retrieval semantics (hide rejected).
+      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
+    }
     if (tag) {
       const normalizedTag = tag.startsWith("#") ? tag : `#${tag}`;
       docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
@@ -265,7 +280,49 @@ server.tool(
           type: "string[]",
           constraints: "Each tag must match: ^#?[a-zA-Z][a-zA-Z0-9_-]*$ — the # prefix is added automatically if omitted",
         },
-        status: { required: false, type: "string", default: "draft", values: ["draft", "published"] },
+        status: {
+          required: false,
+          type: "string",
+          default: "draft",
+          values: ["draft", "pending_review", "approved", "published", "rejected"],
+          aliases: {
+            description:
+              "Aliases are accepted and normalized to canonical on read/write. Unknown values fall back to 'draft'.",
+            map: {
+              cancelled: "rejected",
+              canceled: "rejected",
+              archived: "rejected",
+              abandoned: "rejected",
+              deprecated: "rejected",
+              removed: "rejected",
+              superseded: "draft",
+              todo: "draft",
+              pending: "draft",
+              wip: "draft",
+              new: "draft",
+              review: "pending_review",
+              in_review: "pending_review",
+              "in-review": "pending_review",
+              under_review: "pending_review",
+              "under-review": "pending_review",
+              submitted: "pending_review",
+              needs_review: "pending_review",
+              "needs-review": "pending_review",
+              awaiting_review: "pending_review",
+              "awaiting-review": "pending_review",
+              ready: "approved",
+              reviewed: "approved",
+              accepted: "approved",
+              signed_off: "approved",
+              "signed-off": "approved",
+              active: "published",
+              live: "published",
+              released: "published",
+              final: "published",
+              shipped: "published",
+            },
+          },
+        },
         version: { required: false, type: "integer", constraints: ">= 1, managed automatically by publish" },
         author: { required: false, type: "string" },
         created_at: { required: false, type: "string", format: "ISO 8601" },
@@ -301,7 +358,7 @@ server.tool(
         { rule: 4, description: "Context links must use valid contextnest:// URIs" },
         { rule: 5, description: "Tags must match pattern: ^#?[a-zA-Z][a-zA-Z0-9_-]*$" },
         { rule: 6, description: "type must be one of the 8 defined node types" },
-        { rule: 7, description: "status must be 'draft' or 'published'" },
+        { rule: 7, description: "status must be one of: draft, pending_review, approved, published, rejected (aliases normalized; unknown → draft)" },
         { rule: 8, description: "checksum format: sha256:<64 lowercase hex chars>" },
         { rule: 9, description: "source block MUST be present when type is 'source'" },
         { rule: 10, description: "source.transport must be: mcp, rest, cli, or function" },
@@ -644,28 +701,36 @@ server.tool(
     title: z.string().optional().describe("New title"),
     tags: z.array(z.string()).optional().describe("New tags (replaces existing)"),
     status: z
-      .enum(["draft", "published", "superseded"])
+      .string()
       .optional()
-      .describe("New status. 'superseded' retires the doc — no new published version is cut."),
+      .describe(
+        "New status. Canonical: draft | pending_review | approved | published | rejected. Aliases like 'cancelled', 'superseded', 'active', 'archived', 'review', 'submitted', 'in_review' are accepted and normalized to canonical before storage. Unknown values fall back to 'draft'. 'rejected' retires the doc — no new published version is cut.",
+      ),
     body: z.string().optional().describe("New markdown body content"),
   },
   async ({ path, title, tags, status, body }) => {
     const id = path.replace(/\.md$/, "");
     const doc = await storage.readDocument(id);
 
-    // Refuse content edits on retired docs unless the caller explicitly
-    // names a new status (revive to draft/published, or no-op retirement).
-    // Mirrors the engine guard in publish.ts and forces callers to declare
-    // intent before content changes land.
-    if (isSuperseded(doc) && status === undefined) {
+    // Normalize caller-supplied status to canonical before any guard or
+    // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
+    // collapse here so the disk store and downstream tools only ever see
+    // canonical values.
+    const normalizedStatus = status !== undefined ? normalizeStatus(status) : undefined;
+
+    // Refuse content edits on rejected docs unless the caller explicitly
+    // names a new status (revive to draft/pending_review/approved/published,
+    // or no-op re-rejection). Mirrors the engine guard in publish.ts and
+    // forces callers to declare intent before content changes land.
+    if (isRejected(doc) && normalizedStatus === undefined) {
       return {
         content: [
           {
             type: "text" as const,
             text: JSON.stringify(
               {
-                error: `Document "${id}" is superseded — set status (draft|published|superseded) before further updates`,
-                code: "SUPERSEDED_DOCUMENT",
+                error: `Document "${id}" is rejected — set status (draft|pending_review|approved|published|rejected) before further updates`,
+                code: "REJECTED_DOCUMENT",
               },
               null,
               2,
@@ -678,7 +743,7 @@ server.tool(
 
     // Update frontmatter fields
     if (title !== undefined) doc.frontmatter.title = title;
-    if (status !== undefined) doc.frontmatter.status = status;
+    if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
     if (tags !== undefined) {
       doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
     }
@@ -706,12 +771,26 @@ server.tool(
     const content = serializeDocument(doc);
     await storage.writeDocument(id, content);
 
-    // Retirement path — stewards mark a doc superseded. Don't run
-    // publishDocument (the engine guard would throw SUPERSEDED_DOCUMENT)
-    // and don't cut a new version: retirement is a metadata change, not
-    // a content release.
-    if (status === "superseded") {
+    // Metadata-only paths — any non-published status set is treated as
+    // a lifecycle transition, not a content release. Skip publishDocument
+    // entirely (rejected would throw REJECTED_DOCUMENT) and don't cut a
+    // new version. Only an explicit `published` or no-status update falls
+    // through to the publish flow below.
+    if (
+      normalizedStatus === "rejected" ||
+      normalizedStatus === "approved" ||
+      normalizedStatus === "pending_review" ||
+      normalizedStatus === "draft"
+    ) {
       await regenerateIndex();
+      const message =
+        normalizedStatus === "rejected"
+          ? "Document retired (status: rejected). No new version cut."
+          : normalizedStatus === "pending_review"
+            ? "Document submitted for review (status: pending_review). No new version cut."
+            : normalizedStatus === "approved"
+              ? "Document marked approved. No new version cut — call publish_document to release."
+              : "Document reverted to draft. No new version cut.";
       return {
         content: [
           {
@@ -720,7 +799,7 @@ server.tool(
               {
                 id,
                 frontmatter: doc.frontmatter,
-                message: "Document retired (status: superseded). No new version cut.",
+                message,
               },
               null,
               2,
