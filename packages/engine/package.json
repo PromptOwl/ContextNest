@@ -59,14 +59,25 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@google-cloud/storage": "^7.0.0",
     "@types/diff": "^7.0.0",
     "@types/node": "^22.0.0",
     "@types/js-yaml": "^4.0.9",
     "@types/mdast": "^4.0.4",
     "@types/toposort": "^2.0.7",
+    "mongodb": "^6.0.0",
+    "mongodb-memory-server": "^10.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.9"
+  },
+  "peerDependencies": {
+    "@google-cloud/storage": "^7.0.0",
+    "mongodb": "^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@google-cloud/storage": { "optional": true },
+    "mongodb": { "optional": true }
   },
   "files": [
     "dist",

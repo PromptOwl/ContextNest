@@ -12,7 +12,7 @@ import type {
   SuggestionMeta,
 } from "./types.js";
 import { computeCheckpointHash } from "./integrity.js";
-import { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
 import {
@@ -36,7 +36,7 @@ export function getLatestCheckpointNumber(
 
 /** Input to `scanCheckpointDrift`. */
 export interface CheckpointDriftScanInput {
-  storage: NestStorage;
+  storage: BaseNestStorage;
   /** Actor identifier recorded on every staged suggestion (e.g. "system:checkpoint"). */
   actor: string;
   /**
@@ -221,7 +221,7 @@ function resolveZoneAndTier(
 }
 
 export class CheckpointManager {
-  constructor(private storage: NestStorage) {}
+  constructor(private storage: BaseNestStorage) {}
 
   /**
    * Run the drift scan against this manager's storage. Returns the scan

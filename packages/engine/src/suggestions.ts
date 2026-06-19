@@ -22,7 +22,7 @@ import { createPatch } from "diff";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { suggestionMetaSchema } from "./schemas.js";
-import type { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 import type {
   GovernanceTier,
   SuggestionMeta,
@@ -31,7 +31,7 @@ import type {
 
 /** Input to `stageSuggestion`. */
 export interface StageSuggestionInput {
-  storage: NestStorage;
+  storage: BaseNestStorage;
   /** e.g. `"nodes/sales-playbook"` (no `.md` suffix). */
   documentId: string;
   /** Last-approved canonical bytes (typically the latest keyframe). */
@@ -133,7 +133,7 @@ export async function quarantineSuggestion(
 
 /** List all staged suggestion metas for a document, sorted by suggestion ID. */
 export async function listSuggestions(
-  storage: NestStorage,
+  storage: BaseNestStorage,
   documentId: string,
 ): Promise<SuggestionMeta[]> {
   const ids = await storage.listSuggestionIds(documentId);
@@ -154,7 +154,7 @@ export async function listSuggestions(
  * Returns the patch separately because the meta does not embed bytes.
  */
 export async function readSuggestion(
-  storage: NestStorage,
+  storage: BaseNestStorage,
   documentId: string,
   suggestionId: string,
 ): Promise<{ meta: SuggestionMeta; patch: string } | null> {

@@ -7,12 +7,12 @@ import { createPatch, applyPatch } from "diff";
 import type { ContextNode, DocumentHistory, VersionEntry } from "./types.js";
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
-import { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
 export class VersionManager {
-  constructor(private storage: NestStorage) {}
+  constructor(private storage: BaseNestStorage) {}
 
   /**
    * Create a new version of a document (§6.1).

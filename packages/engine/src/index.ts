@@ -169,8 +169,20 @@ export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL } from "./storage.js";
-export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
+export {
+  BaseNestStorage,
+  NestStorage,
+  MongoNestStorage,
+  GcsNestStorage,
+  UNSTAGED_DRIFT_SENTINEL,
+} from "./storage/index.js";
+export type {
+  LayoutMode,
+  ReadDocumentOptions,
+  CollectionMap,
+  MongoStorageConfig,
+  GcsStorageConfig,
+} from "./storage/index.js";
 
 // URI
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";

@@ -20,10 +20,10 @@
 
 import { hashChainEventSchema } from "./schemas.js";
 import type { HashChainEvent } from "./types.js";
-import type { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 
 export class ChainEventLog {
-  constructor(private readonly storage: NestStorage) {}
+  constructor(private readonly storage: BaseNestStorage) {}
 
   /**
    * Append a single event. Schema-validated before write — throws on

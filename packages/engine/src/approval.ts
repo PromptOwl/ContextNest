@@ -25,7 +25,6 @@
  *     (hootie-inbox-spec §7 — governance history permanently retained).
  */
 
-import { join } from "node:path";
 import { applyPatch } from "diff";
 import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
@@ -48,11 +47,11 @@ import type {
   RbacHook,
   VersionEntry,
 } from "./types.js";
-import type { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
-  storage: NestStorage;
+  storage: BaseNestStorage;
   rbac: RbacHook;
   documentId: string;
   /** Opaque actor string supplied by the bridge. Engine never interprets. */
@@ -356,7 +355,7 @@ async function gateForTier(
 }
 
 async function loadApprovedBase(
-  storage: NestStorage,
+  storage: BaseNestStorage,
   documentId: string,
 ): Promise<{ version: number; content: string }> {
   // The approved base is the EXACT current chain head — last keyframe plus
@@ -389,7 +388,7 @@ async function assertNotStale(
 }
 
 interface CommitInput {
-  storage: NestStorage;
+  storage: BaseNestStorage;
   documentId: string;
   newRawContent: string;
   actor: string;
@@ -399,7 +398,10 @@ interface CommitInput {
 async function commitNewVersion(
   input: CommitInput,
 ): Promise<{ versionEntry: VersionEntry; serialized: string }> {
-  const filePath = join(input.storage.root, `${input.documentId}.md`);
+  // filePath is informational on the parsed node (no I/O performed here).
+  // Synthesize a backend-agnostic path so we don't reach into a file-only
+  // `storage.root` field.
+  const filePath = `${input.documentId}.md`;
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
 
   const newVersion = (parsed.frontmatter.version ?? 0) + 1;

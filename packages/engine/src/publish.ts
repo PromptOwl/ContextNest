@@ -4,7 +4,7 @@
  */
 
 import type { ContextNode, VersionEntry } from "./types.js";
-import { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isPublished, isRejected } from "./parser.js";
@@ -27,7 +27,7 @@ export interface PublishResult {
  * create checkpoint, and regenerate context.yaml.
  */
 export async function publishDocument(
-  storage: NestStorage,
+  storage: BaseNestStorage,
   docId: string,
   options: PublishOptions,
 ): Promise<PublishResult> {

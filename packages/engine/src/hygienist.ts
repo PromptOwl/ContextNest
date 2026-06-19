@@ -23,7 +23,7 @@
  *     the next tick sees the new state (Story 4.2: non-locking traversal).
  */
 
-import type { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 import type {
   ContextNode,
   GovernanceTier,
@@ -36,7 +36,7 @@ import { stageSuggestion, listSuggestions } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 
 export interface HygienistInput {
-  storage: NestStorage;
+  storage: BaseNestStorage;
   rbac: RbacHook;
   /**
    * Actor identity the scanner runs as. The scanner inherits this actor's

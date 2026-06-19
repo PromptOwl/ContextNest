@@ -13,7 +13,7 @@ import type {
   ContextYaml,
   GraphQueryResult,
 } from "./types.js";
-import { NestStorage } from "./storage.js";
+import type { BaseNestStorage } from "./storage/base.js";
 import { Resolver } from "./resolver.js";
 import { PackLoader } from "./packs.js";
 import { ContextInjector } from "./injection.js";
@@ -36,7 +36,7 @@ export interface GraphQueryOptions {
 }
 
 export class GraphQueryEngine {
-  constructor(private storage: NestStorage) {}
+  constructor(private storage: BaseNestStorage) {}
 
   /**
    * Query the vault using graph traversal.
