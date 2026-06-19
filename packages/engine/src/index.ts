@@ -44,6 +44,8 @@ export type {
   TraversalOptions,
   TraversalResult,
   GraphQueryResult,
+  VaultRegistry,
+  VaultRegistryEntry,
 } from "./types.js";
 
 // Errors
@@ -154,6 +156,28 @@ export {
 // Config
 export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
+
+// Vault registry (central alias → path mapping)
+export {
+  getRegistryDir,
+  getRegistryPath,
+  readRegistry,
+  writeRegistry,
+  isVaultRoot,
+  findLocalVault,
+  addVault,
+  removeVault,
+  setDefaultVault,
+  listVaults,
+  resolveVaultPath,
+} from "./registry.js";
+export type {
+  AddVaultOptions,
+  VaultListEntry,
+  VaultResolutionSource,
+  ResolveVaultOptions,
+  ResolvedVault,
+} from "./registry.js";
 
 // Storage
 export { NestStorage, UNSTAGED_DRIFT_SENTINEL } from "./storage.js";

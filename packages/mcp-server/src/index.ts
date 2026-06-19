@@ -26,6 +26,8 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  resolveVaultPath,
+  readRegistry,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -34,8 +36,29 @@ import type {
   RbacHook,
 } from "@promptowl/contextnest-engine";
 
-// Resolve vault path from env or args
-const vaultPath = process.env.CONTEXTNEST_VAULT_PATH || process.argv[2] || process.cwd();
+/**
+ * Resolve which vault to serve. Precedence:
+ *   1. CONTEXTNEST_VAULT (alias) / CONTEXTNEST_VAULT_PATH (path) env vars
+ *   2. positional arg — a registered alias, else a direct path (backward compat
+ *      with `contextnest-mcp /path/to/vault`)
+ *   3. local vault (walk up cwd) → registry default → cwd
+ */
+function resolveMcpVaultPath(): string {
+  if (process.env.CONTEXTNEST_VAULT || process.env.CONTEXTNEST_VAULT_PATH) {
+    return resolveVaultPath().path;
+  }
+  const arg = process.argv[2];
+  if (arg) {
+    const registry = readRegistry();
+    if (registry.vaults[arg]) {
+      return resolveVaultPath({ vaultAlias: arg }).path;
+    }
+    return arg; // treat as a direct path
+  }
+  return resolveVaultPath().path;
+}
+
+const vaultPath = resolveMcpVaultPath();
 const storage = new NestStorage(vaultPath);
 
 const server = new McpServer({

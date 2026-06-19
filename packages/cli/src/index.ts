@@ -36,6 +36,12 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  resolveVaultPath,
+  addVault,
+  removeVault,
+  setDefaultVault,
+  listVaults,
+  getRegistryPath,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -53,37 +59,37 @@ const program = new Command();
 program
   .name("ctx")
   .description("Context Nest CLI — manage structured, versioned context vaults")
-  .version(pkg.version);
+  .version(pkg.version)
+  // Global selector: target a registered vault by alias from any directory.
+  // When omitted, resolution falls back to env vars, the local vault, then the
+  // registry default (see resolveVaultPath precedence in the engine).
+  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)");
 
-// Helper: resolve vault root — walks up from cwd to find .context/config.yaml (like git finds .git/)
+// The --vault alias selected for the currently-running command. Captured by a
+// preAction hook so it works whether the flag is given before the subcommand
+// (`ctx --vault work list`) or after it (`ctx list --vault work`).
+let selectedVaultAlias: string | undefined;
+
+program.hook("preAction", (_thisCommand, actionCommand) => {
+  selectedVaultAlias = actionCommand.optsWithGlobals().vault as string | undefined;
+});
+
+// Helper: resolve vault root. Delegates to the engine resolver, which applies
+// precedence: --vault flag > CONTEXTNEST_VAULT (alias) > CONTEXTNEST_VAULT_PATH
+// (path) > local vault (walk up cwd) > registry default > cwd.
 function getVaultRoot(): string {
-  if (process.env.CONTEXTNEST_VAULT_PATH) {
-    return process.env.CONTEXTNEST_VAULT_PATH;
-  }
-
-  let dir = process.cwd();
-  while (true) {
-    const configPath = pathMod.join(dir, ".context", "config.yaml");
-    try {
-      fs.statSync(configPath);
-      return dir;
-    } catch {
-      // not found, try parent
-    }
-    const parent = pathMod.dirname(dir);
-    if (parent === dir) break; // reached filesystem root
-    dir = parent;
-  }
-
-  // No vault found — fall back to cwd (ctx init will create one here)
-  return process.cwd();
+  return resolveVaultPath({
+    vaultAlias: selectedVaultAlias,
+    cwd: process.cwd(),
+  }).path;
 }
 
 // Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
-// must NOT walk up the tree — initializing a vault is always a "create here"
-// operation. Walking up would resolve to an ancestor vault (e.g. a stray
-// ~/.context/config.yaml), causing init to operate on the wrong directory
-// (the "misresolved to home" bug). The explicit env override still wins.
+// must NOT walk up the tree or consult the registry — initializing a vault is
+// always a "create here" operation. Walking up would resolve to an ancestor
+// vault (e.g. a stray ~/.context/config.yaml), causing init to operate on the
+// wrong directory (the "misresolved to home" bug). The explicit env override
+// still wins.
 function getInitRoot(): string {
   return process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
 }
@@ -114,6 +120,8 @@ program
   .option("-n, --name <name>", "Vault name", "My Context Nest")
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
+  .option("--set-default", "With --vault, also make the new vault the default")
+  .option("--description <text>", "With --vault, a label for the registry entry")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -129,6 +137,27 @@ program
     const root = getInitRoot();
     const storage = new NestStorage(root);
     await storage.init(opts.name, opts.layout as LayoutMode);
+
+    // Register the new vault in the central registry when --vault is given, so
+    // it can be targeted from any directory via `ctx --vault <alias> ...`.
+    // --vault is a global option, so it lands in program.opts(), not opts.
+    const registerAlias = program.opts().vault as string | undefined;
+    if (registerAlias) {
+      try {
+        addVault(registerAlias, pathMod.resolve(root), {
+          description: opts.description,
+          setDefault: opts.setDefault,
+          force: true,
+        });
+        console.log(
+          chalk.green(
+            `  Registered vault "${chalk.bold(registerAlias)}"${opts.setDefault ? " (default)" : ""} → ${root}`,
+          ),
+        );
+      } catch (err) {
+        console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
+      }
+    }
 
     // Apply starter if specified
     if (opts.starter) {
@@ -1373,6 +1402,109 @@ drift
         `\nNote: canonical file on disk still has the drifted bytes. To restore last-approved content, run:\n  ctx read-version ${id} <last-version> > ${id}.md`,
       ),
     );
+  });
+
+// ─── ctx vault ───────────────────────────────────────────────────────────────
+
+const vaultCmd = program
+  .command("vault")
+  .description("Manage the central vault registry (alias → path)");
+
+vaultCmd
+  .command("list")
+  .description("List registered vaults")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    const vaults = listVaults();
+    if (opts.json) {
+      console.log(JSON.stringify(vaults, null, 2));
+      return;
+    }
+    if (vaults.length === 0) {
+      console.log(
+        chalk.dim(`No vaults registered. Add one with: ${chalk.yellow("ctx vault add <alias> [path]")}`),
+      );
+      console.log(chalk.dim(`Registry: ${getRegistryPath()}`));
+      return;
+    }
+    console.log(chalk.bold("\nRegistered vaults:\n"));
+    for (const v of vaults) {
+      const marker = v.isDefault ? chalk.green(" *") : "  ";
+      const missing = v.exists ? "" : chalk.red("  [missing]");
+      console.log(`${marker} ${chalk.cyan(v.alias)}${missing}`);
+      if (v.description) console.log(`     ${chalk.dim(v.description)}`);
+      console.log(`     ${chalk.dim(v.path)}`);
+    }
+    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + getRegistryPath())}\n`);
+  });
+
+vaultCmd
+  .command("add <alias> [path]")
+  .description("Register a vault path under an alias (path defaults to the current vault)")
+  .option("--description <text>", "Short label for this alias")
+  .option("--set-default", "Make this the default vault")
+  .option("--force", "Overwrite an existing alias")
+  .action((alias: string, path: string | undefined, opts) => {
+    const target = pathMod.resolve(path || getVaultRoot());
+    try {
+      addVault(alias, target, {
+        description: opts.description,
+        setDefault: opts.setDefault,
+        force: opts.force,
+      });
+      console.log(
+        chalk.green(`Registered "${chalk.bold(alias)}"${opts.setDefault ? " (default)" : ""} → ${target}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("remove <alias>")
+  .alias("rm")
+  .description("Unregister a vault alias")
+  .action((alias: string) => {
+    try {
+      removeVault(alias);
+      console.log(chalk.yellow(`Removed vault alias "${alias}"`));
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("default <alias>")
+  .description("Set the default vault")
+  .action((alias: string) => {
+    try {
+      setDefaultVault(alias);
+      console.log(chalk.green(`Default vault is now "${chalk.bold(alias)}"`));
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("which")
+  .description("Show which vault the CLI would use right now, and why (respects --vault)")
+  .action(() => {
+    try {
+      const resolved = resolveVaultPath({
+        vaultAlias: selectedVaultAlias,
+        cwd: process.cwd(),
+      });
+      console.log(resolved.path);
+      console.log(
+        chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
   });
 
 // Parse and run

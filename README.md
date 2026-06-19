@@ -313,11 +313,57 @@ agent_instructions: |
 
 ## CLI Reference
 
-Set the vault path (defaults to current directory):
+### Choosing a vault
+
+By default `ctx` operates on the vault in (or above) the current directory. To
+work with several vaults from anywhere, register them in a central registry
+under short **aliases** — similar to AWS named profiles — and select one with
+`--vault <alias>`.
+
+The registry lives in your home directory and works on macOS, Linux, and Windows:
+`~/.contextnest/config.yaml` (i.e. `$HOME/.contextnest/config.yaml`, or
+`%USERPROFILE%\.contextnest\config.yaml` on Windows). Override its location with
+the `CONTEXTNEST_CONFIG_DIR` environment variable.
 
 ```bash
+# Create a vault and register it under an alias
+ctx init --name "Work" --vault work --set-default
+
+# Register an existing vault
+ctx vault add personal /path/to/personal-vault --description "Second brain"
+
+# Use a registered vault from any directory
+ctx list --vault work
+ctx vault list          # show all registered vaults (* = default)
+ctx vault default work  # change the default
+ctx vault which         # show which vault resolves right now, and why
+```
+
+A vault is resolved with this precedence (highest first):
+
+1. `--vault <alias>` flag
+2. `CONTEXTNEST_VAULT` env var (an alias — overrides the default vault)
+3. `CONTEXTNEST_VAULT_PATH` env var (an absolute path)
+4. a vault found by walking up from the current directory
+5. the registry's default alias
+6. the current directory
+
+```bash
+# Override the default vault for a shell session
+export CONTEXTNEST_VAULT=work
+# …or point directly at a path (no registry needed)
 export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 ```
+
+### Vault Registry
+
+| Command | Description |
+|---|---|
+| `ctx vault list` | List registered vaults (`* ` marks the default) |
+| `ctx vault add <alias> [path]` | Register a vault (path defaults to the current vault) |
+| `ctx vault remove <alias>` | Unregister an alias |
+| `ctx vault default <alias>` | Set the default vault |
+| `ctx vault which` | Show the resolved vault and the reason |
 
 ### Document Management
 
