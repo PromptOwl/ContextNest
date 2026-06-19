@@ -69,6 +69,8 @@ export interface AgentConfigInput {
  * All supported agent config targets.
  */
 export interface AgentConfigFile {
+  /** Agentic tool id this file targets (e.g. "claude", "cursor"). */
+  tool: string;
   /** Relative path from vault root */
   path: string;
   /** Content to merge into the file (between markers) */
@@ -76,19 +78,29 @@ export interface AgentConfigFile {
 }
 
 /**
- * Generate all agent config files for the vault.
+ * Generate the agent config files for the vault.
+ *
+ * When `config.agent_tools` is a non-empty array, only the targets whose tool
+ * id is listed are returned. When it is undefined or empty, all targets are
+ * returned (back-compat for vaults initialized before tool selection existed).
  */
 export function generateAgentConfigs(input: AgentConfigInput): AgentConfigFile[] {
   const core = buildCoreInstructions(input);
   const section = `${SECTION_BEGIN}\n${core}\n${SECTION_END}`;
 
-  return [
-    { path: "CLAUDE.md", content: section },
-    { path: "GEMINI.md", content: section },
-    { path: ".cursorrules", content: section },
-    { path: ".windsurfrules", content: section },
-    { path: ".github/copilot-instructions.md", content: section },
+  const all: AgentConfigFile[] = [
+    { tool: "claude", path: "CLAUDE.md", content: section },
+    { tool: "gemini", path: "GEMINI.md", content: section },
+    { tool: "cursor", path: ".cursorrules", content: section },
+    { tool: "windsurf", path: ".windsurfrules", content: section },
+    { tool: "copilot", path: ".github/copilot-instructions.md", content: section },
   ];
+
+  const selected = input.config?.agent_tools;
+  if (selected && selected.length > 0) {
+    return all.filter((f) => selected.includes(f.tool));
+  }
+  return all;
 }
 
 /**

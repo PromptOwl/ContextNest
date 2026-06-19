@@ -340,6 +340,13 @@ export interface NestConfig {
    * index time, a sensible default is used.
    */
   agent_maintenance_directive?: string;
+  /**
+   * Agentic tools whose config files this vault writes. Tool ids:
+   * "claude" | "gemini" | "cursor" | "windsurf" | "copilot".
+   * Set by `ctx init`'s tool picker. When undefined or empty, ALL targets are
+   * written (back-compat). `ctx index` honors this; `ctx init` overwrites it.
+   */
+  agent_tools?: string[];
 }
 
 /** Trace entry for document access (§9.2) */

@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
+import readline from "node:readline";
 import { createRequire } from "node:module";
 import { Command } from "commander";
 
@@ -45,6 +46,7 @@ import type {
   RbacHook,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
+import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
 
@@ -105,6 +107,385 @@ const permissiveRbac: RbacHook = {
   isDocOwner: () => true,
 };
 
+// Interactively prompt the user to pick a starter recipe using an arrow-key
+// navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
+// chosen recipe id, or null if the user skips. Callers MUST only invoke this
+// when attached to a TTY — otherwise it would block on stdin (AI agents, CI,
+// piped input). Falls back to a typed prompt when raw mode is unavailable.
+function promptStarterSelection(): Promise<string | null> {
+  const starters = listStarters();
+
+  // Some terminals (dumb terminals, certain CI shells) can't do raw-mode
+  // keypress capture. Fall back to typing a number/name there.
+  if (typeof process.stdin.setRawMode !== "function") {
+    return promptStarterByNumber(starters);
+  }
+
+  return new Promise((resolve) => {
+    const out = process.stdout;
+    let index = 0;
+
+    console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:"));
+    console.log(chalk.dim("  ↑/↓ to move · Enter to select · Esc to skip\n"));
+
+    const render = () => {
+      starters.forEach((s, i) => {
+        const selected = i === index;
+        const pointer = selected ? chalk.cyan("❯") : " ";
+        const line = `${s.id.padEnd(12)} ${s.name}`;
+        out.write(`  ${pointer} ${selected ? chalk.cyan.bold(line) : line}\n`);
+      });
+    };
+
+    const redraw = () => {
+      readline.moveCursor(out, 0, -starters.length);
+      readline.clearScreenDown(out);
+      render();
+    };
+
+    out.write("\x1B[?25l"); // hide cursor
+    render();
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1B[?25h"); // restore cursor
+    };
+
+    const onKey = (_str: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || key.name === "k") {
+        index = (index - 1 + starters.length) % starters.length;
+        redraw();
+      } else if (key.name === "down" || key.name === "j") {
+        index = (index + 1) % starters.length;
+        redraw();
+      } else if (key.name === "return" || key.name === "enter") {
+        cleanup();
+        out.write("\n");
+        resolve(starters[index].id);
+      } else if (key.name === "escape") {
+        cleanup();
+        out.write("\n");
+        resolve(null);
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        out.write("\n");
+        process.exit(130);
+      }
+    };
+
+    process.stdin.on("keypress", onKey);
+  });
+}
+
+// Fallback selector for terminals without raw-mode support: print a numbered
+// list and read a number or recipe name. Returns null on a blank line (skip).
+function promptStarterByNumber(starters: ReturnType<typeof listStarters>): Promise<string | null> {
+  console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:\n"));
+  starters.forEach((s, i) => {
+    console.log(`    ${chalk.yellow(String(i + 1))}  ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
+    console.log(`       ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
+  });
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(
+        `  Select a starter ${chalk.dim(`[1-${starters.length}, name, or Enter to skip]`)}: `,
+        (answer) => {
+          const trimmed = answer.trim();
+          if (trimmed === "") {
+            rl.close();
+            resolve(null);
+            return;
+          }
+          const num = Number(trimmed);
+          if (Number.isInteger(num) && num >= 1 && num <= starters.length) {
+            rl.close();
+            resolve(starters[num - 1].id);
+            return;
+          }
+          const byName = starters.find((s) => s.id.toLowerCase() === trimmed.toLowerCase());
+          if (byName) {
+            rl.close();
+            resolve(byName.id);
+            return;
+          }
+          console.log(chalk.red(`  '${trimmed}' is not a valid choice — pick a number or recipe name.`));
+          ask();
+        },
+      );
+    };
+    ask();
+  });
+}
+
+// ─── Agentic dev tool selection ─────────────────────────────────────────────────
+
+// Interactively pick which agentic tools to write config for, using an arrow-key
+// navigable multi-select (↑/↓ to move, Space to toggle, Enter to confirm, Esc to
+// accept as-is). Detected tools start checked. Resolves to the selected tool ids.
+// Callers MUST only invoke this when attached to a TTY. Falls back to a numbered
+// prompt when raw mode is unavailable.
+function promptToolSelection(tools: AgentTool[]): Promise<string[]> {
+  if (typeof process.stdin.setRawMode !== "function") {
+    return promptToolsByNumber(tools);
+  }
+
+  return new Promise((resolve) => {
+    const out = process.stdout;
+    let index = 0;
+    const checked = new Set(tools.filter((t) => t.detected).map((t) => t.id));
+
+    console.log(chalk.bold("\n  Configure agentic dev tools for this vault:"));
+    console.log(chalk.dim("  Detected tools are pre-selected."));
+    console.log(chalk.dim("  ↑/↓ to move · Space to toggle · Enter to confirm · Esc to accept\n"));
+
+    const render = () => {
+      tools.forEach((t, i) => {
+        const active = i === index;
+        const pointer = active ? chalk.cyan("❯") : " ";
+        const box = checked.has(t.id) ? chalk.green("[x]") : "[ ]";
+        const label = `${t.name.padEnd(16)} ${chalk.dim(t.hint)}`;
+        out.write(`  ${pointer} ${box} ${active ? chalk.cyan.bold(t.name.padEnd(16)) + " " + chalk.dim(t.hint) : label}\n`);
+      });
+    };
+
+    const redraw = () => {
+      readline.moveCursor(out, 0, -tools.length);
+      readline.clearScreenDown(out);
+      render();
+    };
+
+    out.write("\x1B[?25l"); // hide cursor
+    render();
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1B[?25h"); // restore cursor
+    };
+
+    const finish = () => {
+      cleanup();
+      out.write("\n");
+      resolve(tools.filter((t) => checked.has(t.id)).map((t) => t.id));
+    };
+
+    const onKey = (_str: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || key.name === "k") {
+        index = (index - 1 + tools.length) % tools.length;
+        redraw();
+      } else if (key.name === "down" || key.name === "j") {
+        index = (index + 1) % tools.length;
+        redraw();
+      } else if (key.name === "space") {
+        const id = tools[index].id;
+        if (checked.has(id)) checked.delete(id);
+        else checked.add(id);
+        redraw();
+      } else if (key.name === "return" || key.name === "enter" || key.name === "escape") {
+        finish();
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        out.write("\n");
+        process.exit(130);
+      }
+    };
+
+    process.stdin.on("keypress", onKey);
+  });
+}
+
+// Fallback multi-select for terminals without raw-mode support: print a numbered
+// list with detected tools pre-checked, read comma-separated numbers to toggle,
+// and accept the current selection on a blank line.
+function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
+  const checked = new Set(tools.filter((t) => t.detected).map((t) => t.id));
+
+  console.log(chalk.bold("\n  Configure agentic dev tools for this vault:"));
+  console.log(chalk.dim("  Detected tools are pre-selected.\n"));
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      tools.forEach((t, i) => {
+        const box = checked.has(t.id) ? chalk.green("[x]") : "[ ]";
+        console.log(`    ${box} ${chalk.yellow(String(i + 1))}  ${t.name.padEnd(16)} ${chalk.dim(t.hint)}`);
+      });
+      rl.question(
+        `\n  Toggle tools ${chalk.dim("[comma-separated numbers, or Enter to accept]")}: `,
+        (answer) => {
+          const trimmed = answer.trim();
+          if (trimmed === "") {
+            rl.close();
+            resolve(tools.filter((t) => checked.has(t.id)).map((t) => t.id));
+            return;
+          }
+          const nums = trimmed.split(",").map((p) => Number(p.trim()));
+          if (nums.some((n) => !Number.isInteger(n) || n < 1 || n > tools.length)) {
+            console.log(chalk.red(`  Invalid selection — use numbers 1-${tools.length}.`));
+          } else {
+            for (const n of nums) {
+              const id = tools[n - 1].id;
+              if (checked.has(id)) checked.delete(id);
+              else checked.add(id);
+            }
+          }
+          console.log("");
+          ask();
+        },
+      );
+    };
+    ask();
+  });
+}
+
+// Apply a starter recipe to a freshly-initialized vault: write + publish its
+// nodes/packs, persist its maintenance directive, regenerate the index, and
+// print the post-init summary + AI agent prompt.
+async function applyStarter(
+  storage: NestStorage,
+  root: string,
+  opts: { name: string; layout: string },
+  starter: NonNullable<ReturnType<typeof getStarter>>,
+  agentTools?: string[],
+): Promise<void> {
+  // Persist the starter's maintenance directive into config so
+  // `ctx index` can surface it into CLAUDE.md / GEMINI.md / etc. When the user
+  // picked which agentic tools to configure, persist that too so the upcoming
+  // regenerateIndex() — and future `ctx index` runs — only write those files.
+  const initialConfig = await storage.readConfig();
+  if (initialConfig) {
+    initialConfig.agent_maintenance_directive = starter.getMaintenanceDirective();
+    if (agentTools !== undefined) {
+      initialConfig.agent_tools = agentTools;
+    }
+    await storage.writeConfig(initialConfig);
+  }
+
+  // Write starter nodes
+  for (const node of starter.nodes) {
+    await storage.writeDocument(node.path, node.content);
+  }
+
+  // Write starter packs
+  for (const pack of starter.packs) {
+    const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
+    await fs.promises.mkdir(pathMod.dirname(packPath), { recursive: true });
+    await fs.promises.writeFile(packPath, pack.content, "utf-8");
+  }
+
+  // Publish all starter nodes
+  for (const node of starter.nodes) {
+    await publishDocument(storage, node.path, {
+      editedBy: "cli@contextnest.local",
+      note: `Created by ${starter.id} starter`,
+    });
+  }
+
+  await regenerateIndex(storage);
+
+  // Print results
+  console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
+  console.log(`  Created ${starter.nodes.length} documents:`);
+  for (const node of starter.nodes) {
+    console.log(`    ${chalk.cyan(node.path + ".md")}`);
+  }
+  console.log(`  Created ${starter.packs.length} pack(s):`);
+  for (const pack of starter.packs) {
+    console.log(`    ${chalk.cyan("packs/" + pack.id + ".yml")}`);
+  }
+
+  // Post-init prompt for AI agents
+  const prompt = starter.getPrompt();
+  console.log(`\n${chalk.dim("─".repeat(60))}`);
+  console.log(chalk.dim(prompt.context));
+  console.log(`${chalk.dim("─".repeat(60))}`);
+  console.log(prompt.instructions);
+  console.log(chalk.dim("─".repeat(60)));
+
+  console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
+
+  // Generate welcome HTML
+  const welcomePath = await generateWelcomeHtml({
+    vaultPath: root,
+    vaultName: opts.name,
+    starterName: starter.id,
+    starterDisplayName: starter.name,
+    nodes: starter.nodes.map((n) => ({
+      path: n.path,
+      title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
+      type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
+      tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
+    })),
+    timestamp: new Date().toISOString(),
+    cliVersion: program.version() || "0.3.0",
+  });
+  console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
+}
+
+// Print guidance for a vault left without a starter. `showList` controls
+// whether the recipe list is reprinted — skip it when the interactive picker
+// already displayed it.
+async function printEmptyVaultGuidance(
+  root: string,
+  opts: { name: string },
+  { showList }: { showList: boolean },
+): Promise<void> {
+  if (showList) {
+    console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:\n"));
+    for (const s of listStarters()) {
+      console.log(`    ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
+      console.log(`    ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
+    }
+  }
+  console.log(`  Apply one with: ${chalk.yellow("ctx init --starter <recipe>")}`);
+  console.log(`  Or add documents manually: ${chalk.yellow("ctx add nodes/my-doc --title \"My Document\"")}\n`);
+
+  // Post-init instructions for AI assistants
+  console.log(chalk.dim("─".repeat(60)));
+  console.log(`[CONTEXT NEST VAULT INITIALIZED — EMPTY VAULT]
+
+This vault was initialized without a starter recipe. To help the user get started:
+1. Ask what this vault is for (engineering, strategy, research, team knowledge, etc.)
+2. Recommend a starter recipe based on their answer:
+   - developer  — Software engineering teams
+   - executive  — Strategic leadership
+   - analyst    — Research and analysis
+   - sales      — Sales enablement
+   - team       — General team knowledge base
+3. Run: ctx init --starter <recipe> (in the vault directory)
+   Note: re-running init with --starter will add the starter content to the existing vault.
+4. After the starter is applied, generate a CONTEXT.md tailored to the user's needs.`);
+  console.log(chalk.dim("─".repeat(60)));
+  console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
+
+  // Generate welcome HTML (empty vault)
+  const welcomePath = await generateWelcomeHtml({
+    vaultPath: root,
+    vaultName: opts.name,
+    starterName: null,
+    starterDisplayName: null,
+    nodes: [],
+    timestamp: new Date().toISOString(),
+    cliVersion: program.version() || "0.3.0",
+  });
+  console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
+}
+
 // ─── ctx init ──────────────────────────────────────────────────────────────────
 
 program
@@ -129,125 +510,41 @@ program
     const root = getInitRoot();
     const storage = new NestStorage(root);
     await storage.init(opts.name, opts.layout as LayoutMode);
+    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
 
-    // Apply starter if specified
-    if (opts.starter) {
-      const starter = getStarter(opts.starter);
+    // Resolve which starter to apply. An explicit --starter wins. Otherwise,
+    // when running in an interactive terminal, prompt the user to pick one.
+    // In non-interactive contexts (AI agents, CI, piped stdin) we must not
+    // block on input — fall through to printed guidance instead.
+    let starterId: string | undefined = opts.starter;
+    const interactive = !starterId && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (interactive) {
+      starterId = (await promptStarterSelection()) ?? undefined;
+    }
+
+    if (starterId) {
+      const starter = getStarter(starterId);
       if (!starter) {
-        console.log(chalk.red(`Unknown starter: ${opts.starter}`));
+        console.log(chalk.red(`Unknown starter: ${starterId}`));
         console.log(`Available: ${listStarters().map((s) => s.id).join(", ")}`);
         process.exit(1);
       }
 
-      // Persist the starter's maintenance directive into config so
-      // `ctx index` can surface it into CLAUDE.md / GEMINI.md / etc.
-      const initialConfig = await storage.readConfig();
-      if (initialConfig) {
-        initialConfig.agent_maintenance_directive = starter.getMaintenanceDirective();
-        await storage.writeConfig(initialConfig);
+      // After picking a starter, detect installed agentic dev tools and let the
+      // user choose which to write config for. Only in a real terminal — agents
+      // and CI get the default (all targets) so their output is unchanged. The
+      // `interactive` flag above is false when --starter was passed explicitly,
+      // so re-check the TTY independently here.
+      let agentTools: string[] | undefined;
+      const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+      if (isTty) {
+        agentTools = await promptToolSelection(detectAgentTools(root));
       }
 
-      // Write starter nodes
-      for (const node of starter.nodes) {
-        await storage.writeDocument(node.path, node.content);
-      }
-
-      // Write starter packs
-      for (const pack of starter.packs) {
-        const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
-        await fs.promises.mkdir(pathMod.dirname(packPath), { recursive: true });
-        await fs.promises.writeFile(packPath, pack.content, "utf-8");
-      }
-
-      // Publish all starter nodes
-      for (const node of starter.nodes) {
-        await publishDocument(storage, node.path, {
-          editedBy: "cli@contextnest.local",
-          note: `Created by ${starter.id} starter`,
-        });
-      }
-
-      await regenerateIndex(storage);
-
-      // Print results
-      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
-      console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
-      console.log(`  Created ${starter.nodes.length} documents:`);
-      for (const node of starter.nodes) {
-        console.log(`    ${chalk.cyan(node.path + ".md")}`);
-      }
-      console.log(`  Created ${starter.packs.length} pack(s):`);
-      for (const pack of starter.packs) {
-        console.log(`    ${chalk.cyan("packs/" + pack.id + ".yml")}`);
-      }
-
-      // Post-init prompt for AI agents
-      const prompt = starter.getPrompt();
-      console.log(`\n${chalk.dim("─".repeat(60))}`);
-      console.log(chalk.dim(prompt.context));
-      console.log(`${chalk.dim("─".repeat(60))}`);
-      console.log(prompt.instructions);
-      console.log(chalk.dim("─".repeat(60)));
-
-      console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
-
-      // Generate and open welcome HTML
-      const welcomePath = await generateWelcomeHtml({
-        vaultPath: root,
-        vaultName: opts.name,
-        starterName: starter.id,
-        starterDisplayName: starter.name,
-        nodes: starter.nodes.map((n) => ({
-          path: n.path,
-          title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
-          type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
-          tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
-        })),
-        timestamp: new Date().toISOString(),
-        cliVersion: program.version() || "0.3.0",
-      });
-      openInBrowser(welcomePath);
-      console.log(`  ${chalk.dim("Opened welcome page in browser: .context/welcome.html")}\n`);
+      await applyStarter(storage, root, opts, starter, agentTools);
     } else {
-      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}\n`));
-      console.log(chalk.bold("  Choose a starter recipe to populate your vault:\n"));
-      for (const s of listStarters()) {
-        console.log(`    ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
-        console.log(`    ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
-      }
-      console.log(`  Apply one with: ${chalk.yellow("ctx init --starter <recipe>")}`);
-      console.log(`  Or add documents manually: ${chalk.yellow("ctx add nodes/my-doc --title \"My Document\"")}\n`);
-
-      // Post-init instructions for AI assistants
-      console.log(chalk.dim("─".repeat(60)));
-      console.log(`[CONTEXT NEST VAULT INITIALIZED — EMPTY VAULT]
-
-This vault was initialized without a starter recipe. To help the user get started:
-1. Ask what this vault is for (engineering, strategy, research, team knowledge, etc.)
-2. Recommend a starter recipe based on their answer:
-   - developer  — Software engineering teams
-   - executive  — Strategic leadership
-   - analyst    — Research and analysis
-   - sales      — Sales enablement
-   - team       — General team knowledge base
-3. Run: ctx init --starter <recipe> (in the vault directory)
-   Note: re-running init with --starter will add the starter content to the existing vault.
-4. After the starter is applied, generate a CONTEXT.md tailored to the user's needs.`);
-      console.log(chalk.dim("─".repeat(60)));
-      console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
-
-      // Generate and open welcome HTML (empty vault)
-      const welcomePath = await generateWelcomeHtml({
-        vaultPath: root,
-        vaultName: opts.name,
-        starterName: null,
-        starterDisplayName: null,
-        nodes: [],
-        timestamp: new Date().toISOString(),
-        cliVersion: program.version() || "0.3.0",
-      });
-      openInBrowser(welcomePath);
-      console.log(`  ${chalk.dim("Opened welcome page in browser: .context/welcome.html")}\n`);
+      // Don't reprint the recipe list if the interactive picker just showed it.
+      await printEmptyVaultGuidance(root, opts, { showList: !interactive });
     }
   });
 

@@ -199,6 +199,7 @@ export const nestConfigSchema = z.object({
     })
     .optional(),
   agent_maintenance_directive: z.string().optional(),
+  agent_tools: z.array(z.string()).optional(),
 });
 
 export const packSchema = z.object({
