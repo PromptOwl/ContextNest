@@ -7,7 +7,7 @@ import type { SelectorNode } from "./parser.js";
 import type { ContextNode, Pack } from "../types.js";
 import { parseUri } from "../uri.js";
 import { Resolver } from "../resolver.js";
-import { stripTagPrefix } from "../parser.js";
+import { stripTagPrefix, normalizeStatus } from "../parser.js";
 
 export interface EvaluatorOptions {
   resolver: Resolver;
@@ -150,9 +150,12 @@ function evaluateTypeFilter(type: string, docs: ContextNode[]): Set<string> {
 }
 
 function evaluateStatusFilter(status: string, docs: ContextNode[]): Set<string> {
+  // Normalize the filter value so `status:cancelled` matches `rejected`
+  // docs, `status:superseded` matches `draft`, etc.
+  const wanted = normalizeStatus(status);
   const result = new Set<string>();
   for (const doc of docs) {
-    if ((doc.frontmatter.status || "draft") === status) {
+    if ((doc.frontmatter.status || "draft") === wanted) {
       result.add(doc.id);
     }
   }

@@ -6,11 +6,20 @@ on:
       - main
       - development
   pull_request:
+    branches: [main, development]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref to save CI minutes
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Build & test (${{ matrix.os }}, Node ${{ matrix.node }})
+    name: Build, Lint & Test (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +47,9 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Lint (type-check)
+        run: pnpm lint
 
       - name: Test
         run: pnpm test
