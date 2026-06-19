@@ -8,6 +8,11 @@
  * and platform-tolerant (macOS primary); a miss is recoverable because the
  * picker still lets the user check the tool. No child processes are spawned —
  * only synchronous filesystem + PATH probes — so it stays fast.
+ *
+ * Detection is cross-platform: each desktop app is probed at its conventional
+ * install location on macOS (`/Applications/<App>.app`), Windows (per-user
+ * `%LOCALAPPDATA%\Programs` and roaming `%APPDATA%`), and Linux (XDG config
+ * dir), in addition to portable home-dotdir and PATH probes.
  */
 
 import fs from "node:fs";
@@ -49,6 +54,31 @@ export function isOnPath(bin: string): boolean {
 }
 
 /**
+ * Conventional install/config locations for a desktop agentic app, by platform:
+ * - macOS: `/Applications/<macAppName>.app`
+ * - Windows: per-user `%LOCALAPPDATA%\Programs\<dirName>` and roaming
+ *   `%APPDATA%\<dirName>` (falling back to the standard AppData layout under the
+ *   home dir when the env vars are unset).
+ * - Linux/other: `$XDG_CONFIG_HOME/<dirName>` (default `~/.config/<dirName>`).
+ *
+ * Portable signals (home dotdirs like `~/.cursor`, PATH binaries) are probed
+ * separately by the caller, so they're intentionally not duplicated here.
+ */
+export function appInstallPaths(macAppName: string, dirName: string): string[] {
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || pathMod.join(home, "AppData", "Local");
+    const appData = process.env.APPDATA || pathMod.join(home, "AppData", "Roaming");
+    return [pathMod.join(localAppData, "Programs", dirName), pathMod.join(appData, dirName)];
+  }
+  if (process.platform === "darwin") {
+    return [`/Applications/${macAppName}.app`];
+  }
+  const xdgConfig = process.env.XDG_CONFIG_HOME || pathMod.join(home, ".config");
+  return [pathMod.join(xdgConfig, dirName)];
+}
+
+/**
  * True if any directory entry inside `dir` starts with `prefix` (used to spot
  * versioned VS Code extension folders like `github.copilot-1.2.3`).
  */
@@ -87,14 +117,16 @@ export function detectAgentTools(projectRoot: string): AgentTool[] {
       name: "Cursor",
       hint: ".cursorrules",
       detected:
-        exists("/Applications/Cursor.app") || exists(home, ".cursor") || isOnPath("cursor"),
+        appInstallPaths("Cursor", "Cursor").some((p) => exists(p)) ||
+        exists(home, ".cursor") ||
+        isOnPath("cursor"),
     },
     {
       id: "windsurf",
       name: "Windsurf",
       hint: ".windsurfrules",
       detected:
-        exists("/Applications/Windsurf.app") ||
+        appInstallPaths("Windsurf", "Windsurf").some((p) => exists(p)) ||
         exists(home, ".codeium", "windsurf") ||
         isOnPath("windsurf"),
     },

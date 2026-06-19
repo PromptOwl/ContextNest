@@ -36,9 +36,9 @@ describe("generateAgentConfigs — agent_tools filtering", () => {
     expect(files.map((f) => f.path)).toEqual(ALL_PATHS);
   });
 
-  it("returns all five targets when agent_tools is an empty array", () => {
+  it("returns no targets when agent_tools is an empty array (explicit none)", () => {
     const files = gen({ version: 1, name: "Test Vault", agent_tools: [] });
-    expect(files.map((f) => f.path)).toEqual(ALL_PATHS);
+    expect(files).toEqual([]);
   });
 
   it("returns only the selected targets when agent_tools is set", () => {

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectAgentTools, isOnPath, hasDirWithPrefix } from "../agent-tools.js";
+import { detectAgentTools, isOnPath, hasDirWithPrefix, appInstallPaths } from "../agent-tools.js";
 
 // detectAgentTools reads os.homedir() (HOME on POSIX) and process.env.PATH.
 // We point both at controlled temp dirs so detection is deterministic. We only
@@ -78,6 +78,67 @@ describe("detectAgentTools", () => {
       recursive: true,
     });
     expect(find(detectAgentTools(project), "copilot").detected).toBe(true);
+  });
+
+  // Portable home-dotdir probes — these don't depend on macOS's /Applications,
+  // so they exercise the Cursor/Windsurf detection path on Linux and Windows.
+  it("detects Cursor via a home ~/.cursor directory", () => {
+    mkdirSync(join(home, ".cursor"));
+    expect(find(detectAgentTools(project), "cursor").detected).toBe(true);
+  });
+
+  it("detects Windsurf via a home ~/.codeium/windsurf directory", () => {
+    mkdirSync(join(home, ".codeium", "windsurf"), { recursive: true });
+    expect(find(detectAgentTools(project), "windsurf").detected).toBe(true);
+  });
+});
+
+// appInstallPaths returns the conventional desktop-app install/config locations
+// for the host platform. We assert per-platform so the suite is meaningful on
+// macOS, Linux, and Windows CI runners alike.
+describe("appInstallPaths", () => {
+  let savedLocal: string | undefined;
+  let savedRoaming: string | undefined;
+  let savedXdg: string | undefined;
+
+  beforeEach(() => {
+    savedLocal = process.env.LOCALAPPDATA;
+    savedRoaming = process.env.APPDATA;
+    savedXdg = process.env.XDG_CONFIG_HOME;
+  });
+
+  afterEach(() => {
+    for (const [k, v] of [
+      ["LOCALAPPDATA", savedLocal],
+      ["APPDATA", savedRoaming],
+      ["XDG_CONFIG_HOME", savedXdg],
+    ] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it("returns the host platform's conventional locations", () => {
+    const paths = appInstallPaths("Cursor", "Cursor");
+    if (process.platform === "darwin") {
+      expect(paths).toEqual(["/Applications/Cursor.app"]);
+    } else if (process.platform === "win32") {
+      expect(paths.some((p) => p.includes("Programs") && p.endsWith("Cursor"))).toBe(true);
+      expect(paths.length).toBe(2);
+    } else {
+      // Linux / other → XDG config dir
+      process.env.XDG_CONFIG_HOME = "/tmp/xdg-test";
+      expect(appInstallPaths("Cursor", "Cursor")).toEqual(["/tmp/xdg-test/Cursor"]);
+    }
+  });
+
+  it("honors LOCALAPPDATA/APPDATA on Windows", () => {
+    if (process.platform !== "win32") return;
+    process.env.LOCALAPPDATA = "C:\\Local";
+    process.env.APPDATA = "C:\\Roaming";
+    const paths = appInstallPaths("Windsurf", "Windsurf");
+    expect(paths).toContain(join("C:\\Local", "Programs", "Windsurf"));
+    expect(paths).toContain(join("C:\\Roaming", "Windsurf"));
   });
 });
 

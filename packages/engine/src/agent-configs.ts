@@ -80,9 +80,12 @@ export interface AgentConfigFile {
 /**
  * Generate the agent config files for the vault.
  *
- * When `config.agent_tools` is a non-empty array, only the targets whose tool
- * id is listed are returned. When it is undefined or empty, all targets are
- * returned (back-compat for vaults initialized before tool selection existed).
+ * Selection semantics, keyed on `config.agent_tools`:
+ * - `undefined` — the vault predates tool selection, or selection was skipped
+ *   (non-interactive `ctx init`). All targets are returned (back-compat).
+ * - non-empty array — only the targets whose tool id is listed are returned.
+ * - empty array — the user explicitly chose no tools in the picker, so no
+ *   config files are written.
  */
 export function generateAgentConfigs(input: AgentConfigInput): AgentConfigFile[] {
   const core = buildCoreInstructions(input);
@@ -97,7 +100,9 @@ export function generateAgentConfigs(input: AgentConfigInput): AgentConfigFile[]
   ];
 
   const selected = input.config?.agent_tools;
-  if (selected && selected.length > 0) {
+  // `undefined` is back-compat → write all. A present array (even empty) is an
+  // explicit choice → write exactly those, which for `[]` means nothing.
+  if (selected !== undefined) {
     return all.filter((f) => selected.includes(f.tool));
   }
   return all;

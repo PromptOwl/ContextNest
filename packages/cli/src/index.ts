@@ -540,6 +540,9 @@ program
       const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
       if (isTty) {
         agentTools = await promptToolSelection(detectAgentTools(root));
+        if (agentTools.length === 0) {
+          console.log(chalk.dim("  No tools selected — no agent config files will be written."));
+        }
       }
 
       await applyStarter(storage, root, opts, starter, agentTools);
