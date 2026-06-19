@@ -37,6 +37,7 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  normalizeStatus,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -706,7 +707,10 @@ program
       const id = path.replace(/\.md$/, "");
       docs = [await storage.readDocument(id)];
     } else {
-      docs = await storage.discoverDocuments();
+      // Validation is an audit path — retired docs still need to be
+      // checked for malformed frontmatter (storage.regenerateIndex,
+      // verifyVaultIntegrity, hygienist all use the same flag).
+      docs = await storage.discoverDocuments({ includeRetired: true });
     }
 
     let hasErrors = false;
@@ -796,7 +800,12 @@ program
         for (const doc of results) {
           const type = doc.frontmatter.type || "document";
           const status = doc.frontmatter.status || "draft";
-          const statusColor = status === "published" ? chalk.green : chalk.yellow;
+          const statusColor =
+            status === "published" ? chalk.green
+            : status === "approved" ? chalk.cyan
+            : status === "pending_review" ? chalk.magenta
+            : status === "rejected" ? chalk.red
+            : chalk.yellow;
           console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
           console.log(`    ${doc.frontmatter.title}`);
         }
@@ -957,10 +966,35 @@ program
 
 program
   .command("index")
-  .description("Regenerate context.yaml and INDEX.md files")
+  .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
   .action(async () => {
     const storage = getStorage();
-    const docs = await storage.discoverDocuments();
+    // Per-folder INDEX.md must list retired docs too so stewards can find
+    // them; context.yaml gets filtered to published-only below. Matches
+    // storage.regenerateIndex().
+    const docs = await storage.discoverDocuments({ includeRetired: true });
+
+    // Status-canonicalization pass: rewrite any doc whose on-disk status
+    // differs from its parsed (normalized) status. Only `ctx index` does
+    // this — per-mutation calls to regenerateIndex stay cheap. After this
+    // pass disk values are guaranteed canonical until something else edits
+    // them out-of-band.
+    let normalized = 0;
+    for (const doc of docs) {
+      const onDisk = await storage.readDocument(doc.id);
+      const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
+      const canonical = doc.frontmatter.status;
+      if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
+        // Round-trip through serializeDocument — which itself normalizes —
+        // and write back. This rewrites any aliased value to canonical.
+        await storage.writeDocument(doc.id, serializeDocument(doc));
+        normalized++;
+      }
+    }
+    if (normalized > 0) {
+      console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
+    }
+
     const config = await storage.readConfig();
     const checkpointHistory = await storage.readCheckpointHistory();
     const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
@@ -1128,15 +1162,22 @@ program
   .command("list")
   .description("List all documents with optional filters")
   .option("-t, --type <type>", "Filter by node type")
-  .option("-s, --status <status>", "Filter by status (draft/published)")
+  .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    let docs = await storage.discoverDocuments();
+    // Include retired so users can list them with `--status rejected`; the
+    // default branch below re-filters them out when no status is requested.
+    let docs = await storage.discoverDocuments({ includeRetired: true });
 
     if (opts.type) docs = docs.filter((d) => (d.frontmatter.type || "document") === opts.type);
-    if (opts.status) docs = docs.filter((d) => (d.frontmatter.status || "draft") === opts.status);
+    if (opts.status) {
+      const wanted = normalizeStatus(opts.status);
+      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
+    } else {
+      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
+    }
     if (opts.tag) {
       const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
       docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
@@ -1164,7 +1205,12 @@ program
         for (const doc of docs) {
           const type = doc.frontmatter.type || "document";
           const status = doc.frontmatter.status || "draft";
-          const statusColor = status === "published" ? chalk.green : chalk.yellow;
+          const statusColor =
+            status === "published" ? chalk.green
+            : status === "approved" ? chalk.cyan
+            : status === "pending_review" ? chalk.magenta
+            : status === "rejected" ? chalk.red
+            : chalk.yellow;
           console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
           console.log(`    ${doc.frontmatter.title}`);
         }
@@ -1179,6 +1225,7 @@ program
   .description("Update a document's frontmatter and/or body, then auto-publish")
   .option("--title <title>", "New title")
   .option("--tags <tags>", "New tags (comma-separated, replaces existing)")
+  .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
@@ -1186,6 +1233,9 @@ program
     const doc = await storage.readDocument(id);
 
     if (opts.title !== undefined) doc.frontmatter.title = opts.title;
+    if (opts.status !== undefined) {
+      doc.frontmatter.status = normalizeStatus(opts.status);
+    }
     if (opts.tags !== undefined) {
       doc.frontmatter.tags = opts.tags.split(",").map((t: string) => t.trim()).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
     }
@@ -1206,6 +1256,29 @@ program
 
     const content = serializeDocument(doc);
     await storage.writeDocument(id, content);
+
+    // Non-published lifecycle paths skip auto-publish — those are metadata
+    // changes, not content releases. Mirrors MCP `update_document`.
+    if (
+      opts.status !== undefined &&
+      (doc.frontmatter.status === "rejected" ||
+        doc.frontmatter.status === "approved" ||
+        doc.frontmatter.status === "pending_review" ||
+        doc.frontmatter.status === "draft")
+    ) {
+      await regenerateIndex(storage);
+      const label =
+        doc.frontmatter.status === "rejected"
+          ? "retired"
+          : doc.frontmatter.status === "pending_review"
+            ? "submitted for review"
+            : doc.frontmatter.status === "approved"
+              ? "marked approved"
+              : "reverted to draft";
+      console.log(chalk.green(`Updated and ${label}: ${id}`));
+      console.log(chalk.dim("  No new version cut. Run `ctx publish` to release."));
+      return;
+    }
 
     const result = await publishDocument(storage, id, {
       editedBy: "cli@contextnest.local",

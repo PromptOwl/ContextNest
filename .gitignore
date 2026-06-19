@@ -6,3 +6,4 @@ dist/
 local_vault
 .claude/
 .internal/
+fixtures/

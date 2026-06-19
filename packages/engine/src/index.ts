@@ -60,6 +60,9 @@ export {
   QuarantineError,
   UnauthorizedActionError,
   ChainBreakError,
+  RejectedDocumentError,
+  /** @deprecated retained for back-compat; never thrown post-1.2.0. */
+  SupersededDocumentError,
 } from "./errors.js";
 
 // RBAC
@@ -132,6 +135,7 @@ export {
   hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
+  STATUS_ALIASES,
   TRANSPORTS,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
@@ -149,6 +153,15 @@ export {
   normalizeTags,
   stripTagPrefix,
   getChecksumContent,
+  normalizeStatus,
+  isDraft,
+  isPendingReview,
+  isApproved,
+  isPublished,
+  isRejected,
+  isRetrievable,
+  /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
+  isSuperseded,
 } from "./parser.js";
 
 // Config

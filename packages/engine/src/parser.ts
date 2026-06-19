@@ -4,8 +4,33 @@
  */
 
 import matter from "gray-matter";
-import { frontmatterSchema } from "./schemas.js";
-import type { ContextNode, Frontmatter, ValidationError, ValidationResult } from "./types.js";
+import { frontmatterSchema, STATUSES, STATUS_ALIASES } from "./schemas.js";
+import type { ContextNode, Frontmatter, Status, ValidationError, ValidationResult } from "./types.js";
+
+const CANONICAL_STATUS_SET: Set<string> = new Set(STATUSES);
+
+/**
+ * Normalize a raw frontmatter `status` value to a canonical `Status`.
+ *
+ *   - Canonical values pass through unchanged.
+ *   - Aliases (case-insensitive) are mapped via `STATUS_ALIASES`.
+ *   - Anything else (including `undefined`, `null`, non-strings) falls back
+ *     to `"draft"`.
+ *
+ * Called by `parseDocument` so the rest of the engine never sees raw
+ * status. Also called by `serializeDocument` so disk converges to canonical
+ * on every write.
+ */
+export function normalizeStatus(raw: unknown): Status {
+  if (typeof raw !== "string") return "draft";
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return "draft";
+  const lower = trimmed.toLowerCase();
+  if (CANONICAL_STATUS_SET.has(lower)) return lower as Status;
+  const alias = STATUS_ALIASES[lower];
+  if (alias) return alias;
+  return "draft";
+}
 
 /** Normalize tags to always include the # prefix. Filters out null/undefined entries caused by YAML comment parsing. */
 export function normalizeTags(tags?: unknown[]): string[] | undefined {
@@ -35,9 +60,52 @@ export function stripTagPrefix(tags: string[]): string[] {
   return tags.filter((tag) => typeof tag === "string").map((tag) => (tag.startsWith("#") ? tag.slice(1) : tag));
 }
 
-/** Predicate: document is in `published` status. */
+/** Predicate: document is in `draft` status (post-normalization). */
+export function isDraft(node: ContextNode): boolean {
+  return node.frontmatter.status === "draft";
+}
+
+/** Predicate: document is in `pending_review` status (post-normalization). */
+export function isPendingReview(node: ContextNode): boolean {
+  return node.frontmatter.status === "pending_review";
+}
+
+/** Predicate: document is in `approved` status (post-normalization). */
+export function isApproved(node: ContextNode): boolean {
+  return node.frontmatter.status === "approved";
+}
+
+/** Predicate: document is in `published` status (post-normalization). */
 export function isPublished(node: ContextNode): boolean {
   return node.frontmatter.status === "published";
+}
+
+/** Predicate: document is in `rejected` status (post-normalization). */
+export function isRejected(node: ContextNode): boolean {
+  return node.frontmatter.status === "rejected";
+}
+
+/**
+ * @deprecated The `superseded` status was removed. `parseDocument` normalizes
+ * legacy `superseded` values to `draft`, so this predicate always returns
+ * `false` for parsed nodes. Use `isRejected` for the terminal-hide state.
+ */
+export function isSuperseded(node: ContextNode): boolean {
+  return node.frontmatter.status === ("superseded" as Status);
+}
+
+/**
+ * Retrieval predicate — true when the node may surface to LLMs / context
+ * APIs under any retrieval setting. Excludes `pending_review`, `approved`,
+ * and `rejected`:
+ *   - `rejected` is terminal hide (steward retired the doc).
+ *   - `approved` is reviewer-signed-off but not yet live.
+ *   - `pending_review` is submitted-for-review; reviewer has not signed off.
+ * `draft` returns true here; `GraphQueryEngine` applies a second gate via
+ * `includeDrafts`.
+ */
+export function isRetrievable(node: ContextNode): boolean {
+  return isPublished(node) || isDraft(node);
 }
 
 /**
@@ -65,7 +133,19 @@ export function parseDocument(
     parsed.data.created_at = normalizeDateField(parsed.data.created_at);
   }
 
-  const frontmatter = parsed.data as Frontmatter;
+  // Normalize status to canonical before downstream consumers see it.
+  // Aliases (`cancelled`, `superseded`, `active`, …) and unknown values are
+  // resolved here so zod validation, predicates, retrieval filters, and
+  // index generation all operate on canonical values.
+  if (parsed.data.status !== undefined) {
+    parsed.data.status = normalizeStatus(parsed.data.status);
+  }
+
+  // Copy frontmatter so callers mutating returned node don't leak back into
+  // gray-matter's internal parse state (gray-matter caches by input string;
+  // reusing identical content across tests would otherwise share the same
+  // object).
+  const frontmatter = { ...parsed.data } as Frontmatter;
 
   return {
     id,
@@ -141,10 +221,17 @@ export function validateDocument(
 
 /**
  * Serialize a ContextNode back to file content.
- * Roundtrip-safe: parse(serialize(node)) === node
+ * Roundtrip-safe: parse(serialize(node)) === node.
+ *
+ * Status is normalized before write so disk converges to canonical values
+ * even when a caller bypasses the parser (e.g. assembles a node literal).
  */
 export function serializeDocument(node: ContextNode): string {
-  return matter.stringify(node.body, node.frontmatter);
+  const fm: Frontmatter =
+    node.frontmatter.status !== undefined
+      ? { ...node.frontmatter, status: normalizeStatus(node.frontmatter.status) }
+      : node.frontmatter;
+  return matter.stringify(node.body, fm);
 }
 
 /**
