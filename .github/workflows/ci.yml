@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: [main, development]
 
+permissions:
+  contents: read
+
 # Cancel in-progress runs for the same ref to save CI minutes
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
