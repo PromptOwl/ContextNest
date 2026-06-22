@@ -334,6 +334,22 @@ describe("Selector Lexer", () => {
     expect(tokens[0].type).toBe("TRANSPORT_FILTER");
     expect(tokens[1].type).toBe("SERVER_FILTER");
   });
+
+  it("tokenizes a URI with hyphens in the path as a single URI", () => {
+    // Regression: `-` must not split a URI path. Previously this tokenized as
+    // URI(contextnest://nodes/api) NOT WORD(design) → parse error.
+    const tokens = tokenize("contextnest://nodes/api-design");
+    expect(tokens[0].type).toBe("URI");
+    expect(tokens[0].value).toBe("contextnest://nodes/api-design");
+    expect(tokens[1].type).toBe("EOF");
+  });
+
+  it("still treats a whitespace-delimited NOT after a URI as an operator", () => {
+    const tokens = tokenize("contextnest://nodes/api-design - #legacy");
+    const types = tokens.map((t) => t.type);
+    expect(types).toEqual(["URI", "NOT", "TAG", "EOF"]);
+    expect(tokens[0].value).toBe("contextnest://nodes/api-design");
+  });
 });
 
 describe("Selector Parser", () => {
@@ -376,6 +392,14 @@ describe("Selector Parser", () => {
     expect(ast.type).toBe("and");
     if (ast.type === "and") {
       expect(ast.left.type).toBe("or");
+    }
+  });
+
+  it("parses a hyphenated URI selector", () => {
+    const ast = parseSelector("contextnest://nodes/api-design");
+    expect(ast.type).toBe("uri");
+    if (ast.type === "uri") {
+      expect(ast.value).toBe("contextnest://nodes/api-design");
     }
   });
 });

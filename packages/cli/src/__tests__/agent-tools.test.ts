@@ -13,6 +13,7 @@ describe("detectAgentTools", () => {
   let project: string;
   let bin: string;
   let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
   let savedPath: string | undefined;
 
   beforeEach(() => {
@@ -20,14 +21,18 @@ describe("detectAgentTools", () => {
     project = mkdtempSync(join(tmpdir(), "cn-proj-"));
     bin = mkdtempSync(join(tmpdir(), "cn-bin-"));
     savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
     savedPath = process.env.PATH;
     process.env.HOME = home;
+    process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
     process.env.PATH = bin; // empty bin dir → nothing on PATH
   });
 
   afterEach(() => {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
     if (savedPath === undefined) delete process.env.PATH;
     else process.env.PATH = savedPath;
     rmSync(home, { recursive: true, force: true });
@@ -78,6 +83,16 @@ describe("detectAgentTools", () => {
       recursive: true,
     });
     expect(find(detectAgentTools(project), "copilot").detected).toBe(true);
+  });
+
+  it("detects GitHub Copilot via ~/.config/github-copilot", () => {
+    mkdirSync(join(home, ".config", "github-copilot"), { recursive: true });
+    expect(find(detectAgentTools(project), "copilot").detected).toBe(true);
+  });
+
+  it("detects Gemini CLI via a ~/.gemini directory", () => {
+    mkdirSync(join(home, ".gemini"));
+    expect(find(detectAgentTools(project), "gemini").detected).toBe(true);
   });
 
   // Portable home-dotdir probes — these don't depend on macOS's /Applications,
