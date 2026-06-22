@@ -12,7 +12,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   mkdtempSync,
   writeFileSync,
@@ -24,6 +25,8 @@ import {
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const distPath = join(here, "..", "..", "dist", "index.js");
@@ -37,6 +40,22 @@ function runCtx(cwd: string, args: string[]): string {
     env: ENV,
     encoding: "utf-8",
   });
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Async CLI runner — required when the test process must stay responsive
+ * while the CLI runs (e.g. servicing an in-process mock HTTP server, which a
+ * blocking execFileSync would starve of the event loop). Returns stdout.
+ */
+async function runCtxAsync(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("node", [distPath, ...args], {
+    cwd,
+    env: ENV,
+    encoding: "utf-8",
+  });
+  return stdout;
 }
 
 /**
@@ -70,6 +89,52 @@ function initVault(cwd: string): void {
     [distPath, "init", "--name", "regression-vault", "--layout", "structured"],
     { cwd, env: ENV, stdio: "ignore" },
   );
+}
+
+/** Init a vault from a named starter recipe (scaffolds nodes + packs). */
+function initStarter(cwd: string, recipe: string): void {
+  execFileSync(
+    "node",
+    [distPath, "init", "--name", "starter-vault", "--starter", recipe],
+    { cwd, env: ENV, stdio: "ignore" },
+  );
+}
+
+interface MockServer {
+  url: string;
+  /** The most recently received POST body, parsed. */
+  lastBody: () => unknown;
+  close: () => Promise<void>;
+}
+
+/**
+ * Spin up an ephemeral HTTP server that echoes a ContextNest publish response.
+ * Lets `ctx push` exercise its full request/response path without a real
+ * hosted engine. Listens on an OS-assigned port (0) for parallel-safe isolation.
+ */
+function startMockEngine(
+  respond: (body: any) => Record<string, unknown>,
+): Promise<MockServer> {
+  return new Promise((resolve) => {
+    let captured: unknown;
+    const server: Server = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        captured = JSON.parse(raw);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(respond(captured)));
+      });
+    });
+    server.listen(0, () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        url: `http://localhost:${port}`,
+        lastBody: () => captured,
+        close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
 }
 
 let tmp: string;
@@ -455,5 +520,322 @@ describe("[regression] error handling", () => {
     ) as { version: string };
     const out = runCtx(tmp, ["--version"]).trim();
     expect(out).toBe(pkg.version);
+  });
+});
+
+// ─── selector operators ─────────────────────────────────────────────────────
+// The atomic resolve/query tests above only exercise single-term selectors.
+// These pin the composition operators (+ AND, | OR, - NOT) the query value
+// proposition depends on, which were previously untested through the CLI.
+
+describe("[regression] selector operators", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/auth", "--title", "Auth", "--tags", "security,api"]);
+    runCtx(tmp, ["add", "nodes/billing", "--title", "Billing", "--tags", "payments"]);
+  });
+
+  const ids = (json: string): string[] =>
+    JSON.parse(json).map((d: { id: string }) => d.id);
+
+  it("| (OR) returns the union of both terms", () => {
+    const matched = ids(runCtx(tmp, ["resolve", "#security | #payments", "--json"]));
+    expect(matched).toContain("nodes/auth");
+    expect(matched).toContain("nodes/billing");
+  });
+
+  it("- (NOT) excludes the negated term", () => {
+    const matched = ids(runCtx(tmp, ["resolve", "type:document - #payments", "--json"]));
+    expect(matched).toContain("nodes/auth");
+    expect(matched).not.toContain("nodes/billing");
+  });
+
+  it("+ (AND) requires both terms", () => {
+    const matched = ids(runCtx(tmp, ["resolve", "type:document + #security", "--json"]));
+    expect(matched).toEqual(["nodes/auth"]);
+  });
+});
+
+// ─── query --full mode ──────────────────────────────────────────────────────
+
+describe("[regression] ctx query --full", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/q-full", "--title", "Full Doc"]);
+  });
+
+  it("--full forces full-load mode in the result envelope", () => {
+    const parsed = JSON.parse(runCtx(tmp, ["query", "type:document", "--full", "--json"]));
+    expect(parsed.mode).toBe("full");
+    const matched = parsed.documents.map((d: { id: string }) => d.id);
+    expect(matched).toContain("nodes/q-full");
+  });
+});
+
+// ─── list --status filter ───────────────────────────────────────────────────
+
+describe("[regression] ctx list --status", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/keep", "--title", "Keep"]);
+    runCtx(tmp, ["add", "nodes/retired", "--title", "Retired"]);
+    runCtx(tmp, ["update", "nodes/retired", "--status", "rejected"]);
+  });
+
+  const ids = (json: string): string[] =>
+    JSON.parse(json).map((d: { id: string }) => d.id);
+
+  it("hides rejected documents by default", () => {
+    const matched = ids(runCtx(tmp, ["list", "--json"]));
+    expect(matched).toContain("nodes/keep");
+    expect(matched).not.toContain("nodes/retired");
+  });
+
+  it("--status rejected surfaces only the retired document", () => {
+    const matched = ids(runCtx(tmp, ["list", "--status", "rejected", "--json"]));
+    expect(matched).toContain("nodes/retired");
+    expect(matched).not.toContain("nodes/keep");
+  });
+});
+
+// ─── validate --json (valid path) ───────────────────────────────────────────
+
+describe("[regression] ctx validate --json (valid)", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/ok", "--title", "OK"]);
+  });
+
+  it("reports valid:true with no errors for a clean vault", () => {
+    const res = runCtxResult(tmp, ["validate", "--json"]);
+    expect(res.status).toBe(0);
+    const parsed = JSON.parse(res.stdout);
+    expect(parsed.valid).toBe(true);
+    expect(parsed.errors).toEqual([]);
+  });
+});
+
+// ─── pack operations ────────────────────────────────────────────────────────
+// Packs are scaffolded by starter recipes, so this also covers that a starter
+// init actually produces nodes + packs (previously only --list-starters was
+// asserted).
+
+describe("[regression] ctx pack", () => {
+  beforeEach(() => initStarter(tmp, "developer"));
+
+  it("init --starter scaffolds documents and at least one pack", () => {
+    const docs = JSON.parse(runCtx(tmp, ["list", "--json"]));
+    expect(docs.length).toBeGreaterThan(0);
+    const packs = JSON.parse(runCtx(tmp, ["pack", "list", "--json"]));
+    expect(packs.length).toBeGreaterThanOrEqual(1);
+    expect(packs[0].id).toBeTruthy();
+    expect(packs[0].label).toBeTruthy();
+  });
+
+  it("show renders a known pack's details", () => {
+    const packs = JSON.parse(runCtx(tmp, ["pack", "list", "--json"]));
+    const out = runCtx(tmp, ["pack", "show", packs[0].id]);
+    expect(out).toContain(packs[0].label);
+  });
+
+  it("show exits non-zero for an unknown pack", () => {
+    const res = runCtxResult(tmp, ["pack", "show", "no.such.pack"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout + res.stderr).toMatch(/not found/);
+  });
+});
+
+// ─── html rendering ─────────────────────────────────────────────────────────
+
+describe("[regression] html rendering", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/page", "--title", "Page", "--body", "Hello world"]);
+  });
+
+  it("read --html --out writes a standalone HTML file", () => {
+    const out = join(tmp, "page.html");
+    const res = runCtx(tmp, ["read", "nodes/page", "--html", "--out", out]);
+    expect(res).toMatch(/Written to/);
+    expect(existsSync(out)).toBe(true);
+    const html = readFileSync(out, "utf-8");
+    expect(html).toMatch(/<!DOCTYPE html>/);
+    expect(html).toContain("Page");
+  });
+
+  it("welcome --no-open regenerates .context/welcome.html without opening a browser", () => {
+    const res = runCtx(tmp, ["welcome", "--no-open"]);
+    expect(res).toMatch(/Generated welcome page/);
+    expect(existsSync(join(tmp, ".context", "welcome.html"))).toBe(true);
+  });
+});
+
+// ─── push ───────────────────────────────────────────────────────────────────
+// Exercises the full publish request against an ephemeral mock engine — the
+// command was previously untested anywhere.
+
+describe("[regression] ctx push", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/pushable", "--title", "Pushable", "--tags", "engineering"]);
+  });
+
+  it("posts published documents and reports the server's count", async () => {
+    const server = await startMockEngine((body) => ({
+      published: body.documents.length,
+      context_md_updated: Boolean(body.context_md),
+      node_ids: body.documents.map((_: unknown, i: number) => `node-${i}`),
+    }));
+    try {
+      const out = await runCtxAsync(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+      ]);
+      expect(out).toMatch(/Pushed 1 document/);
+
+      const body = server.lastBody() as { documents: Array<{ title: string; tags: string[] }> };
+      expect(body.documents).toHaveLength(1);
+      expect(body.documents[0].title).toBe("Pushable");
+      expect(body.documents[0].tags).toContain("#engineering");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("exits non-zero when a required connection option is missing", () => {
+    const res = runCtxResult(tmp, ["push", "--nest", "n", "--key", "k"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/--server/);
+  });
+
+  it("reports a clean no-op when there is nothing to push", () => {
+    // A fresh vault with the seed config doc only — no published nodes — and
+    // drafts excluded by default should short-circuit before any network call.
+    const empty = mkdtempSync(join(tmpdir(), "cn-push-empty-"));
+    try {
+      initVault(empty);
+      const res = runCtxResult(empty, [
+        "push",
+        "--server", "http://127.0.0.1:1",
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/No documents to push/);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── end-to-end flows ───────────────────────────────────────────────────────
+// Unlike the atomic command tests above, each test here runs a complete
+// user journey on a SINGLE document and asserts state at every step — the
+// flow-level coverage the suite previously lacked.
+
+describe("[regression] flows", () => {
+  beforeEach(() => initVault(tmp));
+
+  it("full document lifecycle: add → read → update → history → reconstruct → delete", () => {
+    // add (auto-publishes the seeded doc to v2)
+    const added = runCtx(tmp, ["add", "nodes/lc", "--title", "Lifecycle", "--body", "first body"]);
+    expect(added).toMatch(/Version: 2/);
+
+    // read shows the current body
+    expect(runCtx(tmp, ["read", "nodes/lc"])).toContain("first body");
+
+    // a content edit auto-publishes a new version
+    const updated = runCtx(tmp, ["update", "nodes/lc", "--body", "second body"]);
+    expect(updated).toMatch(/Version: 3/);
+
+    // history records both published versions with chain hashes
+    const history = JSON.parse(runCtx(tmp, ["history", "nodes/lc", "--json"]));
+    const versions = history.versions.map((v: { version: number }) => v.version);
+    expect(versions).toEqual(expect.arrayContaining([2, 3]));
+
+    // each version reconstructs to the body it was published with
+    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "2"])).toContain("first body");
+    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "3"])).toContain("second body");
+
+    // delete removes the doc and its version history; reads then fail
+    runCtx(tmp, ["delete", "nodes/lc"]);
+    expect(existsSync(join(tmp, "nodes", "lc.md"))).toBe(false);
+    expect(existsSync(join(tmp, "nodes", ".versions", "lc"))).toBe(false);
+    expect(runCtxResult(tmp, ["read", "nodes/lc"]).status).not.toBe(0);
+  });
+
+  it("deprecation hygiene: retiring a doc hides it from listings and queries but keeps it auditable", () => {
+    runCtx(tmp, ["add", "nodes/soap", "--title", "SOAP Bridge", "--tags", "engineering,legacy", "--body", "deprecated"]);
+    runCtx(tmp, ["add", "nodes/rest", "--title", "REST API", "--tags", "engineering"]);
+
+    // retire the legacy doc (status change is metadata-only)
+    runCtx(tmp, ["update", "nodes/soap", "--status", "rejected"]);
+
+    const listed = JSON.parse(runCtx(tmp, ["list", "--json"])).map((d: { id: string }) => d.id);
+    expect(listed).toContain("nodes/rest");
+    expect(listed).not.toContain("nodes/soap");
+
+    // it remains auditable via an explicit status filter
+    const retired = JSON.parse(runCtx(tmp, ["list", "--status", "rejected", "--json"])).map((d: { id: string }) => d.id);
+    expect(retired).toContain("nodes/soap");
+
+    // an agent query for the live engineering docs excludes the retired one
+    const queried = JSON.parse(runCtx(tmp, ["resolve", "#engineering", "--json"])).map((d: { id: string }) => d.id);
+    expect(queried).toContain("nodes/rest");
+    expect(queried).not.toContain("nodes/soap");
+
+    // and the hash chain is still intact
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+  });
+
+  it("drift governance (approve): out-of-band edit → scan → stage → list → approve → clean", () => {
+    runCtx(tmp, ["add", "nodes/policy", "--title", "Policy", "--body", "original"]);
+
+    // simulate an out-of-band edit by mutating the file bytes directly
+    appendFileSync(join(tmp, "nodes", "policy.md"), "\n\nout-of-band edit\n");
+
+    // scan detects the drift and exits non-zero
+    const scan = runCtxResult(tmp, ["drift", "scan", "--json"]);
+    expect(scan.status).toBe(1);
+    expect(JSON.parse(scan.stdout).drifted).toHaveLength(1);
+
+    // stage it as a reviewable suggestion
+    const staged = JSON.parse(runCtx(tmp, ["drift", "stage", "nodes/policy", "--json"]));
+    const sid: string = staged.suggestion_id;
+    expect(sid).toBeTruthy();
+
+    // it shows up as a pending suggestion
+    expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy", "--json"])).count).toBe(1);
+
+    // approving merges the edit and bumps the version
+    const approved = JSON.parse(runCtx(tmp, ["drift", "approve", "nodes/policy", sid, "--json"]));
+    expect(approved.versionEntry.version).toBe(3);
+
+    // the suggestion is archived and the vault is clean again
+    expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy", "--json"])).count).toBe(0);
+    const rescan = runCtxResult(tmp, ["drift", "scan"]);
+    expect(rescan.status).toBe(0);
+    expect(rescan.stdout).toMatch(/No drift detected/);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+  });
+
+  it("drift governance (reject): a rejected suggestion is archived without bumping the version", () => {
+    runCtx(tmp, ["add", "nodes/policy2", "--title", "Policy Two", "--body", "original"]);
+    appendFileSync(join(tmp, "nodes", "policy2.md"), "\n\nunauthorized edit\n");
+
+    const staged = JSON.parse(runCtx(tmp, ["drift", "stage", "nodes/policy2", "--json"]));
+    const sid: string = staged.suggestion_id;
+
+    runCtx(tmp, ["drift", "reject", "nodes/policy2", sid, "--reason", "not approved", "--json"]);
+
+    // no longer staged…
+    expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy2", "--json"])).count).toBe(0);
+
+    // …and the canonical version was NOT advanced (rejection doesn't merge)
+    const versions = JSON.parse(runCtx(tmp, ["history", "nodes/policy2", "--json"]))
+      .versions.map((v: { version: number }) => v.version);
+    expect(versions).not.toContain(3);
   });
 });
