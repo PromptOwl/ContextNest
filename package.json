@@ -5,6 +5,7 @@
     "build": "pnpm -r build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:regression": "pnpm --filter \"...@promptowl/contextnest-mcp-server\" build && vitest run --config vitest.regression.config.ts",
     "lint": "pnpm -r lint",
     "clean": "pnpm -r clean",
     "prepublish": "pnpm -r build",

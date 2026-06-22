@@ -83,8 +83,12 @@ export function tokenize(input: string): Token[] {
     if (input.slice(pos).startsWith("contextnest://")) {
       const uriStart = pos;
       pos += "contextnest://".length;
-      // Read until whitespace or operator or paren
-      while (pos < input.length && !/[\s+|\-()]/.test(input[pos])) pos++;
+      // Read until whitespace, a binary/group operator, or paren. Note `-` is
+      // NOT a delimiter here: hyphens are valid URI path characters (e.g.
+      // `contextnest://nodes/api-design`), mirroring tag tokenization which
+      // also consumes `-`. The NOT operator is whitespace-delimited in practice
+      // (`uri - #tag`), so it still tokenizes correctly after the URI ends.
+      while (pos < input.length && !/[\s+|()]/.test(input[pos])) pos++;
       tokens.push({ type: "URI", value: input.slice(uriStart, pos), position: uriStart });
       continue;
     }
