@@ -48,5 +48,5 @@ jobs:
       - name: Test
         run: pnpm test
 
-      - name: Regression tests (MCP server)
+      - name: Regression tests (CLI + MCP server)
         run: pnpm test:regression
