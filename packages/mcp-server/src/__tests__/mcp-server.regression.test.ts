@@ -582,4 +582,107 @@ describe("[regression] MCP server e2e — governance & drift", () => {
     const archived = await readdir(archiveDir);
     expect(archived.length).toBeGreaterThan(0);
   });
+
+  it("end-to-end drift flow: create → drift → stage → approve → clean & verified", async () => {
+    // One continuous governance journey on a single doc, asserting state at
+    // each hop (the per-tool tests above each cover a single step in isolation).
+    await seedDrift("nodes/drift-flow");
+
+    const staged = await callJson(client, "stage_drift_suggestion", { path: "nodes/drift-flow" });
+    expect(staged.isError).toBe(false);
+
+    // The suggestion is pending.
+    const pending = await callJson(client, "list_suggestions", { path: "nodes/drift-flow" });
+    expect(pending.json.count).toBe(1);
+
+    // Approve merges the drift and bumps the version.
+    const before = (await storage.readHistory("nodes/drift-flow"))?.versions.length ?? 0;
+    await callJson(client, "approve_suggestion", {
+      path: "nodes/drift-flow",
+      suggestion_id: staged.json.suggestion_id,
+    });
+    const after = (await storage.readHistory("nodes/drift-flow"))?.versions.length ?? 0;
+    expect(after).toBe(before + 1);
+
+    // The drift was merged into the canonical bytes and no suggestions remain.
+    // (verify_integrity is vault-wide and intentionally left dirty by the
+    // reject test's leftover drift, so we assert doc-scoped state here.)
+    const canonical = await readFile(join(vault, "nodes", "drift-flow.md"), "utf-8");
+    expect(canonical).toContain("Drifted content appended out of band.");
+    const cleared = await callJson(client, "list_suggestions", { path: "nodes/drift-flow" });
+    expect(cleared.json.count).toBe(0);
+  });
+});
+
+// ─── integrity failure path ────────────────────────────────────────────────
+// The verify_integrity test above only proves the happy path. This corrupts a
+// document on disk and asserts the server reports valid:false — the
+// tamper-detection guarantee the whole hash-chain design exists for. Runs in
+// its own vault so the corruption can't leak into other suites.
+
+describe("[regression] MCP server e2e — integrity failure", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("verify_integrity reports valid:false when a document is tampered out of band", async () => {
+    await callJson(client, "create_document", { path: "nodes/sealed", title: "Sealed", body: "trusted bytes" });
+
+    // Sanity: clean vault verifies.
+    const clean = await callJson(client, "verify_integrity");
+    expect(clean.json.valid).toBe(true);
+
+    // Tamper the canonical bytes so they no longer match the recorded checksum.
+    const file = join(vault, "nodes", "sealed.md");
+    await writeFile(file, (await readFile(file, "utf-8")) + "\ntampered out of band\n", "utf-8");
+
+    const tampered = await callJson(client, "verify_integrity");
+    expect(tampered.json.valid).toBe(false);
+  });
+});
+
+// ─── selector operators ──────────────────────────────────────────────────────
+// resolve over the shared fixture is contaminated by graph traversal (the
+// fixture docs are interlinked, so backlinks reappear in `documents`). To pin
+// the OR (|) / NOT (-) operator semantics cleanly, seed a fresh vault with two
+// UNLINKED published docs — traversal then adds nothing.
+
+describe("[regression] MCP server e2e — selector operators", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+    await callJson(client, "create_document", { path: "nodes/op-auth", title: "Auth", tags: ["security", "api"] });
+    await callJson(client, "create_document", { path: "nodes/op-billing", title: "Billing", tags: ["payments"] });
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("| (OR) returns the union of both terms", async () => {
+    const { json } = await callJson(client, "resolve", { selector: "#security | #payments" });
+    const ids = json.documents.map((d: any) => d.id);
+    expect(ids).toContain("nodes/op-auth");
+    expect(ids).toContain("nodes/op-billing");
+  });
+
+  it("- (NOT) excludes the negated term", async () => {
+    const { json } = await callJson(client, "resolve", { selector: "#security - #payments" });
+    const ids = json.documents.map((d: any) => d.id);
+    expect(ids).toContain("nodes/op-auth");
+    expect(ids).not.toContain("nodes/op-billing");
+  });
 });

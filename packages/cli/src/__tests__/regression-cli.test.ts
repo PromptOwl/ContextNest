@@ -839,3 +839,43 @@ describe("[regression] flows", () => {
     expect(versions).not.toContain(3);
   });
 });
+
+// ─── add / update edge cases ────────────────────────────────────────────────
+// Parity with the MCP create_document / update_document edge-case coverage:
+// duplicate guard, rejected-doc edit guard, unknown-status fallback, and
+// status-alias normalization on disk.
+
+describe("[regression] add/update edge cases", () => {
+  beforeEach(() => initVault(tmp));
+
+  it("add over an existing path fails instead of silently succeeding", () => {
+    runCtx(tmp, ["add", "nodes/dup", "--title", "Original"]);
+    const res = runCtxResult(tmp, ["add", "nodes/dup", "--title", "Replacement"]);
+    expect(res.status).not.toBe(0);
+    // NOTE — divergence from MCP create_document: the CLI rewrites the file
+    // template before the publish-time guard fires, so the original bytes are
+    // NOT preserved. We assert only the non-zero exit, to lock the contract
+    // without cementing that side-effect wart.
+  });
+
+  it("update refuses to publish a content edit on a rejected document", () => {
+    runCtx(tmp, ["add", "nodes/rej", "--title", "Rejected", "--body", "original"]);
+    runCtx(tmp, ["update", "nodes/rej", "--status", "rejected"]);
+
+    const res = runCtxResult(tmp, ["update", "nodes/rej", "--body", "sneaky edit"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/rejected/i);
+  });
+
+  it("update falls back to draft for an unknown status", () => {
+    runCtx(tmp, ["add", "nodes/unk", "--title", "Unknown"]);
+    runCtx(tmp, ["update", "nodes/unk", "--status", "not-a-real-status"]);
+    expect(readFileSync(join(tmp, "nodes", "unk.md"), "utf-8")).toMatch(/status:\s*draft/);
+  });
+
+  it("update normalizes a status alias on disk (active → published)", () => {
+    runCtx(tmp, ["add", "nodes/alias", "--title", "Aliased"]);
+    runCtx(tmp, ["update", "nodes/alias", "--status", "active"]);
+    expect(readFileSync(join(tmp, "nodes", "alias.md"), "utf-8")).toMatch(/status:\s*published/);
+  });
+});
