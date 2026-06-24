@@ -896,7 +896,19 @@ describe("[regression] add/update edge cases", () => {
 
     const res = runCtxResult(tmp, ["update", "nodes/rej", "--body", "sneaky edit"]);
     expect(res.status).not.toBe(0);
-    expect(res.stderr).toMatch(/rejected/i);
+    expect(res.stderr).toMatch(/Error \[REJECTED_DOCUMENT\]/);
+    // No raw stack trace leaks to end users.
+    expect(res.stderr).not.toMatch(/^\s+at\s/m);
+  });
+
+  it("publish on a rejected document fails with a friendly error, no stack trace", () => {
+    runCtx(tmp, ["add", "nodes/rej2", "--title", "Rejected Two", "--body", "x"]);
+    runCtx(tmp, ["update", "nodes/rej2", "--status", "rejected"]);
+
+    const res = runCtxResult(tmp, ["publish", "nodes/rej2"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/Error \[REJECTED_DOCUMENT\]/);
+    expect(res.stderr).not.toMatch(/^\s+at\s/m);
   });
 
   it("update falls back to draft for an unknown status", () => {
