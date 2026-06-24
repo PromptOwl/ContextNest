@@ -604,6 +604,39 @@ describe("[regression] ctx query --full", () => {
   });
 });
 
+// ─── query --include-drafts ─────────────────────────────────────────────────
+
+describe("[regression] ctx query --include-drafts", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    // Published baseline.
+    runCtx(tmp, ["add", "nodes/q-pub", "--title", "Published Doc"]);
+    // Plant a raw draft on disk — bypasses the auto-publish that `ctx add` does.
+    writeFileSync(
+      join(tmp, "nodes", "q-draft.md"),
+      `---\ntitle: "Draft Doc"\nstatus: draft\n---\n\nbody\n`,
+      "utf-8",
+    );
+    runCtx(tmp, ["index"]);
+  });
+
+  it("hides drafts by default", () => {
+    const parsed = JSON.parse(runCtx(tmp, ["query", "type:document", "--json"]));
+    const ids = parsed.documents.map((d: { id: string }) => d.id);
+    expect(ids).toContain("nodes/q-pub");
+    expect(ids).not.toContain("nodes/q-draft");
+  });
+
+  it("--include-drafts surfaces draft documents alongside published", () => {
+    const parsed = JSON.parse(
+      runCtx(tmp, ["query", "type:document", "--include-drafts", "--json"]),
+    );
+    const ids = parsed.documents.map((d: { id: string }) => d.id);
+    expect(ids).toContain("nodes/q-pub");
+    expect(ids).toContain("nodes/q-draft");
+  });
+});
+
 // ─── list --status filter ───────────────────────────────────────────────────
 
 describe("[regression] ctx list --status", () => {

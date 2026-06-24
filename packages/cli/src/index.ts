@@ -1104,6 +1104,7 @@ program
   .option("--json", "Output as JSON")
   .option("--hops <n>", "Graph traversal depth (default: 2)", parseInt)
   .option("--full", "Force full-load mode (load all documents)")
+  .option("--include-drafts", "Include draft documents (default: published only)", false)
   .action(async (selector, opts) => {
     // Cloud pack: @org/pack-name routes to PromptOwl API
     if (selector.startsWith("@")) {
@@ -1117,6 +1118,7 @@ program
     const result = await engine.query(selector, {
       hops: opts.hops ?? 2,
       full: opts.full ?? false,
+      includeDrafts: opts.includeDrafts ?? false,
     });
 
     if (opts.json) {
