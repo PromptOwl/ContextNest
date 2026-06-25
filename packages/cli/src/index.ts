@@ -23,6 +23,7 @@ import {
   ContextInjector,
   GraphQueryEngine,
   publishDocument,
+  ContextNestError,
   generateContextYaml,
   generateIndexMd,
   generateAgentConfigs,
@@ -1749,4 +1750,12 @@ drift
   });
 
 // Parse and run
-program.parse();
+program.parseAsync().catch((err: unknown) => {
+  // Engine validation errors render as concise one-liners instead of leaking
+  // stack traces. Unknown errors still throw so genuine bugs stay debuggable.
+  if (err instanceof ContextNestError) {
+    console.error(chalk.red(`Error [${err.code}]: ${err.message}`));
+    process.exit(1);
+  }
+  throw err;
+});
