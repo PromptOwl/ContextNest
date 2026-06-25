@@ -292,7 +292,22 @@ export class NestStorage {
     const errors: VerificationReport["errors"] = [];
 
     for (const [docId, history] of allHistories) {
-      const report = verifyDocumentChain(docId, history, (_v) => null);
+      // Pre-load keyframe bytes so the (synchronous) verifyDocumentChain
+      // callback can re-hash them. Without this the keyframe content check is
+      // skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
+      // left intact — goes undetected. Keyframe files are small; the reads are
+      // cheap, and the chain check below still works when one is missing.
+      const keyframeContent = new Map<number, string>();
+      for (const entry of history.versions) {
+        if (!entry.keyframe) continue;
+        const content = await this.readKeyframe(docId, entry.version);
+        if (content !== null) keyframeContent.set(entry.version, content);
+      }
+      const report = verifyDocumentChain(
+        docId,
+        history,
+        (version) => keyframeContent.get(version) ?? null,
+      );
       if (!report.valid) errors.push(...report.errors);
     }
 
