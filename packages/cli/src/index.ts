@@ -43,7 +43,9 @@ import {
   removeVault,
   setDefaultVault,
   listVaults,
+  readRegistry,
   getRegistryPath,
+  ALIAS_PATTERN,
   normalizeStatus,
 } from "@promptowl/contextnest-engine";
 import type {
@@ -82,10 +84,14 @@ program.hook("preAction", (_thisCommand, actionCommand) => {
 // precedence: --vault flag > CONTEXTNEST_VAULT (alias) > CONTEXTNEST_VAULT_PATH
 // (path) > local vault (walk up cwd) > registry default > cwd.
 function getVaultRoot(): string {
-  return resolveVaultPath({
+  const resolved = resolveVaultPath({
     vaultAlias: selectedVaultAlias,
     cwd: process.cwd(),
-  }).path;
+  });
+  if (resolved.warning) {
+    console.error(chalk.yellow(`Warning: ${resolved.warning}`));
+  }
+  return resolved.path;
 }
 
 // Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
@@ -363,10 +369,8 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
 
 // ─── Vault registration prompts (ctx init) ──────────────────────────────────────
 
-// Alias keys must match the engine's ALIAS_PATTERN: letters, digits, hyphens,
-// underscores. Kept in sync here so the interactive prompt can validate before
-// handing off to addVault() (which is the source of truth and re-validates).
-const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+// ALIAS_PATTERN is imported from the engine (single source of truth) so the
+// interactive prompt validates the same way addVault() does.
 
 // Derive a sensible default alias from a directory name, sanitized to the
 // allowed alias characters.
@@ -385,7 +389,11 @@ function slugifyAlias(name: string): string {
 function defaultAliasFor(root: string): string {
   const resolvedRoot = pathMod.resolve(root);
   const base = slugifyAlias(pathMod.basename(resolvedRoot));
-  const taken = new Map(listVaults().map((v) => [v.alias, pathMod.resolve(v.path)]));
+  // readRegistry() gives the alias → path map with a single YAML parse; listVaults()
+  // would additionally stat + read each vault's config (unneeded here).
+  const taken = new Map(
+    Object.entries(readRegistry().vaults).map(([alias, e]) => [alias, pathMod.resolve(e.path)]),
+  );
   const free = (alias: string) => !taken.has(alias) || taken.get(alias) === resolvedRoot;
   if (free(base)) return base;
   let n = 2;
@@ -1946,7 +1954,7 @@ vaultCmd
   .description("Unregister a vault alias")
   .action((alias: string) => {
     try {
-      const wasDefault = listVaults().find((v) => v.alias === alias)?.isDefault ?? false;
+      const wasDefault = readRegistry().default === alias;
       const reg = removeVault(alias);
       console.log(chalk.yellow(`Removed vault alias "${alias}"`));
       if (wasDefault && !reg.default) {

@@ -58,6 +58,7 @@ export {
   IntegrityError,
   FederationNotSupportedError,
   ConfigError,
+  UnknownAliasError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,
@@ -172,6 +173,7 @@ export type { SyntaxConfig } from "./config.js";
 
 // Vault registry (central alias → path mapping)
 export {
+  ALIAS_PATTERN,
   getRegistryDir,
   getRegistryPath,
   readRegistry,

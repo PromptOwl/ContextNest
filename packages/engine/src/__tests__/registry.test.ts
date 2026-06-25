@@ -85,6 +85,22 @@ describe("vault registry", () => {
     expect(readRegistry().vaults.dup.path).toBe(b);
   });
 
+  it("a --force overwrite does not grab the default when none is set", () => {
+    const a = makeVault(join(tmp, "a"));
+    const b = makeVault(join(tmp, "b"));
+    addVault("one", a); // first → default
+    addVault("two", b); // default stays "one"
+    removeVault("one"); // default cleared
+    expect(readRegistry().default).toBeUndefined();
+
+    addVault("two", b, { force: true }); // overwrite existing → must NOT promote
+    expect(readRegistry().default).toBeUndefined();
+
+    const c = makeVault(join(tmp, "c"));
+    addVault("three", c); // brand-new with no default → does promote
+    expect(readRegistry().default).toBe("three");
+  });
+
   it("removes a vault and clears the default when it pointed there", () => {
     const a = makeVault(join(tmp, "a"));
     addVault("a", a);
@@ -163,6 +179,17 @@ describe("vault registry", () => {
 
     it("throws on an unknown alias", () => {
       expect(() => resolveVaultPath({ vaultAlias: "ghost" })).toThrow(/Unknown vault alias/);
+    });
+
+    it("ignores a stale/unknown CONTEXTNEST_VAULT (warns, does not throw)", () => {
+      // An explicit --vault throws, but the persistent env var must not lock the
+      // user out: it falls through (here to the registry default) with a warning.
+      process.env.CONTEXTNEST_VAULT = "ghost";
+      const outside = join(tmp, "out-env");
+      mkdirSync(outside, { recursive: true });
+      const r = resolveVaultPath({ cwd: outside });
+      expect(r).toMatchObject({ path: beta, source: "default", alias: "beta" });
+      expect(r.warning).toMatch(/CONTEXTNEST_VAULT/);
     });
 
     it("throws when a registered alias no longer points to a vault", () => {

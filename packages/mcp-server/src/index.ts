@@ -27,6 +27,7 @@ import {
   approveSuggestion,
   rejectSuggestion,
   resolveVaultPath,
+  UnknownAliasError,
   isRejected,
   normalizeStatus,
   STATUS_ALIASES,
@@ -45,27 +46,36 @@ import type {
  *      with `contextnest-mcp /path/to/vault`)
  *   3. local vault (walk up cwd) → registry default → cwd
  */
+// Surface a non-fatal resolution advisory (e.g. a stale CONTEXTNEST_VAULT that
+// was ignored) on stderr, then return the chosen path.
+function withWarning(resolved: { path: string; warning?: string }): string {
+  if (resolved.warning) {
+    process.stderr.write(`contextnest-mcp: ${resolved.warning}\n`);
+  }
+  return resolved.path;
+}
+
 function resolveMcpVaultPath(): string {
   if (process.env.CONTEXTNEST_VAULT || process.env.CONTEXTNEST_VAULT_PATH) {
-    return resolveVaultPath().path;
+    return withWarning(resolveVaultPath());
   }
   const arg = process.argv[2];
   if (arg) {
     // A registered alias resolves via the registry; anything else is a raw path.
     // Resolve in one shot (no separate probe → no TOCTOU window). Only an
-    // "unknown alias" means arg isn't registered → treat it as a raw path. A
-    // registered-but-stale alias (vault dir gone) must surface as a real error
-    // rather than being silently used as a bogus path.
+    // unregistered alias (UnknownAliasError) means arg isn't an alias → treat it
+    // as a raw path. A registered-but-stale alias (vault dir gone) must surface
+    // as a real error rather than being silently used as a bogus path.
     try {
-      return resolveVaultPath({ vaultAlias: arg }).path;
+      return withWarning(resolveVaultPath({ vaultAlias: arg }));
     } catch (err) {
-      if (/Unknown vault alias/.test((err as Error).message)) {
+      if (err instanceof UnknownAliasError) {
         return arg;
       }
       throw err;
     }
   }
-  return resolveVaultPath().path;
+  return withWarning(resolveVaultPath());
 }
 
 // Resolve at module load. A bad CONTEXTNEST_VAULT alias makes resolveVaultPath

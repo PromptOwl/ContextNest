@@ -28,15 +28,16 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
-import { ConfigError } from "./errors.js";
+import { ConfigError, UnknownAliasError } from "./errors.js";
 import type { VaultRegistry, VaultRegistryEntry } from "./types.js";
 
 /**
  * Allowed characters for a vault alias. Restricted to letters, digits, hyphens
  * and underscores so an alias is always safe to type after `--vault` and to use
- * as a YAML key without quoting.
+ * as a YAML key without quoting. Exported so the CLI's interactive prompt can
+ * validate against the single source of truth.
  */
-const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 const vaultRegistryEntrySchema = z.object({
   path: z.string().min(1),
@@ -98,10 +99,14 @@ export function writeRegistry(registry: VaultRegistry): void {
   writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
   try {
     renameSync(tmp, target);
-  } catch {
+  } catch (renameErr) {
     // On Windows, rename over an existing file can throw EPERM if the target is
-    // briefly locked (antivirus, a concurrent reader). Fall back to a copy, then
-    // best-effort remove the temp file.
+    // briefly locked (antivirus, a concurrent reader). Fall back to a copy there.
+    // On Unix a rename within one dir shouldn't fail for that reason, so surface
+    // the original error rather than masking it with a copy attempt.
+    if (process.platform !== "win32" && (renameErr as NodeJS.ErrnoException).code !== "EPERM") {
+      throw renameErr;
+    }
     try {
       copyFileSync(tmp, target);
       try {
@@ -165,7 +170,8 @@ export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions
     );
   }
   const registry = readRegistry();
-  if (registry.vaults[alias] && !opts.force) {
+  const isNew = !registry.vaults[alias];
+  if (!isNew && !opts.force) {
     throw new ConfigError(
       `Vault alias "${alias}" already exists (-> ${registry.vaults[alias].path}). Use --force to overwrite.`,
     );
@@ -173,7 +179,9 @@ export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions
   const entry: VaultRegistryEntry = { path: vaultPath };
   if (opts.description) entry.description = opts.description;
   registry.vaults[alias] = entry;
-  if (opts.setDefault || !registry.default) {
+  // Auto-promote to default only for a brand-new first entry. A --force update
+  // of an existing alias must not silently grab the default when it's unset.
+  if (opts.setDefault || (isNew && !registry.default)) {
     registry.default = alias;
   }
   writeRegistry(registry);
@@ -246,7 +254,7 @@ function resolveAliasOrThrow(alias: string, registry: VaultRegistry = readRegist
   if (!entry) {
     const known = Object.keys(registry.vaults);
     const hint = known.length ? ` Known aliases: ${known.join(", ")}.` : " No vaults registered yet — add one with `ctx vault add`.";
-    throw new ConfigError(`Unknown vault alias "${alias}".${hint}`);
+    throw new UnknownAliasError(alias, `Unknown vault alias "${alias}".${hint}`);
   }
   if (!isVaultRoot(entry.path)) {
     throw new ConfigError(
@@ -276,6 +284,12 @@ export interface ResolvedVault {
   source: VaultResolutionSource;
   /** The alias used, when resolution went through the registry. */
   alias?: string;
+  /**
+   * Non-fatal advisory (e.g. a stale CONTEXTNEST_VAULT that was ignored). The
+   * CLI/MCP surface this on stderr so the user understands why a fallback path
+   * was chosen instead of silently operating on the wrong vault.
+   */
+  warning?: string;
 }
 
 /**
@@ -285,38 +299,46 @@ export interface ResolvedVault {
 export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault {
   const cwd = opts.cwd ?? process.cwd();
 
-  // 1. explicit --vault flag
+  // 1. explicit --vault flag — per-command and explicit, so a bad alias throws.
   if (opts.vaultAlias) {
     return { path: resolveAliasOrThrow(opts.vaultAlias), source: "flag", alias: opts.vaultAlias };
   }
 
-  // 2. CONTEXTNEST_VAULT env (alias)
+  // 2. CONTEXTNEST_VAULT env (alias). Unlike the flag, this is a persistent
+  // set-and-forget setting, so a stale/unknown alias must NOT lock the user out
+  // of every command — use it when valid, otherwise warn and fall through (same
+  // resilience as the registry default in step 5).
+  let warning: string | undefined;
   const envAlias = process.env.CONTEXTNEST_VAULT;
   if (envAlias) {
-    return { path: resolveAliasOrThrow(envAlias), source: "env-alias", alias: envAlias };
+    const entry = readRegistry().vaults[envAlias];
+    if (entry && isVaultRoot(entry.path)) {
+      return { path: entry.path, source: "env-alias", alias: envAlias };
+    }
+    warning = entry
+      ? `CONTEXTNEST_VAULT="${envAlias}" points to "${entry.path}", which is no longer a vault — ignoring it.`
+      : `CONTEXTNEST_VAULT="${envAlias}" is not a registered vault alias — ignoring it.`;
   }
 
   // 3. CONTEXTNEST_VAULT_PATH env (absolute path) — backward compat
   if (process.env.CONTEXTNEST_VAULT_PATH) {
-    return { path: process.env.CONTEXTNEST_VAULT_PATH, source: "env-path" };
+    return { path: process.env.CONTEXTNEST_VAULT_PATH, source: "env-path", warning };
   }
 
   // 4. local vault from cwd walk-up — backward compat
   const local = findLocalVault(cwd);
   if (local) {
-    return { path: local, source: "local" };
+    return { path: local, source: "local", warning };
   }
 
-  // 5. registry default alias. This is an implicit fallback, not an explicit
-  // user request, so a stale default (vault deleted/moved) must NOT throw —
-  // that would lock the user out of every command. Fall through to cwd instead.
-  // (Explicit --vault / CONTEXTNEST_VAULT above still throw on a bad alias.)
+  // 5. registry default alias. Also an implicit fallback, so a stale default
+  // (vault deleted/moved) must NOT throw — fall through to cwd instead.
   const registry = readRegistry();
   const defaultEntry = registry.default ? registry.vaults[registry.default] : undefined;
   if (defaultEntry && isVaultRoot(defaultEntry.path)) {
-    return { path: defaultEntry.path, source: "default", alias: registry.default };
+    return { path: defaultEntry.path, source: "default", alias: registry.default, warning };
   }
 
   // 6. cwd fallback
-  return { path: cwd, source: "cwd" };
+  return { path: cwd, source: "cwd", warning };
 }
