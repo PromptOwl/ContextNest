@@ -956,3 +956,26 @@ describe("[regression] add/update edge cases", () => {
     expect(readFileSync(join(tmp, "nodes", "alias.md"), "utf-8")).toMatch(/status:\s*published/);
   });
 });
+
+// ─── keyframe tamper detection (cross-surface contract) ──────────────────────
+// Mirrors the engine verifyVaultIntegrity and MCP verify_integrity keyframe
+// tests. `ctx verify` has always caught this (it re-hashes keyframes); these
+// three suites now encode the same guarantee on every surface.
+
+describe("[regression] integrity — keyframe tamper", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/archived", "--title", "Archived", "--body", "trusted history"]);
+  });
+
+  it("ctx verify reports content_hash_mismatch when a version keyframe is tampered", () => {
+    // Canonical .md and history.yaml are untouched — only a keyframe re-hash
+    // can surface this corruption.
+    appendFileSync(join(tmp, "nodes", ".versions", "archived", "v2.md"), "\nrewritten history\n");
+    const res = runCtxResult(tmp, ["verify", "--json"]);
+    expect(res.status).toBe(1);
+    const parsed = JSON.parse(res.stdout);
+    expect(parsed.valid).toBe(false);
+    expect(parsed.errors.map((e: { type: string }) => e.type)).toContain("content_hash_mismatch");
+  });
+});
