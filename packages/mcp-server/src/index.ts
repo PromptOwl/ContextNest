@@ -52,8 +52,8 @@ function resolveMcpVaultPath(): string {
   }
   const arg = process.argv[2];
   if (arg) {
-    const registry = readRegistry();
-    if (registry.vaults[arg]) {
+    // A registered alias resolves via the registry; anything else is a path.
+    if (readRegistry().vaults[arg]) {
       return resolveVaultPath({ vaultAlias: arg }).path;
     }
     return arg; // treat as a direct path

@@ -524,8 +524,8 @@ program
 
     // Register the new vault in the central registry when --vault is given, so
     // it can be targeted from any directory via `ctx --vault <alias> ...`.
-    // --vault is a global option, so it lands in program.opts(), not opts.
-    const registerAlias = program.opts().vault as string | undefined;
+    // --vault is the global selector captured by the preAction hook.
+    const registerAlias = selectedVaultAlias;
     if (registerAlias) {
       try {
         addVault(registerAlias, pathMod.resolve(root), {
@@ -1816,7 +1816,7 @@ vaultCmd
 
 vaultCmd
   .command("add <alias> [path]")
-  .description("Register a vault path under an alias (path defaults to the current vault)")
+  .description("Register a vault path under an alias (path defaults to the resolved vault root)")
   .option("--description <text>", "Short label for this alias")
   .option("--set-default", "Make this the default vault")
   .option("--force", "Overwrite an existing alias")

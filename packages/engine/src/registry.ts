@@ -15,13 +15,20 @@
  *   6. cwd fallback
  */
 
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { ConfigError } from "./errors.js";
 import type { VaultRegistry, VaultRegistryEntry } from "./types.js";
+
+/**
+ * Allowed characters for a vault alias. Restricted to letters, digits, hyphens
+ * and underscores so an alias is always safe to type after `--vault` and to use
+ * as a YAML key without quoting.
+ */
+const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 const vaultRegistryEntrySchema = z.object({
   path: z.string().min(1),
@@ -74,7 +81,12 @@ export function writeRegistry(registry: VaultRegistry): void {
   const dir = getRegistryDir();
   mkdirSync(dir, { recursive: true });
   const content = yaml.dump(registry, { lineWidth: -1, noRefs: true });
-  writeFileSync(getRegistryPath(), content, "utf-8");
+  // Atomic write: a crash mid-write leaves the old registry intact rather than
+  // a truncated/corrupt file. Temp file is on the same dir so rename is atomic.
+  const target = getRegistryPath();
+  const tmp = `${target}.${process.pid}.tmp`;
+  writeFileSync(tmp, content, "utf-8");
+  renameSync(tmp, target);
 }
 
 /** True if `dir` looks like a vault root (has .context/config.yaml). */
@@ -111,6 +123,11 @@ export interface AddVaultOptions {
 export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions = {}): VaultRegistry {
   if (!alias.trim()) {
     throw new ConfigError("Vault alias must not be empty");
+  }
+  if (!ALIAS_PATTERN.test(alias)) {
+    throw new ConfigError(
+      `Vault alias "${alias}" is invalid — use only letters, digits, hyphens, or underscores.`,
+    );
   }
   if (!isVaultRoot(vaultPath)) {
     throw new ConfigError(
@@ -189,9 +206,12 @@ function readVaultName(vaultPath: string): string | undefined {
   }
 }
 
-/** Resolve an alias to a validated vault path, throwing a clear error otherwise. */
-function resolveAliasOrThrow(alias: string): string {
-  const registry = readRegistry();
+/**
+ * Resolve an alias to a validated vault path, throwing a clear error otherwise.
+ * Accepts an already-loaded registry to avoid a redundant disk read when the
+ * caller has one in hand.
+ */
+function resolveAliasOrThrow(alias: string, registry: VaultRegistry = readRegistry()): string {
   const entry = registry.vaults[alias];
   if (!entry) {
     const known = Object.keys(registry.vaults);
@@ -261,7 +281,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   const registry = readRegistry();
   if (registry.default && registry.vaults[registry.default]) {
     return {
-      path: resolveAliasOrThrow(registry.default),
+      path: resolveAliasOrThrow(registry.default, registry),
       source: "default",
       alias: registry.default,
     };

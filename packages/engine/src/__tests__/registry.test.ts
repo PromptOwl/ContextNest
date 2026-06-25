@@ -67,6 +67,15 @@ describe("vault registry", () => {
     expect(() => addVault("bad", notVault)).toThrow(ConfigError);
   });
 
+  it("rejects an alias with disallowed characters", () => {
+    const v = makeVault(join(tmp, "v"));
+    for (const bad of ["my vault", "a/b", "a:b", ""]) {
+      expect(() => addVault(bad, v)).toThrow(ConfigError);
+    }
+    // a clean alias still works
+    expect(() => addVault("my-vault_1", v)).not.toThrow();
+  });
+
   it("rejects a duplicate alias unless forced", () => {
     const a = makeVault(join(tmp, "a"));
     const b = makeVault(join(tmp, "b"));

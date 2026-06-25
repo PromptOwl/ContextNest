@@ -96,4 +96,18 @@ describe("ctx vault — central registry", () => {
     expect(which).toContain("source: env-alias");
     expect(which).toContain("alias: alpha");
   });
+
+  it("surfaces a clear error for an unknown --vault alias", () => {
+    // `vault which` catches the resolution error, prints it, and exits non-zero.
+    let stdout = "";
+    let failed = false;
+    try {
+      run(["vault", "which", "--vault", "ghost"], tmp);
+    } catch (err) {
+      failed = true;
+      stdout = (err as { stdout?: string }).stdout ?? "";
+    }
+    expect(failed).toBe(true);
+    expect(stdout).toContain('Unknown vault alias "ghost"');
+  });
 });
