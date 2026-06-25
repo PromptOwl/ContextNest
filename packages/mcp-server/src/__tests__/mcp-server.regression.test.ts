@@ -686,3 +686,40 @@ describe("[regression] MCP server e2e — selector operators", () => {
     expect(ids).not.toContain("nodes/op-billing");
   });
 });
+
+// Keyframe tampering is the deeper case: the canonical file and history.yaml
+// metadata are left intact, so detection requires re-hashing the version
+// keyframe bytes. Runs in its own vault (a sibling tamper would leave the
+// shared vault permanently invalid and mask the clean baseline).
+describe("[regression] MCP server e2e — integrity failure (keyframe)", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("verify_integrity reports valid:false when a version keyframe is tampered", async () => {
+    await callJson(client, "create_document", { path: "nodes/archived", title: "Archived", body: "trusted history" });
+
+    const clean = await callJson(client, "verify_integrity");
+    expect(clean.json.valid).toBe(true);
+
+    // Tamper whichever v{N}.md keyframe the history actually references
+    // (the create+publish path may land on v2, not v1).
+    const verDir = join(vault, "nodes", ".versions", "archived");
+    const keyframeFile = (await readdir(verDir)).find((f) => /^v\d+\.md$/.test(f));
+    expect(keyframeFile).toBeDefined();
+    const keyframe = join(verDir, keyframeFile!);
+    await writeFile(keyframe, (await readFile(keyframe, "utf-8")) + "\nrewritten history\n", "utf-8");
+
+    const tampered = await callJson(client, "verify_integrity");
+    expect(tampered.json.valid).toBe(false);
+  });
+});
