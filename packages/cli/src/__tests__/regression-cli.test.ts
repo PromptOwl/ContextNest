@@ -11,7 +11,7 @@
  * `vitest run -t regression`.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -31,7 +31,20 @@ import type { AddressInfo } from "node:net";
 const here = dirname(fileURLToPath(import.meta.url));
 const distPath = join(here, "..", "..", "dist", "index.js");
 
-const ENV = { ...process.env, CONTEXTNEST_NO_BROWSER: "1" } as NodeJS.ProcessEnv;
+// Sandbox the central vault registry so `ctx init` (which auto-registers an
+// alias non-interactively) never touches the developer's / CI runner's real
+// ~/.contextnest/config.yaml. Cleared up after the whole suite.
+const CONFIG_DIR = mkdtempSync(join(tmpdir(), "cn-cli-reg-cfg-"));
+afterAll(() => rmSync(CONFIG_DIR, { recursive: true, force: true }));
+
+const ENV = {
+  ...process.env,
+  CONTEXTNEST_NO_BROWSER: "1",
+  CONTEXTNEST_CONFIG_DIR: CONFIG_DIR,
+  // Neutralize any ambient selectors so resolution is deterministic.
+  CONTEXTNEST_VAULT: "",
+  CONTEXTNEST_VAULT_PATH: "",
+} as NodeJS.ProcessEnv;
 
 /** Run the CLI and return stdout. Throws on a non-zero exit. */
 function runCtx(cwd: string, args: string[]): string {

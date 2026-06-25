@@ -52,12 +52,17 @@ function resolveMcpVaultPath(): string {
   const arg = process.argv[2];
   if (arg) {
     // A registered alias resolves via the registry; anything else is a raw path.
-    // Resolve in one shot (no separate probe → no TOCTOU window) and fall back
-    // to treating the arg as a path if it isn't a valid alias.
+    // Resolve in one shot (no separate probe → no TOCTOU window). Only an
+    // "unknown alias" means arg isn't registered → treat it as a raw path. A
+    // registered-but-stale alias (vault dir gone) must surface as a real error
+    // rather than being silently used as a bogus path.
     try {
       return resolveVaultPath({ vaultAlias: arg }).path;
-    } catch {
-      return arg;
+    } catch (err) {
+      if (/Unknown vault alias/.test((err as Error).message)) {
+        return arg;
+      }
+      throw err;
     }
   }
   return resolveVaultPath().path;

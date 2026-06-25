@@ -98,7 +98,7 @@ export function writeRegistry(registry: VaultRegistry): void {
   writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
   try {
     renameSync(tmp, target);
-  } catch (err) {
+  } catch {
     // On Windows, rename over an existing file can throw EPERM if the target is
     // briefly locked (antivirus, a concurrent reader). Fall back to a copy, then
     // best-effort remove the temp file.
@@ -109,9 +109,11 @@ export function writeRegistry(registry: VaultRegistry): void {
       } catch {
         // temp cleanup is best-effort
       }
-    } catch {
+    } catch (copyErr) {
+      // Report the copy failure (the real cause of the rethrow), not the
+      // original rename error.
       throw new ConfigError(
-        `Failed to write vault registry to "${target}": ${(err as Error).message}. A temp file may remain at "${tmp}".`,
+        `Failed to write vault registry to "${target}": ${(copyErr as Error).message}. A temp file may remain at "${tmp}".`,
       );
     }
   }

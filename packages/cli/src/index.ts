@@ -1946,8 +1946,19 @@ vaultCmd
   .description("Unregister a vault alias")
   .action((alias: string) => {
     try {
-      removeVault(alias);
+      const wasDefault = listVaults().find((v) => v.alias === alias)?.isDefault ?? false;
+      const reg = removeVault(alias);
       console.log(chalk.yellow(`Removed vault alias "${alias}"`));
+      if (wasDefault && !reg.default) {
+        // Surface the silent loss of a default so commands without --vault don't
+        // mysteriously start resolving to the local/cwd vault.
+        console.log(
+          chalk.dim(
+            "  That was the default vault — no default is set now. " +
+              "Set one with `ctx vault default <alias>`.",
+          ),
+        );
+      }
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);
