@@ -50,10 +50,13 @@ export class GraphQueryEngine {
     selector: string,
     options: GraphQueryOptions = {},
   ): Promise<GraphQueryResult> {
-    const { hops = 2, full = false } = options;
+    const { hops = 2, full = false, includeDrafts = false } = options;
 
-    // Try graph mode first
-    if (!full) {
+    // Graph mode reads from context.yaml, which is published-only by design
+    // (see `ctx index` and `autoIndex` below). Drafts therefore never appear
+    // as seed candidates and graph mode cannot honor `includeDrafts`. Force
+    // full mode so draft documents actually surface when callers opt in.
+    if (!full && !includeDrafts) {
       let contextYaml = await this.storage.readContextYaml();
 
       // Auto-generate context.yaml if missing
