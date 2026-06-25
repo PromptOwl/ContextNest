@@ -84,11 +84,110 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 - Edges with explicit `priority: 0` in frontmatter are free
 - Adaptive expansion retries with more hops if too few results
 
+## Storage Backends
+
+Three storage backends ship out of the box. All implement the same
+`BaseNestStorage` contract so engine logic (publish, query, integrity,
+graph traversal) is backend-agnostic.
+
+| Backend | Import | Use case |
+|---|---|---|
+| `NestStorage` | `./` | Filesystem vault. Default. |
+| `MongoNestStorage` | `./` | MongoDB-backed vault. Requires `mongodb` peer dep. |
+| `GcsNestStorage` | `./` | Google Cloud Storage. Requires `@google-cloud/storage` peer dep. |
+
+### MongoDB quickstart
+
+```typescript
+import { MongoClient } from "mongodb";
+import { MongoNestStorage, publishDocument } from "@promptowl/contextnest-engine";
+
+const client = await new MongoClient("mongodb://localhost:27017").connect();
+const db = client.db("my_vault");
+
+const storage = new MongoNestStorage({ db });
+await storage.init("My Vault");
+
+await storage.writeDocument(
+  "nodes/welcome",
+  `---
+title: Welcome
+type: document
+status: draft
+---
+
+# Welcome
+`,
+);
+```
+
+`MongoNestStorage` accepts a `collections` override so you can plug into an
+existing schema instead of using the default collection names
+(`documents`, `histories`, `checkpoints`, `suggestions`, `packs`,
+`chain_events`, `nest`). Transactional writes require a Mongo replica set
+or Atlas (4.0+ with sessions).
+
+## Steward Stores (governance)
+
+Two governance shapes ship from the engine — both Mongo-backed, both
+expose the same `resolveStewards()` contract so permission code is
+store-agnostic.
+
+| Store | Shape | Use case |
+|---|---|---|
+| `SingleUserStewardStore` | one row per (scope, target, user) | Simple deployments, one-user-per-grant |
+| `MultiUserStewardStore` | one row per (scope, target) with embedded `users[]` + `teams[]` | Teams + multi-user-per-doc UX |
+
+Both stores support `nest`, `tag`, and `document` scopes; resolution
+priority is `document(1) > tag(2) > nest(3)`. The engine has no notion
+of team membership — pass the actor's `teamIds` into `resolveStewards()`
+to enable team-derived grants.
+
+```typescript
+import {
+  MultiUserStewardStore,
+} from "@promptowl/contextnest-engine";
+
+const stewards = new MultiUserStewardStore({ db });
+
+await stewards.addUser(
+  "my-nest",
+  "document",
+  { documentId: "nodes/api" },
+  { email: "alice@example.com", role: "reviewer", addedType: "steward" },
+);
+
+const grants = await stewards.resolveStewards("my-nest", {
+  nodeId: "nodes/api",
+  tags: ["architecture"],
+  teamIds: ["team-eng"], // optional — omit to suppress team grants
+});
+// → [{ email: "alice@example.com", role: "reviewer", priority: 1, ... }]
+```
+
+## RBAC
+
+Engine is identity-agnostic. The bridge layer supplies an `RbacHook`;
+every method on it is optional, so you wire only the surface you need.
+
+- **Generic:** `canEdit(actor, docId)` + `canApprove(actor, docId)` — use
+  `requireEdit` / `requireApprove` from the engine to assert.
+- **Zone model:** `isCzar(actor, zone)` + `canIngest(actor, zone)` +
+  `isDocOwner(actor, docId)` — use `requireCzar` / `requireIngest` /
+  `requireDocOwner`. Optional; pair with the `zone` + `governance`
+  frontmatter fields when you want a tier-aware approval flow.
+
+Missing methods are treated as deny — never silently allow.
+
 ## Key Exports
 
 | Export | Description |
 |--------|-------------|
-| `NestStorage` | File system abstraction for vault operations |
+| `NestStorage` | Filesystem storage backend |
+| `MongoNestStorage` | MongoDB storage backend |
+| `GcsNestStorage` | Google Cloud Storage backend (preview) |
+| `SingleUserStewardStore` | One-row-per-user steward store (Mongo) |
+| `MultiUserStewardStore` | One-row-per-target steward store with users[] + teams[] (Mongo) |
 | `GraphQueryEngine` | Graph-aware query orchestrator (recommended) |
 | `GraphTraverser` | BFS traversal with priority-weighted edge costs |
 | `Resolver` | URI resolution against an in-memory document set |
@@ -100,6 +199,8 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `parseSelector` | Parse selector query strings into AST |
 | `evaluateFromIndex` | Evaluate selectors against the lightweight index (no bodies) |
 | `publishDocument` | Publish a document (bump version, checkpoint) |
+| `requireEdit` / `requireApprove` | Generic RBAC gates |
+| `requireCzar` / `requireIngest` / `requireDocOwner` | Zone-model RBAC gates |
 
 ## Part of Context Nest
 

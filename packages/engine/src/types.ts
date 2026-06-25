@@ -59,8 +59,16 @@ export type SuggestionSource =
   | "manual-suggestion"
   | "quarantine";
 
-/** Hash chain event taxonomy (zone-classification-rbac-spec §6, hootie-inbox-spec §8) */
-export type HashChainEventType =
+/**
+ * Hash chain event taxonomy.
+ *
+ * The string literal union below is autocomplete-only: it lists the
+ * well-known PromptOwl-flavored event names (zone-classification-rbac-spec §6,
+ * hootie-inbox-spec §8). The runtime schema (`hashChainEventSchema`) accepts
+ * any non-empty string, so consumers can emit custom event types (for
+ * example `"document.approved"`) by casting through `string`.
+ */
+export type WellKnownHashChainEventType =
   | "primary.approved"
   | "primary.rejected"
   | "primary.rolled_back"
@@ -92,6 +100,9 @@ export type HashChainEventType =
   | "platform_admin.session_opened"
   | "platform_admin.session_closed"
   | "agent.zone_scope_assigned";
+
+/** Hash chain event_type — well-known name or any custom string. */
+export type HashChainEventType = WellKnownHashChainEventType | (string & {});
 
 /** Source metadata block — present only on type: source nodes (§1.9.1) */
 export interface SourceMeta {
@@ -221,13 +232,30 @@ export interface HashChainEvent {
 
 /**
  * RBAC policy hook injected by the bridge layer. Engine stays identity-
- * agnostic; the bridge supplies the real implementation
- * (zone-classification-rbac-spec §4, Story 6.2).
+ * agnostic; the bridge supplies the real implementation.
+ *
+ * Every method is OPTIONAL so consumers can wire only the surface they
+ * actually need:
+ *   - Generic deployments wire `canEdit` + `canApprove` (per-document
+ *     gates that match a conventional editor/reviewer permission model).
+ *   - Zone-classification deployments (PromptOwl Czar/Ingest model,
+ *     zone-classification-rbac-spec §4) wire `isCzar` + `canIngest` +
+ *     `isDocOwner` for tier-aware approvals.
+ *
+ * Missing methods are treated as "deny" by the `require*` helpers, so an
+ * incomplete hook can never silently escalate.
  */
 export interface RbacHook {
-  isCzar(actor: string, zoneId: string): boolean | Promise<boolean>;
-  canIngest(actor: string, zoneId: string): boolean | Promise<boolean>;
-  isDocOwner(actor: string, documentId: string): boolean | Promise<boolean>;
+  /** Generic: actor may edit / submit changes to this document. */
+  canEdit?(actor: string, documentId: string): boolean | Promise<boolean>;
+  /** Generic: actor may approve / publish this document. */
+  canApprove?(actor: string, documentId: string): boolean | Promise<boolean>;
+  /** Zone model: actor is the Czar of the given zone. */
+  isCzar?(actor: string, zoneId: string): boolean | Promise<boolean>;
+  /** Zone model: actor has ingest permission for the given zone. */
+  canIngest?(actor: string, zoneId: string): boolean | Promise<boolean>;
+  /** Zone model: actor owns the document (Standard-tier owner-only gate). */
+  isDocOwner?(actor: string, documentId: string): boolean | Promise<boolean>;
 }
 
 /** Relationship edge types (§5.1) */
@@ -352,6 +380,18 @@ export interface NestConfig {
     }
   >;
   sync?: {
+    /**
+     * Optional ID linking this nest to an external workspace / project /
+     * data-room in a host application. Engine never interprets this value;
+     * it round-trips so host UIs can correlate nests with their own records.
+     */
+    external_workspace_id?: string;
+    /**
+     * @deprecated Use `external_workspace_id`. Old field name carried over
+     * from PromptOwl's data-room model. `parseConfig` accepts this key and
+     * copies it into `external_workspace_id` when the new field is absent.
+     * Will be removed in a future release.
+     */
     promptowl_data_room_id?: string;
     auto_index?: boolean;
   };

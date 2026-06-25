@@ -196,10 +196,21 @@ describe("Step 1 — governance shapes (spec-traced)", () => {
       expect(result.success).toBe(true);
     });
 
-    it("rejects an unknown event_type", () => {
+    it("accepts a custom event_type (well-known list is documentation, not enforcement)", () => {
+      // Engine permits any non-empty event_type so OSS consumers can emit
+      // their own names (e.g. `"document.approved"`) without forking. The
+      // HASH_CHAIN_EVENT_TYPES constant is autocomplete + docs only.
       const result = hashChainEventSchema.safeParse({
         ...baseEvent,
-        event_type: "primary.silently_committed" as unknown as HashChainEventType,
+        event_type: "document.approved" as unknown as HashChainEventType,
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects an empty event_type", () => {
+      const result = hashChainEventSchema.safeParse({
+        ...baseEvent,
+        event_type: "",
       });
       expect(result.success).toBe(false);
     });

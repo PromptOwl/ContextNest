@@ -12,6 +12,7 @@ export type {
   GovernanceTier,
   SuggestionSource,
   HashChainEventType,
+  WellKnownHashChainEventType,
   SourceMeta,
   SkillInput,
   SkillMeta,
@@ -71,6 +72,8 @@ export {
   requireCzar,
   requireIngest,
   requireDocOwner,
+  requireEdit,
+  requireApprove,
   filterIngestibleZones,
 } from "./rbac.js";
 
@@ -291,3 +294,28 @@ export { TraceLogger } from "./tracing.js";
 
 // Chain event log (persistent governance audit trail)
 export { ChainEventLog } from "./chain-log.js";
+
+// Steward stores (governance, optional)
+export {
+  BaseStewardStore,
+  SingleUserStewardStore,
+  MultiUserStewardStore,
+} from "./stewards/index.js";
+export type {
+  StewardRole,
+  StewardshipScope,
+  StewardAddedType,
+  SingleUserSteward,
+  MultiUserSteward,
+  StewardUserEntry,
+  StewardTeamEntry,
+  ResolvedStewardEntry,
+  ResolveStewardsInput,
+  SingleUserStewardStoreConfig,
+  AssignSingleUserStewardInput,
+  UpdateSingleUserStewardInput,
+  ListSingleUserStewardsInput,
+  MultiUserStewardStoreConfig,
+  CreateMultiStewardInput,
+  ResolveMultiStewardsInput,
+} from "./stewards/index.js";

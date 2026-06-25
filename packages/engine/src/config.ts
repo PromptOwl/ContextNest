@@ -9,6 +9,10 @@ import { ConfigError } from "./errors.js";
 
 /**
  * Parse and validate .context/config.yaml content.
+ *
+ * Collapses the deprecated `sync.promptowl_data_room_id` alias into
+ * `sync.external_workspace_id` when the canonical key is absent, so
+ * downstream code only ever reads the new field.
  */
 export function parseConfig(content: string): NestConfig {
   const raw = yaml.load(content);
@@ -17,7 +21,16 @@ export function parseConfig(content: string): NestConfig {
     const messages = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
     throw new ConfigError(`Invalid config.yaml: ${messages.join("; ")}`);
   }
-  return result.data as NestConfig;
+  const config = result.data as NestConfig;
+  if (config.sync) {
+    if (
+      !config.sync.external_workspace_id &&
+      config.sync.promptowl_data_room_id
+    ) {
+      config.sync.external_workspace_id = config.sync.promptowl_data_room_id;
+    }
+  }
+  return config;
 }
 
 /** Syntax token configuration from syntax.yml (§11.2) */

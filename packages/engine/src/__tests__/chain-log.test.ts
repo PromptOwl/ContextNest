@@ -58,15 +58,30 @@ describe("ChainEventLog — append + read (Zone §6, Hootie §8)", () => {
     expect(back.map((e) => e.event_id)).toEqual(["evt_1", "evt_2", "evt_3"]);
   });
 
-  it("rejects schema-invalid events at append time (no audit poisoning)", async () => {
+  it("accepts a custom event_type at append time (schema is intentionally loose for OSS use)", async () => {
+    // The well-known HASH_CHAIN_EVENT_TYPES list is documentation, not
+    // enforcement — OSS consumers can name their own events without
+    // forking the engine. The chain still rejects structurally-invalid
+    // events (empty actor, missing event_id, malformed hash, etc.).
+    const custom: HashChainEvent = {
+      event_id: "evt_custom",
+      event_type: "document.approved" as HashChainEvent["event_type"],
+      timestamp: "2026-04-19T12:00:00Z",
+      actor: "alice@example.com",
+    };
+    await expect(log.append(custom)).resolves.toBeUndefined();
+    const back = await log.readAll();
+    expect((back[0] as HashChainEvent).event_type).toBe("document.approved");
+  });
+
+  it("rejects an event with empty event_type (structural validation)", async () => {
     const bad = {
       event_id: "evt_bad",
-      event_type: "primary.invented" as unknown as HashChainEvent["event_type"],
+      event_type: "" as HashChainEvent["event_type"],
       timestamp: "2026-04-19T12:00:00Z",
-      actor: "czar:vp",
+      actor: "alice@example.com",
     } as HashChainEvent;
     await expect(log.append(bad)).rejects.toThrow();
-    expect(await log.readAll()).toEqual([]);
   });
 
   it("rejects an event with empty actor (audit must identify caller)", async () => {

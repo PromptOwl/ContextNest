@@ -100,7 +100,16 @@ export const SUGGESTION_SOURCES = [
   "quarantine",
 ] as const;
 
-/** Hash chain event taxonomy (zone-classification-rbac-spec §6, hootie-inbox-spec §8) */
+/**
+ * Hash chain event taxonomy — well-known event names.
+ *
+ * This list is DOCUMENTATION + autocomplete only. `hashChainEventSchema`
+ * accepts any non-empty string for `event_type` so consumers can emit
+ * their own event names (e.g. `"document.approved"`, `"team.added"`)
+ * without forking the engine. The names here are the PromptOwl-flavored
+ * vocabulary (zone-classification-rbac-spec §6, hootie-inbox-spec §8);
+ * other consumers are free to use them or define their own.
+ */
 export const HASH_CHAIN_EVENT_TYPES = [
   "primary.approved",
   "primary.rejected",
@@ -260,8 +269,12 @@ export const nestConfigSchema = z.object({
       }),
     )
     .optional(),
+  // Accept both `external_workspace_id` (canonical) and the legacy
+  // `promptowl_data_room_id` alias; `parseConfig` collapses the alias into
+  // the canonical field on parse so callers only ever see the new name.
   sync: z
     .object({
+      external_workspace_id: z.string().optional(),
       promptowl_data_room_id: z.string().optional(),
       auto_index: z.boolean().optional(),
     })
@@ -338,13 +351,17 @@ export const suggestionMetaSchema = z.object({
 });
 
 /**
- * Hash chain event schema — every governance action emits one of these
- * (zone-classification-rbac-spec §6, hootie-inbox-spec §8). Events are
- * immutable; the chain is append-only.
+ * Hash chain event schema — every governance action emits one of these.
+ * Events are immutable; the chain is append-only.
+ *
+ * `event_type` is intentionally loose (`z.string`) so consumers can name
+ * their own events. `HASH_CHAIN_EVENT_TYPES` lists the well-known
+ * PromptOwl-flavored names but is not enforced; e.g. a generic deployment
+ * can emit `"document.approved"` and the chain will accept it.
  */
 export const hashChainEventSchema = z.object({
   event_id: z.string().min(1),
-  event_type: z.enum(HASH_CHAIN_EVENT_TYPES),
+  event_type: z.string().min(1),
   timestamp: z.string().min(1),
   actor: z.string().min(1),
   zone: z

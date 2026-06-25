@@ -202,8 +202,45 @@ export class MongoNestStorage extends BaseNestStorage {
       .collection(this.cols.documents)
       .deleteOne({ _id: id });
     if (!result.deletedCount) throw new DocumentNotFoundError(id);
-    // Clean up history too.
-    await this.db.collection(this.cols.histories).deleteOne({ _id: id });
+    // Cascade per-doc data so no orphans survive the delete:
+    //   histories  : version timeline + embedded keyframe payloads
+    //   suggestions: any drift/manual patches still pointed at this doc
+    //   chain_events: hash-chain audit entries scoped to this doc
+    await Promise.all([
+      this.db.collection(this.cols.histories).deleteOne({ _id: id }),
+      this.db
+        .collection(this.cols.suggestions)
+        .deleteMany({ documentId: id }),
+      this.db
+        .collection(this.cols.chainEvents)
+        .deleteMany({ document_id: id }),
+    ]);
+    // Prune the derived INDEX entry if this doc was the last in its folder.
+    await this.pruneEmptyIndexFolder(id);
+  }
+
+  /**
+   * Drop the `nest.indexes.<folder>` entry once a folder loses its last
+   * document. Keeps the derived INDEX surface from holding stale per-folder
+   * Markdown that points at a vanished doc. Siblings keep their entries —
+   * `regenerateIndex` is still the authoritative rebuild path; this is the
+   * minimal in-line cleanup so the surface is correct immediately.
+   */
+  private async pruneEmptyIndexFolder(deletedId: string): Promise<void> {
+    const parts = deletedId.split("/");
+    if (parts.length < 2) return;
+    const folder = parts.slice(0, -1).join("/");
+    const escaped = folder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const sibling = await this.db
+      .collection(this.cols.documents)
+      .findOne({ _id: { $regex: `^${escaped}/` } });
+    if (sibling) return;
+    await this.db
+      .collection(this.cols.nest)
+      .updateOne(
+        { _id: VAULT_KEY },
+        { $unset: { [`indexes.${folder}`]: "" } },
+      );
   }
 
   async detectDocumentDrift(

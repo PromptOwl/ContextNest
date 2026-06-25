@@ -1,21 +1,31 @@
 /**
  * RBAC enforcement primitives for the Context Nest engine.
  *
- * The engine is identity-agnostic by design (zone-classification-rbac-spec
- * §4, bridge-function-spec Story 6.2). It never assumes who the actor is or
- * what permissions they hold; the bridge layer supplies an `RbacHook`
+ * The engine is identity-agnostic by design. It never assumes who the actor
+ * is or what permissions they hold; the bridge layer supplies an `RbacHook`
  * implementation that wraps the org's real identity/permission service.
  *
- * What lives here:
- *   - `denyAllRbac`: a safe default that denies every operation. Used when
- *     no hook is supplied so unwrapped engine usage cannot escalate.
- *   - `requireCzar` / `requireIngest` / `requireDocOwner`: small assertion
- *     helpers that throw `UnauthorizedActionError` on a denied check.
+ * Two parallel surfaces are supported on `RbacHook` (both optional, see
+ * `types.ts`):
+ *   - Generic: `canEdit(actor, docId)` + `canApprove(actor, docId)` — the
+ *     conventional editor/reviewer model most apps use.
+ *   - Zone model: `isCzar(actor, zone)` + `canIngest(actor, zone)` +
+ *     `isDocOwner(actor, docId)` — PromptOwl's zone/Czar terminology
+ *     (zone-classification-rbac-spec §4). Kept first-class so existing
+ *     deployments and OSS consumers who want a tier-aware model can opt in.
  *
- * Engine code that performs a governance-class action (approve, reject,
- * rollback, force-push, dream-approve, classification-manifest-update, etc.)
- * MUST route the permission decision through one of these helpers — it must
- * NOT inspect actor strings, role tables, or anything identity-shaped.
+ * What lives here:
+ *   - `denyAllRbac`: safe default that denies every check.
+ *   - `requireCzar` / `requireIngest` / `requireDocOwner`: zone-model
+ *     assertion helpers.
+ *   - `requireEdit` / `requireApprove`: generic assertion helpers.
+ *
+ * Engine code that performs a governance-class action MUST route the
+ * permission decision through one of these helpers — it must NOT inspect
+ * actor strings, role tables, or anything identity-shaped.
+ *
+ * Missing methods on the hook are treated as "deny". Use the helper that
+ * matches the surface you wired up; mixing models silently denies.
  */
 
 import type { RbacHook } from "./types.js";
@@ -29,10 +39,20 @@ import { UnauthorizedActionError } from "./errors.js";
  * an unauthenticated context is trusted.
  */
 export const denyAllRbac: RbacHook = {
+  canEdit: () => false,
+  canApprove: () => false,
   isCzar: () => false,
   canIngest: () => false,
   isDocOwner: () => false,
 };
+
+async function callOrDeny(
+  fn: ((...args: any[]) => boolean | Promise<boolean>) | undefined,
+  ...args: unknown[]
+): Promise<boolean> {
+  if (!fn) return false;
+  return Boolean(await fn(...args));
+}
 
 /**
  * Assert the actor is the Czar of the given zone. Throws
@@ -49,7 +69,7 @@ export async function requireCzar(
   zoneId: string,
   action: string,
 ): Promise<void> {
-  const ok = await hook.isCzar(actor, zoneId);
+  const ok = await callOrDeny(hook.isCzar, actor, zoneId);
   if (!ok) {
     throw new UnauthorizedActionError(actor, action, zoneId);
   }
@@ -70,7 +90,7 @@ export async function requireIngest(
   zoneId: string,
   action: string,
 ): Promise<void> {
-  const ok = await hook.canIngest(actor, zoneId);
+  const ok = await callOrDeny(hook.canIngest, actor, zoneId);
   if (!ok) {
     throw new UnauthorizedActionError(actor, action, zoneId);
   }
@@ -89,7 +109,46 @@ export async function requireDocOwner(
   documentId: string,
   action: string,
 ): Promise<void> {
-  const ok = await hook.isDocOwner(actor, documentId);
+  const ok = await callOrDeny(hook.isDocOwner, actor, documentId);
+  if (!ok) {
+    throw new UnauthorizedActionError(actor, action);
+  }
+}
+
+/**
+ * Generic editor gate: assert the actor may edit / submit changes to the
+ * given document. Throws `UnauthorizedActionError` otherwise.
+ *
+ * Use this when the consumer wires up the conventional `canEdit` surface
+ * instead of the zone-classification model. Most non-PromptOwl deployments
+ * will route here.
+ */
+export async function requireEdit(
+  hook: RbacHook,
+  actor: string,
+  documentId: string,
+  action: string,
+): Promise<void> {
+  const ok = await callOrDeny(hook.canEdit, actor, documentId);
+  if (!ok) {
+    throw new UnauthorizedActionError(actor, action);
+  }
+}
+
+/**
+ * Generic reviewer gate: assert the actor may approve / publish the given
+ * document. Throws `UnauthorizedActionError` otherwise.
+ *
+ * Use this when the consumer wires up the conventional `canApprove`
+ * surface instead of the zone-classification model.
+ */
+export async function requireApprove(
+  hook: RbacHook,
+  actor: string,
+  documentId: string,
+  action: string,
+): Promise<void> {
+  const ok = await callOrDeny(hook.canApprove, actor, documentId);
   if (!ok) {
     throw new UnauthorizedActionError(actor, action);
   }
@@ -112,7 +171,7 @@ export async function filterIngestibleZones(
   const checks = await Promise.all(
     zoneIds.map(async (zoneId) => ({
       zoneId,
-      allowed: await hook.canIngest(actor, zoneId),
+      allowed: await callOrDeny(hook.canIngest, actor, zoneId),
     })),
   );
   return checks.filter((c) => c.allowed).map((c) => c.zoneId);
