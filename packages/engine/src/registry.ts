@@ -15,7 +15,15 @@
  *   6. cwd fallback
  */
 
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import yaml from "js-yaml";
@@ -79,14 +87,34 @@ export function readRegistry(): VaultRegistry {
 
 export function writeRegistry(registry: VaultRegistry): void {
   const dir = getRegistryDir();
-  mkdirSync(dir, { recursive: true });
+  // 0o700/0o600: the registry lists every vault path; keep it owner-only so it
+  // doesn't leak filesystem topology on shared hosts. (mode is a no-op on Windows.)
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const content = yaml.dump(registry, { lineWidth: -1, noRefs: true });
   // Atomic write: a crash mid-write leaves the old registry intact rather than
   // a truncated/corrupt file. Temp file is on the same dir so rename is atomic.
   const target = getRegistryPath();
   const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, content, "utf-8");
-  renameSync(tmp, target);
+  writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
+  try {
+    renameSync(tmp, target);
+  } catch (err) {
+    // On Windows, rename over an existing file can throw EPERM if the target is
+    // briefly locked (antivirus, a concurrent reader). Fall back to a copy, then
+    // best-effort remove the temp file.
+    try {
+      copyFileSync(tmp, target);
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // temp cleanup is best-effort
+      }
+    } catch {
+      throw new ConfigError(
+        `Failed to write vault registry to "${target}": ${(err as Error).message}. A temp file may remain at "${tmp}".`,
+      );
+    }
+  }
 }
 
 /** True if `dir` looks like a vault root (has .context/config.yaml). */
@@ -277,14 +305,14 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     return { path: local, source: "local" };
   }
 
-  // 5. registry default alias
+  // 5. registry default alias. This is an implicit fallback, not an explicit
+  // user request, so a stale default (vault deleted/moved) must NOT throw —
+  // that would lock the user out of every command. Fall through to cwd instead.
+  // (Explicit --vault / CONTEXTNEST_VAULT above still throw on a bad alias.)
   const registry = readRegistry();
-  if (registry.default && registry.vaults[registry.default]) {
-    return {
-      path: resolveAliasOrThrow(registry.default, registry),
-      source: "default",
-      alias: registry.default,
-    };
+  const defaultEntry = registry.default ? registry.vaults[registry.default] : undefined;
+  if (defaultEntry && isVaultRoot(defaultEntry.path)) {
+    return { path: defaultEntry.path, source: "default", alias: registry.default };
   }
 
   // 6. cwd fallback

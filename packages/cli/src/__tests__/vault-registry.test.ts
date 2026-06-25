@@ -73,7 +73,9 @@ describe("ctx vault — central registry", () => {
   it("vault add / list / remove round-trip", () => {
     const a = join(tmp, "a");
     mkdirSync(a, { recursive: true });
-    run(["init", "--name", "Standalone"], a); // no --vault: not registered yet
+    // init auto-registers the vault under a directory-derived alias ("a").
+    run(["init", "--name", "Standalone"], a);
+    expect(run(["vault", "list"], tmp)).toContain("a");
 
     run(["vault", "add", "work", a, "--description", "Work vault"], tmp);
     const list = run(["vault", "list"], tmp);
@@ -82,7 +84,7 @@ describe("ctx vault — central registry", () => {
 
     run(["vault", "remove", "work"], tmp);
     const listAfter = run(["vault", "list"], tmp);
-    expect(listAfter).toContain("No vaults registered");
+    expect(listAfter).not.toContain("work");
   });
 
   it("CONTEXTNEST_VAULT env selects a registered vault by alias", () => {

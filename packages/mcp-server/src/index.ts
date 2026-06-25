@@ -27,7 +27,6 @@ import {
   approveSuggestion,
   rejectSuggestion,
   resolveVaultPath,
-  readRegistry,
   isRejected,
   normalizeStatus,
   STATUS_ALIASES,
@@ -52,16 +51,28 @@ function resolveMcpVaultPath(): string {
   }
   const arg = process.argv[2];
   if (arg) {
-    // A registered alias resolves via the registry; anything else is a path.
-    if (readRegistry().vaults[arg]) {
+    // A registered alias resolves via the registry; anything else is a raw path.
+    // Resolve in one shot (no separate probe → no TOCTOU window) and fall back
+    // to treating the arg as a path if it isn't a valid alias.
+    try {
       return resolveVaultPath({ vaultAlias: arg }).path;
+    } catch {
+      return arg;
     }
-    return arg; // treat as a direct path
   }
   return resolveVaultPath().path;
 }
 
-const vaultPath = resolveMcpVaultPath();
+// Resolve at module load. A bad CONTEXTNEST_VAULT alias makes resolveVaultPath
+// throw; catch it here so the user gets a clean message on stderr instead of an
+// unhandled Node stack trace, then exit non-zero.
+let vaultPath: string;
+try {
+  vaultPath = resolveMcpVaultPath();
+} catch (err) {
+  process.stderr.write(`contextnest-mcp: ${(err as Error).message}\n`);
+  process.exit(1);
+}
 const storage = new NestStorage(vaultPath);
 
 const server = new McpServer({

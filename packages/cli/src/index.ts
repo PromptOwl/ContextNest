@@ -361,6 +361,70 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
   });
 }
 
+// ─── Vault registration prompts (ctx init) ──────────────────────────────────────
+
+// Alias keys must match the engine's ALIAS_PATTERN: letters, digits, hyphens,
+// underscores. Kept in sync here so the interactive prompt can validate before
+// handing off to addVault() (which is the source of truth and re-validates).
+const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+// Derive a sensible default alias from a directory name, sanitized to the
+// allowed alias characters.
+function slugifyAlias(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "vault";
+}
+
+// Pick a default alias for `root` that doesn't collide with a different vault
+// already in the registry. Re-running init in the same directory reuses the
+// existing alias (idempotent); a clash with a *different* path gets a numeric
+// suffix so we never silently overwrite someone else's alias.
+function defaultAliasFor(root: string): string {
+  const resolvedRoot = pathMod.resolve(root);
+  const base = slugifyAlias(pathMod.basename(resolvedRoot));
+  const taken = new Map(listVaults().map((v) => [v.alias, pathMod.resolve(v.path)]));
+  const free = (alias: string) => !taken.has(alias) || taken.get(alias) === resolvedRoot;
+  if (free(base)) return base;
+  let n = 2;
+  while (!free(`${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
+// Prompt for a free-text answer, returning the default when the user hits Enter.
+function promptText(question: string, defaultValue?: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const suffix = defaultValue ? chalk.dim(` [${defaultValue}]`) : "";
+  return new Promise((resolve) => {
+    rl.question(`  ${question}${suffix}: `, (answer) => {
+      rl.close();
+      resolve(answer.trim() || defaultValue || "");
+    });
+  });
+}
+
+// Prompt for a vault alias, re-asking until it matches ALIAS_PATTERN.
+function promptAlias(defaultAlias: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(`  Vault alias ${chalk.dim(`[${defaultAlias}]`)}: `, (answer) => {
+        const alias = answer.trim() || defaultAlias;
+        if (ALIAS_PATTERN.test(alias)) {
+          rl.close();
+          resolve(alias);
+          return;
+        }
+        console.log(chalk.red("  Use only letters, digits, hyphens, or underscores."));
+        ask();
+      });
+    };
+    ask();
+  });
+}
+
 // Apply a starter recipe to a freshly-initialized vault: write + publish its
 // nodes/packs, persist its maintenance directive, regenerate the index, and
 // print the post-init summary + AI agent prompt.
@@ -503,8 +567,8 @@ program
   .option("-n, --name <name>", "Vault name", "My Context Nest")
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
-  .option("--set-default", "With --vault, also make the new vault the default")
-  .option("--description <text>", "With --vault, a label for the registry entry")
+  .option("--set-default", "Make the new vault the registry default")
+  .option("--description <text>", "Description/label for the registry entry")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -522,24 +586,59 @@ program
     await storage.init(opts.name, opts.layout as LayoutMode);
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
 
-    // Register the new vault in the central registry when --vault is given, so
-    // it can be targeted from any directory via `ctx --vault <alias> ...`.
-    // --vault is the global selector captured by the preAction hook.
-    const registerAlias = selectedVaultAlias;
+    // Register the new vault in the central registry so it can be targeted from
+    // any directory via `ctx --vault <alias> ...`. The alias comes from an
+    // explicit --vault flag, an interactive prompt, or (non-interactively) a
+    // directory-derived default — so init always registers the vault.
+    let registerAlias = selectedVaultAlias;
+    let registerDescription = opts.description as string | undefined;
+    const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (!registerAlias) {
+      const defaultAlias = defaultAliasFor(root);
+      if (canPrompt) {
+        console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
+        registerAlias = await promptAlias(defaultAlias);
+        if (!registerDescription) {
+          registerDescription = (await promptText("Vault description (optional)")) || undefined;
+        }
+      } else {
+        registerAlias = defaultAlias;
+      }
+    }
     if (registerAlias) {
-      try {
-        addVault(registerAlias, pathMod.resolve(root), {
-          description: opts.description,
-          setDefault: opts.setDefault,
-          force: true,
-        });
+      const resolvedRoot = pathMod.resolve(root);
+      const existing = listVaults().find((v) => v.alias === registerAlias);
+      if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
+        // The alias is already taken by a *different* vault. Don't silently
+        // clobber it — the vault was still created; just skip registration.
         console.log(
-          chalk.green(
-            `  Registered vault "${chalk.bold(registerAlias)}"${opts.setDefault ? " (default)" : ""} → ${root}`,
+          chalk.yellow(
+            `  Vault alias "${registerAlias}" already points to ${existing.path} — not overwriting.`,
           ),
         );
-      } catch (err) {
-        console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
+        console.log(
+          chalk.dim(
+            `  To repoint it: ctx vault add ${registerAlias} ${resolvedRoot} --force`,
+          ),
+        );
+      } else {
+        try {
+          // force is safe here: the alias is either free or already points to
+          // this same vault (idempotent re-init).
+          const reg = addVault(registerAlias, resolvedRoot, {
+            description: registerDescription,
+            setDefault: opts.setDefault,
+            force: true,
+          });
+          const isDefault = reg.default === registerAlias;
+          console.log(
+            chalk.green(
+              `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${root}`,
+            ),
+          );
+        } catch (err) {
+          console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
+        }
       }
     }
 
@@ -1821,15 +1920,19 @@ vaultCmd
   .option("--set-default", "Make this the default vault")
   .option("--force", "Overwrite an existing alias")
   .action((alias: string, path: string | undefined, opts) => {
-    const target = pathMod.resolve(path || getVaultRoot());
     try {
-      addVault(alias, target, {
+      // Resolve the target inside the try: when no path is given, getVaultRoot()
+      // can throw (e.g. a stale CONTEXTNEST_VAULT alias), and the user should get
+      // a clear error rather than an uncaught throw from Commander.
+      const target = pathMod.resolve(path || getVaultRoot());
+      const reg = addVault(alias, target, {
         description: opts.description,
         setDefault: opts.setDefault,
         force: opts.force,
       });
+      const isDefault = reg.default === alias;
       console.log(
-        chalk.green(`Registered "${chalk.bold(alias)}"${opts.setDefault ? " (default)" : ""} → ${target}`),
+        chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${target}`),
       );
     } catch (err) {
       console.log(chalk.red((err as Error).message));

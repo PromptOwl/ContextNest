@@ -169,5 +169,16 @@ describe("vault registry", () => {
       rmSync(join(alpha, ".context"), { recursive: true, force: true });
       expect(() => resolveVaultPath({ vaultAlias: "alpha" })).toThrow(/no longer a vault/);
     });
+
+    it("falls back to cwd (does not throw) when the default's vault is gone", () => {
+      // A stale default must never lock the user out of the CLI. Unlike an
+      // explicit --vault/env alias, the default is a soft fallback.
+      setDefaultVault("beta");
+      rmSync(join(beta, ".context"), { recursive: true, force: true });
+      const outside = join(tmp, "outside-stale");
+      mkdirSync(outside, { recursive: true });
+      const r = resolveVaultPath({ cwd: outside });
+      expect(r).toMatchObject({ path: outside, source: "cwd" });
+    });
   });
 });
