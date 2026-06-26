@@ -4,7 +4,6 @@ dist/
 *.tsbuildinfo
 .DS_Store
 local_vault
-.claude/
 .internal/
 fixtures/*
 # Keep the committed test vault tracked (it backs the engine test suite).

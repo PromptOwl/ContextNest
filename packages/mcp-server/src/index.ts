@@ -27,7 +27,6 @@ import {
   approveSuggestion,
   rejectSuggestion,
   resolveVaultPath,
-  UnknownAliasError,
   isRejected,
   normalizeStatus,
   STATUS_ALIASES,
@@ -40,45 +39,22 @@ import type {
 } from "@promptowl/contextnest-engine";
 
 /**
- * Resolve which vault to serve. Precedence:
- *   1. CONTEXTNEST_VAULT (alias) / CONTEXTNEST_VAULT_PATH (path) env vars
- *   2. positional arg — a registered alias, else a direct path (backward compat
- *      with `contextnest-mcp /path/to/vault`)
- *   3. local vault (walk up cwd) → registry default → cwd
+ * Resolve which vault to serve via the engine resolver, which owns the full
+ * precedence: CONTEXTNEST_VAULT (alias) → CONTEXTNEST_VAULT_PATH (path) →
+ * positional arg (alias or absolute path) → local walk-up → registry default →
+ * cwd. The positional arg is threaded in as `argPath`, so a stale env alias no
+ * longer hides it, and a typo'd arg surfaces a clear error instead of becoming
+ * a bogus relative path.
  */
-// Surface a non-fatal resolution advisory (e.g. a stale CONTEXTNEST_VAULT that
-// was ignored) on stderr, then return the chosen path.
-function withWarning(resolved: { path: string; warning?: string }): string {
+function resolveMcpVaultPath(): string {
+  const resolved = resolveVaultPath({ argPath: process.argv[2] });
   if (resolved.warning) {
     process.stderr.write(`contextnest-mcp: ${resolved.warning}\n`);
   }
   return resolved.path;
 }
 
-function resolveMcpVaultPath(): string {
-  if (process.env.CONTEXTNEST_VAULT || process.env.CONTEXTNEST_VAULT_PATH) {
-    return withWarning(resolveVaultPath());
-  }
-  const arg = process.argv[2];
-  if (arg) {
-    // A registered alias resolves via the registry; anything else is a raw path.
-    // Resolve in one shot (no separate probe → no TOCTOU window). Only an
-    // unregistered alias (UnknownAliasError) means arg isn't an alias → treat it
-    // as a raw path. A registered-but-stale alias (vault dir gone) must surface
-    // as a real error rather than being silently used as a bogus path.
-    try {
-      return withWarning(resolveVaultPath({ vaultAlias: arg }));
-    } catch (err) {
-      if (err instanceof UnknownAliasError) {
-        return arg;
-      }
-      throw err;
-    }
-  }
-  return withWarning(resolveVaultPath());
-}
-
-// Resolve at module load. A bad CONTEXTNEST_VAULT alias makes resolveVaultPath
+// Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
 // throw; catch it here so the user gets a clean message on stderr instead of an
 // unhandled Node stack trace, then exit non-zero.
 let vaultPath: string;

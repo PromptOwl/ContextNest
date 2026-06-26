@@ -188,6 +188,7 @@ export {
 } from "./registry.js";
 export type {
   AddVaultOptions,
+  RemoveVaultResult,
   VaultListEntry,
   VaultResolutionSource,
   ResolveVaultOptions,

@@ -47,7 +47,10 @@ const vaultRegistryEntrySchema = z.object({
 const vaultRegistrySchema = z.object({
   version: z.number().default(1),
   default: z.string().optional(),
-  vaults: z.record(z.string(), vaultRegistryEntrySchema).default({}),
+  // Validate alias keys on read too, not just in addVault — a hand-edited entry
+  // like "my vault" would otherwise be silently usable via CONTEXTNEST_VAULT,
+  // bypassing the shell-safety invariant.
+  vaults: z.record(z.string().regex(ALIAS_PATTERN), vaultRegistryEntrySchema).default({}),
 });
 
 /** A fresh empty registry. Constructed per call so the nested `vaults` object is never shared. */
@@ -196,17 +199,24 @@ export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions
   return registry;
 }
 
-export function removeVault(alias: string): VaultRegistry {
+export interface RemoveVaultResult {
+  registry: VaultRegistry;
+  /** True if the removed alias was the default (its default slot is now empty). */
+  wasDefault: boolean;
+}
+
+export function removeVault(alias: string): RemoveVaultResult {
   const registry = readRegistry();
   if (!registry.vaults[alias]) {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
   }
   delete registry.vaults[alias];
-  if (registry.default === alias) {
+  const wasDefault = registry.default === alias;
+  if (wasDefault) {
     delete registry.default;
   }
   writeRegistry(registry);
-  return registry;
+  return { registry, wasDefault };
 }
 
 export function setDefaultVault(alias: string): VaultRegistry {
@@ -276,6 +286,7 @@ export type VaultResolutionSource =
   | "flag"
   | "env-alias"
   | "env-path"
+  | "arg"
   | "local"
   | "default"
   | "cwd";
@@ -283,6 +294,12 @@ export type VaultResolutionSource =
 export interface ResolveVaultOptions {
   /** Alias from an explicit --vault flag. */
   vaultAlias?: string;
+  /**
+   * Positional argument (the MCP server's `contextnest-mcp <arg>`): a registered
+   * alias or an absolute vault path. Sits between the env vars and the local
+   * walk-up in precedence, matching the documented MCP order.
+   */
+  argPath?: string;
   /** Working directory to resolve from. Defaults to process.cwd(). */
   cwd?: string;
 }
@@ -312,47 +329,75 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     return { path: resolveAliasOrThrow(opts.vaultAlias), source: "flag", alias: opts.vaultAlias };
   }
 
-  // Lazily read the registry at most once, shared by the env-alias (step 2) and
-  // default (step 5) branches. The env-path/local early-returns never trigger a
-  // read at all.
+  // Lazily read the registry at most once, shared across the branches below.
   let registry: VaultRegistry | undefined;
   const getRegistry = (): VaultRegistry => (registry ??= readRegistry());
 
+  // Advisory about an ignored set-and-forget env var. It is only surfaced when
+  // we ultimately fall through to the bare cwd (step 7) — a concrete resolution
+  // (env-path, arg, local, default) means the user has a working vault, so
+  // nagging on every command would be noise.
+  let warning: string | undefined;
+
   // 2. CONTEXTNEST_VAULT env (alias). Unlike the flag, this is a persistent
   // set-and-forget setting, so a stale/unknown alias must NOT lock the user out
-  // of every command — use it when valid, otherwise warn and fall through (same
-  // resilience as the registry default in step 5).
-  let warning: string | undefined;
+  // of every command — use it when valid, otherwise warn and fall through.
   const envAlias = process.env.CONTEXTNEST_VAULT;
   if (envAlias) {
     const entry = getRegistry().vaults[envAlias];
     if (entry && isVaultRoot(entry.path)) {
       return { path: entry.path, source: "env-alias", alias: envAlias };
     }
-    warning = entry
+    warning ??= entry
       ? `CONTEXTNEST_VAULT="${envAlias}" points to "${entry.path}", which is no longer a vault — ignoring it.`
       : `CONTEXTNEST_VAULT="${envAlias}" is not a registered vault alias — ignoring it.`;
   }
 
-  // 3. CONTEXTNEST_VAULT_PATH env (absolute path) — backward compat
-  if (process.env.CONTEXTNEST_VAULT_PATH) {
-    return { path: process.env.CONTEXTNEST_VAULT_PATH, source: "env-path", warning };
+  // 3. CONTEXTNEST_VAULT_PATH env (absolute path). Validate it like every other
+  // source so a stale/mistyped path warns and falls through rather than handing
+  // back a non-vault that fails later with a cryptic ENOENT.
+  const envPath = process.env.CONTEXTNEST_VAULT_PATH;
+  if (envPath) {
+    if (isVaultRoot(envPath)) {
+      return { path: envPath, source: "env-path" };
+    }
+    warning ??= `CONTEXTNEST_VAULT_PATH="${envPath}" is not a vault (no .context/config.yaml) — ignoring it.`;
   }
 
-  // 4. local vault from cwd walk-up — backward compat
+  // 4. positional arg (MCP `contextnest-mcp <arg>`): a registered alias or an
+  // absolute vault path. A registered-but-stale alias is an explicit selection,
+  // so it throws; a non-alias that isn't an absolute path is almost certainly a
+  // typo, so it throws too (rather than silently becoming a bogus path).
+  if (opts.argPath) {
+    const arg = opts.argPath;
+    if (getRegistry().vaults[arg]) {
+      return { path: resolveAliasOrThrow(arg, getRegistry()), source: "arg", alias: arg };
+    }
+    if (!isAbsolute(arg)) {
+      throw new ConfigError(
+        `"${arg}" is not a registered vault alias and is not an absolute path.`,
+      );
+    }
+    if (isVaultRoot(arg)) {
+      return { path: arg, source: "arg" };
+    }
+    warning ??= `"${arg}" is not a vault (no .context/config.yaml) — ignoring it.`;
+  }
+
+  // 5. local vault from cwd walk-up — backward compat
   const local = findLocalVault(cwd);
   if (local) {
-    return { path: local, source: "local", warning };
+    return { path: local, source: "local" };
   }
 
-  // 5. registry default alias. Also an implicit fallback, so a stale default
+  // 6. registry default alias. Also an implicit fallback, so a stale default
   // (vault deleted/moved) must NOT throw — fall through to cwd instead.
   const reg = getRegistry();
   const defaultEntry = reg.default ? reg.vaults[reg.default] : undefined;
   if (defaultEntry && isVaultRoot(defaultEntry.path)) {
-    return { path: defaultEntry.path, source: "default", alias: reg.default, warning };
+    return { path: defaultEntry.path, source: "default", alias: reg.default };
   }
 
-  // 6. cwd fallback
+  // 7. cwd fallback — the only place the stale-env advisory surfaces.
   return { path: cwd, source: "cwd", warning };
 }

@@ -150,13 +150,22 @@ describe("vault registry", () => {
       expect(r).toMatchObject({ path: alpha, source: "env-alias", alias: "alpha" });
     });
 
-    it("3. CONTEXTNEST_VAULT_PATH beats local and default", () => {
-      const loose = join(tmp, "loose");
+    it("3. CONTEXTNEST_VAULT_PATH (a real vault) beats local and default", () => {
+      expect(resolveVaultPath({ cwd: alpha }).source).toBe("local"); // sanity: no env yet
+      process.env.CONTEXTNEST_VAULT_PATH = beta; // an actual vault root
       const r = resolveVaultPath({ cwd: alpha });
-      expect(r.source).toBe("local"); // sanity: no env yet
+      expect(r).toMatchObject({ path: beta, source: "env-path" });
+    });
+
+    it("3b. a stale CONTEXTNEST_VAULT_PATH warns and falls through", () => {
+      const loose = join(tmp, "loose"); // not a vault
+      mkdirSync(loose, { recursive: true });
       process.env.CONTEXTNEST_VAULT_PATH = loose;
-      const r2 = resolveVaultPath({ cwd: alpha });
-      expect(r2).toMatchObject({ path: loose, source: "env-path" });
+      const outside = join(tmp, "out-envpath");
+      mkdirSync(outside, { recursive: true });
+      const r = resolveVaultPath({ cwd: outside });
+      // falls through to the registry default; the advisory only surfaces at cwd
+      expect(r).toMatchObject({ path: beta, source: "default", alias: "beta" });
     });
 
     it("4. local vault (walk up) beats registry default", () => {
@@ -186,14 +195,26 @@ describe("vault registry", () => {
       expect(() => resolveVaultPath({ vaultAlias: "ghost" })).toThrow(/Unknown vault alias/);
     });
 
-    it("ignores a stale/unknown CONTEXTNEST_VAULT (warns, does not throw)", () => {
+    it("ignores a stale/unknown CONTEXTNEST_VAULT (does not throw), no warning when a vault resolves", () => {
       // An explicit --vault throws, but the persistent env var must not lock the
-      // user out: it falls through (here to the registry default) with a warning.
+      // user out: it falls through to the registry default. Since a concrete
+      // vault resolved, the advisory is suppressed (no per-command nag).
       process.env.CONTEXTNEST_VAULT = "ghost";
       const outside = join(tmp, "out-env");
       mkdirSync(outside, { recursive: true });
       const r = resolveVaultPath({ cwd: outside });
       expect(r).toMatchObject({ path: beta, source: "default", alias: "beta" });
+      expect(r.warning).toBeUndefined();
+    });
+
+    it("surfaces the stale-CONTEXTNEST_VAULT warning only at the cwd fallback", () => {
+      removeVault("alpha");
+      removeVault("beta"); // no default, no local vault below → cwd fallback
+      process.env.CONTEXTNEST_VAULT = "ghost";
+      const outside = join(tmp, "out-env-cwd");
+      mkdirSync(outside, { recursive: true });
+      const r = resolveVaultPath({ cwd: outside });
+      expect(r).toMatchObject({ path: outside, source: "cwd" });
       expect(r.warning).toMatch(/CONTEXTNEST_VAULT/);
     });
 
@@ -211,6 +232,28 @@ describe("vault registry", () => {
       mkdirSync(outside, { recursive: true });
       const r = resolveVaultPath({ cwd: outside });
       expect(r).toMatchObject({ path: outside, source: "cwd" });
+    });
+
+    // ── positional arg (MCP `contextnest-mcp <arg>`) ──────────────────────────
+    it("argPath resolves a registered alias", () => {
+      const r = resolveVaultPath({ argPath: "alpha", cwd: join(tmp, "x") });
+      expect(r).toMatchObject({ path: alpha, source: "arg", alias: "alpha" });
+    });
+
+    it("argPath resolves an absolute vault path", () => {
+      const r = resolveVaultPath({ argPath: beta, cwd: join(tmp, "x") });
+      expect(r).toMatchObject({ path: beta, source: "arg" });
+    });
+
+    it("argPath is still honored when CONTEXTNEST_VAULT is stale", () => {
+      // Regression: a stale env alias must not hide the positional arg.
+      process.env.CONTEXTNEST_VAULT = "ghost";
+      const r = resolveVaultPath({ argPath: "alpha", cwd: join(tmp, "x") });
+      expect(r).toMatchObject({ path: alpha, source: "arg", alias: "alpha" });
+    });
+
+    it("argPath that is neither an alias nor an absolute path throws (typo guard)", () => {
+      expect(() => resolveVaultPath({ argPath: "mytypo" })).toThrow(/not a registered vault alias/);
     });
   });
 });

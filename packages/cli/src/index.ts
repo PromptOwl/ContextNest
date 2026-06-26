@@ -54,6 +54,7 @@ import type {
   LayoutMode,
   GovernanceTier,
   RbacHook,
+  VaultRegistry,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
@@ -499,13 +500,13 @@ function slugifyAlias(name: string): string {
 // already in the registry. Re-running init in the same directory reuses the
 // existing alias (idempotent); a clash with a *different* path gets a numeric
 // suffix so we never silently overwrite someone else's alias.
-function defaultAliasFor(root: string): string {
+function defaultAliasFor(root: string, registry: VaultRegistry): string {
   const resolvedRoot = pathMod.resolve(root);
   const base = slugifyAlias(pathMod.basename(resolvedRoot));
-  // readRegistry() gives the alias → path map with a single YAML parse; listVaults()
-  // would additionally stat + read each vault's config (unneeded here).
+  // Use the registry map the caller already loaded — no extra read, no listVaults()
+  // stat/read per vault.
   const taken = new Map(
-    Object.entries(readRegistry().vaults).map(([alias, e]) => [alias, pathMod.resolve(e.path)]),
+    Object.entries(registry.vaults).map(([alias, e]) => [alias, pathMod.resolve(e.path)]),
   );
   const free = (alias: string) => !taken.has(alias) || taken.get(alias) === resolvedRoot;
   if (free(base)) return base;
@@ -714,8 +715,11 @@ program
     let registerAlias = selectedVaultAlias;
     let registerDescription = opts.description as string | undefined;
     const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    // One registry read for both the derived-alias collision check and the
+    // ownership check below (addVault re-reads internally for its write).
+    const registrySnapshot = readRegistry();
     if (!registerAlias) {
-      const defaultAlias = defaultAliasFor(root);
+      const defaultAlias = defaultAliasFor(root, registrySnapshot);
       if (canPrompt) {
         console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
         registerAlias = await promptAlias(defaultAlias);
@@ -728,9 +732,7 @@ program
     }
     if (registerAlias) {
       const resolvedRoot = pathMod.resolve(root);
-      // Read the registry map directly — listVaults() would stat + read every
-      // registered vault's config just to answer this one alias-ownership check.
-      const existing = readRegistry().vaults[registerAlias];
+      const existing = registrySnapshot.vaults[registerAlias];
       if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
         // The alias is already taken by a *different* vault. Don't silently
         // clobber it — the vault was still created; just skip registration.
@@ -2069,10 +2071,10 @@ vaultCmd
   .description("Unregister a vault alias")
   .action((alias: string) => {
     try {
-      const wasDefault = readRegistry().default === alias;
-      const reg = removeVault(alias);
+      // removeVault reports wasDefault from its single read — no pre-read needed.
+      const { wasDefault } = removeVault(alias);
       console.log(chalk.yellow(`Removed vault alias "${alias}"`));
-      if (wasDefault && !reg.default) {
+      if (wasDefault) {
         // Surface the silent loss of a default so commands without --vault don't
         // mysteriously start resolving to the local/cwd vault.
         console.log(
