@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { ConfigError, UnknownAliasError } from "./errors.js";
@@ -98,28 +98,31 @@ export function writeRegistry(registry: VaultRegistry): void {
   const tmp = `${target}.${process.pid}.tmp`;
   writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
   try {
-    renameSync(tmp, target);
-  } catch (renameErr) {
-    // On Windows, rename over an existing file can throw EPERM if the target is
-    // briefly locked (antivirus, a concurrent reader). Fall back to a copy there.
-    // On Unix a rename within one dir shouldn't fail for that reason, so surface
-    // the original error rather than masking it with a copy attempt.
-    if (process.platform !== "win32" && (renameErr as NodeJS.ErrnoException).code !== "EPERM") {
-      throw renameErr;
-    }
     try {
-      copyFileSync(tmp, target);
-      try {
-        unlinkSync(tmp);
-      } catch {
-        // temp cleanup is best-effort
+      renameSync(tmp, target);
+    } catch (renameErr) {
+      // Fall back to a copy ONLY on Windows EPERM (the target can be briefly
+      // locked by antivirus or a concurrent reader). Every other failure —
+      // including all Unix errors — is surfaced rather than masked by a copy.
+      if (process.platform !== "win32" || (renameErr as NodeJS.ErrnoException).code !== "EPERM") {
+        throw renameErr;
       }
-    } catch (copyErr) {
-      // Report the copy failure (the real cause of the rethrow), not the
-      // original rename error.
-      throw new ConfigError(
-        `Failed to write vault registry to "${target}": ${(copyErr as Error).message}. A temp file may remain at "${tmp}".`,
-      );
+      try {
+        copyFileSync(tmp, target);
+      } catch (copyErr) {
+        throw new ConfigError(
+          `Failed to write vault registry to "${target}": ${(copyErr as Error).message}.`,
+        );
+      }
+    }
+  } finally {
+    // Remove the temp file on every path: it's already gone after a successful
+    // rename (ENOENT, ignored here), and this prevents leaked `.<pid>.tmp` files
+    // when a write fails (e.g. ENOSPC), since each PID uses a distinct name.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // best-effort
     }
   }
 }
@@ -163,6 +166,11 @@ export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions
     throw new ConfigError(
       `Vault alias "${alias}" is invalid — use only letters, digits, hyphens, or underscores.`,
     );
+  }
+  // Store absolute paths only: the registry is read from arbitrary working
+  // directories, so a relative path would resolve differently at lookup time.
+  if (!isAbsolute(vaultPath)) {
+    throw new ConfigError(`Vault path must be absolute, got "${vaultPath}".`);
   }
   if (!isVaultRoot(vaultPath)) {
     throw new ConfigError(
@@ -304,6 +312,12 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     return { path: resolveAliasOrThrow(opts.vaultAlias), source: "flag", alias: opts.vaultAlias };
   }
 
+  // Lazily read the registry at most once, shared by the env-alias (step 2) and
+  // default (step 5) branches. The env-path/local early-returns never trigger a
+  // read at all.
+  let registry: VaultRegistry | undefined;
+  const getRegistry = (): VaultRegistry => (registry ??= readRegistry());
+
   // 2. CONTEXTNEST_VAULT env (alias). Unlike the flag, this is a persistent
   // set-and-forget setting, so a stale/unknown alias must NOT lock the user out
   // of every command — use it when valid, otherwise warn and fall through (same
@@ -311,7 +325,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   let warning: string | undefined;
   const envAlias = process.env.CONTEXTNEST_VAULT;
   if (envAlias) {
-    const entry = readRegistry().vaults[envAlias];
+    const entry = getRegistry().vaults[envAlias];
     if (entry && isVaultRoot(entry.path)) {
       return { path: entry.path, source: "env-alias", alias: envAlias };
     }
@@ -333,10 +347,10 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
 
   // 5. registry default alias. Also an implicit fallback, so a stale default
   // (vault deleted/moved) must NOT throw — fall through to cwd instead.
-  const registry = readRegistry();
-  const defaultEntry = registry.default ? registry.vaults[registry.default] : undefined;
+  const reg = getRegistry();
+  const defaultEntry = reg.default ? reg.vaults[reg.default] : undefined;
   if (defaultEntry && isVaultRoot(defaultEntry.path)) {
-    return { path: defaultEntry.path, source: "default", alias: registry.default, warning };
+    return { path: defaultEntry.path, source: "default", alias: reg.default, warning };
   }
 
   // 6. cwd fallback

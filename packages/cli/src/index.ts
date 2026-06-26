@@ -7,7 +7,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
-import { Command } from "commander";
+import { Command, Help } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "chalk";
@@ -70,6 +70,119 @@ program
   // When omitted, resolution falls back to env vars, the local vault, then the
   // registry default (see resolveVaultPath precedence in the engine).
   .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)");
+
+// ---------------------------------------------------------------------------
+// Friendly top-level help
+//
+// Commander's default `--help` prints every command in one flat, unexplained
+// list. For a 20+ command CLI that's hard to scan, so we replace the ROOT
+// command's help with a grouped, example-led screen. Subcommand help (e.g.
+// `ctx vault --help`) keeps Commander's default rendering.
+// ---------------------------------------------------------------------------
+
+/** Commands grouped by what the user is trying to do, with plain-English blurbs. */
+const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[] = [
+  {
+    title: "Set up a vault",
+    commands: [
+      ["init", "Create a new vault here (try --starter for a ready-made template)"],
+      ["vault", "Manage named vaults so you can switch with --vault <alias>"],
+      ["welcome", "Open the vault's welcome page in your browser"],
+    ],
+  },
+  {
+    title: "Create & edit documents",
+    commands: [
+      ["add", "Add a new document"],
+      ["read", "Show a document (add --html to open it in the browser)"],
+      ["update", "Edit a document, then auto-publish a new version"],
+      ["delete", "Remove a document and its version history"],
+    ],
+  },
+  {
+    title: "Find & retrieve context",
+    commands: [
+      ["list", "Browse documents (filter with --type / --status / --tag)"],
+      ["search", "Full-text search across the vault"],
+      ["query", "Pull context for an agent by selector — graph-aware and token-cheap"],
+      ["resolve", "List the documents a selector matches"],
+      ["pack", "Bundle documents into reusable context packs"],
+    ],
+  },
+  {
+    title: "Versions & snapshots",
+    commands: [
+      ["publish", "Bump a document's version and record a checkpoint"],
+      ["history", "Show a document's version history"],
+      ["reconstruct", "Rebuild a specific past version of a document"],
+      ["checkpoint", "Inspect vault-wide snapshots"],
+    ],
+  },
+  {
+    title: "Integrity & governance",
+    commands: [
+      ["verify", "Check every hash chain for tampering"],
+      ["validate", "Check documents against the Context Nest spec"],
+      ["drift", "Review edits made outside the CLI (suggestion workflow)"],
+      ["index", "Regenerate context.yaml and INDEX.md"],
+    ],
+  },
+  {
+    title: "Share",
+    commands: [["push", "Push the vault to a hosted ContextNest server"]],
+  },
+];
+
+/** Renders the grouped root help screen. */
+function renderRootHelp(): string {
+  const indent = "  ";
+  const names = HELP_GROUPS.flatMap((g) => g.commands.map(([n]) => n));
+  const col = Math.max(...names.map((n) => n.length)) + 3;
+  const lines: string[] = [];
+
+  lines.push(`${chalk.bold("Context Nest")} — a structured, versioned knowledge base your AI agents can query.`);
+  lines.push("");
+  lines.push(chalk.bold("USAGE"));
+  lines.push(`${indent}ctx <command> [options]`);
+  lines.push(`${indent}${chalk.dim("ctx --vault <alias> <command>   run against a named vault from any folder")}`);
+  lines.push("");
+  lines.push(chalk.bold("GETTING STARTED"));
+  for (const [cmd, hint] of [
+    ["ctx init", "create a vault in the current folder"],
+    ['ctx add notes/idea', "add a document"],
+    ['ctx query "#tag"', "retrieve matching context for an agent"],
+    ["ctx publish notes/idea", "version the document and snapshot the vault"],
+  ] as const) {
+    lines.push(`${indent}${chalk.cyan(cmd.padEnd(24))} ${chalk.dim(hint)}`);
+  }
+  lines.push("");
+  lines.push(chalk.bold("COMMANDS"));
+  for (const group of HELP_GROUPS) {
+    lines.push(`${indent}${chalk.bold(group.title)}`);
+    for (const [name, blurb] of group.commands) {
+      lines.push(`${indent}${indent}${chalk.cyan(name.padEnd(col))}${blurb}`);
+    }
+    lines.push("");
+  }
+  lines.push(chalk.bold("GLOBAL OPTIONS"));
+  lines.push(`${indent}${chalk.cyan("--vault <alias>".padEnd(col + 2))}target a registered vault by alias`);
+  lines.push(`${indent}${chalk.cyan("-V, --version".padEnd(col + 2))}print the version number`);
+  lines.push(`${indent}${chalk.cyan("-h, --help".padEnd(col + 2))}show this help`);
+  lines.push("");
+  lines.push(chalk.dim(`Run ${chalk.reset("ctx <command> --help")}${chalk.dim(" for the options and details of any command.")}`));
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+// Scope the custom formatter to the root command only; subcommands fall back to
+// Commander's default Help rendering.
+program.configureHelp({
+  formatHelp(cmd, helper) {
+    if (cmd === program) return renderRootHelp();
+    return Help.prototype.formatHelp.call(helper, cmd, helper);
+  },
+});
 
 // The --vault alias selected for the currently-running command. Captured by a
 // preAction hook so it works whether the flag is given before the subcommand
@@ -615,7 +728,9 @@ program
     }
     if (registerAlias) {
       const resolvedRoot = pathMod.resolve(root);
-      const existing = listVaults().find((v) => v.alias === registerAlias);
+      // Read the registry map directly — listVaults() would stat + read every
+      // registered vault's config just to answer this one alias-ownership check.
+      const existing = readRegistry().vaults[registerAlias];
       if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
         // The alias is already taken by a *different* vault. Don't silently
         // clobber it — the vault was still created; just skip registration.

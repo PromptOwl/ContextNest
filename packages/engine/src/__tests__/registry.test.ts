@@ -76,6 +76,11 @@ describe("vault registry", () => {
     expect(() => addVault("my-vault_1", v)).not.toThrow();
   });
 
+  it("rejects a relative vault path (must be absolute)", () => {
+    // A relative path would resolve differently depending on the cwd at lookup.
+    expect(() => addVault("rel", "some/relative/vault")).toThrow(/must be absolute/);
+  });
+
   it("rejects a duplicate alias unless forced", () => {
     const a = makeVault(join(tmp, "a"));
     const b = makeVault(join(tmp, "b"));
