@@ -171,13 +171,16 @@ export {
 export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
 
-// Vault registry (central alias → path mapping)
+// Vault registry (central alias → path mapping).
+// NOTE: writeRegistry is intentionally NOT re-exported — it bypasses alias/path
+// validation, so external callers must go through addVault/removeVault/
+// setDefaultVault. It stays exported from ./registry.js for the engine's own
+// tests, but is not part of the public API surface.
 export {
   ALIAS_PATTERN,
   getRegistryDir,
   getRegistryPath,
   readRegistry,
-  writeRegistry,
   isVaultRoot,
   findLocalVault,
   addVault,

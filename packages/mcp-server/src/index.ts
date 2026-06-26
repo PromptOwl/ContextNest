@@ -26,7 +26,6 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
-  resolveVaultPath,
   isRejected,
   normalizeStatus,
   STATUS_ALIASES,
@@ -37,22 +36,7 @@ import type {
   GovernanceTier,
   RbacHook,
 } from "@promptowl/contextnest-engine";
-
-/**
- * Resolve which vault to serve via the engine resolver, which owns the full
- * precedence: CONTEXTNEST_VAULT (alias) → CONTEXTNEST_VAULT_PATH (path) →
- * positional arg (alias or absolute path) → local walk-up → registry default →
- * cwd. The positional arg is threaded in as `argPath`, so a stale env alias no
- * longer hides it, and a typo'd arg surfaces a clear error instead of becoming
- * a bogus relative path.
- */
-function resolveMcpVaultPath(): string {
-  const resolved = resolveVaultPath({ argPath: process.argv[2] });
-  if (resolved.warning) {
-    process.stderr.write(`contextnest-mcp: ${resolved.warning}\n`);
-  }
-  return resolved.path;
-}
+import { resolveMcpVaultPath } from "./vault-resolution.js";
 
 // Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
 // throw; catch it here so the user gets a clean message on stderr instead of an

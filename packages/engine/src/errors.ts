@@ -92,6 +92,14 @@ export class UnknownAliasError extends ConfigError {
   constructor(public readonly alias: string, message: string) {
     super(message);
     this.name = "UnknownAliasError";
+    // ConfigError hardcodes code = "CONFIG_ERROR"; give this subtype its own
+    // stable code so callers can switch on `err.code` like every other error.
+    Object.defineProperty(this, "code", {
+      value: "UNKNOWN_ALIAS",
+      writable: false,
+      enumerable: true,
+      configurable: true,
+    });
   }
 }
 

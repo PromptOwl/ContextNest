@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   setDefaultVault,
   listVaults,
   readRegistry,
+  getRegistryDir,
   getRegistryPath,
   resolveVaultPath,
 } from "../registry.js";
@@ -125,6 +126,69 @@ describe("vault registry", () => {
     expect(() => setDefaultVault("nope")).toThrow(/No vault registered/);
   });
 
+  describe("readRegistry rejects corrupt config", () => {
+    /** Write raw bytes to the (sandboxed) registry path, creating its dir. */
+    function writeRawConfig(content: string): void {
+      mkdirSync(getRegistryDir(), { recursive: true });
+      writeFileSync(getRegistryPath(), content, "utf-8");
+    }
+
+    it("treats an empty / null document as an empty registry", () => {
+      writeRawConfig("\n# just a comment\n");
+      expect(readRegistry()).toEqual({ version: 1, vaults: {} });
+    });
+
+    it("throws ConfigError when the root is a scalar, not a mapping", () => {
+      writeRawConfig("just a string\n");
+      expect(() => readRegistry()).toThrow(ConfigError);
+    });
+
+    it("throws ConfigError when `vaults` is not a mapping", () => {
+      writeRawConfig("version: 1\nvaults: 5\n");
+      expect(() => readRegistry()).toThrow(ConfigError);
+    });
+
+    it("throws ConfigError on a hand-edited alias with illegal characters", () => {
+      // Catching this on read is the point: a "my vault" key must not be silently
+      // usable via CONTEXTNEST_VAULT, which would bypass the shell-safety invariant.
+      writeRawConfig('version: 1\nvaults:\n  "my vault":\n    path: /tmp/v\n');
+      expect(() => readRegistry()).toThrow(ConfigError);
+    });
+
+    it("throws ConfigError when an entry is missing its required path", () => {
+      writeRawConfig("version: 1\nvaults:\n  a:\n    description: no path here\n");
+      expect(() => readRegistry()).toThrow(ConfigError);
+    });
+
+    it("includes the registry path in the ConfigError message", () => {
+      writeRawConfig("oops\n");
+      expect(() => readRegistry()).toThrow(getRegistryPath());
+    });
+  });
+
+  describe("writeRegistry atomic write", () => {
+    it("leaves no temp file behind after a successful write", () => {
+      const v = makeVault(join(tmp, "a"));
+      addVault("a", v); // addVault → writeRegistry
+      const entries = readdirSync(getRegistryDir());
+      expect(entries).toContain("config.yaml");
+      // The atomic-write temp is `config.yaml.<pid>.tmp`; none must linger.
+      expect(entries.some((e) => e.endsWith(".tmp"))).toBe(false);
+    });
+
+    it("round-trips the registry through disk unchanged", () => {
+      const a = makeVault(join(tmp, "a"));
+      const b = makeVault(join(tmp, "b"));
+      addVault("a", a, { description: "first" });
+      addVault("b", b, { setDefault: true });
+      // Re-read from disk: a corrupt/truncated atomic write would fail to parse.
+      const reg = readRegistry();
+      expect(reg.default).toBe("b");
+      expect(reg.vaults.a).toMatchObject({ path: a, description: "first" });
+      expect(reg.vaults.b).toMatchObject({ path: b });
+    });
+  });
+
   describe("resolveVaultPath precedence", () => {
     let alpha: string;
     let beta: string;
@@ -168,6 +232,23 @@ describe("vault registry", () => {
       expect(r).toMatchObject({ path: beta, source: "default", alias: "beta" });
     });
 
+    it("3c. a valid CONTEXTNEST_VAULT_PATH is honored even when unregistered", () => {
+      // The path env var is a raw absolute path, not a registry lookup — an
+      // unregistered-but-real vault must still resolve via env-path.
+      const loose = makeVault(join(tmp, "loose-vault")); // a real vault, no alias
+      process.env.CONTEXTNEST_VAULT_PATH = loose;
+      const r = resolveVaultPath({ cwd: join(tmp, "anywhere") });
+      expect(r).toMatchObject({ path: loose, source: "env-path" });
+      expect(r.alias).toBeUndefined();
+    });
+
+    it("3d. CONTEXTNEST_VAULT_PATH outranks the positional arg", () => {
+      // Precedence: env-path (step 3) sits above argPath (step 4).
+      process.env.CONTEXTNEST_VAULT_PATH = beta;
+      const r = resolveVaultPath({ argPath: "alpha", cwd: join(tmp, "x") });
+      expect(r).toMatchObject({ path: beta, source: "env-path" });
+    });
+
     it("4. local vault (walk up) beats registry default", () => {
       const nested = join(alpha, "nodes", "deep");
       mkdirSync(nested, { recursive: true });
@@ -195,19 +276,20 @@ describe("vault registry", () => {
       expect(() => resolveVaultPath({ vaultAlias: "ghost" })).toThrow(/Unknown vault alias/);
     });
 
-    it("ignores a stale/unknown CONTEXTNEST_VAULT (does not throw), no warning when a vault resolves", () => {
+    it("ignores a stale/unknown CONTEXTNEST_VAULT (does not throw) but carries the advisory", () => {
       // An explicit --vault throws, but the persistent env var must not lock the
-      // user out: it falls through to the registry default. Since a concrete
-      // vault resolved, the advisory is suppressed (no per-command nag).
+      // user out: it falls through to the registry default. The advisory is
+      // carried on the result so a diagnostic caller (ctx vault which) can show
+      // it; normal commands decide whether to print it.
       process.env.CONTEXTNEST_VAULT = "ghost";
       const outside = join(tmp, "out-env");
       mkdirSync(outside, { recursive: true });
       const r = resolveVaultPath({ cwd: outside });
       expect(r).toMatchObject({ path: beta, source: "default", alias: "beta" });
-      expect(r.warning).toBeUndefined();
+      expect(r.warning).toMatch(/CONTEXTNEST_VAULT/);
     });
 
-    it("surfaces the stale-CONTEXTNEST_VAULT warning only at the cwd fallback", () => {
+    it("carries the stale-CONTEXTNEST_VAULT advisory at the cwd fallback too", () => {
       removeVault("alpha");
       removeVault("beta"); // no default, no local vault below → cwd fallback
       process.env.CONTEXTNEST_VAULT = "ghost";
@@ -215,6 +297,15 @@ describe("vault registry", () => {
       mkdirSync(outside, { recursive: true });
       const r = resolveVaultPath({ cwd: outside });
       expect(r).toMatchObject({ path: outside, source: "cwd" });
+      expect(r.warning).toMatch(/CONTEXTNEST_VAULT/);
+    });
+
+    it("carries the advisory even when a local vault resolves (CLI suppresses the print)", () => {
+      process.env.CONTEXTNEST_VAULT = "ghost";
+      const nested = join(alpha, "nodes", "deep2");
+      mkdirSync(nested, { recursive: true });
+      const r = resolveVaultPath({ cwd: nested });
+      expect(r).toMatchObject({ path: alpha, source: "local" });
       expect(r.warning).toMatch(/CONTEXTNEST_VAULT/);
     });
 
@@ -254,6 +345,16 @@ describe("vault registry", () => {
 
     it("argPath that is neither an alias nor an absolute path throws (typo guard)", () => {
       expect(() => resolveVaultPath({ argPath: "mytypo" })).toThrow(/not a registered vault alias/);
+    });
+
+    it("an explicit absolute argPath that isn't a vault throws (no silent fallthrough)", () => {
+      // Regression: an explicit MCP arg pointing at a not-yet-mounted path must
+      // not silently fall through to the registry default.
+      const notYet = join(tmp, "not-a-vault");
+      mkdirSync(notYet, { recursive: true });
+      expect(() => resolveVaultPath({ argPath: notYet, cwd: join(tmp, "x") })).toThrow(
+        /is not a vault/,
+      );
     });
   });
 });

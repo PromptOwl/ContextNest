@@ -44,6 +44,7 @@ import {
   setDefaultVault,
   listVaults,
   readRegistry,
+  findLocalVault,
   getRegistryPath,
   ALIAS_PATTERN,
   normalizeStatus,
@@ -202,7 +203,10 @@ function getVaultRoot(): string {
     vaultAlias: selectedVaultAlias,
     cwd: process.cwd(),
   });
-  if (resolved.warning) {
+  // Surface a stale-env advisory, but stay quiet when a *local* vault resolved:
+  // standing inside a vault directory is a deliberate, unambiguous choice, so a
+  // forgotten env var there is noise. `ctx vault which` shows it unconditionally.
+  if (resolved.warning && resolved.source !== "local") {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
   return resolved.path;
@@ -730,7 +734,12 @@ program
         registerAlias = defaultAlias;
       }
     }
-    if (registerAlias) {
+
+    // Registration is performed AFTER the starter is applied (see registerVault
+    // below) so an interruption mid-starter never leaves a registry alias
+    // pointing at a half-populated vault.
+    const registerVault = (): void => {
+      if (!registerAlias) return;
       const resolvedRoot = pathMod.resolve(root);
       const existing = registrySnapshot.vaults[registerAlias];
       if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
@@ -746,26 +755,26 @@ program
             `  To repoint it: ctx vault add ${registerAlias} ${resolvedRoot} --force`,
           ),
         );
-      } else {
-        try {
-          // force is safe here: the alias is either free or already points to
-          // this same vault (idempotent re-init).
-          const reg = addVault(registerAlias, resolvedRoot, {
-            description: registerDescription,
-            setDefault: opts.setDefault,
-            force: true,
-          });
-          const isDefault = reg.default === registerAlias;
-          console.log(
-            chalk.green(
-              `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${root}`,
-            ),
-          );
-        } catch (err) {
-          console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
-        }
+        return;
       }
-    }
+      try {
+        // force is safe here: the alias is either free or already points to
+        // this same vault (idempotent re-init).
+        const reg = addVault(registerAlias, resolvedRoot, {
+          description: registerDescription,
+          setDefault: opts.setDefault,
+          force: true,
+        });
+        const isDefault = reg.default === registerAlias;
+        console.log(
+          chalk.green(
+            `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${root}`,
+          ),
+        );
+      } catch (err) {
+        console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
+      }
+    };
 
     // Resolve which starter to apply. An explicit --starter wins. Otherwise,
     // when running in an interactive terminal, prompt the user to pick one.
@@ -804,6 +813,10 @@ program
       // Don't reprint the recipe list if the interactive picker just showed it.
       await printEmptyVaultGuidance(root, opts, { showList: !interactive });
     }
+
+    // Register only now that the vault is fully initialized (structure + any
+    // starter content), so the registry never points at a partial vault.
+    registerVault();
   });
 
 // ─── ctx read ──────────────────────────────────────────────────────────────────
@@ -2040,16 +2053,28 @@ vaultCmd
 
 vaultCmd
   .command("add <alias> [path]")
-  .description("Register a vault path under an alias (path defaults to the resolved vault root)")
+  .description("Register a vault path under an alias (path defaults to the vault in the current directory)")
   .option("--description <text>", "Short label for this alias")
   .option("--set-default", "Make this the default vault")
   .option("--force", "Overwrite an existing alias")
   .action((alias: string, path: string | undefined, opts) => {
     try {
-      // Resolve the target inside the try: when no path is given, getVaultRoot()
-      // can throw (e.g. a stale CONTEXTNEST_VAULT alias), and the user should get
-      // a clear error rather than an uncaught throw from Commander.
-      const target = pathMod.resolve(path || getVaultRoot());
+      // With no explicit path, "register the vault I'm in" — resolve strictly
+      // from the cwd walk-up, NOT getVaultRoot() (which honors CONTEXTNEST_VAULT
+      // and could register the wrong vault under this alias).
+      let target: string;
+      if (path) {
+        target = pathMod.resolve(path);
+      } else {
+        const local = findLocalVault(process.cwd());
+        if (!local) {
+          console.log(
+            chalk.red("No vault found in the current directory. Pass a path: ctx vault add <alias> <path>"),
+          );
+          process.exit(1);
+        }
+        target = pathMod.resolve(local);
+      }
       const reg = addVault(alias, target, {
         description: opts.description,
         setDefault: opts.setDefault,
@@ -2112,6 +2137,12 @@ vaultCmd
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
+      // which is the diagnostic command — always surface a stale-env advisory,
+      // even when a vault resolved (unlike normal commands, which stay quiet for
+      // a local resolution).
+      if (resolved.warning) {
+        console.error(chalk.yellow(resolved.warning));
+      }
       console.log(resolved.path);
       console.log(
         chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),

@@ -99,8 +99,10 @@ export function writeRegistry(registry: VaultRegistry): void {
   // a truncated/corrupt file. Temp file is on the same dir so rename is atomic.
   const target = getRegistryPath();
   const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
   try {
+    // Inside the try so the finally also cleans up a temp file left behind when
+    // writeFileSync itself fails partway (e.g. ENOSPC, permission error).
+    writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600 });
     try {
       renameSync(tmp, target);
     } catch (renameErr) {
@@ -365,9 +367,10 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   }
 
   // 4. positional arg (MCP `contextnest-mcp <arg>`): a registered alias or an
-  // absolute vault path. A registered-but-stale alias is an explicit selection,
-  // so it throws; a non-alias that isn't an absolute path is almost certainly a
-  // typo, so it throws too (rather than silently becoming a bogus path).
+  // absolute vault path. It is an *explicit* selection, so anything that doesn't
+  // resolve to a real vault throws rather than silently falling through to a
+  // different one: a stale alias, a non-absolute non-alias (typo), AND an
+  // absolute path that isn't (yet) a vault.
   if (opts.argPath) {
     const arg = opts.argPath;
     if (getRegistry().vaults[arg]) {
@@ -378,16 +381,18 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
         `"${arg}" is not a registered vault alias and is not an absolute path.`,
       );
     }
-    if (isVaultRoot(arg)) {
-      return { path: arg, source: "arg" };
+    if (!isVaultRoot(arg)) {
+      throw new ConfigError(`"${arg}" is not a vault (no .context/config.yaml).`);
     }
-    warning ??= `"${arg}" is not a vault (no .context/config.yaml) — ignoring it.`;
+    return { path: arg, source: "arg" };
   }
 
-  // 5. local vault from cwd walk-up — backward compat
+  // 5. local vault from cwd walk-up — backward compat. Carry any stale-env
+  // advisory: an explicit override was set and ignored, so the caller (e.g.
+  // `ctx vault which`) can surface it even though a vault did resolve.
   const local = findLocalVault(cwd);
   if (local) {
-    return { path: local, source: "local" };
+    return { path: local, source: "local", warning };
   }
 
   // 6. registry default alias. Also an implicit fallback, so a stale default
@@ -395,9 +400,9 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   const reg = getRegistry();
   const defaultEntry = reg.default ? reg.vaults[reg.default] : undefined;
   if (defaultEntry && isVaultRoot(defaultEntry.path)) {
-    return { path: defaultEntry.path, source: "default", alias: reg.default };
+    return { path: defaultEntry.path, source: "default", alias: reg.default, warning };
   }
 
-  // 7. cwd fallback — the only place the stale-env advisory surfaces.
+  // 7. cwd fallback.
   return { path: cwd, source: "cwd", warning };
 }
