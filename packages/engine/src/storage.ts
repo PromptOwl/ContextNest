@@ -99,7 +99,10 @@ export class NestStorage {
     let patterns: string[];
 
     if (layout === "structured") {
-      patterns = ["nodes/**/*.md", "sources/**/*.md"];
+      // Include root-level *.md so a node is discoverable wherever it lives,
+      // not only under nodes/ or sources/. Agent-config and scaffold files at
+      // the root are excluded via the ignore list below.
+      patterns = ["*.md", "nodes/**/*.md", "sources/**/*.md"];
     } else {
       patterns = ["**/*.md"];
     }
@@ -113,6 +116,11 @@ export class NestStorage {
         "**/INDEX.md",
         "CONTEXT.md",
         "context.yaml",
+        // Agent-config / scaffold files are not knowledge nodes.
+        "**/CLAUDE.md",
+        "**/GEMINI.md",
+        "**/AGENTS.md",
+        "**/README.md",
       ],
       dot: false,
       // Skip unreadable directories rather than failing the whole crawl.

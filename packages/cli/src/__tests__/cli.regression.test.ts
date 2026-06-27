@@ -216,6 +216,14 @@ describe("[regression] ctx add", () => {
     expect(onDisk).toMatch(/type:\s*skill/);
     expect(onDisk).toMatch(/trigger:\s*when asked to deploy/);
   });
+
+  it("stores a bare slug under nodes/ instead of the vault root", () => {
+    const out = runCtx(tmp, ["add", "qaish", "--title", "Qaish"]);
+    expect(out).toMatch(/Created and published nodes\/qaish\.md/);
+    // The file lands in nodes/, not at the vault root.
+    expect(existsSync(join(tmp, "nodes", "qaish.md"))).toBe(true);
+    expect(existsSync(join(tmp, "qaish.md"))).toBe(false);
+  });
 });
 
 // ─── read ────────────────────────────────────────────────────────────────────
@@ -327,6 +335,36 @@ describe("[regression] ctx search", () => {
     const parsed = JSON.parse(runCtx(tmp, ["search", "Findable", "--json"]));
     const ids = parsed.map((d: { id: string }) => d.id);
     expect(ids).toContain("nodes/searchable");
+  });
+
+  it("finds a bare-slug node now that add stores it under nodes/", () => {
+    runCtx(tmp, ["add", "qaish", "--title", "Qaish Bareslug"]);
+    const parsed = JSON.parse(runCtx(tmp, ["search", "Bareslug", "--json"]));
+    const ids = parsed.map((d: { id: string }) => d.id);
+    expect(ids).toContain("nodes/qaish");
+  });
+
+  it("finds a root-level file added without `ctx add` (live discovery)", () => {
+    // A file dropped at the vault root by hand — no `ctx add`, no re-index.
+    writeFileSync(
+      join(tmp, "stray.md"),
+      [
+        "---",
+        "title: Stray Root Doc",
+        "type: document",
+        "status: published",
+        "version: 1",
+        "---",
+        "",
+        "# Stray Root Doc",
+        "",
+        "Findable even at the root.",
+        "",
+      ].join("\n"),
+    );
+    const parsed = JSON.parse(runCtx(tmp, ["search", "Stray", "--json"]));
+    const ids = parsed.map((d: { id: string }) => d.id);
+    expect(ids).toContain("stray");
   });
 });
 

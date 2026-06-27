@@ -8,3 +8,6 @@ local_vault
 fixtures/*
 # Keep the committed test vault tracked (it backs the engine test suite).
 !fixtures/minimal-vault/
+
+# Test coverage output
+coverage/
