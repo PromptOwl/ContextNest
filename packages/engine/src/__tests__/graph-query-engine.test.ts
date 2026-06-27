@@ -133,7 +133,11 @@ describe("GraphQueryEngine — graph mode", () => {
     const result = await engine.query("#engineering");
 
     expect(result.traces.length).toBe(1);
-    expect(result.traces[0].document_ref).toBe("contextnest://nodes/api");
+    const trace = result.traces[0];
+    expect(trace.trace_type).toBe("access");
+    expect(trace.trace_type === "access" && trace.document_ref).toBe(
+      "contextnest://nodes/api",
+    );
   });
 });
 
