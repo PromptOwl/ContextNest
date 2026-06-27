@@ -1,3 +1,0 @@
-- [Vault Registry Architecture](vault-registry.md) — central alias→path registry, resolveVaultPath precedence, security model
-- [Engine Conventions](engine-conventions.md) — error hierarchy, schema/validation, export surface, env-var conventions
-- [Review Environment Constraints](review-env.md) — Bash git fetch and pnpm build/test/lint are denied in this sandbox
