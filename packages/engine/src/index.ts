@@ -199,7 +199,7 @@ export type {
 } from "./registry.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL } from "./storage.js";
+export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";
 export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
 
 // URI

@@ -48,6 +48,7 @@ import {
   getRegistryPath,
   ALIAS_PATTERN,
   normalizeStatus,
+  normalizeDocumentId,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -905,10 +906,7 @@ program
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .action(async (path, opts) => {
     const storage = getStorage();
-    // Default bare slugs into nodes/ so they land where discovery scans;
-    // explicit folder paths (nodes/x, sources/y) are respected as-is.
-    const raw = path.replace(/\.md$/, "").replace(/^\/+/, "");
-    const id = raw.includes("/") ? raw : `nodes/${raw}`;
+    const id = normalizeDocumentId(path);
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const tagList = opts.tags

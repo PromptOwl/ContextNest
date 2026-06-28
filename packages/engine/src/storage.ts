@@ -37,6 +37,25 @@ import {
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
 
+/**
+ * Normalize a user-supplied document path/slug into a canonical document id.
+ *
+ * Single source of truth shared by every client (CLI, MCP) so a bare slug
+ * resolves to the same place no matter which surface created it:
+ *   - strips a trailing `.md` extension,
+ *   - strips leading slashes,
+ *   - defaults a bare slug (no `/`) into `nodes/` so it lands where discovery
+ *     scans; explicit folder paths (`nodes/x`, `sources/y`) are respected as-is.
+ *
+ * @example normalizeDocumentId("my-doc")        // "nodes/my-doc"
+ * @example normalizeDocumentId("sources/cfg")   // "sources/cfg"
+ * @example normalizeDocumentId("/nodes/x.md")   // "nodes/x"
+ */
+export function normalizeDocumentId(raw: string): string {
+  const trimmed = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+  return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
+}
+
 /** Options for `NestStorage.readDocument`. */
 export interface ReadDocumentOptions {
   /**

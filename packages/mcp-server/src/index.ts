@@ -29,6 +29,7 @@ import {
   isRejected,
   normalizeStatus,
   STATUS_ALIASES,
+  normalizeDocumentId,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -582,7 +583,10 @@ server.tool(
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
   },
   async ({ path, title, type, tags, body, trigger, tools_required, output_format }) => {
-    const id = path.replace(/\.md$/, "");
+    // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
+    // lands in the same place as one created via `ctx add` (single source of
+    // truth — normalizeDocumentId in the engine).
+    const id = normalizeDocumentId(path);
 
     // Check if document already exists
     try {
