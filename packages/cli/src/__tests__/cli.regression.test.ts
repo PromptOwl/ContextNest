@@ -203,6 +203,22 @@ describe("[regression] ctx add", () => {
     expect(onDisk).toMatch(/#api/);
   });
 
+  it("normalizes space-separated tags (--tags '#cmd #analyze') into discrete tags", () => {
+    runCtx(tmp, ["add", "nodes/space-tags", "--tags", "#cmd #analyze"]);
+    const onDisk = readFileSync(join(tmp, "nodes", "space-tags.md"), "utf-8");
+    expect(onDisk).toMatch(/#cmd/);
+    expect(onDisk).toMatch(/#analyze/);
+    expect(onDisk).not.toMatch(/#cmd #analyze/);
+  });
+
+  it("space-separated tags on add are queryable by individual tag", () => {
+    runCtx(tmp, ["add", "nodes/queryable-tags", "--tags", "#alpha #beta"]);
+    const matched = JSON.parse(runCtx(tmp, ["resolve", "#alpha", "--json"])).map(
+      (d: { id: string }) => d.id,
+    );
+    expect(matched).toContain("nodes/queryable-tags");
+  });
+
   it("scaffolds a skill block for --type skill", () => {
     runCtx(tmp, [
       "add",
@@ -359,6 +375,19 @@ describe("[regression] ctx update", () => {
     expect(out).toMatch(/No new version cut/);
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
     expect(onDisk).toMatch(/status:\s*draft/);
+  });
+
+  it("normalizes space-separated tags on update into discrete queryable tags", () => {
+    runCtx(tmp, ["update", "nodes/mutable", "--tags", "#foo #bar"]);
+    const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
+    expect(onDisk).toMatch(/#foo/);
+    expect(onDisk).toMatch(/#bar/);
+    expect(onDisk).not.toMatch(/#foo #bar/);
+
+    const matched = JSON.parse(runCtx(tmp, ["resolve", "#foo", "--json"])).map(
+      (d: { id: string }) => d.id,
+    );
+    expect(matched).toContain("nodes/mutable");
   });
 });
 

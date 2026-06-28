@@ -634,7 +634,7 @@ program
   .description("Create a new document with frontmatter template")
   .option("-t, --type <type>", "Node type", "document")
   .option("--title <title>", "Document title")
-  .option("--tags <tags>", "Comma-separated tags")
+  .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .action(async (path, opts) => {
@@ -643,7 +643,7 @@ program
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const tagList = opts.tags
-      ? opts.tags.split(",").map((t: string) => t.trim()).map((t: string) => (t.startsWith("#") ? t : `#${t}`))
+      ? opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`))
       : undefined;
     const frontmatter: Frontmatter = {
       title,
@@ -1230,7 +1230,7 @@ program
   .command("update <path>")
   .description("Update a document's frontmatter and/or body, then auto-publish")
   .option("--title <title>", "New title")
-  .option("--tags <tags>", "New tags (comma-separated, replaces existing)")
+  .option("--tags <tags>", "New tags (comma- or space-separated, replaces existing)")
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
@@ -1243,7 +1243,7 @@ program
       doc.frontmatter.status = normalizeStatus(opts.status);
     }
     if (opts.tags !== undefined) {
-      doc.frontmatter.tags = opts.tags.split(",").map((t: string) => t.trim()).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
+      doc.frontmatter.tags = opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
     }
     doc.frontmatter.updated_at = new Date().toISOString();
 
