@@ -63,6 +63,13 @@ describe("Bug 1: concurrent publishes keep the checkpoint chain consistent", () 
     const report = verifyCheckpointChain(cpHistory!.checkpoints, histories);
     expect(report.errors).toEqual([]);
     expect(report.valid).toBe(true);
+
+    // All documents must appear in the final checkpoint — none were dropped under the race.
+    const latestCp = cpHistory!.checkpoints[cpHistory!.checkpoints.length - 1];
+    for (const id of ids) {
+      expect(Object.keys(latestCp.document_versions)).toContain(id);
+      expect(Object.keys(latestCp.document_chain_hashes)).toContain(id);
+    }
   });
 });
 
@@ -121,12 +128,13 @@ describe("Bug 2: rebuildCheckpointHistory converges and is idempotent", () => {
     expect(report.errors).toEqual([]);
     expect(report.valid).toBe(true);
 
-    // Idempotency: running again produces a structurally identical history.
+    // Capture on-disk state written by the first rebuild.
+    const onDisk1 = await storage.readCheckpointHistory();
+
+    // Idempotency: a second rebuild must produce the same history and write the same bytes.
     const second = await cm.rebuildCheckpointHistory();
     expect(second.history).toEqual(first.history);
 
-    // And the on-disk bytes are identical too.
-    const onDisk1 = await storage.readCheckpointHistory();
     const onDisk2 = await storage.readCheckpointHistory();
     expect(onDisk2).toEqual(onDisk1);
   });
