@@ -7,7 +7,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
-import { Command } from "commander";
+import { Command, Help } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "chalk";
@@ -38,7 +38,17 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  resolveVaultPath,
+  addVault,
+  removeVault,
+  setDefaultVault,
+  listVaults,
+  readRegistry,
+  findLocalVault,
+  getRegistryPath,
+  ALIAS_PATTERN,
   normalizeStatus,
+  normalizeDocumentId,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -46,6 +56,7 @@ import type {
   LayoutMode,
   GovernanceTier,
   RbacHook,
+  VaultRegistry,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
@@ -57,37 +68,157 @@ const program = new Command();
 program
   .name("ctx")
   .description("Context Nest CLI — manage structured, versioned context vaults")
-  .version(pkg.version);
+  .version(pkg.version)
+  // Global selector: target a registered vault by alias from any directory.
+  // When omitted, resolution falls back to env vars, the local vault, then the
+  // registry default (see resolveVaultPath precedence in the engine).
+  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)");
 
-// Helper: resolve vault root — walks up from cwd to find .context/config.yaml (like git finds .git/)
-function getVaultRoot(): string {
-  if (process.env.CONTEXTNEST_VAULT_PATH) {
-    return process.env.CONTEXTNEST_VAULT_PATH;
+// ---------------------------------------------------------------------------
+// Friendly top-level help
+//
+// Commander's default `--help` prints every command in one flat, unexplained
+// list. For a 20+ command CLI that's hard to scan, so we replace the ROOT
+// command's help with a grouped, example-led screen. Subcommand help (e.g.
+// `ctx vault --help`) keeps Commander's default rendering.
+// ---------------------------------------------------------------------------
+
+/** Commands grouped by what the user is trying to do, with plain-English blurbs. */
+const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[] = [
+  {
+    title: "Set up a vault",
+    commands: [
+      ["init", "Create a new vault here (try --starter for a ready-made template)"],
+      ["vault", "Manage named vaults so you can switch with --vault <alias>"],
+      ["welcome", "Open the vault's welcome page in your browser"],
+    ],
+  },
+  {
+    title: "Create & edit documents",
+    commands: [
+      ["add", "Add a new document"],
+      ["read", "Show a document (add --html to open it in the browser)"],
+      ["update", "Edit a document, then auto-publish a new version"],
+      ["delete", "Remove a document and its version history"],
+    ],
+  },
+  {
+    title: "Find & retrieve context",
+    commands: [
+      ["list", "Browse documents (filter with --type / --status / --tag)"],
+      ["search", "Full-text search across the vault"],
+      ["query", "Pull context for an agent by selector — graph-aware and token-cheap"],
+      ["resolve", "List the documents a selector matches"],
+      ["pack", "Bundle documents into reusable context packs"],
+    ],
+  },
+  {
+    title: "Versions & snapshots",
+    commands: [
+      ["publish", "Bump a document's version and record a checkpoint"],
+      ["history", "Show a document's version history"],
+      ["reconstruct", "Rebuild a specific past version of a document"],
+      ["checkpoint", "Inspect vault-wide snapshots"],
+    ],
+  },
+  {
+    title: "Integrity & governance",
+    commands: [
+      ["verify", "Check every hash chain for tampering"],
+      ["validate", "Check documents against the Context Nest spec"],
+      ["drift", "Review edits made outside the CLI (suggestion workflow)"],
+      ["index", "Regenerate context.yaml and INDEX.md"],
+    ],
+  },
+  {
+    title: "Share",
+    commands: [["push", "Push the vault to a hosted ContextNest server"]],
+  },
+];
+
+/** Renders the grouped root help screen. */
+function renderRootHelp(): string {
+  const indent = "  ";
+  const names = HELP_GROUPS.flatMap((g) => g.commands.map(([n]) => n));
+  const col = Math.max(...names.map((n) => n.length)) + 3;
+  const lines: string[] = [];
+
+  lines.push(`${chalk.bold("Context Nest")} — a structured, versioned knowledge base your AI agents can query.`);
+  lines.push("");
+  lines.push(chalk.bold("USAGE"));
+  lines.push(`${indent}ctx <command> [options]`);
+  lines.push(`${indent}${chalk.dim("ctx --vault <alias> <command>   run against a named vault from any folder")}`);
+  lines.push("");
+  lines.push(chalk.bold("GETTING STARTED"));
+  for (const [cmd, hint] of [
+    ["ctx init", "create a vault in the current folder"],
+    ['ctx add notes/idea', "add a document"],
+    ['ctx query "#tag"', "retrieve matching context for an agent"],
+    ["ctx publish notes/idea", "version the document and snapshot the vault"],
+  ] as const) {
+    lines.push(`${indent}${chalk.cyan(cmd.padEnd(24))} ${chalk.dim(hint)}`);
   }
-
-  let dir = process.cwd();
-  while (true) {
-    const configPath = pathMod.join(dir, ".context", "config.yaml");
-    try {
-      fs.statSync(configPath);
-      return dir;
-    } catch {
-      // not found, try parent
+  lines.push("");
+  lines.push(chalk.bold("COMMANDS"));
+  for (const group of HELP_GROUPS) {
+    lines.push(`${indent}${chalk.bold(group.title)}`);
+    for (const [name, blurb] of group.commands) {
+      lines.push(`${indent}${indent}${chalk.cyan(name.padEnd(col))}${blurb}`);
     }
-    const parent = pathMod.dirname(dir);
-    if (parent === dir) break; // reached filesystem root
-    dir = parent;
+    lines.push("");
   }
+  lines.push(chalk.bold("GLOBAL OPTIONS"));
+  lines.push(`${indent}${chalk.cyan("--vault <alias>".padEnd(col + 2))}target a registered vault by alias`);
+  lines.push(`${indent}${chalk.cyan("-V, --version".padEnd(col + 2))}print the version number`);
+  lines.push(`${indent}${chalk.cyan("-h, --help".padEnd(col + 2))}show this help`);
+  lines.push("");
+  lines.push(chalk.dim(`Run ${chalk.reset("ctx <command> --help")}${chalk.dim(" for the options and details of any command.")}`));
+  lines.push("");
 
-  // No vault found — fall back to cwd (ctx init will create one here)
-  return process.cwd();
+  return lines.join("\n");
+}
+
+// Scope the custom formatter to the root command only; subcommands fall back to
+// Commander's default Help rendering.
+program.configureHelp({
+  formatHelp(cmd, helper) {
+    if (cmd === program) return renderRootHelp();
+    return Help.prototype.formatHelp.call(helper, cmd, helper);
+  },
+});
+
+// The --vault alias selected for the currently-running command. Captured by a
+// preAction hook so it works whether the flag is given before the subcommand
+// (`ctx --vault work list`) or after it (`ctx list --vault work`).
+let selectedVaultAlias: string | undefined;
+
+program.hook("preAction", (_thisCommand, actionCommand) => {
+  selectedVaultAlias = actionCommand.optsWithGlobals().vault as string | undefined;
+});
+
+// Helper: resolve vault root. Delegates to the engine resolver, which applies
+// precedence: --vault flag > CONTEXTNEST_VAULT (alias) > CONTEXTNEST_VAULT_PATH
+// (path) > local vault (walk up cwd) > registry default > cwd.
+function getVaultRoot(): string {
+  const resolved = resolveVaultPath({
+    vaultAlias: selectedVaultAlias,
+    cwd: process.cwd(),
+  });
+  // Surface a stale-env advisory, but stay quiet when a *local* vault resolved:
+  // standing inside a vault directory is a deliberate, unambiguous choice, so a
+  // forgotten env var there is noise. `ctx vault which` shows it unconditionally.
+  if (resolved.warning && resolved.source !== "local") {
+    console.error(chalk.yellow(`Warning: ${resolved.warning}`));
+  }
+  return resolved.path;
 }
 
 // Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
-// must NOT walk up the tree — initializing a vault is always a "create here"
-// operation. Walking up would resolve to an ancestor vault (e.g. a stray
-// ~/.context/config.yaml), causing init to operate on the wrong directory
-// (the "misresolved to home" bug). The explicit env override still wins.
+// must NOT walk up the tree or consult the registry — initializing a vault is
+// always a "create here" operation. Walking up would resolve to an ancestor
+// vault (e.g. a stray ~/.context/config.yaml), causing init to operate on the
+// wrong directory (the "misresolved to home" bug). The explicit env override
+// still wins.
 function getInitRoot(): string {
   return process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
 }
@@ -355,6 +486,72 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
   });
 }
 
+// ─── Vault registration prompts (ctx init) ──────────────────────────────────────
+
+// ALIAS_PATTERN is imported from the engine (single source of truth) so the
+// interactive prompt validates the same way addVault() does.
+
+// Derive a sensible default alias from a directory name, sanitized to the
+// allowed alias characters.
+function slugifyAlias(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "vault";
+}
+
+// Pick a default alias for `root` that doesn't collide with a different vault
+// already in the registry. Re-running init in the same directory reuses the
+// existing alias (idempotent); a clash with a *different* path gets a numeric
+// suffix so we never silently overwrite someone else's alias.
+function defaultAliasFor(root: string, registry: VaultRegistry): string {
+  const resolvedRoot = pathMod.resolve(root);
+  const base = slugifyAlias(pathMod.basename(resolvedRoot));
+  // Use the registry map the caller already loaded — no extra read, no listVaults()
+  // stat/read per vault.
+  const taken = new Map(
+    Object.entries(registry.vaults).map(([alias, e]) => [alias, pathMod.resolve(e.path)]),
+  );
+  const free = (alias: string) => !taken.has(alias) || taken.get(alias) === resolvedRoot;
+  if (free(base)) return base;
+  let n = 2;
+  while (!free(`${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
+// Prompt for a free-text answer, returning the default when the user hits Enter.
+function promptText(question: string, defaultValue?: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const suffix = defaultValue ? chalk.dim(` [${defaultValue}]`) : "";
+  return new Promise((resolve) => {
+    rl.question(`  ${question}${suffix}: `, (answer) => {
+      rl.close();
+      resolve(answer.trim() || defaultValue || "");
+    });
+  });
+}
+
+// Prompt for a vault alias, re-asking until it matches ALIAS_PATTERN.
+function promptAlias(defaultAlias: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(`  Vault alias ${chalk.dim(`[${defaultAlias}]`)}: `, (answer) => {
+        const alias = answer.trim() || defaultAlias;
+        if (ALIAS_PATTERN.test(alias)) {
+          rl.close();
+          resolve(alias);
+          return;
+        }
+        console.log(chalk.red("  Use only letters, digits, hyphens, or underscores."));
+        ask();
+      });
+    };
+    ask();
+  });
+}
+
 // Apply a starter recipe to a freshly-initialized vault: write + publish its
 // nodes/packs, persist its maintenance directive, regenerate the index, and
 // print the post-init summary + AI agent prompt.
@@ -497,6 +694,8 @@ program
   .option("-n, --name <name>", "Vault name", "My Context Nest")
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
+  .option("--set-default", "Make the new vault the registry default")
+  .option("--description <text>", "Description/label for the registry entry")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -513,6 +712,70 @@ program
     const storage = new NestStorage(root);
     await storage.init(opts.name, opts.layout as LayoutMode);
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
+
+    // Register the new vault in the central registry so it can be targeted from
+    // any directory via `ctx --vault <alias> ...`. The alias comes from an
+    // explicit --vault flag, an interactive prompt, or (non-interactively) a
+    // directory-derived default — so init always registers the vault.
+    let registerAlias = selectedVaultAlias;
+    let registerDescription = opts.description as string | undefined;
+    const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    // One registry read for both the derived-alias collision check and the
+    // ownership check below (addVault re-reads internally for its write).
+    const registrySnapshot = readRegistry();
+    if (!registerAlias) {
+      const defaultAlias = defaultAliasFor(root, registrySnapshot);
+      if (canPrompt) {
+        console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
+        registerAlias = await promptAlias(defaultAlias);
+        if (!registerDescription) {
+          registerDescription = (await promptText("Vault description (optional)")) || undefined;
+        }
+      } else {
+        registerAlias = defaultAlias;
+      }
+    }
+
+    // Registration is performed AFTER the starter is applied (see registerVault
+    // below) so an interruption mid-starter never leaves a registry alias
+    // pointing at a half-populated vault.
+    const registerVault = (): void => {
+      if (!registerAlias) return;
+      const resolvedRoot = pathMod.resolve(root);
+      const existing = registrySnapshot.vaults[registerAlias];
+      if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
+        // The alias is already taken by a *different* vault. Don't silently
+        // clobber it — the vault was still created; just skip registration.
+        console.log(
+          chalk.yellow(
+            `  Vault alias "${registerAlias}" already points to ${existing.path} — not overwriting.`,
+          ),
+        );
+        console.log(
+          chalk.dim(
+            `  To repoint it: ctx vault add ${registerAlias} ${resolvedRoot} --force`,
+          ),
+        );
+        return;
+      }
+      try {
+        // force is safe here: the alias is either free or already points to
+        // this same vault (idempotent re-init).
+        const reg = addVault(registerAlias, resolvedRoot, {
+          description: registerDescription,
+          setDefault: opts.setDefault,
+          force: true,
+        });
+        const isDefault = reg.default === registerAlias;
+        console.log(
+          chalk.green(
+            `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${root}`,
+          ),
+        );
+      } catch (err) {
+        console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
+      }
+    };
 
     // Resolve which starter to apply. An explicit --starter wins. Otherwise,
     // when running in an interactive terminal, prompt the user to pick one.
@@ -551,6 +814,10 @@ program
       // Don't reprint the recipe list if the interactive picker just showed it.
       await printEmptyVaultGuidance(root, opts, { showList: !interactive });
     }
+
+    // Register only now that the vault is fully initialized (structure + any
+    // starter content), so the registry never points at a partial vault.
+    registerVault();
   });
 
 // ─── ctx read ──────────────────────────────────────────────────────────────────
@@ -563,7 +830,7 @@ program
   .option("--raw", "Output raw file content (frontmatter + body)")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     if (opts.raw) {
@@ -639,7 +906,7 @@ program
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const tagList = opts.tags
@@ -708,7 +975,7 @@ program
     let docs: ContextNode[];
 
     if (path) {
-      const id = path.replace(/\.md$/, "");
+      const id = normalizeDocumentId(path);
       docs = [await storage.readDocument(id)];
     } else {
       // Validation is an audit path — retired docs still need to be
@@ -826,7 +1093,7 @@ program
   .option("-m, --message <note>", "Version note")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
       editedBy: opts.author,
@@ -849,7 +1116,7 @@ program
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const history = await vm.getHistory(id);
 
@@ -879,7 +1146,7 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, parseInt(version, 10));
     console.log(content);
@@ -1235,7 +1502,7 @@ program
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     if (opts.title !== undefined) doc.frontmatter.title = opts.title;
@@ -1305,7 +1572,7 @@ program
   .description("Delete a document and its version history")
   .action(async (path) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     const doc = await storage.readDocument(id);
     await storage.deleteDocument(id);
@@ -1603,7 +1870,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
     if (!history || history.versions.length === 0) {
@@ -1652,7 +1919,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const metas = await listSuggestions(storage, id);
 
     if (opts.json) {
@@ -1685,7 +1952,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
@@ -1721,7 +1988,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
@@ -1749,6 +2016,142 @@ drift
         `\nNote: canonical file on disk still has the drifted bytes. To restore last-approved content, run:\n  ctx read-version ${id} <last-version> > ${id}.md`,
       ),
     );
+  });
+
+// ─── ctx vault ───────────────────────────────────────────────────────────────
+
+const vaultCmd = program
+  .command("vault")
+  .description("Manage the central vault registry (alias → path)");
+
+vaultCmd
+  .command("list")
+  .description("List registered vaults")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    const vaults = listVaults();
+    if (opts.json) {
+      console.log(JSON.stringify(vaults, null, 2));
+      return;
+    }
+    if (vaults.length === 0) {
+      console.log(
+        chalk.dim(`No vaults registered. Add one with: ${chalk.yellow("ctx vault add <alias> [path]")}`),
+      );
+      console.log(chalk.dim(`Registry: ${getRegistryPath()}`));
+      return;
+    }
+    console.log(chalk.bold("\nRegistered vaults:\n"));
+    for (const v of vaults) {
+      const marker = v.isDefault ? chalk.green(" *") : "  ";
+      const missing = v.exists ? "" : chalk.red("  [missing]");
+      console.log(`${marker} ${chalk.cyan(v.alias)}${missing}`);
+      if (v.description) console.log(`     ${chalk.dim(v.description)}`);
+      console.log(`     ${chalk.dim(v.path)}`);
+    }
+    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + getRegistryPath())}\n`);
+  });
+
+vaultCmd
+  .command("add <alias> [path]")
+  .description("Register a vault path under an alias (path defaults to the vault in the current directory)")
+  .option("--description <text>", "Short label for this alias")
+  .option("--set-default", "Make this the default vault")
+  .option("--force", "Overwrite an existing alias")
+  .action((alias: string, path: string | undefined, opts) => {
+    try {
+      // With no explicit path, "register the vault I'm in" — resolve strictly
+      // from the cwd walk-up, NOT getVaultRoot() (which honors CONTEXTNEST_VAULT
+      // and could register the wrong vault under this alias).
+      let target: string;
+      if (path) {
+        target = pathMod.resolve(path);
+      } else {
+        const local = findLocalVault(process.cwd());
+        if (!local) {
+          console.log(
+            chalk.red("No vault found in the current directory. Pass a path: ctx vault add <alias> <path>"),
+          );
+          process.exit(1);
+        }
+        target = pathMod.resolve(local);
+      }
+      const reg = addVault(alias, target, {
+        description: opts.description,
+        setDefault: opts.setDefault,
+        force: opts.force,
+      });
+      const isDefault = reg.default === alias;
+      console.log(
+        chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${target}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("remove <alias>")
+  .alias("rm")
+  .description("Unregister a vault alias")
+  .action((alias: string) => {
+    try {
+      // removeVault reports wasDefault from its single read — no pre-read needed.
+      const { wasDefault } = removeVault(alias);
+      console.log(chalk.yellow(`Removed vault alias "${alias}"`));
+      if (wasDefault) {
+        // Surface the silent loss of a default so commands without --vault don't
+        // mysteriously start resolving to the local/cwd vault.
+        console.log(
+          chalk.dim(
+            "  That was the default vault — no default is set now. " +
+              "Set one with `ctx vault default <alias>`.",
+          ),
+        );
+      }
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("default <alias>")
+  .description("Set the default vault")
+  .action((alias: string) => {
+    try {
+      setDefaultVault(alias);
+      console.log(chalk.green(`Default vault is now "${chalk.bold(alias)}"`));
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("which")
+  .description("Show which vault the CLI would use right now, and why (respects --vault)")
+  .action(() => {
+    try {
+      const resolved = resolveVaultPath({
+        vaultAlias: selectedVaultAlias,
+        cwd: process.cwd(),
+      });
+      // which is the diagnostic command — always surface a stale-env advisory,
+      // even when a vault resolved (unlike normal commands, which stay quiet for
+      // a local resolution).
+      if (resolved.warning) {
+        console.error(chalk.yellow(resolved.warning));
+      }
+      console.log(resolved.path);
+      console.log(
+        chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
   });
 
 // Parse and run

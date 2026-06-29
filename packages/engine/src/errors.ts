@@ -83,6 +83,27 @@ export class ConfigError extends ContextNestError {
 }
 
 /**
+ * Raised when a `--vault`/`CONTEXTNEST_VAULT` alias is not present in the vault
+ * registry. A distinct subtype (rather than message matching) so callers can
+ * cleanly distinguish "not a registered alias → treat as a path" from a
+ * registered-but-stale alias, which is a plain ConfigError.
+ */
+export class UnknownAliasError extends ConfigError {
+  constructor(public readonly alias: string, message: string) {
+    super(message);
+    this.name = "UnknownAliasError";
+    // ConfigError hardcodes code = "CONFIG_ERROR"; give this subtype its own
+    // stable code so callers can switch on `err.code` like every other error.
+    Object.defineProperty(this, "code", {
+      value: "UNKNOWN_ALIAS",
+      writable: false,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+}
+
+/**
  * Raised when a document's frontmatter-declared zone contradicts its
  * folder-implied zone (zone-classification-rbac-spec §2.4). Per spec, the
  * document remains injectable; the Czar resolves via the Inbox.

@@ -7,9 +7,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["packages/**/*.regression.test.ts"],
-    // Spawning a child server + MCP handshake is slower than a unit test.
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
+    // Spawning a child server/CLI + handshake is slower than a unit test, and
+    // notably slower on the Windows CI runners (process startup cost). Generous
+    // timeouts keep these subprocess-heavy e2e suites from flaking under load.
+    testTimeout: 60_000,
+    hookTimeout: 60_000,
     pool: "forks",
   },
 });

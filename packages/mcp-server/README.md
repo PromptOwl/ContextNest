@@ -59,11 +59,27 @@ gemini mcp add contextnest -- contextnest-mcp /path/to/your/vault
 contextnest-mcp /path/to/your/vault
 ```
 
+The positional argument may also be a **registered alias** (see the CLI's
+`ctx vault add`), in which case the path is looked up in the central registry
+(`~/.contextnest/config.yaml`):
+
+```bash
+contextnest-mcp work
+```
+
 Or via environment variable:
 
 ```bash
+# Absolute path
 CONTEXTNEST_VAULT_PATH=/path/to/vault contextnest-mcp
+# …or a registered alias (overrides the registry default)
+CONTEXTNEST_VAULT=work contextnest-mcp
 ```
+
+The vault is resolved with this precedence: `CONTEXTNEST_VAULT` (alias) →
+`CONTEXTNEST_VAULT_PATH` (path) → positional argument (alias or path) → a vault
+found above the current directory → the registry's default alias → the current
+directory.
 
 ## Tools
 

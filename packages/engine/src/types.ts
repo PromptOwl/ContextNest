@@ -374,6 +374,30 @@ export interface NestConfig {
   agent_tools?: string[];
 }
 
+/**
+ * A single registered vault in the central registry (~/.contextnest/config.yaml).
+ * The registry only stores paths — vaults are not physically relocated.
+ */
+export interface VaultRegistryEntry {
+  /** Absolute path to the vault root (the directory containing .context/config.yaml). */
+  path: string;
+  /** Optional short label for this alias, independent of the vault's own name. */
+  description?: string;
+}
+
+/**
+ * Central vault registry. Maps short aliases to vault paths so the CLI and MCP
+ * server can target any vault from any working directory (analogous to AWS
+ * named profiles). Stored at ~/.contextnest/config.yaml.
+ */
+export interface VaultRegistry {
+  version: number;
+  /** Alias of the default vault, used when no flag/env selects one. */
+  default?: string;
+  /** Registered vaults, keyed by alias. */
+  vaults: Record<string, VaultRegistryEntry>;
+}
+
 /** Trace entry for document access (§9.2) */
 export interface AccessTrace {
   trace_type: "access";

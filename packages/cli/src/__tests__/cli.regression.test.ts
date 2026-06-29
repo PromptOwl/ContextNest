@@ -11,7 +11,7 @@
  * `vitest run -t regression`.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -31,7 +31,20 @@ import type { AddressInfo } from "node:net";
 const here = dirname(fileURLToPath(import.meta.url));
 const distPath = join(here, "..", "..", "dist", "index.js");
 
-const ENV = { ...process.env, CONTEXTNEST_NO_BROWSER: "1" } as NodeJS.ProcessEnv;
+// Sandbox the central vault registry so `ctx init` (which auto-registers an
+// alias non-interactively) never touches the developer's / CI runner's real
+// ~/.contextnest/config.yaml. Cleared up after the whole suite.
+const CONFIG_DIR = mkdtempSync(join(tmpdir(), "cn-cli-reg-cfg-"));
+afterAll(() => rmSync(CONFIG_DIR, { recursive: true, force: true }));
+
+const ENV = {
+  ...process.env,
+  CONTEXTNEST_NO_BROWSER: "1",
+  CONTEXTNEST_CONFIG_DIR: CONFIG_DIR,
+  // Neutralize any ambient selectors so resolution is deterministic.
+  CONTEXTNEST_VAULT: "",
+  CONTEXTNEST_VAULT_PATH: "",
+} as NodeJS.ProcessEnv;
 
 /** Run the CLI and return stdout. Throws on a non-zero exit. */
 function runCtx(cwd: string, args: string[]): string {
@@ -216,6 +229,14 @@ describe("[regression] ctx add", () => {
     expect(onDisk).toMatch(/type:\s*skill/);
     expect(onDisk).toMatch(/trigger:\s*when asked to deploy/);
   });
+
+  it("stores a bare slug under nodes/ instead of the vault root", () => {
+    const out = runCtx(tmp, ["add", "qaish", "--title", "Qaish"]);
+    expect(out).toMatch(/Created and published nodes\/qaish\.md/);
+    // The file lands in nodes/, not at the vault root.
+    expect(existsSync(join(tmp, "nodes", "qaish.md"))).toBe(true);
+    expect(existsSync(join(tmp, "qaish.md"))).toBe(false);
+  });
 });
 
 // ─── read ────────────────────────────────────────────────────────────────────
@@ -242,6 +263,18 @@ describe("[regression] ctx read", () => {
   it("accepts a path with a trailing .md extension", () => {
     const out = runCtx(tmp, ["read", "nodes/readme.md", "--raw"]);
     expect(out).toMatch(/title:\s*Read Me/);
+  });
+
+  it("reads and publishes a doc back by the same bare slug it was created with", () => {
+    // Regression: `add` normalizes a bare slug into nodes/, so every other
+    // command must normalize identically or the doc is unreachable by slug.
+    runCtx(tmp, ["add", "qaish", "--title", "Qaish", "--body", "Bare slug body"]);
+    // read by bare slug resolves (would throw DOCUMENT_NOT_FOUND pre-fix).
+    const out = runCtx(tmp, ["read", "qaish"]);
+    expect(out).toMatch(/Qaish/);
+    expect(out).toMatch(/Bare slug body/);
+    // publish by bare slug resolves too (does not error out).
+    expect(() => runCtx(tmp, ["publish", "qaish"])).not.toThrow();
   });
 });
 
@@ -327,6 +360,36 @@ describe("[regression] ctx search", () => {
     const parsed = JSON.parse(runCtx(tmp, ["search", "Findable", "--json"]));
     const ids = parsed.map((d: { id: string }) => d.id);
     expect(ids).toContain("nodes/searchable");
+  });
+
+  it("finds a bare-slug node now that add stores it under nodes/", () => {
+    runCtx(tmp, ["add", "qaish", "--title", "Qaish Bareslug"]);
+    const parsed = JSON.parse(runCtx(tmp, ["search", "Bareslug", "--json"]));
+    const ids = parsed.map((d: { id: string }) => d.id);
+    expect(ids).toContain("nodes/qaish");
+  });
+
+  it("finds a root-level file added without `ctx add` (live discovery)", () => {
+    // A file dropped at the vault root by hand — no `ctx add`, no re-index.
+    writeFileSync(
+      join(tmp, "stray.md"),
+      [
+        "---",
+        "title: Stray Root Doc",
+        "type: document",
+        "status: published",
+        "version: 1",
+        "---",
+        "",
+        "# Stray Root Doc",
+        "",
+        "Findable even at the root.",
+        "",
+      ].join("\n"),
+    );
+    const parsed = JSON.parse(runCtx(tmp, ["search", "Stray", "--json"]));
+    const ids = parsed.map((d: { id: string }) => d.id);
+    expect(ids).toContain("stray");
   });
 });
 

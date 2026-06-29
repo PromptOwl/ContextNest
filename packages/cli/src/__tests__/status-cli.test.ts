@@ -3,7 +3,7 @@
  * Spawns the compiled CLI as a subprocess against an isolated vault.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -18,10 +18,24 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const distPath = join(here, "..", "..", "dist", "index.js");
 
+// Sandbox the central vault registry so `ctx init` (which auto-registers an
+// alias non-interactively) never writes to the developer's / CI runner's real
+// ~/.contextnest/config.yaml. Cleared up after the whole suite.
+const CONFIG_DIR = mkdtempSync(join(tmpdir(), "cn-status-cli-cfg-"));
+afterAll(() => rmSync(CONFIG_DIR, { recursive: true, force: true }));
+
+const ENV = {
+  ...process.env,
+  CONTEXTNEST_NO_BROWSER: "1",
+  CONTEXTNEST_CONFIG_DIR: CONFIG_DIR,
+  CONTEXTNEST_VAULT: "",
+  CONTEXTNEST_VAULT_PATH: "",
+} as NodeJS.ProcessEnv;
+
 function runCtx(cwd: string, args: string[]): string {
   return execFileSync("node", [distPath, ...args], {
     cwd,
-    env: { ...process.env, CONTEXTNEST_NO_BROWSER: "1" },
+    env: ENV,
     encoding: "utf-8",
   });
 }
@@ -30,7 +44,7 @@ function initVault(cwd: string) {
   execFileSync(
     "node",
     [distPath, "init", "--name", "status-vault", "--layout", "structured"],
-    { cwd, env: { ...process.env, CONTEXTNEST_NO_BROWSER: "1" }, stdio: "ignore" },
+    { cwd, env: ENV, stdio: "ignore" },
   );
 }
 

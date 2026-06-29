@@ -29,6 +29,7 @@ import {
   isRejected,
   normalizeStatus,
   STATUS_ALIASES,
+  normalizeDocumentId,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -36,9 +37,18 @@ import type {
   GovernanceTier,
   RbacHook,
 } from "@promptowl/contextnest-engine";
+import { resolveMcpVaultPath } from "./vault-resolution.js";
 
-// Resolve vault path from env or args
-const vaultPath = process.env.CONTEXTNEST_VAULT_PATH || process.argv[2] || process.cwd();
+// Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
+// throw; catch it here so the user gets a clean message on stderr instead of an
+// unhandled Node stack trace, then exit non-zero.
+let vaultPath: string;
+try {
+  vaultPath = resolveMcpVaultPath();
+} catch (err) {
+  process.stderr.write(`contextnest-mcp: ${(err as Error).message}\n`);
+  process.exit(1);
+}
 const storage = new NestStorage(vaultPath);
 
 const server = new McpServer({
@@ -154,7 +164,10 @@ server.tool(
       const parsed = parseUri(uri);
       docId = parsed.path;
     } else {
-      docId = uri.replace(/\.md$/, "");
+      // Mirror create_document: a bare slug resolves into nodes/ so a doc is
+      // readable by the same path it was created with (normalizeDocumentId is
+      // the single source of truth across every surface).
+      docId = normalizeDocumentId(uri);
     }
 
     const doc = await storage.readDocument(docId);
@@ -538,7 +551,7 @@ server.tool(
     version: z.number().describe("Version number to reconstruct"),
   },
   async ({ path, version }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
 
@@ -573,7 +586,10 @@ server.tool(
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
   },
   async ({ path, title, type, tags, body, trigger, tools_required, output_format }) => {
-    const id = path.replace(/\.md$/, "");
+    // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
+    // lands in the same place as one created via `ctx add` (single source of
+    // truth — normalizeDocumentId in the engine).
+    const id = normalizeDocumentId(path);
 
     // Check if document already exists
     try {
@@ -680,7 +696,7 @@ server.tool(
     body: z.string().optional().describe("New markdown body content"),
   },
   async ({ path, title, tags, status, body }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     // Normalize caller-supplied status to canonical before any guard or
@@ -819,7 +835,7 @@ server.tool(
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
   },
   async ({ path }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     // Verify the document exists before deleting
     const doc = await storage.readDocument(id);
@@ -853,7 +869,7 @@ server.tool(
     note: z.string().optional().describe("Version note"),
   },
   async ({ path, author, note }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
       editedBy: author,
@@ -894,7 +910,7 @@ server.tool(
     note: z.string().optional().describe("Optional human note explaining the drift"),
   },
   async ({ path, actor, note }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
     if (!history || history.versions.length === 0) {
@@ -959,7 +975,7 @@ server.tool(
   "List all staged suggestions for a document",
   { path: z.string().describe("Document path (e.g., 'nodes/api-design')") },
   async ({ path }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const metas = await listSuggestions(storage, id);
     return {
       content: [
@@ -988,7 +1004,7 @@ server.tool(
     comment: z.string().optional().describe("Optional approval comment recorded in the chain event"),
   },
   async ({ path, suggestion_id, actor, comment }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
@@ -1038,7 +1054,7 @@ server.tool(
     actor: z.string().optional().describe("Actor identity recorded as rejector. Defaults to 'local-mcp'."),
   },
   async ({ path, suggestion_id, reason, actor }) => {
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
