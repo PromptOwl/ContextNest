@@ -136,10 +136,12 @@ export function parseDocument(
   // Normalize status to canonical before downstream consumers see it.
   // Aliases (`cancelled`, `superseded`, `active`, …) and unknown values are
   // resolved here so zod validation, predicates, retrieval filters, and
-  // index generation all operate on canonical values.
-  if (parsed.data.status !== undefined) {
-    parsed.data.status = normalizeStatus(parsed.data.status);
-  }
+  // index generation all operate on canonical values. Done unconditionally: a
+  // document with no `status` field (pre-v1.1 / hand-authored) defaults to
+  // `draft` (normalizeStatus(undefined) === "draft") rather than staying
+  // `undefined`, which `isRetrievable` would treat as neither published nor
+  // draft — making the doc visible in listings but invisible to query/resolve.
+  parsed.data.status = normalizeStatus(parsed.data.status);
 
   // Copy frontmatter so callers mutating returned node don't leak back into
   // gray-matter's internal parse state (gray-matter caches by input string;

@@ -27,7 +27,7 @@ import type {
   PendingChange,
   VerificationReport,
 } from "./types.js";
-import { DocumentNotFoundError } from "./errors.js";
+import { ContextNestError, DocumentNotFoundError } from "./errors.js";
 import {
   packSchema,
   documentHistorySchema,
@@ -46,13 +46,26 @@ export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
  *   - strips leading slashes,
  *   - defaults a bare slug (no `/`) into `nodes/` so it lands where discovery
  *     scans; explicit folder paths (`nodes/x`, `sources/y`) are respected as-is.
+ *   - rejects `..` segments — callers always join the id against the vault root,
+ *     so a traversal sequence would escape the vault (arbitrary read/write/delete
+ *     via a manipulated CLI/MCP path).
  *
  * @example normalizeDocumentId("my-doc")        // "nodes/my-doc"
  * @example normalizeDocumentId("sources/cfg")   // "sources/cfg"
  * @example normalizeDocumentId("/nodes/x.md")   // "nodes/x"
+ * @example normalizeDocumentId("../../etc/x")   // throws — path traversal
  */
 export function normalizeDocumentId(raw: string): string {
   const trimmed = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+  // A legitimate document id never contains a `..` segment; treating one as a
+  // path would let it escape the vault root. Reject it at this single choke
+  // point that every CLI/MCP path conversion flows through.
+  if (trimmed.split(/[/\\]/).some((seg) => seg === "..")) {
+    throw new ContextNestError(
+      `Invalid document id "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
   return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
 }
 
@@ -155,12 +168,15 @@ export class NestStorage {
       // Root-level discovery (structured layout) globs *.md at the vault root so
       // a node can live anywhere. But a vault root commonly holds scaffold files
       // (CHANGELOG, CONTRIBUTING, LICENSE, SECURITY, …) that are NOT knowledge
-      // nodes. Require frontmatter before treating a root file as a node — an
-      // authored node always has frontmatter; plain scaffold markdown does not.
+      // nodes. Require authored frontmatter before treating a root file as a node
+      // — an authored node always has frontmatter; plain scaffold markdown does
+      // not. parseDocument injects a default `status` even when none was present,
+      // so the scaffold signal is "no authored keys beyond that injected status".
       // (Only root-level files in structured layout: nodes/ and sources/ files
       // are always nodes, and Obsidian notes legitimately have no frontmatter.)
       const isRootLevel = !file.includes("/");
-      if (layout === "structured" && isRootLevel && Object.keys(node.frontmatter).length === 0) {
+      const authoredKeys = Object.keys(node.frontmatter).filter((k) => k !== "status");
+      if (layout === "structured" && isRootLevel && authoredKeys.length === 0) {
         continue;
       }
       nodes.push(node);
@@ -186,37 +202,24 @@ export class NestStorage {
     id: string,
     options: ReadDocumentOptions = {},
   ): Promise<ContextNode> {
-    // Resolve the on-disk file. Clients normalize a bare slug into nodes/
-    // (normalizeDocumentId), but a node may legitimately live at the vault root
-    // (root-level discovery). Try the id as given, then — for a nodes/<slug> id
-    // with no further nesting — fall back to the root so a root node stays
-    // readable by the same slug it surfaces under in list/search.
-    let filePath = join(this.root, `${id}.md`);
-    let resolvedId = id;
+    // Read the file at exactly `${id}.md`. We deliberately do NOT fall back to a
+    // root-level file for a `nodes/<slug>` id: writes always target `${id}.md`,
+    // so a read that silently resolved elsewhere would split a later
+    // update_document into a second file and leave the original stale. Root-level
+    // nodes remain discoverable via list/search; they are addressed by their own
+    // (root) id, not by a normalized `nodes/` slug.
+    const filePath = join(this.root, `${id}.md`);
     let liveContent: string;
     try {
       liveContent = await readFile(filePath, "utf-8");
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      const rootSlug = id.startsWith("nodes/") ? id.slice("nodes/".length) : null;
-      if (rootSlug && !rootSlug.includes("/")) {
-        const rootPath = join(this.root, `${rootSlug}.md`);
-        try {
-          liveContent = await readFile(rootPath, "utf-8");
-          filePath = rootPath;
-          resolvedId = rootSlug;
-        } catch (rootErr: unknown) {
-          if ((rootErr as NodeJS.ErrnoException).code === "ENOENT") {
-            throw new DocumentNotFoundError(id);
-          }
-          throw rootErr;
-        }
-      } else {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         throw new DocumentNotFoundError(id);
       }
+      throw err;
     }
 
-    const liveNode = parseDocument(filePath, liveContent, resolvedId);
+    const liveNode = parseDocument(filePath, liveContent, id);
     if (!options.verifyChecksum) {
       return liveNode;
     }
@@ -229,7 +232,7 @@ export class NestStorage {
     // Drift detected. Try to serve last-approved canonical content
     // (hootie-inbox-spec §4.2). Live bytes are NEVER promoted into
     // canonical state here — that happens only via approval (step 7).
-    const approved = await this.readLatestApprovedKeyframe(resolvedId);
+    const approved = await this.readLatestApprovedKeyframe(id);
     const pendingChange: PendingChange = {
       suggestion_id: UNSTAGED_DRIFT_SENTINEL,
       detected_at: new Date().toISOString(),
@@ -238,7 +241,7 @@ export class NestStorage {
     };
 
     if (approved) {
-      const approvedNode = parseDocument(filePath, approved.content, resolvedId);
+      const approvedNode = parseDocument(filePath, approved.content, id);
       return { ...approvedNode, pendingChange };
     }
 

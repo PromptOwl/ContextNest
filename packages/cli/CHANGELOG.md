@@ -1,5 +1,20 @@
 # @promptowl/contextnest-cli
 
+## 1.2.0
+
+### Minor Changes
+
+- Support the new document status lifecycle (`draft`, `pending_review`, `approved`, `published`, `rejected`) and its case-insensitive aliases. `ctx update --status` and `ctx list --status` accept alias values (e.g. `active`, `cancelled`, `superseded`) and persist/filter on the canonical value; unknown values fall back to `draft`. `ctx index` rewrites any aliased on-disk status to canonical.
+- Add a `ctx vault` command group (`list`, `add`, `remove`, `default`, `which`) and a global `--vault <alias>` selector usable before or after any subcommand, so any registered vault can be targeted from any directory. Resolution is delegated to the engine's central registry; `ctx vault which` reports which vault would be used and why.
+
+  A document created by a bare slug (`ctx add foo` → `nodes/foo`) is now reachable by that same slug from every command (`read`, `publish`, `update`, `delete`, `history`, `validate`, `reconstruct`) — previously only `add` normalized into `nodes/` while the others looked at the vault root, so the document was unreachable by its slug.
+
+### Patch Changes
+
+- Normalize space-separated `--tags` input (e.g. `--tags "#cmd #analyze"`) into discrete tags in `ctx add` and `ctx update`, matching the existing comma-separated behavior.
+- Updated dependencies:
+  - @promptowl/contextnest-engine@1.2.0
+
 ## 1.1.1
 
 ### Patch Changes
