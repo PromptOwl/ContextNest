@@ -356,5 +356,13 @@ describe("vault registry", () => {
         /is not a vault/,
       );
     });
+
+    it("argPath resolves a relative vault path against cwd (backward compat)", () => {
+      // `contextnest-mcp ./vault` / `../vault` worked before the registry; a
+      // relative, unregistered path must resolve against cwd, not throw.
+      makeVault(join(tmp, "rel-vault"));
+      const r = resolveVaultPath({ argPath: "rel-vault", cwd: tmp });
+      expect(r).toMatchObject({ path: join(tmp, "rel-vault"), source: "arg" });
+    });
   });
 });

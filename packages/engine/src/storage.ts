@@ -151,7 +151,19 @@ export class NestStorage {
       const filePath = join(this.root, file);
       const content = await readFile(filePath, "utf-8");
       const id = file.replace(/\.md$/, "");
-      nodes.push(parseDocument(filePath, content, id));
+      const node = parseDocument(filePath, content, id);
+      // Root-level discovery (structured layout) globs *.md at the vault root so
+      // a node can live anywhere. But a vault root commonly holds scaffold files
+      // (CHANGELOG, CONTRIBUTING, LICENSE, SECURITY, …) that are NOT knowledge
+      // nodes. Require frontmatter before treating a root file as a node — an
+      // authored node always has frontmatter; plain scaffold markdown does not.
+      // (Only root-level files in structured layout: nodes/ and sources/ files
+      // are always nodes, and Obsidian notes legitimately have no frontmatter.)
+      const isRootLevel = !file.includes("/");
+      if (layout === "structured" && isRootLevel && Object.keys(node.frontmatter).length === 0) {
+        continue;
+      }
+      nodes.push(node);
     }
 
     const includeRetired = options.includeRetired || options.includeSuperseded;
@@ -174,18 +186,37 @@ export class NestStorage {
     id: string,
     options: ReadDocumentOptions = {},
   ): Promise<ContextNode> {
-    const filePath = join(this.root, `${id}.md`);
+    // Resolve the on-disk file. Clients normalize a bare slug into nodes/
+    // (normalizeDocumentId), but a node may legitimately live at the vault root
+    // (root-level discovery). Try the id as given, then — for a nodes/<slug> id
+    // with no further nesting — fall back to the root so a root node stays
+    // readable by the same slug it surfaces under in list/search.
+    let filePath = join(this.root, `${id}.md`);
+    let resolvedId = id;
     let liveContent: string;
     try {
       liveContent = await readFile(filePath, "utf-8");
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      const rootSlug = id.startsWith("nodes/") ? id.slice("nodes/".length) : null;
+      if (rootSlug && !rootSlug.includes("/")) {
+        const rootPath = join(this.root, `${rootSlug}.md`);
+        try {
+          liveContent = await readFile(rootPath, "utf-8");
+          filePath = rootPath;
+          resolvedId = rootSlug;
+        } catch (rootErr: unknown) {
+          if ((rootErr as NodeJS.ErrnoException).code === "ENOENT") {
+            throw new DocumentNotFoundError(id);
+          }
+          throw rootErr;
+        }
+      } else {
         throw new DocumentNotFoundError(id);
       }
-      throw err;
     }
 
-    const liveNode = parseDocument(filePath, liveContent, id);
+    const liveNode = parseDocument(filePath, liveContent, resolvedId);
     if (!options.verifyChecksum) {
       return liveNode;
     }
@@ -198,7 +229,7 @@ export class NestStorage {
     // Drift detected. Try to serve last-approved canonical content
     // (hootie-inbox-spec §4.2). Live bytes are NEVER promoted into
     // canonical state here — that happens only via approval (step 7).
-    const approved = await this.readLatestApprovedKeyframe(id);
+    const approved = await this.readLatestApprovedKeyframe(resolvedId);
     const pendingChange: PendingChange = {
       suggestion_id: UNSTAGED_DRIFT_SENTINEL,
       detected_at: new Date().toISOString(),
@@ -207,7 +238,7 @@ export class NestStorage {
     };
 
     if (approved) {
-      const approvedNode = parseDocument(filePath, approved.content, id);
+      const approvedNode = parseDocument(filePath, approved.content, resolvedId);
       return { ...approvedNode, pendingChange };
     }
 

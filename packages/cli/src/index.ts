@@ -830,7 +830,7 @@ program
   .option("--raw", "Output raw file content (frontmatter + body)")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     if (opts.raw) {
@@ -975,7 +975,7 @@ program
     let docs: ContextNode[];
 
     if (path) {
-      const id = path.replace(/\.md$/, "");
+      const id = normalizeDocumentId(path);
       docs = [await storage.readDocument(id)];
     } else {
       // Validation is an audit path — retired docs still need to be
@@ -1093,7 +1093,7 @@ program
   .option("-m, --message <note>", "Version note")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
       editedBy: opts.author,
@@ -1116,7 +1116,7 @@ program
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const history = await vm.getHistory(id);
 
@@ -1146,7 +1146,7 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, parseInt(version, 10));
     console.log(content);
@@ -1502,7 +1502,7 @@ program
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     if (opts.title !== undefined) doc.frontmatter.title = opts.title;
@@ -1572,7 +1572,7 @@ program
   .description("Delete a document and its version history")
   .action(async (path) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     const doc = await storage.readDocument(id);
     await storage.deleteDocument(id);
@@ -1870,7 +1870,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
     if (!history || history.versions.length === 0) {
@@ -1919,7 +1919,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const metas = await listSuggestions(storage, id);
 
     if (opts.json) {
@@ -1952,7 +1952,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
@@ -1988,7 +1988,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 

@@ -7,12 +7,13 @@
  * physically relocated.
  *
  * Resolution (highest precedence first), implemented by resolveVaultPath():
- *   1. explicit --vault <alias> flag        → registry lookup
+ *   1. explicit --vault <alias> flag         → registry lookup
  *   2. CONTEXTNEST_VAULT env (alias)         → registry lookup
  *   3. CONTEXTNEST_VAULT_PATH env (abs path) → used directly (backward compat)
- *   4. local vault found by walking up cwd   → .context/config.yaml (legacy)
- *   5. registry `default:` alias             → registry lookup
- *   6. cwd fallback
+ *   4. positional arg (MCP `<arg>`)          → alias, or abs/relative vault path
+ *   5. local vault found by walking up cwd   → .context/config.yaml (legacy)
+ *   6. registry `default:` alias             → registry lookup
+ *   7. cwd fallback
  */
 
 import {
@@ -376,15 +377,17 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     if (getRegistry().vaults[arg]) {
       return { path: resolveAliasOrThrow(arg, getRegistry()), source: "arg", alias: arg };
     }
-    if (!isAbsolute(arg)) {
+    // Not an alias → treat as a path. A relative path is resolved against cwd
+    // (backward compat: `contextnest-mcp ./vault` / `../vault` worked before the
+    // registry landed). Either way the resolved path must be a real vault, so a
+    // typo still surfaces a clear error instead of silently using a bogus dir.
+    const resolvedArg = isAbsolute(arg) ? arg : join(cwd, arg);
+    if (!isVaultRoot(resolvedArg)) {
       throw new ConfigError(
-        `"${arg}" is not a registered vault alias and is not an absolute path.`,
+        `"${arg}" is not a registered vault alias and is not a vault directory (no .context/config.yaml).`,
       );
     }
-    if (!isVaultRoot(arg)) {
-      throw new ConfigError(`"${arg}" is not a vault (no .context/config.yaml).`);
-    }
-    return { path: arg, source: "arg" };
+    return { path: resolvedArg, source: "arg" };
   }
 
   // 5. local vault from cwd walk-up — backward compat. Carry any stale-env
