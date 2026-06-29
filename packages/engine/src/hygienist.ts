@@ -87,7 +87,7 @@ export async function runHygienistScan(
   input: HygienistInput,
 ): Promise<HygienistResult> {
   // Hygienist audits every doc including retired ones.
-  const docs = await input.storage.discoverDocuments({ includeSuperseded: true });
+  const docs = await input.storage.discoverDocuments({ includeRetired: true });
   const entries: HygienistEntry[] = [];
   for (const doc of docs) {
     entries.push(await scanOne(doc, input));

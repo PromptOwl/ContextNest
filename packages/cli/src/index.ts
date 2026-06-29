@@ -5,8 +5,9 @@
 import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
+import readline from "node:readline";
 import { createRequire } from "node:module";
-import { Command } from "commander";
+import { Command, Help } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "chalk";
@@ -22,6 +23,7 @@ import {
   ContextInjector,
   GraphQueryEngine,
   publishDocument,
+  ContextNestError,
   generateContextYaml,
   generateIndexMd,
   generateAgentConfigs,
@@ -36,6 +38,17 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  resolveVaultPath,
+  addVault,
+  removeVault,
+  setDefaultVault,
+  listVaults,
+  readRegistry,
+  findLocalVault,
+  getRegistryPath,
+  ALIAS_PATTERN,
+  normalizeStatus,
+  normalizeDocumentId,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -43,8 +56,10 @@ import type {
   LayoutMode,
   GovernanceTier,
   RbacHook,
+  VaultRegistry,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
+import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
 
@@ -53,37 +68,157 @@ const program = new Command();
 program
   .name("ctx")
   .description("Context Nest CLI — manage structured, versioned context vaults")
-  .version(pkg.version);
+  .version(pkg.version)
+  // Global selector: target a registered vault by alias from any directory.
+  // When omitted, resolution falls back to env vars, the local vault, then the
+  // registry default (see resolveVaultPath precedence in the engine).
+  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)");
 
-// Helper: resolve vault root — walks up from cwd to find .context/config.yaml (like git finds .git/)
-function getVaultRoot(): string {
-  if (process.env.CONTEXTNEST_VAULT_PATH) {
-    return process.env.CONTEXTNEST_VAULT_PATH;
+// ---------------------------------------------------------------------------
+// Friendly top-level help
+//
+// Commander's default `--help` prints every command in one flat, unexplained
+// list. For a 20+ command CLI that's hard to scan, so we replace the ROOT
+// command's help with a grouped, example-led screen. Subcommand help (e.g.
+// `ctx vault --help`) keeps Commander's default rendering.
+// ---------------------------------------------------------------------------
+
+/** Commands grouped by what the user is trying to do, with plain-English blurbs. */
+const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[] = [
+  {
+    title: "Set up a vault",
+    commands: [
+      ["init", "Create a new vault here (try --starter for a ready-made template)"],
+      ["vault", "Manage named vaults so you can switch with --vault <alias>"],
+      ["welcome", "Open the vault's welcome page in your browser"],
+    ],
+  },
+  {
+    title: "Create & edit documents",
+    commands: [
+      ["add", "Add a new document"],
+      ["read", "Show a document (add --html to open it in the browser)"],
+      ["update", "Edit a document, then auto-publish a new version"],
+      ["delete", "Remove a document and its version history"],
+    ],
+  },
+  {
+    title: "Find & retrieve context",
+    commands: [
+      ["list", "Browse documents (filter with --type / --status / --tag)"],
+      ["search", "Full-text search across the vault"],
+      ["query", "Pull context for an agent by selector — graph-aware and token-cheap"],
+      ["resolve", "List the documents a selector matches"],
+      ["pack", "Bundle documents into reusable context packs"],
+    ],
+  },
+  {
+    title: "Versions & snapshots",
+    commands: [
+      ["publish", "Bump a document's version and record a checkpoint"],
+      ["history", "Show a document's version history"],
+      ["reconstruct", "Rebuild a specific past version of a document"],
+      ["checkpoint", "Inspect vault-wide snapshots"],
+    ],
+  },
+  {
+    title: "Integrity & governance",
+    commands: [
+      ["verify", "Check every hash chain for tampering"],
+      ["validate", "Check documents against the Context Nest spec"],
+      ["drift", "Review edits made outside the CLI (suggestion workflow)"],
+      ["index", "Regenerate context.yaml and INDEX.md"],
+    ],
+  },
+  {
+    title: "Share",
+    commands: [["push", "Push the vault to a hosted ContextNest server"]],
+  },
+];
+
+/** Renders the grouped root help screen. */
+function renderRootHelp(): string {
+  const indent = "  ";
+  const names = HELP_GROUPS.flatMap((g) => g.commands.map(([n]) => n));
+  const col = Math.max(...names.map((n) => n.length)) + 3;
+  const lines: string[] = [];
+
+  lines.push(`${chalk.bold("Context Nest")} — a structured, versioned knowledge base your AI agents can query.`);
+  lines.push("");
+  lines.push(chalk.bold("USAGE"));
+  lines.push(`${indent}ctx <command> [options]`);
+  lines.push(`${indent}${chalk.dim("ctx --vault <alias> <command>   run against a named vault from any folder")}`);
+  lines.push("");
+  lines.push(chalk.bold("GETTING STARTED"));
+  for (const [cmd, hint] of [
+    ["ctx init", "create a vault in the current folder"],
+    ['ctx add notes/idea', "add a document"],
+    ['ctx query "#tag"', "retrieve matching context for an agent"],
+    ["ctx publish notes/idea", "version the document and snapshot the vault"],
+  ] as const) {
+    lines.push(`${indent}${chalk.cyan(cmd.padEnd(24))} ${chalk.dim(hint)}`);
   }
-
-  let dir = process.cwd();
-  while (true) {
-    const configPath = pathMod.join(dir, ".context", "config.yaml");
-    try {
-      fs.statSync(configPath);
-      return dir;
-    } catch {
-      // not found, try parent
+  lines.push("");
+  lines.push(chalk.bold("COMMANDS"));
+  for (const group of HELP_GROUPS) {
+    lines.push(`${indent}${chalk.bold(group.title)}`);
+    for (const [name, blurb] of group.commands) {
+      lines.push(`${indent}${indent}${chalk.cyan(name.padEnd(col))}${blurb}`);
     }
-    const parent = pathMod.dirname(dir);
-    if (parent === dir) break; // reached filesystem root
-    dir = parent;
+    lines.push("");
   }
+  lines.push(chalk.bold("GLOBAL OPTIONS"));
+  lines.push(`${indent}${chalk.cyan("--vault <alias>".padEnd(col + 2))}target a registered vault by alias`);
+  lines.push(`${indent}${chalk.cyan("-V, --version".padEnd(col + 2))}print the version number`);
+  lines.push(`${indent}${chalk.cyan("-h, --help".padEnd(col + 2))}show this help`);
+  lines.push("");
+  lines.push(chalk.dim(`Run ${chalk.reset("ctx <command> --help")}${chalk.dim(" for the options and details of any command.")}`));
+  lines.push("");
 
-  // No vault found — fall back to cwd (ctx init will create one here)
-  return process.cwd();
+  return lines.join("\n");
+}
+
+// Scope the custom formatter to the root command only; subcommands fall back to
+// Commander's default Help rendering.
+program.configureHelp({
+  formatHelp(cmd, helper) {
+    if (cmd === program) return renderRootHelp();
+    return Help.prototype.formatHelp.call(helper, cmd, helper);
+  },
+});
+
+// The --vault alias selected for the currently-running command. Captured by a
+// preAction hook so it works whether the flag is given before the subcommand
+// (`ctx --vault work list`) or after it (`ctx list --vault work`).
+let selectedVaultAlias: string | undefined;
+
+program.hook("preAction", (_thisCommand, actionCommand) => {
+  selectedVaultAlias = actionCommand.optsWithGlobals().vault as string | undefined;
+});
+
+// Helper: resolve vault root. Delegates to the engine resolver, which applies
+// precedence: --vault flag > CONTEXTNEST_VAULT (alias) > CONTEXTNEST_VAULT_PATH
+// (path) > local vault (walk up cwd) > registry default > cwd.
+function getVaultRoot(): string {
+  const resolved = resolveVaultPath({
+    vaultAlias: selectedVaultAlias,
+    cwd: process.cwd(),
+  });
+  // Surface a stale-env advisory, but stay quiet when a *local* vault resolved:
+  // standing inside a vault directory is a deliberate, unambiguous choice, so a
+  // forgotten env var there is noise. `ctx vault which` shows it unconditionally.
+  if (resolved.warning && resolved.source !== "local") {
+    console.error(chalk.yellow(`Warning: ${resolved.warning}`));
+  }
+  return resolved.path;
 }
 
 // Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
-// must NOT walk up the tree — initializing a vault is always a "create here"
-// operation. Walking up would resolve to an ancestor vault (e.g. a stray
-// ~/.context/config.yaml), causing init to operate on the wrong directory
-// (the "misresolved to home" bug). The explicit env override still wins.
+// must NOT walk up the tree or consult the registry — initializing a vault is
+// always a "create here" operation. Walking up would resolve to an ancestor
+// vault (e.g. a stray ~/.context/config.yaml), causing init to operate on the
+// wrong directory (the "misresolved to home" bug). The explicit env override
+// still wins.
 function getInitRoot(): string {
   return process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
 }
@@ -105,6 +240,451 @@ const permissiveRbac: RbacHook = {
   isDocOwner: () => true,
 };
 
+// Interactively prompt the user to pick a starter recipe using an arrow-key
+// navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
+// chosen recipe id, or null if the user skips. Callers MUST only invoke this
+// when attached to a TTY — otherwise it would block on stdin (AI agents, CI,
+// piped input). Falls back to a typed prompt when raw mode is unavailable.
+function promptStarterSelection(): Promise<string | null> {
+  const starters = listStarters();
+
+  // Some terminals (dumb terminals, certain CI shells) can't do raw-mode
+  // keypress capture. Fall back to typing a number/name there.
+  if (typeof process.stdin.setRawMode !== "function") {
+    return promptStarterByNumber(starters);
+  }
+
+  return new Promise((resolve) => {
+    const out = process.stdout;
+    let index = 0;
+
+    console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:"));
+    console.log(chalk.dim("  ↑/↓ to move · Enter to select · Esc to skip\n"));
+
+    const render = () => {
+      starters.forEach((s, i) => {
+        const selected = i === index;
+        const pointer = selected ? chalk.cyan("❯") : " ";
+        const line = `${s.id.padEnd(12)} ${s.name}`;
+        out.write(`  ${pointer} ${selected ? chalk.cyan.bold(line) : line}\n`);
+      });
+    };
+
+    const redraw = () => {
+      readline.moveCursor(out, 0, -starters.length);
+      readline.clearScreenDown(out);
+      render();
+    };
+
+    out.write("\x1B[?25l"); // hide cursor
+    render();
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1B[?25h"); // restore cursor
+    };
+
+    const onKey = (_str: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || key.name === "k") {
+        index = (index - 1 + starters.length) % starters.length;
+        redraw();
+      } else if (key.name === "down" || key.name === "j") {
+        index = (index + 1) % starters.length;
+        redraw();
+      } else if (key.name === "return" || key.name === "enter") {
+        cleanup();
+        out.write("\n");
+        resolve(starters[index].id);
+      } else if (key.name === "escape") {
+        cleanup();
+        out.write("\n");
+        resolve(null);
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        out.write("\n");
+        process.exit(130);
+      }
+    };
+
+    process.stdin.on("keypress", onKey);
+  });
+}
+
+// Fallback selector for terminals without raw-mode support: print a numbered
+// list and read a number or recipe name. Returns null on a blank line (skip).
+function promptStarterByNumber(starters: ReturnType<typeof listStarters>): Promise<string | null> {
+  console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:\n"));
+  starters.forEach((s, i) => {
+    console.log(`    ${chalk.yellow(String(i + 1))}  ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
+    console.log(`       ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
+  });
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(
+        `  Select a starter ${chalk.dim(`[1-${starters.length}, name, or Enter to skip]`)}: `,
+        (answer) => {
+          const trimmed = answer.trim();
+          if (trimmed === "") {
+            rl.close();
+            resolve(null);
+            return;
+          }
+          const num = Number(trimmed);
+          if (Number.isInteger(num) && num >= 1 && num <= starters.length) {
+            rl.close();
+            resolve(starters[num - 1].id);
+            return;
+          }
+          const byName = starters.find((s) => s.id.toLowerCase() === trimmed.toLowerCase());
+          if (byName) {
+            rl.close();
+            resolve(byName.id);
+            return;
+          }
+          console.log(chalk.red(`  '${trimmed}' is not a valid choice — pick a number or recipe name.`));
+          ask();
+        },
+      );
+    };
+    ask();
+  });
+}
+
+// ─── Agentic dev tool selection ─────────────────────────────────────────────────
+
+// Interactively pick which agentic tools to write config for, using an arrow-key
+// navigable multi-select (↑/↓ to move, Space to toggle, Enter to confirm, Esc to
+// accept as-is). Detected tools start checked. Resolves to the selected tool ids.
+// Callers MUST only invoke this when attached to a TTY. Falls back to a numbered
+// prompt when raw mode is unavailable.
+function promptToolSelection(tools: AgentTool[]): Promise<string[]> {
+  if (typeof process.stdin.setRawMode !== "function") {
+    return promptToolsByNumber(tools);
+  }
+
+  return new Promise((resolve) => {
+    const out = process.stdout;
+    let index = 0;
+    const checked = new Set(tools.filter((t) => t.detected).map((t) => t.id));
+
+    console.log(chalk.bold("\n  Configure agentic dev tools for this vault:"));
+    console.log(chalk.dim("  Detected tools are pre-selected."));
+    console.log(chalk.dim("  ↑/↓ to move · Space to toggle · Enter to confirm · Esc to accept\n"));
+
+    const render = () => {
+      tools.forEach((t, i) => {
+        const active = i === index;
+        const pointer = active ? chalk.cyan("❯") : " ";
+        const box = checked.has(t.id) ? chalk.green("[x]") : "[ ]";
+        const label = `${t.name.padEnd(16)} ${chalk.dim(t.hint)}`;
+        out.write(`  ${pointer} ${box} ${active ? chalk.cyan.bold(t.name.padEnd(16)) + " " + chalk.dim(t.hint) : label}\n`);
+      });
+    };
+
+    const redraw = () => {
+      readline.moveCursor(out, 0, -tools.length);
+      readline.clearScreenDown(out);
+      render();
+    };
+
+    out.write("\x1B[?25l"); // hide cursor
+    render();
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1B[?25h"); // restore cursor
+    };
+
+    const finish = () => {
+      cleanup();
+      out.write("\n");
+      resolve(tools.filter((t) => checked.has(t.id)).map((t) => t.id));
+    };
+
+    const onKey = (_str: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || key.name === "k") {
+        index = (index - 1 + tools.length) % tools.length;
+        redraw();
+      } else if (key.name === "down" || key.name === "j") {
+        index = (index + 1) % tools.length;
+        redraw();
+      } else if (key.name === "space") {
+        const id = tools[index].id;
+        if (checked.has(id)) checked.delete(id);
+        else checked.add(id);
+        redraw();
+      } else if (key.name === "return" || key.name === "enter" || key.name === "escape") {
+        finish();
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        out.write("\n");
+        process.exit(130);
+      }
+    };
+
+    process.stdin.on("keypress", onKey);
+  });
+}
+
+// Fallback multi-select for terminals without raw-mode support: print a numbered
+// list with detected tools pre-checked, read comma-separated numbers to toggle,
+// and accept the current selection on a blank line.
+function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
+  const checked = new Set(tools.filter((t) => t.detected).map((t) => t.id));
+
+  console.log(chalk.bold("\n  Configure agentic dev tools for this vault:"));
+  console.log(chalk.dim("  Detected tools are pre-selected.\n"));
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      tools.forEach((t, i) => {
+        const box = checked.has(t.id) ? chalk.green("[x]") : "[ ]";
+        console.log(`    ${box} ${chalk.yellow(String(i + 1))}  ${t.name.padEnd(16)} ${chalk.dim(t.hint)}`);
+      });
+      rl.question(
+        `\n  Toggle tools ${chalk.dim("[comma-separated numbers, or Enter to accept]")}: `,
+        (answer) => {
+          const trimmed = answer.trim();
+          if (trimmed === "") {
+            rl.close();
+            resolve(tools.filter((t) => checked.has(t.id)).map((t) => t.id));
+            return;
+          }
+          const nums = trimmed.split(",").map((p) => Number(p.trim()));
+          if (nums.some((n) => !Number.isInteger(n) || n < 1 || n > tools.length)) {
+            console.log(chalk.red(`  Invalid selection — use numbers 1-${tools.length}.`));
+          } else {
+            for (const n of nums) {
+              const id = tools[n - 1].id;
+              if (checked.has(id)) checked.delete(id);
+              else checked.add(id);
+            }
+          }
+          console.log("");
+          ask();
+        },
+      );
+    };
+    ask();
+  });
+}
+
+// ─── Vault registration prompts (ctx init) ──────────────────────────────────────
+
+// ALIAS_PATTERN is imported from the engine (single source of truth) so the
+// interactive prompt validates the same way addVault() does.
+
+// Derive a sensible default alias from a directory name, sanitized to the
+// allowed alias characters.
+function slugifyAlias(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "vault";
+}
+
+// Pick a default alias for `root` that doesn't collide with a different vault
+// already in the registry. Re-running init in the same directory reuses the
+// existing alias (idempotent); a clash with a *different* path gets a numeric
+// suffix so we never silently overwrite someone else's alias.
+function defaultAliasFor(root: string, registry: VaultRegistry): string {
+  const resolvedRoot = pathMod.resolve(root);
+  const base = slugifyAlias(pathMod.basename(resolvedRoot));
+  // Use the registry map the caller already loaded — no extra read, no listVaults()
+  // stat/read per vault.
+  const taken = new Map(
+    Object.entries(registry.vaults).map(([alias, e]) => [alias, pathMod.resolve(e.path)]),
+  );
+  const free = (alias: string) => !taken.has(alias) || taken.get(alias) === resolvedRoot;
+  if (free(base)) return base;
+  let n = 2;
+  while (!free(`${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
+// Prompt for a free-text answer, returning the default when the user hits Enter.
+function promptText(question: string, defaultValue?: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const suffix = defaultValue ? chalk.dim(` [${defaultValue}]`) : "";
+  return new Promise((resolve) => {
+    rl.question(`  ${question}${suffix}: `, (answer) => {
+      rl.close();
+      resolve(answer.trim() || defaultValue || "");
+    });
+  });
+}
+
+// Prompt for a vault alias, re-asking until it matches ALIAS_PATTERN.
+function promptAlias(defaultAlias: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(`  Vault alias ${chalk.dim(`[${defaultAlias}]`)}: `, (answer) => {
+        const alias = answer.trim() || defaultAlias;
+        if (ALIAS_PATTERN.test(alias)) {
+          rl.close();
+          resolve(alias);
+          return;
+        }
+        console.log(chalk.red("  Use only letters, digits, hyphens, or underscores."));
+        ask();
+      });
+    };
+    ask();
+  });
+}
+
+// Apply a starter recipe to a freshly-initialized vault: write + publish its
+// nodes/packs, persist its maintenance directive, regenerate the index, and
+// print the post-init summary + AI agent prompt.
+async function applyStarter(
+  storage: NestStorage,
+  root: string,
+  opts: { name: string; layout: string },
+  starter: NonNullable<ReturnType<typeof getStarter>>,
+  agentTools?: string[],
+): Promise<void> {
+  // Persist the starter's maintenance directive into config so
+  // `ctx index` can surface it into CLAUDE.md / GEMINI.md / etc. When the user
+  // picked which agentic tools to configure, persist that too so the upcoming
+  // regenerateIndex() — and future `ctx index` runs — only write those files.
+  const initialConfig = await storage.readConfig();
+  if (initialConfig) {
+    initialConfig.agent_maintenance_directive = starter.getMaintenanceDirective();
+    if (agentTools !== undefined) {
+      initialConfig.agent_tools = agentTools;
+    }
+    await storage.writeConfig(initialConfig);
+  }
+
+  // Write starter nodes
+  for (const node of starter.nodes) {
+    await storage.writeDocument(node.path, node.content);
+  }
+
+  // Write starter packs
+  for (const pack of starter.packs) {
+    const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
+    await fs.promises.mkdir(pathMod.dirname(packPath), { recursive: true });
+    await fs.promises.writeFile(packPath, pack.content, "utf-8");
+  }
+
+  // Publish all starter nodes
+  for (const node of starter.nodes) {
+    await publishDocument(storage, node.path, {
+      editedBy: "cli@contextnest.local",
+      note: `Created by ${starter.id} starter`,
+    });
+  }
+
+  await regenerateIndex(storage);
+
+  // Print results
+  console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
+  console.log(`  Created ${starter.nodes.length} documents:`);
+  for (const node of starter.nodes) {
+    console.log(`    ${chalk.cyan(node.path + ".md")}`);
+  }
+  console.log(`  Created ${starter.packs.length} pack(s):`);
+  for (const pack of starter.packs) {
+    console.log(`    ${chalk.cyan("packs/" + pack.id + ".yml")}`);
+  }
+
+  // Post-init prompt for AI agents
+  const prompt = starter.getPrompt();
+  console.log(`\n${chalk.dim("─".repeat(60))}`);
+  console.log(chalk.dim(prompt.context));
+  console.log(`${chalk.dim("─".repeat(60))}`);
+  console.log(prompt.instructions);
+  console.log(chalk.dim("─".repeat(60)));
+
+  console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
+
+  // Generate welcome HTML
+  const welcomePath = await generateWelcomeHtml({
+    vaultPath: root,
+    vaultName: opts.name,
+    starterName: starter.id,
+    starterDisplayName: starter.name,
+    nodes: starter.nodes.map((n) => ({
+      path: n.path,
+      title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
+      type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
+      tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
+    })),
+    timestamp: new Date().toISOString(),
+    cliVersion: program.version() || "0.3.0",
+  });
+  console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
+}
+
+// Print guidance for a vault left without a starter. `showList` controls
+// whether the recipe list is reprinted — skip it when the interactive picker
+// already displayed it.
+async function printEmptyVaultGuidance(
+  root: string,
+  opts: { name: string },
+  { showList }: { showList: boolean },
+): Promise<void> {
+  if (showList) {
+    console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:\n"));
+    for (const s of listStarters()) {
+      console.log(`    ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
+      console.log(`    ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
+    }
+  }
+  console.log(`  Apply one with: ${chalk.yellow("ctx init --starter <recipe>")}`);
+  console.log(`  Or add documents manually: ${chalk.yellow("ctx add nodes/my-doc --title \"My Document\"")}\n`);
+
+  // Post-init instructions for AI assistants
+  console.log(chalk.dim("─".repeat(60)));
+  console.log(`[CONTEXT NEST VAULT INITIALIZED — EMPTY VAULT]
+
+This vault was initialized without a starter recipe. To help the user get started:
+1. Ask what this vault is for (engineering, strategy, research, team knowledge, etc.)
+2. Recommend a starter recipe based on their answer:
+   - developer  — Software engineering teams
+   - executive  — Strategic leadership
+   - analyst    — Research and analysis
+   - sales      — Sales enablement
+   - team       — General team knowledge base
+3. Run: ctx init --starter <recipe> (in the vault directory)
+   Note: re-running init with --starter will add the starter content to the existing vault.
+4. After the starter is applied, generate a CONTEXT.md tailored to the user's needs.`);
+  console.log(chalk.dim("─".repeat(60)));
+  console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
+
+  // Generate welcome HTML (empty vault)
+  const welcomePath = await generateWelcomeHtml({
+    vaultPath: root,
+    vaultName: opts.name,
+    starterName: null,
+    starterDisplayName: null,
+    nodes: [],
+    timestamp: new Date().toISOString(),
+    cliVersion: program.version() || "0.3.0",
+  });
+  console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
+}
+
 // ─── ctx init ──────────────────────────────────────────────────────────────────
 
 program
@@ -114,6 +694,8 @@ program
   .option("-n, --name <name>", "Vault name", "My Context Nest")
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
+  .option("--set-default", "Make the new vault the registry default")
+  .option("--description <text>", "Description/label for the registry entry")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -129,126 +711,113 @@ program
     const root = getInitRoot();
     const storage = new NestStorage(root);
     await storage.init(opts.name, opts.layout as LayoutMode);
+    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
 
-    // Apply starter if specified
-    if (opts.starter) {
-      const starter = getStarter(opts.starter);
+    // Register the new vault in the central registry so it can be targeted from
+    // any directory via `ctx --vault <alias> ...`. The alias comes from an
+    // explicit --vault flag, an interactive prompt, or (non-interactively) a
+    // directory-derived default — so init always registers the vault.
+    let registerAlias = selectedVaultAlias;
+    let registerDescription = opts.description as string | undefined;
+    const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    // One registry read for both the derived-alias collision check and the
+    // ownership check below (addVault re-reads internally for its write).
+    const registrySnapshot = readRegistry();
+    if (!registerAlias) {
+      const defaultAlias = defaultAliasFor(root, registrySnapshot);
+      if (canPrompt) {
+        console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
+        registerAlias = await promptAlias(defaultAlias);
+        if (!registerDescription) {
+          registerDescription = (await promptText("Vault description (optional)")) || undefined;
+        }
+      } else {
+        registerAlias = defaultAlias;
+      }
+    }
+
+    // Registration is performed AFTER the starter is applied (see registerVault
+    // below) so an interruption mid-starter never leaves a registry alias
+    // pointing at a half-populated vault.
+    const registerVault = (): void => {
+      if (!registerAlias) return;
+      const resolvedRoot = pathMod.resolve(root);
+      const existing = registrySnapshot.vaults[registerAlias];
+      if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
+        // The alias is already taken by a *different* vault. Don't silently
+        // clobber it — the vault was still created; just skip registration.
+        console.log(
+          chalk.yellow(
+            `  Vault alias "${registerAlias}" already points to ${existing.path} — not overwriting.`,
+          ),
+        );
+        console.log(
+          chalk.dim(
+            `  To repoint it: ctx vault add ${registerAlias} ${resolvedRoot} --force`,
+          ),
+        );
+        return;
+      }
+      try {
+        // force is safe here: the alias is either free or already points to
+        // this same vault (idempotent re-init).
+        const reg = addVault(registerAlias, resolvedRoot, {
+          description: registerDescription,
+          setDefault: opts.setDefault,
+          force: true,
+        });
+        const isDefault = reg.default === registerAlias;
+        console.log(
+          chalk.green(
+            `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${root}`,
+          ),
+        );
+      } catch (err) {
+        console.log(chalk.red(`  Could not register vault alias: ${(err as Error).message}`));
+      }
+    };
+
+    // Resolve which starter to apply. An explicit --starter wins. Otherwise,
+    // when running in an interactive terminal, prompt the user to pick one.
+    // In non-interactive contexts (AI agents, CI, piped stdin) we must not
+    // block on input — fall through to printed guidance instead.
+    let starterId: string | undefined = opts.starter;
+    const interactive = !starterId && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (interactive) {
+      starterId = (await promptStarterSelection()) ?? undefined;
+    }
+
+    if (starterId) {
+      const starter = getStarter(starterId);
       if (!starter) {
-        console.log(chalk.red(`Unknown starter: ${opts.starter}`));
+        console.log(chalk.red(`Unknown starter: ${starterId}`));
         console.log(`Available: ${listStarters().map((s) => s.id).join(", ")}`);
         process.exit(1);
       }
 
-      // Persist the starter's maintenance directive into config so
-      // `ctx index` can surface it into CLAUDE.md / GEMINI.md / etc.
-      const initialConfig = await storage.readConfig();
-      if (initialConfig) {
-        initialConfig.agent_maintenance_directive = starter.getMaintenanceDirective();
-        await storage.writeConfig(initialConfig);
+      // After picking a starter, detect installed agentic dev tools and let the
+      // user choose which to write config for. Only in a real terminal — agents
+      // and CI get the default (all targets) so their output is unchanged. The
+      // `interactive` flag above is false when --starter was passed explicitly,
+      // so re-check the TTY independently here.
+      let agentTools: string[] | undefined;
+      const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+      if (isTty) {
+        agentTools = await promptToolSelection(detectAgentTools(root));
+        if (agentTools.length === 0) {
+          console.log(chalk.dim("  No tools selected — no agent config files will be written."));
+        }
       }
 
-      // Write starter nodes
-      for (const node of starter.nodes) {
-        await storage.writeDocument(node.path, node.content);
-      }
-
-      // Write starter packs
-      for (const pack of starter.packs) {
-        const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
-        await fs.promises.mkdir(pathMod.dirname(packPath), { recursive: true });
-        await fs.promises.writeFile(packPath, pack.content, "utf-8");
-      }
-
-      // Publish all starter nodes
-      for (const node of starter.nodes) {
-        await publishDocument(storage, node.path, {
-          editedBy: "cli@contextnest.local",
-          note: `Created by ${starter.id} starter`,
-        });
-      }
-
-      await regenerateIndex(storage);
-
-      // Print results
-      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
-      console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
-      console.log(`  Created ${starter.nodes.length} documents:`);
-      for (const node of starter.nodes) {
-        console.log(`    ${chalk.cyan(node.path + ".md")}`);
-      }
-      console.log(`  Created ${starter.packs.length} pack(s):`);
-      for (const pack of starter.packs) {
-        console.log(`    ${chalk.cyan("packs/" + pack.id + ".yml")}`);
-      }
-
-      // Post-init prompt for AI agents
-      const prompt = starter.getPrompt();
-      console.log(`\n${chalk.dim("─".repeat(60))}`);
-      console.log(chalk.dim(prompt.context));
-      console.log(`${chalk.dim("─".repeat(60))}`);
-      console.log(prompt.instructions);
-      console.log(chalk.dim("─".repeat(60)));
-
-      console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
-
-      // Generate and open welcome HTML
-      const welcomePath = await generateWelcomeHtml({
-        vaultPath: root,
-        vaultName: opts.name,
-        starterName: starter.id,
-        starterDisplayName: starter.name,
-        nodes: starter.nodes.map((n) => ({
-          path: n.path,
-          title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
-          type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
-          tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
-        })),
-        timestamp: new Date().toISOString(),
-        cliVersion: program.version() || "0.3.0",
-      });
-      openInBrowser(welcomePath);
-      console.log(`  ${chalk.dim("Opened welcome page in browser: .context/welcome.html")}\n`);
+      await applyStarter(storage, root, opts, starter, agentTools);
     } else {
-      console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}\n`));
-      console.log(chalk.bold("  Choose a starter recipe to populate your vault:\n"));
-      for (const s of listStarters()) {
-        console.log(`    ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
-        console.log(`    ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
-      }
-      console.log(`  Apply one with: ${chalk.yellow("ctx init --starter <recipe>")}`);
-      console.log(`  Or add documents manually: ${chalk.yellow("ctx add nodes/my-doc --title \"My Document\"")}\n`);
-
-      // Post-init instructions for AI assistants
-      console.log(chalk.dim("─".repeat(60)));
-      console.log(`[CONTEXT NEST VAULT INITIALIZED — EMPTY VAULT]
-
-This vault was initialized without a starter recipe. To help the user get started:
-1. Ask what this vault is for (engineering, strategy, research, team knowledge, etc.)
-2. Recommend a starter recipe based on their answer:
-   - developer  — Software engineering teams
-   - executive  — Strategic leadership
-   - analyst    — Research and analysis
-   - sales      — Sales enablement
-   - team       — General team knowledge base
-3. Run: ctx init --starter <recipe> (in the vault directory)
-   Note: re-running init with --starter will add the starter content to the existing vault.
-4. After the starter is applied, generate a CONTEXT.md tailored to the user's needs.`);
-      console.log(chalk.dim("─".repeat(60)));
-      console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
-
-      // Generate and open welcome HTML (empty vault)
-      const welcomePath = await generateWelcomeHtml({
-        vaultPath: root,
-        vaultName: opts.name,
-        starterName: null,
-        starterDisplayName: null,
-        nodes: [],
-        timestamp: new Date().toISOString(),
-        cliVersion: program.version() || "0.3.0",
-      });
-      openInBrowser(welcomePath);
-      console.log(`  ${chalk.dim("Opened welcome page in browser: .context/welcome.html")}\n`);
+      // Don't reprint the recipe list if the interactive picker just showed it.
+      await printEmptyVaultGuidance(root, opts, { showList: !interactive });
     }
+
+    // Register only now that the vault is fully initialized (structure + any
+    // starter content), so the registry never points at a partial vault.
+    registerVault();
   });
 
 // ─── ctx read ──────────────────────────────────────────────────────────────────
@@ -261,7 +830,7 @@ program
   .option("--raw", "Output raw file content (frontmatter + body)")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     if (opts.raw) {
@@ -332,16 +901,16 @@ program
   .description("Create a new document with frontmatter template")
   .option("-t, --type <type>", "Node type", "document")
   .option("--title <title>", "Document title")
-  .option("--tags <tags>", "Comma-separated tags")
+  .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const tagList = opts.tags
-      ? opts.tags.split(",").map((t: string) => t.trim()).map((t: string) => (t.startsWith("#") ? t : `#${t}`))
+      ? opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`))
       : undefined;
     const frontmatter: Frontmatter = {
       title,
@@ -406,13 +975,13 @@ program
     let docs: ContextNode[];
 
     if (path) {
-      const id = path.replace(/\.md$/, "");
+      const id = normalizeDocumentId(path);
       docs = [await storage.readDocument(id)];
     } else {
       // Validation is an audit path — retired docs still need to be
       // checked for malformed frontmatter (storage.regenerateIndex,
       // verifyVaultIntegrity, hygienist all use the same flag).
-      docs = await storage.discoverDocuments({ includeSuperseded: true });
+      docs = await storage.discoverDocuments({ includeRetired: true });
     }
 
     let hasErrors = false;
@@ -502,7 +1071,12 @@ program
         for (const doc of results) {
           const type = doc.frontmatter.type || "document";
           const status = doc.frontmatter.status || "draft";
-          const statusColor = status === "published" ? chalk.green : chalk.yellow;
+          const statusColor =
+            status === "published" ? chalk.green
+            : status === "approved" ? chalk.cyan
+            : status === "pending_review" ? chalk.magenta
+            : status === "rejected" ? chalk.red
+            : chalk.yellow;
           console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
           console.log(`    ${doc.frontmatter.title}`);
         }
@@ -519,7 +1093,7 @@ program
   .option("-m, --message <note>", "Version note")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
       editedBy: opts.author,
@@ -542,7 +1116,7 @@ program
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const history = await vm.getHistory(id);
 
@@ -572,7 +1146,7 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, parseInt(version, 10));
     console.log(content);
@@ -663,13 +1237,35 @@ program
 
 program
   .command("index")
-  .description("Regenerate context.yaml and INDEX.md files")
+  .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
   .action(async () => {
     const storage = getStorage();
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published-only below. Matches
     // storage.regenerateIndex().
-    const docs = await storage.discoverDocuments({ includeSuperseded: true });
+    const docs = await storage.discoverDocuments({ includeRetired: true });
+
+    // Status-canonicalization pass: rewrite any doc whose on-disk status
+    // differs from its parsed (normalized) status. Only `ctx index` does
+    // this — per-mutation calls to regenerateIndex stay cheap. After this
+    // pass disk values are guaranteed canonical until something else edits
+    // them out-of-band.
+    let normalized = 0;
+    for (const doc of docs) {
+      const onDisk = await storage.readDocument(doc.id);
+      const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
+      const canonical = doc.frontmatter.status;
+      if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
+        // Round-trip through serializeDocument — which itself normalizes —
+        // and write back. This rewrites any aliased value to canonical.
+        await storage.writeDocument(doc.id, serializeDocument(doc));
+        normalized++;
+      }
+    }
+    if (normalized > 0) {
+      console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
+    }
+
     const config = await storage.readConfig();
     const checkpointHistory = await storage.readCheckpointHistory();
     const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
@@ -776,6 +1372,7 @@ program
   .option("--json", "Output as JSON")
   .option("--hops <n>", "Graph traversal depth (default: 2)", parseInt)
   .option("--full", "Force full-load mode (load all documents)")
+  .option("--include-drafts", "Include draft documents (default: published only)", false)
   .action(async (selector, opts) => {
     // Cloud pack: @org/pack-name routes to PromptOwl API
     if (selector.startsWith("@")) {
@@ -789,6 +1386,7 @@ program
     const result = await engine.query(selector, {
       hops: opts.hops ?? 2,
       full: opts.full ?? false,
+      includeDrafts: opts.includeDrafts ?? false,
     });
 
     if (opts.json) {
@@ -837,15 +1435,22 @@ program
   .command("list")
   .description("List all documents with optional filters")
   .option("-t, --type <type>", "Filter by node type")
-  .option("-s, --status <status>", "Filter by status (draft/published)")
+  .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    let docs = await storage.discoverDocuments();
+    // Include retired so users can list them with `--status rejected`; the
+    // default branch below re-filters them out when no status is requested.
+    let docs = await storage.discoverDocuments({ includeRetired: true });
 
     if (opts.type) docs = docs.filter((d) => (d.frontmatter.type || "document") === opts.type);
-    if (opts.status) docs = docs.filter((d) => (d.frontmatter.status || "draft") === opts.status);
+    if (opts.status) {
+      const wanted = normalizeStatus(opts.status);
+      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
+    } else {
+      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
+    }
     if (opts.tag) {
       const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
       docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
@@ -873,7 +1478,12 @@ program
         for (const doc of docs) {
           const type = doc.frontmatter.type || "document";
           const status = doc.frontmatter.status || "draft";
-          const statusColor = status === "published" ? chalk.green : chalk.yellow;
+          const statusColor =
+            status === "published" ? chalk.green
+            : status === "approved" ? chalk.cyan
+            : status === "pending_review" ? chalk.magenta
+            : status === "rejected" ? chalk.red
+            : chalk.yellow;
           console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
           console.log(`    ${doc.frontmatter.title}`);
         }
@@ -887,16 +1497,20 @@ program
   .command("update <path>")
   .description("Update a document's frontmatter and/or body, then auto-publish")
   .option("--title <title>", "New title")
-  .option("--tags <tags>", "New tags (comma-separated, replaces existing)")
+  .option("--tags <tags>", "New tags (comma- or space-separated, replaces existing)")
+  .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
     if (opts.title !== undefined) doc.frontmatter.title = opts.title;
+    if (opts.status !== undefined) {
+      doc.frontmatter.status = normalizeStatus(opts.status);
+    }
     if (opts.tags !== undefined) {
-      doc.frontmatter.tags = opts.tags.split(",").map((t: string) => t.trim()).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
+      doc.frontmatter.tags = opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
     }
     doc.frontmatter.updated_at = new Date().toISOString();
 
@@ -915,6 +1529,29 @@ program
 
     const content = serializeDocument(doc);
     await storage.writeDocument(id, content);
+
+    // Non-published lifecycle paths skip auto-publish — those are metadata
+    // changes, not content releases. Mirrors MCP `update_document`.
+    if (
+      opts.status !== undefined &&
+      (doc.frontmatter.status === "rejected" ||
+        doc.frontmatter.status === "approved" ||
+        doc.frontmatter.status === "pending_review" ||
+        doc.frontmatter.status === "draft")
+    ) {
+      await regenerateIndex(storage);
+      const label =
+        doc.frontmatter.status === "rejected"
+          ? "retired"
+          : doc.frontmatter.status === "pending_review"
+            ? "submitted for review"
+            : doc.frontmatter.status === "approved"
+              ? "marked approved"
+              : "reverted to draft";
+      console.log(chalk.green(`Updated and ${label}: ${id}`));
+      console.log(chalk.dim("  No new version cut. Run `ctx publish` to release."));
+      return;
+    }
 
     const result = await publishDocument(storage, id, {
       editedBy: "cli@contextnest.local",
@@ -935,7 +1572,7 @@ program
   .description("Delete a document and its version history")
   .action(async (path) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
 
     try {
       const doc = await storage.readDocument(id);
@@ -1082,20 +1719,8 @@ cpCmd
   .action(async () => {
     const storage = getStorage();
     const cm = new CheckpointManager(storage);
-    const { history, skippedDocuments } = await cm.rebuildCheckpointHistory();
+    const history = await cm.rebuildCheckpointHistory();
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
-    if (skippedDocuments.length > 0) {
-      console.log(
-        chalk.yellow(
-          `\nWarning: ${skippedDocuments.length} document(s) excluded due to broken version chains:`,
-        ),
-      );
-      for (const skipped of skippedDocuments) {
-        console.log(
-          chalk.yellow(`  ✗ ${skipped.docId}: ${skipped.errors.length} error(s)`),
-        );
-      }
-    }
   });
 
 // ─── ctx welcome ──────────────────────────────────────────────────────────────
@@ -1254,7 +1879,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
     if (!history || history.versions.length === 0) {
@@ -1303,7 +1928,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const metas = await listSuggestions(storage, id);
 
     if (opts.json) {
@@ -1336,7 +1961,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
@@ -1372,7 +1997,7 @@ drift
   .option("--json", "Output as JSON")
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
-    const id = path.replace(/\.md$/, "");
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
@@ -1402,10 +2027,149 @@ drift
     );
   });
 
-// Parse and run. parseAsync (not parse) so async command actions are awaited;
-// the catch turns any action rejection into a clean error + non-zero exit
-// instead of an unhandled promise rejection that crashes Node.
-program.parseAsync().catch((err) => {
-  console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-  process.exitCode = 1;
+// ─── ctx vault ───────────────────────────────────────────────────────────────
+
+const vaultCmd = program
+  .command("vault")
+  .description("Manage the central vault registry (alias → path)");
+
+vaultCmd
+  .command("list")
+  .description("List registered vaults")
+  .option("--json", "Output as JSON")
+  .action((opts) => {
+    const vaults = listVaults();
+    if (opts.json) {
+      console.log(JSON.stringify(vaults, null, 2));
+      return;
+    }
+    if (vaults.length === 0) {
+      console.log(
+        chalk.dim(`No vaults registered. Add one with: ${chalk.yellow("ctx vault add <alias> [path]")}`),
+      );
+      console.log(chalk.dim(`Registry: ${getRegistryPath()}`));
+      return;
+    }
+    console.log(chalk.bold("\nRegistered vaults:\n"));
+    for (const v of vaults) {
+      const marker = v.isDefault ? chalk.green(" *") : "  ";
+      const missing = v.exists ? "" : chalk.red("  [missing]");
+      console.log(`${marker} ${chalk.cyan(v.alias)}${missing}`);
+      if (v.description) console.log(`     ${chalk.dim(v.description)}`);
+      console.log(`     ${chalk.dim(v.path)}`);
+    }
+    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + getRegistryPath())}\n`);
+  });
+
+vaultCmd
+  .command("add <alias> [path]")
+  .description("Register a vault path under an alias (path defaults to the vault in the current directory)")
+  .option("--description <text>", "Short label for this alias")
+  .option("--set-default", "Make this the default vault")
+  .option("--force", "Overwrite an existing alias")
+  .action((alias: string, path: string | undefined, opts) => {
+    try {
+      // With no explicit path, "register the vault I'm in" — resolve strictly
+      // from the cwd walk-up, NOT getVaultRoot() (which honors CONTEXTNEST_VAULT
+      // and could register the wrong vault under this alias).
+      let target: string;
+      if (path) {
+        target = pathMod.resolve(path);
+      } else {
+        const local = findLocalVault(process.cwd());
+        if (!local) {
+          console.log(
+            chalk.red("No vault found in the current directory. Pass a path: ctx vault add <alias> <path>"),
+          );
+          process.exit(1);
+        }
+        target = pathMod.resolve(local);
+      }
+      const reg = addVault(alias, target, {
+        description: opts.description,
+        setDefault: opts.setDefault,
+        force: opts.force,
+      });
+      const isDefault = reg.default === alias;
+      console.log(
+        chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${target}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("remove <alias>")
+  .alias("rm")
+  .description("Unregister a vault alias")
+  .action((alias: string) => {
+    try {
+      // removeVault reports wasDefault from its single read — no pre-read needed.
+      const { wasDefault } = removeVault(alias);
+      console.log(chalk.yellow(`Removed vault alias "${alias}"`));
+      if (wasDefault) {
+        // Surface the silent loss of a default so commands without --vault don't
+        // mysteriously start resolving to the local/cwd vault.
+        console.log(
+          chalk.dim(
+            "  That was the default vault — no default is set now. " +
+              "Set one with `ctx vault default <alias>`.",
+          ),
+        );
+      }
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("default <alias>")
+  .description("Set the default vault")
+  .action((alias: string) => {
+    try {
+      setDefaultVault(alias);
+      console.log(chalk.green(`Default vault is now "${chalk.bold(alias)}"`));
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("which")
+  .description("Show which vault the CLI would use right now, and why (respects --vault)")
+  .action(() => {
+    try {
+      const resolved = resolveVaultPath({
+        vaultAlias: selectedVaultAlias,
+        cwd: process.cwd(),
+      });
+      // which is the diagnostic command — always surface a stale-env advisory,
+      // even when a vault resolved (unlike normal commands, which stay quiet for
+      // a local resolution).
+      if (resolved.warning) {
+        console.error(chalk.yellow(resolved.warning));
+      }
+      console.log(resolved.path);
+      console.log(
+        chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+// Parse and run
+program.parseAsync().catch((err: unknown) => {
+  // Engine validation errors render as concise one-liners instead of leaking
+  // stack traces. Unknown errors still throw so genuine bugs stay debuggable.
+  if (err instanceof ContextNestError) {
+    console.error(chalk.red(`Error [${err.code}]: ${err.message}`));
+    process.exit(1);
+  }
+  throw err;
 });

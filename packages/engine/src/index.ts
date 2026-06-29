@@ -44,6 +44,8 @@ export type {
   TraversalOptions,
   TraversalResult,
   GraphQueryResult,
+  VaultRegistry,
+  VaultRegistryEntry,
 } from "./types.js";
 
 // Errors
@@ -56,10 +58,13 @@ export {
   IntegrityError,
   FederationNotSupportedError,
   ConfigError,
+  UnknownAliasError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,
   ChainBreakError,
+  RejectedDocumentError,
+  /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
 
@@ -133,6 +138,7 @@ export {
   hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
+  STATUS_ALIASES,
   TRANSPORTS,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
@@ -150,17 +156,50 @@ export {
   normalizeTags,
   stripTagPrefix,
   getChecksumContent,
+  normalizeStatus,
+  isDraft,
+  isPendingReview,
+  isApproved,
   isPublished,
-  isSuperseded,
+  isRejected,
   isRetrievable,
+  /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
+  isSuperseded,
 } from "./parser.js";
 
 // Config
 export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
 
+// Vault registry (central alias → path mapping).
+// NOTE: writeRegistry is intentionally NOT re-exported — it bypasses alias/path
+// validation, so external callers must go through addVault/removeVault/
+// setDefaultVault. It stays exported from ./registry.js for the engine's own
+// tests, but is not part of the public API surface.
+export {
+  ALIAS_PATTERN,
+  getRegistryDir,
+  getRegistryPath,
+  readRegistry,
+  isVaultRoot,
+  findLocalVault,
+  addVault,
+  removeVault,
+  setDefaultVault,
+  listVaults,
+  resolveVaultPath,
+} from "./registry.js";
+export type {
+  AddVaultOptions,
+  RemoveVaultResult,
+  VaultListEntry,
+  VaultResolutionSource,
+  ResolveVaultOptions,
+  ResolvedVault,
+} from "./registry.js";
+
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL } from "./storage.js";
+export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";
 export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
 
 // URI
@@ -225,6 +264,8 @@ export type {
   CheckpointDriftScanInput,
   CheckpointDriftScanResult,
   DriftScanEntry,
+  SkippedDocument,
+  RebuildCheckpointResult,
 } from "./checkpoint.js";
 
 // Hygienist (background drift scanner)

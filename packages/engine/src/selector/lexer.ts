@@ -83,8 +83,12 @@ export function tokenize(input: string): Token[] {
     if (input.slice(pos).startsWith("contextnest://")) {
       const uriStart = pos;
       pos += "contextnest://".length;
-      // Read until whitespace or operator or paren
-      while (pos < input.length && !/[\s+|\-()]/.test(input[pos])) pos++;
+      // Read until whitespace, a binary/group operator, or paren. Note `-` is
+      // NOT a delimiter here: hyphens are valid URI path characters (e.g.
+      // `contextnest://nodes/api-design`), mirroring tag tokenization which
+      // also consumes `-`. The NOT operator is whitespace-delimited in practice
+      // (`uri - #tag`), so it still tokenizes correctly after the URI ends.
+      while (pos < input.length && !/[\s+|()]/.test(input[pos])) pos++;
       tokens.push({ type: "URI", value: input.slice(uriStart, pos), position: uriStart });
       continue;
     }
@@ -136,7 +140,7 @@ export function tokenize(input: string): Token[] {
           case "server":
             tokens.push({ type: "SERVER_FILTER", value: filterValue, position: start });
             break;
-          case "pack":
+          case "pack": {
             // Pack values can include dots
             const packStart = pos - filterValue.length;
             pos = packStart;
@@ -147,7 +151,8 @@ export function tokenize(input: string): Token[] {
               position: start,
             });
             break;
-          case "tag":
+          }
+          case "tag": {
             // `tag:#X` is the spec-documented alias for the bare `#X` form.
             // The standard filterValue read stops at `#`, so rewind and re-read,
             // consuming an optional leading `#`.
@@ -165,6 +170,7 @@ export function tokenize(input: string): Token[] {
               position: start,
             });
             break;
+          }
           default:
             throw new Error(`Unknown filter type "${word}" at position ${start}`);
         }
