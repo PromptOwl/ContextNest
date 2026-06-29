@@ -28,4 +28,12 @@ describe("normalizeDocumentId", () => {
       "sources/integrations/slack",
     );
   });
+
+  it("rejects path traversal (`..`) so an id cannot escape the vault root", () => {
+    expect(() => normalizeDocumentId("../../etc/passwd")).toThrow(/path traversal/);
+    expect(() => normalizeDocumentId("nodes/../../secret")).toThrow(/path traversal/);
+    expect(() => normalizeDocumentId("..")).toThrow(/path traversal/);
+    // Backslash-separated traversal (Windows-style input) is rejected too.
+    expect(() => normalizeDocumentId("..\\..\\secret")).toThrow(/path traversal/);
+  });
 });

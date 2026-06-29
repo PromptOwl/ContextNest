@@ -44,15 +44,20 @@ describe("root-level discovery + normalizeDocumentId coherence", () => {
     expect(node.frontmatter.title).toBe("Foo");
   });
 
-  it("reads a genuine root-level node via its normalized nodes/ id", async () => {
-    // A node authored at the vault root has the bare id "bar".
+  it("reads a root-level node by its own id but never silently via a nodes/ slug", async () => {
+    // A node authored at the vault root has the bare id "bar". It IS reachable
+    // by its own (root) id...
     await writeFile(join(root, "bar.md"), NODE, "utf-8");
+    const rootNode = await storage.readDocument("bar");
+    expect(rootNode.id).toBe("bar");
+    expect(rootNode.frontmatter.title).toBe("Foo");
 
-    // A client passes the slug, which normalizes to nodes/bar; readDocument
-    // falls back to the root so the node stays reachable by its slug.
-    const node = await storage.readDocument(normalizeDocumentId("bar"));
-    expect(node.id).toBe("bar");
-    expect(node.frontmatter.title).toBe("Foo");
+    // ...but a normalized `nodes/bar` slug does NOT silently resolve to the root
+    // file. readDocument reads exactly `${id}.md` — a fallback would split a
+    // later update_document into `nodes/bar.md`, leaving the root file stale.
+    await expect(
+      storage.readDocument(normalizeDocumentId("bar")),
+    ).rejects.toBeInstanceOf(DocumentNotFoundError);
   });
 
   it("prefers nodes/<slug> over a root file of the same slug", async () => {

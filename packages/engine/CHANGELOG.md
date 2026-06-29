@@ -4,6 +4,8 @@
 
 ### Minor Changes
 
+- Security & correctness hardening for the new id/lifecycle work: `normalizeDocumentId` now rejects `..` path-traversal segments at the single choke point every CLI/MCP path conversion flows through (a manipulated path can no longer escape the vault root); `parseDocument` defaults a missing `status` to `draft` so a doc with no status field is no longer visible in listings yet invisible to `query`/`resolve`; and `readDocument` reads exactly `${id}.md` (no silent root fallback) so an `update_document` can never split a node into a second file.
+
 - Replace `status: superseded` with a four-value canonical set + alias normalization.
 
   **Canonical statuses:** `draft`, `pending_review`, `approved`, `published`, `rejected`.
