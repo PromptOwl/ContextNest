@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -15,13 +15,26 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const distPath = join(here, "..", "..", "dist", "index.js");
 
+// Sandbox the central vault registry so `ctx init` (which auto-registers an
+// alias non-interactively) never writes to the developer's / CI runner's real
+// ~/.contextnest/config.yaml. Cleared up after the whole suite.
+const CONFIG_DIR = mkdtempSync(join(tmpdir(), "cn-init-cfg-"));
+afterAll(() => rmSync(CONFIG_DIR, { recursive: true, force: true }));
+
 function runInit(cwd: string, extraEnv: Record<string, string> = {}): void {
   execFileSync(
     "node",
     [distPath, "init", "--name", "child-vault", "--layout", "structured"],
     {
       cwd,
-      env: { ...process.env, CONTEXTNEST_NO_BROWSER: "1", ...extraEnv },
+      env: {
+        ...process.env,
+        CONTEXTNEST_NO_BROWSER: "1",
+        CONTEXTNEST_CONFIG_DIR: CONFIG_DIR,
+        CONTEXTNEST_VAULT: "",
+        CONTEXTNEST_VAULT_PATH: "",
+        ...extraEnv,
+      },
       stdio: "ignore",
     },
   );

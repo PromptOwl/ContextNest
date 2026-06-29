@@ -69,6 +69,8 @@ export interface AgentConfigInput {
  * All supported agent config targets.
  */
 export interface AgentConfigFile {
+  /** Agentic tool id this file targets (e.g. "claude", "cursor"). */
+  tool: string;
   /** Relative path from vault root */
   path: string;
   /** Content to merge into the file (between markers) */
@@ -76,19 +78,34 @@ export interface AgentConfigFile {
 }
 
 /**
- * Generate all agent config files for the vault.
+ * Generate the agent config files for the vault.
+ *
+ * Selection semantics, keyed on `config.agent_tools`:
+ * - `undefined` — the vault predates tool selection, or selection was skipped
+ *   (non-interactive `ctx init`). All targets are returned (back-compat).
+ * - non-empty array — only the targets whose tool id is listed are returned.
+ * - empty array — the user explicitly chose no tools in the picker, so no
+ *   config files are written.
  */
 export function generateAgentConfigs(input: AgentConfigInput): AgentConfigFile[] {
   const core = buildCoreInstructions(input);
   const section = `${SECTION_BEGIN}\n${core}\n${SECTION_END}`;
 
-  return [
-    { path: "CLAUDE.md", content: section },
-    { path: "GEMINI.md", content: section },
-    { path: ".cursorrules", content: section },
-    { path: ".windsurfrules", content: section },
-    { path: ".github/copilot-instructions.md", content: section },
+  const all: AgentConfigFile[] = [
+    { tool: "claude", path: "CLAUDE.md", content: section },
+    { tool: "gemini", path: "GEMINI.md", content: section },
+    { tool: "cursor", path: ".cursorrules", content: section },
+    { tool: "windsurf", path: ".windsurfrules", content: section },
+    { tool: "copilot", path: ".github/copilot-instructions.md", content: section },
   ];
+
+  const selected = input.config?.agent_tools;
+  // `undefined` is back-compat → write all. A present array (even empty) is an
+  // explicit choice → write exactly those, which for `[]` means nothing.
+  if (selected !== undefined) {
+    return all.filter((f) => selected.includes(f.tool));
+  }
+  return all;
 }
 
 /**

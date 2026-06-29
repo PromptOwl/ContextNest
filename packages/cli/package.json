@@ -42,7 +42,8 @@
     "clean": "rm -rf dist",
     "postinstall": "echo \"\n  Context Nest CLI installed successfully.\n\n  Get started:\n    ctx init --starter developer    # Engineering vault (in a codebase)\n    ctx init --starter personal     # Personal second brain (no codebase needed)\n    ctx init --starter executive    # Strategy vault\n    ctx init --starter analyst      # Research / analysis vault\n    ctx init --starter team         # Team knowledge base\n    ctx init --starter sales        # Sales enablement vault\n    ctx init --list-starters        # See all options\n\n  Or just run: ctx init\n\n  Docs: https://github.com/PromptOwl/ContextNest\n  Context Nest by PromptOwl — https://promptowl.ai\n\"",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@promptowl/contextnest-engine": "workspace:^",
@@ -51,8 +52,9 @@
     "cli-table3": "^0.6.5"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
     "tsup": "^8.0.0",
+    "typescript": "^5.7.0",
     "vitest": "^4.1.9"
   },
   "files": [

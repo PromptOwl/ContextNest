@@ -7,8 +7,9 @@ import type { ContextNode, VersionEntry } from "./types.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
-import { serializeDocument, getChecksumContent, isPublished } from "./parser.js";
+import { serializeDocument, getChecksumContent, isPublished, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
+import { RejectedDocumentError } from "./errors.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -32,6 +33,14 @@ export async function publishDocument(
 ): Promise<PublishResult> {
   // Read current document
   let node = await storage.readDocument(docId);
+
+  // Guard against silent resurrection: republishing a rejected node would
+  // flip its status to "published" and put it back into retrieval. Callers
+  // (e.g. importers running publishDocument on every discovered file) must
+  // either skip rejected docs or change their status first.
+  if (isRejected(node)) {
+    throw new RejectedDocumentError(docId);
+  }
 
   const versionManager = new VersionManager(storage);
 
