@@ -15,8 +15,33 @@ export type NodeType =
   | "reference"
   | "skill";
 
-/** Document status (§1.5) */
-export type Status = "draft" | "published";
+/** Document status (§1.5)
+ *
+ * Lifecycle:
+ *   draft           → editable scratch state. Hidden from LLM retrieval
+ *                     unless `includeDrafts: true` is set on the query.
+ *   pending_review  → author submitted for review; reviewer has not yet
+ *                     signed off. Hidden from LLM but visible to stewards.
+ *   approved        → reviewer signed off; ready for publish ceremony but
+ *                     not yet live. Hidden from LLM retrieval.
+ *   published       → live, retrievable, the only status surfaced to LLMs
+ *                     by default.
+ *   rejected        → terminal hide. `publishDocument` refuses rejected
+ *                     docs to prevent silent resurrection. Stewards revive
+ *                     by setting status back to draft/pending_review/
+ *                     approved/published.
+ *
+ * Aliases (e.g. `cancelled` → `rejected`, `superseded` → `draft`,
+ * `review` → `pending_review`, `active` → `published`) are normalized to
+ * canonical at parse time — see `STATUS_ALIASES` in `schemas.ts`. Unknown
+ * values fall back to `"draft"`.
+ */
+export type Status =
+  | "draft"
+  | "pending_review"
+  | "approved"
+  | "published"
+  | "rejected";
 
 /** Source transport protocol (§1.9.1) */
 export type Transport = "mcp" | "rest" | "cli" | "function";
@@ -340,6 +365,37 @@ export interface NestConfig {
    * index time, a sensible default is used.
    */
   agent_maintenance_directive?: string;
+  /**
+   * Agentic tools whose config files this vault writes. Tool ids:
+   * "claude" | "gemini" | "cursor" | "windsurf" | "copilot".
+   * Set by `ctx init`'s tool picker. When undefined or empty, ALL targets are
+   * written (back-compat). `ctx index` honors this; `ctx init` overwrites it.
+   */
+  agent_tools?: string[];
+}
+
+/**
+ * A single registered vault in the central registry (~/.contextnest/config.yaml).
+ * The registry only stores paths — vaults are not physically relocated.
+ */
+export interface VaultRegistryEntry {
+  /** Absolute path to the vault root (the directory containing .context/config.yaml). */
+  path: string;
+  /** Optional short label for this alias, independent of the vault's own name. */
+  description?: string;
+}
+
+/**
+ * Central vault registry. Maps short aliases to vault paths so the CLI and MCP
+ * server can target any vault from any working directory (analogous to AWS
+ * named profiles). Stored at ~/.contextnest/config.yaml.
+ */
+export interface VaultRegistry {
+  version: number;
+  /** Alias of the default vault, used when no flag/env selects one. */
+  default?: string;
+  /** Registered vaults, keyed by alias. */
+  vaults: Record<string, VaultRegistryEntry>;
 }
 
 /** Trace entry for document access (§9.2) */

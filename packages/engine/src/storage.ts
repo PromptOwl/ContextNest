@@ -27,7 +27,7 @@ import type {
   PendingChange,
   VerificationReport,
 } from "./types.js";
-import { DocumentNotFoundError } from "./errors.js";
+import { ContextNestError, DocumentNotFoundError } from "./errors.js";
 import {
   packSchema,
   documentHistorySchema,
@@ -36,6 +36,38 @@ import {
 
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
+
+/**
+ * Normalize a user-supplied document path/slug into a canonical document id.
+ *
+ * Single source of truth shared by every client (CLI, MCP) so a bare slug
+ * resolves to the same place no matter which surface created it:
+ *   - strips a trailing `.md` extension,
+ *   - strips leading slashes,
+ *   - defaults a bare slug (no `/`) into `nodes/` so it lands where discovery
+ *     scans; explicit folder paths (`nodes/x`, `sources/y`) are respected as-is.
+ *   - rejects `..` segments — callers always join the id against the vault root,
+ *     so a traversal sequence would escape the vault (arbitrary read/write/delete
+ *     via a manipulated CLI/MCP path).
+ *
+ * @example normalizeDocumentId("my-doc")        // "nodes/my-doc"
+ * @example normalizeDocumentId("sources/cfg")   // "sources/cfg"
+ * @example normalizeDocumentId("/nodes/x.md")   // "nodes/x"
+ * @example normalizeDocumentId("../../etc/x")   // throws — path traversal
+ */
+export function normalizeDocumentId(raw: string): string {
+  const trimmed = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+  // A legitimate document id never contains a `..` segment; treating one as a
+  // path would let it escape the vault root. Reject it at this single choke
+  // point that every CLI/MCP path conversion flows through.
+  if (trimmed.split(/[/\\]/).some((seg) => seg === "..")) {
+    throw new ContextNestError(
+      `Invalid document id "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
+}
 
 /** Options for `NestStorage.readDocument`. */
 export interface ReadDocumentOptions {
@@ -82,13 +114,27 @@ export class NestStorage {
   /**
    * Discover all markdown documents in the vault.
    * Skips hidden directories (.-prefixed) and node_modules.
+   *
+   * By default, documents with `status: rejected` are EXCLUDED — they stay
+   * on disk for audit history but never surface to retrieval (CLI / MCP /
+   * community / desktop all inherit this). Callers that need the full set
+   * (integrity checks, hygienist, regenerateIndex, version audit) pass
+   * `{ includeRetired: true }`.
+   *
+   * Back-compat: `includeSuperseded` is accepted as a deprecated alias for
+   * `includeRetired`. Either flag opens the filter.
    */
-  async discoverDocuments(): Promise<ContextNode[]> {
+  async discoverDocuments(
+    options: { includeRetired?: boolean; includeSuperseded?: boolean } = {},
+  ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
     let patterns: string[];
 
     if (layout === "structured") {
-      patterns = ["nodes/**/*.md", "sources/**/*.md"];
+      // Include root-level *.md so a node is discoverable wherever it lives,
+      // not only under nodes/ or sources/. Agent-config and scaffold files at
+      // the root are excluded via the ignore list below.
+      patterns = ["*.md", "nodes/**/*.md", "sources/**/*.md"];
     } else {
       patterns = ["**/*.md"];
     }
@@ -102,6 +148,11 @@ export class NestStorage {
         "**/INDEX.md",
         "CONTEXT.md",
         "context.yaml",
+        // Agent-config / scaffold files are not knowledge nodes.
+        "**/CLAUDE.md",
+        "**/GEMINI.md",
+        "**/AGENTS.md",
+        "**/README.md",
       ],
       dot: false,
       // Skip unreadable directories rather than failing the whole crawl.
@@ -113,10 +164,27 @@ export class NestStorage {
       const filePath = join(this.root, file);
       const content = await readFile(filePath, "utf-8");
       const id = file.replace(/\.md$/, "");
-      nodes.push(parseDocument(filePath, content, id));
+      const node = parseDocument(filePath, content, id);
+      // Root-level discovery (structured layout) globs *.md at the vault root so
+      // a node can live anywhere. But a vault root commonly holds scaffold files
+      // (CHANGELOG, CONTRIBUTING, LICENSE, SECURITY, …) that are NOT knowledge
+      // nodes. Require authored frontmatter before treating a root file as a node
+      // — an authored node always has frontmatter; plain scaffold markdown does
+      // not. parseDocument injects a default `status` even when none was present,
+      // so the scaffold signal is "no authored keys beyond that injected status".
+      // (Only root-level files in structured layout: nodes/ and sources/ files
+      // are always nodes, and Obsidian notes legitimately have no frontmatter.)
+      const isRootLevel = !file.includes("/");
+      const authoredKeys = Object.keys(node.frontmatter).filter((k) => k !== "status");
+      if (layout === "structured" && isRootLevel && authoredKeys.length === 0) {
+        continue;
+      }
+      nodes.push(node);
     }
 
-    return nodes;
+    const includeRetired = options.includeRetired || options.includeSuperseded;
+    if (includeRetired) return nodes;
+    return nodes.filter((n) => n.frontmatter.status !== "rejected");
   }
 
   /**
@@ -134,6 +202,12 @@ export class NestStorage {
     id: string,
     options: ReadDocumentOptions = {},
   ): Promise<ContextNode> {
+    // Read the file at exactly `${id}.md`. We deliberately do NOT fall back to a
+    // root-level file for a `nodes/<slug>` id: writes always target `${id}.md`,
+    // so a read that silently resolved elsewhere would split a later
+    // update_document into a second file and leave the original stale. Root-level
+    // nodes remain discoverable via list/search; they are addressed by their own
+    // (root) id, not by a normalized `nodes/` slug.
     const filePath = join(this.root, `${id}.md`);
     let liveContent: string;
     try {
@@ -209,7 +283,9 @@ export class NestStorage {
    * outside engine-managed blocks are preserved.
    */
   async regenerateIndex(): Promise<void> {
-    const docs = await this.discoverDocuments();
+    // Per-folder INDEX.md must list retired docs too so stewards can find
+    // them; context.yaml gets filtered to published only below.
+    const docs = await this.discoverDocuments({ includeRetired: true });
     const config = await this.readConfig();
     const checkpointHistory = await this.readCheckpointHistory();
     const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
@@ -277,7 +353,22 @@ export class NestStorage {
     const errors: VerificationReport["errors"] = [];
 
     for (const [docId, history] of allHistories) {
-      const report = verifyDocumentChain(docId, history, (_v) => null);
+      // Pre-load keyframe bytes so the (synchronous) verifyDocumentChain
+      // callback can re-hash them. Without this the keyframe content check is
+      // skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
+      // left intact — goes undetected. Keyframe files are small; the reads are
+      // cheap, and the chain check below still works when one is missing.
+      const keyframeContent = new Map<number, string>();
+      for (const entry of history.versions) {
+        if (!entry.keyframe) continue;
+        const content = await this.readKeyframe(docId, entry.version);
+        if (content !== null) keyframeContent.set(entry.version, content);
+      }
+      const report = verifyDocumentChain(
+        docId,
+        history,
+        (version) => keyframeContent.get(version) ?? null,
+      );
       if (!report.valid) errors.push(...report.errors);
     }
 
@@ -289,7 +380,8 @@ export class NestStorage {
       if (!report.valid) errors.push(...report.errors);
     }
 
-    const liveDocs = await this.discoverDocuments();
+    // Integrity check must verify every doc on disk, including retired ones.
+    const liveDocs = await this.discoverDocuments({ includeRetired: true });
     for (const doc of liveDocs) {
       const drift = await this.detectDocumentDrift(doc.id);
       if (drift && drift.drifted) {

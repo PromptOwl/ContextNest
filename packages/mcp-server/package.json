@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-mcp-server",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -41,7 +41,8 @@
     "build": "tsup",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@promptowl/contextnest-engine": "workspace:^",
@@ -49,8 +50,9 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
     "tsup": "^8.0.0",
+    "typescript": "^5.7.0",
     "vitest": "^4.1.9"
   },
   "files": [
