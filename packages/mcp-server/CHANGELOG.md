@@ -1,5 +1,20 @@
 # @promptowl/contextnest-mcp-server
 
+## 1.2.0
+
+### Minor Changes
+
+- Support the new document status lifecycle (`draft`, `pending_review`, `approved`, `published`, `rejected`) and its case-insensitive aliases. `update_document` and `list_documents` accept alias values (e.g. `active`, `cancelled`, `superseded`) and persist/filter on the canonical value; the `document_format` tool returns the full alias map.
+
+### Patch Changes
+
+- Resolve the served vault through the engine's vault registry: honor the `CONTEXTNEST_VAULT` alias and the documented resolution precedence (alias → path → positional arg → local walk-up → registry default → cwd). A bad alias or non-vault path now produces a clean error on stderr at startup instead of an unhandled stack trace. A relative positional vault-path argument (`contextnest-mcp ./vault`) resolves against the working directory again.
+
+  The mutation and read tools (`read_document`, `read_version`, `update_document`, `delete_document`, `publish_document`) now normalize a bare path into `nodes/` consistently with `create_document`, so a document created via MCP is reachable by the same path.
+
+- Updated dependencies:
+  - @promptowl/contextnest-engine@1.2.0
+
 ## 1.1.1
 
 ### Patch Changes
