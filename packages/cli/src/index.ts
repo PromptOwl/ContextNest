@@ -23,6 +23,9 @@ import {
   ContextInjector,
   GraphQueryEngine,
   publishDocument,
+  forgetDocument,
+  forgetLog,
+  computeGovernanceEnvelope,
   ContextNestError,
   generateContextYaml,
   generateIndexMd,
@@ -1139,6 +1142,37 @@ program
     }
   });
 
+// ─── ctx forget-log ──────────────────────────────────────────────────────────
+
+program
+  .command("forget-log [path]")
+  .description("Show forget / unforget audit events (optionally scoped to a document)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    const storage = getStorage();
+    const id = path ? normalizeDocumentId(path) : undefined;
+    const events = await forgetLog(storage, id);
+
+    if (opts.json) {
+      console.log(JSON.stringify(events, null, 2));
+      return;
+    }
+
+    if (events.length === 0) {
+      console.log(chalk.yellow("No forget events recorded."));
+      return;
+    }
+
+    console.log(chalk.bold(`${events.length} forget event(s):\n`));
+    for (const e of events) {
+      const meta = (e.action_metadata ?? {}) as Record<string, unknown>;
+      console.log(`  ${chalk.cyan(e.document_id ?? "(unknown)")} — ${e.event_type}`);
+      console.log(`    By: ${e.actor} at ${e.timestamp}`);
+      if (meta.reason) console.log(`    Reason: ${String(meta.reason)}`);
+      if (meta.requested_by) console.log(`    Requested by: ${String(meta.requested_by)}`);
+    }
+  });
+
 // ─── ctx reconstruct ───────────────────────────────────────────────────────────
 
 program
@@ -1373,10 +1407,54 @@ program
   .option("--hops <n>", "Graph traversal depth (default: 2)", parseInt)
   .option("--full", "Force full-load mode (load all documents)")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
+  .option(
+    "--strict",
+    "Return a sealed governance envelope (records + directive + provenance) for --actor",
+  )
+  .option("--actor <principal>", "Principal the strict envelope is computed for")
   .action(async (selector, opts) => {
     // Cloud pack: @org/pack-name routes to PromptOwl API
     if (selector.startsWith("@")) {
       await queryFromCloud(selector, opts);
+      return;
+    }
+
+    // Strict governed retrieval — SCAFFOLD (ctx-forget-strict-pr-spec §2).
+    // Returns a closed-world envelope instead of raw candidates. The actor's
+    // per-principal eligibility model is NOT yet implemented; the CLI applies
+    // only zone-RBAC (via a permissive hook) + tombstone exclusion. See
+    // engine/governance-envelope.ts for the porting TODO.
+    if (opts.strict) {
+      const storage = getStorage();
+      const envelope = await computeGovernanceEnvelope(
+        storage,
+        selector,
+        opts.actor ?? "anonymous",
+        { hops: opts.hops ?? 2, full: opts.full ?? false, rbac: permissiveRbac },
+      );
+
+      if (opts.json) {
+        console.log(JSON.stringify(envelope, null, 2));
+      } else {
+        console.log(chalk.bold("Governance envelope (strict mode):"));
+        console.log(chalk.dim(`  directive: ${envelope.directive}`));
+        console.log(chalk.dim(`  actor: ${opts.actor ?? "anonymous"}`));
+        console.log(chalk.bold(`\n${envelope.records.length} record(s):`));
+        for (const rec of envelope.records) {
+          const prov = envelope.provenance.find((p) => p.id === rec.id);
+          console.log(`  ${chalk.cyan(rec.id)}: ${rec.title}`);
+          console.log(
+            chalk.dim(
+              `    v${prov?.version ?? "?"} | ${prov?.eligibility_reason ?? "n/a"}`,
+            ),
+          );
+        }
+        console.log(
+          chalk.yellow(
+            "\n  NOTE: scaffold — per-principal eligibility (owner/assignment/consent/delegation) not yet implemented.",
+          ),
+        );
+      }
       return;
     }
 
@@ -1566,6 +1644,78 @@ program
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────
+
+// ─── ctx forget ────────────────────────────────────────────────────────────────
+
+program
+  .command("forget <pathOrSelector>")
+  .description(
+    "Tombstone document(s): exclude from all retrieval, retain history for audit (ctx-forget-strict-pr-spec §1)",
+  )
+  .option("--reason <r>", "Why the node is being forgotten (recorded in audit)")
+  .option("--requested-by <who>", "Principal who requested the forget")
+  .option("--at <iso>", "ISO-8601 timestamp the forget took effect (default: now)")
+  .option("-a, --author <email>", "Actor recorded in version + chain", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (pathOrSelector, opts) => {
+    const storage = getStorage();
+
+    // Resolve targets: a literal path forgets one doc; otherwise treat the arg
+    // as a selector (parity with `ctx resolve`) and forget every match.
+    let ids: string[];
+    const looksLikeSelector = /[#:|+]/.test(pathOrSelector);
+    if (looksLikeSelector) {
+      const docs = await storage.discoverDocuments();
+      const packs = await storage.readPacks();
+      const resolver = new Resolver({ documents: docs });
+      const packLoader = new PackLoader(packs);
+      const ast = parseSelector(pathOrSelector);
+      const results = await evaluate(ast, {
+        resolver,
+        packLoader: (id) => packLoader.get(id),
+      });
+      ids = results.map((d) => d.id);
+    } else {
+      ids = [normalizeDocumentId(pathOrSelector)];
+    }
+
+    if (ids.length === 0) {
+      console.log(chalk.yellow("No documents matched — nothing forgotten."));
+      return;
+    }
+
+    const forgotten: Array<{ id: string; version: number; chainHash?: string }> = [];
+    for (const id of ids) {
+      const result = await forgetDocument(storage, id, {
+        reason: opts.reason,
+        requestedBy: opts.requestedBy,
+        at: opts.at,
+        editedBy: opts.author,
+      });
+      forgotten.push({
+        id,
+        version: result.node.frontmatter.version ?? 0,
+        chainHash: result.versionEntry.chain_hash,
+      });
+    }
+
+    await regenerateIndex(storage);
+
+    if (opts.json) {
+      console.log(JSON.stringify({ forgotten }, null, 2));
+    } else {
+      console.log(chalk.green(`Forgot ${forgotten.length} document(s):`));
+      for (const f of forgotten) {
+        console.log(`  ${chalk.cyan(f.id)} → v${f.version}`);
+      }
+      if (opts.reason) console.log(chalk.dim(`  reason: ${opts.reason}`));
+      console.log(
+        chalk.dim("  History retained; excluded from all retrieval. Use `ctx forget-log` to audit."),
+      );
+    }
+  });
+
+// ─── ctx delete ────────────────────────────────────────────────────────────────
 
 program
   .command("delete <path>")

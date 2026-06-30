@@ -91,7 +91,9 @@ export type HashChainEventType =
   | "platform_admin.toggle_changed"
   | "platform_admin.session_opened"
   | "platform_admin.session_closed"
-  | "agent.zone_scope_assigned";
+  | "agent.zone_scope_assigned"
+  | "document.forgotten"
+  | "document.unforgotten";
 
 /** Source metadata block — present only on type: source nodes (§1.9.1) */
 export interface SourceMeta {
@@ -145,6 +147,28 @@ export interface Frontmatter {
   zone?: string;
   /** Governance tier (zone-classification-rbac-spec §1) */
   governance?: GovernanceTier;
+  /**
+   * Tombstone flag (ctx-forget-strict-pr-spec §1). When true, the node is
+   * excluded from ALL retrieval (search/resolve/query) but retained in
+   * history for audit. Set by `ctx forget`; distinct from a hard delete.
+   */
+  forgotten?: boolean;
+  /** Provenance for a tombstone — what was forgotten, who requested, when, why. */
+  forget_record?: ForgetRecord;
+}
+
+/**
+ * Right-to-be-forgotten / record-keeping evidence for a tombstoned node
+ * (ctx-forget-strict-pr-spec §1). Persisted in frontmatter and mirrored into
+ * the `document.forgotten` hash-chain event's action_metadata.
+ */
+export interface ForgetRecord {
+  /** Why the node was forgotten (e.g. GDPR erasure request, supersession). */
+  reason?: string;
+  /** Principal who requested the forget (data subject, steward, regulator). */
+  requested_by?: string;
+  /** ISO-8601 timestamp the forget took effect. */
+  at: string;
 }
 
 /** A parsed Context Nest document */

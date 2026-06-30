@@ -133,6 +133,8 @@ export const HASH_CHAIN_EVENT_TYPES = [
   "platform_admin.session_opened",
   "platform_admin.session_closed",
   "agent.zone_scope_assigned",
+  "document.forgotten",
+  "document.unforgotten",
 ] as const;
 
 /** Zone ID pattern: lowercase letter start, then alphanumeric / hyphen / underscore */
@@ -198,6 +200,14 @@ export const frontmatterSchema = z
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
       .optional(),
     governance: z.enum(GOVERNANCE_TIERS).optional(),
+    forgotten: z.boolean().optional(),
+    forget_record: z
+      .object({
+        reason: z.string().optional(),
+        requested_by: z.string().optional(),
+        at: z.string(),
+      })
+      .optional(),
   })
   .superRefine((data, ctx) => {
     // Rule 9: source block MUST be present when type is "source"

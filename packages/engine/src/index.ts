@@ -163,6 +163,7 @@ export {
   isPublished,
   isRejected,
   isRetrievable,
+  isTombstoned,
   /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
   isSuperseded,
 } from "./parser.js";
@@ -277,6 +278,22 @@ export type {
 // Publish
 export { publishDocument } from "./publish.js";
 export type { PublishOptions, PublishResult } from "./publish.js";
+
+// Forget (tombstone) — ctx-forget-strict-pr-spec §1
+export { forgetDocument, forgetLog } from "./forget.js";
+export type { ForgetOptions, ForgetResult } from "./forget.js";
+
+// Governance envelope — SCAFFOLD for `ctx query --strict` (§2)
+export {
+  computeGovernanceEnvelope,
+  STRICT_ENVELOPE_DIRECTIVE,
+} from "./governance-envelope.js";
+export type {
+  GovernanceEnvelope,
+  GovernanceEnvelopeOptions,
+  EnvelopeRecord,
+  EnvelopeProvenance,
+} from "./governance-envelope.js";
 
 // Source graph
 export {

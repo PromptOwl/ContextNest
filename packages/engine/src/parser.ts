@@ -75,6 +75,15 @@ export function isApproved(node: ContextNode): boolean {
   return node.frontmatter.status === "approved";
 }
 
+/**
+ * Predicate: document has been tombstoned via `ctx forget`
+ * (ctx-forget-strict-pr-spec §1). Tombstoned nodes are retained in history
+ * for audit but excluded from ALL retrieval paths.
+ */
+export function isTombstoned(node: ContextNode): boolean {
+  return node.frontmatter.forgotten === true;
+}
+
 /** Predicate: document is in `published` status (post-normalization). */
 export function isPublished(node: ContextNode): boolean {
   return node.frontmatter.status === "published";

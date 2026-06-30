@@ -19,7 +19,7 @@ import { PackLoader } from "./packs.js";
 import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
-import { isPublished, isRetrievable } from "./parser.js";
+import { isPublished, isRetrievable, isTombstoned } from "./parser.js";
 import { getLatestCheckpoint, getLatestCheckpointNumber } from "./checkpoint.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
@@ -113,6 +113,11 @@ export class GraphQueryEngine {
     const sourceNodes: ContextNode[] = [];
 
     for (const doc of docMap.values()) {
+      // Tombstoned (ctx forget) docs vanish from every retrieval path, even
+      // with includeDrafts (ctx-forget-strict-pr-spec §1).
+      if (isTombstoned(doc)) {
+        continue;
+      }
       // Rejected + approved docs are never returned, even with includeDrafts.
       // Rejected = terminal hide (steward retired). Approved = signed off
       // but not yet live — surfaces only after publish.
@@ -166,7 +171,7 @@ export class GraphQueryEngine {
       const config = await this.storage.readConfig();
       const checkpointHistory = await this.storage.readCheckpointHistory();
       const latestCheckpoint = getLatestCheckpoint(checkpointHistory);
-      const published = docs.filter(isPublished);
+      const published = docs.filter((d) => isPublished(d) && !isTombstoned(d));
 
       const contextYaml = generateContextYaml(published, config, latestCheckpoint);
       await this.storage.writeContextYaml(contextYaml);
@@ -203,11 +208,13 @@ export class GraphQueryEngine {
     // Apply the same retrieval gates as graphQuery so approved/rejected
     // never leak to LLMs, and drafts surface only when explicitly opted in.
     const filteredDocs = result.documents.filter((doc) => {
+      if (isTombstoned(doc)) return false;
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;
     });
     const filteredSources = result.sourceNodes.filter((doc) => {
+      if (isTombstoned(doc)) return false;
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;

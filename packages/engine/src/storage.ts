@@ -7,7 +7,7 @@ import { readFile, writeFile, mkdir, stat, unlink, rm, rename } from "node:fs/pr
 import { join, dirname, basename } from "node:path";
 import fg from "fast-glob";
 import yaml from "js-yaml";
-import { parseDocument } from "./parser.js";
+import { parseDocument, isTombstoned } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
   detectDrift,
@@ -289,7 +289,12 @@ export class NestStorage {
     const config = await this.readConfig();
     const checkpointHistory = await this.readCheckpointHistory();
     const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
-    const published = docs.filter((d) => d.frontmatter.status === "published");
+    // Tombstoned (ctx forget) docs are kept in per-folder INDEX.md for stewards
+    // but excluded from context.yaml so they never seed graph retrieval
+    // (ctx-forget-strict-pr-spec §1).
+    const published = docs.filter(
+      (d) => d.frontmatter.status === "published" && !isTombstoned(d),
+    );
     const packs = await this.readPacks();
 
     const contextYaml = generateContextYaml(published, config, latestCheckpoint);

@@ -5,7 +5,7 @@
 import MiniSearch from "minisearch";
 import type { ContextNode, ContextNestUri, Checkpoint } from "./types.js";
 import { extractSection } from "./inline.js";
-import { stripTagPrefix, isPublished } from "./parser.js";
+import { stripTagPrefix, isPublished, isTombstoned } from "./parser.js";
 import { FederationNotSupportedError } from "./errors.js";
 
 export interface ResolverOptions {
@@ -30,8 +30,11 @@ export class Resolver {
     this.checkpoints = options.checkpoints || [];
     this.reconstructVersion = options.reconstructVersion;
 
-    // Index all documents
+    // Index all documents. Tombstoned (ctx forget) docs are never indexed, so
+    // they cannot surface from resolve / tag / folder / search / getPublished —
+    // even with includeDrafts (ctx-forget-strict-pr-spec §1).
     for (const doc of options.documents) {
+      if (isTombstoned(doc)) continue;
       this.documents.set(doc.id, doc);
 
       // Build tag index
@@ -51,7 +54,7 @@ export class Resolver {
     });
 
     const searchDocs = options.documents
-      .filter(isPublished)
+      .filter((d) => isPublished(d) && !isTombstoned(d))
       .map((d) => ({
         id: d.id,
         title: d.frontmatter.title,
