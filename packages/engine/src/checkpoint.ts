@@ -15,6 +15,7 @@ import { computeCheckpointHash, computeChainHash } from "./integrity.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
+import { isPublished } from "./parser.js";
 import {
   classifyDocument,
   type ClassificationManifest,
@@ -235,8 +236,13 @@ export class CheckpointManager {
   }
 
   /**
-   * Create a new checkpoint (§7.1).
-   * Called each time a document is published.
+   * Create a new checkpoint (§7.1) from caller-supplied snapshots.
+   *
+   * Prefer `createCheckpointFromVault` for the publish path: the snapshots here
+   * are captured by the caller before the lock is taken, so a concurrent publish
+   * landing between the caller's two reads can leave a doc missing from, or
+   * version-skewed within, this checkpoint. Kept for callers (and tests) that
+   * need to seal an explicit, possibly-torn snapshot.
    */
   async createCheckpoint(
     triggeredBy: string,
@@ -248,7 +254,42 @@ export class CheckpointManager {
     // history and the last writer would clobber the others, silently dropping
     // checkpoints. The lock is in-process only — separate OS processes would
     // need file-level locking, which is out of scope here.
+    return this.storage.withCheckpointLock(() =>
+      this.sealCheckpoint(triggeredBy, publishedDocuments, documentHistories),
+    );
+  }
+
+  /**
+   * Create a checkpoint whose document snapshots are gathered INSIDE the lock,
+   * so the sealed state is a consistent point-in-time view of the vault. This
+   * closes the publish-path race where `discoverDocuments` and `findAllHistories`
+   * read at different times and a concurrent publish slips between them, leaving
+   * a freshly-published doc absent from the checkpoint it should have sealed.
+   */
+  async createCheckpointFromVault(triggeredBy: string): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
+      const publishedDocuments = (
+        await this.storage.discoverDocuments()
+      ).filter(isPublished);
+      const documentHistories = await this.storage.findAllHistories();
+      return this.sealCheckpoint(
+        triggeredBy,
+        publishedDocuments,
+        documentHistories,
+      );
+    });
+  }
+
+  /**
+   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it re-reads
+   * context_history.yaml, appends one checkpoint, and writes it back.
+   */
+  private async sealCheckpoint(
+    triggeredBy: string,
+    publishedDocuments: ContextNode[],
+    documentHistories: Map<string, DocumentHistory>,
+  ): Promise<Checkpoint> {
+    {
       // Re-read inside the lock so the checkpoint number and previous-hash
       // linkage are based on the latest committed write, not a stale snapshot.
       const history = (await this.storage.readCheckpointHistory()) || {
@@ -280,6 +321,15 @@ export class CheckpointManager {
         const docHistory = documentHistories.get(doc.id);
         if (!docHistory || docHistory.versions.length === 0) continue;
         const sealedVersion = documentVersions[doc.id];
+        // Prefer the exact sealed version's hash. If the supplied snapshot does
+        // not contain that version (a torn/inconsistent caller snapshot, or
+        // corruption), fall back to the latest entry. This deliberately seals a
+        // mismatched hash so verifyCheckpointChain reports cross_chain_mismatch
+        // — a loud, detectable failure is safer than omitting the hash, which
+        // would leave the checkpoint with no integrity anchor for the doc and
+        // pass verification silently. The publish path no longer hits this
+        // branch: createCheckpointFromVault gathers a consistent snapshot under
+        // the lock, so sealedVersion is always present there.
         const entry =
           docHistory.versions.find((v) => v.version === sealedVersion) ??
           docHistory.versions[docHistory.versions.length - 1];
@@ -308,7 +358,7 @@ export class CheckpointManager {
       await this.storage.writeCheckpointHistory(history);
 
       return checkpoint;
-    });
+    }
   }
 
   /**
@@ -345,9 +395,9 @@ export class CheckpointManager {
     const RETRY_BACKOFF_MS = 25;
 
     let lastHistory: CheckpointHistory = { checkpoints: [] };
+    let before = await this.storage.findAllHistories();
 
     for (let attempt = 0; attempt < MAX_REBUILD_ATTEMPTS; attempt++) {
-      const before = await this.storage.findAllHistories();
       lastHistory = this.deriveCheckpointHistory(before);
       await this.storage.writeCheckpointHistory(lastHistory);
 
@@ -360,10 +410,12 @@ export class CheckpointManager {
       }
 
       // A publish landed mid-rebuild. Back off briefly so any further in-flight
-      // publish can finish, then re-derive to include the new checkpoint.
+      // publish can finish, then re-derive from the fresh state (reuse `after`
+      // as the next pass's `before` to save a filesystem read).
       if (attempt < MAX_REBUILD_ATTEMPTS - 1) {
         await delay(RETRY_BACKOFF_MS);
       }
+      before = after;
     }
 
     return lastHistory;

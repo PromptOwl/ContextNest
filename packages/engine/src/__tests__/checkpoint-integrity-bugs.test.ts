@@ -1,5 +1,5 @@
 /**
- * Reproduction tests for two known checkpoint-integrity defects.
+ * Regression tests for two checkpoint-integrity defects, now FIXED.
  *
  *   Bug 1 — non-atomic checkpoint seal references a superseded chain_hash.
  *           `publishDocument` reads the published-doc snapshot (publish.ts:91)
@@ -21,9 +21,9 @@
  *           into a checkpoint chain that then verifies "clean" — no convergence
  *           toward a correct state.
  *
- * These tests are written to FAIL against the current (buggy) engine and pass
- * once the publish path is serialized / re-reads heads before sealing (Bug 1)
- * and the rebuild validates chains before re-sealing (Bug 2).
+ * These tests failed against the pre-fix engine (the original reproduction) and
+ * pass now that the publish path seals from a snapshot gathered inside the lock
+ * (Bug 1) and the rebuild recomputes/validates chains before re-sealing (Bug 2).
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

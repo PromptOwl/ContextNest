@@ -116,7 +116,12 @@ export class NestStorage {
    * require file-level locking.
    */
   async withCheckpointLock<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.checkpointWriteChain.then(fn, fn);
+    // Invoke fn with no arguments on both settle paths: `.then(fn, fn)` would
+    // pass the prior critical section's rejection reason as fn's first argument.
+    const run = this.checkpointWriteChain.then(
+      () => fn(),
+      () => fn(),
+    );
     // Keep the chain alive regardless of how `run` settles so a rejected
     // critical section does not wedge every subsequent caller.
     this.checkpointWriteChain = run.then(

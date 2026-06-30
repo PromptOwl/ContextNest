@@ -9,9 +9,10 @@ import { verifyCheckpointChain } from "../integrity.js";
 import { serializeDocument, isPublished } from "../parser.js";
 
 /**
- * Reproductions for two open checkpoint-chain defects. Both tests assert the
- * CORRECT (desired) behaviour and therefore FAIL on the current code — that
- * failure IS the reproduction. They do not fix anything.
+ * Regression tests for two checkpoint-chain defects, now FIXED. Each asserts the
+ * correct behaviour and guards against regression; they were written to fail
+ * against the pre-fix engine (that failure was the original reproduction) and
+ * pass against the current, fixed engine.
  *
  *   Bug 1 — cross_chain_mismatch from the non-atomic two-phase publish write.
  *           publishDocument() snapshots document versions (discoverDocuments)

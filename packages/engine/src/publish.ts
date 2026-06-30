@@ -7,7 +7,7 @@ import type { ContextNode, VersionEntry } from "./types.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
-import { serializeDocument, getChecksumContent, isPublished, isRejected } from "./parser.js";
+import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
 
@@ -87,20 +87,12 @@ export async function publishDocument(
     publishedAt,
   });
 
-  // Gather all published documents for checkpoint
-  const allDocs = await storage.discoverDocuments();
-  const publishedDocs = allDocs.filter(isPublished);
-
-  // Gather all document histories
-  const histories = await storage.findAllHistories();
-
-  // Create checkpoint
+  // Create checkpoint. The published-docs and histories snapshots are gathered
+  // INSIDE the checkpoint lock (createCheckpointFromVault) so a concurrent
+  // publish cannot slip between two separate reads and leave a doc missing from
+  // — or version-skewed within — the checkpoint this publish seals.
   const checkpointManager = new CheckpointManager(storage);
-  const checkpoint = await checkpointManager.createCheckpoint(
-    docId,
-    publishedDocs,
-    histories,
-  );
+  const checkpoint = await checkpointManager.createCheckpointFromVault(docId);
 
   return {
     node,
