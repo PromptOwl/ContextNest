@@ -212,6 +212,88 @@ describe("Bug 1 (concurrency) — silent checkpoint loss under parallel publishe
   });
 });
 
+describe("Finding 1 — rebuildCheckpointHistory races with createCheckpoint (missing lock)", () => {
+  let root: string;
+  let storage: NestStorage;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "cn-rebuild-race-"));
+    storage = new NestStorage(root);
+    await storage.init("Rebuild Race Vault");
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("preserves a checkpoint written by a concurrent createCheckpoint that runs between rebuild's compute and write phases", async () => {
+    // Arrange: two published docs establish an initial checkpoint history.
+    const idA = "nodes/rebuild-a";
+    const idB = "nodes/rebuild-b";
+    await storage.writeDocument(idA, draftDoc(idA));
+    await storage.writeDocument(idB, draftDoc(idB));
+    await publishDocument(storage, idA, { editedBy: "tester" }); // cp1
+    await publishDocument(storage, idB, { editedBy: "tester" }); // cp2
+
+    const initialCount =
+      (await storage.readCheckpointHistory())?.checkpoints.length ?? 0;
+    expect(initialCount).toBe(2);
+
+    // A third doc is ready to publish but has NOT been published yet.
+    const idC = "nodes/rebuild-c";
+    await storage.writeDocument(idC, draftDoc(idC));
+
+    // --- Simulate the race ---
+    //
+    // rebuildCheckpointHistory() computes a rebuilt history (from idA+idB only,
+    // since idC is not yet published), then calls writeCheckpointHistory().
+    // That write is NOT guarded by withCheckpointLock. A concurrent
+    // publishDocument(idC) runs between rebuild's compute and its write:
+    //
+    //   1. rebuild reads histories, builds 2-checkpoint history
+    //   2. concurrent publish: withCheckpointLock → reads 2 cps → appends cp3
+    //      → writes 3 cps to disk → releases lock
+    //   3. rebuild writes its stale 2-checkpoint history — cp3 is silently lost
+    //
+    // We model step 2 by monkey-patching writeCheckpointHistory so the first
+    // call (from rebuild) triggers the concurrent publish first, then proceeds
+    // with the original (stale) write.
+    const originalWrite = storage.writeCheckpointHistory.bind(storage);
+    let intercepted = false;
+
+    storage.writeCheckpointHistory = async (
+      history,
+    ): Promise<void> => {
+      if (!intercepted) {
+        intercepted = true;
+        // This concurrent publish runs under withCheckpointLock and writes cp3
+        // to disk BEFORE rebuild's write. On buggy code rebuild then overwrites
+        // it; on fixed code rebuild must also hold the lock and will not race.
+        await publishDocument(storage, idC, { editedBy: "concurrent" });
+      }
+      return originalWrite(history);
+    };
+
+    const cm = new CheckpointManager(storage);
+    await cm.rebuildCheckpointHistory();
+
+    storage.writeCheckpointHistory = originalWrite;
+
+    // After the race, the concurrent publish's checkpoint (cp3, containing idC)
+    // must still be present on disk.
+    const after = await storage.readCheckpointHistory();
+    const hasIdC =
+      after?.checkpoints.some(
+        (cp) => cp.document_versions[idC] !== undefined,
+      ) ?? false;
+
+    // DESIRED: cp3 survives — rebuild must not overwrite concurrently-written
+    // checkpoints. CURRENT: rebuild's unlocked full-overwrite clobbers cp3 and
+    // hasIdC is false. This expectation FAILS on the current code (the repro).
+    expect(hasIdC).toBe(true);
+  });
+});
+
 describe("Bug 2 — rebuildCheckpointHistory does not repair a corrupted chain", () => {
   let root: string;
   let storage: NestStorage;
