@@ -1,0 +1,248 @@
+# Stale-Version Attack Query Suite
+# Each query probes a fact where the current published version contradicts the older
+# archived version in .versions/. gold_facts contains the CURRENT (correct) answer.
+# A retrieval that surfaces the stale version may emit the OLD (wrong) answer.
+
+# ============================================================
+# Deploy Rollback (5 queries) — runbooks/deploy-rollback
+# ============================================================
+- id: s01
+  question: "What error rate threshold triggers a production deploy rollback?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "1%"
+    - "exceeds 1%"
+
+- id: s02
+  question: "What P99 latency threshold triggers a production deploy rollback?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "800ms"
+    - "exceeds 800ms"
+
+- id: s03
+  question: "Which Datadog monitor triggers a production deploy rollback?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "prod-deploy-health"
+
+- id: s04
+  question: "Which team owns the production deploy rollback runbook?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "platform team"
+
+- id: s05
+  question: "What is the mean rollback time for a production deploy?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "4 minutes"
+
+# ============================================================
+# Database Migration (5 queries) — runbooks/database-migration
+# ============================================================
+- id: s06
+  question: "What S3 bucket should the database be snapshotted to before a migration?"
+  selector: "#runbook #database"
+  gold_doc: nodes/runbooks/database-migration
+  gold_facts:
+    - "prod-db-backups"
+
+- id: s07
+  question: "How long before a database migration window should #eng-ops be notified?"
+  selector: "#runbook #database"
+  gold_doc: nodes/runbooks/database-migration
+  gold_facts:
+    - "30 minutes"
+
+- id: s08
+  question: "Which bastion host is used to run database migrations?"
+  selector: "#runbook #database"
+  gold_doc: nodes/runbooks/database-migration
+  gold_facts:
+    - "bastion-prod"
+
+- id: s09
+  question: "What script applies a database migration?"
+  selector: "#runbook #database"
+  gold_doc: nodes/runbooks/database-migration
+  gold_facts:
+    - "./scripts/migrate.sh"
+    - "scripts/migrate.sh up"
+
+- id: s10
+  question: "What is the database migration rollback SLA?"
+  selector: "#runbook #database"
+  gold_doc: nodes/runbooks/database-migration
+  gold_facts:
+    - "15 minutes"
+
+# ============================================================
+# Incident Response (5 queries) — runbooks/incident-response
+# ============================================================
+- id: s11
+  question: "What defines a SEV1 incident?"
+  selector: "#runbook #incident"
+  gold_doc: nodes/runbooks/incident-response
+  gold_facts:
+    - "customer-facing outage"
+
+- id: s12
+  question: "Which tool is used to open an incident in the first 15 minutes?"
+  selector: "#runbook #incident"
+  gold_doc: nodes/runbooks/incident-response
+  gold_facts:
+    - "PagerDuty"
+
+- id: s13
+  question: "Which communication channel hosts the bridge for active incidents?"
+  selector: "#runbook #incident"
+  gold_doc: nodes/runbooks/incident-response
+  gold_facts:
+    - "Zoom"
+    - "#incidents"
+
+- id: s14
+  question: "What is the Incident Commander's role during an active incident?"
+  selector: "#runbook #incident"
+  gold_doc: nodes/runbooks/incident-response
+  gold_facts:
+    - "coordination"
+    - "do not debug"
+
+- id: s15
+  question: "What is the deadline for publishing a blameless postmortem after an incident?"
+  selector: "#runbook #incident"
+  gold_doc: nodes/runbooks/incident-response
+  gold_facts:
+    - "48 hours"
+
+# ============================================================
+# API Design Standards (5 queries) — standards/api-design
+# ============================================================
+- id: s16
+  question: "What URL prefix do versioned API endpoints use?"
+  selector: "#standards #api"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "/v1/"
+    - "/v2/"
+
+- id: s17
+  question: "What is the API deprecation notice period?"
+  selector: "#standards #api"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "90 days"
+
+- id: s18
+  question: "What is the JSON response envelope shape used by all APIs?"
+  selector: "#standards #api"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "data"
+    - "meta"
+    - "request_id"
+
+- id: s19
+  question: "What error format do APIs use?"
+  selector: "#standards #api"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "RFC 7807"
+    - "problem-details"
+
+- id: s20
+  question: "What pagination style is required for APIs?"
+  selector: "#standards #api"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "cursor-based"
+    - "offset pagination is forbidden"
+
+# ============================================================
+# Security Review Process (5 queries) — standards/security-review
+# ============================================================
+- id: s21
+  question: "Which Jira project hosts security review tickets?"
+  selector: "#standards #security"
+  gold_doc: nodes/standards/security-review
+  gold_facts:
+    - "SEC"
+
+- id: s22
+  question: "What tag should be applied to a security review request ticket?"
+  selector: "#standards #security"
+  gold_doc: nodes/standards/security-review
+  gold_facts:
+    - "review-request"
+
+- id: s23
+  question: "What is the initial response SLA for a security review request?"
+  selector: "#standards #security"
+  gold_doc: nodes/standards/security-review
+  gold_facts:
+    - "2 business days"
+
+- id: s24
+  question: "What is the full review SLA for a standard feature security review?"
+  selector: "#standards #security"
+  gold_doc: nodes/standards/security-review
+  gold_facts:
+    - "1 week"
+
+- id: s25
+  question: "Does a feature that accepts user-uploaded files require a security review?"
+  selector: "#standards #security"
+  gold_doc: nodes/standards/security-review
+  gold_facts:
+    - "mandatory"
+    - "user-uploaded files"
+
+# ============================================================
+# ADR 0003 (5 queries) — adrs/0003-grpc-internal-rest-external
+# ============================================================
+- id: s26
+  question: "What protocol do internal services use to talk to each other?"
+  selector: "#adr #api"
+  gold_doc: nodes/adrs/0003-grpc-internal-rest-external
+  gold_facts:
+    - "gRPC"
+    - "internal service-to-service"
+
+- id: s27
+  question: "What protocol do external-facing APIs use?"
+  selector: "#adr #api"
+  gold_doc: nodes/adrs/0003-grpc-internal-rest-external
+  gold_facts:
+    - "REST"
+    - "external-facing"
+
+- id: s28
+  question: "What is the status and date of ADR 0003?"
+  selector: "#adr #api"
+  gold_doc: nodes/adrs/0003-grpc-internal-rest-external
+  gold_facts:
+    - "accepted"
+    - "2025-09-21"
+
+- id: s29
+  question: "Why was gRPC chosen for internal traffic over REST?"
+  selector: "#adr #api"
+  gold_doc: nodes/adrs/0003-grpc-internal-rest-external
+  gold_facts:
+    - "typed contracts"
+    - "compile time"
+
+- id: s30
+  question: "How are HTTP clients between internal services generated?"
+  selector: "#adr #api"
+  gold_doc: nodes/adrs/0003-grpc-internal-rest-external
+  gold_facts:
+    - "generated gRPC client"
+    - "no longer hand-roll"
