@@ -100,6 +100,33 @@ export class NestStorage {
   constructor(public readonly root: string) {}
 
   /**
+   * In-process serialization chain for the checkpoint history
+   * read-modify-write. See `withCheckpointLock`.
+   */
+  private checkpointWriteChain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Run `fn` with exclusive access to the checkpoint history file, serializing
+   * concurrent callers in this process. `createCheckpoint` reads, mutates, and
+   * rewrites `context_history.yaml`; without this lock concurrent publishes
+   * (e.g. `Promise.all`) each read the same base history and the last writer
+   * clobbers the rest, silently dropping checkpoints.
+   *
+   * In-process only: this does NOT guard separate OS processes, which would
+   * require file-level locking.
+   */
+  async withCheckpointLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.checkpointWriteChain.then(fn, fn);
+    // Keep the chain alive regardless of how `run` settles so a rejected
+    // critical section does not wedge every subsequent caller.
+    this.checkpointWriteChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
    * Detect layout mode. If nodes/ directory exists, structured; otherwise Obsidian.
    */
   async detectLayout(): Promise<LayoutMode> {

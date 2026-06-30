@@ -11,7 +11,7 @@ import type {
   GovernanceTier,
   SuggestionMeta,
 } from "./types.js";
-import { computeCheckpointHash } from "./integrity.js";
+import { computeCheckpointHash, computeChainHash } from "./integrity.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
@@ -243,55 +243,72 @@ export class CheckpointManager {
     publishedDocuments: ContextNode[],
     documentHistories: Map<string, DocumentHistory>,
   ): Promise<Checkpoint> {
-    const history = (await this.storage.readCheckpointHistory()) || {
-      checkpoints: [],
-    };
+    // Serialize the read-modify-write of context_history.yaml. Concurrent
+    // publishes (e.g. Promise.all) would otherwise each read the same base
+    // history and the last writer would clobber the others, silently dropping
+    // checkpoints. The lock is in-process only — separate OS processes would
+    // need file-level locking, which is out of scope here.
+    return this.storage.withCheckpointLock(async () => {
+      // Re-read inside the lock so the checkpoint number and previous-hash
+      // linkage are based on the latest committed write, not a stale snapshot.
+      const history = (await this.storage.readCheckpointHistory()) || {
+        checkpoints: [],
+      };
 
-    const previousCheckpoint = getLatestCheckpoint(history);
+      const previousCheckpoint = getLatestCheckpoint(history);
 
-    const checkpointNumber = previousCheckpoint
-      ? previousCheckpoint.checkpoint + 1
-      : 1;
-    const at = new Date().toISOString();
+      const checkpointNumber = previousCheckpoint
+        ? previousCheckpoint.checkpoint + 1
+        : 1;
+      const at = new Date().toISOString();
 
-    // Build document_versions map
-    const documentVersions: Record<string, number> = {};
-    for (const doc of publishedDocuments) {
-      documentVersions[doc.id] = doc.frontmatter.version || 1;
-    }
-
-    // Build document_chain_hashes from each document's latest chain_hash
-    const documentChainHashes: Record<string, string> = {};
-    for (const doc of publishedDocuments) {
-      const docHistory = documentHistories.get(doc.id);
-      if (docHistory && docHistory.versions.length > 0) {
-        const latestEntry = docHistory.versions[docHistory.versions.length - 1];
-        documentChainHashes[doc.id] = latestEntry.chain_hash;
+      // Build document_versions map
+      const documentVersions: Record<string, number> = {};
+      for (const doc of publishedDocuments) {
+        documentVersions[doc.id] = doc.frontmatter.version || 1;
       }
-    }
 
-    const checkpointHash = computeCheckpointHash(
-      previousCheckpoint?.checkpoint_hash ?? null,
-      checkpointNumber,
-      at,
-      triggeredBy,
-      documentVersions,
-      documentChainHashes,
-    );
+      // Build document_chain_hashes from the chain hash of the *version being
+      // sealed*, not merely the latest history entry. document_versions and
+      // document_chain_hashes are snapshotted from two separate reads in the
+      // publish path; if a concurrent publish advances the head between them,
+      // sealing the "latest" hash would bind version N to a different version's
+      // hash and trip cross_chain_mismatch on verify. Looking up the matching
+      // version keeps the seal internally consistent.
+      const documentChainHashes: Record<string, string> = {};
+      for (const doc of publishedDocuments) {
+        const docHistory = documentHistories.get(doc.id);
+        if (!docHistory || docHistory.versions.length === 0) continue;
+        const sealedVersion = documentVersions[doc.id];
+        const entry =
+          docHistory.versions.find((v) => v.version === sealedVersion) ??
+          docHistory.versions[docHistory.versions.length - 1];
+        documentChainHashes[doc.id] = entry.chain_hash;
+      }
 
-    const checkpoint: Checkpoint = {
-      checkpoint: checkpointNumber,
-      at,
-      triggered_by: triggeredBy,
-      document_versions: documentVersions,
-      document_chain_hashes: documentChainHashes,
-      checkpoint_hash: checkpointHash,
-    };
+      const checkpointHash = computeCheckpointHash(
+        previousCheckpoint?.checkpoint_hash ?? null,
+        checkpointNumber,
+        at,
+        triggeredBy,
+        documentVersions,
+        documentChainHashes,
+      );
 
-    history.checkpoints.push(checkpoint);
-    await this.storage.writeCheckpointHistory(history);
+      const checkpoint: Checkpoint = {
+        checkpoint: checkpointNumber,
+        at,
+        triggered_by: triggeredBy,
+        document_versions: documentVersions,
+        document_chain_hashes: documentChainHashes,
+        checkpoint_hash: checkpointHash,
+      };
 
-    return checkpoint;
+      history.checkpoints.push(checkpoint);
+      await this.storage.writeCheckpointHistory(history);
+
+      return checkpoint;
+    });
   }
 
   /**
@@ -307,7 +324,43 @@ export class CheckpointManager {
   async rebuildCheckpointHistory(): Promise<CheckpointHistory> {
     const allHistories = await this.storage.findAllHistories();
 
-    // Step 2: Collect all {docId, version, published_at} tuples
+    // Step 1: Recompute each version's chain hash per document instead of
+    // trusting the value stored on disk. Rebuild is the documented §7.3 repair
+    // path; copying stored hashes verbatim would preserve corruption (e.g.
+    // duplicate version numbers from re-imports) and even launder a tampered
+    // chain_hash into a freshly "repaired" chain that then verifies clean.
+    //
+    // We replay each doc's entries in chain order, recompute each chain hash,
+    // and remember the recomputed hash of the FIRST occurrence of each
+    // (doc, version). That first occurrence is exactly the entry
+    // verifyCheckpointChain looks up, so an untampered chain reproduces its
+    // stored hash (the rebuild stays verifiable) while a tampered entry is
+    // replaced by its correct recomputation rather than re-sealed.
+    const recomputed = new Map<
+      string,
+      Map<number, { hash: string; publishedAt: string }>
+    >();
+    for (const [docId, history] of allHistories) {
+      const perVersion = new Map<number, { hash: string; publishedAt: string }>();
+      let prevChainHash: string | null = null;
+      for (const entry of history.versions) {
+        const hash = computeChainHash(
+          prevChainHash,
+          entry.content_hash,
+          entry.version,
+          entry.edited_by,
+          entry.edited_at,
+        );
+        prevChainHash = hash;
+        // Only published versions seed checkpoints; keep the first occurrence.
+        if (entry.published_at && !perVersion.has(entry.version)) {
+          perVersion.set(entry.version, { hash, publishedAt: entry.published_at });
+        }
+      }
+      recomputed.set(docId, perVersion);
+    }
+
+    // Step 2: One tuple per (docId, version) first occurrence.
     const tuples: Array<{
       docId: string;
       version: number;
@@ -315,16 +368,9 @@ export class CheckpointManager {
       chainHash: string;
     }> = [];
 
-    for (const [docId, history] of allHistories) {
-      for (const entry of history.versions) {
-        if (entry.published_at) {
-          tuples.push({
-            docId,
-            version: entry.version,
-            publishedAt: entry.published_at,
-            chainHash: entry.chain_hash,
-          });
-        }
+    for (const [docId, perVersion] of recomputed) {
+      for (const [version, { hash, publishedAt }] of perVersion) {
+        tuples.push({ docId, version, publishedAt, chainHash: hash });
       }
     }
 
