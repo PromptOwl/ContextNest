@@ -298,19 +298,35 @@ export function verifyCheckpointChain(
 
   for (const cp of checkpoints) {
     // Step 4: Cross-chain binding verification.
-    // Skip rows where the current history entry post-dates the checkpoint —
-    // that means the document was deleted and recreated; the new identity
-    // is not the same as the one the checkpoint sealed.
     for (const [docPath, expectedChainHash] of Object.entries(cp.document_chain_hashes)) {
       const history = documentHistories.get(docPath);
       if (!history) continue;
 
       const version = cp.document_versions[docPath];
-      const entry = history.versions.find((v) => v.version === version);
-      if (!entry) continue;
-      if (entry.edited_at > cp.at) continue;
+      const idx = history.versions.findIndex((v) => v.version === version);
+      if (idx === -1) continue;
+      const entry = history.versions[idx];
 
       if (entry.chain_hash !== expectedChainHash) {
+        // A mismatch can mean two very different things. If the entry post-dates
+        // the checkpoint it is normally a delete+recreate — a new identity the
+        // checkpoint never sealed, which we must NOT flag. But that timestamp
+        // check alone would also let a back-dated tamper slip through (rewrite
+        // chain_hash, set a future edited_at). Only treat the row as a benign
+        // recreate when the entry's own chain hash is internally self-consistent;
+        // a tampered hash fails this recompute and is reported.
+        if (entry.edited_at > cp.at) {
+          const prev = idx > 0 ? history.versions[idx - 1].chain_hash : null;
+          const selfHash = computeChainHash(
+            prev,
+            entry.content_hash,
+            entry.version,
+            entry.edited_by,
+            entry.edited_at,
+          );
+          if (selfHash === entry.chain_hash) continue; // genuine recreate
+        }
+
         errors.push({
           type: "cross_chain_mismatch",
           document: docPath,
