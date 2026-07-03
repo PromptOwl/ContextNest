@@ -62,6 +62,16 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
+import {
+  resolveTarget,
+  scanRepo,
+  planNodes,
+  genQuestions,
+  nodePrompt,
+  draftBodyViaClaude,
+  claudeOnPath,
+  renderWorkOrder,
+} from "./distill.js";
 
 const program = new Command();
 
@@ -962,6 +972,93 @@ program
     console.log(chalk.green(`Created and published ${id}.md`));
     console.log(`  Version: ${result.node.frontmatter.version}`);
     console.log(`  Checkpoint: ${result.checkpointNumber}`);
+  });
+
+// ─── ctx distill ──────────────────────────────────────────────────────────────
+
+program
+  .command("distill [target]")
+  .description("Distill a code repo (local dir or GitHub URL) into a governed Context Nest about itself")
+  .option("--auto", "Write node bodies now via `claude -p` (must be on PATH)")
+  .option("--no-auto", "Skip the model; emit a work-order for your agent instead")
+  .action(async (target: string | undefined, opts: { auto?: boolean }) => {
+    const repo = resolveTarget(target || ".");
+    const map = scanRepo(repo);
+    console.log(chalk.bold(`\n● Distilling ${map.name}`));
+    console.log(
+      chalk.dim(
+        `  ${map.totals.files} files (${map.totals.codeFiles} code) · subsystems: ` +
+          map.subsystems.slice(0, 6).map((s) => s.name).join(", "),
+      ),
+    );
+
+    // Pin storage to the TARGET repo so we never walk up to an ancestor vault.
+    const storage = new NestStorage(repo);
+    if (!(await storage.readConfig())) {
+      await storage.init(map.name, "structured" as Parameters<typeof storage.init>[1]);
+      console.log(chalk.green(`  Initialized vault at ${repo}`));
+    }
+
+    const planned = planNodes(map);
+
+    // Always write the human-only questions + a work-order beside the repo.
+    const outDir = pathMod.join(repo, ".distill");
+    await mkdir(outDir, { recursive: true });
+    await writeFile(
+      pathMod.join(outDir, "QUESTIONS.md"),
+      `# Questions for the maintainer\n\n${genQuestions(map).map((q, i) => `${i + 1}. ${q}`).join("\n\n")}\n`,
+      "utf-8",
+    );
+    await writeFile(pathMod.join(outDir, "work-order.md"), renderWorkOrder(map, planned), "utf-8");
+
+    const useAuto = opts.auto !== false && claudeOnPath();
+    if (useAuto) {
+      console.log(chalk.dim(`  Drafting ${planned.length} nodes via claude (verifying against source)…`));
+      let made = 0;
+      for (const n of planned) {
+        const bodyText = draftBodyViaClaude(repo, nodePrompt(map, n));
+        if (!bodyText) {
+          console.log(chalk.yellow(`    ${n.path} … skipped (no model output)`));
+          continue;
+        }
+        const id = normalizeDocumentId(n.path);
+        const frontmatter: Frontmatter = {
+          title: n.title,
+          type: "document",
+          status: "draft",
+          version: 1,
+          created_at: new Date().toISOString(),
+          tags: n.tags,
+        };
+        const node: ContextNode = {
+          id,
+          filePath: "",
+          frontmatter,
+          body: `\n# ${n.title}\n\n${bodyText.trim()}\n`,
+          rawContent: "",
+        };
+        await storage.writeDocument(id, serializeDocument(node));
+        const result = await publishDocument(storage, id, {
+          editedBy: "repo-distill@contextnest",
+          note: "Distilled from source",
+        });
+        console.log(chalk.green(`    ${id} … published v${result.node.frontmatter.version}`));
+        made++;
+      }
+      await regenerateIndex(storage);
+      console.log(chalk.bold(`\n✓ Distilled ${made} nodes into ${repo}`));
+      console.log(chalk.dim(`  Review:  CONTEXTNEST_VAULT_PATH="${repo}" ctx resolve '#architecture'`));
+    } else {
+      const woPath = pathMod.relative(process.cwd(), pathMod.join(outDir, "work-order.md"));
+      console.log(`\n${chalk.bold("Work order written:")} ${woPath}`);
+      console.log(
+        chalk.dim(
+          `  ${planned.length} nodes planned. Drive it with your agent then \`ctx publish <path>\`, ` +
+            `or re-run with --auto and \`claude\` on PATH.`,
+        ),
+      );
+    }
+    console.log(chalk.dim(`  Questions for you: ${pathMod.relative(process.cwd(), pathMod.join(outDir, "QUESTIONS.md"))}`));
   });
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
