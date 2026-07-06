@@ -4,7 +4,8 @@ export default defineConfig({
   test: {
     // Each package is its own project. Replaces the removed
     // vitest.workspace.ts (Vitest 4 uses test.projects instead).
-    projects: ["packages/*"],
+    // `plugins` carries the agent-plugin unit + structural suites.
+    projects: ["packages/*", "plugins"],
     coverage: {
       provider: "v8",
       // Build artifacts get instrumented when regression tests invoke the
