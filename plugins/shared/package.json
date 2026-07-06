@@ -1,0 +1,8 @@
+{
+  "name": "@promptowl/contextnest-plugin-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent-agnostic core (ctx-driving hook scripts + canonical prompts) shared by the Context Nest coding-agent plugins",
+  "license": "AGPL-3.0"
+}
