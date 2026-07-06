@@ -13,7 +13,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, "..", "..");
 const plugin = join(repo, "plugins", "claude-code");
 const readJson = (p: string) => JSON.parse(readFileSync(p, "utf-8"));
-const read = (p: string) => readFileSync(p, "utf-8");
+const read = (p: string) => readFileSync(p, "utf-8").replace(/\r\n/g, "\n");
 
 /** Hook events this plugin relies on (subset of the documented set). */
 const KNOWN_EVENTS = new Set([
@@ -91,13 +91,13 @@ describe("agent + skill frontmatter", () => {
 
   it.each(files)("%s has name/description frontmatter and a filled SHARED block", (rel) => {
     const text = read(join(plugin, rel));
-    const fm = text.match(/^---\n([\s\S]*?)\n---/);
+    const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
     expect(fm, "frontmatter present").toBeTruthy();
     const block = fm![1];
     expect(block).toMatch(/\bname:\s*\S+/);
     expect(block).toMatch(/\bdescription:\s*\S+/);
     // SHARED region exists and is non-empty after sync.
-    const shared = text.match(/<!-- BEGIN SHARED -->\n([\s\S]*?)\n<!-- END SHARED -->/);
+    const shared = text.match(/<!-- BEGIN SHARED -->\r?\n([\s\S]*?)\r?\n<!-- END SHARED -->/);
     expect(shared, "SHARED markers present").toBeTruthy();
     expect(shared![1].trim().length).toBeGreaterThan(50);
   });

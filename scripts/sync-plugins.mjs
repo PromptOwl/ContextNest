@@ -23,7 +23,7 @@ import {
   mkdirSync,
   existsSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -51,7 +51,9 @@ const drift = [];
 const written = [];
 
 function read(path) {
-  return readFileSync(path, "utf-8");
+  // Normalize CRLF so comparisons and writes are stable even when git has
+  // checked the working tree out with Windows line endings.
+  return readFileSync(path, "utf-8").replace(/\r\n/g, "\n");
 }
 
 /** Render a markdown file's content with the SHARED region replaced by `body`. */
@@ -70,12 +72,12 @@ function reconcile(path, expected) {
   const actual = existsSync(path) ? read(path) : null;
   if (actual === expected) return;
   if (CHECK) {
-    drift.push(path.replace(`${ROOT}/`, ""));
+    drift.push(relative(ROOT, path));
     return;
   }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, expected);
-  written.push(path.replace(`${ROOT}/`, ""));
+  written.push(relative(ROOT, path));
 }
 
 for (const target of TARGETS) {
