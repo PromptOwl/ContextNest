@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-mcp-server",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -45,8 +45,8 @@
     "lint": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@promptowl/contextnest-engine": "workspace:^",
-    "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {

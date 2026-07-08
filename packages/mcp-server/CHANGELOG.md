@@ -1,5 +1,14 @@
 # @promptowl/contextnest-mcp-server
 
+## 1.2.1
+
+### Patch Changes
+
+- Bump `@modelcontextprotocol/sdk` to `^1.29.0`.
+
+- Updated dependencies []:
+  - @promptowl/contextnest-engine@1.2.1
+
 ## 1.2.0
 
 ### Minor Changes
