@@ -6,7 +6,10 @@ import { defineConfig } from "vitest/config";
 // so e2e results are reported on their own and gated behind a build.
 export default defineConfig({
   test: {
-    include: ["packages/**/*.regression.test.ts"],
+    include: [
+      "packages/**/*.regression.test.ts",
+      "plugins/**/*.regression.test.ts",
+    ],
     // Spawning a child server/CLI + handshake is slower than a unit test, and
     // notably slower on the Windows CI runners (process startup cost). Generous
     // timeouts keep these subprocess-heavy e2e suites from flaking under load.
