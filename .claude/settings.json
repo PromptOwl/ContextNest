@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --filter @promptowl/contextnest-engine exec tsc --noEmit)",
+      "Bash(echo \"---exit $?\")",
+      "Bash(pnpm --filter @promptowl/contextnest-governance lint)",
+      "Bash(pnpm --filter @promptowl/contextnest-governance test)",
+      "Bash(pnpm --filter @promptowl/contextnest-governance build)",
+      "Bash(pnpm --filter @promptowl/contextnest-mcp-server build)",
+      "Bash(ctx update *)",
+      "Bash(ctx --help)",
+      "Bash(ctx publish *)",
+      "Bash(cd /Users/qaishkanchwala/Documents/GitHub/qaish-test2)",
+      "Bash(ctx search *)",
+      "Bash(ctx list *)",
+      "Bash(cd /Users/qaishkanchwala/Documents/GitHub/qaish-test2 *)"
+    ],
+    "additionalDirectories": [
+      "/private/tmp/claude-501/-Users-qaishkanchwala-Documents-GitHub-ContextNest/1bfebf99-6de0-44a3-9a34-e1a779045f69/scratchpad"
+    ]
+  }
+}

@@ -4,7 +4,12 @@
  */
 
 import { createPatch, applyPatch } from "diff";
-import type { ContextNode, DocumentHistory, VersionEntry } from "./types.js";
+import type {
+  ContextNode,
+  DocumentHistory,
+  ProvenanceOrigin,
+  VersionEntry,
+} from "./types.js";
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
 import { NestStorage } from "./storage.js";
@@ -24,6 +29,8 @@ export class VersionManager {
     options: {
       note?: string;
       publishedAt?: string;
+      /** Provenance origin — stored on the entry, never hashed. */
+      origin?: ProvenanceOrigin;
     } = {},
   ): Promise<VersionEntry> {
     const history = (await this.storage.readHistory(node.id)) || {
@@ -89,6 +96,8 @@ export class VersionManager {
       ...(options.note ? { note: options.note } : {}),
       content_hash: contentHash,
       chain_hash: chainHash,
+      // Stored-but-unhashed: computeChainHash inputs above are untouched.
+      ...(options.origin ? { origin: options.origin } : {}),
     };
 
     history.versions.push(entry);

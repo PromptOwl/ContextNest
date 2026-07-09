@@ -4,6 +4,7 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
@@ -30,12 +31,19 @@ import {
   normalizeStatus,
   STATUS_ALIASES,
   normalizeDocumentId,
+  loadGovernanceBundle,
+  allowAllGovernance,
+  requireRead,
+  filterReadable,
+  UnauthorizedActionError,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
   Frontmatter,
   GovernanceTier,
-  RbacHook,
+  GovernanceHooks,
+  ProvenanceOrigin,
+  ProvenanceRecorder,
 } from "@promptowl/contextnest-engine";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
 
@@ -58,15 +66,77 @@ const server = new McpServer({
 
 const regenerateIndex = () => storage.regenerateIndex();
 
-// Permissive RBAC stub — local single-user MCP context has no real identity
-// layer. All gates pass; engine still records the supplied `actor` in the
-// hash chain audit trail and suggestion meta. Real deploys inject a hook
-// backed by their identity provider (zone-classification-rbac-spec §4).
-const permissiveRbac: RbacHook = {
-  isCzar: () => true,
-  canIngest: () => true,
-  isDocOwner: () => true,
-};
+// ─── Governance ────────────────────────────────────────────────────────────
+//
+// User-level governance is injected at deploy time via a governance module
+// (CONTEXTNEST_GOVERNANCE_MODULE env var, or `governance.module` in the vault
+// config — see loadGovernanceBundle). Without one, `allowAllGovernance` keeps
+// every gate fully open: the local single-user MCP context has no identity
+// layer, and behavior is exactly as before. The bundle is loaded in main()
+// BEFORE the transport connects, so no tool call can race the load.
+let governance: GovernanceHooks = allowAllGovernance;
+let recorder: ProvenanceRecorder | undefined;
+
+// Actor identity precedence: per-call `actor` tool argument (attribution
+// supplied by the caller — NOT authentication) → CONTEXTNEST_ACTOR env var
+// (the per-deployment identity channel for MCP) → fallback. Mutation tools
+// pass their legacy attribution default ("mcp@contextnest.local") as the
+// fallback so ungoverned deployments keep byte-identical audit trails.
+function resolveActor(toolActor?: string, fallback = "local-mcp"): string {
+  return toolActor ?? process.env.CONTEXTNEST_ACTOR ?? fallback;
+}
+
+/** Provenance origin stamped on gated engine calls: which client + tool acted. */
+function mcpOrigin(tool: string): ProvenanceOrigin {
+  return { client: "mcp", tool };
+}
+
+interface ToolResponse {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+}
+
+/**
+ * Shared registration wrapper for governance-gated tools. A denial from the
+ * engine (UnauthorizedActionError) is a per-call policy outcome, not a server
+ * fault: map it to an MCP tool error (isError) so the client sees the denial
+ * and the process never crashes. Every other error keeps today's behavior
+ * (the SDK's CallTool handler converts thrown errors to generic tool errors).
+ */
+function governedTool<S extends z.ZodRawShape>(
+  name: string,
+  description: string,
+  schema: S,
+  handler: (args: z.objectOutputType<S, z.ZodTypeAny>) => Promise<ToolResponse>,
+): void {
+  server.tool(name, description, schema, (async (args: z.objectOutputType<S, z.ZodTypeAny>) => {
+    try {
+      return await handler(args);
+    } catch (err) {
+      if (err instanceof UnauthorizedActionError) {
+        return {
+          content: [{ type: "text" as const, text: err.message }],
+          isError: true,
+        };
+      }
+      throw err;
+    }
+  }) as unknown as ToolCallback<S>);
+}
+
+// Shared description suffix for the optional per-call actor argument.
+const ACTOR_ARG_DESCRIPTION =
+  "Actor identity for governance gating and audit attribution (attribution only — NOT authentication). Precedence: this argument, then the CONTEXTNEST_ACTOR environment variable, then the local default.";
+
+// Document-targeting tools accept `path` (legacy) or `id` (alias) — both are
+// optional in the schema so either spelling validates; exactly one must be
+// present at runtime. Thrown Error → SDK maps it to a tool error (isError).
+const DOC_ID_ALIAS_DESCRIPTION = "Alias for 'path' — document ID (e.g., 'nodes/api-design')";
+function requireDocRef(primary: string | undefined, alias: string | undefined, argName: string): string {
+  const raw = primary ?? alias;
+  if (!raw) throw new Error(`Missing required argument: '${argName}' (or 'id')`);
+  return raw;
+}
 
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
@@ -102,7 +172,7 @@ server.tool("vault_info", "Get vault identity (CONTEXT.md) and configuration sum
 
 // ─── Tool: resolve ─────────────────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "resolve",
   "Execute a selector query to find matching documents using graph traversal",
   {
@@ -115,6 +185,10 @@ server.tool(
     const result = await engine.query(selector, {
       hops: hops ?? 2,
       full: full ?? false,
+      actor: resolveActor(),
+      governance,
+      origin: mcpOrigin("resolve"),
+      recorder,
     });
 
     return {
@@ -154,11 +228,15 @@ server.tool(
 
 // ─── Tool: read_document ───────────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "read_document",
   "Read a single document by its contextnest:// URI or path",
-  { uri: z.string().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')") },
-  async ({ uri }) => {
+  {
+    uri: z.string().optional().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe("Alias for 'uri' — document ID (e.g., 'nodes/api-design')"),
+  },
+  async ({ uri: uriArg, id }) => {
+    const uri = requireDocRef(uriArg, id, "uri");
     let docId: string;
     if (uri.startsWith("contextnest://")) {
       const parsed = parseUri(uri);
@@ -170,7 +248,7 @@ server.tool(
       docId = normalizeDocumentId(uri);
     }
 
-    const doc = await storage.readDocument(docId);
+    const doc = await storage.readDocument(docId, { governance, actor: resolveActor() });
     return {
       content: [
         {
@@ -223,6 +301,10 @@ server.tool(
       const normalizedTag = tag.startsWith("#") ? tag : `#${tag}`;
       docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
     }
+
+    // User-level read gate: silently elide documents the actor cannot read
+    // (deny is a filter here, never an error — mirrors GraphQueryEngine).
+    docs = await filterReadable(governance, resolveActor(), docs, (d) => d.frontmatter.zone);
 
     return {
       content: [
@@ -399,7 +481,7 @@ server.tool("read_index", "Return the context.yaml index", {}, async () => {
 
 // ─── Tool: read_pack ───────────────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "read_pack",
   "Resolve and return a context pack using graph traversal",
   {
@@ -417,7 +499,13 @@ server.tool(
 
     const selector = pack.query || `pack:${id}`;
     const engine = new GraphQueryEngine(storage);
-    const result = await engine.query(selector, { hops: hops ?? 2 });
+    const result = await engine.query(selector, {
+      hops: hops ?? 2,
+      actor: resolveActor(),
+      governance,
+      origin: mcpOrigin("read_pack"),
+      recorder,
+    });
 
     return {
       content: [
@@ -455,7 +543,7 @@ server.tool(
 
 // ─── Tool: search ──────────────────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "search",
   "Full-text search across vault documents with graph traversal",
   {
@@ -464,11 +552,18 @@ server.tool(
     full: z.boolean().optional().describe("Force full-load mode for body-level search (default: false)"),
   },
   async ({ query, hops, full }) => {
-    const selector = `contextnest://search/${query.replace(/\s+/g, "+")}`;
+    // Quote the URI so the selector lexer consumes it verbatim — a bare `+`
+    // (multi-word query separator) would otherwise terminate the URI token
+    // and parse as the AND operator.
+    const selector = `"contextnest://search/${query.replace(/"/g, "").replace(/\s+/g, "+")}"`;
     const engine = new GraphQueryEngine(storage);
     const result = await engine.query(selector, {
       hops: hops ?? 2,
       full: full ?? false,
+      actor: resolveActor(),
+      governance,
+      origin: mcpOrigin("search"),
+      recorder,
     });
 
     return {
@@ -543,7 +638,7 @@ server.tool(
 
 // ─── Tool: read_version ────────────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "read_version",
   "Read a specific version of a document",
   {
@@ -552,6 +647,8 @@ server.tool(
   },
   async ({ path, version }) => {
     const id = normalizeDocumentId(path);
+    // Historical bytes are as sensitive as the live document — same read gate.
+    await requireRead(governance, resolveActor(), { documentId: id }, "read_version");
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
 
@@ -568,11 +665,12 @@ server.tool(
 
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "create_document",
   "Create a new document in the vault with frontmatter and optional body content",
   {
-    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    path: z.string().optional().describe("Document path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe(DOC_ID_ALIAS_DESCRIPTION),
     title: z.string().describe("Document title"),
     type: z
       .enum(["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill"])
@@ -584,12 +682,15 @@ server.tool(
     trigger: z.string().optional().describe("Skill trigger description (required when type is 'skill')"),
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
+    actor: z.string().optional().describe(ACTOR_ARG_DESCRIPTION),
   },
-  async ({ path, title, type, tags, body, trigger, tools_required, output_format }) => {
+  async ({ path, id: idArg, title, type, tags, body, trigger, tools_required, output_format, actor: actorArg }) => {
+    const actor = resolveActor(actorArg, "mcp@contextnest.local");
+    const docRef = requireDocRef(path, idArg, "path");
     // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
     // lands in the same place as one created via `ctx add` (single source of
     // truth — normalizeDocumentId in the engine).
-    const id = normalizeDocumentId(path);
+    const id = normalizeDocumentId(docRef);
 
     // Check if document already exists
     try {
@@ -634,7 +735,7 @@ server.tool(
     };
 
     const content = serializeDocument(node);
-    await storage.writeDocument(id, content);
+    await storage.writeDocument(id, content, { governance, actor, operation: "create" });
 
     // Auto-publish: bump version, create version entry & checkpoint.
     // If publish fails after writeDocument succeeded, roll back the file
@@ -642,8 +743,11 @@ server.tool(
     let result;
     try {
       result = await publishDocument(storage, id, {
-        editedBy: "mcp@contextnest.local",
+        editedBy: actor,
         note: "Created via MCP server",
+        governance,
+        origin: mcpOrigin("create_document"),
+        recorder,
       });
     } catch (err) {
       try {
@@ -680,11 +784,12 @@ server.tool(
 
 // ─── Tool: update_document ─────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "update_document",
   "Update an existing document's frontmatter fields and/or body content",
   {
-    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    path: z.string().optional().describe("Document path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe(DOC_ID_ALIAS_DESCRIPTION),
     title: z.string().optional().describe("New title"),
     tags: z.array(z.string()).optional().describe("New tags (replaces existing)"),
     status: z
@@ -694,10 +799,12 @@ server.tool(
         "New status. Canonical: draft | pending_review | approved | published | rejected. Aliases like 'cancelled', 'superseded', 'active', 'archived', 'review', 'submitted', 'in_review' are accepted and normalized to canonical before storage. Unknown values fall back to 'draft'. 'rejected' retires the doc — no new published version is cut.",
       ),
     body: z.string().optional().describe("New markdown body content"),
+    actor: z.string().optional().describe(ACTOR_ARG_DESCRIPTION),
   },
-  async ({ path, title, tags, status, body }) => {
-    const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+  async ({ path, id: idArg, title, tags, status, body, actor: actorArg }) => {
+    const actor = resolveActor(actorArg, "mcp@contextnest.local");
+    const id = normalizeDocumentId(requireDocRef(path, idArg, "path"));
+    const doc = await storage.readDocument(id, { governance, actor });
 
     // Normalize caller-supplied status to canonical before any guard or
     // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
@@ -756,7 +863,7 @@ server.tool(
     }
 
     const content = serializeDocument(doc);
-    await storage.writeDocument(id, content);
+    await storage.writeDocument(id, content, { governance, actor, operation: "update" });
 
     // Metadata-only paths — any non-published status set is treated as
     // a lifecycle transition, not a content release. Skip publishDocument
@@ -798,8 +905,11 @@ server.tool(
 
     // Auto-publish: bump version, create version entry & checkpoint
     const result = await publishDocument(storage, id, {
-      editedBy: "mcp@contextnest.local",
+      editedBy: actor,
       note: "Updated via MCP server",
+      governance,
+      origin: mcpOrigin("update_document"),
+      recorder,
     });
 
     await regenerateIndex();
@@ -828,19 +938,22 @@ server.tool(
 
 // ─── Tool: delete_document ─────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "delete_document",
   "Delete a document and its version history from the vault",
   {
-    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    path: z.string().optional().describe("Document path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe(DOC_ID_ALIAS_DESCRIPTION),
+    actor: z.string().optional().describe(ACTOR_ARG_DESCRIPTION),
   },
-  async ({ path }) => {
-    const id = normalizeDocumentId(path);
+  async ({ path, id: idArg, actor: actorArg }) => {
+    const actor = resolveActor(actorArg);
+    const id = normalizeDocumentId(requireDocRef(path, idArg, "path"));
 
     // Verify the document exists before deleting
-    const doc = await storage.readDocument(id);
+    const doc = await storage.readDocument(id, { governance, actor });
 
-    await storage.deleteDocument(id);
+    await storage.deleteDocument(id, { governance, actor });
     await regenerateIndex();
 
     return {
@@ -860,20 +973,28 @@ server.tool(
 
 // ─── Tool: publish_document ────────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "publish_document",
   "Publish a document: bump version, compute checksum, create version entry and checkpoint",
   {
-    path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
+    path: z.string().optional().describe("Document path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe(DOC_ID_ALIAS_DESCRIPTION),
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),
     note: z.string().optional().describe("Version note"),
+    actor: z.string().optional().describe(`${ACTOR_ARG_DESCRIPTION} Takes precedence over 'author' for version attribution.`),
   },
-  async ({ path, author, note }) => {
-    const id = normalizeDocumentId(path);
+  async ({ path, id: idArg, author, note, actor: actorArg }) => {
+    const id = normalizeDocumentId(requireDocRef(path, idArg, "path"));
+    // Legacy `author` (with its default) stays the attribution fallback so
+    // ungoverned deployments record exactly what they always did.
+    const actor = resolveActor(actorArg, author);
 
     const result = await publishDocument(storage, id, {
-      editedBy: author,
+      editedBy: actor,
       note,
+      governance,
+      origin: mcpOrigin("publish_document"),
+      recorder,
     });
 
     await regenerateIndex();
@@ -901,17 +1022,18 @@ server.tool(
 
 // ─── Tool: stage_drift_suggestion ──────────────────────────────────────────
 
-server.tool(
+governedTool(
   "stage_drift_suggestion",
   "Capture an out-of-band edit (live file drifted from last-approved bytes) as a staged suggestion under _suggestions/. Does NOT modify the canonical document or hash chain. Pair with verify_integrity → approve_suggestion or reject_suggestion to resolve drift.",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
-    actor: z.string().optional().describe("Opaque actor identity recorded in suggestion meta. Defaults to 'local-mcp'."),
+    actor: z.string().optional().describe(`Opaque actor identity recorded in suggestion meta. ${ACTOR_ARG_DESCRIPTION}`),
     note: z.string().optional().describe("Optional human note explaining the drift"),
   },
-  async ({ path, actor, note }) => {
+  async ({ path, actor: actorArg, note }) => {
+    const actor = resolveActor(actorArg);
     const id = normalizeDocumentId(path);
-    const node = await storage.readDocument(id);
+    const node = await storage.readDocument(id, { governance, actor });
     const history = await storage.readHistory(id);
     if (!history || history.versions.length === 0) {
       return {
@@ -936,10 +1058,13 @@ server.tool(
       approvedRawContent: approvedRaw,
       proposedRawContent: node.rawContent,
       source: "out-of-band-edit",
-      actor: actor ?? "local-mcp",
+      actor,
       zone,
       docTier,
       note,
+      governance,
+      origin: mcpOrigin("stage_drift_suggestion"),
+      recorder,
     });
 
     return {
@@ -994,28 +1119,31 @@ server.tool(
 
 // ─── Tool: approve_suggestion ──────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "approve_suggestion",
   "Approve a staged suggestion: applies the patch, bumps version, writes new canonical bytes, archives the suggestion under _archive/approved/. Refuses if the chain head moved since staging (caller must re-stage).",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     suggestion_id: z.string().describe("Suggestion ID from stage_drift_suggestion or list_suggestions"),
-    actor: z.string().optional().describe("Actor identity recorded as approver. Defaults to 'local-mcp'."),
+    actor: z.string().optional().describe(`Actor identity recorded as approver. ${ACTOR_ARG_DESCRIPTION}`),
     comment: z.string().optional().describe("Optional approval comment recorded in the chain event"),
   },
-  async ({ path, suggestion_id, actor, comment }) => {
+  async ({ path, suggestion_id, actor: actorArg, comment }) => {
+    const actor = resolveActor(actorArg);
     const id = normalizeDocumentId(path);
-    const node = await storage.readDocument(id);
+    const node = await storage.readDocument(id, { governance, actor });
     const zone = node.frontmatter.zone ?? "default";
 
     const result = await approveSuggestion({
       storage,
-      rbac: permissiveRbac,
+      rbac: governance,
       documentId: id,
-      actor: actor ?? "local-mcp",
+      actor,
       zone,
       suggestionId: suggestion_id,
       comment,
+      origin: mcpOrigin("approve_suggestion"),
+      recorder,
     });
 
     await regenerateIndex();
@@ -1044,28 +1172,31 @@ server.tool(
 
 // ─── Tool: reject_suggestion ───────────────────────────────────────────────
 
-server.tool(
+governedTool(
   "reject_suggestion",
   "Reject a staged suggestion: archives the patch + meta under _archive/rejected/ and emits a chain event. Canonical document and hash chain head are untouched. Rejection reason is required for audit trail.",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     suggestion_id: z.string().describe("Suggestion ID to reject"),
     reason: z.string().describe("Rejection reason (required, non-empty)"),
-    actor: z.string().optional().describe("Actor identity recorded as rejector. Defaults to 'local-mcp'."),
+    actor: z.string().optional().describe(`Actor identity recorded as rejector. ${ACTOR_ARG_DESCRIPTION}`),
   },
-  async ({ path, suggestion_id, reason, actor }) => {
+  async ({ path, suggestion_id, reason, actor: actorArg }) => {
+    const actor = resolveActor(actorArg);
     const id = normalizeDocumentId(path);
-    const node = await storage.readDocument(id);
+    const node = await storage.readDocument(id, { governance, actor });
     const zone = node.frontmatter.zone ?? "default";
 
     const result = await rejectSuggestion({
       storage,
-      rbac: permissiveRbac,
+      rbac: governance,
       documentId: id,
-      actor: actor ?? "local-mcp",
+      actor,
       zone,
       suggestionId: suggestion_id,
       reason,
+      origin: mcpOrigin("reject_suggestion"),
+      recorder,
     });
 
     return {
@@ -1092,6 +1223,15 @@ server.tool(
 // ─── Start server ──────────────────────────────────────────────────────────────
 
 async function main() {
+  // Load the deployment's governance module (if any) BEFORE the transport
+  // connects so no tool call can race an open gate. Nothing configured →
+  // null → fully open (exact legacy behavior). A configured-but-broken
+  // module throws ConfigError, which propagates to the catch below and
+  // crashes startup loudly — misconfigured governance must never fall open.
+  const bundle = await loadGovernanceBundle({ vaultPath, env: process.env });
+  governance = bundle?.hooks ?? allowAllGovernance;
+  recorder = bundle?.recorder;
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

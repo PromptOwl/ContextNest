@@ -21,6 +21,15 @@ export type {
   SuggestionMeta,
   HashChainEvent,
   RbacHook,
+  GovernanceHooks,
+  GovernanceTarget,
+  CommitOperation,
+  GovernanceBundle,
+  ProvenanceOrigin,
+  ProvenanceContext,
+  ProvenanceEventKind,
+  ProvenanceRecord,
+  ProvenanceRecorder,
   EdgeType,
   RelationshipEdge,
   HubEntry,
@@ -68,14 +77,29 @@ export {
   SupersededDocumentError,
 } from "./errors.js";
 
-// RBAC
+// RBAC + user-level governance seams
 export {
   denyAllRbac,
   requireCzar,
   requireIngest,
   requireDocOwner,
   filterIngestibleZones,
+  denyAllGovernance,
+  allowAllGovernance,
+  requireRead,
+  requireCommit,
+  filterReadable,
 } from "./rbac.js";
+
+// Provenance
+export { recordProvenance } from "./provenance.js";
+
+// Governance module loader (deployment-time hook injection)
+export {
+  loadGovernanceBundle,
+  GOVERNANCE_MODULE_ENV,
+} from "./governance-loader.js";
+export type { LoadGovernanceOptions } from "./governance-loader.js";
 
 // Suggestions
 export {
@@ -136,6 +160,7 @@ export {
   checkpointHistorySchema,
   suggestionMetaSchema,
   hashChainEventSchema,
+  provenanceOriginSchema,
   NODE_TYPES,
   STATUSES,
   STATUS_ALIASES,
@@ -200,7 +225,11 @@ export type {
 
 // Storage
 export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";
-export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
+export type {
+  LayoutMode,
+  ReadDocumentOptions,
+  GovernanceCallOptions,
+} from "./storage.js";
 
 // URI
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";

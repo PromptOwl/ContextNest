@@ -3,17 +3,33 @@
  * Ties together versioning, integrity, checkpoints, and index regeneration.
  */
 
-import type { ContextNode, VersionEntry } from "./types.js";
+import type {
+  ContextNode,
+  GovernanceHooks,
+  ProvenanceOrigin,
+  ProvenanceRecorder,
+  VersionEntry,
+} from "./types.js";
 import { NestStorage } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
+import { requireCommit } from "./rbac.js";
+import { recordProvenance } from "./provenance.js";
 
 export interface PublishOptions {
   editedBy: string;
   note?: string;
+  /** Zone of the document, when the caller knows it (governance target). */
+  zone?: string;
+  /** User-level commit gate. Absent = allow (back-compat). */
+  governance?: GovernanceHooks;
+  /** Provenance origin stamped on the version entry (never hashed). */
+  origin?: ProvenanceOrigin;
+  /** Best-effort audit sink mirror for the publish event. */
+  recorder?: ProvenanceRecorder;
 }
 
 export interface PublishResult {
@@ -42,6 +58,16 @@ export async function publishDocument(
     throw new RejectedDocumentError(docId);
   }
 
+  // User-level commit gate — BEFORE any mutation so a denied publish leaves
+  // the vault byte-for-byte untouched (no version entry, no checkpoint).
+  await requireCommit(
+    options.governance,
+    options.editedBy,
+    { documentId: docId, zone: options.zone ?? node.frontmatter.zone },
+    "publish",
+    "publishDocument",
+  );
+
   const versionManager = new VersionManager(storage);
 
   // Seed pre-publish snapshot when a doc carries an existing
@@ -52,6 +78,7 @@ export async function publishDocument(
   if (!existingHistory && (node.frontmatter.version || 0) > 1) {
     await versionManager.createVersion(node, "system:seed", {
       note: "Pre-publish snapshot (auto-seeded — no prior history)",
+      origin: options.origin,
     });
   }
 
@@ -85,6 +112,7 @@ export async function publishDocument(
   const versionEntry = await versionManager.createVersion(node, options.editedBy, {
     note: options.note,
     publishedAt,
+    origin: options.origin,
   });
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
@@ -93,6 +121,17 @@ export async function publishDocument(
   // — or version-skewed within — the checkpoint this publish seals.
   const checkpointManager = new CheckpointManager(storage);
   const checkpoint = await checkpointManager.createCheckpointFromVault(docId);
+
+  await recordProvenance(options.recorder, {
+    kind: "publish",
+    actor: options.editedBy,
+    origin: options.origin,
+    document_id: docId,
+    zone: options.zone ?? node.frontmatter.zone,
+    version: versionEntry.version,
+    content_hash: versionEntry.content_hash,
+    chain_hash: versionEntry.chain_hash,
+  });
 
   return {
     node,

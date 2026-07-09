@@ -38,6 +38,8 @@ import {
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
+  filterReadable,
+  UnauthorizedActionError,
   resolveVaultPath,
   addVault,
   removeVault,
@@ -55,9 +57,10 @@ import type {
   Frontmatter,
   LayoutMode,
   GovernanceTier,
-  RbacHook,
+  ProvenanceOrigin,
   VaultRegistry,
 } from "@promptowl/contextnest-engine";
+import { resolveGovernance, type ResolvedGovernance } from "./governance.js";
 import { getStarter, listStarters } from "./starters/index.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
@@ -72,7 +75,15 @@ program
   // Global selector: target a registered vault by alias from any directory.
   // When omitted, resolution falls back to env vars, the local vault, then the
   // registry default (see resolveVaultPath precedence in the engine).
-  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)");
+  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)")
+  // Global actor identity: threaded through governance permission checks and
+  // provenance records. Per-command --actor flags (drift stage/approve/reject)
+  // override this when given explicitly.
+  .option(
+    "-a, --actor <actor>",
+    "Actor identity for permission checks and provenance",
+    process.env.CONTEXTNEST_ACTOR ?? "cli-user",
+  );
 
 // ---------------------------------------------------------------------------
 // Friendly top-level help
@@ -231,14 +242,35 @@ async function regenerateIndex(storage: NestStorage): Promise<void> {
   await storage.regenerateIndex();
 }
 
-// Permissive RBAC stub for local CLI usage. Engine still records the
-// supplied actor in suggestion meta + chain events. Real deploys inject
-// a hook backed by their identity provider.
-const permissiveRbac: RbacHook = {
-  isCzar: () => true,
-  canIngest: () => true,
-  isDocOwner: () => true,
-};
+// ─── Governance plumbing ────────────────────────────────────────────────────────
+// Every read/commit path threads the resolved governance hooks + actor +
+// origin through the engine's opt-in gates. Without a configured module
+// (CONTEXTNEST_GOVERNANCE_MODULE or vault config `governance.module`) the
+// hooks are allow-all and the recorder is a no-op — exact legacy behavior.
+
+// Resolve the governance bundle for the vault this command targets.
+// Memoized per vault path inside resolveGovernance.
+function getGovernance(): Promise<ResolvedGovernance> {
+  return resolveGovernance(getVaultRoot());
+}
+
+// The program-level actor (-a/--actor, defaulting to CONTEXTNEST_ACTOR).
+function getGlobalActor(): string {
+  return program.opts().actor as string;
+}
+
+// Actor for commands that keep their own --actor flag (drift stage/approve/
+// reject): an explicitly-passed local flag wins, otherwise fall back to the
+// program-level actor (which itself defaults from CONTEXTNEST_ACTOR).
+function resolveCommandActor(cmd: Command): string {
+  if (cmd.getOptionValueSource("actor") === "cli") return cmd.opts().actor as string;
+  return getGlobalActor();
+}
+
+// Provenance origin stamped on version entries / audit records.
+function cliOrigin(tool: string): ProvenanceOrigin {
+  return { client: "cli", tool };
+}
 
 // Interactively prompt the user to pick a starter recipe using an arrow-key
 // navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
@@ -830,8 +862,9 @@ program
   .option("--raw", "Output raw file content (frontmatter + body)")
   .action(async (path, opts) => {
     const storage = getStorage();
+    const { hooks } = await getGovernance();
     const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    const doc = await storage.readDocument(id, { governance: hooks, actor: getGlobalActor() });
 
     if (opts.raw) {
       console.log(doc.rawContent);
@@ -906,6 +939,8 @@ program
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .action(async (path, opts) => {
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
+    const actor = getGlobalActor();
     const id = normalizeDocumentId(path);
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
@@ -950,11 +985,18 @@ program
     };
 
     const content = serializeDocument(node);
-    await storage.writeDocument(id, content);
+    await storage.writeDocument(id, content, {
+      governance: hooks,
+      actor,
+      operation: "create",
+    });
 
     const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
+      editedBy: actor,
       note: "Created via CLI",
+      governance: hooks,
+      origin: cliOrigin("add"),
+      recorder,
     });
 
     await regenerateIndex(storage);
@@ -1044,10 +1086,20 @@ program
     const packLoader = new PackLoader(packs);
 
     const ast = parseSelector(selector);
-    const results = await evaluate(ast, {
+    const matched = await evaluate(ast, {
       resolver,
       packLoader: (id) => packLoader.get(id),
     });
+
+    // Per-user read filtering: documents the actor cannot read are silently
+    // elided (allow-all hooks when no governance module is configured).
+    const { hooks } = await getGovernance();
+    const results = await filterReadable(
+      hooks,
+      getGlobalActor(),
+      matched,
+      (node) => node.frontmatter.zone,
+    );
 
     if (opts.json) {
       console.log(
@@ -1089,15 +1141,25 @@ program
 program
   .command("publish <path>")
   .description("Publish a document (bump version, create checkpoint)")
-  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--author <email>", "Author email (defaults to the actor identity)")
   .option("-m, --message <note>", "Version note")
-  .action(async (path, opts) => {
+  .action(async (path, opts, cmd) => {
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
     const id = normalizeDocumentId(path);
 
+    // An explicit --author wins for attribution; otherwise the actor
+    // identity (-a/--actor or CONTEXTNEST_ACTOR) is both the commit-gate
+    // subject and the recorded author.
+    const editedBy =
+      cmd.getOptionValueSource("author") === "cli" ? opts.author : getGlobalActor();
+
     const result = await publishDocument(storage, id, {
-      editedBy: opts.author,
+      editedBy,
       note: opts.message,
+      governance: hooks,
+      origin: cliOrigin("publish"),
+      recorder,
     });
 
     await regenerateIndex(storage);
@@ -1382,11 +1444,16 @@ program
 
     // Local query — graph-aware traversal
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
     const engine = new GraphQueryEngine(storage);
     const result = await engine.query(selector, {
       hops: opts.hops ?? 2,
       full: opts.full ?? false,
       includeDrafts: opts.includeDrafts ?? false,
+      actor: getGlobalActor(),
+      governance: hooks,
+      origin: cliOrigin("query"),
+      recorder,
     });
 
     if (opts.json) {
@@ -1502,8 +1569,10 @@ program
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
+    const actor = getGlobalActor();
     const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    const doc = await storage.readDocument(id, { governance: hooks, actor });
 
     if (opts.title !== undefined) doc.frontmatter.title = opts.title;
     if (opts.status !== undefined) {
@@ -1528,7 +1597,11 @@ program
     }
 
     const content = serializeDocument(doc);
-    await storage.writeDocument(id, content);
+    await storage.writeDocument(id, content, {
+      governance: hooks,
+      actor,
+      operation: "update",
+    });
 
     // Non-published lifecycle paths skip auto-publish — those are metadata
     // changes, not content releases. Mirrors MCP `update_document`.
@@ -1554,8 +1627,11 @@ program
     }
 
     const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
+      editedBy: actor,
       note: "Updated via CLI",
+      governance: hooks,
+      origin: cliOrigin("update"),
+      recorder,
     });
 
     await regenerateIndex(storage);
@@ -1570,12 +1646,17 @@ program
 program
   .command("delete <path>")
   .description("Delete a document and its version history")
+  // Deletion is non-interactive today; --force is accepted so scripts that
+  // pass it (and future confirmation-prompt versions) keep working.
+  .option("-f, --force", "Delete without confirmation")
   .action(async (path) => {
     const storage = getStorage();
+    const { hooks } = await getGovernance();
+    const actor = getGlobalActor();
     const id = normalizeDocumentId(path);
 
-    const doc = await storage.readDocument(id);
-    await storage.deleteDocument(id);
+    const doc = await storage.readDocument(id, { governance: hooks, actor });
+    await storage.deleteDocument(id, { governance: hooks, actor });
     await regenerateIndex(storage);
 
     console.log(chalk.green(`Deleted ${id} (${doc.frontmatter.title})`));
@@ -1868,8 +1949,10 @@ drift
   .option("-a, --actor <actor>", "Actor identity recorded in suggestion meta", "cli-user")
   .option("-n, --note <note>", "Optional note explaining the drift")
   .option("--json", "Output as JSON")
-  .action(async (path: string, opts) => {
+  .action(async (path: string, opts, cmd) => {
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
+    const actor = resolveCommandActor(cmd);
     const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
@@ -1889,10 +1972,13 @@ drift
       approvedRawContent: approvedRaw,
       proposedRawContent: node.rawContent,
       source: "out-of-band-edit",
-      actor: opts.actor,
+      actor,
       zone,
       docTier,
       note: opts.note,
+      governance: hooks,
+      origin: cliOrigin("drift stage"),
+      recorder,
     });
 
     if (opts.json) {
@@ -1950,20 +2036,24 @@ drift
   .option("-a, --actor <actor>", "Actor identity recorded as approver", "cli-user")
   .option("-c, --comment <comment>", "Optional approval comment recorded in chain event")
   .option("--json", "Output as JSON")
-  .action(async (path: string, suggestionId: string, opts) => {
+  .action(async (path: string, suggestionId: string, opts, cmd) => {
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
+    const actor = resolveCommandActor(cmd);
     const id = normalizeDocumentId(path);
-    const node = await storage.readDocument(id);
+    const node = await storage.readDocument(id, { governance: hooks, actor });
     const zone = node.frontmatter.zone ?? "default";
 
     const result = await approveSuggestion({
       storage,
-      rbac: permissiveRbac,
+      rbac: hooks,
       documentId: id,
-      actor: opts.actor,
+      actor,
       zone,
       suggestionId,
       comment: opts.comment,
+      origin: cliOrigin("drift approve"),
+      recorder,
     });
 
     await regenerateIndex(storage);
@@ -1986,20 +2076,24 @@ drift
   .requiredOption("-r, --reason <reason>", "Rejection reason (required for audit)")
   .option("-a, --actor <actor>", "Actor identity recorded as rejector", "cli-user")
   .option("--json", "Output as JSON")
-  .action(async (path: string, suggestionId: string, opts) => {
+  .action(async (path: string, suggestionId: string, opts, cmd) => {
     const storage = getStorage();
+    const { hooks, recorder } = await getGovernance();
+    const actor = resolveCommandActor(cmd);
     const id = normalizeDocumentId(path);
-    const node = await storage.readDocument(id);
+    const node = await storage.readDocument(id, { governance: hooks, actor });
     const zone = node.frontmatter.zone ?? "default";
 
     const result = await rejectSuggestion({
       storage,
-      rbac: permissiveRbac,
+      rbac: hooks,
       documentId: id,
-      actor: opts.actor,
+      actor,
       zone,
       suggestionId,
       reason: opts.reason,
+      origin: cliOrigin("drift reject"),
+      recorder,
     });
 
     if (opts.json) {
@@ -2156,6 +2250,12 @@ vaultCmd
 
 // Parse and run
 program.parseAsync().catch((err: unknown) => {
+  // Denied governance checks render as a clean one-liner — no stack trace,
+  // non-zero exit — so scripts and agents can pattern-match the denial.
+  if (err instanceof UnauthorizedActionError) {
+    console.error(chalk.red(`Unauthorized: ${err.message}`));
+    process.exit(1);
+  }
   // Engine validation errors render as concise one-liners instead of leaking
   // stack traces. Unknown errors still throw so genuine bugs stay debuggable.
   if (err instanceof ContextNestError) {

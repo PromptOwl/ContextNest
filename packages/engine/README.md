@@ -100,6 +100,50 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `parseSelector` | Parse selector query strings into AST |
 | `evaluateFromIndex` | Evaluate selectors against the lightweight index (no bodies) |
 | `publishDocument` | Publish a document (bump version, checkpoint) |
+| `GovernanceHooks` / `requireRead` / `requireCommit` / `filterReadable` | User-level read/commit gates (identity-agnostic) |
+| `ProvenanceRecorder` / `recordProvenance` | Best-effort audit-sink mirroring of engine events |
+| `loadGovernanceBundle` | Load a deployment's governance module at runtime |
+
+## Governance Modules (user-level RBAC + provenance)
+
+The engine is identity-agnostic: it never interprets who an actor is. Instead,
+every read/query/write/publish surface accepts optional `GovernanceHooks`
+(`canRead`, `canCommit`, plus the original `RbacHook` methods) and an optional
+`ProvenanceRecorder`. Absent hooks mean **allow** — existing callers are
+unaffected.
+
+A deployment injects its policy implementation as a **governance module**: any
+importable module whose factory returns `{ hooks?, recorder? }`:
+
+```js
+// my-governance.mjs
+export default function createGovernance({ vaultPath }) {
+  return {
+    hooks: {
+      isCzar: () => false,
+      canIngest: () => true,
+      isDocOwner: (actor, docId) => actor === "owner@example.com",
+      canRead: (actor) => actor.endsWith("@example.com"),
+      canCommit: (actor) => actor === "owner@example.com",
+    },
+    recorder: { record: (rec) => console.error("[audit]", rec.kind, rec.actor) },
+  };
+}
+```
+
+The CLI and MCP server discover it via (in precedence order) the
+`CONTEXTNEST_GOVERNANCE_MODULE` environment variable or the vault's
+`.context/config.yaml` `governance.module` field, and thread the caller's
+identity from `--actor` / `CONTEXTNEST_ACTOR`. Library consumers call
+`loadGovernanceBundle({ vaultPath })` themselves or construct hooks directly.
+A configured-but-broken module throws `ConfigError` — governance never
+silently falls open. PromptOwl's commercial stewardship implementation lives
+in [`packages/governance`](https://github.com/PromptOwl/ContextNest/tree/main/packages/governance)
+(source-available, commercial license).
+
+Provenance: every version entry and chain event can carry an `origin`
+(`{ client, tool, session_id, agent }`). It is stored but **never hashed** —
+existing hash chains and vaults verify unchanged.
 
 ## Part of Context Nest
 

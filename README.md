@@ -85,6 +85,7 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) | Command-line tool (`ctx`) | AGPL-3.0 |
 | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, integrity | AGPL-3.0 |
 | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access | AGPL-3.0 |
+| @promptowl/contextnest-governance ([packages/governance](packages/governance)) | Stewardship RBAC, user-level read/commit policy, provenance store — source-available, not on npm | [Commercial](packages/governance/LICENSE.md) |
 
 ## Prerequisites
 
@@ -533,14 +534,15 @@ ctx verify                         # 8. Verify integrity
 
 ## License
 
-All packages are licensed under **AGPL-3.0**:
+This repository is **open core** — see [NOTICE](NOTICE) for the authoritative split:
 
 - **CLI** ([@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli)): **AGPL-3.0**
 - **Engine** ([@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine)): **AGPL-3.0**
 - **MCP Server** ([@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)): **AGPL-3.0**
+- **Governance** ([packages/governance](packages/governance)): **[Commercial, source-available](packages/governance/LICENSE.md)** — stewardship RBAC, user-level access policy, and provenance store. Published in source form for transparency; NOT open source, not on npm, production use requires a commercial agreement.
 - **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard
 
-AGPL-3.0 ensures all improvements stay open source. You are free to use, modify, and distribute Context Nest, but modifications to the source must be shared under the same license. Commercial licensing is available from [PromptOwl](https://promptowl.ai) for organizations that need to embed or redistribute without AGPL obligations.
+AGPL-3.0 ensures all improvements to the open components stay open source. You are free to use, modify, and distribute them, but modifications to the source must be shared under the same license. The engine exposes identity-agnostic governance seams (`GovernanceHooks`, `ProvenanceRecorder`, `CONTEXTNEST_GOVERNANCE_MODULE`) so any deployment — open or commercial — can plug in its own policy layer. Commercial licensing is available from [PromptOwl](https://promptowl.ai) for organizations that need the governance package, or need to embed or redistribute without AGPL obligations.
 
 ---
 

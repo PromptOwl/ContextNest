@@ -199,6 +199,8 @@ export interface SuggestionMeta {
   /** Relative path to the patch file under `_suggestions/` */
   patch_path: string;
   note?: string;
+  /** Provenance origin of the staging action, when supplied. */
+  origin?: ProvenanceOrigin;
 }
 
 /**
@@ -217,6 +219,8 @@ export interface HashChainEvent {
   resulting_hash?: string;
   action_metadata?: Record<string, unknown>;
   signature?: string;
+  /** Provenance origin — stored but never part of any hash input. */
+  origin?: ProvenanceOrigin;
 }
 
 /**
@@ -228,6 +232,106 @@ export interface RbacHook {
   isCzar(actor: string, zoneId: string): boolean | Promise<boolean>;
   canIngest(actor: string, zoneId: string): boolean | Promise<boolean>;
   isDocOwner(actor: string, documentId: string): boolean | Promise<boolean>;
+}
+
+/**
+ * Target of a user-level read/commit permission check. The engine never
+ * interprets these fields — they are passed through verbatim to the
+ * caller-supplied `GovernanceHooks`.
+ */
+export interface GovernanceTarget {
+  documentId: string;
+  /** Zone the document belongs to, when the caller knows it. */
+  zone?: string;
+}
+
+/** Kind of mutation being gated by `GovernanceHooks.canCommit`. */
+export type CommitOperation =
+  | "create"
+  | "update"
+  | "delete"
+  | "publish"
+  | "stage_suggestion";
+
+/**
+ * Superset of `RbacHook` adding optional user-level read and commit gates.
+ *
+ * Both additions are OPTIONAL so every existing `RbacHook` implementation is
+ * already a valid `GovernanceHooks`. An absent method means ALLOW — reads
+ * and commits were ungated before this seam existed, so absence must not
+ * change behavior for existing deployments. Callers that want the safe
+ * baseline use `denyAllGovernance` explicitly.
+ */
+export interface GovernanceHooks extends RbacHook {
+  canRead?(actor: string, target: GovernanceTarget): boolean | Promise<boolean>;
+  canCommit?(
+    actor: string,
+    target: GovernanceTarget,
+    operation: CommitOperation,
+  ): boolean | Promise<boolean>;
+}
+
+/**
+ * Where an action came from. Persisted on version entries and chain events
+ * as a stored-but-UNHASHED sibling field — it never participates in
+ * `computeChainHash`/`computeCheckpointHash` inputs, so adding it cannot
+ * invalidate existing hash chains. Tamper evidence for origin comes from the
+ * `ProvenanceRecorder` mirror, not the chain.
+ */
+export interface ProvenanceOrigin {
+  /** e.g. "cli" | "mcp" | "community-server" | arbitrary client id */
+  client?: string;
+  /** MCP tool name or CLI command, e.g. "publish_document" */
+  tool?: string;
+  session_id?: string;
+  /** Agent/model identifier when an AI performed the action */
+  agent?: string;
+}
+
+/** Actor identity plus origin, threaded through gated engine operations. */
+export interface ProvenanceContext {
+  actor: string;
+  origin?: ProvenanceOrigin;
+}
+
+/** Kind of provenance record emitted to a `ProvenanceRecorder`. */
+export type ProvenanceEventKind =
+  | "read"
+  | "query"
+  | "commit"
+  | "publish"
+  | "version_created"
+  | "chain_event"
+  | "suggestion_staged"
+  | "access_denied";
+
+/** A single provenance record mirrored to the deployment's audit sink. */
+export interface ProvenanceRecord extends ProvenanceContext {
+  kind: ProvenanceEventKind;
+  timestamp: string;
+  document_id?: string;
+  zone?: string;
+  version?: number;
+  content_hash?: string;
+  chain_hash?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Best-effort provenance sink. Engine call sites wrap every `record` call in
+ * try/catch — a broken recorder must never fail the underlying operation.
+ */
+export interface ProvenanceRecorder {
+  record(rec: ProvenanceRecord): void | Promise<void>;
+}
+
+/**
+ * What a governance module's factory returns (see `loadGovernanceBundle`).
+ * Both fields optional so a module can supply policy, auditing, or both.
+ */
+export interface GovernanceBundle {
+  hooks?: GovernanceHooks;
+  recorder?: ProvenanceRecorder;
 }
 
 /** Relationship edge types (§5.1) */
@@ -305,6 +409,12 @@ export interface VersionEntry {
   note?: string;
   content_hash: string;
   chain_hash: string;
+  /**
+   * Provenance origin of the edit. Stored but NEVER part of the chain hash
+   * input (`prev:content_hash:version:edited_by:edited_at`), so histories
+   * with and without this field verify identically.
+   */
+  origin?: ProvenanceOrigin;
 }
 
 /** Document history file (§6.2) */
@@ -372,6 +482,16 @@ export interface NestConfig {
    * written (back-compat). `ctx index` honors this; `ctx init` overwrites it.
    */
   agent_tools?: string[];
+  /**
+   * Governance module wiring. `module` is an import specifier (bare package
+   * name or path relative to the vault root) whose factory returns a
+   * `GovernanceBundle` — see `loadGovernanceBundle`. Lets a deployment inject
+   * a proprietary RBAC/provenance implementation without the engine
+   * referencing it.
+   */
+  governance?: {
+    module?: string;
+  };
 }
 
 /**
@@ -407,6 +527,10 @@ export interface AccessTrace {
   author?: string;
   edited_at?: string;
   accessed_at: string;
+  /** Actor who performed the access, when the caller supplied one. */
+  actor?: string;
+  /** Provenance origin of the access, when the caller supplied one. */
+  origin?: ProvenanceOrigin;
 }
 
 /** Trace entry for source hydration (§9.3) */

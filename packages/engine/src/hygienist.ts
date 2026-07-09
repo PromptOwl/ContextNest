@@ -26,8 +26,8 @@
 import type { NestStorage } from "./storage.js";
 import type {
   ContextNode,
+  GovernanceHooks,
   GovernanceTier,
-  RbacHook,
   SuggestionMeta,
 } from "./types.js";
 import type { ClassificationManifest } from "./classification.js";
@@ -37,7 +37,8 @@ import { VersionManager } from "./versioning.js";
 
 export interface HygienistInput {
   storage: NestStorage;
-  rbac: RbacHook;
+  /** Superset of `RbacHook` — any existing RbacHook implementation works. */
+  rbac: GovernanceHooks;
   /**
    * Actor identity the scanner runs as. The scanner inherits this actor's
    * ingest permissions (zone-classification-rbac-spec §4.1). For

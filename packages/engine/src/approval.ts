@@ -42,23 +42,34 @@ import {
 } from "./errors.js";
 import type {
   ContextNode,
+  GovernanceHooks,
   GovernanceTier,
   HashChainEvent,
   HashChainEventType,
-  RbacHook,
+  ProvenanceOrigin,
+  ProvenanceRecorder,
   VersionEntry,
 } from "./types.js";
 import type { NestStorage } from "./storage.js";
+import { recordProvenance } from "./provenance.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
   storage: NestStorage;
-  rbac: RbacHook;
+  /**
+   * Governance policy hook. `GovernanceHooks` is a superset of `RbacHook`,
+   * so every existing `RbacHook` implementation remains valid here.
+   */
+  rbac: GovernanceHooks;
   documentId: string;
   /** Opaque actor string supplied by the bridge. Engine never interprets. */
   actor: string;
   /** Zone the document belongs to. Required for the Czar gate (Primary tier). */
   zone: string;
+  /** Provenance origin stamped on version entries and chain events. */
+  origin?: ProvenanceOrigin;
+  /** Best-effort audit sink mirror for the governance action. */
+  recorder?: ProvenanceRecorder;
 }
 
 export interface ApproveSuggestionInput extends BaseInput {
@@ -119,6 +130,7 @@ export async function approveSuggestion(
     newRawContent: patched,
     actor: input.actor,
     note: input.comment,
+    origin: input.origin,
   });
 
   const archivedAt = await input.storage.archiveSuggestion(
@@ -138,6 +150,7 @@ export async function approveSuggestion(
     zone: input.zone,
     documentId: input.documentId,
     versionEntry,
+    origin: input.origin,
     metadata: {
       suggestion_id: input.suggestionId,
       source: sug.meta.source,
@@ -145,6 +158,18 @@ export async function approveSuggestion(
       proposed_hash: sug.meta.proposed_hash,
       ...(input.comment ? { approval_comment: input.comment } : {}),
     },
+  });
+
+  await recordProvenance(input.recorder, {
+    kind: "commit",
+    actor: input.actor,
+    origin: input.origin,
+    document_id: input.documentId,
+    zone: input.zone,
+    version: versionEntry.version,
+    content_hash: versionEntry.content_hash,
+    chain_hash: versionEntry.chain_hash,
+    metadata: { action: "approveSuggestion", suggestion_id: input.suggestionId },
   });
 
   return { versionEntry, chainEvent, archivedAt };
@@ -223,7 +248,17 @@ export async function rejectSuggestion(
       source: sug.meta.source,
       rejection_reason: input.reason,
     },
+    ...(input.origin ? { origin: input.origin } : {}),
   };
+
+  await recordProvenance(input.recorder, {
+    kind: "commit",
+    actor: input.actor,
+    origin: input.origin,
+    document_id: input.documentId,
+    zone: input.zone,
+    metadata: { action: "rejectSuggestion", suggestion_id: input.suggestionId },
+  });
 
   return { chainEvent, archivedAt };
 }
@@ -271,6 +306,7 @@ export async function rollbackDocument(
     note: input.reason
       ? `rollback to v${input.targetVersion}: ${input.reason}`
       : `rollback to v${input.targetVersion}`,
+    origin: input.origin,
   });
 
   const eventType: HashChainEventType =
@@ -284,10 +320,22 @@ export async function rollbackDocument(
     zone: input.zone,
     documentId: input.documentId,
     versionEntry,
+    origin: input.origin,
     metadata: {
       target_version: input.targetVersion,
       ...(input.reason ? { reason: input.reason } : {}),
     },
+  });
+
+  await recordProvenance(input.recorder, {
+    kind: "commit",
+    actor: input.actor,
+    origin: input.origin,
+    document_id: input.documentId,
+    zone: input.zone,
+    version: versionEntry.version,
+    chain_hash: versionEntry.chain_hash,
+    metadata: { action: "rollbackDocument", target_version: input.targetVersion },
   });
 
   return { versionEntry, chainEvent };
@@ -324,6 +372,7 @@ export async function czarDirectEdit(
     newRawContent: input.newRawContent,
     actor: input.actor,
     note: input.note ?? "czar direct edit",
+    origin: input.origin,
   });
 
   const chainEvent = buildChainEvent({
@@ -332,10 +381,22 @@ export async function czarDirectEdit(
     zone: input.zone,
     documentId: input.documentId,
     versionEntry,
+    origin: input.origin,
     metadata: {
       direct_edit: true,
       ...(input.note ? { note: input.note } : {}),
     },
+  });
+
+  await recordProvenance(input.recorder, {
+    kind: "commit",
+    actor: input.actor,
+    origin: input.origin,
+    document_id: input.documentId,
+    zone: input.zone,
+    version: versionEntry.version,
+    chain_hash: versionEntry.chain_hash,
+    metadata: { action: "czarDirectEdit" },
   });
 
   return { versionEntry, chainEvent };
@@ -344,7 +405,7 @@ export async function czarDirectEdit(
 // --- internals ------------------------------------------------------------
 
 async function gateForTier(
-  rbac: RbacHook,
+  rbac: GovernanceHooks,
   tier: GovernanceTier,
   ctx: { actor: string; zone: string; documentId: string; action: string },
 ): Promise<void> {
@@ -394,6 +455,7 @@ interface CommitInput {
   newRawContent: string;
   actor: string;
   note?: string;
+  origin?: ProvenanceOrigin;
 }
 
 async function commitNewVersion(
@@ -429,6 +491,7 @@ async function commitNewVersion(
     {
       note: input.note,
       publishedAt: updatedAt,
+      origin: input.origin,
     },
   );
 
@@ -446,6 +509,7 @@ function buildChainEvent(args: {
   zone: string;
   documentId: string;
   versionEntry: VersionEntry;
+  origin?: ProvenanceOrigin;
   metadata?: Record<string, unknown>;
 }): HashChainEvent {
   return {
@@ -457,6 +521,7 @@ function buildChainEvent(args: {
     document_id: args.documentId,
     resulting_hash: args.versionEntry.chain_hash,
     action_metadata: args.metadata,
+    ...(args.origin ? { origin: args.origin } : {}),
   };
 }
 

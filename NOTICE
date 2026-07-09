@@ -1,0 +1,29 @@
+ContextNest — Licensing Notice
+==============================
+
+Copyright © 2026 Promptowl LLC.
+
+This repository contains components under two different licenses:
+
+1. GNU Affero General Public License v3.0 (AGPL-3.0)
+   Applies to ALL files in this repository EXCEPT those listed in (2).
+   See the repository-root LICENSE file. This covers:
+     - packages/engine       (@promptowl/contextnest-engine)
+     - packages/cli          (@promptowl/contextnest-cli)
+     - packages/mcp-server   (@promptowl/contextnest-mcp-server)
+     - plugins/              (agent plugins)
+     - all other files not covered by (2)
+
+2. ContextNest Governance — Commercial Software License (source-available)
+   Applies ONLY to files under:
+     - packages/governance/  (@promptowl/contextnest-governance)
+   See packages/governance/LICENSE.md. This component is proprietary
+   commercial software published in source form for transparency and
+   evaluation. It is NOT open source, is NOT published to npm, and its
+   production use requires a commercial agreement with Promptowl LLC
+   (hello@promptowl.ai).
+
+The AGPL-3.0 grant for the components in (1) does not extend to the
+component in (2), and the presence of (2) in this repository does not
+subject it to the AGPL. Promptowl LLC, as copyright holder of all
+components, licenses each component separately as described above.

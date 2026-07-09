@@ -19,11 +19,36 @@
  */
 
 import { hashChainEventSchema } from "./schemas.js";
-import type { HashChainEvent } from "./types.js";
+import type { HashChainEvent, ProvenanceRecorder } from "./types.js";
 import type { NestStorage } from "./storage.js";
+import { recordProvenance } from "./provenance.js";
 
 export class ChainEventLog {
-  constructor(private readonly storage: NestStorage) {}
+  constructor(
+    private readonly storage: NestStorage,
+    private readonly options: {
+      /**
+       * Best-effort provenance mirror. Each event is mirrored AFTER
+       * successful persistence; a broken recorder never fails the append
+       * (the on-disk log remains the source of truth).
+       */
+      recorder?: ProvenanceRecorder;
+    } = {},
+  ) {}
+
+  /** Mirror a persisted event into the deployment's audit sink. */
+  private async mirror(event: HashChainEvent): Promise<void> {
+    await recordProvenance(this.options.recorder, {
+      kind: "chain_event",
+      actor: event.actor,
+      origin: event.origin,
+      document_id: event.document_id,
+      zone: event.zone,
+      chain_hash: event.resulting_hash,
+      timestamp: event.timestamp,
+      metadata: { event_type: event.event_type, event_id: event.event_id },
+    });
+  }
 
   /**
    * Append a single event. Schema-validated before write — throws on
@@ -32,6 +57,7 @@ export class ChainEventLog {
   async append(event: HashChainEvent): Promise<void> {
     const validated = hashChainEventSchema.parse(event);
     await this.storage.appendChainEvent(validated);
+    await this.mirror(validated as HashChainEvent);
   }
 
   /**
@@ -44,6 +70,7 @@ export class ChainEventLog {
     const validated = events.map((e) => hashChainEventSchema.parse(e));
     for (const event of validated) {
       await this.storage.appendChainEvent(event);
+      await this.mirror(event as HashChainEvent);
     }
   }
 

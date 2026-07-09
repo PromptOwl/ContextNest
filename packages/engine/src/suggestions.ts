@@ -22,9 +22,14 @@ import { createPatch } from "diff";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { suggestionMetaSchema } from "./schemas.js";
+import { requireCommit } from "./rbac.js";
+import { recordProvenance } from "./provenance.js";
 import type { NestStorage } from "./storage.js";
 import type {
+  GovernanceHooks,
   GovernanceTier,
+  ProvenanceOrigin,
+  ProvenanceRecorder,
   SuggestionMeta,
   SuggestionSource,
 } from "./types.js";
@@ -52,6 +57,12 @@ export interface StageSuggestionInput {
    * determinism; production callers should let the function generate one.
    */
   suggestionId?: string;
+  /** User-level commit gate for staging. Absent = allow (back-compat). */
+  governance?: GovernanceHooks;
+  /** Provenance origin persisted on the suggestion meta. */
+  origin?: ProvenanceOrigin;
+  /** Best-effort audit sink mirror for the staging event. */
+  recorder?: ProvenanceRecorder;
 }
 
 /** Result of staging a suggestion. */
@@ -75,6 +86,16 @@ export interface StageSuggestionResult {
 export async function stageSuggestion(
   input: StageSuggestionInput,
 ): Promise<StageSuggestionResult> {
+  // User-level commit gate — staging is a (soft) mutation of the vault's
+  // governance state, so it honors the same seam as writes/publishes.
+  await requireCommit(
+    input.governance,
+    input.actor,
+    { documentId: input.documentId, zone: input.zone },
+    "stage_suggestion",
+    "stageSuggestion",
+  );
+
   const detectedAt = input.detectedAt ?? new Date().toISOString();
   const targetHash = computeContentHash(getChecksumContent(input.approvedRawContent));
   const proposedHash = computeContentHash(getChecksumContent(input.proposedRawContent));
@@ -110,6 +131,7 @@ export async function stageSuggestion(
     proposed_hash: proposedHash,
     patch_path: `${suggestionId}.patch`,
     note: input.note,
+    ...(input.origin ? { origin: input.origin } : {}),
   };
 
   // Validate before write so we never persist a malformed audit record.
@@ -120,6 +142,16 @@ export async function stageSuggestion(
     suggestionId,
     validated,
   );
+
+  await recordProvenance(input.recorder, {
+    kind: "suggestion_staged",
+    actor: input.actor,
+    origin: input.origin,
+    document_id: input.documentId,
+    zone: input.zone,
+    content_hash: proposedHash,
+    metadata: { suggestion_id: suggestionId, source: input.source },
+  });
 
   return { meta: validated as SuggestionMeta, patchPath, metaPath };
 }

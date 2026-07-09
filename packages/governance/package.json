@@ -1,0 +1,48 @@
+{
+  "name": "@promptowl/contextnest-governance",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Proprietary governance layer for Context Nest — stewardship RBAC, user-level read/commit policy, and provenance store. Source-available; commercial license; never published to npm.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PromptOwl/ContextNest.git",
+    "directory": "packages/governance"
+  },
+  "homepage": "https://github.com/PromptOwl/ContextNest/tree/main/packages/governance",
+  "author": "PromptOwl <hello@promptowl.ai> (https://promptowl.ai)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@promptowl/contextnest-engine": "workspace:^",
+    "better-sqlite3": "^11.7.0",
+    "js-yaml": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.9"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "license": "SEE LICENSE IN LICENSE.md"
+}

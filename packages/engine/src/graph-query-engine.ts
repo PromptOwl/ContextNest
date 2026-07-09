@@ -11,8 +11,13 @@
 import type {
   ContextNode,
   ContextYaml,
+  GovernanceHooks,
   GraphQueryResult,
+  ProvenanceOrigin,
+  ProvenanceRecorder,
 } from "./types.js";
+import { filterReadable } from "./rbac.js";
+import { recordProvenance } from "./provenance.js";
 import { NestStorage } from "./storage.js";
 import { Resolver } from "./resolver.js";
 import { PackLoader } from "./packs.js";
@@ -33,6 +38,22 @@ export interface GraphQueryOptions {
   full?: boolean;
   /** Include draft documents (default: false) */
   includeDrafts?: boolean;
+  /** Actor identity for per-user read filtering. Absent = no filtering. */
+  actor?: string;
+  /**
+   * User-level read gate. Reached nodes the actor cannot read are excluded
+   * from results POST-traversal: their content is never returned, but they
+   * may still act as bridge hops so allowed neighbors stay reachable.
+   * `nodesTraversed` keeps its existing meaning (traversal size) and may
+   * exceed the number of documents returned. Deployments needing hard zone
+   * isolation should additionally pre-restrict seeds via `canIngest` /
+   * `filterIngestibleZones`.
+   */
+  governance?: GovernanceHooks;
+  /** Provenance origin recorded on access traces and query records. */
+  origin?: ProvenanceOrigin;
+  /** Best-effort audit sink for a per-query provenance record. */
+  recorder?: ProvenanceRecorder;
 }
 
 export class GraphQueryEngine {
@@ -109,8 +130,8 @@ export class GraphQueryEngine {
     const docMap = await this.storage.readDocuments(reachedIds);
 
     // 4. Separate source nodes from regular documents
-    const regularDocs: ContextNode[] = [];
-    const sourceNodes: ContextNode[] = [];
+    let regularDocs: ContextNode[] = [];
+    let sourceNodes: ContextNode[] = [];
 
     for (const doc of docMap.values()) {
       // Rejected + approved docs are never returned, even with includeDrafts.
@@ -129,6 +150,22 @@ export class GraphQueryEngine {
       }
     }
 
+    // 4b. Per-user read filtering, POST-traversal: denied nodes are dropped
+    // from results (content never surfaces) but were still usable as bridge
+    // hops above, so allowed neighbors remain reachable.
+    regularDocs = await filterReadable(
+      options.governance,
+      options.actor,
+      regularDocs,
+      (node) => node.frontmatter.zone,
+    );
+    sourceNodes = await filterReadable(
+      options.governance,
+      options.actor,
+      sourceNodes,
+      (node) => node.frontmatter.zone,
+    );
+
     // 5. Order source nodes topologically
     const orderedSourceNodes = orderSourceNodesTopologically(sourceNodes);
 
@@ -143,6 +180,22 @@ export class GraphQueryEngine {
         checkpoint: currentCheckpoint,
         author: doc.frontmatter.author,
         editedAt: doc.frontmatter.updated_at,
+        actor: options.actor,
+        origin: options.origin,
+      });
+    }
+
+    if (options.actor !== undefined) {
+      await recordProvenance(options.recorder, {
+        kind: "query",
+        actor: options.actor,
+        origin: options.origin,
+        metadata: {
+          selector,
+          mode: "graph",
+          returned: regularDocs.length + orderedSourceNodes.length,
+          traversed: traversal.nodeIds.size,
+        },
       });
     }
 
@@ -202,16 +255,43 @@ export class GraphQueryEngine {
 
     // Apply the same retrieval gates as graphQuery so approved/rejected
     // never leak to LLMs, and drafts surface only when explicitly opted in.
-    const filteredDocs = result.documents.filter((doc) => {
+    const statusFilteredDocs = result.documents.filter((doc) => {
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;
     });
-    const filteredSources = result.sourceNodes.filter((doc) => {
+    const statusFilteredSources = result.sourceNodes.filter((doc) => {
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;
     });
+
+    // Per-user read filtering — same semantics as graph mode.
+    const filteredDocs = await filterReadable(
+      options.governance,
+      options.actor,
+      statusFilteredDocs,
+      (node) => node.frontmatter.zone,
+    );
+    const filteredSources = await filterReadable(
+      options.governance,
+      options.actor,
+      statusFilteredSources,
+      (node) => node.frontmatter.zone,
+    );
+
+    if (options.actor !== undefined) {
+      await recordProvenance(options.recorder, {
+        kind: "query",
+        actor: options.actor,
+        origin: options.origin,
+        metadata: {
+          selector,
+          mode: "full",
+          returned: filteredDocs.length + filteredSources.length,
+        },
+      });
+    }
 
     return {
       ...result,

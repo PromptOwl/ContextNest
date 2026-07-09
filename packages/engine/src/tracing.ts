@@ -2,7 +2,12 @@
  * Audit trace logging (§9.2, §9.3).
  */
 
-import type { AccessTrace, SourceHydrationTrace, TraceEntry } from "./types.js";
+import type {
+  AccessTrace,
+  ProvenanceOrigin,
+  SourceHydrationTrace,
+  TraceEntry,
+} from "./types.js";
 
 const DEFAULT_MAX_TRACES = 1000;
 
@@ -28,6 +33,8 @@ export class TraceLogger {
     checkpoint: number;
     author?: string;
     editedAt?: string;
+    actor?: string;
+    origin?: ProvenanceOrigin;
   }): AccessTrace {
     const trace: AccessTrace = {
       trace_type: "access",
@@ -37,6 +44,8 @@ export class TraceLogger {
       author: params.author,
       edited_at: params.editedAt,
       accessed_at: new Date().toISOString(),
+      ...(params.actor !== undefined ? { actor: params.actor } : {}),
+      ...(params.origin ? { origin: params.origin } : {}),
     };
     this.traces.push(trace);
     this.evictIfNeeded();

@@ -18,7 +18,12 @@
  * NOT inspect actor strings, role tables, or anything identity-shaped.
  */
 
-import type { RbacHook } from "./types.js";
+import type {
+  CommitOperation,
+  GovernanceHooks,
+  GovernanceTarget,
+  RbacHook,
+} from "./types.js";
 import { UnauthorizedActionError } from "./errors.js";
 
 /**
@@ -116,4 +121,93 @@ export async function filterIngestibleZones(
     })),
   );
   return checks.filter((c) => c.allowed).map((c) => c.zoneId);
+}
+
+/**
+ * Deny-everything governance bundle including the user-level read/commit
+ * gates. The explicit safe baseline for deployments that want closed-by-
+ * default behavior.
+ */
+export const denyAllGovernance: GovernanceHooks = {
+  ...denyAllRbac,
+  canRead: () => false,
+  canCommit: () => false,
+};
+
+/**
+ * Allow-everything governance bundle for local single-user contexts. This is
+ * what the CLI and MCP server fall back to when no governance module is
+ * loaded — identical to the ungated behavior that existed before these seams.
+ */
+export const allowAllGovernance: GovernanceHooks = {
+  isCzar: () => true,
+  canIngest: () => true,
+  isDocOwner: () => true,
+  canRead: () => true,
+  canCommit: () => true,
+};
+
+/**
+ * Assert the actor may read the target document. Absent hooks, absent
+ * `canRead`, or absent actor mean ALLOW (reads were ungated before this
+ * seam; gating is opt-in per call). Throws `UnauthorizedActionError` on an
+ * explicit deny.
+ */
+export async function requireRead(
+  hooks: GovernanceHooks | undefined,
+  actor: string | undefined,
+  target: GovernanceTarget,
+  action: string,
+): Promise<void> {
+  if (!hooks?.canRead || actor === undefined) return;
+  const ok = await hooks.canRead(actor, target);
+  if (!ok) {
+    throw new UnauthorizedActionError(actor, action, target.zone);
+  }
+}
+
+/**
+ * Assert the actor may perform a mutation (`create`/`update`/`delete`/
+ * `publish`/`stage_suggestion`) on the target document. Absent hooks, absent
+ * `canCommit`, or absent actor mean ALLOW. Throws `UnauthorizedActionError`
+ * on an explicit deny.
+ */
+export async function requireCommit(
+  hooks: GovernanceHooks | undefined,
+  actor: string | undefined,
+  target: GovernanceTarget,
+  operation: CommitOperation,
+  action: string,
+): Promise<void> {
+  if (!hooks?.canCommit || actor === undefined) return;
+  const ok = await hooks.canCommit(actor, target, operation);
+  if (!ok) {
+    throw new UnauthorizedActionError(actor, action, target.zone);
+  }
+}
+
+/**
+ * Filter a node list down to those the actor may read. Batch/silent
+ * counterpart of `requireRead` — denied nodes are elided, never thrown on
+ * (mirrors the community access-guard's `filterAccessible` semantics).
+ * Absent hooks/`canRead`/actor → identity. Order is preserved.
+ */
+export async function filterReadable<T extends { id: string }>(
+  hooks: GovernanceHooks | undefined,
+  actor: string | undefined,
+  nodes: readonly T[],
+  zoneOf?: (node: T) => string | undefined,
+): Promise<T[]> {
+  if (!hooks?.canRead || actor === undefined) return [...nodes];
+  const canRead = hooks.canRead.bind(hooks);
+  const checks = await Promise.all(
+    nodes.map(async (node) => ({
+      node,
+      allowed: await canRead(actor, {
+        documentId: node.id,
+        zone: zoneOf?.(node),
+      }),
+    })),
+  );
+  return checks.filter((c) => c.allowed).map((c) => c.node);
 }

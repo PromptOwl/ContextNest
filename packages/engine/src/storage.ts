@@ -22,12 +22,14 @@ import type {
   NestConfig,
   DocumentHistory,
   CheckpointHistory,
+  GovernanceHooks,
   Pack,
   ContextYaml,
   PendingChange,
   VerificationReport,
 } from "./types.js";
 import { ContextNestError, DocumentNotFoundError } from "./errors.js";
+import { requireRead, requireCommit, filterReadable } from "./rbac.js";
 import {
   packSchema,
   documentHistorySchema,
@@ -69,8 +71,22 @@ export function normalizeDocumentId(raw: string): string {
   return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
 }
 
+/**
+ * Per-call user-level governance options. Gating is strictly opt-in: calls
+ * without these options behave exactly as before. Internal whole-vault flows
+ * (indexing, integrity verification, checkpoints) never pass them.
+ */
+export interface GovernanceCallOptions {
+  /** User-level read/commit gate. Absent = allow (back-compat). */
+  governance?: GovernanceHooks;
+  /** Actor identity for the gate. Absent = allow (back-compat). */
+  actor?: string;
+  /** Zone override for the governance target (defaults to frontmatter zone). */
+  zone?: string;
+}
+
 /** Options for `NestStorage.readDocument`. */
-export interface ReadDocumentOptions {
+export interface ReadDocumentOptions extends GovernanceCallOptions {
   /**
    * When true, recompute the body hash and compare against the stored
    * frontmatter checksum (bridge-function-spec Story 3.1, Story 2.1).
@@ -252,6 +268,16 @@ export class NestStorage {
     }
 
     const liveNode = parseDocument(filePath, liveContent, id);
+
+    // User-level read gate (opt-in per call). Zone defaults to the doc's own
+    // frontmatter zone when the caller didn't supply one.
+    await requireRead(
+      options.governance,
+      options.actor,
+      { documentId: id, zone: options.zone ?? liveNode.frontmatter.zone },
+      "readDocument",
+    );
+
     if (!options.verifyChecksum) {
       return liveNode;
     }
@@ -452,18 +478,44 @@ export class NestStorage {
   }
 
   /**
-   * Write a document to disk.
+   * Write a document to disk. When governance options are supplied, the
+   * commit gate runs BEFORE any bytes touch disk.
    */
-  async writeDocument(id: string, content: string): Promise<void> {
+  async writeDocument(
+    id: string,
+    content: string,
+    options: GovernanceCallOptions & {
+      /** Which mutation this write represents for the gate. Default: "update". */
+      operation?: "create" | "update";
+    } = {},
+  ): Promise<void> {
+    await requireCommit(
+      options.governance,
+      options.actor,
+      { documentId: id, zone: options.zone },
+      options.operation ?? "update",
+      "writeDocument",
+    );
     const filePath = join(this.root, `${id}.md`);
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, content, "utf-8");
   }
 
   /**
-   * Delete a document and its version history from the vault.
+   * Delete a document and its version history from the vault. When
+   * governance options are supplied, the commit gate runs before deletion.
    */
-  async deleteDocument(id: string): Promise<void> {
+  async deleteDocument(
+    id: string,
+    options: GovernanceCallOptions = {},
+  ): Promise<void> {
+    await requireCommit(
+      options.governance,
+      options.actor,
+      { documentId: id, zone: options.zone },
+      "delete",
+      "deleteDocument",
+    );
     const filePath = join(this.root, `${id}.md`);
     try {
       await unlink(filePath);
@@ -488,8 +540,14 @@ export class NestStorage {
   /**
    * Batch-read documents by ID. Only loads bodies for requested IDs.
    * Parallelizes reads for performance. Missing documents are silently skipped.
+   *
+   * With governance options, unreadable documents are silently FILTERED (batch
+   * semantics — never thrown on), mirroring `filterReadable`.
    */
-  async readDocuments(ids: string[]): Promise<Map<string, ContextNode>> {
+  async readDocuments(
+    ids: string[],
+    options: Pick<GovernanceCallOptions, "governance" | "actor"> = {},
+  ): Promise<Map<string, ContextNode>> {
     const results = new Map<string, ContextNode>();
     const reads = ids.map(async (id) => {
       try {
@@ -500,6 +558,19 @@ export class NestStorage {
       }
     });
     await Promise.all(reads);
+
+    if (options.governance && options.actor !== undefined) {
+      const readable = await filterReadable(
+        options.governance,
+        options.actor,
+        [...results.values()],
+        (node) => node.frontmatter.zone,
+      );
+      const allowed = new Set(readable.map((n) => n.id));
+      for (const id of [...results.keys()]) {
+        if (!allowed.has(id)) results.delete(id);
+      }
+    }
     return results;
   }
 

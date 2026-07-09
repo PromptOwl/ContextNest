@@ -268,6 +268,11 @@ export const nestConfigSchema = z.object({
     .optional(),
   agent_maintenance_directive: z.string().optional(),
   agent_tools: z.array(z.string()).optional(),
+  governance: z
+    .object({
+      module: z.string().optional(),
+    })
+    .optional(),
 });
 
 export const packSchema = z.object({
@@ -286,6 +291,18 @@ export const packSchema = z.object({
   audiences: z.array(z.string()).optional(),
 });
 
+/**
+ * Provenance origin — who/what client produced a mutation. Stored on version
+ * entries and chain events but NEVER part of any hash input, so old and new
+ * histories verify identically. Older engines strip this field on parse.
+ */
+export const provenanceOriginSchema = z.object({
+  client: z.string().optional(),
+  tool: z.string().optional(),
+  session_id: z.string().optional(),
+  agent: z.string().optional(),
+});
+
 export const versionEntrySchema = z.object({
   version: z.number().int().min(1),
   keyframe: z.boolean().optional(),
@@ -296,6 +313,7 @@ export const versionEntrySchema = z.object({
   note: z.string().optional(),
   content_hash: z.string().regex(CHECKSUM_PATTERN),
   chain_hash: z.string().regex(CHECKSUM_PATTERN),
+  origin: provenanceOriginSchema.optional(),
 });
 
 export const documentHistorySchema = z.object({
@@ -336,6 +354,7 @@ export const suggestionMetaSchema = z.object({
   proposed_hash: z.string().regex(CHECKSUM_PATTERN),
   patch_path: z.string().min(1),
   note: z.string().optional(),
+  origin: provenanceOriginSchema.optional(),
 });
 
 /**
@@ -356,6 +375,7 @@ export const hashChainEventSchema = z.object({
   resulting_hash: z.string().regex(CHECKSUM_PATTERN).optional(),
   action_metadata: z.record(z.unknown()).optional(),
   signature: z.string().optional(),
+  origin: provenanceOriginSchema.optional(),
 });
 
 export type FrontmatterInput = z.input<typeof frontmatterSchema>;
