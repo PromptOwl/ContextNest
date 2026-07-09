@@ -46,6 +46,7 @@ import type {
   ProvenanceRecorder,
 } from "@promptowl/contextnest-engine";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
+import { makeAclGovernance, type AccessControl } from "./acl-governance.js";
 
 // Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
 // throw; catch it here so the user gets a clean message on stderr instead of an
@@ -89,6 +90,66 @@ function resolveActor(toolActor?: string, fallback = "local-mcp"): string {
 /** Provenance origin stamped on gated engine calls: which client + tool acted. */
 function mcpOrigin(tool: string): ProvenanceOrigin {
   return { client: "mcp", tool };
+}
+
+// ─── Per-query access control ───────────────────────────────────────────────
+//
+// Read tools accept an optional per-call requester (`asker` + `asker_role`).
+// When supplied, reads are gated by the document's frontmatter `metadata.access`
+// ACL evaluated against that requester (see acl-governance.ts) — the channel a
+// multi-principal shared-memory agent (e.g. GateMem) needs to enforce access
+// control per query, which the startup-loaded governance singleton cannot. When
+// omitted, behavior is unchanged: the fixed attribution actor + base governance.
+const ASKER_ARG_DESCRIPTION =
+  "Requesting principal id for per-query access control (e.g. a GateMem checkpoint's asker_principal_id). When set, reads are gated by each document's metadata.access ACL (readers/roles) evaluated against this principal. Omit for the default single-principal behavior.";
+const ASKER_ROLE_ARG_DESCRIPTION =
+  "Requesting principal's role for per-query access control (e.g. asker_role). Matched against a document's metadata.access.roles. Only meaningful alongside 'asker'.";
+
+// Access-control block writers can attach to a document. Persisted verbatim
+// under `metadata.access` and enforced on reads by makeAclGovernance. Omitting
+// it (or setting visibility "public") leaves the document readable by anyone.
+const accessArgSchema = z
+  .object({
+    visibility: z
+      .enum(["public", "private"])
+      .optional()
+      .describe("'private' restricts reads to the readers/roles below; 'public' (default when omitted) is open."),
+    readers: z.array(z.string()).optional().describe("Principal ids permitted to read this document."),
+    roles: z.array(z.string()).optional().describe("Roles permitted to read this document."),
+  })
+  .optional()
+  .describe(
+    "Per-document access control. Enforced when a reader passes 'asker'/'asker_role'. A restricted document (visibility 'private' or a non-empty readers/roles list) admits an asker whose principal id is in readers OR whose role is in roles.",
+  );
+
+/** Fold an access arg into a frontmatter metadata map, dropping empty fields. */
+function mergeAccessIntoMetadata(
+  metadata: Record<string, unknown> | undefined,
+  access: AccessControl | undefined,
+): Record<string, unknown> | undefined {
+  if (access === undefined) return metadata;
+  const cleaned: AccessControl = {};
+  if (access.visibility !== undefined) cleaned.visibility = access.visibility;
+  if (access.readers && access.readers.length > 0) cleaned.readers = access.readers;
+  if (access.roles && access.roles.length > 0) cleaned.roles = access.roles;
+  return { ...(metadata ?? {}), access: cleaned };
+}
+
+/**
+ * Resolve the governance hooks + actor to use for a read, given an optional
+ * per-call requester. With `asker`, layer frontmatter-ACL enforcement over the
+ * base governance and read AS that principal; without it, keep the legacy fixed
+ * attribution actor and base governance untouched.
+ */
+function readGovernanceFor(
+  asker?: string,
+  askerRole?: string,
+): { gov: GovernanceHooks; actor: string } {
+  if (asker === undefined) return { gov: governance, actor: resolveActor() };
+  return {
+    gov: makeAclGovernance(governance, storage, asker, askerRole),
+    actor: asker,
+  };
 }
 
 interface ToolResponse {
@@ -179,14 +240,17 @@ governedTool(
     selector: z.string().describe("Selector query expression (e.g., '#engineering + type:document')"),
     hops: z.number().optional().describe("Graph traversal depth (default: 2). More hops = more context, slower. Fewer hops = faster, less context."),
     full: z.boolean().optional().describe("Force full-load mode, bypassing graph traversal (default: false)"),
+    asker: z.string().optional().describe(ASKER_ARG_DESCRIPTION),
+    asker_role: z.string().optional().describe(ASKER_ROLE_ARG_DESCRIPTION),
   },
-  async ({ selector, hops, full }) => {
+  async ({ selector, hops, full, asker, asker_role }) => {
+    const { gov, actor } = readGovernanceFor(asker, asker_role);
     const engine = new GraphQueryEngine(storage);
     const result = await engine.query(selector, {
       hops: hops ?? 2,
       full: full ?? false,
-      actor: resolveActor(),
-      governance,
+      actor,
+      governance: gov,
       origin: mcpOrigin("resolve"),
       recorder,
     });
@@ -234,8 +298,10 @@ governedTool(
   {
     uri: z.string().optional().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')"),
     id: z.string().optional().describe("Alias for 'uri' — document ID (e.g., 'nodes/api-design')"),
+    asker: z.string().optional().describe(ASKER_ARG_DESCRIPTION),
+    asker_role: z.string().optional().describe(ASKER_ROLE_ARG_DESCRIPTION),
   },
-  async ({ uri: uriArg, id }) => {
+  async ({ uri: uriArg, id, asker, asker_role }) => {
     const uri = requireDocRef(uriArg, id, "uri");
     let docId: string;
     if (uri.startsWith("contextnest://")) {
@@ -248,7 +314,8 @@ governedTool(
       docId = normalizeDocumentId(uri);
     }
 
-    const doc = await storage.readDocument(docId, { governance, actor: resolveActor() });
+    const { gov, actor } = readGovernanceFor(asker, asker_role);
+    const doc = await storage.readDocument(docId, { governance: gov, actor });
     return {
       content: [
         {
@@ -282,8 +349,10 @@ server.tool(
         "Filter by status. Canonical: draft | pending_review | approved | published | rejected. Aliases (cancelled, superseded, review, submitted, active, …) are normalized before matching.",
       ),
     tag: z.string().optional().describe("Filter by tag"),
+    asker: z.string().optional().describe(ASKER_ARG_DESCRIPTION),
+    asker_role: z.string().optional().describe(ASKER_ROLE_ARG_DESCRIPTION),
   },
-  async ({ type, status, tag }) => {
+  async ({ type, status, tag, asker, asker_role }) => {
     // includeRetired so callers can list rejected docs; default filter
     // (rejected hidden) still applies only when status filter is not set
     // to "rejected" — match below handles both cases.
@@ -304,7 +373,8 @@ server.tool(
 
     // User-level read gate: silently elide documents the actor cannot read
     // (deny is a filter here, never an error — mirrors GraphQueryEngine).
-    docs = await filterReadable(governance, resolveActor(), docs, (d) => d.frontmatter.zone);
+    const { gov, actor } = readGovernanceFor(asker, asker_role);
+    docs = await filterReadable(gov, actor, docs, (d) => d.frontmatter.zone);
 
     return {
       content: [
@@ -395,7 +465,24 @@ server.tool(
         updated_at: { required: false, type: "string", format: "ISO 8601" },
         derived_from: { required: false, type: "string[]", constraints: "Array of contextnest:// URIs" },
         checksum: { required: false, type: "string", format: "sha256:<64 lowercase hex chars>, managed automatically" },
-        metadata: { required: false, type: "object", description: "Extensible key-value metadata" },
+        metadata: {
+          required: false,
+          type: "object",
+          description: "Extensible key-value metadata",
+          fields: {
+            access: {
+              required: false,
+              type: "object",
+              description:
+                "Per-document access control enforced on reads when the caller passes 'asker'/'asker_role' to read_document/resolve/search/list_documents/read_version. A document is public unless restricted. Restricted = visibility 'private' OR a non-empty readers/roles list; a restricted document admits an asker whose principal id is in 'readers' OR whose role is in 'roles'.",
+              fields: {
+                visibility: { required: false, type: "string", values: ["public", "private"], default: "public" },
+                readers: { required: false, type: "string[]", description: "Principal ids allowed to read" },
+                roles: { required: false, type: "string[]", description: "Roles allowed to read" },
+              },
+            },
+          },
+        },
         source: {
           required: "Only when type is 'source'; must NOT be present on other types",
           fields: {
@@ -550,18 +637,21 @@ governedTool(
     query: z.string().describe("Search query"),
     hops: z.number().optional().describe("Graph traversal depth from search results (default: 2)"),
     full: z.boolean().optional().describe("Force full-load mode for body-level search (default: false)"),
+    asker: z.string().optional().describe(ASKER_ARG_DESCRIPTION),
+    asker_role: z.string().optional().describe(ASKER_ROLE_ARG_DESCRIPTION),
   },
-  async ({ query, hops, full }) => {
+  async ({ query, hops, full, asker, asker_role }) => {
     // Quote the URI so the selector lexer consumes it verbatim — a bare `+`
     // (multi-word query separator) would otherwise terminate the URI token
     // and parse as the AND operator.
     const selector = `"contextnest://search/${query.replace(/"/g, "").replace(/\s+/g, "+")}"`;
+    const { gov, actor } = readGovernanceFor(asker, asker_role);
     const engine = new GraphQueryEngine(storage);
     const result = await engine.query(selector, {
       hops: hops ?? 2,
       full: full ?? false,
-      actor: resolveActor(),
-      governance,
+      actor,
+      governance: gov,
       origin: mcpOrigin("search"),
       recorder,
     });
@@ -644,11 +734,14 @@ governedTool(
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     version: z.number().describe("Version number to reconstruct"),
+    asker: z.string().optional().describe(ASKER_ARG_DESCRIPTION),
+    asker_role: z.string().optional().describe(ASKER_ROLE_ARG_DESCRIPTION),
   },
-  async ({ path, version }) => {
+  async ({ path, version, asker, asker_role }) => {
     const id = normalizeDocumentId(path);
     // Historical bytes are as sensitive as the live document — same read gate.
-    await requireRead(governance, resolveActor(), { documentId: id }, "read_version");
+    const { gov, actor } = readGovernanceFor(asker, asker_role);
+    await requireRead(gov, actor, { documentId: id }, "read_version");
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
 
@@ -682,9 +775,10 @@ governedTool(
     trigger: z.string().optional().describe("Skill trigger description (required when type is 'skill')"),
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
+    access: accessArgSchema,
     actor: z.string().optional().describe(ACTOR_ARG_DESCRIPTION),
   },
-  async ({ path, id: idArg, title, type, tags, body, trigger, tools_required, output_format, actor: actorArg }) => {
+  async ({ path, id: idArg, title, type, tags, body, trigger, tools_required, output_format, access, actor: actorArg }) => {
     const actor = resolveActor(actorArg, "mcp@contextnest.local");
     const docRef = requireDocRef(path, idArg, "path");
     // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
@@ -707,12 +801,14 @@ governedTool(
     // version omitted — publishDocument owns version assignment (spec §6:
     // "version managed automatically by publish"). Pre-setting it caused
     // create-with-publish to land on v=2 instead of v=1.
+    const metadata = mergeAccessIntoMetadata(undefined, access);
     const frontmatter: Frontmatter = {
       title,
       type,
       status: "draft",
       created_at: new Date().toISOString(),
       ...(tagList ? { tags: tagList } : {}),
+      ...(metadata ? { metadata } : {}),
     };
 
     // Add skill block for skill nodes
@@ -799,9 +895,10 @@ governedTool(
         "New status. Canonical: draft | pending_review | approved | published | rejected. Aliases like 'cancelled', 'superseded', 'active', 'archived', 'review', 'submitted', 'in_review' are accepted and normalized to canonical before storage. Unknown values fall back to 'draft'. 'rejected' retires the doc — no new published version is cut.",
       ),
     body: z.string().optional().describe("New markdown body content"),
+    access: accessArgSchema,
     actor: z.string().optional().describe(ACTOR_ARG_DESCRIPTION),
   },
-  async ({ path, id: idArg, title, tags, status, body, actor: actorArg }) => {
+  async ({ path, id: idArg, title, tags, status, body, access, actor: actorArg }) => {
     const actor = resolveActor(actorArg, "mcp@contextnest.local");
     const id = normalizeDocumentId(requireDocRef(path, idArg, "path"));
     const doc = await storage.readDocument(id, { governance, actor });
@@ -840,6 +937,9 @@ governedTool(
     if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
     if (tags !== undefined) {
       doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
+    }
+    if (access !== undefined) {
+      doc.frontmatter.metadata = mergeAccessIntoMetadata(doc.frontmatter.metadata, access);
     }
     doc.frontmatter.updated_at = new Date().toISOString();
 
