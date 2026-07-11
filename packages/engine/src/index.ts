@@ -228,6 +228,16 @@ export type { SelectorNode } from "./selector/parser.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
 
+// Wiki-link seeds + ungated traversal (plumbing — the eligibility GATE stays
+// with the consumer; these primitives never gate by status/permission)
+export {
+  extractWikiLinks,
+  buildWikiTitleIndex,
+  resolveWikiSeeds,
+  traverseWikiGraph,
+} from "./wiki-graph.js";
+export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
+
 // Stewards format (parse/serialize only — enforcement stays with the consumer)
 export {
   parseStewards,
