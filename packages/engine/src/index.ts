@@ -228,6 +228,14 @@ export type { SelectorNode } from "./selector/parser.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
 
+// Stewards format (parse/serialize only — enforcement stays with the consumer)
+export {
+  parseStewards,
+  serializeStewards,
+  STEWARDS_FILENAMES,
+} from "./stewards.js";
+export type { StewardRole, StewardEntry, StewardsConfig } from "./stewards.js";
+
 // Packs
 export { PackLoader } from "./packs.js";
 
