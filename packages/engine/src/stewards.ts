@@ -43,9 +43,7 @@ export const STEWARDS_FILENAMES = [
   ".context/stewards.yaml",
 ] as const;
 
-const ROLES: readonly string[] = ["editor", "reviewer", "viewer"];
-
-/** Coerce a raw YAML list into validated StewardEntry[] (drops invalid rows). */
+/** Coerce a raw YAML list into StewardEntry[] (drops only rows without an email). */
 function toEntries(raw: unknown): StewardEntry[] {
   if (!Array.isArray(raw)) return [];
   const out: StewardEntry[] = [];
@@ -55,8 +53,11 @@ function toEntries(raw: unknown): StewardEntry[] {
     const email = typeof obj.email === "string" ? obj.email.trim() : "";
     if (!email) continue;
     const entry: StewardEntry = { email };
-    if (typeof obj.role === "string" && ROLES.includes(obj.role)) {
-      entry.role = obj.role as StewardRole;
+    // Keep any role string as authored. This module is format-only; validating
+    // role names is enforcement (the consumer's job), and silently dropping a
+    // non-canonical role here would be a quiet permissions regression.
+    if (typeof obj.role === "string" && obj.role.trim()) {
+      entry.role = obj.role.trim() as StewardRole;
     }
     out.push(entry);
   }
@@ -83,8 +84,17 @@ function toGroup(raw: unknown): Record<string, StewardEntry[]> | undefined {
  */
 export function parseStewards(content: string): StewardsConfig {
   let doc: Record<string, unknown> = {};
-  const loaded = yamlLoad(content);
-  if (loaded && typeof loaded === "object") doc = loaded as Record<string, unknown>;
+  try {
+    const loaded = yamlLoad(content);
+    if (loaded && typeof loaded === "object") doc = loaded as Record<string, unknown>;
+  } catch {
+    // Malformed or legacy-shorthand YAML — e.g. the comma-joined single-line
+    // entries the previous hand-rolled community parser tolerated
+    // (`- email: a@b.com, role: admin`), which js-yaml rejects with a throw.
+    // Fall back to a lenient line parse so consumers neither get an unhandled
+    // exception (→ 500 on stewards sync) nor a silently dropped role.
+    return parseLenient(content);
+  }
 
   const result: StewardsConfig = {
     version: typeof doc.version === "number" ? doc.version : 1,
@@ -125,4 +135,70 @@ export function serializeStewards(config: StewardsConfig): string {
     );
   }
   return yamlDump(doc, { lineWidth: -1, quotingType: '"', forceQuotes: false });
+}
+
+/**
+ * Lenient line-based fallback for input that strict YAML rejects — notably the
+ * legacy comma-joined single-line entry (`- email: a@b.com, role: admin, ...`)
+ * the previous hand-rolled community parser tolerated. Never throws; extracts
+ * email + role per entry regardless of layout. Only used when yamlLoad fails.
+ */
+function parseLenient(content: string): StewardsConfig {
+  const result: StewardsConfig = { version: 1 };
+  let section: "nest" | "tags" | "documents" | null = null;
+  let target: string | null = null;
+  let entries: StewardEntry[] = [];
+
+  const flush = () => {
+    if (!section || entries.length === 0) return;
+    if (section === "nest") result.nest = [...(result.nest || []), ...entries];
+    else if (section === "tags" && target) (result.tags ||= {})[target] = entries;
+    else if (section === "documents" && target) (result.documents ||= {})[target] = entries;
+    entries = [];
+  };
+
+  for (const raw of content.split("\n")) {
+    const line = raw.trimEnd();
+    // Only a '#' at column 0 is a comment. An INDENTED '#tag:' is a tag-key
+    // header (tag scopes are '#'-prefixed), so it must not be skipped here.
+    if (!line || line.startsWith("#")) continue;
+
+    // Top-level section header (no indent, ends with ':')
+    if (!/^\s/.test(line) && line.endsWith(":")) {
+      flush();
+      target = null;
+      const key = line.slice(0, -1).trim();
+      if (key === "version") { section = null; continue; }
+      section = key === "nest" || key === "data_room" ? "nest"
+        : key === "tags" ? "tags"
+        : key === "documents" ? "documents"
+        : null; // folders (legacy) + anything else ignored
+      continue;
+    }
+    // Sub-target header (indented, ends with ':') under tags/documents
+    const sub = line.match(/^(?:\s{2}|\t)(\S.*):$/);
+    if (sub && section && section !== "nest") {
+      flush();
+      target = sub[1].trim().replace(/^["']|["']$/g, "");
+      continue;
+    }
+    // List entry
+    const item = line.match(/^\s*-\s+(.*)$/);
+    if (item && section) {
+      const entry = parseLenientEntry(item[1].trim());
+      if (entry) entries.push(entry);
+    }
+  }
+  flush();
+  return result;
+}
+
+/** Pull email + optional role out of one entry line, layout-agnostic. */
+function parseLenientEntry(str: string): StewardEntry | null {
+  const email = str.match(/email:\s*["']?([^\s,"'{}]+)["']?/)?.[1];
+  if (!email) return null;
+  const entry: StewardEntry = { email };
+  const role = str.match(/role:\s*["']?([A-Za-z_]+)["']?/)?.[1];
+  if (role) entry.role = role as StewardRole;
+  return entry;
 }

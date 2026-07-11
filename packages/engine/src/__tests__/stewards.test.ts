@@ -57,16 +57,33 @@ describe("parseStewards", () => {
     expect(cfg.tags).toBeUndefined();
   });
 
-  it("drops invalid role values and rows without an email", () => {
+  it("keeps role strings as authored (format-only) and drops rows without an email", () => {
     const cfg = parseStewards(
       "nest:\n  - email: a@b.com\n    role: superuser\n  - role: reviewer\n",
     );
-    expect(cfg.nest).toEqual([{ email: "a@b.com" }]);
+    // Non-canonical roles are preserved (validating role names is the
+    // consumer's enforcement job); the row with no email is dropped.
+    expect(cfg.nest).toEqual([{ email: "a@b.com", role: "superuser" }]);
   });
 
   it("returns { version: 1 } for empty input", () => {
     expect(parseStewards("")).toEqual({ version: 1 });
     expect(parseStewards("# just a comment\n")).toEqual({ version: 1 });
+  });
+
+  it("tolerates the legacy comma-joined shorthand without throwing or dropping role", () => {
+    // js-yaml rejects this shape; the lenient fallback must recover email + role.
+    const cfg = parseStewards(
+      "nest:\n  - email: lead@acme.com, role: admin, can_approve: true\n" +
+        'tags:\n  "#policy":\n    - email: rev@acme.com, role: reviewer\n',
+    );
+    expect(cfg.nest).toEqual([{ email: "lead@acme.com", role: "admin" }]);
+    expect(cfg.tags?.["#policy"]).toEqual([{ email: "rev@acme.com", role: "reviewer" }]);
+  });
+
+  it("never throws on malformed YAML (returns best-effort, not a 500)", () => {
+    expect(() => parseStewards("nest:\n  - [unclosed\n  : : :")).not.toThrow();
+    expect(parseStewards("::: not yaml :::")).toHaveProperty("version", 1);
   });
 });
 
