@@ -34,7 +34,10 @@ export interface WikiDocLike {
  */
 export function extractWikiLinks(body: string): string[] {
   const out = new Set<string>();
-  const re = /\[\[([^\]]+?)\]\]/g;
+  // Inner class excludes '[' as well as ']' so it can't backtrack across
+  // overlapping '[[' — keeps this linear and avoids the polynomial-ReDoS
+  // pattern CodeQL flags for `[^\]]+?` on uncontrolled document bodies.
+  const re = /\[\[([^[\]]+)\]\]/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(body)) !== null) {
     const target = m[1].split("|")[0].trim();
@@ -73,7 +76,7 @@ export function buildWikiTitleIndex(docs: WikiDocLike[]): WikiTitleIndex {
 /** Resolve one wiki target (id or title, optionally wrapped in `[[ ]]`) to a node id. */
 function resolveTarget(target: string, index: WikiTitleIndex): string | null {
   let t = target.trim();
-  const wrapped = t.match(/^\[\[([^\]]+?)\]\]$/);
+  const wrapped = t.match(/^\[\[([^[\]]+)\]\]$/);
   if (wrapped) t = wrapped[1].split("|")[0].trim();
   if (index.ids.has(t)) return t; // it's already an id
   return index.byTitle.get(t) ?? index.byTitleLower.get(t.toLowerCase()) ?? null;
