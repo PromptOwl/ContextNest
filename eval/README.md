@@ -19,6 +19,16 @@ the `ctx forget` + `ctx query --strict` work (`ctx-forget-strict` PR); this
 adapter is the benchmark-time approximation that proved the result. We label it
 this way deliberately — this is a public, audited-tier benchmark.
 
+## License & IP
+
+This directory is licensed under **AGPL-3.0** (see [`LICENSE`](./LICENSE) and
+[`NOTICE`](./NOTICE)). The ContextNest **governed-retrieval method is proprietary
+to Promptowl LLC and patent-pending**; the agent here is an LLM-gated *research
+approximation* for benchmark reproducibility, **not** the production
+implementation, and discloses no production mechanism. AGPL §11 conditions its
+patent grant on AGPL compliance, so publishing this grants no patent license to
+a proprietary fork.
+
 ## The three methods (`CTX_MODE`)
 
 | Mode | Pipeline | What it shows |
