@@ -8,7 +8,10 @@
  *
  * Status: **`core` namespace seeded** (PRD Phase 1 — "write the op catalog for
  * core first, governance/workflow/sync after"). The other namespaces are
- * declared but not yet populated; see `NAMESPACES`.
+ * declared but not yet populated; see `NAMESPACES`. `core` operations are also
+ * **executable** — `createEngineApi()` binds them to the engine primitives so
+ * every surface calls one implementation. Consumers add governance/workflow/
+ * sync and enforcement via {@link EngineExtension} without forking the engine.
  */
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type { JsonSchema7Type } from "zod-to-json-schema";
@@ -22,6 +25,18 @@ import { CORE_OPERATIONS } from "./core.js";
 
 export * from "./types.js";
 export { CORE_OPERATIONS } from "./core.js";
+export { CORE_EXECUTORS } from "./core-executors.js";
+export type { OperationContext, OperationExecutor } from "./context.js";
+export type {
+  EngineExtension,
+  OperationEvent,
+  OperationResultEvent,
+} from "./extension.js";
+export {
+  createEngineApi,
+  type EngineApi,
+  type CreateEngineApiOptions,
+} from "./runtime.js";
 
 /** Every operation across every implemented namespace. */
 const ALL_OPERATIONS: readonly OperationDescriptor[] = [...CORE_OPERATIONS];
