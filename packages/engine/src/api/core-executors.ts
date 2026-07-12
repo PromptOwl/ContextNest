@@ -5,17 +5,29 @@
  * (`query-routes.ts`), OSS mcp-server, and OSS CLI.
  *
  * Everything here is **ungated mechanics**. No commercial governance: the only
- * policy seam is the identity-agnostic `RbacHook` on the context, and it is not
- * consulted for these ungated core reads/writes. Stewardship enforcement is
- * layered by a Community extension's `authorize` hook (see `extension.ts`).
+ * policy seam is the identity-agnostic `RbacHook` on the context. Stewardship
+ * enforcement is layered by a Community extension's `authorize` hook (see
+ * `extension.ts`). Behaviour is reconciled against CONTEXT_NEST_SPEC.md and the
+ * existing surfaces (published-only search, index regeneration after publish,
+ * status/tag normalization, document validation before write).
  */
 import type { ContextNode, Frontmatter } from "../types.js";
-import { serializeDocument } from "../parser.js";
+import {
+  serializeDocument,
+  validateDocument,
+  normalizeTags,
+  normalizeStatus,
+  isRejected,
+} from "../parser.js";
 import { normalizeDocumentId } from "../storage.js";
 import { parseUri } from "../uri.js";
+import { ContextNestError, RejectedDocumentError } from "../errors.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
-/** ContextNode → the wire `nodeSummary` shape. */
+/** Community/engine cap on graph traversal depth (community MAX_HOPS). */
+const MAX_HOPS = 10;
+
+/** ContextNode → the wire `nodeSummary` shape. Source nodes keep their block. */
 function toSummary(node: ContextNode, includeBody = false) {
   return {
     id: node.id,
@@ -23,11 +35,14 @@ function toSummary(node: ContextNode, includeBody = false) {
     type: node.frontmatter.type ?? "document",
     status: node.frontmatter.status ?? "draft",
     tags: node.frontmatter.tags,
+    ...(node.frontmatter.type === "source" && node.frontmatter.source
+      ? { source: node.frontmatter.source }
+      : {}),
     ...(includeBody ? { body: node.body } : {}),
   };
 }
 
-/** Lowercase, hyphenate — used to derive a slug from a title for create. */
+/** Lowercase, hyphenate — used to derive a slug from a title/folder segment. */
 function slugify(input: string): string {
   return input
     .toLowerCase()
@@ -35,9 +50,55 @@ function slugify(input: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+/** Clamp a caller-supplied hop count into [0, MAX_HOPS]. */
+function clampHops(hops: unknown): number {
+  const n = typeof hops === "number" ? hops : 2;
+  return Math.max(0, Math.min(MAX_HOPS, n));
+}
+
+/**
+ * Resolve a document id from an id / uri / title selector. Title resolves to
+ * the *actual* frontmatter title across discovered docs (matches how every
+ * surface resolves title→id), falling back to a slugified id under nodes/.
+ */
+async function resolveId(
+  ctx: OperationContext,
+  sel: { id?: string; uri?: string; title?: string },
+): Promise<string> {
+  if (sel.id) return normalizeDocumentId(sel.id);
+  if (sel.uri) return normalizeDocumentId(parseUri(sel.uri).path);
+  const docs = await ctx.storage.discoverDocuments();
+  const match = docs.find(
+    (d) => d.frontmatter.title.toLowerCase() === String(sel.title).toLowerCase(),
+  );
+  return match ? match.id : normalizeDocumentId(slugify(String(sel.title)));
+}
+
+/** Validate a node against the spec (§13) before it is written/published. */
+function assertValid(node: ContextNode): void {
+  const result = validateDocument(node);
+  if (!result.valid) {
+    throw new ContextNestError(
+      `Document validation failed: ${result.errors.map((e) => e.message).join("; ")}`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
+/** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
+async function publishAndIndex(ctx: OperationContext, id: string): Promise<{ version: number }> {
+  const { publishDocument } = await import("../publish.js");
+  const res = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
+  // publishDocument does NOT touch context.yaml; graph-mode reads (the default
+  // context_query) seed from it, so a stale index would hide the write. OSS
+  // mcp-server/CLI both regenerate here.
+  await ctx.storage.regenerateIndex();
+  return { version: res.versionEntry.version };
+}
+
 const query: OperationExecutor = async (ctx, input: any) => {
   const result = await ctx.query.query(input.query, {
-    hops: input.hops ?? 2,
+    hops: clampHops(input.hops),
     full: input.full ?? false,
   });
   return {
@@ -52,17 +113,18 @@ const query: OperationExecutor = async (ctx, input: any) => {
 };
 
 const resolve: OperationExecutor = async (ctx, input: any) => {
+  // Honour `hops` — graph mode traverses the neighbourhood; forcing full mode
+  // would make the advertised hops a no-op (fullQuery reports hopsUsed:0).
   const result = await ctx.query.query(input.selector, {
-    hops: input.hops ?? 2,
-    full: true,
+    hops: clampHops(input.hops),
+    full: false,
   });
   const budget = input.max_tokens ?? 8000;
   const documents: Array<{ id: string; frontmatter: Frontmatter; body: string }> = [];
   let tokens = 0;
   let truncated = false;
   for (const d of result.documents) {
-    // ~4 chars/token is the usual rough estimate.
-    const cost = Math.ceil((d.body?.length ?? 0) / 4);
+    const cost = Math.ceil((d.body?.length ?? 0) / 4); // ~4 chars/token
     if (tokens + cost > budget && documents.length > 0) {
       truncated = true;
       break;
@@ -74,49 +136,32 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
 };
 
 const search: OperationExecutor = async (ctx, input: any) => {
-  const terms = String(input.query).toLowerCase().split(/\s+/).filter(Boolean);
-  const docs = await ctx.storage.discoverDocuments();
-  const scored = docs
-    .map((d) => {
-      const haystack = [
-        d.frontmatter.title,
-        d.frontmatter.tags?.join(" ") ?? "",
-        d.body ?? "",
-      ]
-        .join(" ")
-        .toLowerCase();
-      const score = terms.reduce((n, t) => n + (haystack.includes(t) ? 1 : 0), 0);
-      return { d, score };
-    })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score);
-  const limited = input.limit ? scored.slice(0, input.limit) : scored;
-  return { results: limited.map((s) => ({ ...toSummary(s.d), score: s.score })) };
+  // Go through the engine's published-only, ranked full-text search (the
+  // `contextnest://search/…` resolver, which indexes title/description/body/tags
+  // and filters to published) instead of a hand-rolled substring scorer — never
+  // leaks unpublished content. `full: true` routes through the Resolver; graph
+  // mode would only match context.yaml metadata (no body).
+  const q = String(input.query).trim().replace(/\s+/g, "+");
+  const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
+  const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
+  return { results: docs.map((d) => toSummary(d)) };
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
-  let id: string | undefined = input.id;
-  if (!id && input.uri) id = parseUri(input.uri).path;
-  if (id) {
-    const node = await ctx.storage.readDocument(normalizeDocumentId(id));
-    return { id: node.id, frontmatter: node.frontmatter, body: node.body };
-  }
-  // Resolve by title across the vault.
-  const docs = await ctx.storage.discoverDocuments();
-  const match = docs.find(
-    (d) => d.frontmatter.title.toLowerCase() === String(input.title).toLowerCase(),
-  );
-  if (!match) {
-    const node = await ctx.storage.readDocument(normalizeDocumentId(String(input.title)));
-    return { id: node.id, frontmatter: node.frontmatter, body: node.body };
-  }
-  return { id: match.id, frontmatter: match.frontmatter, body: match.body };
+  const id = await resolveId(ctx, input);
+  const node = await ctx.storage.readDocument(id);
+  // Consistent rejected handling (the descriptor advertises REJECTED_DOCUMENT).
+  if (isRejected(node)) throw new RejectedDocumentError(node.id);
+  return { id: node.id, frontmatter: node.frontmatter, body: node.body };
 };
 
 const list: OperationExecutor = async (ctx, input: any) => {
   let docs = await ctx.storage.discoverDocuments();
   if (input.type) docs = docs.filter((d) => d.frontmatter.type === input.type);
-  if (input.status) docs = docs.filter((d) => (d.frontmatter.status ?? "draft") === input.status);
+  if (input.status) {
+    const want = normalizeStatus(input.status);
+    docs = docs.filter((d) => normalizeStatus(d.frontmatter.status ?? "draft") === want);
+  }
   if (input.tag) {
     const want = String(input.tag).replace(/^#/, "");
     docs = docs.filter((d) => d.frontmatter.tags?.some((t) => t.replace(/^#/, "") === want));
@@ -126,54 +171,49 @@ const list: OperationExecutor = async (ctx, input: any) => {
 };
 
 const create: OperationExecutor = async (ctx, input: any) => {
-  const slug = slugify(input.title);
-  const rawId = input.folder ? `${input.folder}/${slug}` : slug;
-  const id = normalizeDocumentId(rawId);
+  // Slugify each folder segment and always root under nodes/ so the doc is
+  // discoverable (normalizeDocumentId only prepends nodes/ when there is no
+  // slash — a raw "gtm/deals/x" would escape the discoverable tree).
+  const folderSegments = String(input.folder ?? "")
+    .split("/")
+    .map(slugify)
+    .filter(Boolean);
+  const id = normalizeDocumentId(["nodes", ...folderSegments, slugify(input.title)].join("/"));
   const frontmatter: Frontmatter = {
     title: input.title,
     type: input.type ?? "document",
-    ...(input.tags ? { tags: input.tags } : {}),
+    ...(input.tags ? { tags: normalizeTags(input.tags) } : {}),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
     status: "draft",
+    created_at: new Date().toISOString(),
   };
-  // filePath/rawContent are unused by serializeDocument (it reads frontmatter +
-  // body only); the CLI's `add` constructs the node the same way.
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body: input.content };
+  assertValid(node);
   await ctx.storage.writeDocument(id, serializeDocument(node));
-  const result = await publish(ctx, id);
+  const result = await publishAndIndex(ctx, id);
   return { id, version: result.version };
 };
 
 const update: OperationExecutor = async (ctx, input: any) => {
-  const id = normalizeDocumentId(input.id ?? slugifyId(ctx, input.title));
+  const id = await resolveId(ctx, input);
   const existing = await ctx.storage.readDocument(id);
   const frontmatter: Frontmatter = { ...existing.frontmatter };
   if (input.tags) {
-    const merged = new Set([...(frontmatter.tags ?? []), ...input.tags]);
-    frontmatter.tags = [...merged];
+    const merged = [...(frontmatter.tags ?? []), ...input.tags];
+    frontmatter.tags = normalizeTags(merged);
+  }
+  if (input.metadata) {
+    frontmatter.metadata = { ...(frontmatter.metadata ?? {}), ...input.metadata };
   }
   let body = existing.body;
   if (typeof input.content === "string") body = input.content;
   if (typeof input.append === "string") body = `${body}\n${input.append}`;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
+  assertValid(node);
   await ctx.storage.writeDocument(id, serializeDocument(node));
-  const result = await publish(ctx, id);
+  const result = await publishAndIndex(ctx, id);
   return { id, version: result.version };
 };
-
-/** Resolve an update target by title when no id was supplied. */
-function slugifyId(_ctx: OperationContext, title: string): string {
-  return title;
-}
-
-/** Publish via the engine's publishDocument, using the context actor. */
-async function publish(ctx: OperationContext, id: string): Promise<{ version: number }> {
-  // Imported lazily to keep the module graph flat; publish.ts pulls in a lot.
-  const { publishDocument } = await import("../publish.js");
-  const res = await publishDocument(ctx.storage, id, {
-    editedBy: ctx.actor ?? "engine",
-  });
-  return { version: res.versionEntry.version };
-}
 
 /** name → executor for the built-in `core` namespace. */
 export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({

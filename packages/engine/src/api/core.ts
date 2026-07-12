@@ -31,6 +31,9 @@ const nodeSummary = z.object({
   status: z.enum(STATUSES).default("draft"),
   tags: z.array(tag).optional(),
   body: z.string().optional(),
+  // Source nodes carry their `source` block so agents can hydrate them
+  // (spec §1.9, §5). Present only for type:"source".
+  source: z.record(z.unknown()).optional(),
 });
 
 /** A fully-loaded document. */
@@ -156,7 +159,9 @@ const listOp: OperationDescriptor = {
   input: z.object({
     type: z.enum(NODE_TYPES).optional().describe("Filter by node type"),
     tag: tag.optional().describe("Filter by tag"),
-    status: z.enum(STATUSES).optional().describe("Filter by status"),
+    // Accept status synonyms (spec §1.5.1 "implementations SHOULD accept
+    // synonyms and normalize"); the executor normalizes before comparing.
+    status: z.string().optional().describe("Filter by status (aliases normalized)"),
     limit: z.number().int().positive().optional().describe("Max nodes to return"),
   }),
   output: z.object({
@@ -181,6 +186,10 @@ const createOp: OperationDescriptor = {
       .string()
       .optional()
       .describe('Folder path under nodes/ (e.g. "gtm/deals"); segments are slugified'),
+    metadata: z
+      .record(z.unknown())
+      .optional()
+      .describe("Extra frontmatter metadata (e.g. a binding's scope). Merged into frontmatter.metadata."),
   }),
   output: z.object({
     id: z.string(),
@@ -203,6 +212,10 @@ const updateOp: OperationDescriptor = {
       content: z.string().optional().describe("New content (replaces body)"),
       append: z.string().optional().describe("Content to append"),
       tags: z.array(tag).optional().describe("Tags to add"),
+      metadata: z
+        .record(z.unknown())
+        .optional()
+        .describe("Extra frontmatter metadata to merge into frontmatter.metadata."),
     })
     .refine((v) => Boolean(v.id || v.title), {
       message: "One of id or title is required",

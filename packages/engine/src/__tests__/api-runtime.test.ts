@@ -74,6 +74,72 @@ describe("createEngineApi — executable core operations", () => {
     expect(after.body).toContain("Appended line.");
   });
 
+  it("create with a folder stays discoverable under nodes/ (regression: C1)", async () => {
+    const api = createEngineApi();
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Big Deal", content: "body", folder: "gtm/deals" },
+      ctx,
+    );
+    expect(created.id).toBe("nodes/gtm/deals/big-deal");
+    const listed = await api.run<{ documents: Array<{ id: string }> }>("context_list", {}, ctx);
+    expect(listed.documents.some((d) => d.id === created.id)).toBe(true);
+  });
+
+  it("update by title (not id) resolves the real doc (regression: C2)", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "My Cool Title", content: "orig" }, ctx);
+    const updated = await api.run<{ id: string; version: number }>(
+      "context_update",
+      { title: "My Cool Title", append: "more" },
+      ctx,
+    );
+    expect(updated.id).toBe("nodes/my-cool-title");
+    const got = await api.run<{ body: string }>("context_get", { title: "My Cool Title" }, ctx);
+    expect(got.body).toContain("more");
+  });
+
+  it("published doc is visible to graph-mode query after create (regression: S3 index regen)", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Findable", content: "body", tags: ["#api"] }, ctx);
+    const result = await api.run<{ documents: Array<{ id: string }> }>(
+      "context_query",
+      { query: "#api" },
+      ctx,
+    );
+    expect(result.documents.some((d) => d.id === "nodes/findable")).toBe(true);
+  });
+
+  it("search returns published matches via the engine resolver (S1)", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Searchable Widget", content: "gizmo body" }, ctx);
+    const out = await api.run<{ results: Array<{ id: string }> }>(
+      "context_search",
+      { query: "gizmo" },
+      ctx,
+    );
+    expect(out.results.some((r) => r.id === "nodes/searchable-widget")).toBe(true);
+  });
+
+  it("normalizes tags to #-prefixed form on create (S7)", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Tagged", content: "b", tags: ["api", "ml"] }, ctx);
+    const got = await api.run<{ frontmatter: { tags?: string[] } }>(
+      "context_get",
+      { id: "nodes/tagged" },
+      ctx,
+    );
+    expect(got.frontmatter.tags).toEqual(["#api", "#ml"]);
+  });
+
+  it("rejects an invalid source node before writing (S5 validation)", async () => {
+    const api = createEngineApi();
+    // type:"source" requires a source block (spec §13.1 rule 9) — none supplied.
+    await expect(
+      api.run("context_create", { title: "Bad Source", content: "b", type: "source" }, ctx),
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+  });
+
   it("resolves legacy aliases through the runtime", async () => {
     const api = createEngineApi();
     expect(api.getOperation("read_document")?.name).toBe("context_get");
