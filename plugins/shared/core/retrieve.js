@@ -1,0 +1,165 @@
+/**
+ * UserPromptSubmit handler — effort-toggled vault retrieval.
+ *
+ * Modes (CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE / CONTEXTNEST_RETRIEVAL_MODE):
+ *   off    → inject nothing.
+ *   search → cheap full-text `ctx search`; inject top hits.
+ *   query  → graph load: search → map ids→tags via `ctx list` → `ctx query` on
+ *            those tags (1 hop); inject distilled documents + source nodes.
+ *   agent  → inject a directive telling the model to invoke the retriever agent.
+ *
+ * Pure core: run({input, env, exec}) returns the hook output object (or null for
+ * "inject nothing"). The IO shell at the bottom does stdin/stdout.
+ */
+
+import {
+  getConfig,
+  ctxJson,
+  withVault,
+  vaultTargets,
+  squish,
+  runAsHook,
+  isMain,
+  MAX_HITS,
+} from "./lib.js";
+
+const HEADER = "Relevant Context Nest vault material (auto-retrieved):";
+
+/** Pull the user's prompt text out of the hook payload (field name varies). */
+function promptText(input) {
+  return String(input?.prompt ?? input?.user_prompt ?? "").trim();
+}
+
+/** search one vault target → [{id,title,type,vault}] */
+function searchVault(exec, query, alias) {
+  const hits = ctxJson(exec, withVault(["search", query, "--json"], alias), []);
+  if (!Array.isArray(hits)) return [];
+  return hits.map((h) => ({
+    id: h.id,
+    title: h.title,
+    type: h.type,
+    vault: alias || null,
+  }));
+}
+
+/** Fan search across the resolved vault targets, capped to MAX_HITS total. */
+function searchAll(exec, config, query) {
+  const targets = vaultTargets(config, exec);
+  const out = [];
+  const seen = new Set();
+  for (const alias of targets) {
+    for (const hit of searchVault(exec, query, alias)) {
+      const key = `${alias || ""}::${hit.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(hit);
+      if (out.length >= MAX_HITS * targets.length) break;
+    }
+  }
+  return out.slice(0, MAX_HITS);
+}
+
+/** Format the cheap-search injection block, or null when there are no hits. */
+function formatSearch(hits) {
+  if (hits.length === 0) return null;
+  const lines = hits.map((h) => {
+    const ref = h.vault ? `${h.vault}:${h.id}` : h.id;
+    return `- ${ref} — ${h.title}${h.type ? ` (${h.type})` : ""}`;
+  });
+  return [
+    HEADER,
+    ...lines,
+    "",
+    "Cite these as `vault:id`. Run `ctx query \"<selector>\"` or the contextnest-retriever agent for full bodies and related nodes.",
+  ].join("\n");
+}
+
+/**
+ * query tier: enrich the search seeds with a 1-hop graph load. search results
+ * carry no tags, so we map id→tags through `ctx list --json` (which does), then
+ * query those tags. Falls back to the plain search block when no graph emerges.
+ */
+function formatQuery(exec, config, hits) {
+  if (hits.length === 0) return null;
+  // Group seeds by their vault so each graph load targets the right vault.
+  const byVault = new Map();
+  for (const h of hits) {
+    const k = h.vault || "";
+    if (!byVault.has(k)) byVault.set(k, []);
+    byVault.get(k).push(h.id);
+  }
+
+  const blocks = [];
+  for (const [vaultKey, ids] of byVault) {
+    const alias = vaultKey || null;
+    const docs = ctxJson(exec, withVault(["list", "--json"], alias), []);
+    const tagOf = new Map(
+      (Array.isArray(docs) ? docs : []).map((d) => [d.id, d.tags || []]),
+    );
+    const tags = new Set();
+    for (const id of ids) for (const t of tagOf.get(id) || []) tags.add(t);
+    if (tags.size === 0) continue;
+
+    const selector = [...tags].slice(0, 6).join(" | ");
+    const graph = ctxJson(
+      exec,
+      withVault(["query", selector, "--hops", "1", "--json"], alias),
+      null,
+    );
+    const documents = graph?.documents || [];
+    if (documents.length === 0) continue;
+
+    const refPrefix = alias ? `${alias}:` : "";
+    for (const d of documents.slice(0, MAX_HITS)) {
+      blocks.push(`### ${refPrefix}${d.id} — ${d.title}\n${squish(d.body, 320)}`);
+    }
+    for (const s of graph?.sourceNodes || []) {
+      blocks.push(`### ${refPrefix}${s.id} — ${s.title} (source)\n${squish(s.body, 200)}`);
+    }
+  }
+
+  if (blocks.length === 0) return formatSearch(hits);
+  return [HEADER, "", ...blocks].join("\n\n");
+}
+
+const AGENT_DIRECTIVE = [
+  "This project has a Context Nest vault. Before answering this prompt, invoke the",
+  "`contextnest-retriever` agent to pull relevant vault context (it selects the",
+  "right vault(s), builds a selector, runs `ctx query`, and returns a cited digest).",
+  "Then answer, citing nodes as `vault:id`.",
+].join(" ");
+
+/**
+ * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function}} ctx
+ * @returns {object|null} hook output, or null to inject nothing.
+ */
+export function run({ input, env, exec }) {
+  const config = getConfig(env);
+  const mode = config.retrievalMode;
+  if (mode === "off") return null;
+
+  if (mode === "agent") {
+    return wrap(AGENT_DIRECTIVE);
+  }
+
+  const query = promptText(input);
+  if (!query) return null;
+
+  const hits = searchAll(exec, config, query);
+  const context = mode === "query" ? formatQuery(exec, config, hits) : formatSearch(hits);
+  if (!context) return null;
+  return wrap(context);
+}
+
+function wrap(additionalContext) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext,
+    },
+  };
+}
+
+if (isMain(import.meta.url)) {
+  runAsHook(run);
+}
