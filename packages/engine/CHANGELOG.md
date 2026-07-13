@@ -1,5 +1,11 @@
 # @promptowl/contextnest-engine
 
+## 1.2.1
+
+### Patch Changes
+
+- Harden checkpoint-chain integrity against torn seals, tamper, concurrent-publish races, and rebuild laundering. `publishDocument` now gathers the published-docs and history snapshots inside the checkpoint lock via `createCheckpointFromVault`, so a concurrent publish can no longer slip between two separate reads and leave a document missing from — or version-skewed within — the checkpoint it seals.
+
 ## 1.2.0
 
 ### Minor Changes
