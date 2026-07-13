@@ -85,6 +85,25 @@ describe("parseStewards", () => {
     expect(() => parseStewards("nest:\n  - [unclosed\n  : : :")).not.toThrow();
     expect(parseStewards("::: not yaml :::")).toHaveProperty("version", 1);
   });
+
+  it("lenient fallback handles 4-space sub-key indentation, not just 2-space", () => {
+    // The comma-joined shorthand forces the lenient path; the sub-keys here are
+    // nested with 4 spaces. A fixed 2-space match silently dropped these entries.
+    const cfg = parseStewards(
+      [
+        "tags:",
+        '    "#policy":',
+        "        - email: rev@acme.com, role: reviewer", // comma-joined → forces fallback
+        "documents:",
+        "    nodes/spec:",
+        "        - email: viewer@acme.com, role: viewer",
+      ].join("\n"),
+    );
+    expect(cfg.tags?.["#policy"]).toEqual([{ email: "rev@acme.com", role: "reviewer" }]);
+    expect(cfg.documents?.["nodes/spec"]).toEqual([
+      { email: "viewer@acme.com", role: "viewer" },
+    ]);
+  });
 });
 
 describe("serializeStewards", () => {
@@ -113,6 +132,32 @@ describe("serializeStewards", () => {
     expect(out).not.toContain("nest:");
     expect(out).not.toContain("tags:");
     expect(out).toContain("version: 1");
+  });
+
+  it("omits keys whose entry list is empty (symmetric with parseStewards)", () => {
+    // parseStewards never yields an empty-array group, so serialize must not
+    // emit one either — otherwise this round-trips asymmetrically.
+    const cfg: StewardsConfig = {
+      version: 1,
+      tags: { "#empty": [], "#policy": [{ email: "a@b.com", role: "editor" }] },
+      documents: { "nodes/x": [] },
+    };
+    const out = serializeStewards(cfg);
+    expect(out).not.toContain("#empty");
+    expect(out).not.toContain("documents:");
+    expect(out).toContain("#policy");
+    // Round-trips to just the non-empty content.
+    expect(parseStewards(out)).toEqual({
+      version: 1,
+      tags: { "#policy": [{ email: "a@b.com", role: "editor" }] },
+    });
+  });
+
+  it("preserves a non-default version through round-trip", () => {
+    const cfg: StewardsConfig = { version: 2, nest: [{ email: "a@b.com" }] };
+    const out = serializeStewards(cfg);
+    expect(out).toContain("version: 2");
+    expect(parseStewards(out).version).toBe(2);
   });
 });
 

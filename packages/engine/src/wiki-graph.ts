@@ -17,6 +17,12 @@
  * DRAFT: pure functions only. A storage-coupled convenience wrapper
  * (resolve+load+traverse in one call) can be added later if a consumer wants
  * it — left out here so loading and gating stay explicitly on the consumer.
+ *
+ * NOT the same as `GraphTraverser` (graph-traverser.ts). That does
+ * priority-weighted BFS over the STRUCTURED, typed relationship edges declared
+ * in `context.yaml`. This traverses the UNTYPED free-text `[[Title]]` link graph
+ * scraped from document bodies. Different edge source, different cost model —
+ * kept separate on purpose; neither supersedes the other.
  */
 
 /** Minimal doc shape these primitives need — id + title + body. */
@@ -78,6 +84,9 @@ function resolveTarget(target: string, index: WikiTitleIndex): string | null {
   let t = target.trim();
   const wrapped = t.match(/^\[\[([^[\]]+)\]\]$/);
   if (wrapped) t = wrapped[1].split("|")[0].trim();
+  // Precedence: id match wins over title match. A string that is BOTH a node id
+  // and some other doc's title resolves to the id. Intentional — ids are exact
+  // and unambiguous; titles are user-authored free text and can collide.
   if (index.ids.has(t)) return t; // it's already an id
   return index.byTitle.get(t) ?? index.byTitleLower.get(t.toLowerCase()) ?? null;
 }
@@ -107,6 +116,18 @@ export interface WikiTraversalResult {
  * Edges run both directions: A→B if A's body links [[B]], and the reverse.
  * UNGATED — every reachable node within `hops` is returned regardless of
  * status; the consumer is responsible for gating before/after.
+ *
+ * Expects ALREADY-RESOLVED node ids (run titles/`[[..]]` seeds through
+ * `resolveWikiSeeds` first). Any seed not present in the doc set is silently
+ * dropped — pass a raw title here and it contributes nothing, yielding empty or
+ * partial results with no error. `hopsUsed` is the DEEPEST hop actually reached,
+ * which saturates below `hops` once the frontier empties (e.g. hops:5 over a
+ * 1-hop graph returns hopsUsed:1), not the requested hop count.
+ *
+ * Title collisions: the adjacency is built from every doc's outgoing links, so a
+ * doc that LOSES a title collision (see buildWikiTitleIndex "first writer wins")
+ * is still reachable via its OWN outgoing `[[..]]` links — only its role as a
+ * link *target* is lost. Self-links (`[[Self]]`) are dropped (no self-edge).
  */
 export function traverseWikiGraph(
   seedIds: string[],

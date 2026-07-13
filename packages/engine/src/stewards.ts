@@ -18,6 +18,13 @@ import { load as yamlLoad, dump as yamlDump } from "js-yaml";
  * viewer → access only · editor → edit · reviewer → approve + reject + access.
  * `role` is the sole authority signal; legacy `can_approve`/`can_reject` keys
  * are accepted on input but ignored.
+ *
+ * NOTE: this union lists the CANONICAL roles, not a runtime guarantee. Because
+ * this module is format-only (validating role names is the consumer's
+ * enforcement job), `parseStewards` preserves any non-empty role string as
+ * authored — so a `StewardEntry.role` read back from a parsed file may hold a
+ * value outside this union. Consumers that switch/pattern-match on `role` must
+ * handle the non-canonical case rather than assume exhaustiveness.
  */
 export type StewardRole = "editor" | "reviewer" | "viewer";
 
@@ -117,22 +124,38 @@ function cleanEntry(e: StewardEntry): Record<string, unknown> {
 }
 
 /**
+ * Clean a keyed steward group for serialization, dropping keys whose entry list
+ * is empty. Mirrors `toGroup` on the parse side so the roundtrip is symmetric:
+ * `parseStewards` never yields an empty-array group, so `serializeStewards` must
+ * not emit one either (otherwise `{ tags: { "#x": [] } }` would serialize to a
+ * group that parses back to nothing — a silent asymmetry).
+ */
+function cleanGroup(
+  group: Record<string, StewardEntry[]>,
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const [key, entries] of Object.entries(group)) {
+    if (entries.length) out[key] = entries.map(cleanEntry);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
  * Serialize a StewardsConfig to canonical `stewards.yaml`.
  * Roundtrip-safe: parseStewards(serializeStewards(cfg)) is equivalent to cfg
- * (empty groups omitted, entries reduced to email + optional role).
+ * (empty groups AND empty-entry-list keys omitted, entries reduced to email +
+ * optional role).
  */
 export function serializeStewards(config: StewardsConfig): string {
   const doc: Record<string, unknown> = { version: config.version ?? 1 };
   if (config.nest?.length) doc.nest = config.nest.map(cleanEntry);
-  if (config.tags && Object.keys(config.tags).length) {
-    doc.tags = Object.fromEntries(
-      Object.entries(config.tags).map(([k, v]) => [k, v.map(cleanEntry)]),
-    );
+  if (config.tags) {
+    const tags = cleanGroup(config.tags);
+    if (tags) doc.tags = tags;
   }
-  if (config.documents && Object.keys(config.documents).length) {
-    doc.documents = Object.fromEntries(
-      Object.entries(config.documents).map(([k, v]) => [k, v.map(cleanEntry)]),
-    );
+  if (config.documents) {
+    const documents = cleanGroup(config.documents);
+    if (documents) doc.documents = documents;
   }
   return yamlDump(doc, { lineWidth: -1, quotingType: '"', forceQuotes: false });
 }
@@ -175,8 +198,12 @@ function parseLenient(content: string): StewardsConfig {
         : null; // folders (legacy) + anything else ignored
       continue;
     }
-    // Sub-target header (indented, ends with ':') under tags/documents
-    const sub = line.match(/^(?:\s{2}|\t)(\S.*):$/);
+    // Sub-target header (indented, ends with ':') under tags/documents.
+    // Accept ANY leading whitespace, not just 2 spaces / a tab — legacy files
+    // that reach this fallback are exactly the irregular ones (4-space nesting,
+    // mixed indent), and matching a fixed width silently dropped their entries.
+    // A list entry ("- ...") ends in a value not a colon, so it won't match here.
+    const sub = line.match(/^\s+(\S.*):$/);
     if (sub && section && section !== "nest") {
       flush();
       target = sub[1].trim().replace(/^["']|["']$/g, "");
