@@ -14,3 +14,4 @@ Hardening on the above seams:
 - `parseStewards`' lenient fallback (used only when strict YAML rejects legacy comma-joined shorthand) now accepts any sub-key indentation, not just 2 spaces — 4-space / mixed-indent legacy files no longer silently drop entries.
 - `StewardRole` documented as the canonical set, not a runtime guarantee: the format-only parser preserves non-canonical role strings as authored, so consumers must not assume the union is exhaustive.
 - `serializeDocument`'s undefined-strip is documented as shallow (top-level frontmatter only); a nested `undefined` would still throw. No current parser path produces one.
+- `parseStewards`' lenient fallback now recovers an inline `version: N` instead of silently pinning legacy files to version 1 — symmetric with its role handling (no field is dropped just because strict YAML rejected the file's shorthand).

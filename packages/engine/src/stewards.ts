@@ -186,6 +186,13 @@ function parseLenient(content: string): StewardsConfig {
     // header (tag scopes are '#'-prefixed), so it must not be skipped here.
     if (!line || line.startsWith("#")) continue;
 
+    // Top-level inline `version: N`. It has no trailing ':' so the section-header
+    // branch below never catches it; without this the lenient path would silently
+    // pin every legacy file to version 1 (matching the role handling — no field
+    // gets dropped just because strict YAML rejected the file's shorthand).
+    const ver = line.match(/^version:\s*(\d+)/);
+    if (ver) { result.version = Number(ver[1]); continue; }
+
     // Top-level section header (no indent, ends with ':')
     if (!/^\s/.test(line) && line.endsWith(":")) {
       flush();

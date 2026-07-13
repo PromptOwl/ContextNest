@@ -86,6 +86,16 @@ describe("parseStewards", () => {
     expect(parseStewards("::: not yaml :::")).toHaveProperty("version", 1);
   });
 
+  it("recovers a non-default version through the lenient fallback path", () => {
+    // Comma-joined shorthand forces yamlLoad to throw → lenient path. The inline
+    // `version: 2` must survive rather than being silently pinned to 1.
+    const cfg = parseStewards(
+      "version: 2\nnest:\n  - email: lead@acme.com, role: admin\n",
+    );
+    expect(cfg.version).toBe(2);
+    expect(cfg.nest).toEqual([{ email: "lead@acme.com", role: "admin" }]);
+  });
+
   it("lenient fallback handles 4-space sub-key indentation, not just 2-space", () => {
     // The comma-joined shorthand forces the lenient path; the sub-keys here are
     // nested with 4 spaces. A fixed 2-space match silently dropped these entries.
