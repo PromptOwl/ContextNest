@@ -200,8 +200,11 @@ export function validateDocument(
     }
   }
 
-  // Rule 4: Context links use valid contextnest:// URIs
-  const linkPattern = /\]\(contextnest:\/\/([^)]*)\)/g;
+  // Rule 4: Context links use valid contextnest:// URIs.
+  // The URI capture is length-bounded so the pattern stays linear on adversarial
+  // bodies (many `](contextnest://` prefixes without a closing `)` would otherwise
+  // backtrack polynomially — CodeQL js/polynomial-redos). Real URIs are far shorter.
+  const linkPattern = /\]\(contextnest:\/\/([^)]{0,2048})\)/g;
   let match;
   while ((match = linkPattern.exec(node.body)) !== null) {
     const uri = match[1];
