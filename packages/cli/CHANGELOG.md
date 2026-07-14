@@ -1,5 +1,11 @@
 # @promptowl/contextnest-cli
 
+## 1.2.1
+
+### Patch Changes
+
+- Pick up `@promptowl/contextnest-engine@1.2.1` (checkpoint-chain integrity hardening). No CLI behavior change.
+
 ## 1.2.0
 
 ### Minor Changes

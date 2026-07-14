@@ -229,10 +229,27 @@ export function validateDocument(
  * even when a caller bypasses the parser (e.g. assembles a node literal).
  */
 export function serializeDocument(node: ContextNode): string {
-  const fm: Frontmatter =
+  const normalized: Frontmatter =
     node.frontmatter.status !== undefined
       ? { ...node.frontmatter, status: normalizeStatus(node.frontmatter.status) }
-      : node.frontmatter;
+      : { ...node.frontmatter };
+  // Drop undefined-valued keys before dumping. js-yaml (via gray-matter) throws
+  // "unacceptable kind of an object to dump [object Undefined]" on an undefined
+  // value — and these arise from our OWN parser (e.g. normalizeTags() returns
+  // undefined for empty tags, which parseDocument writes back into frontmatter).
+  // The serializer must not choke on what parseDocument produces. Dropping an
+  // undefined key is roundtrip-safe: an absent key and an undefined value parse
+  // identically.
+  //
+  // NOTE: this is a SHALLOW strip — it only drops undefined values at the top
+  // level of frontmatter. An undefined nested inside a frontmatter value (e.g.
+  // `metadata: { x: undefined }`) would still reach matter.stringify and throw.
+  // No current parser path produces that (normalizeTags is the only undefined
+  // source and it sits top-level), so a deep strip is deliberately out of scope
+  // here; revisit if a nested-optional frontmatter field is ever added.
+  const fm = Object.fromEntries(
+    Object.entries(normalized).filter(([, v]) => v !== undefined),
+  ) as Frontmatter;
   return matter.stringify(node.body, fm);
 }
 
