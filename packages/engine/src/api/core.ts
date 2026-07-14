@@ -93,6 +93,9 @@ const queryOp: OperationDescriptor = {
     traversal: traversal.optional(),
   }),
   errors: ["VALIDATION_FAILED", "INVALID_URI"],
+  // "resolve" is the legacy OSS mcp-server tool name for THIS graph query — not
+  // to be confused with the separate `context_resolve` op below (token-budgeted
+  // full-content resolution).
   aliases: ["resolve"],
 };
 
@@ -146,7 +149,13 @@ const getOp: OperationDescriptor = {
       message: "One of uri, id, or title is required",
     }),
   output: documentPayload,
-  errors: ["DOCUMENT_NOT_FOUND", "INVALID_URI", "REJECTED_DOCUMENT"],
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "REJECTED_DOCUMENT",
+  ],
   aliases: ["read_document"],
 };
 
@@ -195,7 +204,7 @@ const createOp: OperationDescriptor = {
     id: z.string(),
     version: z.number().int().min(1),
   }),
-  errors: ["VALIDATION_FAILED"],
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
   aliases: ["create_document"],
 };
 
@@ -224,7 +233,12 @@ const updateOp: OperationDescriptor = {
     id: z.string(),
     version: z.number().int().min(1),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "REJECTED_DOCUMENT"],
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "REJECTED_DOCUMENT",
+  ],
   aliases: ["update_document"],
 };
 

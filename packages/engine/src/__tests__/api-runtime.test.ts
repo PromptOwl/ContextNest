@@ -6,7 +6,9 @@ import { z } from "zod";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
+import { serializeDocument } from "../parser.js";
 import { UnauthorizedActionError } from "../errors.js";
+import type { ContextNode } from "../types.js";
 import {
   createEngineApi,
   type OperationContext,
@@ -225,5 +227,71 @@ describe("EngineExtension — authorization + capability registration", () => {
     expect(api.namespaces.core.implemented).toBe(true);
     const out = await api.run<{ echo: string }>("context_ping", { msg: "hi" }, ctx);
     expect(out.echo).toBe("hi");
+  });
+
+  it("throws on an operation-name collision from an extension", () => {
+    const dup: OperationDescriptor = {
+      name: "context_get", // collides with a core op
+      namespace: "core",
+      description: "dup",
+      input: z.object({}),
+      output: z.object({}),
+      errors: [],
+    };
+    expect(() =>
+      createEngineApi({ extensions: [{ name: "bad", operations: [dup] }] }),
+    ).toThrow(/Duplicate operation/);
+  });
+});
+
+describe("core executors — review-fix regressions", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("context_update on a rejected doc fails WITHOUT mutating the file", async () => {
+    const rejected: ContextNode = {
+      id: "nodes/gone",
+      filePath: "",
+      rawContent: "",
+      frontmatter: { title: "Gone", status: "rejected" },
+      body: "original body",
+    };
+    await ctx.storage.writeDocument("nodes/gone", serializeDocument(rejected));
+
+    const api = createEngineApi();
+    await expect(
+      api.run("context_update", { id: "nodes/gone", append: "APPENDED_MARKER" }, ctx),
+    ).rejects.toMatchObject({ code: "REJECTED_DOCUMENT" });
+
+    // File must be untouched — no append, no version bump.
+    const afterFile = await ctx.storage.readDocument("nodes/gone");
+    expect(afterFile.body).toContain("original body");
+    expect(afterFile.body).not.toContain("APPENDED_MARKER");
+  });
+
+  it("context_create rejects a title with no slug-able characters", async () => {
+    const api = createEngineApi();
+    await expect(
+      api.run("context_create", { title: "日本語のみ", content: "b" }, ctx),
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+  });
+
+  it("context_update de-duplicates merged tags", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Dedupe", content: "b", tags: ["#api"] }, ctx);
+    await api.run("context_update", { id: "nodes/dedupe", tags: ["api", "#api", "ml"] }, ctx);
+    const got = await api.run<{ frontmatter: { tags?: string[] } }>(
+      "context_get",
+      { id: "nodes/dedupe" },
+      ctx,
+    );
+    expect(got.frontmatter.tags).toEqual(["#api", "#ml"]);
   });
 });

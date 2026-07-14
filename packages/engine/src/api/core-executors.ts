@@ -20,6 +20,7 @@ import {
   isRejected,
 } from "../parser.js";
 import { normalizeDocumentId } from "../storage.js";
+import { publishDocument } from "../publish.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
@@ -58,6 +59,27 @@ function clampHops(hops: unknown): number {
 }
 
 /**
+ * Slugify a title, rejecting titles with no slug-able characters (all-CJK,
+ * all-emoji, all-punctuation) rather than producing a degenerate `nodes/.md`.
+ */
+function requireSlug(title: string): string {
+  const slug = slugify(title);
+  if (!slug) {
+    throw new ContextNestError(
+      `Title "${title}" has no slug-able (a-z0-9) characters; supply an explicit id/folder`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return slug;
+}
+
+/** Normalize (#-prefix) and de-duplicate a tag list. */
+function normalizeUniqueTags(tags?: unknown[]): string[] | undefined {
+  const normalized = normalizeTags(tags);
+  return normalized ? [...new Set(normalized)] : normalized;
+}
+
+/**
  * Resolve a document id from an id / uri / title selector. Title resolves to
  * the *actual* frontmatter title across discovered docs (matches how every
  * surface resolves title→id), falling back to a slugified id under nodes/.
@@ -72,7 +94,8 @@ async function resolveId(
   const match = docs.find(
     (d) => d.frontmatter.title.toLowerCase() === String(sel.title).toLowerCase(),
   );
-  return match ? match.id : normalizeDocumentId(slugify(String(sel.title)));
+  if (match) return match.id;
+  return normalizeDocumentId(requireSlug(String(sel.title)));
 }
 
 /** Validate a node against the spec (§13) before it is written/published. */
@@ -88,7 +111,6 @@ function assertValid(node: ContextNode): void {
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
 async function publishAndIndex(ctx: OperationContext, id: string): Promise<{ version: number }> {
-  const { publishDocument } = await import("../publish.js");
   const res = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
@@ -179,11 +201,11 @@ const create: OperationExecutor = async (ctx, input: any) => {
     .split("/")
     .map(slugify)
     .filter(Boolean);
-  const id = normalizeDocumentId(["nodes", ...folderSegments, slugify(input.title)].join("/"));
+  const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
   const frontmatter: Frontmatter = {
     title: input.title,
     type: input.type ?? "document",
-    ...(input.tags ? { tags: normalizeTags(input.tags) } : {}),
+    ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
     status: "draft",
     created_at: new Date().toISOString(),
@@ -198,10 +220,14 @@ const create: OperationExecutor = async (ctx, input: any) => {
 const update: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   const existing = await ctx.storage.readDocument(id);
+  // Guard BEFORE any write: republishing a rejected doc would flip it back into
+  // retrieval, and writing first would mutate the file even though publish then
+  // rejects (no version/checksum/history). Mirrors OSS update_document.
+  if (isRejected(existing)) throw new RejectedDocumentError(id);
   const frontmatter: Frontmatter = { ...existing.frontmatter };
   if (input.tags) {
     const merged = [...(frontmatter.tags ?? []), ...input.tags];
-    frontmatter.tags = normalizeTags(merged);
+    frontmatter.tags = normalizeUniqueTags(merged);
   }
   if (input.metadata) {
     frontmatter.metadata = { ...(frontmatter.metadata ?? {}), ...input.metadata };

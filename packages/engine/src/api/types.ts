@@ -30,13 +30,16 @@ export const CAPABILITY_NAMESPACES = [
 export type CapabilityNamespace = (typeof CAPABILITY_NAMESPACES)[number];
 
 /**
- * Canonical error codes an operation may surface. These mirror the engine's
- * {@link ContextNestError} `code` values (see `errors.ts`) so the wire contract
- * and the thrown errors stay in lockstep.
+ * Canonical error codes an operation may surface. The first group mirrors the
+ * engine's {@link ContextNestError} `code` values (see `errors.ts`, `storage.ts`);
+ * the last group is raised by the operation runtime itself (`runtime.ts`). Kept
+ * in lockstep so consumers can generate error handling from `op.errors`.
  */
 export const ERROR_CODES = [
+  // engine ContextNestError codes
   "VALIDATION_FAILED",
   "DOCUMENT_NOT_FOUND",
+  "INVALID_DOCUMENT_ID",
   "INVALID_URI",
   "CIRCULAR_DEPENDENCY",
   "INTEGRITY_ERROR",
@@ -44,6 +47,9 @@ export const ERROR_CODES = [
   "REJECTED_DOCUMENT",
   "SUPERSEDED_DOCUMENT",
   "CONFIG_ERROR",
+  // operation-runtime codes
+  "UNKNOWN_OPERATION",
+  "NOT_IMPLEMENTED",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

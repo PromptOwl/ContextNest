@@ -32,10 +32,11 @@ export interface OperationContext {
   /** Version manager for history/reconstruction. */
   readonly versions: VersionManager;
   /**
-   * Basic engine RBAC hook. Defaults to `denyAllRbac` when omitted so
-   * governance-class operations cannot escalate on unwrapped engine usage.
-   * This is the engine's OWN spec-level RBAC — NOT commercial stewardship,
-   * which is injected as an extension `authorize` hook.
+   * Basic engine RBAC hook. When omitted, `createEngineApi().run()` substitutes
+   * `denyAllRbac` before invoking authorize/executors, so governance-class
+   * operations cannot escalate on unwrapped engine usage. This is the engine's
+   * OWN spec-level RBAC — NOT commercial stewardship, which is injected as an
+   * extension `authorize` hook.
    */
   readonly rbac?: RbacHook;
   /** Opaque actor identifier passed through to the rbac hook / audit trail. */
