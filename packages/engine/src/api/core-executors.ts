@@ -46,8 +46,9 @@ function toSummary(node: ContextNode, includeBody = false) {
 function slugify(input: string): string {
   return input
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .replace(/[^a-z0-9]+/g, "-") // collapse each non-alphanumeric run to ONE dash
+    .replace(/^-|-$/g, ""); // runs are already collapsed, so trim a single edge dash
+  // (linear — avoids the `-+$` polynomial-backtracking ReDoS CodeQL flags)
 }
 
 /** Clamp a caller-supplied hop count into [0, MAX_HOPS]. */
