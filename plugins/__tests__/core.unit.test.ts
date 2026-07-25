@@ -3,6 +3,9 @@
  * fake `exec` returning canned ctx JSON; no subprocess, no real vault.
  */
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { run as retrieve } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
@@ -56,6 +59,81 @@ describe("getConfig", () => {
     const c = getConfig({ CONTEXTNEST_RETRIEVAL_MODE: "agent", CONTEXTNEST_VAULT_ALIAS: "p" });
     expect(c.retrievalMode).toBe("agent");
     expect(c.vault).toBe("p");
+  });
+});
+
+describe("getConfig settings override files (CU-wdqcpzw825)", () => {
+  /**
+   * Build throwaway project/user dirs with optional override files.
+   *  - project: <cwd>/.claude/contextnest.local.json
+   *  - user:    <home>/.contextnest/plugin-settings.json
+   */
+  function tempSettings(project?: unknown, user?: unknown) {
+    const cwd = mkdtempSync(join(tmpdir(), "cn-proj-"));
+    const homedir = mkdtempSync(join(tmpdir(), "cn-home-"));
+    if (project !== undefined) {
+      mkdirSync(join(cwd, ".claude"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".claude", "contextnest.local.json"),
+        typeof project === "string" ? project : JSON.stringify(project),
+      );
+    }
+    if (user !== undefined) {
+      mkdirSync(join(homedir, ".contextnest"), { recursive: true });
+      writeFileSync(
+        join(homedir, ".contextnest", "plugin-settings.json"),
+        typeof user === "string" ? user : JSON.stringify(user),
+      );
+    }
+    return { cwd, homedir };
+  }
+
+  // Enable-time answers, frozen into env by Claude Code. The bug: these used
+  // to be the ONLY source, so settings could never be changed after enable.
+  const enableTimeEnv = {
+    CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE: "search",
+    CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE: "true",
+    CLAUDE_PLUGIN_OPTION_VAULT: "work",
+  };
+
+  it("project override file beats the stale enable-time env value", () => {
+    const opts = tempSettings({ retrieval_mode: "off" });
+    expect(getConfig(enableTimeEnv, opts).retrievalMode).toBe("off");
+  });
+
+  it("auto_capture:false in the project file disables capture despite env true", () => {
+    const opts = tempSettings({ auto_capture: false });
+    expect(getConfig(enableTimeEnv, opts).autoCapture).toBe(false);
+  });
+
+  it("user-level file beats env; project file beats user file", () => {
+    const fromUser = tempSettings(undefined, { retrieval_mode: "agent" });
+    expect(getConfig(enableTimeEnv, fromUser).retrievalMode).toBe("agent");
+
+    const both = tempSettings({ retrieval_mode: "query" }, { retrieval_mode: "agent" });
+    expect(getConfig(enableTimeEnv, both).retrievalMode).toBe("query");
+  });
+
+  it('an explicit vault:"" in the file unpins an enable-time pinned vault', () => {
+    const opts = tempSettings({ vault: "" });
+    expect(getConfig(enableTimeEnv, opts).vault).toBe("");
+  });
+
+  it("keys absent from the file fall through to env, then defaults", () => {
+    const opts = tempSettings({ retrieval_mode: "off" });
+    const c = getConfig(enableTimeEnv, opts);
+    expect(c.vault).toBe("work"); // untouched by file → env wins
+    expect(c.ctxCommand).toBe("ctx"); // nowhere → default
+  });
+
+  it("missing or malformed override files never throw and leave env in charge", () => {
+    const none = tempSettings(); // dirs exist, no files
+    expect(getConfig(enableTimeEnv, none).retrievalMode).toBe("search");
+
+    const broken = tempSettings("{not json", "[1,2,3]");
+    const c = getConfig(enableTimeEnv, broken);
+    expect(c.retrievalMode).toBe("search");
+    expect(c.autoCapture).toBe(true);
   });
 });
 
