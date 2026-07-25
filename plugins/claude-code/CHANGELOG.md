@@ -5,7 +5,11 @@
 Settings are no longer frozen at enable time (CU-wdqcpzw825).
 
 - New `/contextnest:config` command to view and change `retrieval_mode`,
-  `auto_capture`, `vault`, and `ctx_command` at any time.
+  `auto_capture`, `vault`, and `ctx_command` at any time. Bare invocation
+  drives the change through interactive pickers (setting, value, scope) instead
+  of requiring the user to type an exact value; the pinned-vault choices are
+  populated from the registered vault aliases. A `<setting> <value>` pair still
+  works for scripting.
 - Settings override files, read by every hook and beating the enable-time
   values: project `.claude/contextnest.local.json` > user
   `~/.contextnest/plugin-settings.json` > `CLAUDE_PLUGIN_OPTION_*` >

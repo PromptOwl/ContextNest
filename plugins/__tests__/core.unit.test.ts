@@ -13,9 +13,11 @@ import { run as captureGate, isSubstantive } from "../shared/core/capture-gate.j
 import {
   getConfig,
   vaultTargets,
+  isVaultRegistered,
   withVault,
   ctxJson,
   squish,
+  VALID_RETRIEVAL_MODES,
 } from "../shared/core/lib.js";
 
 /** Build a fake exec from a list of [substringMatch, jsonValue]. */
@@ -135,6 +137,104 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
     expect(c.retrievalMode).toBe("search");
     expect(c.autoCapture).toBe(true);
   });
+
+  // retrieval_mode is the one setting with a fixed value set. A wrong value
+  // (typo, stale, wrong case) must never silently degrade to "search" while
+  // looking set — it is skipped per layer, so resolution falls through.
+  describe("invalid retrieval_mode is rejected, not silently mis-applied", () => {
+    it("a bogus value in the only layer falls back to the search default", () => {
+      const opts = tempSettings({ retrieval_mode: "aggressive" });
+      expect(getConfig({}, opts).retrievalMode).toBe("search");
+    });
+
+    it("a bogus project value is skipped so a valid env value still wins", () => {
+      const opts = tempSettings({ retrieval_mode: "turbo" });
+      // enable-time env is a valid "search"; the junk file must not mask it.
+      expect(getConfig(enableTimeEnv, opts).retrievalMode).toBe("search");
+    });
+
+    it("a bogus project value is skipped so a valid user-file value wins", () => {
+      const opts = tempSettings({ retrieval_mode: "nope" }, { retrieval_mode: "agent" });
+      expect(getConfig({}, opts).retrievalMode).toBe("agent");
+    });
+
+    it("normalizes surrounding whitespace and casing before validating", () => {
+      const opts = tempSettings({ retrieval_mode: "  AGENT  " });
+      expect(getConfig({}, opts).retrievalMode).toBe("agent");
+    });
+
+    it("every accepted mode round-trips through a file override", () => {
+      for (const mode of VALID_RETRIEVAL_MODES) {
+        const opts = tempSettings({ retrieval_mode: mode });
+        expect(getConfig({}, opts).retrievalMode).toBe(mode);
+      }
+    });
+
+    it("a non-string junk value (number) is rejected too", () => {
+      const opts = tempSettings({ retrieval_mode: 42 });
+      expect(getConfig({}, opts).retrievalMode).toBe("search");
+    });
+  });
+
+  describe("auto_capture accepts only boolean spellings", () => {
+    it("recognized truthy/falsy spellings resolve as expected", () => {
+      for (const v of ["true", "1", "yes", "on", "TRUE", " On "]) {
+        expect(getConfig({}, tempSettings({ auto_capture: v })).autoCapture).toBe(true);
+      }
+      for (const v of ["false", "0", "no", "off", "OFF", " No "]) {
+        expect(getConfig({}, tempSettings({ auto_capture: v })).autoCapture).toBe(false);
+      }
+    });
+
+    it("a JSON boolean (not a string) is honoured", () => {
+      expect(getConfig({}, tempSettings({ auto_capture: false })).autoCapture).toBe(false);
+      expect(getConfig({}, tempSettings({ auto_capture: true })).autoCapture).toBe(true);
+    });
+
+    it("a garbage value is skipped → default ON, and cannot mask a valid layer", () => {
+      // Junk in the only layer → default ON.
+      expect(getConfig({}, tempSettings({ auto_capture: "banana" })).autoCapture).toBe(true);
+      // Junk project value must not hide a valid "off" in the user file.
+      const both = tempSettings({ auto_capture: "2" }, { auto_capture: "off" });
+      expect(getConfig({}, both).autoCapture).toBe(false);
+    });
+  });
+
+  describe("vault accepts only the unpin sentinel or a shape-valid alias", () => {
+    it("a shape-valid alias passes through", () => {
+      expect(getConfig({}, tempSettings({ vault: "work-2_v1" })).vault).toBe("work-2_v1");
+    });
+
+    it("a malformed alias is skipped → default unpinned, cannot mask a valid layer", () => {
+      for (const bad of ["my vault", "a/b", "..", "work!"]) {
+        expect(getConfig({}, tempSettings({ vault: bad })).vault).toBe("");
+      }
+      // Junk project value must not hide a valid alias in the user file.
+      const both = tempSettings({ vault: "a/b" }, { vault: "home" });
+      expect(getConfig({}, both).vault).toBe("home");
+    });
+
+    it('an explicit "" still unpins (not treated as malformed)', () => {
+      const env = { CLAUDE_PLUGIN_OPTION_VAULT: "work" };
+      expect(getConfig(env, tempSettings({ vault: "" })).vault).toBe("");
+    });
+  });
+
+  describe("ctx_command is trimmed and must be non-empty", () => {
+    it("surrounding whitespace is trimmed; internal spaces are preserved", () => {
+      expect(getConfig({}, tempSettings({ ctx_command: "  /bin/ctx  " })).ctxCommand).toBe("/bin/ctx");
+      // A path with internal spaces is a legitimate argv[0] for execFileSync.
+      expect(getConfig({}, tempSettings({ ctx_command: "/opt/my ctx/ctx" })).ctxCommand).toBe(
+        "/opt/my ctx/ctx",
+      );
+    });
+
+    it("a blank value is skipped → default 'ctx', cannot mask a valid layer", () => {
+      expect(getConfig({}, tempSettings({ ctx_command: "   " })).ctxCommand).toBe("ctx");
+      const both = tempSettings({ ctx_command: "" }, { ctx_command: "/usr/local/bin/ctx" });
+      expect(getConfig({}, both).ctxCommand).toBe("/usr/local/bin/ctx");
+    });
+  });
 });
 
 describe("lib helpers", () => {
@@ -155,11 +255,28 @@ describe("lib helpers", () => {
     expect(ctxJson(() => ({ status: 0, stdout: "[1,2]" }), ["x"], null)).toEqual([1, 2]);
   });
 
-  it("vaultTargets: pinned beats registry; empty registry → [null]", () => {
+  it("vaultTargets: a registered pin is honoured; unpinned fans out; empty registry → [null]", () => {
     const ex = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "b", exists: true }]]]);
-    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "pin" }), ex)).toEqual(["pin"]);
+    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
     expect(vaultTargets(getConfig({}), ex)).toEqual(["a", "b"]);
     expect(vaultTargets(getConfig({}), fakeExec([["vault list", []]]))).toEqual([null]);
+  });
+
+  it("vaultTargets: a stale pin (not registered) falls back to auto-select, not a bad --vault", () => {
+    const twoVaults = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "b", exists: true }]]]);
+    // "pin" isn't in the registry → behave as unpinned (fan out), never ["pin"].
+    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "pin" }), twoVaults)).toEqual(["a", "b"]);
+    // Registered but path missing (exists:false) is also not usable → fall back.
+    const missing = fakeExec([["vault list", [{ alias: "gone", exists: false }]]]);
+    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "gone" }), missing)).toEqual([null]);
+  });
+
+  it("isVaultRegistered: true only for a registered, present alias", () => {
+    const ex = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "gone", exists: false }]]]);
+    expect(isVaultRegistered("a", ex)).toBe(true);
+    expect(isVaultRegistered("gone", ex)).toBe(false); // registered but missing on disk
+    expect(isVaultRegistered("nope", ex)).toBe(false); // not registered
+    expect(isVaultRegistered("", ex)).toBe(false); // unpinned
   });
 
   it("squish collapses whitespace and truncates", () => {
@@ -260,6 +377,19 @@ describe("session-start", () => {
     expect(ctx).toContain("`work`");
     expect(ctx).toContain("default");
     expect(ctx).toContain("pinned");
+  });
+
+  it("warns when the pinned vault is not registered (stale pin)", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", exists: true }, { alias: "home", exists: true }]],
+    ]);
+    const out = sessionStart({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "ghost" }, exec: ex });
+    const ctx = additional(out)!;
+    expect(ctx).toMatch(/not a registered vault/i);
+    expect(ctx).toContain("`ghost`");
+    // Must NOT claim the ghost pin is in effect, and no vault is flagged pinned.
+    expect(ctx).not.toContain("all queries/captures use it");
+    expect(ctx).not.toContain("pinned");
   });
 
   it("notes local resolution when no vaults are registered", () => {

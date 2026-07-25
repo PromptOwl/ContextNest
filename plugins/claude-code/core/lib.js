@@ -27,6 +27,29 @@ export const PROJECT_SETTINGS_FILE = join(".claude", "contextnest.local.json");
 export const USER_SETTINGS_FILE = join(".contextnest", "plugin-settings.json");
 
 /**
+ * The only accepted retrieval_mode values. Anything else (a typo, a stale
+ * value, `SEARCH` in the wrong case) is treated as if the key were absent, so
+ * it can never silently degrade to the wrong tier. Shared so the command and
+ * tests validate against the same source of truth.
+ */
+export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
+
+/** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
+export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
+export const FALSY_VALUES = ["false", "0", "no", "off"];
+
+/**
+ * Valid shape for a pinned vault alias — mirrors the engine's ALIAS_PATTERN
+ * (packages/engine/src/registry.ts), the single source of truth for what ctx
+ * accepts. Plugins can't import the engine (they run as standalone vendored
+ * JS), so the rule is duplicated here. An empty string is handled separately:
+ * it is the deliberate "unpin" value, not a malformed alias. Note this only
+ * validates *shape*; whether the alias is actually registered is checked by
+ * the /contextnest:config command, which can consult the registry.
+ */
+export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+/**
  * Read a settings override file. Missing or malformed files are silently
  * ignored (hooks must never break a session), as is anything that isn't a
  * plain JSON object.
@@ -69,42 +92,85 @@ export function getConfig(env = process.env, opts = {}) {
     readSettingsFile(join(home, USER_SETTINGS_FILE)),
   ];
 
-  const pick = (fileKey, ...envKeys) => {
+  // Resolve one setting across the layers. `envKeys` is scanned after the
+  // files. `opts.normalize` transforms a raw value before it is validated and
+  // returned; `opts.accept` rejects invalid values — a rejected value is
+  // skipped as if that layer never set the key, so resolution falls through to
+  // the next layer (and ultimately the default). File layers honour an empty
+  // string (e.g. vault:"" unpins); env layers treat "" as absent, as before.
+  const pick = (fileKey, envKeys = [], opts = {}) => {
+    const finalize = (raw) => {
+      const v = opts.normalize ? opts.normalize(String(raw)) : String(raw);
+      return opts.accept && !opts.accept(v) ? undefined : v;
+    };
     for (const layer of fileLayers) {
-      const v = layer[fileKey];
-      if (v !== undefined && v !== null) return String(v);
+      const raw = layer[fileKey];
+      if (raw !== undefined && raw !== null) {
+        const v = finalize(raw);
+        if (v !== undefined) return v;
+      }
     }
     for (const k of envKeys) {
-      const v = env[k];
-      if (v !== undefined && v !== "") return v;
+      const raw = env[k];
+      if (raw !== undefined && raw !== "") {
+        const v = finalize(raw);
+        if (v !== undefined) return v;
+      }
     }
     return undefined;
   };
 
+  // Accept only recognized boolean spellings; a garbage value ("banana", "2")
+  // is skipped per layer so it can neither be mistaken for a boolean nor mask
+  // a valid lower-precedence value. JSON booleans arrive as "true"/"false".
   const rawAuto = pick(
     "auto_capture",
-    "CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE",
-    "CONTEXTNEST_AUTO_CAPTURE",
+    ["CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE", "CONTEXTNEST_AUTO_CAPTURE"],
+    {
+      normalize: (s) => s.trim().toLowerCase(),
+      accept: (s) => TRUTHY_VALUES.includes(s) || FALSY_VALUES.includes(s),
+    },
   );
 
+  // Accept the unpin sentinel "" or a shape-valid alias; a malformed alias
+  // ("my vault", "a/b", "..") is skipped so it can't reach ctx as a bad
+  // --vault arg. Registry membership is verified by the config command.
   const rawVault = pick(
     "vault",
-    "CLAUDE_PLUGIN_OPTION_VAULT",
-    "CONTEXTNEST_VAULT_ALIAS",
+    ["CLAUDE_PLUGIN_OPTION_VAULT", "CONTEXTNEST_VAULT_ALIAS"],
+    {
+      normalize: (s) => s.trim(),
+      accept: (s) => s === "" || ALIAS_PATTERN.test(s),
+    },
   );
 
   return {
-    retrievalMode: (
-      pick("retrieval_mode", "CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE", "CONTEXTNEST_RETRIEVAL_MODE") ||
-      "search"
-    ).toLowerCase(),
-    // Default ON. Only an explicit false/0/no disables it.
-    autoCapture: rawAuto === undefined ? true : !/^(false|0|no|off)$/i.test(rawAuto),
+    // Invalid values are skipped per layer (see pick), so this only ever
+    // yields a known mode or the "search" default — never a bogus string.
+    retrievalMode:
+      pick(
+        "retrieval_mode",
+        ["CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE", "CONTEXTNEST_RETRIEVAL_MODE"],
+        {
+          normalize: (s) => s.trim().toLowerCase(),
+          accept: (s) => VALID_RETRIEVAL_MODES.includes(s),
+        },
+      ) || "search",
+    // Default ON. Only a recognized falsy value disables it.
+    autoCapture: rawAuto === undefined ? true : TRUTHY_VALUES.includes(rawAuto),
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,
+    // Command used to invoke ctx. Trimmed; a blank value is skipped so it
+    // falls back to the "ctx" default (which itself npx-falls-back on ENOENT).
+    // Internal whitespace is allowed — execFileSync runs the whole string as
+    // argv[0], so a path containing spaces is legitimate.
     ctxCommand:
-      pick("ctx_command", "CLAUDE_PLUGIN_OPTION_CTX_COMMAND", "CONTEXTNEST_CTX_COMMAND") || "ctx",
+      pick(
+        "ctx_command",
+        ["CLAUDE_PLUGIN_OPTION_CTX_COMMAND", "CONTEXTNEST_CTX_COMMAND"],
+        { normalize: (s) => s.trim(), accept: (s) => s.length > 0 },
+      ) || "ctx",
   };
 }
 
@@ -191,9 +257,25 @@ export function listVaults(exec) {
 }
 
 /**
+ * True when `alias` names a vault that is registered AND present on disk.
+ * `getConfig` only checks the alias *shape*; this is the registry check that
+ * needs the live `ctx` registry, so it lives with the exec-taking helpers.
+ *
+ * @param {string} alias
+ * @param {(args:string[]) => any} exec
+ */
+export function isVaultRegistered(alias, exec) {
+  if (!alias) return false;
+  return listVaults(exec).some((v) => v.alias === alias && v.exists !== false);
+}
+
+/**
  * Decide which vault aliases the cheap (non-agent) tiers should search.
  *
- *  - Pinned alias set        → just that alias.
+ *  - Pinned alias, registered → just that alias.
+ *  - Pinned alias, NOT registered (stale/removed pin) → ignore the pin and
+ *    behave as unpinned, rather than passing ctx a bad --vault that resolves to
+ *    nothing. session-start surfaces a warning so this isn't silent.
  *  - Unpinned + registry     → fan out across registered vaults (capped).
  *  - Unpinned + empty registry → a single null target, i.e. let ctx resolve the
  *                                 local/default vault with no --vault flag.
@@ -203,8 +285,10 @@ export function listVaults(exec) {
  * @returns {(string|null)[]} list of alias targets (null = ctx default resolution)
  */
 export function vaultTargets(config, exec) {
-  if (config.vault) return [config.vault];
   const vaults = listVaults(exec).filter((v) => v.exists !== false);
+  if (config.vault && vaults.some((v) => v.alias === config.vault)) {
+    return [config.vault];
+  }
   if (vaults.length === 0) return [null];
   return vaults.slice(0, MAX_FANOUT_VAULTS).map((v) => v.alias);
 }

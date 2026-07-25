@@ -44,10 +44,16 @@ Claude Code only prompts for the settings above once, at enable time. To view
 or change them afterwards, use the config command:
 
 ```text
-/contextnest:config                          # show effective settings + sources
+/contextnest:config                          # show settings, then pick what to change
 /contextnest:config retrieval_mode query     # change for this project
 /contextnest:config auto_capture false --global   # change for all projects
 ```
+
+Run bare `/contextnest:config` and it shows the current settings, then walks you
+through a picker — choose the setting, choose the value from its valid options
+(pinned vault is filled from your registered aliases), and choose the scope. No
+need to remember exact values; typing a `<setting> <value>` pair still works for
+scripting.
 
 Changes are written to a settings override file and take effect on the next
 prompt — no restart or re-enable needed. You can also edit the files directly
