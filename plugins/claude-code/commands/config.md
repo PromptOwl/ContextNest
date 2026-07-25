@@ -91,6 +91,11 @@ the change interactively with `AskUserQuestion`:
    and write it back as pretty-printed JSON. Create the parent directory if
    needed. For **Unpin**, write `"vault": ""` explicitly — the empty string is
    honoured as a deliberate unpin.
-4. Confirm to the user: the new value, the file written, and that it takes
+4. For project scope, make sure `.claude/contextnest.local.json` is ignored by
+   git — it is a personal, per-checkout override and must not be committed.
+   If the project is a git repo and the path isn't already ignored (check with
+   `git check-ignore -q .claude/contextnest.local.json`), append it to the
+   repo's `.gitignore`.
+5. Confirm to the user: the new value, the file written, and that it takes
    effect from the next prompt in any session — no restart or re-enable
    needed. To undo, remove the key from that file.
