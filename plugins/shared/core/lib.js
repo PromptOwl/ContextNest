@@ -12,24 +12,69 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir as osHomedir } from "node:os";
+import { join } from "node:path";
 
 /** Default cap on how many registered vaults the cheap tiers fan out across. */
 export const MAX_FANOUT_VAULTS = 5;
 /** Default cap on how many retrieval hits we inject. */
 export const MAX_HITS = 6;
 
+/** Project-level settings override, relative to the project root. */
+export const PROJECT_SETTINGS_FILE = join(".claude", "contextnest.local.json");
+/** User-level settings override, relative to the home directory. */
+export const USER_SETTINGS_FILE = join(".contextnest", "plugin-settings.json");
+
 /**
- * Read plugin configuration from the environment.
+ * Read a settings override file. Missing or malformed files are silently
+ * ignored (hooks must never break a session), as is anything that isn't a
+ * plain JSON object.
+ */
+function readSettingsFile(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read plugin configuration.
  *
- * Claude Code exports userConfig values as CLAUDE_PLUGIN_OPTION_<KEY>. Other
- * agents (Codex/Gemini) that lack a userConfig mechanism can feed the same
- * values via the generic CONTEXTNEST_* fallbacks.
+ * Claude Code collects userConfig answers once at enable time and exports
+ * them as CLAUDE_PLUGIN_OPTION_<KEY> — they cannot be changed afterwards from
+ * within a session. Settings override files exist so users CAN change them
+ * later (via /contextnest:config or by editing the file); a key present in a
+ * file therefore beats the frozen env value. Precedence, highest first:
+ *
+ *   1. <project>/.claude/contextnest.local.json
+ *   2. ~/.contextnest/plugin-settings.json
+ *   3. CLAUDE_PLUGIN_OPTION_* env (enable-time answers)
+ *   4. CONTEXTNEST_* env (generic fallbacks for Codex/Gemini adapters)
+ *   5. defaults
+ *
+ * File keys mirror the manifest: retrieval_mode, auto_capture, vault,
+ * ctx_command. An explicit "" in a file is honoured (e.g. vault:"" unpins).
  *
  * @param {Record<string, string | undefined>} env
+ * @param {{ cwd?: string, homedir?: string }} [opts] injection points for tests
  */
-export function getConfig(env = process.env) {
-  const pick = (...keys) => {
-    for (const k of keys) {
+export function getConfig(env = process.env, opts = {}) {
+  const cwd = opts.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
+  const home = opts.homedir || osHomedir();
+  const fileLayers = [
+    readSettingsFile(join(cwd, PROJECT_SETTINGS_FILE)),
+    readSettingsFile(join(home, USER_SETTINGS_FILE)),
+  ];
+
+  const pick = (fileKey, ...envKeys) => {
+    for (const layer of fileLayers) {
+      const v = layer[fileKey];
+      if (v !== undefined && v !== null) return String(v);
+    }
+    for (const k of envKeys) {
       const v = env[k];
       if (v !== undefined && v !== "") return v;
     }
@@ -37,22 +82,29 @@ export function getConfig(env = process.env) {
   };
 
   const rawAuto = pick(
+    "auto_capture",
     "CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE",
     "CONTEXTNEST_AUTO_CAPTURE",
   );
 
+  const rawVault = pick(
+    "vault",
+    "CLAUDE_PLUGIN_OPTION_VAULT",
+    "CONTEXTNEST_VAULT_ALIAS",
+  );
+
   return {
     retrievalMode: (
-      pick("CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE", "CONTEXTNEST_RETRIEVAL_MODE") ||
+      pick("retrieval_mode", "CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE", "CONTEXTNEST_RETRIEVAL_MODE") ||
       "search"
     ).toLowerCase(),
     // Default ON. Only an explicit false/0/no disables it.
     autoCapture: rawAuto === undefined ? true : !/^(false|0|no|off)$/i.test(rawAuto),
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
-    vault: pick("CLAUDE_PLUGIN_OPTION_VAULT", "CONTEXTNEST_VAULT_ALIAS") || "",
+    vault: rawVault === undefined ? "" : rawVault,
     ctxCommand:
-      pick("CLAUDE_PLUGIN_OPTION_CTX_COMMAND", "CONTEXTNEST_CTX_COMMAND") || "ctx",
+      pick("ctx_command", "CLAUDE_PLUGIN_OPTION_CTX_COMMAND", "CONTEXTNEST_CTX_COMMAND") || "ctx",
   };
 }
 
