@@ -258,15 +258,17 @@ export function listVaults(exec) {
 
 /**
  * True when `alias` names a vault that is registered AND present on disk.
- * `getConfig` only checks the alias *shape*; this is the registry check that
- * needs the live `ctx` registry, so it lives with the exec-taking helpers.
+ * `getConfig` only checks the alias *shape*; this is the registry check.
+ * Takes the already-fetched `listVaults` result so callers that need the list
+ * anyway (vaultTargets, session-start) share this predicate instead of each
+ * re-running `vault list` — and instead of each inlining the same `.some(...)`.
  *
  * @param {string} alias
- * @param {(args:string[]) => any} exec
+ * @param {{alias: string, exists?: boolean}[]} vaults from listVaults()
  */
-export function isVaultRegistered(alias, exec) {
+export function isVaultRegistered(alias, vaults) {
   if (!alias) return false;
-  return listVaults(exec).some((v) => v.alias === alias && v.exists !== false);
+  return vaults.some((v) => v.alias === alias && v.exists !== false);
 }
 
 /**
@@ -286,9 +288,7 @@ export function isVaultRegistered(alias, exec) {
  */
 export function vaultTargets(config, exec) {
   const vaults = listVaults(exec).filter((v) => v.exists !== false);
-  if (config.vault && vaults.some((v) => v.alias === config.vault)) {
-    return [config.vault];
-  }
+  if (isVaultRegistered(config.vault, vaults)) return [config.vault];
   if (vaults.length === 0) return [null];
   return vaults.slice(0, MAX_FANOUT_VAULTS).map((v) => v.alias);
 }

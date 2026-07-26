@@ -2,7 +2,7 @@
  * Tier 1 — pure unit tests for the shared core. Each run() is called with a
  * fake `exec` returning canned ctx JSON; no subprocess, no real vault.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,6 +36,24 @@ function fakeExec(routes: [string, unknown][], fallback: unknown = []) {
 function additional(out: any): string | undefined {
   return out?.hookSpecificOutput?.additionalContext;
 }
+
+// getConfig() reads real override files when the caller doesn't inject
+// cwd/homedir (sessionStart never does). Point HOME and the project dir at an
+// empty temp dir so a developer's own ~/.contextnest/plugin-settings.json can't
+// leak into these assertions. Node's os.homedir() honours $HOME on POSIX.
+const realHome = process.env.HOME;
+const realProjectDir = process.env.CLAUDE_PROJECT_DIR;
+beforeAll(() => {
+  const empty = mkdtempSync(join(tmpdir(), "cn-no-settings-"));
+  process.env.HOME = empty;
+  process.env.CLAUDE_PROJECT_DIR = empty;
+});
+afterAll(() => {
+  if (realHome === undefined) delete process.env.HOME;
+  else process.env.HOME = realHome;
+  if (realProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+  else process.env.CLAUDE_PROJECT_DIR = realProjectDir;
+});
 
 describe("getConfig", () => {
   it("defaults and Claude userConfig precedence", () => {
@@ -272,11 +290,11 @@ describe("lib helpers", () => {
   });
 
   it("isVaultRegistered: true only for a registered, present alias", () => {
-    const ex = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "gone", exists: false }]]]);
-    expect(isVaultRegistered("a", ex)).toBe(true);
-    expect(isVaultRegistered("gone", ex)).toBe(false); // registered but missing on disk
-    expect(isVaultRegistered("nope", ex)).toBe(false); // not registered
-    expect(isVaultRegistered("", ex)).toBe(false); // unpinned
+    const vaults = [{ alias: "a", exists: true }, { alias: "gone", exists: false }];
+    expect(isVaultRegistered("a", vaults)).toBe(true);
+    expect(isVaultRegistered("gone", vaults)).toBe(false); // registered but missing on disk
+    expect(isVaultRegistered("nope", vaults)).toBe(false); // not registered
+    expect(isVaultRegistered("", vaults)).toBe(false); // unpinned
   });
 
   it("squish collapses whitespace and truncates", () => {

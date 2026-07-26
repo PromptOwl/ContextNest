@@ -10,6 +10,7 @@
 import {
   getConfig,
   ctxJson,
+  isVaultRegistered,
   squish,
   runAsHook,
   isMain,
@@ -42,8 +43,7 @@ export function run({ env, exec }) {
   // A pin is only honoured if it still resolves to a registered vault; it may
   // have been removed or renamed since it was set. Warn loudly on a stale pin —
   // retrieval falls back to automatic selection (see vaultTargets).
-  const pinnedIsRegistered =
-    config.vault && vaults.some((v) => v.alias === config.vault && v.exists !== false);
+  const pinnedIsRegistered = isVaultRegistered(config.vault, vaults);
 
   if (config.vault && !pinnedIsRegistered) {
     lines.push(
