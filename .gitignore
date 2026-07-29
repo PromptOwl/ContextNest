@@ -9,6 +9,8 @@ fixtures/*
 # Keep the committed test vault tracked (it backs the engine test suite).
 !fixtures/minimal-vault/
 .claude/agent-memory/*
+# Per-checkout Context Nest plugin overrides — personal, never shared.
+.claude/contextnest.local.json
 
 # Test coverage output
 coverage/
