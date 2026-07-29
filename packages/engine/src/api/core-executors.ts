@@ -98,17 +98,6 @@ async function resolveId(
   return normalizeDocumentId(requireSlug(String(sel.title)));
 }
 
-/** True if a document already exists at `id` (readDocument throws when absent). */
-async function documentExists(ctx: OperationContext, id: string): Promise<boolean> {
-  try {
-    await ctx.storage.readDocument(id);
-    return true;
-  } catch (err) {
-    if (err instanceof ContextNestError && err.code === "DOCUMENT_NOT_FOUND") return false;
-    throw err;
-  }
-}
-
 /** Validate a node against the spec (§13) before it is written/published. */
 function assertValid(node: ContextNode): void {
   const result = validateDocument(node);
@@ -220,12 +209,6 @@ const create: OperationExecutor = async (ctx, input: any) => {
     .map(slugify)
     .filter(Boolean);
   const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
-  // Refuse to clobber an existing doc (mirrors OSS create_document). Without
-  // this, a colliding title overwrites the prior node AND resurrects a rejected
-  // one into retrieval — the exact invariant `update` guards via isRejected.
-  if (await documentExists(ctx, id)) {
-    throw new ContextNestError(`Document "${id}" already exists`, "DOCUMENT_ALREADY_EXISTS");
-  }
   const frontmatter: Frontmatter = {
     title: input.title,
     type: input.type ?? "document",
@@ -236,7 +219,10 @@ const create: OperationExecutor = async (ctx, input: any) => {
   };
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body: input.content };
   assertValid(node);
-  await ctx.storage.writeDocument(id, serializeDocument(node));
+  // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
+  // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
+  // the way the pre-check + separate write could race.
+  await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: true });
   const result = await publishAndIndex(ctx, id);
   return { id, version: result.version };
 };
@@ -331,8 +317,21 @@ const overview: OperationExecutor = async (ctx) => {
 
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  const content = await ctx.versions.reconstructVersion(id, input.version);
-  return { id, version: input.version, content };
+  // Surface DOCUMENT_NOT_FOUND for a bogus id/title (the descriptor advertises it).
+  await ctx.storage.readDocument(id);
+  try {
+    const content = await ctx.versions.reconstructVersion(id, input.version);
+    return { id, version: input.version, content };
+  } catch (err) {
+    if (err instanceof ContextNestError) throw err;
+    // reconstructVersion throws plain Error (no .code) for missing history,
+    // an out-of-range version, or a corrupt keyframe. Map to VALIDATION_FAILED
+    // so callers can dispatch on the advertised error contract.
+    throw new ContextNestError(
+      err instanceof Error ? err.message : String(err),
+      "VALIDATION_FAILED",
+    );
+  }
 };
 
 const verify: OperationExecutor = async (ctx) => {

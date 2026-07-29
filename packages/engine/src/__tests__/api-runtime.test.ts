@@ -235,6 +235,42 @@ describe("createEngineApi — executable core operations", () => {
     expect(out.content).toContain("original body");
   });
 
+  it("context_reconstruct honors its error contract (coded errors)", async () => {
+    const api = createEngineApi();
+    // A doc on disk with NO version history (never published) → reconstructVersion
+    // throws a plain Error; the executor must surface it as VALIDATION_FAILED.
+    const node: ContextNode = {
+      id: "nodes/nohist",
+      filePath: "",
+      rawContent: "",
+      frontmatter: { title: "NoHist", type: "document", status: "draft" },
+      body: "b",
+    };
+    await ctx.storage.writeDocument("nodes/nohist", serializeDocument(node));
+    await expect(
+      api.run("context_reconstruct", { id: "nodes/nohist", version: 1 }, ctx),
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    // Bogus id → DOCUMENT_NOT_FOUND (as advertised), not an un-coded error.
+    await expect(
+      api.run("context_reconstruct", { id: "nodes/ghost", version: 1 }, ctx),
+    ).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+  });
+
+  it("concurrent context_create for the same id — exactly one wins (no clobber)", async () => {
+    const api = createEngineApi();
+    const results = await Promise.allSettled([
+      api.run("context_create", { title: "Racer", content: "first" }, ctx),
+      api.run("context_create", { title: "Racer", content: "second" }, ctx),
+    ]);
+    const ok = results.filter((r) => r.status === "fulfilled");
+    const failed = results.filter(
+      (r) => r.status === "rejected",
+    ) as PromiseRejectedResult[];
+    expect(ok).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0].reason).toMatchObject({ code: "DOCUMENT_ALREADY_EXISTS" });
+  });
+
   it("context_verify reports valid chains for a healthy vault", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Sound", content: "b" }, ctx);
