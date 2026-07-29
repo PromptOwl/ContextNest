@@ -292,6 +292,54 @@ describe("createEngineApi — executable core operations", () => {
     expect(Array.isArray(out.packs)).toBe(true);
   });
 
+  it("context_import bulk-creates many nodes under ONE checkpoint", async () => {
+    const api = createEngineApi();
+    const documents = Array.from({ length: 6 }, (_, i) => ({
+      title: `Imported ${i}`,
+      content: `body ${i}`,
+      tags: ["#bulk"],
+    }));
+    const out = await api.run<{
+      created: Array<{ id: string; version: number }>;
+      failed: unknown[];
+    }>("context_import", { documents }, ctx);
+
+    expect(out.created).toHaveLength(6);
+    expect(out.failed).toHaveLength(0);
+    expect(out.created.every((c) => c.version === 1)).toBe(true);
+    // Whole batch sealed one checkpoint, not one-per-doc.
+    const history = await ctx.storage.readCheckpointHistory();
+    expect(history?.checkpoints).toHaveLength(1);
+    // Imported docs are published and retrievable.
+    const got = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: "nodes/imported-0" },
+      ctx,
+    );
+    expect(got.frontmatter.status).toBe("published");
+  });
+
+  it("context_import reports per-document failures without aborting the batch", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{
+      created: Array<{ id: string }>;
+      failed: Array<{ title: string; error: string }>;
+    }>(
+      "context_import",
+      {
+        documents: [
+          { title: "Fine One", content: "b" },
+          { title: "日本語のみ", content: "b" }, // no slug-able chars → fails
+          { title: "Fine Two", content: "b" },
+        ],
+      },
+      ctx,
+    );
+    expect(out.created).toHaveLength(2);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0].title).toBe("日本語のみ");
+  });
+
   it("normalizes tags to #-prefixed form on create (S7)", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Tagged", content: "b", tags: ["api", "ml"] }, ctx);

@@ -415,6 +415,31 @@ const packsOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED"],
 };
 
+// ─── context_import ──────────────────────────────────────────────────────────
+
+/** One node to create in a bulk import — same shape as context_create input. */
+const importDoc = z.object({
+  title: z.string().min(1).max(200).describe("Descriptive title"),
+  content: z.string().describe("Markdown content body"),
+  type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+  tags: z.array(tag).optional().describe("Tags"),
+  folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
+  metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
+});
+
+const importOp: OperationDescriptor = {
+  name: "context_import",
+  namespace: "core",
+  description:
+    "Bulk-create and publish many nodes in one pass (folder/batch import). Seals one checkpoint for the batch; failures are reported per-document, never aborting the rest.",
+  input: z.object({ documents: z.array(importDoc).min(1) }),
+  output: z.object({
+    created: z.array(z.object({ id: z.string(), version: z.number().int().min(1) })),
+    failed: z.array(z.object({ title: z.string(), error: z.string() })),
+  }),
+  errors: ["VALIDATION_FAILED"],
+};
+
 /** All `core` namespace operations, in catalog order. */
 export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   getOp,
@@ -432,4 +457,5 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   verifyOp,
   initOp,
   packsOp,
+  importOp,
 ];
