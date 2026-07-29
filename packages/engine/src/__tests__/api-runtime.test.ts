@@ -166,6 +166,96 @@ describe("createEngineApi — executable core operations", () => {
     expect(out.results.some((r) => r.id === "nodes/url-doc")).toBe(true);
   });
 
+  it("context_publish bumps version + returns a checkpoint", async () => {
+    const api = createEngineApi();
+    // create auto-publishes at v1; publishing again bumps to v2.
+    await api.run("context_create", { title: "Pub Me", content: "b" }, ctx);
+    const out = await api.run<{ id: string; version: number; checkpoint: number }>(
+      "context_publish",
+      { id: "nodes/pub-me" },
+      ctx,
+    );
+    expect(out.version).toBe(2);
+    expect(out.checkpoint).toBeGreaterThanOrEqual(1);
+  });
+
+  it("context_delete removes a node; a later get is NOT_FOUND", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Doomed", content: "b" }, ctx);
+    const out = await api.run<{ id: string; deleted: boolean }>(
+      "context_delete",
+      { id: "nodes/doomed" },
+      ctx,
+    );
+    expect(out.deleted).toBe(true);
+    await expect(api.run("context_get", { id: "nodes/doomed" }, ctx)).rejects.toMatchObject({
+      code: "DOCUMENT_NOT_FOUND",
+    });
+  });
+
+  it("context_versions returns the node's history", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Historic", content: "b" }, ctx);
+    const out = await api.run<{ id: string; versions: Array<{ chain_hash: string }> }>(
+      "context_versions",
+      { id: "nodes/historic" },
+      ctx,
+    );
+    expect(out.versions.length).toBeGreaterThanOrEqual(1);
+    expect(out.versions[0].chain_hash).toMatch(/^sha256:/);
+  });
+
+  it("context_overview reports counts, tags, and the node list", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Alpha", content: "b", tags: ["#x"] }, ctx);
+    await api.run("context_create", { title: "Beta", content: "b", type: "glossary" }, ctx);
+    const out = await api.run<{
+      total: number;
+      by_type: Record<string, number>;
+      tags: string[];
+      nodes: Array<{ id: string }>;
+    }>("context_overview", {}, ctx);
+    expect(out.total).toBeGreaterThanOrEqual(2);
+    expect(out.by_type.document).toBeGreaterThanOrEqual(1);
+    expect(out.by_type.glossary).toBeGreaterThanOrEqual(1);
+    expect(out.tags).toContain("#x");
+    expect(out.nodes.some((n) => n.id === "nodes/alpha")).toBe(true);
+  });
+
+  it("context_reconstruct returns a past version's content", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Evolving", content: "original body" }, ctx);
+    await api.run("context_update", { id: "nodes/evolving", content: "rewritten body" }, ctx);
+    const out = await api.run<{ id: string; version: number; content: string }>(
+      "context_reconstruct",
+      { id: "nodes/evolving", version: 1 },
+      ctx,
+    );
+    expect(out.version).toBe(1);
+    expect(out.content).toContain("original body");
+  });
+
+  it("context_verify reports valid chains for a healthy vault", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Sound", content: "b" }, ctx);
+    const out = await api.run<{ valid: boolean; errors: unknown[] }>("context_verify", {}, ctx);
+    expect(out.valid).toBe(true);
+    expect(out.errors).toHaveLength(0);
+  });
+
+  it("context_init returns the vault CONTEXT.md", async () => {
+    await ctx.storage.writeContextMd("# Operating instructions");
+    const api = createEngineApi();
+    const out = await api.run<{ context_md: string | null }>("context_init", {}, ctx);
+    expect(out.context_md).toContain("Operating instructions");
+  });
+
+  it("context_packs lists packs (empty when none defined)", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ packs: unknown[] }>("context_packs", {}, ctx);
+    expect(Array.isArray(out.packs)).toBe(true);
+  });
+
   it("normalizes tags to #-prefixed form on create (S7)", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Tagged", content: "b", tags: ["api", "ml"] }, ctx);

@@ -43,6 +43,17 @@ const documentPayload = z.object({
   body: z.string(),
 });
 
+/** Address a single node by URI, id, or title — shared by get/delete/publish/versions. */
+const nodeSelector = z
+  .object({
+    uri: z.string().optional().describe("Document URI, e.g. contextnest://nodes/api-design"),
+    id: z.string().optional().describe("Document id / path"),
+    title: z.string().optional().describe("Document title"),
+  })
+  .refine((v) => Boolean(v.uri || v.id || v.title), {
+    message: "One of uri, id, or title is required",
+  });
+
 // ─── context_search ──────────────────────────────────────────────────────────
 
 const searchOp: OperationDescriptor = {
@@ -242,6 +253,168 @@ const updateOp: OperationDescriptor = {
   aliases: ["update_document"],
 };
 
+// ─── context_publish ─────────────────────────────────────────────────────────
+
+const publishOp: OperationDescriptor = {
+  name: "context_publish",
+  namespace: "core",
+  description:
+    "Publish a node: bump version, compute checksum, seal a version entry + checkpoint.",
+  input: nodeSelector,
+  output: z.object({
+    id: z.string(),
+    version: z.number().int().min(1),
+    checkpoint: z.number().int().min(1),
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "REJECTED_DOCUMENT",
+  ],
+  aliases: ["publish_document"],
+};
+
+// ─── context_delete ──────────────────────────────────────────────────────────
+
+const deleteOp: OperationDescriptor = {
+  name: "context_delete",
+  namespace: "core",
+  description: "Delete a node and its version history from the vault.",
+  input: nodeSelector,
+  output: z.object({ id: z.string(), deleted: z.literal(true) }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  aliases: ["delete_document"],
+};
+
+// ─── context_versions ────────────────────────────────────────────────────────
+
+const versionEntryOut = z.object({
+  version: z.number().int(),
+  keyframe: z.boolean(),
+  edited_by: z.string(),
+  edited_at: z.string(),
+  published_at: z.string().optional(),
+  note: z.string().optional(),
+  content_hash: z.string(),
+  chain_hash: z.string(),
+});
+
+const versionsOp: OperationDescriptor = {
+  name: "context_versions",
+  namespace: "core",
+  description: "Version history of a node (newest entries last).",
+  input: nodeSelector,
+  output: z.object({
+    id: z.string(),
+    keyframe_interval: z.number().int(),
+    versions: z.array(versionEntryOut),
+  }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+};
+
+// ─── context_overview ────────────────────────────────────────────────────────
+
+const overviewOp: OperationDescriptor = {
+  name: "context_overview",
+  namespace: "core",
+  description:
+    "Vault manifest: node counts by type and status, the tag set, and a node list.",
+  input: z.object({}),
+  output: z.object({
+    total: z.number().int(),
+    by_type: z.record(z.number().int()),
+    by_status: z.record(z.number().int()),
+    tags: z.array(z.string()),
+    nodes: z.array(nodeSummary),
+  }),
+  errors: ["VALIDATION_FAILED"],
+  aliases: ["vault_info"],
+};
+
+// ─── context_reconstruct ─────────────────────────────────────────────────────
+
+const reconstructOp: OperationDescriptor = {
+  name: "context_reconstruct",
+  namespace: "core",
+  description: "Reconstruct the full content of a specific past version of a node.",
+  input: z
+    .object({
+      uri: z.string().optional().describe("Document URI"),
+      id: z.string().optional().describe("Document id / path"),
+      title: z.string().optional().describe("Document title"),
+      version: z.number().int().positive().describe("Version number to reconstruct"),
+    })
+    .refine((v) => Boolean(v.uri || v.id || v.title), {
+      message: "One of uri, id, or title is required",
+    }),
+  output: z.object({
+    id: z.string(),
+    version: z.number().int(),
+    content: z.string(),
+  }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  aliases: ["read_version"],
+};
+
+// ─── context_verify ──────────────────────────────────────────────────────────
+
+const verifyError = z.object({
+  type: z.enum([
+    "content_hash_mismatch",
+    "chain_hash_mismatch",
+    "cross_chain_mismatch",
+    "checkpoint_hash_mismatch",
+    "body_drift",
+  ]),
+  document: z.string().optional(),
+  version: z.number().int().optional(),
+  checkpoint: z.number().int().optional(),
+  expected: z.string().nullable(),
+  actual: z.string(),
+});
+
+const verifyOp: OperationDescriptor = {
+  name: "context_verify",
+  namespace: "core",
+  description: "Verify every document and checkpoint hash chain in the vault.",
+  input: z.object({}),
+  output: z.object({ valid: z.boolean(), errors: z.array(verifyError) }),
+  errors: ["VALIDATION_FAILED"],
+  aliases: ["verify_integrity"],
+};
+
+// ─── context_init ────────────────────────────────────────────────────────────
+
+const initOp: OperationDescriptor = {
+  name: "context_init",
+  namespace: "core",
+  description: "Load the vault's CONTEXT.md operating instructions (null if none).",
+  input: z.object({}),
+  output: z.object({ context_md: z.string().nullable() }),
+  errors: ["VALIDATION_FAILED"],
+};
+
+// ─── context_packs ───────────────────────────────────────────────────────────
+
+const packSummary = z.object({
+  id: z.string(),
+  label: z.string(),
+  description: z.string().optional(),
+  query: z.string().optional(),
+  agent_instructions: z.string().optional(),
+});
+
+const packsOp: OperationDescriptor = {
+  name: "context_packs",
+  namespace: "core",
+  description: "List the context packs defined in the vault.",
+  input: z.object({}),
+  output: z.object({ packs: z.array(packSummary) }),
+  errors: ["VALIDATION_FAILED"],
+};
+
 /** All `core` namespace operations, in catalog order. */
 export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   getOp,
@@ -251,4 +424,12 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   searchOp,
   createOp,
   updateOp,
+  publishOp,
+  deleteOp,
+  versionsOp,
+  reconstructOp,
+  overviewOp,
+  verifyOp,
+  initOp,
+  packsOp,
 ];

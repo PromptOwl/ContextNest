@@ -266,6 +266,97 @@ const update: OperationExecutor = async (ctx, input: any) => {
   return { id, version: result.version };
 };
 
+const publish: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  // publishDocument guards rejected docs and seals a checkpoint; regenerate the
+  // index so graph-mode reads see the freshly-published node (same as create/update).
+  const result = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
+  await ctx.storage.regenerateIndex();
+  return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
+};
+
+const del: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  // deleteDocument throws DOCUMENT_NOT_FOUND when the id doesn't exist.
+  await ctx.storage.deleteDocument(id);
+  await ctx.storage.regenerateIndex();
+  return { id, deleted: true as const };
+};
+
+const versions: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const history = await ctx.storage.readHistory(id);
+  if (!history) {
+    // No history yet (never published). Confirm the doc exists so a bogus
+    // id/title still surfaces DOCUMENT_NOT_FOUND rather than an empty list.
+    await ctx.storage.readDocument(id);
+    return { id, keyframe_interval: 0, versions: [] };
+  }
+  return {
+    id,
+    keyframe_interval: history.keyframe_interval,
+    versions: history.versions.map((v) => ({
+      version: v.version,
+      keyframe: v.keyframe ?? false,
+      edited_by: v.edited_by,
+      edited_at: v.edited_at,
+      published_at: v.published_at,
+      note: v.note,
+      content_hash: v.content_hash,
+      chain_hash: v.chain_hash,
+    })),
+  };
+};
+
+const overview: OperationExecutor = async (ctx) => {
+  const docs = await ctx.storage.discoverDocuments();
+  const byType: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const tags = new Set<string>();
+  for (const d of docs) {
+    const t = d.frontmatter.type ?? "document";
+    byType[t] = (byType[t] ?? 0) + 1;
+    const s = d.frontmatter.status ?? "draft";
+    byStatus[s] = (byStatus[s] ?? 0) + 1;
+    for (const tag of d.frontmatter.tags ?? []) tags.add(tag);
+  }
+  return {
+    total: docs.length,
+    by_type: byType,
+    by_status: byStatus,
+    tags: [...tags].sort(),
+    nodes: docs.map((d) => toSummary(d)),
+  };
+};
+
+const reconstruct: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const content = await ctx.versions.reconstructVersion(id, input.version);
+  return { id, version: input.version, content };
+};
+
+const verify: OperationExecutor = async (ctx) => {
+  const report = await ctx.storage.verifyVaultIntegrity();
+  return { valid: report.valid, errors: report.errors };
+};
+
+const init: OperationExecutor = async (ctx) => {
+  return { context_md: await ctx.storage.readContextMd() };
+};
+
+const packs: OperationExecutor = async (ctx) => {
+  const all = await ctx.storage.readPacks();
+  return {
+    packs: all.map((p) => ({
+      id: p.id,
+      label: p.label,
+      description: p.description,
+      query: p.query,
+      agent_instructions: p.agent_instructions,
+    })),
+  };
+};
+
 /** name → executor for the built-in `core` namespace. */
 export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({
   context_query: query,
@@ -275,4 +366,12 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_list: list,
   context_create: create,
   context_update: update,
+  context_publish: publish,
+  context_delete: del,
+  context_versions: versions,
+  context_reconstruct: reconstruct,
+  context_overview: overview,
+  context_verify: verify,
+  context_init: init,
+  context_packs: packs,
 });

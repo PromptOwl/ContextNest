@@ -24,13 +24,18 @@ divergence stops at the root.
 | **Extension framework** | `EngineExtension` lets consumers register new ops (governance/workflow/sync) and wrap every op with `authorize` + `onResult`, without forking the engine. |
 | **Namespace discovery** | `NAMESPACES` advertises the implemented set for MCP `initialize` / REST manifest. |
 
-### `core` operations
+### `core` operations (15)
 
-`context_get` · `context_query` · `context_resolve` · `context_list` ·
-`context_search` · `context_create` · `context_update`
+Read: `context_get` · `context_query` · `context_resolve` · `context_list` ·
+`context_search` · `context_overview` · `context_packs` · `context_init`
+Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
+`context_delete`
+History/audit: `context_versions` · `context_reconstruct` · `context_verify`
 
-`governance`, `workflow`, and `sync` namespaces are **declared but not yet
-populated** (`implemented: false`) — those come in later phases.
+These cover the operations all three surfaces (OSS MCP, CLI, Community MCP)
+expose, so Phase 2 bindings import them instead of hand-rolling. `governance`,
+`workflow`, and `sync` namespaces are **declared but not yet populated**
+(`implemented: false`) — those come in later phases.
 
 ## Public API
 
