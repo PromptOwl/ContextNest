@@ -453,11 +453,30 @@ export class NestStorage {
 
   /**
    * Write a document to disk.
+   *
+   * With `{ exclusive: true }` the write is fail-if-exists (O_EXCL) so a
+   * create-and-write is atomic: two concurrent creates for the same id can't
+   * both pass a separate exists-check and clobber each other (TOCTOU). The
+   * loser gets DOCUMENT_ALREADY_EXISTS. Default (overwrite) is unchanged.
    */
-  async writeDocument(id: string, content: string): Promise<void> {
+  async writeDocument(
+    id: string,
+    content: string,
+    options: { exclusive?: boolean } = {},
+  ): Promise<void> {
     const filePath = join(this.root, `${id}.md`);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, content, "utf-8");
+    try {
+      await writeFile(filePath, content, {
+        encoding: "utf-8",
+        ...(options.exclusive ? { flag: "wx" } : {}),
+      });
+    } catch (err) {
+      if (options.exclusive && (err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new ContextNestError(`Document "${id}" already exists`, "DOCUMENT_ALREADY_EXISTS");
+      }
+      throw err;
+    }
   }
 
   /**
