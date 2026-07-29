@@ -20,7 +20,7 @@ import {
   isRejected,
 } from "../parser.js";
 import { normalizeDocumentId } from "../storage.js";
-import { publishDocument } from "../publish.js";
+import { publishDocument, publishDocuments } from "../publish.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
@@ -200,10 +200,21 @@ const list: OperationExecutor = async (ctx, input: any) => {
   return { documents: docs.map((d) => toSummary(d)) };
 };
 
-const create: OperationExecutor = async (ctx, input: any) => {
-  // Slugify each folder segment and always root under nodes/ so the doc is
-  // discoverable (normalizeDocumentId only prepends nodes/ when there is no
-  // slash — a raw "gtm/deals/x" would escape the discoverable tree).
+/**
+ * Build a fresh draft node from create/import input. Slugifies each folder
+ * segment and always roots under nodes/ so the doc is discoverable
+ * (normalizeDocumentId only prepends nodes/ when there is no slash — a raw
+ * "gtm/deals/x" would escape the discoverable tree). Shared by `create` and
+ * the bulk `import` executor so their node shape stays identical.
+ */
+function buildDraftNode(input: {
+  title: string;
+  content: string;
+  type?: string;
+  tags?: unknown[];
+  folder?: string;
+  metadata?: Record<string, unknown>;
+}): ContextNode {
   const folderSegments = String(input.folder ?? "")
     .split("/")
     .map(slugify)
@@ -211,20 +222,24 @@ const create: OperationExecutor = async (ctx, input: any) => {
   const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
   const frontmatter: Frontmatter = {
     title: input.title,
-    type: input.type ?? "document",
+    type: (input.type as Frontmatter["type"]) ?? "document",
     ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
     status: "draft",
     created_at: new Date().toISOString(),
   };
-  const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body: input.content };
+  return { id, filePath: "", rawContent: "", frontmatter, body: input.content };
+}
+
+const create: OperationExecutor = async (ctx, input: any) => {
+  const node = buildDraftNode(input);
   assertValid(node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
   // the way the pre-check + separate write could race.
-  await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: true });
-  const result = await publishAndIndex(ctx, id);
-  return { id, version: result.version };
+  await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
+  const result = await publishAndIndex(ctx, node.id);
+  return { id: node.id, version: result.version };
 };
 
 const update: OperationExecutor = async (ctx, input: any) => {
@@ -356,6 +371,40 @@ const packs: OperationExecutor = async (ctx) => {
   };
 };
 
+const importDocs: OperationExecutor = async (ctx, input: any) => {
+  const created: { id: string; version: number }[] = [];
+  const failed: { title: string; error: string }[] = [];
+  const titleById = new Map<string, string>();
+
+  // Stage 1: write every doc as a draft (exclusive → dup/invalid go to failed).
+  const writtenIds: string[] = [];
+  for (const doc of input.documents) {
+    try {
+      const node = buildDraftNode(doc);
+      assertValid(node);
+      await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
+      writtenIds.push(node.id);
+      titleById.set(node.id, doc.title);
+    } catch (err) {
+      failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // Stage 2: bulk-publish the drafts — ONE checkpoint + ONE index regen for the
+  // whole batch (the O(N) path), instead of a checkpoint per document.
+  if (writtenIds.length > 0) {
+    const result = await publishDocuments(ctx.storage, writtenIds, {
+      editedBy: ctx.actor ?? "engine",
+    });
+    for (const p of result.published) created.push({ id: p.id, version: p.version });
+    for (const f of result.failed) {
+      failed.push({ title: titleById.get(f.id) ?? f.id, error: f.error });
+    }
+  }
+
+  return { created, failed };
+};
+
 /** name → executor for the built-in `core` namespace. */
 export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({
   context_query: query,
@@ -373,4 +422,5 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_verify: verify,
   context_init: init,
   context_packs: packs,
+  context_import: importDocs,
 });

@@ -293,8 +293,13 @@ export type {
 } from "./hygienist.js";
 
 // Publish
-export { publishDocument } from "./publish.js";
-export type { PublishOptions, PublishResult } from "./publish.js";
+export { publishDocument, publishDocuments } from "./publish.js";
+export type {
+  PublishOptions,
+  PublishResult,
+  BulkPublishOptions,
+  BulkPublishResult,
+} from "./publish.js";
 
 // Source graph
 export {

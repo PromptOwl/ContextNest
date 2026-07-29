@@ -24,12 +24,12 @@ divergence stops at the root.
 | **Extension framework** | `EngineExtension` lets consumers register new ops (governance/workflow/sync) and wrap every op with `authorize` + `onResult`, without forking the engine. |
 | **Namespace discovery** | `NAMESPACES` advertises the implemented set for MCP `initialize` / REST manifest. |
 
-### `core` operations (15)
+### `core` operations (16)
 
 Read: `context_get` · `context_query` · `context_resolve` · `context_list` ·
 `context_search` · `context_overview` · `context_packs` · `context_init`
 Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
-`context_delete`
+`context_delete` · `context_import` (bulk create+publish, one checkpoint)
 History/audit: `context_versions` · `context_reconstruct` · `context_verify`
 
 These cover the operations all three surfaces (OSS MCP, CLI, Community MCP)
