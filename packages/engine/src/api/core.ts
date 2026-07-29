@@ -204,7 +204,7 @@ const createOp: OperationDescriptor = {
     id: z.string(),
     version: z.number().int().min(1),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
   aliases: ["create_document"],
 };
 

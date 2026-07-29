@@ -53,6 +53,8 @@ import {
   `packages/mcp-server` and the CLI (two sources of truth in the interim).
 - **No governance enforcement.** The engine ships signatures only; eligibility
   gates, scope resolution, and approvals stay in Community.
+- **`context_update` only adds tags** (merges + de-dupes); there is no tag
+  removal yet — a follow-up if surfaces need it.
 
 ## Next phases (not in this PR)
 

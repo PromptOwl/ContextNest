@@ -98,6 +98,17 @@ async function resolveId(
   return normalizeDocumentId(requireSlug(String(sel.title)));
 }
 
+/** True if a document already exists at `id` (readDocument throws when absent). */
+async function documentExists(ctx: OperationContext, id: string): Promise<boolean> {
+  try {
+    await ctx.storage.readDocument(id);
+    return true;
+  } catch (err) {
+    if (err instanceof ContextNestError && err.code === "DOCUMENT_NOT_FOUND") return false;
+    throw err;
+  }
+}
+
 /** Validate a node against the spec (§13) before it is written/published. */
 function assertValid(node: ContextNode): void {
   const result = validateDocument(node);
@@ -164,7 +175,14 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // and filters to published) instead of a hand-rolled substring scorer — never
   // leaks unpublished content. `full: true` routes through the Resolver; graph
   // mode would only match context.yaml metadata (no body).
-  const q = String(input.query).trim().replace(/\s+/g, "+");
+  // Slugify the query before embedding it in the URI. This string is re-lexed
+  // by the selector grammar, whose URI token terminates on whitespace/+/|/()
+  // (lexer.ts), and parseUri rejects '//'. Raw user text (spaces, a '/' from a
+  // pasted URL, '+') would truncate the token or throw INVALID_URI. Hyphens are
+  // lexer-safe URI path chars and MiniSearch tokenizes on them, so slugifying
+  // keeps recall while guaranteeing a single well-formed URI token.
+  const q = slugify(String(input.query));
+  if (!q) return { results: [] };
   const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
   const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
   return { results: docs.map((d) => toSummary(d)) };
@@ -202,6 +220,12 @@ const create: OperationExecutor = async (ctx, input: any) => {
     .map(slugify)
     .filter(Boolean);
   const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  // Refuse to clobber an existing doc (mirrors OSS create_document). Without
+  // this, a colliding title overwrites the prior node AND resurrects a rejected
+  // one into retrieval — the exact invariant `update` guards via isRejected.
+  if (await documentExists(ctx, id)) {
+    throw new ContextNestError(`Document "${id}" already exists`, "DOCUMENT_ALREADY_EXISTS");
+  }
   const frontmatter: Frontmatter = {
     title: input.title,
     type: input.type ?? "document",

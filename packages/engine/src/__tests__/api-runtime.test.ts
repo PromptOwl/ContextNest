@@ -123,6 +123,49 @@ describe("createEngineApi — executable core operations", () => {
     expect(out.results.some((r) => r.id === "nodes/searchable-widget")).toBe(true);
   });
 
+  it("context_create refuses to overwrite an existing doc", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Dup Node", content: "first" }, ctx);
+    await expect(
+      api.run("context_create", { title: "Dup Node", content: "second" }, ctx),
+    ).rejects.toMatchObject({ code: "DOCUMENT_ALREADY_EXISTS" });
+    // Original body must survive the rejected second create.
+    const got = await api.run<{ body: string }>("context_get", { id: "nodes/dup-node" }, ctx);
+    expect(got.body.trim()).toBe("first");
+  });
+
+  it("context_create cannot resurrect a rejected doc", async () => {
+    const rejected: ContextNode = {
+      id: "nodes/retired",
+      filePath: "",
+      rawContent: "",
+      frontmatter: { title: "Retired", status: "rejected" },
+      body: "retired body",
+    };
+    await ctx.storage.writeDocument("nodes/retired", serializeDocument(rejected));
+
+    const api = createEngineApi();
+    // Same title → same id; must be refused rather than overwritten to draft+published.
+    await expect(
+      api.run("context_create", { title: "Retired", content: "fresh" }, ctx),
+    ).rejects.toMatchObject({ code: "DOCUMENT_ALREADY_EXISTS" });
+    const afterFile = await ctx.storage.readDocument("nodes/retired");
+    expect(afterFile.frontmatter.status).toBe("rejected");
+    expect(afterFile.body.trim()).toBe("retired body");
+  });
+
+  it("context_search survives a query containing slashes", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Url Doc", content: "visit example gizmo" }, ctx);
+    // A '/' in the query used to throw INVALID_URI via parseUri's '//' guard.
+    const out = await api.run<{ results: Array<{ id: string }> }>(
+      "context_search",
+      { query: "http://example gizmo" },
+      ctx,
+    );
+    expect(out.results.some((r) => r.id === "nodes/url-doc")).toBe(true);
+  });
+
   it("normalizes tags to #-prefixed form on create (S7)", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Tagged", content: "b", tags: ["api", "ml"] }, ctx);
