@@ -907,6 +907,19 @@ program
   .action(async (path, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
+
+    // Refuse to clobber an existing document. This used to fail only by
+    // accident: the template below resets the version to 1, which collided with
+    // a number already recorded in the chain and blew up during publish — but
+    // only AFTER the original bytes had been overwritten. Checking up front
+    // makes the refusal deliberate and leaves the existing document intact.
+    if (fs.existsSync(pathMod.join(storage.root, `${id}.md`))) {
+      throw new ContextNestError(
+        `Document already exists: ${id}. Use \`ctx update ${id}\` to edit it.`,
+        "DOCUMENT_EXISTS",
+      );
+    }
+
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const tagList = opts.tags
@@ -1168,23 +1181,31 @@ program
 
     // Verify each document chain
     for (const [docId, history] of allHistories) {
-      const report = verifyDocumentChain(docId, history, (version) => {
-        // Synchronous read — for CLI simplicity
-        const docName = pathMod.basename(docId);
-        const docDir = pathMod.dirname(docId);
-        const keyframePath = pathMod.join(
-          storage.root,
-          docDir,
-          ".versions",
-          docName,
-          `v${version}.md`,
-        );
+      // Synchronous reads — for CLI simplicity. Both are needed: a keyframe
+      // entry hashes its snapshot, a non-keyframe entry hashes its change log,
+      // and the change log lives in its own v{N}.diff file.
+      const readVersionFile = (version: number, ext: "md" | "diff") => {
         try {
-          return fs.readFileSync(keyframePath, "utf-8");
+          return fs.readFileSync(
+            pathMod.join(
+              storage.root,
+              pathMod.dirname(docId),
+              ".versions",
+              pathMod.basename(docId),
+              `v${version}.${ext}`,
+            ),
+            "utf-8",
+          );
         } catch {
           return null;
         }
-      });
+      };
+      const report = verifyDocumentChain(
+        docId,
+        history,
+        (version) => readVersionFile(version, "md"),
+        (version) => readVersionFile(version, "diff"),
+      );
 
       if (!report.valid) {
         totalErrors += report.errors.length;

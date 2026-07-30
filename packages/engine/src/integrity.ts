@@ -233,8 +233,9 @@ export function verifyDocumentChain(
   history: DocumentHistory,
   readKeyframe: (version: number) => string | null,
   /** Change log for a non-keyframe version, when it lives in a v{N}.diff file
-   *  rather than inline on the entry. Omitted by callers that only have the
-   *  history — those fall back to the inline patch, as before. */
+   *  rather than inline on the entry. A caller that cannot read version files
+   *  omits this; its non-keyframe content checks are then skipped rather than
+   *  failed, the same way a missing keyframe file is skipped. */
   readDiff?: (version: number) => string | null,
 ): VerificationReport {
   const errors: VerificationReport["errors"] = [];
@@ -249,11 +250,19 @@ export function verifyDocumentChain(
       actualContent = readKeyframe(entry.version);
     } else {
       // Externalized change log wins; inline patch is the legacy fallback.
-      // Neither available means the version can no longer be reconstructed, so
-      // hash "" and let it surface as a content_hash_mismatch — unlike a
-      // missing keyframe (recoverable by replaying from an earlier one), a
-      // missing diff silently breaks every version after it.
-      actualContent = readDiff?.(entry.version) ?? entry.diff ?? "";
+      //
+      // With a reader supplied, "neither available" means the change log is
+      // gone and the version can no longer be reconstructed — hash "" so it
+      // surfaces as a content_hash_mismatch, because unlike a missing keyframe
+      // (recoverable by replaying from an earlier one) a missing diff breaks
+      // every version after it.
+      //
+      // Without a reader, we simply cannot see the change log, which is not
+      // evidence of tampering — skip the content check as we do for a keyframe
+      // whose file we could not read, and let the chain_hash check below stand.
+      actualContent = readDiff
+        ? (readDiff(entry.version) ?? entry.diff ?? "")
+        : (entry.diff ?? null);
     }
 
     if (actualContent !== null) {
