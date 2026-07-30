@@ -389,6 +389,7 @@ const verifyError = z.object({
     "cross_chain_mismatch",
     "checkpoint_hash_mismatch",
     "body_drift",
+    "unreadable_history",
   ]),
   document: z.string().optional(),
   version: z.number().int().optional(),

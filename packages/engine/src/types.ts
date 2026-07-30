@@ -511,7 +511,8 @@ export interface VerificationReport {
       | "chain_hash_mismatch"
       | "cross_chain_mismatch"
       | "checkpoint_hash_mismatch"
-      | "body_drift";
+      | "body_drift"
+      | "unreadable_history";
     document?: string;
     version?: number;
     checkpoint?: number;

@@ -3,7 +3,7 @@
  * Supports both structured and Obsidian-compatible layouts (§1.1).
  */
 
-import { readFile, writeFile, mkdir, stat, unlink, rm, rename } from "node:fs/promises";
+import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import fg from "fast-glob";
 import yaml from "js-yaml";
@@ -96,6 +96,32 @@ export interface ReadDocumentOptions {
 
 export type LayoutMode = "structured" | "obsidian";
 
+/**
+ * `rename` onto an existing target is atomic on POSIX but contended on Windows:
+ * if any other handle has the destination open — a concurrent replace of the
+ * same file, an antivirus scanner, the search indexer — MoveFileEx fails with
+ * EPERM/EACCES/EBUSY rather than waiting. The contention is transient, so retry
+ * briefly before giving up.
+ *
+ * ponytail: fixed backoff schedule, ~1.3s total. If a real workload starts
+ * losing writes here, the fix is a per-path write queue, not a longer sleep.
+ */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  const RETRYABLE = new Set(["EPERM", "EACCES", "EBUSY"]);
+  const MAX_ATTEMPTS = 10;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      if (attempt >= MAX_ATTEMPTS - 1 || !RETRYABLE.has(code)) throw err;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2 ** attempt, 250)));
+    }
+  }
+}
+
 export class NestStorage {
   constructor(public readonly root: string) {}
 
@@ -104,6 +130,9 @@ export class NestStorage {
    * read-modify-write. See `withCheckpointLock`.
    */
   private checkpointWriteChain: Promise<unknown> = Promise.resolve();
+
+  /** Disambiguates concurrent `writeFileDurable` temp files. See that method. */
+  private tmpWriteCounter = 0;
 
   /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
@@ -378,11 +407,21 @@ export class NestStorage {
    *   - content_hash_mismatch / chain_hash_mismatch in version history
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
+   *   - unreadable_history when a history.yaml exists but cannot be parsed
    */
   async verifyVaultIntegrity(): Promise<VerificationReport> {
-    const allHistories = await this.findAllHistories();
-    const checkpointHistory = await this.readCheckpointHistory();
     const errors: VerificationReport["errors"] = [];
+    // A history we cannot parse is an unverifiable document, not a clean one —
+    // report it instead of letting the crawl skip it into a silent pass.
+    const allHistories = await this.findAllHistories((docId, reason) => {
+      errors.push({
+        type: "unreadable_history",
+        document: docId,
+        expected: null,
+        actual: reason,
+      });
+    });
+    const checkpointHistory = await this.readCheckpointHistory();
 
     for (const [docId, history] of allHistories) {
       // Pre-load keyframe bytes so the (synchronous) verifyDocumentChain
@@ -616,6 +655,44 @@ export class NestStorage {
   }
 
   /**
+   * Durable write for the hash-chain files: write a sibling temp file, flush it
+   * to disk, then rename over the target.
+   *
+   * A plain `writeFile` truncates and extends in place. If the process dies (or
+   * the machine loses power) after the metadata grows but before the data is
+   * flushed, the file comes back zero-filled — the "null byte is not allowed in
+   * input" YAMLException seen from `findAllHistories`. Reserved for
+   * history.yaml / context_history.yaml: they are the integrity anchors, and a
+   * torn one is unrecoverable, unlike a regenerable index.
+   *
+   * The temp name is unique per call. A shared `{path}.tmp` would make
+   * concurrent writers to the same target collide: both open and truncate the
+   * same temp file, the first rename consumes it, and the second fails ENOENT.
+   * That is not hypothetical — `rebuildCheckpointHistory` deliberately writes
+   * context_history.yaml outside `withCheckpointLock` (holding it would deadlock
+   * against the publishes it retries around), so it can overlap a publish's
+   * write. Unique temps keep the old last-write-wins semantics instead of
+   * turning that overlap into a throw.
+   */
+  private async writeFileDurable(path: string, content: string): Promise<void> {
+    const tmp = `${path}.${process.pid}.${++this.tmpWriteCounter}.tmp`;
+    const handle = await open(tmp, "w");
+    try {
+      await handle.writeFile(content, "utf-8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await renameWithRetry(tmp, path);
+    } catch (err) {
+      // Never leave the temp behind if the rename itself failed.
+      await unlink(tmp).catch(() => {});
+      throw err;
+    }
+  }
+
+  /**
    * Write document history to .versions/{docName}/history.yaml.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
@@ -624,7 +701,7 @@ export class NestStorage {
     const historyDir = join(this.root, docDir, ".versions", docName);
     await mkdir(historyDir, { recursive: true });
     const content = yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(historyDir, "history.yaml"), content, "utf-8");
+    await this.writeFileDurable(join(historyDir, "history.yaml"), content);
   }
 
   /**
@@ -840,7 +917,7 @@ export class NestStorage {
     const content =
       "# Auto-generated. Do not edit manually.\n" +
       yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(dir, "context_history.yaml"), content, "utf-8");
+    await this.writeFileDurable(join(dir, "context_history.yaml"), content);
   }
 
   /**
@@ -940,8 +1017,19 @@ export class NestStorage {
   /**
    * Find all document history files across the nest.
    * Used for checkpoint rebuild (§7.3).
+   *
+   * A history file that cannot be parsed (truncated / null-byte-padded by an
+   * interrupted write, hand-edited into invalid YAML, failing the schema) is
+   * SKIPPED rather than thrown from: one corrupt file used to abort the whole
+   * crawl, taking `ctx verify`, `ctx publish`'s checkpoint seal and the §7.3
+   * rebuild down with it. Skipping alone would be a silent green though —
+   * `verifyCheckpointChain` treats a missing history as "nothing to check" — so
+   * callers that verify pass `onUnreadable` and report the file as an
+   * `unreadable_history` integrity error.
    */
-  async findAllHistories(): Promise<Map<string, DocumentHistory>> {
+  async findAllHistories(
+    onUnreadable?: (docId: string, reason: string) => void,
+  ): Promise<Map<string, DocumentHistory>> {
     const historyFiles = await fg("**/.versions/*/history.yaml", {
       cwd: this.root,
       dot: true,
@@ -960,11 +1048,19 @@ export class NestStorage {
       const docName = parts[versionsIdx + 1];
       const docId = docDir ? `${docDir}/${docName}` : docName;
 
-      const content = await readFile(join(this.root, file), "utf-8");
-      const raw = yaml.load(content);
+      let raw: unknown;
+      try {
+        raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+      } catch (err) {
+        onUnreadable?.(docId, err instanceof Error ? err.message : String(err));
+        continue;
+      }
+
       const result = documentHistorySchema.safeParse(raw);
       if (result.success) {
         histories.set(docId, result.data as DocumentHistory);
+      } else {
+        onUnreadable?.(docId, `history.yaml failed schema validation`);
       }
     }
 
