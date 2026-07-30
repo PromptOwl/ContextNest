@@ -27,7 +27,12 @@ import type {
   PendingChange,
   VerificationReport,
 } from "./types.js";
-import { ContextNestError, DocumentNotFoundError } from "./errors.js";
+import {
+  ContextNestError,
+  CorruptHistoryError,
+  DocumentNotFoundError,
+  VersionArtifactExistsError,
+} from "./errors.js";
 import {
   packSchema,
   documentHistorySchema,
@@ -633,6 +638,15 @@ export class NestStorage {
 
   /**
    * Read document history from .versions/{docName}/history.yaml (§6.2).
+   *
+   * `null` means "this document has no history yet" and nothing else. A file
+   * that is present but unreadable raises {@link CorruptHistoryError}.
+   *
+   * The distinction is load-bearing. Every write path reads this, and each one
+   * treats `null` as a brand-new document; because history.yaml is rewritten
+   * whole rather than appended to, a corrupt file that read as `null` was
+   * silently replaced by a two-entry history on the next publish — orphaning the
+   * recorded versions' keyframe/diff files and taking `reconstruct` with them.
    */
   async readHistory(docId: string): Promise<DocumentHistory | null> {
     const docName = basename(docId);
@@ -644,14 +658,38 @@ export class NestStorage {
       docName,
       "history.yaml",
     );
+
+    let content: string;
     try {
-      const content = await readFile(historyPath, "utf-8");
-      const raw = yaml.load(content);
-      const result = documentHistorySchema.safeParse(raw);
-      return result.success ? (result.data as DocumentHistory) : null;
-    } catch {
-      return null;
+      content = await readFile(historyPath, "utf-8");
+    } catch (err) {
+      // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
+      // an I/O error) must not read as a fresh document either.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new CorruptHistoryError(
+        docId,
+        err instanceof Error ? err.message : String(err),
+      );
     }
+
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      throw new CorruptHistoryError(
+        docId,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
+    const result = documentHistorySchema.safeParse(raw);
+    if (!result.success) {
+      throw new CorruptHistoryError(
+        docId,
+        `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
+      );
+    }
+    return result.data as DocumentHistory;
   }
 
   /**
@@ -725,18 +763,66 @@ export class NestStorage {
   }
 
   /**
-   * Write a keyframe version file.
+   * Write a version artifact (`v{N}.md` / `v{N}.diff`).
+   *
+   * Sealed versions are immutable: the artifact's bytes are hashed into
+   * `content_hash` and chained, so overwriting one destroys the only copy of
+   * that version's content AND silently breaks the chain. The default refuses,
+   * via an exclusive create rather than an exists-check, so two writers cannot
+   * race past the guard. Repair paths that must genuinely re-anchor an artifact
+   * opt in with `overwrite`.
+   */
+  private async writeVersionArtifact(
+    docId: string,
+    version: number,
+    fileName: string,
+    content: string,
+    overwrite: boolean,
+  ): Promise<void> {
+    const docName = basename(docId);
+    const docDir = dirname(docId);
+    const dir = join(this.root, docDir, ".versions", docName);
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, fileName);
+
+    if (overwrite) {
+      await writeFile(path, content, "utf-8");
+      return;
+    }
+
+    let handle;
+    try {
+      handle = await open(path, "wx");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new VersionArtifactExistsError(docId, version, fileName);
+      }
+      throw err;
+    }
+    try {
+      await handle.writeFile(content, "utf-8");
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Write a keyframe version file. Refuses to overwrite a sealed one unless
+   * `options.overwrite` is set — see {@link writeVersionArtifact}.
    */
   async writeKeyframe(
     docId: string,
     version: number,
     content: string,
+    options: { overwrite?: boolean } = {},
   ): Promise<void> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const keyframeDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(keyframeDir, { recursive: true });
-    await writeFile(join(keyframeDir, `v${version}.md`), content, "utf-8");
+    await this.writeVersionArtifact(
+      docId,
+      version,
+      `v${version}.md`,
+      content,
+      options.overwrite ?? false,
+    );
   }
 
   /**
@@ -771,17 +857,23 @@ export class NestStorage {
    * Content is the unified diff exactly as produced by `createPatch` — hunk
    * headers included — so the file is readable on its own and applies with
    * standard patch tooling.
+   *
+   * Refuses to overwrite a sealed change log unless `options.overwrite` is set
+   * — see {@link writeVersionArtifact}.
    */
   async writeDiff(
     docId: string,
     version: number,
     diff: string,
+    options: { overwrite?: boolean } = {},
   ): Promise<void> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const diffDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(diffDir, { recursive: true });
-    await writeFile(join(diffDir, `v${version}.diff`), diff, "utf-8");
+    await this.writeVersionArtifact(
+      docId,
+      version,
+      `v${version}.diff`,
+      diff,
+      options.overwrite ?? false,
+    );
   }
 
   /**

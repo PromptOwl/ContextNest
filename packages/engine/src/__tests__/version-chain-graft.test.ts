@@ -145,10 +145,13 @@ describe("version chain integrity", () => {
     // Corrupt the chain the way a grafted history did: make v2's change log
     // unusable against the version it claims to follow.
     const patch = (await versions.getDiff(DOC_ID, 2))!;
+    // `overwrite` because this IS the tamper being simulated — sealed artifacts
+    // are immutable to normal callers, so the guard has to be opted out of here.
     await storage.writeDiff(
       DOC_ID,
       2,
       patch.replace("body line 1", "text that is not in v1"),
+      { overwrite: true },
     );
     await expect(versions.reconstructVersion(DOC_ID, 3)).rejects.toThrow();
 

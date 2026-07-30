@@ -6,6 +6,9 @@ import fg from "fast-glob";
 import { NestStorage } from "../storage.js";
 import { publishDocument } from "../publish.js";
 import { CheckpointManager } from "../checkpoint.js";
+import { VersionManager } from "../versioning.js";
+import { serializeDocument } from "../parser.js";
+import { CorruptHistoryError, VersionArtifactExistsError } from "../errors.js";
 
 /**
  * Regression tests for the corrupt-history crash surfaced while dogfooding:
@@ -110,6 +113,105 @@ describe("corrupt history.yaml — crawl survives and reports", () => {
     const rebuilt = await new CheckpointManager(storage).rebuildCheckpointHistory();
 
     expect(rebuilt.checkpoints.length).toBeGreaterThan(0);
+  });
+});
+
+describe("corrupt history.yaml — no version is lost or orphaned", () => {
+  let root: string;
+  let storage: NestStorage;
+  const ID = "nodes/victim";
+
+  /** Publish `count` successive revisions so there is real history to destroy. */
+  async function buildHistory(count: number): Promise<void> {
+    await storage.writeDocument(ID, draft(ID));
+    for (let i = 0; i < count; i++) {
+      const node = await storage.readDocument(ID);
+      node.body = `\n# victim\n\nrevision ${i}\n`;
+      await storage.writeDocument(ID, serializeDocument(node));
+      await publishDocument(storage, ID, { editedBy: "tester" });
+    }
+  }
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "cn-hist-loss-"));
+    storage = new NestStorage(root);
+    await storage.init("History Loss Vault");
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("refuses to publish rather than replacing a corrupt history with a fresh one", async () => {
+    await buildHistory(4);
+    const before = (await storage.readHistory(ID))!;
+    const historyPath = join(root, "nodes", ".versions", "victim", "history.yaml");
+    await writeFile(historyPath, "versions:\n  - version: 1\0\0\0\n", "utf-8");
+
+    await expect(
+      publishDocument(storage, ID, { editedBy: "tester" }),
+    ).rejects.toThrow(CorruptHistoryError);
+
+    // The corrupt file must still be there — overwriting it is the data loss.
+    const raw = await readFile(historyPath, "utf-8");
+    expect(raw).toContain("\0");
+
+    // And once it is restored, every recorded version is reachable again.
+    await storage.writeHistory(ID, before);
+    const vm = new VersionManager(storage);
+    for (const entry of before.versions) {
+      await expect(vm.reconstructVersion(ID, entry.version)).resolves.toContain("---");
+    }
+  });
+
+  it("distinguishes a corrupt history from a document that has none", async () => {
+    await storage.writeDocument("nodes/fresh", draft("fresh"));
+    expect(await storage.readHistory("nodes/fresh")).toBeNull();
+
+    await buildHistory(1);
+    await writeFile(
+      join(root, "nodes", ".versions", "victim", "history.yaml"),
+      "versions: not-a-list\n",
+      "utf-8",
+    );
+    await expect(storage.readHistory(ID)).rejects.toThrow(CorruptHistoryError);
+  });
+
+  it("keeps every keyframe and diff reachable after a refused publish", async () => {
+    await buildHistory(4);
+    const artifactsBefore = await fg("nodes/.versions/victim/v*", { cwd: root });
+    const hashesBefore = await Promise.all(
+      artifactsBefore.sort().map((f) => readFile(join(root, f), "utf-8")),
+    );
+
+    await writeFile(
+      join(root, "nodes", ".versions", "victim", "history.yaml"),
+      "versions:\n  - version: 1\0\0\0\n",
+      "utf-8",
+    );
+    await publishDocument(storage, ID, { editedBy: "tester" }).catch(() => {});
+
+    const artifactsAfter = await fg("nodes/.versions/victim/v*", { cwd: root });
+    const hashesAfter = await Promise.all(
+      artifactsAfter.sort().map((f) => readFile(join(root, f), "utf-8")),
+    );
+    expect(artifactsAfter.sort()).toEqual(artifactsBefore.sort());
+    expect(hashesAfter).toEqual(hashesBefore);
+  });
+
+  it("refuses to overwrite a sealed version artifact", async () => {
+    await buildHistory(2);
+    const keyframePath = join(root, "nodes", ".versions", "victim", "v1.md");
+    const sealed = await readFile(keyframePath, "utf-8");
+
+    await expect(
+      storage.writeKeyframe(ID, 1, "REPLACEMENT CONTENT"),
+    ).rejects.toThrow(VersionArtifactExistsError);
+    expect(await readFile(keyframePath, "utf-8")).toBe(sealed);
+
+    // The repair paths opt in explicitly and are still allowed through.
+    await storage.writeKeyframe(ID, 1, "REPLACEMENT CONTENT", { overwrite: true });
+    expect(await readFile(keyframePath, "utf-8")).toBe("REPLACEMENT CONTENT");
   });
 });
 
