@@ -54,6 +54,7 @@ export {
   ValidationFailedError,
   DocumentNotFoundError,
   InvalidUriError,
+  InvalidSelectorError,
   CircularDependencyError,
   IntegrityError,
   FederationNotSupportedError,

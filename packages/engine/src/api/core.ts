@@ -104,7 +104,7 @@ const queryOp: OperationDescriptor = {
     source_nodes: z.array(nodeSummary).optional(),
     traversal: traversal.optional(),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_URI"],
+  errors: ["VALIDATION_FAILED", "INVALID_SELECTOR", "INVALID_URI"],
   // "resolve" is the legacy OSS mcp-server tool name for THIS graph query — not
   // to be confused with the separate `context_resolve` op below (token-budgeted
   // full-content resolution).
@@ -138,7 +138,7 @@ const resolveOp: OperationDescriptor = {
     tokens_used: z.number().int().optional(),
     truncated: z.boolean().optional(),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_URI"],
+  errors: ["VALIDATION_FAILED", "INVALID_SELECTOR", "INVALID_URI"],
 };
 
 // ─── context_get ─────────────────────────────────────────────────────────────
@@ -369,7 +369,14 @@ const reconstructOp: OperationDescriptor = {
     version: z.number().int(),
     content: z.string(),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  errors: [
+    "VALIDATION_FAILED",
+    "VERSION_NOT_FOUND",
+    "RECONSTRUCTION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+  ],
   aliases: ["read_version"],
 };
 
