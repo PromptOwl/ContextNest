@@ -109,8 +109,9 @@ export type LayoutMode = "structured" | "obsidian";
  * EPERM/EACCES/EBUSY rather than waiting. The contention is transient, so retry
  * briefly before giving up.
  *
- * ponytail: fixed backoff schedule, ~1.3s total. If a real workload starts
- * losing writes here, the fix is a per-path write queue, not a longer sleep.
+ * ponytail: fixed backoff schedule, ~500ms total across 10 attempts. If a real
+ * workload starts losing writes here, the fix is a per-path write queue, not a
+ * longer sleep.
  */
 async function renameWithRetry(from: string, to: string): Promise<void> {
   const RETRYABLE = new Set(["EPERM", "EACCES", "EBUSY"]);
@@ -650,19 +651,9 @@ export class NestStorage {
    * recorded versions' keyframe/diff files and taking `reconstruct` with them.
    */
   async readHistory(docId: string): Promise<DocumentHistory | null> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const historyPath = join(
-      this.root,
-      docDir,
-      ".versions",
-      docName,
-      "history.yaml",
-    );
-
     let content: string;
     try {
-      content = await readFile(historyPath, "utf-8");
+      content = await readFile(this.historyPath(docId), "utf-8");
     } catch (err) {
       // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
       // an I/O error) must not read as a fresh document either.
@@ -775,9 +766,17 @@ export class NestStorage {
    * came back empty, and a guard on the read is only as good as the next code
    * path that forgets it.
    *
-   * The file's header (`keyframe_interval` + the `versions:` key) is written
-   * once, on first append, and `writeHistory` keeps `versions` last so the list
-   * stays open at EOF. Appends go out under O_APPEND and are fsynced.
+   * The file's header (`keyframe_interval` + the `versions:` key) belongs to
+   * whichever caller CREATES the file, and it is written in the same operation
+   * as that caller's own entry. Deciding on the header from an observed size
+   * would be a check-then-act race: concurrent first-time appends each see an
+   * empty file and each prepend a header, leaving two `versions:` keys and an
+   * unparseable history (measured: ~70% of documents corrupted under load).
+   * Exclusive create is what makes it exact — the OS picks one winner, and it
+   * holds across processes, which an in-process lock would not.
+   *
+   * Every write goes out under O_APPEND and is fsynced. `writeHistory` keeps
+   * `versions` last so the list stays open at EOF for these appends.
    */
   async appendVersionEntry(
     docId: string,
@@ -794,16 +793,32 @@ export class NestStorage {
       .split("\n")
       .map((line) => (line.length > 0 ? `  ${line}` : line))
       .join("\n");
+    const header = `keyframe_interval: ${keyframeInterval}\nversions:\n`;
+
+    // Create-and-write in one shot. Exactly one caller can win `wx`, so exactly
+    // one header is ever written — and it lands together with its entry, so the
+    // file is never left as a header with no versions under it.
+    try {
+      const created = await open(path, "wx");
+      try {
+        await created.write(header + block);
+        await created.sync();
+      } finally {
+        await created.close();
+      }
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
 
     const handle = await open(path, "a");
     try {
-      // Size via the open handle rather than a prior stat: O_APPEND makes the
-      // write itself atomic against other appenders, and this avoids a
-      // check-then-act window where two callers both decide to write a header.
+      // The file exists. A zero-length one is not something this class ever
+      // produces (the create branch above always writes a header), so it means
+      // an external truncation — write the header rather than append an entry
+      // into a headerless file.
       const { size } = await handle.stat();
-      const header =
-        size === 0 ? `keyframe_interval: ${keyframeInterval}\nversions:\n` : "";
-      await handle.write(header + block);
+      await handle.write(size === 0 ? header + block : block);
       await handle.sync();
     } finally {
       await handle.close();
@@ -854,7 +869,7 @@ export class NestStorage {
     const path = join(dir, fileName);
 
     if (overwrite) {
-      await writeFile(path, content, "utf-8");
+      await this.writeFileDurable(path, content);
       return;
     }
 
@@ -869,6 +884,11 @@ export class NestStorage {
     }
     try {
       await handle.writeFile(content, "utf-8");
+      // Flush before the history entry that hashes this content is recorded.
+      // history.yaml is fsynced; without this the artifact it points at could
+      // still be in the page cache, so a power loss could leave a durable entry
+      // referencing truncated or missing content.
+      await handle.sync();
     } finally {
       await handle.close();
     }

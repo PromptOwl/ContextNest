@@ -9,6 +9,7 @@ import { CheckpointManager } from "../checkpoint.js";
 import { VersionManager } from "../versioning.js";
 import { serializeDocument } from "../parser.js";
 import { CorruptHistoryError, VersionArtifactExistsError } from "../errors.js";
+import type { VersionEntry } from "../types.js";
 
 /**
  * Regression tests for the corrupt-history crash surfaced while dogfooding:
@@ -287,6 +288,40 @@ describe("recording a version appends — it never rewrites what is on disk", ()
     await publishRevision("after rewrite");
     const reread = (await storage.readHistory(ID))!;
     expect(reread.versions.map((v) => v.version)).toEqual([1, 2]);
+  });
+
+  it("writes exactly one header when first-time appends race on the same file", async () => {
+    // Deciding the header from an observed file size is a check-then-act race:
+    // concurrent first appends each see an empty file and each prepend a header,
+    // producing two `versions:` keys and an unparseable history. At this width
+    // the pre-fix code corrupted ~70% of the documents, every run.
+    const entry = (version: number): VersionEntry => ({
+      version,
+      keyframe: true,
+      edited_by: "tester",
+      edited_at: "2026-01-01T00:00:00.000Z",
+      content_hash: `sha256:${"a".repeat(64)}`,
+      chain_hash: `sha256:${"b".repeat(64)}`,
+    });
+
+    const ids = Array.from({ length: 60 }, (_, i) => `nodes/hdr-${i}`);
+    await Promise.all(
+      ids.flatMap((id) => [
+        storage.appendVersionEntry(id, entry(1), 10),
+        storage.appendVersionEntry(id, entry(2), 10),
+        storage.appendVersionEntry(id, entry(3), 10),
+      ]),
+    );
+
+    for (const id of ids) {
+      const raw = await readFile(
+        join(root, "nodes", ".versions", id.split("/")[1], "history.yaml"),
+        "utf-8",
+      );
+      expect(raw.match(/^versions:$/gm)).toHaveLength(1);
+      const history = await storage.readHistory(id);
+      expect(history?.versions.map((v) => v.version).sort()).toEqual([1, 2, 3]);
+    }
   });
 
   it("does not lose entries when several versions are recorded concurrently", async () => {
