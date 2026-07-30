@@ -55,9 +55,13 @@ export async function publishDocument(
     });
   }
 
-  // Bump version
-  const currentVersion = node.frontmatter.version || 0;
-  const newVersion = currentVersion + 1;
+  // Bump version — past the recorded history too, not just frontmatter, so a
+  // doc whose frontmatter lags its history.yaml (imported/copied vault) cannot
+  // reuse a version number and graft a second chain onto the first.
+  const newVersion = await versionManager.nextVersion(
+    docId,
+    node.frontmatter.version || 0,
+  );
   node.frontmatter.version = newVersion;
   node.frontmatter.status = "published";
   node.frontmatter.updated_at = new Date().toISOString();
@@ -157,7 +161,10 @@ export async function publishDocuments(
         });
       }
 
-      const newVersion = (node.frontmatter.version || 0) + 1;
+      const newVersion = await versionManager.nextVersion(
+        docId,
+        node.frontmatter.version || 0,
+      );
       node.frontmatter.version = newVersion;
       node.frontmatter.status = "published";
       node.frontmatter.updated_at = new Date().toISOString();

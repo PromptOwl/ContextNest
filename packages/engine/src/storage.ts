@@ -390,16 +390,27 @@ export class NestStorage {
       // skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
       // left intact — goes undetected. Keyframe files are small; the reads are
       // cheap, and the chain check below still works when one is missing.
+      //
+      // Non-keyframe entries hash their change log, which now lives in a
+      // v{N}.diff file rather than inline on the entry — pre-load those too, or
+      // a tampered diff file goes unchecked exactly the way a tampered keyframe
+      // used to.
       const keyframeContent = new Map<number, string>();
+      const diffContent = new Map<number, string>();
       for (const entry of history.versions) {
-        if (!entry.keyframe) continue;
-        const content = await this.readKeyframe(docId, entry.version);
-        if (content !== null) keyframeContent.set(entry.version, content);
+        if (entry.keyframe) {
+          const content = await this.readKeyframe(docId, entry.version);
+          if (content !== null) keyframeContent.set(entry.version, content);
+        } else {
+          const diff = await this.readDiff(docId, entry.version);
+          if (diff !== null) diffContent.set(entry.version, diff);
+        }
       }
       const report = verifyDocumentChain(
         docId,
         history,
         (version) => keyframeContent.get(version) ?? null,
+        (version) => diffContent.get(version) ?? null,
       );
       if (!report.valid) errors.push(...report.errors);
     }
@@ -649,6 +660,51 @@ export class NestStorage {
     const keyframeDir = join(this.root, docDir, ".versions", docName);
     await mkdir(keyframeDir, { recursive: true });
     await writeFile(join(keyframeDir, `v${version}.md`), content, "utf-8");
+  }
+
+  /**
+   * Read the change log for a non-keyframe version — the unified diff taking
+   * v{version-1} to v{version}, stored beside the keyframes as v{version}.diff.
+   *
+   * Returns null when there is no diff file. Histories written before diffs
+   * were externalized carry the patch inline on the version entry instead, so
+   * callers fall back to `entry.diff` (see VersionManager.reconstructVersion) —
+   * that fallback is what keeps pre-existing nests readable without migration.
+   */
+  async readDiff(docId: string, version: number): Promise<string | null> {
+    const docName = basename(docId);
+    const docDir = dirname(docId);
+    const diffPath = join(
+      this.root,
+      docDir,
+      ".versions",
+      docName,
+      `v${version}.diff`,
+    );
+    try {
+      return await readFile(diffPath, "utf-8");
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Write the change log for a non-keyframe version.
+   *
+   * Content is the unified diff exactly as produced by `createPatch` — hunk
+   * headers included — so the file is readable on its own and applies with
+   * standard patch tooling.
+   */
+  async writeDiff(
+    docId: string,
+    version: number,
+    diff: string,
+  ): Promise<void> {
+    const docName = basename(docId);
+    const docDir = dirname(docId);
+    const diffDir = join(this.root, docDir, ".versions", docName);
+    await mkdir(diffDir, { recursive: true });
+    await writeFile(join(diffDir, `v${version}.diff`), diff, "utf-8");
   }
 
   /**

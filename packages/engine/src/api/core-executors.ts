@@ -21,6 +21,7 @@ import {
 } from "../parser.js";
 import { normalizeDocumentId } from "../storage.js";
 import { publishDocument, publishDocuments } from "../publish.js";
+import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
@@ -293,19 +294,28 @@ const versions: OperationExecutor = async (ctx, input: any) => {
     await ctx.storage.readDocument(id);
     return { id, keyframe_interval: 0, versions: [] };
   }
+  // Change logs are opt-in — see the `include_diff` note on the descriptor.
+  const versionManager = input?.include_diff
+    ? new VersionManager(ctx.storage)
+    : null;
   return {
     id,
     keyframe_interval: history.keyframe_interval,
-    versions: history.versions.map((v) => ({
-      version: v.version,
-      keyframe: v.keyframe ?? false,
-      edited_by: v.edited_by,
-      edited_at: v.edited_at,
-      published_at: v.published_at,
-      note: v.note,
-      content_hash: v.content_hash,
-      chain_hash: v.chain_hash,
-    })),
+    versions: await Promise.all(
+      history.versions.map(async (v) => ({
+        version: v.version,
+        keyframe: v.keyframe ?? false,
+        edited_by: v.edited_by,
+        edited_at: v.edited_at,
+        published_at: v.published_at,
+        note: v.note,
+        content_hash: v.content_hash,
+        chain_hash: v.chain_hash,
+        ...(versionManager
+          ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
+          : {}),
+      })),
+    ),
   };
 };
 

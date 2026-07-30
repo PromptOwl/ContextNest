@@ -232,6 +232,10 @@ export function verifyDocumentChain(
   docId: string,
   history: DocumentHistory,
   readKeyframe: (version: number) => string | null,
+  /** Change log for a non-keyframe version, when it lives in a v{N}.diff file
+   *  rather than inline on the entry. Omitted by callers that only have the
+   *  history — those fall back to the inline patch, as before. */
+  readDiff?: (version: number) => string | null,
 ): VerificationReport {
   const errors: VerificationReport["errors"] = [];
 
@@ -244,7 +248,12 @@ export function verifyDocumentChain(
     if (entry.keyframe) {
       actualContent = readKeyframe(entry.version);
     } else {
-      actualContent = entry.diff || "";
+      // Externalized change log wins; inline patch is the legacy fallback.
+      // Neither available means the version can no longer be reconstructed, so
+      // hash "" and let it surface as a content_hash_mismatch — unlike a
+      // missing keyframe (recoverable by replaying from an earlier one), a
+      // missing diff silently breaks every version after it.
+      actualContent = readDiff?.(entry.version) ?? entry.diff ?? "";
     }
 
     if (actualContent !== null) {

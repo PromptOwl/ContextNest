@@ -44,15 +44,16 @@ const documentPayload = z.object({
 });
 
 /** Address a single node by URI, id, or title — shared by get/delete/publish/versions. */
-const nodeSelector = z
-  .object({
-    uri: z.string().optional().describe("Document URI, e.g. contextnest://nodes/api-design"),
-    id: z.string().optional().describe("Document id / path"),
-    title: z.string().optional().describe("Document title"),
-  })
-  .refine((v) => Boolean(v.uri || v.id || v.title), {
-    message: "One of uri, id, or title is required",
-  });
+const nodeSelectorShape = {
+  uri: z.string().optional().describe("Document URI, e.g. contextnest://nodes/api-design"),
+  id: z.string().optional().describe("Document id / path"),
+  title: z.string().optional().describe("Document title"),
+};
+const SELECTOR_REQUIRED = { message: "One of uri, id, or title is required" };
+const hasSelector = (v: { uri?: string; id?: string; title?: string }) =>
+  Boolean(v.uri || v.id || v.title);
+
+const nodeSelector = z.object(nodeSelectorShape).refine(hasSelector, SELECTOR_REQUIRED);
 
 // ─── context_search ──────────────────────────────────────────────────────────
 
@@ -299,13 +300,27 @@ const versionEntryOut = z.object({
   note: z.string().optional(),
   content_hash: z.string(),
   chain_hash: z.string(),
+  /** Only present when the caller passes `include_diff`. Absent for a keyframe
+   *  (a full snapshot has no patch) and for v1. */
+  diff: z.string().optional().describe("Unified diff from the previous version"),
 });
 
 const versionsOp: OperationDescriptor = {
   name: "context_versions",
   namespace: "core",
   description: "Version history of a node (newest entries last).",
-  input: nodeSelector,
+  input: z
+    .object({
+      ...nodeSelectorShape,
+      // Off by default on purpose: a doc with dozens of versions would other-
+      // wise return dozens of patches, which is a lot of tokens to push into an
+      // agent that only asked who edited what and when.
+      include_diff: z
+        .boolean()
+        .optional()
+        .describe("Attach each version's change log (unified diff from the previous version)"),
+    })
+    .refine(hasSelector, SELECTOR_REQUIRED),
   output: z.object({
     id: z.string(),
     keyframe_interval: z.number().int(),
