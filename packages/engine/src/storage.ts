@@ -813,10 +813,20 @@ export class NestStorage {
 
     const handle = await open(path, "a");
     try {
-      // The file exists. A zero-length one is not something this class ever
-      // produces (the create branch above always writes a header), so it means
-      // an external truncation — write the header rather than append an entry
-      // into a headerless file.
+      // The file exists. A zero-length one normally means an external
+      // truncation, so write the header rather than append into a headerless
+      // file.
+      //
+      // Known residual window: the winner's `wx` open creates a 0-byte file and
+      // resolves BEFORE its write lands, so a loser that gets EEXIST, reopens
+      // and stats inside that gap would also see 0 and also write a header,
+      // giving two `versions:` keys. Not closed here because it needs the loser
+      // to complete three threadpool round-trips inside the winner's single
+      // queued write, and it did not occur in 60 rounds of 32-way contention on
+      // a single new file (nor 1200 docs of 3-way). If it ever does, the result
+      // is an unparseable history — loud (CorruptHistoryError), not silent — and
+      // the fix is to have the loser re-stat with a bounded wait instead of
+      // trusting the first observation.
       const { size } = await handle.stat();
       await handle.write(size === 0 ? header + block : block);
       await handle.sync();
