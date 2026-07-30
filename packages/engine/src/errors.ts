@@ -39,6 +39,18 @@ export class InvalidUriError extends ContextNestError {
   }
 }
 
+/**
+ * Raised when a selector string fails to lex or parse (§2). Selectors are raw
+ * user input, so these are validation errors — not bugs — and callers (CLI,
+ * MCP) render them as one-line messages instead of stack traces.
+ */
+export class InvalidSelectorError extends ContextNestError {
+  constructor(message: string) {
+    super(message, "INVALID_SELECTOR", "§2");
+    this.name = "InvalidSelectorError";
+  }
+}
+
 export class CircularDependencyError extends ContextNestError {
   constructor(public readonly cycle: string[]) {
     super(

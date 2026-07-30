@@ -265,7 +265,7 @@ describe("createEngineApi — executable core operations", () => {
   it("context_reconstruct honors its error contract (coded errors)", async () => {
     const api = createEngineApi();
     // A doc on disk with NO version history (never published) → reconstructVersion
-    // throws a plain Error; the executor must surface it as VALIDATION_FAILED.
+    // throws a coded VERSION_NOT_FOUND, which the executor passes through.
     const node: ContextNode = {
       id: "nodes/nohist",
       filePath: "",
@@ -276,7 +276,7 @@ describe("createEngineApi — executable core operations", () => {
     await ctx.storage.writeDocument("nodes/nohist", serializeDocument(node));
     await expect(
       api.run("context_reconstruct", { id: "nodes/nohist", version: 1 }, ctx),
-    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    ).rejects.toMatchObject({ code: "VERSION_NOT_FOUND" });
     // Bogus id → DOCUMENT_NOT_FOUND (as advertised), not an un-coded error.
     await expect(
       api.run("context_reconstruct", { id: "nodes/ghost", version: 1 }, ctx),

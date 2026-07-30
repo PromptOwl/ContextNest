@@ -2177,11 +2177,14 @@ vaultCmd
 
 // Parse and run
 program.parseAsync().catch((err: unknown) => {
-  // Engine validation errors render as concise one-liners instead of leaking
-  // stack traces. Unknown errors still throw so genuine bugs stay debuggable.
-  if (err instanceof ContextNestError) {
-    console.error(chalk.red(`Error [${err.code}]: ${err.message}`));
-    process.exit(1);
+  // No error path prints a raw stack trace: engine errors render with their
+  // code, everything else (YAML syntax errors, fs failures, genuine bugs) as a
+  // plain one-liner. Set CONTEXTNEST_DEBUG=1 to get the full stack back.
+  if (process.env.CONTEXTNEST_DEBUG) throw err;
+  const label = err instanceof ContextNestError ? `Error [${err.code}]` : "Error";
+  console.error(chalk.red(`${label}: ${(err as Error)?.message ?? String(err)}`));
+  if (!(err instanceof ContextNestError)) {
+    console.error(chalk.dim("Re-run with CONTEXTNEST_DEBUG=1 for the full stack trace."));
   }
-  throw err;
+  process.exit(1);
 });

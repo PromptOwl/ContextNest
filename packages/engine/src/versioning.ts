@@ -8,6 +8,7 @@ import type { ContextNode, DocumentHistory, VersionEntry } from "./types.js";
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
 import { NestStorage } from "./storage.js";
+import { ContextNestError } from "./errors.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
@@ -142,7 +143,11 @@ export class VersionManager {
   async reconstructVersion(docId: string, targetVersion: number): Promise<string> {
     const history = await this.storage.readHistory(docId);
     if (!history) {
-      throw new Error(`No version history found for ${docId}`);
+      throw new ContextNestError(
+        `No version history found for ${docId}`,
+        "VERSION_NOT_FOUND",
+        "§6",
+      );
     }
 
     // Find the nearest keyframe at or before target version
@@ -154,16 +159,20 @@ export class VersionManager {
     }
 
     if (keyframeVersion === -1) {
-      throw new Error(
+      throw new ContextNestError(
         `No keyframe found at or before version ${targetVersion} for ${docId}`,
+        "VERSION_NOT_FOUND",
+        "§6",
       );
     }
 
     // Read keyframe content
     let content = await this.storage.readKeyframe(docId, keyframeVersion);
     if (content === null) {
-      throw new Error(
+      throw new ContextNestError(
         `Keyframe file for version ${keyframeVersion} not found for ${docId}`,
+        "VERSION_NOT_FOUND",
+        "§6",
       );
     }
 
@@ -190,8 +199,10 @@ export class VersionManager {
         if (typeof result === "string") {
           content = result;
         } else if (result === false) {
-          throw new Error(
+          throw new ContextNestError(
             `Failed to apply diff for version ${entry.version} of ${docId}`,
+            "RECONSTRUCTION_FAILED",
+            "§6",
           );
         }
       }
