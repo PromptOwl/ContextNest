@@ -21,6 +21,7 @@ import type {
   ContextNode,
   NestConfig,
   DocumentHistory,
+  VersionEntry,
   CheckpointHistory,
   Pack,
   ContextYaml,
@@ -730,16 +731,83 @@ export class NestStorage {
     }
   }
 
+  /** Absolute path of a document's history.yaml. */
+  private historyPath(docId: string): string {
+    return join(
+      this.root,
+      dirname(docId),
+      ".versions",
+      basename(docId),
+      "history.yaml",
+    );
+  }
+
   /**
-   * Write document history to .versions/{docName}/history.yaml.
+   * Rewrite a document's history.yaml in full.
+   *
+   * Only for the paths that genuinely MUTATE existing entries — re-anchoring a
+   * version, moving inline patches into files. Recording a NEW version goes
+   * through {@link appendVersionEntry}, which cannot touch the bytes of the
+   * entries already on disk. Prefer that: a full rewrite is only ever as correct
+   * as the object handed to it, and an object built from a bad read is how a
+   * corrupt history silently became a two-entry one.
+   *
+   * `versions` is forced last so the serialized list stays open at the end of
+   * the file for appending. Anything else here is a latent break in append.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const historyDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(historyDir, { recursive: true });
-    const content = yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await this.writeFileDurable(join(historyDir, "history.yaml"), content);
+    const { versions, ...rest } = history;
+    await mkdir(dirname(this.historyPath(docId)), { recursive: true });
+    const content = yaml.dump(
+      { ...rest, versions },
+      { lineWidth: -1, noRefs: true },
+    );
+    await this.writeFileDurable(this.historyPath(docId), content);
+  }
+
+  /**
+   * Record one new version by APPENDING it to history.yaml.
+   *
+   * The bytes of every previously recorded version are never reopened for
+   * writing, so no bug in a caller — and no failed read — can drop them. That is
+   * the difference between "we check before rewriting" and "there is nothing to
+   * rewrite": the old full-rewrite path lost v1–v4 whenever the read that fed it
+   * came back empty, and a guard on the read is only as good as the next code
+   * path that forgets it.
+   *
+   * The file's header (`keyframe_interval` + the `versions:` key) is written
+   * once, on first append, and `writeHistory` keeps `versions` last so the list
+   * stays open at EOF. Appends go out under O_APPEND and are fsynced.
+   */
+  async appendVersionEntry(
+    docId: string,
+    entry: VersionEntry,
+    keyframeInterval: number,
+  ): Promise<void> {
+    const path = this.historyPath(docId);
+    await mkdir(dirname(path), { recursive: true });
+
+    // One list item, indented to sit under `versions:`. Indenting a whole YAML
+    // document by a fixed amount keeps it valid, including multi-line scalars.
+    const block = yaml
+      .dump([entry], { lineWidth: -1, noRefs: true })
+      .split("\n")
+      .map((line) => (line.length > 0 ? `  ${line}` : line))
+      .join("\n");
+
+    const handle = await open(path, "a");
+    try {
+      // Size via the open handle rather than a prior stat: O_APPEND makes the
+      // write itself atomic against other appenders, and this avoids a
+      // check-then-act window where two callers both decide to write a header.
+      const { size } = await handle.stat();
+      const header =
+        size === 0 ? `keyframe_interval: ${keyframeInterval}\nversions:\n` : "";
+      await handle.write(header + block);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**

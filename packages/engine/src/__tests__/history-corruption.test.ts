@@ -215,6 +215,94 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
   });
 });
 
+describe("recording a version appends — it never rewrites what is on disk", () => {
+  let root: string;
+  let storage: NestStorage;
+  const ID = "nodes/appended";
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "cn-hist-append-"));
+    storage = new NestStorage(root);
+    await storage.init("Append Vault");
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const historyPath = () =>
+    join(root, "nodes", ".versions", "appended", "history.yaml");
+
+  async function publishRevision(label: string): Promise<void> {
+    const node = await storage.readDocument(ID);
+    node.body = `\n# appended\n\n${label}\n`;
+    await storage.writeDocument(ID, serializeDocument(node));
+    await publishDocument(storage, ID, { editedBy: "tester" });
+  }
+
+  it("leaves the existing bytes untouched and only grows the file", async () => {
+    await storage.writeDocument(ID, draft(ID));
+    await publishDocument(storage, ID, { editedBy: "tester" });
+    await publishRevision("second");
+    const before = await readFile(historyPath(), "utf-8");
+
+    await publishRevision("third");
+    const after = await readFile(historyPath(), "utf-8");
+
+    // The whole prior file is a byte-exact PREFIX of the new one. That is the
+    // structural guarantee: earlier versions cannot be dropped or altered,
+    // because those bytes are never reopened for writing.
+    expect(after.startsWith(before)).toBe(true);
+    expect(after.length).toBeGreaterThan(before.length);
+  });
+
+  it("writes the file header exactly once", async () => {
+    await storage.writeDocument(ID, draft(ID));
+    await publishDocument(storage, ID, { editedBy: "tester" });
+    await publishRevision("second");
+    await publishRevision("third");
+
+    const raw = await readFile(historyPath(), "utf-8");
+    expect(raw.match(/^versions:$/gm)).toHaveLength(1);
+    expect(raw.match(/^keyframe_interval:/gm)).toHaveLength(1);
+
+    const history = (await storage.readHistory(ID))!;
+    expect(history.versions.map((v) => v.version)).toEqual([1, 2, 3]);
+  });
+
+  it("keeps `versions` last when rewriting, so the list stays open for appends", async () => {
+    // writeHistory is the mutating path (repairs). If it ever emitted another
+    // key after `versions`, the next append would land outside the list and
+    // produce invalid YAML — so the ordering is a hard precondition, not style.
+    await storage.writeDocument(ID, draft(ID));
+    await publishDocument(storage, ID, { editedBy: "tester" });
+
+    const history = (await storage.readHistory(ID))!;
+    await storage.writeHistory(ID, history);
+    const raw = await readFile(historyPath(), "utf-8");
+    expect(raw.trimEnd().split("\n").at(0)).toMatch(/^keyframe_interval:/);
+    expect(raw).toMatch(/^versions:$/m);
+
+    // And an append on top of a rewritten file still round-trips.
+    await publishRevision("after rewrite");
+    const reread = (await storage.readHistory(ID))!;
+    expect(reread.versions.map((v) => v.version)).toEqual([1, 2]);
+  });
+
+  it("does not lose entries when several versions are recorded concurrently", async () => {
+    const ids = Array.from({ length: 8 }, (_, i) => `nodes/conc-${i}`);
+    for (const id of ids) await storage.writeDocument(id, draft(id));
+    await Promise.all(
+      ids.map((id) => publishDocument(storage, id, { editedBy: "tester" })),
+    );
+
+    for (const id of ids) {
+      const history = await storage.readHistory(id);
+      expect(history?.versions.map((v) => v.version)).toEqual([1]);
+    }
+  });
+});
+
 describe("history writes are durable (no torn file to begin with)", () => {
   let root: string;
   let storage: NestStorage;

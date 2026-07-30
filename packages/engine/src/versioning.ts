@@ -130,8 +130,14 @@ export class VersionManager {
       chain_hash: chainHash,
     };
 
-    history.versions.push(entry);
-    await this.storage.writeHistory(node.id, history);
+    // APPEND, never rewrite. The entries already on disk are not reopened for
+    // writing, so recording a new version cannot drop an old one no matter what
+    // this function got back from the read above.
+    await this.storage.appendVersionEntry(
+      node.id,
+      entry,
+      history.keyframe_interval,
+    );
 
     return entry;
   }
