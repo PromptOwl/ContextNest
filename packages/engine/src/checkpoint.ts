@@ -132,8 +132,19 @@ async function scanOneDocument(
     return { documentId, drifted: false };
   }
 
-  // Need a chain head to diff against — skip legacy unseeded docs.
-  const history = await input.storage.readHistory(documentId);
+  // Need a chain head to diff against — skip legacy unseeded docs. readHistory
+  // throws on a present-but-unreadable history; that is one document's problem,
+  // and this scan promises not to fail wholesale over one ill-formed file.
+  let history: DocumentHistory | null;
+  try {
+    history = await input.storage.readHistory(documentId);
+  } catch (err) {
+    return {
+      documentId,
+      drifted: true,
+      skippedReason: `unreadable-history: ${(err as Error).message.split("\n")[0]}`,
+    };
+  }
   if (!history || history.versions.length === 0) {
     return {
       documentId,

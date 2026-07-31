@@ -1173,11 +1173,25 @@ program
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const allHistories = await storage.findAllHistories();
-    const checkpointHistory = await storage.readCheckpointHistory();
 
     let totalErrors = 0;
     const allReportErrors: any[] = [];
+
+    // A history.yaml that cannot be parsed is skipped by the crawl, so nothing
+    // downstream would ever check that document — report it instead of passing.
+    const allHistories = await storage.findAllHistories((docId, reason) => {
+      totalErrors++;
+      allReportErrors.push({
+        type: "unreadable_history",
+        document: docId,
+        expected: null,
+        actual: reason,
+      });
+      if (!opts.json) {
+        console.log(chalk.red(`✗ ${docId}: history.yaml unreadable — ${reason}`));
+      }
+    });
+    const checkpointHistory = await storage.readCheckpointHistory();
 
     // Verify each document chain
     for (const [docId, history] of allHistories) {

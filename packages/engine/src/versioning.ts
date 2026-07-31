@@ -130,8 +130,14 @@ export class VersionManager {
       chain_hash: chainHash,
     };
 
-    history.versions.push(entry);
-    await this.storage.writeHistory(node.id, history);
+    // APPEND, never rewrite. The entries already on disk are not reopened for
+    // writing, so recording a new version cannot drop an old one no matter what
+    // this function got back from the read above.
+    await this.storage.appendVersionEntry(
+      node.id,
+      entry,
+      history.keyframe_interval,
+    );
 
     return entry;
   }
@@ -251,7 +257,12 @@ export class VersionManager {
     }
 
     const fullContent = serializeDocument(await this.storage.readDocument(docId));
-    await this.storage.writeKeyframe(docId, latest.version, fullContent);
+    // Deliberate re-anchor: this version is unreconstructable as-is, so its
+    // artifact is replaced and the entry re-hashed below. The only path allowed
+    // to rewrite a sealed artifact besides externalizeDiffs.
+    await this.storage.writeKeyframe(docId, latest.version, fullContent, {
+      overwrite: true,
+    });
 
     latest.keyframe = true;
     delete latest.diff;
@@ -311,7 +322,11 @@ export class VersionManager {
     for (const entry of history.versions) {
       if (!entry.diff) continue;
       // Write first, drop from history only once the file is safely on disk.
-      await this.storage.writeDiff(docId, entry.version, entry.diff);
+      // Idempotent by design — re-running writes the same bytes over an already
+      // externalized file, so this one opts out of the immutability guard.
+      await this.storage.writeDiff(docId, entry.version, entry.diff, {
+        overwrite: true,
+      });
       delete entry.diff;
       moved += 1;
     }
