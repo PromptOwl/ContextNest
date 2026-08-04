@@ -10,6 +10,7 @@
 import {
   getConfig,
   ctxJson,
+  isVaultRegistered,
   squish,
   runAsHook,
   isMain,
@@ -39,7 +40,18 @@ export function run({ env, exec }) {
 
   const lines = ["Context Nest is active for this session."];
 
-  if (config.vault) {
+  // A pin is only honoured if it still resolves to a registered vault; it may
+  // have been removed or renamed since it was set. Warn loudly on a stale pin —
+  // retrieval falls back to automatic selection (see vaultTargets).
+  const pinnedIsRegistered = isVaultRegistered(config.vault, vaults);
+
+  if (config.vault && !pinnedIsRegistered) {
+    lines.push(
+      `⚠ Pinned vault \`${config.vault}\` is not a registered vault (removed, renamed, or ` +
+        `misspelled). Retrieval and capture fall back to automatic vault selection. Fix it with ` +
+        `\`/contextnest:config vault <alias>\` (or re-register the vault with \`ctx vault add\`).`,
+    );
+  } else if (config.vault) {
     lines.push(`Pinned vault: \`${config.vault}\` (all queries/captures use it).`);
   }
 

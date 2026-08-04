@@ -103,6 +103,24 @@ describe("agent + skill frontmatter", () => {
   });
 });
 
+describe("config command (CU-wdqcpzw825: settings must be changeable after enable)", () => {
+  const commandPath = join(plugin, "commands", "config.md");
+
+  it("ships a /contextnest:config command", () => {
+    expect(existsSync(commandPath)).toBe(true);
+  });
+
+  it("command has description frontmatter and covers all four settings", () => {
+    const text = read(commandPath);
+    const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    expect(fm, "frontmatter present").toBeTruthy();
+    expect(fm![1]).toMatch(/\bdescription:\s*\S+/);
+    for (const key of ["retrieval_mode", "auto_capture", "vault", "ctx_command"]) {
+      expect(text).toContain(key);
+    }
+  });
+});
+
 describe("vendored core sync", () => {
   it("plugins:check passes (vendored core matches plugins/shared)", () => {
     // Throws (non-zero exit) if any vendored copy has drifted.

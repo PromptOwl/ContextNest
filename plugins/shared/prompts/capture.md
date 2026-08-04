@@ -17,9 +17,12 @@ durable insight). Staying silent is correct in that case — do not force a writ
 
 ## Procedure
 
-1. **Pick the vault.** If a vault is pinned, use it (`--vault <alias>`). Otherwise
-   run `ctx vault list --json` and choose the vault whose `description` fits the
-   material.
+1. **Pick the vault.** Run `ctx vault list --json` first. If a vault is pinned
+   *and its alias appears in that list*, use it (`--vault <alias>`). If a vault
+   is pinned but its alias is **not** in the list, the pin is stale (the vault
+   was removed or renamed) — ignore it, note the stale pin in your summary, and
+   fall back to choosing the vault whose `description` fits the material. If no
+   vault is pinned, likewise choose by `description`.
 
 2. **Dedupe first.** For each candidate fact, run
    `ctx search "<key terms>" --json`. If a node already covers it, extend that node

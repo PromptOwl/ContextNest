@@ -4,13 +4,15 @@ content — only report what `ctx` returns.
 
 ## Procedure
 
-1. **Pick the vault(s).**
+1. **Pick the vault(s).** Run `ctx vault list --json` first to see what's
+   actually registered.
    - If a vault is pinned (the session overview names a pinned vault, or
-     `CONTEXTNEST_VAULT_ALIAS` is set), use only that one — pass `--vault <alias>`
-     to every command.
-   - Otherwise run `ctx vault list --json` and choose the vault(s) whose
-     `description` best matches the user's topic. Prefer one; use two only when the
-     topic clearly spans them.
+     `CONTEXTNEST_VAULT_ALIAS` is set) *and its alias is in that list*, use only
+     that one — pass `--vault <alias>` to every command.
+   - If a pinned alias is **not** in the list, the pin is stale (the vault was
+     removed or renamed) — ignore it and choose by `description` instead.
+   - Otherwise (no pin) choose the vault(s) whose `description` best matches the
+     user's topic. Prefer one; use two only when the topic clearly spans them.
 
 2. **Find seed nodes.** Translate the topic into a selector:
    - Run `ctx search "<topic keywords>" --json` to discover relevant node ids.

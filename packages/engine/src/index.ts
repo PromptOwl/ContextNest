@@ -54,6 +54,7 @@ export {
   ValidationFailedError,
   DocumentNotFoundError,
   InvalidUriError,
+  InvalidSelectorError,
   CircularDependencyError,
   IntegrityError,
   FederationNotSupportedError,
@@ -64,6 +65,8 @@ export {
   UnauthorizedActionError,
   ChainBreakError,
   RejectedDocumentError,
+  CorruptHistoryError,
+  VersionArtifactExistsError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
@@ -228,6 +231,24 @@ export type { SelectorNode } from "./selector/parser.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
 
+// Wiki-link seeds + ungated traversal (plumbing — the eligibility GATE stays
+// with the consumer; these primitives never gate by status/permission)
+export {
+  extractWikiLinks,
+  buildWikiTitleIndex,
+  resolveWikiSeeds,
+  traverseWikiGraph,
+} from "./wiki-graph.js";
+export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
+
+// Stewards format (parse/serialize only — enforcement stays with the consumer)
+export {
+  parseStewards,
+  serializeStewards,
+  STEWARDS_FILENAMES,
+} from "./stewards.js";
+export type { StewardRole, StewardEntry, StewardsConfig } from "./stewards.js";
+
 // Packs
 export { PackLoader } from "./packs.js";
 
@@ -275,8 +296,13 @@ export type {
 } from "./hygienist.js";
 
 // Publish
-export { publishDocument } from "./publish.js";
-export type { PublishOptions, PublishResult } from "./publish.js";
+export { publishDocument, publishDocuments } from "./publish.js";
+export type {
+  PublishOptions,
+  PublishResult,
+  BulkPublishOptions,
+  BulkPublishResult,
+} from "./publish.js";
 
 // Source graph
 export {

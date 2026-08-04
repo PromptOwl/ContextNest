@@ -907,6 +907,19 @@ program
   .action(async (path, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
+
+    // Refuse to clobber an existing document. This used to fail only by
+    // accident: the template below resets the version to 1, which collided with
+    // a number already recorded in the chain and blew up during publish — but
+    // only AFTER the original bytes had been overwritten. Checking up front
+    // makes the refusal deliberate and leaves the existing document intact.
+    if (fs.existsSync(pathMod.join(storage.root, `${id}.md`))) {
+      throw new ContextNestError(
+        `Document already exists: ${id}. Use \`ctx update ${id}\` to edit it.`,
+        "DOCUMENT_EXISTS",
+      );
+    }
+
     const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
 
     const tagList = opts.tags
@@ -1160,31 +1173,53 @@ program
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const allHistories = await storage.findAllHistories();
-    const checkpointHistory = await storage.readCheckpointHistory();
 
     let totalErrors = 0;
     const allReportErrors: any[] = [];
 
+    // A history.yaml that cannot be parsed is skipped by the crawl, so nothing
+    // downstream would ever check that document — report it instead of passing.
+    const allHistories = await storage.findAllHistories((docId, reason) => {
+      totalErrors++;
+      allReportErrors.push({
+        type: "unreadable_history",
+        document: docId,
+        expected: null,
+        actual: reason,
+      });
+      if (!opts.json) {
+        console.log(chalk.red(`✗ ${docId}: history.yaml unreadable — ${reason}`));
+      }
+    });
+    const checkpointHistory = await storage.readCheckpointHistory();
+
     // Verify each document chain
     for (const [docId, history] of allHistories) {
-      const report = verifyDocumentChain(docId, history, (version) => {
-        // Synchronous read — for CLI simplicity
-        const docName = pathMod.basename(docId);
-        const docDir = pathMod.dirname(docId);
-        const keyframePath = pathMod.join(
-          storage.root,
-          docDir,
-          ".versions",
-          docName,
-          `v${version}.md`,
-        );
+      // Synchronous reads — for CLI simplicity. Both are needed: a keyframe
+      // entry hashes its snapshot, a non-keyframe entry hashes its change log,
+      // and the change log lives in its own v{N}.diff file.
+      const readVersionFile = (version: number, ext: "md" | "diff") => {
         try {
-          return fs.readFileSync(keyframePath, "utf-8");
+          return fs.readFileSync(
+            pathMod.join(
+              storage.root,
+              pathMod.dirname(docId),
+              ".versions",
+              pathMod.basename(docId),
+              `v${version}.${ext}`,
+            ),
+            "utf-8",
+          );
         } catch {
           return null;
         }
-      });
+      };
+      const report = verifyDocumentChain(
+        docId,
+        history,
+        (version) => readVersionFile(version, "md"),
+        (version) => readVersionFile(version, "diff"),
+      );
 
       if (!report.valid) {
         totalErrors += report.errors.length;
@@ -2156,11 +2191,14 @@ vaultCmd
 
 // Parse and run
 program.parseAsync().catch((err: unknown) => {
-  // Engine validation errors render as concise one-liners instead of leaking
-  // stack traces. Unknown errors still throw so genuine bugs stay debuggable.
-  if (err instanceof ContextNestError) {
-    console.error(chalk.red(`Error [${err.code}]: ${err.message}`));
-    process.exit(1);
+  // No error path prints a raw stack trace: engine errors render with their
+  // code, everything else (YAML syntax errors, fs failures, genuine bugs) as a
+  // plain one-liner. Set CONTEXTNEST_DEBUG=1 to get the full stack back.
+  if (process.env.CONTEXTNEST_DEBUG) throw err;
+  const label = err instanceof ContextNestError ? `Error [${err.code}]` : "Error";
+  console.error(chalk.red(`${label}: ${(err as Error)?.message ?? String(err)}`));
+  if (!(err instanceof ContextNestError)) {
+    console.error(chalk.dim("Re-run with CONTEXTNEST_DEBUG=1 for the full stack trace."));
   }
-  throw err;
+  process.exit(1);
 });
