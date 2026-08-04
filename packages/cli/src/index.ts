@@ -12,6 +12,14 @@ import { Command, Help } from "commander";
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "chalk";
 import {
+  readCredentialStore,
+  writeCredentialStore,
+  upsertCredential,
+  removeCredential,
+  resolveToken,
+  normalizeServerUrl,
+} from "./credentials.js";
+import {
   NestStorage,
   validateDocument,
   parseSelector,
@@ -1784,6 +1792,80 @@ program
     }
   });
 
+// ─── ctx login / logout ───────────────────────────────────────────────────────
+
+program
+  .command("login <server>")
+  .description("Save an API token for a hosted ContextNest server so commands stop asking for --key")
+  .option("--key <apiKey>", "Paste an existing API key (cnst_...). Create one in the nest UI → Connect.")
+  .option("--label <text>", "Label for this credential (e.g. your email)")
+  .action(async (server: string, opts: { key?: string; label?: string }) => {
+    let url: string;
+    try {
+      url = normalizeServerUrl(server);
+    } catch (e: any) {
+      console.error(chalk.red(e.message));
+      process.exit(1);
+      return;
+    }
+    if (!opts.key) {
+      // Browser/device login can reuse this server's existing /auth/device flow,
+      // but it needs a live-server verification pass first (session-cookie
+      // capture + the /auth/keys "key already exists" 409 case), so the shipped
+      // path today is pasting a key once.
+      console.error(
+        chalk.red("Browser login isn't wired up yet.") +
+          `\n  Paste a key once instead:\n    ${chalk.cyan(`ctx login ${url} --key cnst_...`)}` +
+          `\n  (create one in the nest UI → Connect, or POST ${url}/auth/keys)`,
+      );
+      process.exit(1);
+      return;
+    }
+    const store = upsertCredential(readCredentialStore(), url, {
+      token: opts.key,
+      label: opts.label,
+      updatedAt: new Date().toISOString(),
+    });
+    writeCredentialStore(store);
+    console.log(
+      chalk.green(`Saved credential for ${url}${opts.label ? ` (${opts.label})` : ""}.`) +
+        (store.default === url ? chalk.dim("  (default)") : ""),
+    );
+    console.log(chalk.dim(`  Now: ctx push --server ${url} --nest <id>   (no --key needed)`));
+  });
+
+program
+  .command("logout [server]")
+  .description("Remove a saved server credential")
+  .option("--all", "Remove every saved credential")
+  .action((server: string | undefined, opts: { all?: boolean }) => {
+    if (opts.all) {
+      writeCredentialStore({ version: 1, servers: {} });
+      console.log(chalk.green("Removed all saved credentials."));
+      return;
+    }
+    if (!server) {
+      console.error(chalk.red("Specify a <server> URL to log out of, or use --all."));
+      process.exit(1);
+      return;
+    }
+    let url: string;
+    try {
+      url = normalizeServerUrl(server);
+    } catch (e: any) {
+      console.error(chalk.red(e.message));
+      process.exit(1);
+      return;
+    }
+    const store = readCredentialStore();
+    if (!store.servers[url]) {
+      console.log(chalk.yellow(`No saved credential for ${url}.`));
+      return;
+    }
+    writeCredentialStore(removeCredential(store, url));
+    console.log(chalk.green(`Logged out of ${url}.`));
+  });
+
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
 program
@@ -1791,9 +1873,20 @@ program
   .description("Push the local vault to a hosted ContextNest server")
   .requiredOption("--server <url>", "Hosted engine URL (e.g. http://localhost:3737)")
   .requiredOption("--nest <id>", "Target nest ID")
-  .requiredOption("--key <apiKey>", "API key (cnst_...)")
+  .option("--key <apiKey>", "API key (cnst_...) — omit to reuse a token saved via `ctx login`")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .action(async (opts) => {
+    // Prefer an explicit --key; otherwise fall back to the token saved for this
+    // server by `ctx login` (that's the whole point — stop re-pasting keys).
+    const token = opts.key || resolveToken(readCredentialStore(), opts.server);
+    if (!token) {
+      console.error(
+        chalk.red(`No API key for ${opts.server}.`) +
+          `\n  Run ${chalk.cyan(`ctx login ${opts.server} --key cnst_...`)} once, or pass --key.`,
+      );
+      process.exit(1);
+    }
+
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
 
@@ -1830,7 +1923,7 @@ program
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${opts.key}`,
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify(body),
       });
