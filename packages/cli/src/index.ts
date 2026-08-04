@@ -1794,43 +1794,158 @@ program
 
 // ─── ctx login / logout ───────────────────────────────────────────────────────
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Browser (device) login — reuses the server's existing device-auth flow, the
+ * same one the web UI's "Login with PromptOwl" button drives, then mints a
+ * durable API key from the resulting session so the CLI holds a bearer token:
+ *   POST /auth/device → poll /auth/device/poll → POST /auth/promptowl (session)
+ *   → POST /auth/keys (mint). One key per user, so an existing key 409s unless
+ *   --rotate replaces it (destructive — invalidates the old key everywhere).
+ * NOTE: the happy path needs a real browser approval to exercise end-to-end;
+ * the logic mirrors the shipped web flow and handles the known edge cases.
+ */
+async function deviceLogin(
+  serverUrl: string,
+  opts: { label?: string; rotate?: boolean },
+): Promise<{ token: string; label?: string }> {
+  const startRes = await fetch(`${serverUrl}/auth/device`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!startRes.ok) {
+    const e = (await startRes.json().catch(() => ({}))) as { error?: string };
+    throw new Error(
+      `This server doesn't offer browser login (${startRes.status})${e.error ? `: ${e.error}` : ""}. Use --key instead.`,
+    );
+  }
+  const start = (await startRes.json()) as {
+    deviceCode: string;
+    clientSecret: string;
+    verificationUrl: string;
+  };
+  console.log(
+    `\n  Approve the login in your browser:\n    ${chalk.cyan(start.verificationUrl)}\n`,
+  );
+  try {
+    openInBrowser(start.verificationUrl);
+  } catch {
+    /* the URL is printed above */
+  }
+  console.log(chalk.dim("  Waiting for approval..."));
+
+  let poToken: string | null = null;
+  for (let i = 0; i < 180; i++) {
+    await sleep(2000);
+    const pr = await fetch(
+      `${serverUrl}/auth/device/poll?code=${encodeURIComponent(start.deviceCode)}&client_secret=${encodeURIComponent(start.clientSecret)}`,
+    );
+    const pd = (await pr.json().catch(() => ({}))) as {
+      status?: string;
+      token?: string;
+    };
+    if (pd.status === "approved" && pd.token) {
+      poToken = pd.token;
+      break;
+    }
+    if (pd.status === "pending") continue;
+    throw new Error(`Login ${pd.status || "failed"}. Try again.`);
+  }
+  if (!poToken) throw new Error("Login timed out waiting for approval.");
+
+  // Exchange the PromptOwl token for a Community session, capturing the cookie.
+  const exRes = await fetch(`${serverUrl}/auth/promptowl`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: poToken }),
+  });
+  if (!exRes.ok) {
+    const e = (await exRes.json().catch(() => ({}))) as { error?: string };
+    throw new Error(
+      `Session exchange failed (${exRes.status})${e.error ? `: ${e.error}` : ""}.`,
+    );
+  }
+  const setCookies: string[] =
+    (exRes.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
+  const cookie = setCookies.map((c) => c.split(";")[0]).join("; ");
+  if (!cookie) throw new Error("Server did not return a session cookie.");
+  const exData = (await exRes.json().catch(() => ({}))) as {
+    user?: { email?: string };
+  };
+  const label = opts.label ?? exData.user?.email;
+
+  // Mint a durable key with the session. One key per user → 409 unless --rotate.
+  const mintRes = await fetch(
+    `${serverUrl}${opts.rotate ? "/auth/keys/rotate" : "/auth/keys"}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ label: "ctx CLI" }),
+    },
+  );
+  if (mintRes.status === 409) {
+    throw new Error(
+      `You already have an API key on ${serverUrl} (one per user).\n` +
+        `  • Reuse it:   ctx login ${serverUrl} --key cnst_...\n` +
+        `  • Replace it: re-run with --rotate  (WARNING: invalidates the existing key wherever it's used)`,
+    );
+  }
+  if (!mintRes.ok) {
+    const e = (await mintRes.json().catch(() => ({}))) as { error?: string };
+    throw new Error(
+      `Could not mint an API key (${mintRes.status})${e.error ? `: ${e.error}` : ""}.`,
+    );
+  }
+  const md = (await mintRes.json()) as { api_key?: string };
+  if (!md.api_key) throw new Error("Server did not return an API key.");
+  return { token: md.api_key, label };
+}
+
 program
   .command("login <server>")
   .description("Save an API token for a hosted ContextNest server so commands stop asking for --key")
-  .option("--key <apiKey>", "Paste an existing API key (cnst_...). Create one in the nest UI → Connect.")
+  .option("--key <apiKey>", "Paste an existing API key (cnst_...) instead of the browser flow")
   .option("--label <text>", "Label for this credential (e.g. your email)")
-  .action(async (server: string, opts: { key?: string; label?: string }) => {
-    let url: string;
-    try {
-      url = normalizeServerUrl(server);
-    } catch (e: any) {
-      console.error(chalk.red(e.message));
-      process.exit(1);
-      return;
-    }
-    if (!opts.key) {
-      // Browser/device login can reuse this server's existing /auth/device flow,
-      // but it needs a live-server verification pass first (session-cookie
-      // capture + the /auth/keys "key already exists" 409 case), so the shipped
-      // path today is pasting a key once.
-      console.error(
-        chalk.red("Browser login isn't wired up yet.") +
-          `\n  Paste a key once instead:\n    ${chalk.cyan(`ctx login ${url} --key cnst_...`)}` +
-          `\n  (create one in the nest UI → Connect, or POST ${url}/auth/keys)`,
+  .option("--rotate", "During browser login, replace an existing key (invalidates the old one)")
+  .action(
+    async (
+      server: string,
+      opts: { key?: string; label?: string; rotate?: boolean },
+    ) => {
+      let url: string;
+      try {
+        url = normalizeServerUrl(server);
+      } catch (e: any) {
+        console.error(chalk.red(e.message));
+        process.exit(1);
+        return;
+      }
+      let token = opts.key;
+      let label = opts.label;
+      if (!token) {
+        // No key pasted → browser login against the server's device-auth flow.
+        try {
+          const res = await deviceLogin(url, { label, rotate: opts.rotate });
+          token = res.token;
+          label = label ?? res.label;
+        } catch (e: any) {
+          console.error(chalk.red(e.message));
+          process.exit(1);
+          return;
+        }
+      }
+      const store = upsertCredential(readCredentialStore(), url, {
+        token: token!,
+        label,
+        updatedAt: new Date().toISOString(),
+      });
+      writeCredentialStore(store);
+      console.log(
+        chalk.green(`Saved credential for ${url}${label ? ` (${label})` : ""}.`) +
+          (store.default === url ? chalk.dim("  (default)") : ""),
       );
-      process.exit(1);
-      return;
-    }
-    const store = upsertCredential(readCredentialStore(), url, {
-      token: opts.key,
-      label: opts.label,
-      updatedAt: new Date().toISOString(),
-    });
-    writeCredentialStore(store);
-    console.log(
-      chalk.green(`Saved credential for ${url}${opts.label ? ` (${opts.label})` : ""}.`) +
-        (store.default === url ? chalk.dim("  (default)") : ""),
-    );
     console.log(chalk.dim(`  Now: ctx push --server ${url} --nest <id>   (no --key needed)`));
   });
 
