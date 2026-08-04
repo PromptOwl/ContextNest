@@ -60,6 +60,9 @@ jobs:
   docker:
     name: Docker image (MCP server)
     runs-on: ubuntu-latest
+    # The smoke test below relies on the server exiting when stdin closes; cap
+    # the job so a regression there fails fast instead of hanging for 6 hours.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
