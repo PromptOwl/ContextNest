@@ -438,6 +438,19 @@ The MCP server exposes vault operations as 19 tools for AI agents over stdio tra
 node packages/mcp-server/dist/index.js /path/to/your/vault
 ```
 
+### Running the server in Docker
+
+For Glama.ai and any MCP client that runs servers as containers:
+
+```bash
+docker build -t contextnest-mcp .
+
+docker run -i --rm contextnest-mcp                    # demo vault baked into the image
+docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
+```
+
+The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
+
 ### Configuring with Claude Code
 
 Add to your project's `.mcp.json`:
