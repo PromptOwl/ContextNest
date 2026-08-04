@@ -3,9 +3,11 @@ Deeply retrieve context from the **Context Nest** vault for the topic in
 
 ## Steps
 
-1. **Choose the vault.** If a vault is pinned, use it (`--vault <alias>`).
-   Otherwise `ctx vault list --json` and pick the vault(s) whose `description`
-   matches `$ARGUMENTS`.
+1. **Choose the vault.** Run `ctx vault list --json` first. If a vault is pinned
+   *and its alias is in that list*, use it (`--vault <alias>`). If a pinned alias
+   is **not** listed, the pin is stale — ignore it and pick the vault(s) whose
+   `description` matches `$ARGUMENTS`. If no vault is pinned, likewise pick by
+   `description`.
 
 2. **Build a selector.** Run `ctx search "$ARGUMENTS" --json` for seed node ids,
    map ids → tags via `ctx list --json`, and form a tag selector

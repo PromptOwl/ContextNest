@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "contextnest",
   "displayName": "Context Nest",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
   "author": { "name": "PromptOwl" },
   "homepage": "https://github.com/promptowl/contextnest",

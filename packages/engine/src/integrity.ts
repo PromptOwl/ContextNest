@@ -232,6 +232,11 @@ export function verifyDocumentChain(
   docId: string,
   history: DocumentHistory,
   readKeyframe: (version: number) => string | null,
+  /** Change log for a non-keyframe version, when it lives in a v{N}.diff file
+   *  rather than inline on the entry. A caller that cannot read version files
+   *  omits this; its non-keyframe content checks are then skipped rather than
+   *  failed, the same way a missing keyframe file is skipped. */
+  readDiff?: (version: number) => string | null,
 ): VerificationReport {
   const errors: VerificationReport["errors"] = [];
 
@@ -244,7 +249,20 @@ export function verifyDocumentChain(
     if (entry.keyframe) {
       actualContent = readKeyframe(entry.version);
     } else {
-      actualContent = entry.diff || "";
+      // Externalized change log wins; inline patch is the legacy fallback.
+      //
+      // With a reader supplied, "neither available" means the change log is
+      // gone and the version can no longer be reconstructed — hash "" so it
+      // surfaces as a content_hash_mismatch, because unlike a missing keyframe
+      // (recoverable by replaying from an earlier one) a missing diff breaks
+      // every version after it.
+      //
+      // Without a reader, we simply cannot see the change log, which is not
+      // evidence of tampering — skip the content check as we do for a keyframe
+      // whose file we could not read, and let the chain_hash check below stand.
+      actualContent = readDiff
+        ? (readDiff(entry.version) ?? entry.diff ?? "")
+        : (entry.diff ?? null);
     }
 
     if (actualContent !== null) {

@@ -402,7 +402,11 @@ async function commitNewVersion(
   const filePath = join(input.storage.root, `${input.documentId}.md`);
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
 
-  const newVersion = (parsed.frontmatter.version ?? 0) + 1;
+  const versionManager = new VersionManager(input.storage);
+  const newVersion = await versionManager.nextVersion(
+    input.documentId,
+    parsed.frontmatter.version ?? 0,
+  );
   const updatedAt = new Date().toISOString();
   const node: ContextNode = {
     ...parsed,
@@ -423,14 +427,10 @@ async function commitNewVersion(
   const serialized = serializeDocument(node);
   const finalNode: ContextNode = { ...node, rawContent: serialized };
 
-  const versionEntry = await new VersionManager(input.storage).createVersion(
-    finalNode,
-    input.actor,
-    {
-      note: input.note,
-      publishedAt: updatedAt,
-    },
-  );
+  const versionEntry = await versionManager.createVersion(finalNode, input.actor, {
+    note: input.note,
+    publishedAt: updatedAt,
+  });
 
   // Write the live canonical file last so a mid-flight crash leaves the
   // chain consistent (history wrote first, live file matches the chain

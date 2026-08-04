@@ -1036,6 +1036,20 @@ describe("[regression] add/update edge cases", () => {
     expect(res.stderr).not.toMatch(/^\s+at\s/m);
   });
 
+  it("an invalid selector fails with a friendly error, no stack trace", () => {
+    const res = runCtxResult(tmp, ["resolve", "tag:"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/Error \[INVALID_SELECTOR\]: Invalid tag filter/);
+    expect(res.stderr).not.toMatch(/^\s+at\s/m);
+  });
+
+  it("reconstruct without version history fails with a friendly error, no stack trace", () => {
+    const res = runCtxResult(tmp, ["reconstruct", "nodes/never-existed", "1"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/Error \[VERSION_NOT_FOUND\]/);
+    expect(res.stderr).not.toMatch(/^\s+at\s/m);
+  });
+
   it("update falls back to draft for an unknown status", () => {
     runCtx(tmp, ["add", "nodes/unk", "--title", "Unknown"]);
     runCtx(tmp, ["update", "nodes/unk", "--status", "not-a-real-status"]);
