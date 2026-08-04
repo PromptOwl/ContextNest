@@ -67,7 +67,8 @@ console.log(report.valid ? "Integrity OK" : `Tampering: ${report.errors}`);
 - **Selector Grammar** — Deterministic query language: select by tag, type, URI, pack, status, and boolean combinations (`type:skill + #engineering`)
 - **Graph Traversal** — Hop-based BFS over `context.yaml` as a lightweight graph index, with priority-weighted edges
 - **Skill Nodes** — First-class `type: skill` nodes with trigger, inputs, tools_required, output_format, and guard_rails
-- **Versioning** — Hash-chained version history with keyframe + diff reconstruction
+- **Versioning** — Hash-chained version history with keyframe + diff reconstruction; each non-keyframe version's change log is a standalone `v{N}.diff` unified diff beside the keyframes
+- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own
 - **Integrity** — SHA-256 content hashes, chain hashes, and checkpoint verification down to the byte
 - **URI Resolution** — Resolve `contextnest://` URIs to documents, tags, folders, or search results
 - **Storage** — Read/write documents, version histories, checkpoints, and config from the vault file system
@@ -100,6 +101,48 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `parseSelector` | Parse selector query strings into AST |
 | `evaluateFromIndex` | Evaluate selectors against the lightweight index (no bodies) |
 | `publishDocument` | Publish a document (bump version, checkpoint) |
+| `publishDocuments` | Bulk publish — one checkpoint and one index pass for the whole batch |
+| `parseStewards` / `serializeStewards` | Canonical `stewards.yaml` marshalling (format only) |
+| `traverseWikiGraph` | `[[wikilink]]` seed resolution and hop traversal |
+
+Errors all carry a `code`: `InvalidSelectorError`, `CorruptHistoryError`,
+`VersionArtifactExistsError`, and the rest are exported from the package root.
+
+## Operation Catalog
+
+`@promptowl/contextnest-engine/api` is a second entry point holding the canonical
+operation set — the same names, input/output schemas, and error codes that the
+CLI, the MCP server, and REST surfaces bind to, so an agent config written
+against one works unchanged against another.
+
+```typescript
+import {
+  NestStorage,
+  GraphQueryEngine,
+  VersionManager,
+} from "@promptowl/contextnest-engine";
+import { createEngineApi } from "@promptowl/contextnest-engine/api";
+
+const storage = new NestStorage("./my-vault");
+const ctx = {
+  storage,
+  query: new GraphQueryEngine(storage),
+  versions: new VersionManager(storage),
+};
+
+const api = createEngineApi();
+const doc = await api.run("context_get", { id: "nodes/api-design" }, ctx);
+```
+
+`run(name, input, ctx)` resolves the operation (canonical name or legacy alias),
+validates the input, runs every extension's authorize gate, executes, and
+notifies `onResult`. The context is identity-agnostic and per-vault — the same
+primitives every surface already builds.
+
+Each operation exposes a Zod schema plus a draft-07 `inputJsonSchema` /
+`outputJsonSchema` for tool manifests. `EngineExtension` lets a consumer register
+extra operations and wrap every call with `authorize` / `onResult` without
+forking the engine — governance policy stays out of the AGPL core.
 
 ## Part of Context Nest
 

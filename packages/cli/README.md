@@ -65,7 +65,7 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 ## Commands
 
 ### Document Management
-- `ctx add <path>` — Create a new document
+- `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)
 - `ctx add <path> --type skill` — Create a skill node with trigger, inputs, and guard rails
 - `ctx read <path>` — Read and display a document in the terminal
 - `ctx read <path> --html` — Render as styled HTML and open in browser
@@ -87,7 +87,17 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 ### Versioning & Integrity
 - `ctx history <path>` — Show version history
 - `ctx reconstruct <path> <version>` — Reconstruct a specific version
-- `ctx verify` — Verify all hash chains
+- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it)
+
+### Errors
+
+Every failure prints as a single line — `Error [CODE]: message` for engine
+errors, a plain `Error: message` for everything else. No stack traces leak into
+normal output.
+
+```bash
+CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
+```
 
 ### Packs & Checkpoints
 - `ctx pack list` — List context packs
