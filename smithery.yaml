@@ -1,0 +1,24 @@
+# Smithery configuration file: https://smithery.ai/docs
+#
+# Context Nest is a *local* governance vault — the value is a server running on
+# the developer's machine against their own `.context/` directory, so this is a
+# stdio server started from the published npm package rather than a hosted one.
+
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP.
+    type: object
+    required:
+      - contextPath
+    properties:
+      contextPath:
+        type: string
+        description: Absolute path to the local directory where your Context Nest
+          vault is stored (the directory containing your `.context` folder).
+  commandFunction:
+    # A function that produces the CLI command to start the MCP on stdio.
+    |-
+    (config) => ({ command: 'npx', args: ['-y', '@promptowl/contextnest-mcp-server'], env: { CONTEXTNEST_VAULT_PATH: config.contextPath } })
+  exampleConfig:
+    contextPath: /Users/you/projects/my-project
