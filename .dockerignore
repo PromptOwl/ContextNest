@@ -1,0 +1,11 @@
+.git
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+*.tsbuildinfo
+.context
+local_vault
+.internal
+.env*
