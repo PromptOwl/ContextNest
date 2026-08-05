@@ -1,7 +1,7 @@
 # MCPB bundle (Smithery stdio release)
 
 Smithery distributes local stdio servers as a pre-built [MCPB](https://github.com/anthropics/mcpb)
-bundle, not from `smithery.yaml`. Build it here, then publish the `.mcpb`.
+bundle. Build it here, then publish the `.mcpb`.
 
 ```bash
 cd mcpb
