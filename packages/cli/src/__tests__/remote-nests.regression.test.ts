@@ -214,8 +214,13 @@ describe("[regression] remote nests — vault registry registration", () => {
     expect(registry).toContain("team:");
     expect(registry).toContain("https://nest.example.com/mcp");
     expect(registry).toContain("CN_TEAM_TOKEN");
-    // The `vaults:` map keeps only path-shaped entries.
-    expect(registry).not.toMatch(/vaults:[\s\S]*url:/);
+    // The `vaults:` map keeps only path-shaped entries — the endpoint must
+    // live in `remotes:`, not inside the vaults block.
+    const vaultsBlock = registry.slice(
+      registry.indexOf("vaults:"),
+      registry.indexOf("remotes:"),
+    );
+    expect(vaultsBlock).not.toContain("url:");
   });
 
   it("never stores secret VALUES — only env-var references", () => {

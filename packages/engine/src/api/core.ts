@@ -27,6 +27,7 @@ const tag = z.string().regex(TAG_PATTERN);
 const nodeSummary = z.object({
   id: z.string(),
   title: z.string(),
+  description: z.string().optional(),
   type: z.enum(NODE_TYPES).default("document"),
   status: z.enum(STATUSES).default("draft"),
   tags: z.array(tag).optional(),
@@ -103,6 +104,8 @@ const queryOp: OperationDescriptor = {
     documents: z.array(nodeSummary),
     source_nodes: z.array(nodeSummary).optional(),
     traversal: traversal.optional(),
+    /** Number of §9 access traces recorded by the query (consumed by `ctx query`). */
+    trace_count: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED", "INVALID_SELECTOR", "INVALID_URI"],
   // "resolve" is the legacy OSS mcp-server tool name for THIS graph query — not
@@ -156,11 +159,18 @@ const getOp: OperationDescriptor = {
         .describe("Document URI, e.g. contextnest://nodes/api-design"),
       id: z.string().optional().describe("Document id / path"),
       title: z.string().optional().describe("Document title"),
+      include_raw: z
+        .boolean()
+        .optional()
+        .describe("Also return the document's exact on-disk bytes as `raw`"),
     })
     .refine((v) => Boolean(v.uri || v.id || v.title), {
       message: "One of uri, id, or title is required",
     }),
-  output: documentPayload,
+  output: documentPayload.extend({
+    /** Exact on-disk file content (frontmatter + body). Present only with include_raw. */
+    raw: z.string().optional(),
+  }),
   errors: [
     "VALIDATION_FAILED",
     "DOCUMENT_NOT_FOUND",
@@ -199,6 +209,10 @@ const createOp: OperationDescriptor = {
   namespace: "core",
   description: "Create a new knowledge node in the vault.",
   input: z.object({
+    id: z
+      .string()
+      .optional()
+      .describe("Explicit document id/path (e.g. 'nodes/api-design'); overrides folder + slugified title"),
     title: z.string().min(1).max(200).describe("Descriptive title"),
     content: z.string().describe("Markdown content body"),
     type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),

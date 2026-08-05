@@ -52,6 +52,7 @@
     "lint": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "diff": "^9.0.0",
     "fast-glob": "^3.3.0",
     "gray-matter": "^4.0.3",

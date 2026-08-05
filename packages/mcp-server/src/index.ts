@@ -31,6 +31,7 @@ import {
   normalizeStatus,
   STATUS_ALIASES,
   normalizeDocumentId,
+  ContextNestError,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -38,6 +39,11 @@ import type {
   GovernanceTier,
   RbacHook,
 } from "@promptowl/contextnest-engine";
+import {
+  createEngineApi,
+  listOperations,
+} from "@promptowl/contextnest-engine/api";
+import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
 
 // Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
@@ -76,9 +82,84 @@ const permissiveRbac: RbacHook = {
   isDocOwner: () => true,
 };
 
+// ─── Canonical operation catalog (API Convergence Phase 2) ────────────────────
+//
+// Every `core` operation from the engine's canonical catalog is exposed under
+// its `context_*` name with catalog-sourced description + input schema — the
+// single implementation lives in the engine's executors, not here. The legacy
+// OSS tool names remain registered below as deprecated aliases for the
+// migration window.
+
+const api = createEngineApi();
+
+/** Fresh per-call execution context over the resolved vault. */
+function opCtx(): OperationContext {
+  return {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    rbac: permissiveRbac,
+    actor: "mcp@contextnest.local",
+  };
+}
+
+function toolResult(payload: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+/**
+ * Structured error contract: every catalog-bound tool failure is an isError
+ * result whose text is `{ code, message }` JSON, with `code` drawn from the
+ * catalog's ERROR_CODES. This is what lets a remote `ctx` client map failures
+ * back to typed engine errors instead of scraping message strings.
+ */
+function toolError(err: unknown) {
+  const code = err instanceof ContextNestError ? err.code : "INTERNAL";
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ code, message }, null, 2) }],
+    isError: true,
+  };
+}
+
+/** Run a catalog operation and package the outcome as a tool result. */
+async function runOp(name: string, input: Record<string, unknown>) {
+  try {
+    return toolResult(await api.run(name, input, opCtx()));
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
+/**
+ * Unwrap a (possibly refined) catalog input schema to its raw object shape —
+ * the SDK's tool() takes a ZodRawShape. Refinements (e.g. "one of uri/id/title
+ * required") still run: api.run() re-validates against the full schema.
+ * Uses _def.typeName rather than instanceof so a duplicated zod instance in
+ * the dependency graph can't silently break the unwrap.
+ */
+function inputShape(op: OperationDescriptor): Record<string, z.ZodTypeAny> {
+  let schema: any = op.input;
+  while (schema?._def?.typeName === "ZodEffects") schema = schema._def.schema;
+  return schema.shape as Record<string, z.ZodTypeAny>;
+}
+
+for (const op of listOperations("core")) {
+  server.tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
+    runOp(op.name, args),
+  );
+}
+
+/** Description for a deprecated legacy alias, steering agents to the canonical name. */
+function deprecated(canonical: string, description: string): string {
+  return `DEPRECATED — use ${canonical}. ${description}`;
+}
+
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
-server.tool("vault_info", "Get vault identity (CONTEXT.md) and configuration summary", {}, async () => {
+server.tool("vault_info", deprecated("context_overview", "Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
   const contextMd = await storage.readContextMd();
   const config = await storage.readConfig();
 
@@ -112,89 +193,47 @@ server.tool("vault_info", "Get vault identity (CONTEXT.md) and configuration sum
 
 server.tool(
   "resolve",
-  "Execute a selector query to find matching documents using graph traversal",
+  deprecated("context_query", "Execute a selector query to find matching documents using graph traversal"),
   {
-    selector: z.string().describe("Selector query expression (e.g., '#engineering + type:document')"),
+    // Superset of the catalog shape: the legacy param was `selector`, the
+    // canonical one is `query`. Both are accepted for the migration window;
+    // the catalog op does the real validation.
+    selector: z.string().optional().describe("Legacy name for `query`"),
+    query: z.string().optional().describe("Selector query expression (e.g., '#engineering + type:document')"),
     hops: z.number().optional().describe("Graph traversal depth (default: 2). More hops = more context, slower. Fewer hops = faster, less context."),
     full: z.boolean().optional().describe("Force full-load mode, bypassing graph traversal (default: false)"),
   },
-  async ({ selector, hops, full }) => {
-    const engine = new GraphQueryEngine(storage);
-    const result = await engine.query(selector, {
-      hops: hops ?? 2,
-      full: full ?? false,
-    });
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            {
-              documents: result.documents.map((d) => ({
-                id: d.id,
-                title: d.frontmatter.title,
-                type: d.frontmatter.type || "document",
-                status: d.frontmatter.status || "draft",
-                tags: d.frontmatter.tags,
-                body: d.body,
-              })),
-              source_nodes: result.sourceNodes.map((d) => ({
-                id: d.id,
-                title: d.frontmatter.title,
-                source: d.frontmatter.source,
-                body: d.body,
-              })),
-              traversal: {
-                mode: result.mode,
-                hops_used: result.hopsUsed,
-                nodes_traversed: result.nodesTraversed,
-              },
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+  async ({ selector, query, hops, full }) => {
+    const input: Record<string, unknown> = { query: query ?? selector };
+    if (hops !== undefined) input.hops = hops;
+    if (full !== undefined) input.full = full;
+    return runOp("context_query", input);
   },
 );
 
-// ─── Tool: read_document ───────────────────────────────────────────────────────
+// ─── Tool: read_document (deprecated alias of context_get) ─────────────────────
 
 server.tool(
   "read_document",
-  "Read a single document by its contextnest:// URI or path",
-  { uri: z.string().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')") },
-  async ({ uri }) => {
-    let docId: string;
-    if (uri.startsWith("contextnest://")) {
-      const parsed = parseUri(uri);
-      docId = parsed.path;
-    } else {
-      // Mirror create_document: a bare slug resolves into nodes/ so a doc is
-      // readable by the same path it was created with (normalizeDocumentId is
-      // the single source of truth across every surface).
-      docId = normalizeDocumentId(uri);
+  deprecated("context_get", "Read a single document by its contextnest:// URI or path"),
+  {
+    uri: z.string().optional().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe("Document id / path"),
+    title: z.string().optional().describe("Document title"),
+    include_raw: z.boolean().optional().describe("Also return the exact on-disk bytes as `raw`"),
+  },
+  async ({ uri, id, title, include_raw }) => {
+    const input: Record<string, unknown> = {};
+    if (id) input.id = id;
+    else if (uri) {
+      // The legacy param accepted a plain path in `uri`; the catalog op treats
+      // `uri` strictly, so route non-URIs through `id`.
+      if (uri.startsWith("contextnest://")) input.uri = uri;
+      else input.id = uri;
     }
-
-    const doc = await storage.readDocument(docId);
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            {
-              id: doc.id,
-              frontmatter: doc.frontmatter,
-              body: doc.body,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    if (title) input.title = title;
+    if (include_raw !== undefined) input.include_raw = include_raw;
+    return runOp("context_get", input);
   },
 );
 
@@ -202,7 +241,7 @@ server.tool(
 
 server.tool(
   "list_documents",
-  "List all documents with optional filters",
+  deprecated("context_list", "List all documents with optional filters"),
   {
     type: z.string().optional().describe("Filter by node type"),
     status: z
@@ -465,7 +504,7 @@ server.tool(
 
 server.tool(
   "search",
-  "Full-text search across vault documents with graph traversal",
+  deprecated("context_search", "Full-text search across vault documents with graph traversal"),
   {
     query: z.string().describe("Search query"),
     hops: z.number().optional().describe("Graph traversal depth from search results (default: 2)"),
@@ -509,7 +548,7 @@ server.tool(
 
 // ─── Tool: verify_integrity ────────────────────────────────────────────────────
 
-server.tool("verify_integrity", "Verify integrity of all hash chains in the vault", {}, async () => {
+server.tool("verify_integrity", deprecated("context_verify", "Verify integrity of all hash chains in the vault"), {}, async () => {
   const report = await storage.verifyVaultIntegrity();
   return {
     content: [
@@ -553,7 +592,7 @@ server.tool(
 
 server.tool(
   "read_version",
-  "Read a specific version of a document",
+  deprecated("context_reconstruct", "Read a specific version of a document"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     version: z.number().describe("Version number to reconstruct"),
@@ -578,7 +617,7 @@ server.tool(
 
 server.tool(
   "create_document",
-  "Create a new document in the vault with frontmatter and optional body content",
+  deprecated("context_create", "Create a new document in the vault with frontmatter and optional body content"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().describe("Document title"),
@@ -690,7 +729,7 @@ server.tool(
 
 server.tool(
   "update_document",
-  "Update an existing document's frontmatter fields and/or body content",
+  deprecated("context_update", "Update an existing document's frontmatter fields and/or body content"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().optional().describe("New title"),
@@ -838,7 +877,7 @@ server.tool(
 
 server.tool(
   "delete_document",
-  "Delete a document and its version history from the vault",
+  deprecated("context_delete", "Delete a document and its version history from the vault"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
   },
@@ -870,7 +909,7 @@ server.tool(
 
 server.tool(
   "publish_document",
-  "Publish a document: bump version, compute checksum, create version entry and checkpoint",
+  deprecated("context_publish", "Publish a document: bump version, compute checksum, create version entry and checkpoint"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),

@@ -27,6 +27,24 @@ const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.ur
 const FIXTURES = fileURLToPath(new URL("../../../../fixtures/minimal-vault", import.meta.url));
 
 const EXPECTED_TOOLS = [
+  // Canonical catalog operations (API Convergence Phase 2).
+  "context_get",
+  "context_query",
+  "context_resolve",
+  "context_list",
+  "context_search",
+  "context_create",
+  "context_update",
+  "context_publish",
+  "context_delete",
+  "context_versions",
+  "context_reconstruct",
+  "context_overview",
+  "context_verify",
+  "context_init",
+  "context_packs",
+  "context_import",
+  // Legacy names — kept as deprecated aliases for the migration window.
   "vault_info",
   "resolve",
   "read_document",

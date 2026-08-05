@@ -34,6 +34,9 @@ function toSummary(node: ContextNode, includeBody = false) {
   return {
     id: node.id,
     title: node.frontmatter.title,
+    ...(node.frontmatter.description !== undefined
+      ? { description: node.frontmatter.description }
+      : {}),
     type: node.frontmatter.type ?? "document",
     status: node.frontmatter.status ?? "draft",
     tags: node.frontmatter.tags,
@@ -133,6 +136,7 @@ const query: OperationExecutor = async (ctx, input: any) => {
       hops_used: result.hopsUsed,
       nodes_traversed: result.nodesTraversed,
     },
+    trace_count: result.traces.length,
   };
 };
 
@@ -183,7 +187,12 @@ const get: OperationExecutor = async (ctx, input: any) => {
   const node = await ctx.storage.readDocument(id);
   // Consistent rejected handling (the descriptor advertises REJECTED_DOCUMENT).
   if (isRejected(node)) throw new RejectedDocumentError(node.id);
-  return { id: node.id, frontmatter: node.frontmatter, body: node.body };
+  return {
+    id: node.id,
+    frontmatter: node.frontmatter,
+    body: node.body,
+    ...(input.include_raw ? { raw: node.rawContent } : {}),
+  };
 };
 
 const list: OperationExecutor = async (ctx, input: any) => {
@@ -209,6 +218,7 @@ const list: OperationExecutor = async (ctx, input: any) => {
  * the bulk `import` executor so their node shape stays identical.
  */
 function buildDraftNode(input: {
+  id?: string;
   title: string;
   content: string;
   type?: string;
@@ -220,7 +230,11 @@ function buildDraftNode(input: {
     .split("/")
     .map(slugify)
     .filter(Boolean);
-  const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  // An explicit id wins over the folder+title derivation — this is how the CLI
+  // (`ctx add <path>`) and the legacy create_document `path` param address docs.
+  const id = input.id
+    ? normalizeDocumentId(input.id)
+    : normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
   const frontmatter: Frontmatter = {
     title: input.title,
     type: (input.type as Frontmatter["type"]) ?? "document",
