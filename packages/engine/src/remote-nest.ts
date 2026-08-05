@@ -90,10 +90,17 @@ export async function connectRemoteNest(
       );
       // StdioClientTransport REPLACES the child env when `env` is set, so
       // forward the caller's environment (the spawned server may need PATH,
-      // CONTEXTNEST_* overrides, proxies, …). Undefined values are filtered to
-      // satisfy the Record<string, string> contract.
+      // proxies, …). Undefined values are filtered to satisfy the
+      // Record<string, string> contract.
+      //
+      // EXCEPT the caller's ambient vault selectors: the child's target vault
+      // is fully determined by this spec's command/args. Leaking
+      // CONTEXTNEST_VAULT=<this remote's own alias> would make the spawned
+      // server resolve the alias, find a remote, and refuse to start
+      // ("local-only") — a self-referential deadlock.
       const childEnv: Record<string, string> = {};
       for (const [k, v] of Object.entries(env)) {
+        if (k === "CONTEXTNEST_VAULT" || k === "CONTEXTNEST_VAULT_PATH") continue;
         if (typeof v === "string") childEnv[k] = v;
       }
       const transport = new StdioClientTransport({

@@ -124,6 +124,21 @@ async function callError(
 
 const CORE_OPS = listOperations("core");
 
+/**
+ * Normalize a query-shaped payload for identity comparison: graph traversal
+ * does not guarantee document ORDER between calls, so sort by id. The
+ * contract under test is "same documents, same shapes, same metadata" — not
+ * a stable iteration order.
+ */
+function sortedQueryResult<T extends { documents?: any[]; source_nodes?: any[] }>(payload: T): T {
+  const byId = (a: any, b: any) => String(a.id).localeCompare(String(b.id));
+  return {
+    ...payload,
+    ...(payload.documents ? { documents: [...payload.documents].sort(byId) } : {}),
+    ...(payload.source_nodes ? { source_nodes: [...payload.source_nodes].sort(byId) } : {}),
+  };
+}
+
 // ─── Tool surface ───────────────────────────────────────────────────────────
 
 describe("[regression] catalog binding — tool surface", () => {
@@ -211,6 +226,10 @@ describe("[regression] catalog binding — read operations return catalog shapes
   beforeAll(async () => {
     vault = await freshVault();
     client = await connect(vault);
+    // Warm the vault index: the first query against a fixture without
+    // context.yaml triggers auto-indexing, and a query racing that warmup can
+    // see different traversal results than the next one.
+    await callJson(client, "context_query", { query: "#engineering" });
   });
 
   afterAll(async () => {
@@ -259,7 +278,7 @@ describe("[regression] catalog binding — read operations return catalog shapes
   it("legacy alias resolve answers identically to context_query", async () => {
     const canonical = await callJson(client, "context_query", { query: "#engineering" });
     const legacy = await callJson(client, "resolve", { query: "#engineering" });
-    expect(legacy).toEqual(canonical);
+    expect(sortedQueryResult(legacy)).toEqual(sortedQueryResult(canonical));
   });
 
   it("context_search returns scored summaries", async () => {
@@ -366,6 +385,68 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
   });
 });
 
+// ─── Alias adapter edge cases ───────────────────────────────────────────────
+
+describe("[regression] catalog binding — alias adapter edge cases", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+    // Warm the auto-generated index before any query-identity comparison.
+    await callJson(client, "context_query", { query: "#engineering" });
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("read_document still accepts a plain path in its legacy uri param", async () => {
+    const legacy = await callJson(client, "read_document", { uri: "nodes/api-design" });
+    const canonical = await callJson(client, "context_get", { id: "nodes/api-design" });
+    expect(legacy).toEqual(canonical);
+  });
+
+  it("read_document accepts a real contextnest:// uri", async () => {
+    const byUri = await callJson(client, "read_document", {
+      uri: "contextnest://nodes/api-design",
+    });
+    expect(byUri.id).toBe("nodes/api-design");
+  });
+
+  it("context_get resolves by uri and by title too", async () => {
+    const byUri = await callJson(client, "context_get", {
+      uri: "contextnest://nodes/api-design",
+    });
+    expect(byUri.id).toBe("nodes/api-design");
+    const byTitle = await callJson(client, "context_get", { title: "API Design Guidelines" });
+    expect(byTitle.id).toBe("nodes/api-design");
+  });
+
+  it("context_get include_raw returns the exact on-disk bytes", async () => {
+    const got = await callJson(client, "context_get", {
+      id: "nodes/api-design",
+      include_raw: true,
+    });
+    const { readFile } = await import("node:fs/promises");
+    const onDisk = await readFile(join(vault, "nodes", "api-design.md"), "utf-8");
+    expect(got.raw).toBe(onDisk);
+  });
+
+  it("resolve accepts the legacy selector param and answers like canonical query", async () => {
+    const legacy = await callJson(client, "resolve", { selector: "#engineering" });
+    const canonical = await callJson(client, "context_query", { query: "#engineering" });
+    expect(sortedQueryResult(legacy)).toEqual(sortedQueryResult(canonical));
+  });
+
+  it("resolve with neither query nor selector returns a structured VALIDATION_FAILED", async () => {
+    const err = await callError(client, "resolve", {});
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+});
+
 // ─── Structured errors ──────────────────────────────────────────────────────
 
 describe("[regression] catalog binding — structured error contract", () => {
@@ -396,5 +477,44 @@ describe("[regression] catalog binding — structured error contract", () => {
     const canonical = await callError(client, "context_get", { id: "nodes/no-such-doc" });
     const legacy = await callError(client, "read_document", { id: "nodes/no-such-doc" });
     expect(legacy.code).toBe(canonical.code);
+  });
+
+  it("context_delete on a missing document yields DOCUMENT_NOT_FOUND", async () => {
+    const err = await callError(client, "context_delete", { id: "nodes/no-such-doc" });
+    expect(err.code).toBe("DOCUMENT_NOT_FOUND");
+  });
+
+  it("context_create with an un-sluggable title yields a structured VALIDATION_FAILED", async () => {
+    // "!!!" passes the schema (string, 1–200 chars) but has no slug-able
+    // characters, so the ENGINE rejects it — this pins the structured error
+    // contract for semantically-invalid input. (Schema-invalid input, e.g. a
+    // malformed tag, is rejected earlier by MCP protocol-level validation,
+    // which is standard SDK behavior and not part of this contract.)
+    const err = await callError(client, "context_create", {
+      title: "!!!",
+      content: "b",
+    });
+    expect(err.code).toBe("VALIDATION_FAILED");
+    expect(err.message).toMatch(/slug/i);
+  });
+
+  it("content edits on a rejected doc yield REJECTED_DOCUMENT across surfaces", async () => {
+    // Create canonically, retire via the legacy status-transition surface
+    // (the catalog has no status op yet), then hit both read and update.
+    await callJson(client, "context_create", {
+      id: "nodes/retired-probe",
+      title: "Retired Probe",
+      content: "b",
+    });
+    await callJson(client, "update_document", { path: "nodes/retired-probe", status: "rejected" });
+
+    const updateErr = await callError(client, "context_update", {
+      id: "nodes/retired-probe",
+      content: "sneaky",
+    });
+    expect(updateErr.code).toBe("REJECTED_DOCUMENT");
+
+    const getErr = await callError(client, "context_get", { id: "nodes/retired-probe" });
+    expect(getErr.code).toBe("REJECTED_DOCUMENT");
   });
 });

@@ -498,6 +498,244 @@ describe("[regression] remote nests — guardrails", () => {
   });
 });
 
+// ─── 3b. Registration flag validation ───────────────────────────────────────
+
+describe("[regression] remote nests — vault add flag validation", () => {
+  let configDir: string;
+  let cwd: string;
+  let run: ReturnType<typeof makeRunner>;
+
+  beforeEach(() => {
+    configDir = mkdtempSync(join(tmpdir(), "cn-remote-flags-cfg-"));
+    cwd = mkdtempSync(join(tmpdir(), "cn-remote-flags-cwd-"));
+    run = makeRunner(configDir);
+  });
+
+  afterEach(() => {
+    rmSync(configDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("rejects --url combined with --mcp-command", () => {
+    const res = run(cwd, [
+      "vault", "add", "x",
+      "--url", "https://a/mcp",
+      "--mcp-command", "node",
+    ]);
+    expect(res.status).not.toBe(0);
+    expect(res.stdout + res.stderr).toMatch(/either --url or --mcp-command/i);
+  });
+
+  it("rejects a path argument alongside --url", () => {
+    const res = run(cwd, ["vault", "add", "x", "/some/path", "--url", "https://a/mcp"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stdout + res.stderr).toMatch(/no path/i);
+  });
+
+  it("--force replaces an existing remote's endpoint", () => {
+    expect(run(cwd, ["vault", "add", "x", "--url", "https://old.example.com/mcp"]).status).toBe(0);
+    expect(run(cwd, ["vault", "add", "x", "--url", "https://new.example.com/mcp"]).status).not.toBe(0);
+    const forced = run(cwd, ["vault", "add", "x", "--url", "https://new.example.com/mcp", "--force"]);
+    expect(forced.status, forced.stderr).toBe(0);
+    const registry = readFileSync(join(configDir, "config.yaml"), "utf-8");
+    expect(registry).toContain("new.example.com");
+    expect(registry).not.toContain("old.example.com");
+  });
+
+  it("a malformed alias is rejected for remotes too", () => {
+    const res = run(cwd, ["vault", "add", "bad alias", "--url", "https://a/mcp"]);
+    expect(res.status).not.toBe(0);
+  });
+});
+
+// ─── 3c. Unsupported options fail loudly, not silently ──────────────────────
+
+describe("[regression] remote nests — unsupported options fail loudly", () => {
+  let configDir: string;
+  let cwd: string;
+  let localVault: string;
+  let serverVault: string;
+  let run: ReturnType<typeof makeRunner>;
+
+  beforeAll(() => {
+    configDir = mkdtempSync(join(tmpdir(), "cn-remote-unsup-cfg-"));
+    cwd = mkdtempSync(join(tmpdir(), "cn-remote-unsup-cwd-"));
+    localVault = freshVault("cn-remote-unsup-local-");
+    serverVault = freshVault("cn-remote-unsup-server-");
+    writeRegistryWithStdioRemote(configDir, localVault, serverVault);
+    run = makeRunner(configDir);
+  });
+
+  afterAll(() => {
+    for (const dir of [configDir, cwd, localVault, serverVault]) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ctx read --html on a remote errors clearly (exit 1, not 3)", () => {
+    const res = run(cwd, ["read", "nodes/api-design", "--html", "--vault", "farnest"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/not supported/i);
+  });
+
+  it("ctx update --status on a remote errors clearly instead of diverging", () => {
+    const res = run(cwd, [
+      "update", "nodes/api-design", "--status", "draft", "--vault", "farnest",
+    ]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/--body/);
+  });
+
+  it("ctx update with no flags on a remote reports nothing to update", () => {
+    const res = run(cwd, ["update", "nodes/api-design", "--vault", "farnest"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/--body|nothing to update/i);
+  });
+
+  it("ctx add --type skill on a remote errors clearly", () => {
+    const res = run(cwd, [
+      "add", "nodes/some-skill", "--type", "skill", "--vault", "farnest",
+    ]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/not supported/i);
+    expect(existsSync(join(serverVault, "nodes", "some-skill.md"))).toBe(false);
+  });
+
+  it("a remote-side failure (missing doc) exits 1 with the typed code — never 3", () => {
+    const res = run(cwd, ["read", "nodes/does-not-exist", "--raw", "--vault", "farnest"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("DOCUMENT_NOT_FOUND");
+  });
+
+  it("a nonexistent stdio command exits 3 like a dead process", () => {
+    const yaml = [
+      "version: 1",
+      "vaults: {}",
+      "remotes:",
+      "  ghostcmd:",
+      "    transport: stdio",
+      `    command: ${yq("definitely-not-a-real-command-cn")}`,
+      "",
+    ].join("\n");
+    writeFileSync(join(configDir, "config.yaml"), yaml, "utf-8");
+    try {
+      const res = run(cwd, ["list", "--json", "--vault", "ghostcmd"]);
+      expect(res.status).toBe(REMOTE_UNREACHABLE_EXIT);
+      expect(res.stderr).toMatch(/ghostcmd/);
+    } finally {
+      writeRegistryWithStdioRemote(configDir, localVault, serverVault);
+    }
+  });
+});
+
+// ─── 3d. Filter parity and ambient (env/default) routing ────────────────────
+
+describe("[regression] remote nests — filter parity and ambient routing", () => {
+  let configDir: string;
+  let cwd: string;
+  let localVault: string;
+  let serverVault: string;
+  let run: ReturnType<typeof makeRunner>;
+
+  beforeAll(() => {
+    configDir = mkdtempSync(join(tmpdir(), "cn-remote-amb-cfg-"));
+    cwd = mkdtempSync(join(tmpdir(), "cn-remote-amb-cwd-"));
+    localVault = freshVault("cn-remote-amb-local-");
+    serverVault = freshVault("cn-remote-amb-server-");
+    writeRegistryWithStdioRemote(configDir, localVault, serverVault);
+    run = makeRunner(configDir);
+  });
+
+  afterAll(() => {
+    for (const dir of [configDir, cwd, localVault, serverVault]) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ctx list --json --type filter is shape-identical between local and remote", () => {
+    const local = run(cwd, ["list", "--json", "--type", "document", "--vault", "local"]);
+    const remote = run(cwd, ["list", "--json", "--type", "document", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("ctx list --json --tag filter is shape-identical between local and remote", () => {
+    const local = run(cwd, ["list", "--json", "--tag", "api", "--vault", "local"]);
+    const remote = run(cwd, ["list", "--json", "--tag", "api", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+    expect(JSON.parse(remote.stdout).length).toBeGreaterThan(0);
+  });
+
+  it("ctx list --json --status alias filter is shape-identical between local and remote", () => {
+    // 'active' is a status alias for 'published' — both branches must normalize it.
+    const local = run(cwd, ["list", "--json", "--status", "active", "--vault", "local"]);
+    const remote = run(cwd, ["list", "--json", "--status", "active", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("ctx query --hops 0 is shape-identical between local and remote", () => {
+    const local = run(cwd, ["query", "#engineering", "--json", "--hops", "0", "--vault", "local"]);
+    const remote = run(cwd, ["query", "#engineering", "--json", "--hops", "0", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("CONTEXTNEST_VAULT env alias routes to the remote without --vault", () => {
+    const viaEnv = run(cwd, ["list", "--json"], { CONTEXTNEST_VAULT: "farnest" });
+    expect(viaEnv.status, viaEnv.stderr).toBe(0);
+    const viaFlag = run(cwd, ["list", "--json", "--vault", "farnest"]);
+    expect(normalized(viaEnv.stdout)).toEqual(normalized(viaFlag.stdout));
+  });
+
+  it("a remote registry default routes commands from a bare cwd", () => {
+    const yaml = [
+      "version: 1",
+      "default: farnest",
+      "vaults:",
+      "  local:",
+      `    path: ${yq(localVault)}`,
+      "remotes:",
+      "  farnest:",
+      "    transport: stdio",
+      `    command: ${yq(process.execPath)}`,
+      "    args:",
+      `      - ${yq(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "mcp-server", "dist", "index.js"))}`,
+      `      - ${yq(serverVault)}`,
+      "",
+    ].join("\n");
+    writeFileSync(join(configDir, "config.yaml"), yaml, "utf-8");
+    try {
+      const viaDefault = run(cwd, ["list", "--json"]);
+      expect(viaDefault.status, viaDefault.stderr).toBe(0);
+      const viaFlag = run(cwd, ["list", "--json", "--vault", "farnest"]);
+      expect(normalized(viaDefault.stdout)).toEqual(normalized(viaFlag.stdout));
+
+      // vault which reports the remote default.
+      const which = run(cwd, ["vault", "which"]);
+      expect(which.status, which.stderr).toBe(0);
+      expect(which.stdout).toMatch(/remote/i);
+      expect(which.stdout).toMatch(/farnest/);
+    } finally {
+      writeRegistryWithStdioRemote(configDir, localVault, serverVault);
+    }
+  });
+
+  it("ctx history on a draft with no versions reports cleanly over remote", () => {
+    // nodes/onboarding-guide is a fixture draft with no .versions history.
+    const res = run(cwd, ["history", "nodes/onboarding-guide", "--vault", "farnest"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout).toMatch(/No version history/i);
+  });
+
+  it("ctx read (terminal mode) renders the remote document", () => {
+    const res = run(cwd, ["read", "nodes/api-design", "--vault", "farnest"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout).toContain("API Design Guidelines");
+  });
+});
+
 // ─── 4. Remote routing — write surface ──────────────────────────────────────
 
 describe("[regression] remote nests — write surface routed over stdio MCP", () => {
