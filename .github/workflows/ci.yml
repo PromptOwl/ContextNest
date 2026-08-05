@@ -51,6 +51,11 @@ jobs:
       - name: Lint (type-check)
         run: pnpm lint
 
+      # The MCPB bundle vendors the published mcp-server package, so a stale
+      # manifest version ships a bundle that misreports what is inside it.
+      - name: Check MCPB manifest version
+        run: pnpm mcpb:check
+
       - name: Test
         run: pnpm test
 

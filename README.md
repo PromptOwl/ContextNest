@@ -451,6 +451,16 @@ docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
 
 The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
 
+### Installing from Smithery
+
+The server is distributed as an [MCPB](https://github.com/anthropics/mcpb) bundle that runs locally — your vault never leaves your machine:
+
+```bash
+npx smithery mcp add promptowl/context-nest -c claude-code
+```
+
+`-c` also accepts `cursor`, `vscode`, `windsurf`, `codex` and others. You will be asked for your vault directory (the one containing `.context/`). See [`mcpb/README.md`](mcpb/README.md) to build or publish the bundle.
+
 ### Configuring with Claude Code
 
 Add to your project's `.mcp.json`:

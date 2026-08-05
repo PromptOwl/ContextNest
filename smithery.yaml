@@ -16,9 +16,8 @@ startCommand:
         type: string
         description: Absolute path to the local directory where your Context Nest
           vault is stored (the directory containing your `.context` folder).
-  commandFunction:
-    # A function that produces the CLI command to start the MCP on stdio.
-    |-
+  # A function that produces the CLI command to start the MCP on stdio.
+  commandFunction: |-
     (config) => ({ command: 'npx', args: ['-y', '@promptowl/contextnest-mcp-server'], env: { CONTEXTNEST_VAULT_PATH: config.contextPath } })
   exampleConfig:
     contextPath: /Users/you/projects/my-project
