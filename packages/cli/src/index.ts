@@ -67,6 +67,14 @@ import {
   remotePublish,
   remoteDelete,
 } from "./remote.js";
+import {
+  filterDocList,
+  listJsonEntry,
+  queryJsonPayload,
+  searchJsonEntry,
+  titleFromId,
+  parseTagsOption,
+} from "./doc-views.js";
 import type {
   ContextNode,
   Frontmatter,
@@ -947,11 +955,9 @@ program
       );
     }
 
-    const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+    const title = opts.title || titleFromId(id);
 
-    const tagList = opts.tags
-      ? opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`))
-      : undefined;
+    const tagList = opts.tags ? parseTagsOption(opts.tags) : undefined;
     const frontmatter: Frontmatter = {
       title,
       type: opts.type,
@@ -1473,9 +1479,10 @@ program
     });
 
     if (opts.json) {
+      // Field selection shared with the remote branch (doc-views.ts).
       console.log(
         JSON.stringify(
-          {
+          queryJsonPayload({
             documents: result.documents.map((d) => ({
               id: d.id,
               title: d.frontmatter.title,
@@ -1491,7 +1498,7 @@ program
             mode: result.mode,
             hopsUsed: result.hopsUsed,
             nodesTraversed: result.nodesTraversed,
-          },
+          }),
           null,
           2,
         ),
@@ -1529,43 +1536,31 @@ program
     }
     const storage = getStorage();
     // Include retired so users can list them with `--status rejected`; the
-    // default branch below re-filters them out when no status is requested.
-    let docs = await storage.discoverDocuments({ includeRetired: true });
-
-    if (opts.type) docs = docs.filter((d) => (d.frontmatter.type || "document") === opts.type);
-    if (opts.status) {
-      const wanted = normalizeStatus(opts.status);
-      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
-    } else {
-      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
-    }
-    if (opts.tag) {
-      const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
-      docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
-    }
+    // shared filter re-hides them when no status is requested.
+    const discovered = await storage.discoverDocuments({ includeRetired: true });
+    // Filter semantics + field selection are shared with the remote branch
+    // (doc-views.ts) so the two can never drift apart on defaults.
+    const docs = filterDocList(
+      discovered.map((d) => ({
+        id: d.id,
+        title: d.frontmatter.title,
+        type: d.frontmatter.type,
+        status: d.frontmatter.status,
+        tags: d.frontmatter.tags,
+      })),
+      opts,
+    );
 
     if (opts.json) {
-      console.log(
-        JSON.stringify(
-          docs.map((d) => ({
-            id: d.id,
-            title: d.frontmatter.title,
-            type: d.frontmatter.type || "document",
-            status: d.frontmatter.status || "draft",
-            tags: d.frontmatter.tags,
-          })),
-          null,
-          2,
-        ),
-      );
+      console.log(JSON.stringify(docs.map(listJsonEntry), null, 2));
     } else {
       if (docs.length === 0) {
         console.log(chalk.yellow("No documents found."));
       } else {
         console.log(chalk.bold(`${docs.length} document(s):\n`));
         for (const doc of docs) {
-          const type = doc.frontmatter.type || "document";
-          const status = doc.frontmatter.status || "draft";
+          const type = doc.type || "document";
+          const status = doc.status || "draft";
           const statusColor =
             status === "published" ? chalk.green
             : status === "approved" ? chalk.cyan
@@ -1573,7 +1568,7 @@ program
             : status === "rejected" ? chalk.red
             : chalk.yellow;
           console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
-          console.log(`    ${doc.frontmatter.title}`);
+          console.log(`    ${doc.title}`);
         }
       }
     }
@@ -1603,7 +1598,7 @@ program
       doc.frontmatter.status = normalizeStatus(opts.status);
     }
     if (opts.tags !== undefined) {
-      doc.frontmatter.tags = opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
+      doc.frontmatter.tags = parseTagsOption(opts.tags);
     }
     doc.frontmatter.updated_at = new Date().toISOString();
 
@@ -1699,14 +1694,17 @@ program
     const results = await resolver.resolve(uri);
 
     if (opts.json) {
+      // Field selection shared with the remote branch (doc-views.ts).
       console.log(
         JSON.stringify(
-          results.map((d) => ({
-            id: d.id,
-            title: d.frontmatter.title,
-            description: d.frontmatter.description,
-            type: d.frontmatter.type || "document",
-          })),
+          results.map((d) =>
+            searchJsonEntry({
+              id: d.id,
+              title: d.frontmatter.title,
+              description: d.frontmatter.description,
+              type: d.frontmatter.type,
+            }),
+          ),
           null,
           2,
         ),

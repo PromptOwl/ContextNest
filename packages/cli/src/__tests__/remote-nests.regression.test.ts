@@ -1,10 +1,10 @@
 /**
- * [regression] TDD contract suite — local + remote nests through the ctx CLI.
+ * [regression] Contract suite — local + remote nests through the ctx CLI.
  *
  * Written test-first for docs/plans/remote-nests-mcp-integration.md (§3
- * registry `remotes:` map, §4 remote backend, §5 CLI routing): these tests
- * encode the TARGET contract and are expected to FAIL until the feature
- * lands.
+ * registry `remotes:` map, §4 remote backend, §5 CLI routing); the
+ * implementation landed on this same branch, and this suite is now the
+ * normative contract guarding it against regressions.
  *
  * Contract under test:
  *  1. Registration UX — `ctx vault add` grows remote flags (--url /

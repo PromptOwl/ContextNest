@@ -112,6 +112,61 @@ describe("registry remotes", () => {
     ).toThrow(/bearer_env/);
   });
 
+  it("rejects credentials over cleartext http to a non-loopback host", () => {
+    expect(() =>
+      addRemote("x", {
+        transport: "http",
+        url: "http://nest.example.com/mcp",
+        auth: { bearer_env: "CN_TOKEN" },
+      }),
+    ).toThrow(/cleartext|https/);
+  });
+
+  it("allows credentials over https, and over loopback http for local testing", () => {
+    expect(() => addRemote("secure", HTTP_SPEC)).not.toThrow();
+    for (const [alias, host] of [
+      ["lo1", "localhost"],
+      ["lo2", "127.0.0.1"],
+      ["lo3", "127.1.2.3"],
+    ] as const) {
+      expect(() =>
+        addRemote(alias, {
+          transport: "http",
+          url: `http://${host}:8080/mcp`,
+          auth: { bearer_env: "CN_TOKEN" },
+        }),
+      ).not.toThrow();
+    }
+  });
+
+  it("allows cleartext http WITHOUT credentials (nothing secret to leak)", () => {
+    expect(() =>
+      addRemote("open", { transport: "http", url: "http://nest.example.com/mcp" }),
+    ).not.toThrow();
+  });
+
+  it("rejects unparseable and non-http(s) urls", () => {
+    expect(() => addRemote("x", { transport: "http", url: "not a url" })).toThrow(/valid URL/);
+    expect(() => addRemote("x", { transport: "http", url: "ftp://x/mcp" })).toThrow(/http/);
+  });
+
+  it("readRegistry enforces the cleartext-credentials rule on hand-edited files too", () => {
+    writeRawRegistry(
+      [
+        "version: 1",
+        "vaults: {}",
+        "remotes:",
+        "  insecure:",
+        "    transport: http",
+        "    url: http://nest.example.com/mcp",
+        "    auth:",
+        "      bearer_env: CN_TOKEN",
+        "",
+      ].join("\n"),
+    );
+    expect(() => readRegistry()).toThrow(/cleartext|https/);
+  });
+
   it("the first-ever registry entry becomes the default, later ones do not", () => {
     addRemote("first", HTTP_SPEC);
     expect(readRegistry().default).toBe("first");

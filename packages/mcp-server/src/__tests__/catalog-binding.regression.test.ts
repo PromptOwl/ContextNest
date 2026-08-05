@@ -1,11 +1,11 @@
 /**
- * [regression] TDD contract suite — MCP server bound to the canonical
- * operation catalog (API Convergence Phase 2).
+ * [regression] Contract suite — MCP server bound to the canonical operation
+ * catalog (API Convergence Phase 2).
  *
- * Written test-first for docs/plans/remote-nests-mcp-integration.md §2/§4.2:
- * these tests encode the TARGET contract and are expected to FAIL until the
- * server migrates from its hand-written inline schemas onto
- * `@promptowl/contextnest-engine/api`.
+ * Written test-first for docs/plans/remote-nests-mcp-integration.md §2/§4.2;
+ * the implementation (server generated from `@promptowl/contextnest-engine/api`
+ * instead of hand-written inline schemas) landed on this same branch, and this
+ * suite is now the normative contract guarding it against regressions.
  *
  * Contract under test:
  *  1. Every `core` catalog operation is exposed as an MCP tool under its

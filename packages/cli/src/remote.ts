@@ -18,10 +18,17 @@ import {
   ContextNestError,
   connectRemoteNest,
   normalizeDocumentId,
-  normalizeStatus,
   resolveNest,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestConnection, RemoteNestSpec } from "@promptowl/contextnest-engine";
+import {
+  filterDocList,
+  listJsonEntry,
+  queryJsonPayload,
+  searchJsonEntry,
+  titleFromId,
+  parseTagsOption,
+} from "./doc-views.js";
 
 export interface RemoteTarget {
   alias: string;
@@ -72,35 +79,12 @@ export async function remoteList(
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {});
-    // Replicate the local command's filter semantics client-side so the two
-    // branches can never drift apart on defaults (e.g. rejected hidden).
-    let docs = out.documents;
-    if (opts.type) docs = docs.filter((d) => (d.type || "document") === opts.type);
-    if (opts.status) {
-      const wanted = normalizeStatus(opts.status);
-      docs = docs.filter((d) => (d.status || "draft") === wanted);
-    } else {
-      docs = docs.filter((d) => d.status !== "rejected");
-    }
-    if (opts.tag) {
-      const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
-      docs = docs.filter((d) => d.tags?.includes(normalizedTag));
-    }
+    // Filter semantics + field selection come from doc-views.ts — the same
+    // code the local branch runs, so the two cannot drift apart on defaults.
+    const docs = filterDocList(out.documents, opts);
 
     if (opts.json) {
-      console.log(
-        JSON.stringify(
-          docs.map((d) => ({
-            id: d.id,
-            title: d.title,
-            type: d.type || "document",
-            status: d.status || "draft",
-            tags: d.tags,
-          })),
-          null,
-          2,
-        ),
-      );
+      console.log(JSON.stringify(docs.map(listJsonEntry), null, 2));
       return;
     }
     if (docs.length === 0) {
@@ -134,21 +118,17 @@ export async function remoteQuery(
 
     const sourceNodes = out.source_nodes ?? [];
     if (opts.json) {
+      // Field selection shared with the local branch (doc-views.ts).
       console.log(
         JSON.stringify(
-          {
-            documents: out.documents.map((d) => ({ id: d.id, title: d.title, body: d.body })),
-            sourceNodes: sourceNodes.map((d) => ({
-              id: d.id,
-              title: d.title,
-              source: d.source,
-              body: d.body,
-            })),
+          queryJsonPayload({
+            documents: out.documents,
+            sourceNodes,
             traceCount: out.trace_count ?? 0,
             mode: out.traversal?.mode,
             hopsUsed: out.traversal?.hops_used,
             nodesTraversed: out.traversal?.nodes_traversed,
-          },
+          }),
           null,
           2,
         ),
@@ -181,18 +161,8 @@ export async function remoteSearch(
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ results: NodeSummary[] }>("context_search", { query });
     if (opts.json) {
-      console.log(
-        JSON.stringify(
-          out.results.map((d) => ({
-            id: d.id,
-            title: d.title,
-            description: d.description,
-            type: d.type || "document",
-          })),
-          null,
-          2,
-        ),
-      );
+      // Field selection shared with the local branch (doc-views.ts).
+      console.log(JSON.stringify(out.results.map(searchJsonEntry), null, 2));
       return;
     }
     if (out.results.length === 0) {
@@ -249,7 +219,10 @@ export async function remoteVerify(
   target: RemoteTarget,
   opts: { json?: boolean },
 ): Promise<void> {
-  await withRemote(target, async (conn) => {
+  // Return the verdict out of the withRemote callback and exit AFTER it — a
+  // process.exit inside the callback would skip the finally that closes the
+  // connection (and with it, the spawned stdio server).
+  const valid = await withRemote(target, async (conn) => {
     const report = await conn.run<{ valid: boolean; errors: unknown[] }>("context_verify", {});
     if (opts.json) {
       console.log(JSON.stringify(report, null, 2));
@@ -260,8 +233,9 @@ export async function remoteVerify(
           : chalk.red(`${report.errors.length} integrity error(s) found`),
       );
     }
-    if (!report.valid) process.exit(1);
+    return report.valid;
   });
+  if (!valid) process.exit(1);
 }
 
 export async function remoteHistory(
@@ -310,21 +284,11 @@ export async function remoteAdd(
   }
   await withRemote(target, async (conn) => {
     const id = normalizeDocumentId(path);
-    // Mirror the local command's title derivation so `ctx add nodes/foo-bar`
-    // titles identically wherever it runs.
-    const title =
-      opts.title ||
-      id
-        .split("/")
-        .pop()!
-        .replace(/-/g, " ")
-        .replace(/\b\w/g, (c: string) => c.toUpperCase());
-    const tags = opts.tags
-      ? opts.tags
-          .split(/[,\s]+/)
-          .filter((t: string) => t.length > 0)
-          .map((t: string) => (t.startsWith("#") ? t : `#${t}`))
-      : undefined;
+    // Title derivation + tag parsing shared with the local branch
+    // (doc-views.ts), so `ctx add nodes/foo-bar` behaves identically
+    // wherever it runs.
+    const title = opts.title || titleFromId(id);
+    const tags = opts.tags ? parseTagsOption(opts.tags) : undefined;
 
     const input: Record<string, unknown> = {
       id,

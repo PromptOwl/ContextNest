@@ -112,6 +112,9 @@ Rules:
 - `auth` supports `bearer_env` (recommended) and `header_env` for custom
   header schemes. Raw secrets in the file are rejected by the schema —
   the registry is 0600 but secrets belong in env/keychain.
+- Credentials over cleartext `http://` are rejected by the schema (on write
+  AND read) unless the host is loopback (`localhost`/`127.x`) — a bearer
+  token on an unencrypted wire is a leak, not a configuration choice.
 - Optional per-remote `timeout_ms` (default 10 000).
 
 ### 3.2 Vault-local config (`.context/config.yaml`)

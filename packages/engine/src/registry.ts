@@ -70,22 +70,66 @@ const remoteAuthSchema = z
     }
   });
 
-const remoteNestSpecSchema = z.discriminatedUnion("transport", [
-  z.object({
-    transport: z.literal("stdio"),
-    command: z.string().min(1),
-    args: z.array(z.string()).optional(),
-    description: z.string().optional(),
-    timeout_ms: z.number().int().positive().optional(),
-  }),
-  z.object({
-    transport: z.literal("http"),
-    url: z.string().min(1),
-    auth: remoteAuthSchema.optional(),
-    description: z.string().optional(),
-    timeout_ms: z.number().int().positive().optional(),
-  }),
-]);
+/** Hosts where cleartext http is acceptable (local development/testing). */
+function isLoopbackHost(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname === "[::1]" ||
+    hostname.startsWith("127.")
+  );
+}
+
+const remoteNestSpecSchema = z
+  .discriminatedUnion("transport", [
+    z.object({
+      transport: z.literal("stdio"),
+      command: z.string().min(1),
+      args: z.array(z.string()).optional(),
+      description: z.string().optional(),
+      timeout_ms: z.number().int().positive().optional(),
+    }),
+    z.object({
+      transport: z.literal("http"),
+      url: z.string().min(1),
+      auth: remoteAuthSchema.optional(),
+      description: z.string().optional(),
+      timeout_ms: z.number().int().positive().optional(),
+    }),
+  ])
+  // superRefine on the UNION, not its options — discriminatedUnion requires
+  // plain ZodObject options, so per-option effects would fail to construct.
+  .superRefine((spec, rc) => {
+    if (spec.transport !== "http") return;
+    let url: URL;
+    try {
+      url = new URL(spec.url);
+    } catch {
+      rc.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `url "${spec.url}" is not a valid URL`,
+      });
+      return;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      rc.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `url must use http(s), got "${url.protocol}//"`,
+      });
+      return;
+    }
+    // Credentials over cleartext http would put the bearer token/header value
+    // on the wire unencrypted. Refuse outright (not just a warning) unless the
+    // host is loopback — local development is the one legitimate cleartext case.
+    if (spec.auth && url.protocol === "http:" && !isLoopbackHost(url.hostname)) {
+      rc.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          `refusing to send credentials over cleartext ${url.protocol}// to "${url.hostname}" — ` +
+          `use https://, or a loopback address (localhost/127.x) for local testing`,
+      });
+    }
+  });
 
 const vaultRegistrySchema = z
   .object({
