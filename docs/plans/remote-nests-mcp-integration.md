@@ -28,19 +28,43 @@ is the single integration point.
                                                                    local or hosted)
 ```
 
-## 2. Key Design Decision: MCP as the Remote Nest Protocol
+## 2. Key Design Decision: the Operation Catalog over MCP as the Remote Protocol
 
-We already ship an MCP server (`@promptowl/contextnest-mcp-server`) exposing 19
-tools (`vault_info`, `resolve`, `search`, `query`-equivalents, document CRUD,
-drift workflow, …). That tool contract **is** the remote protocol:
+The engine already ships the **canonical operation catalog**
+(`packages/engine/src/api/` — "API Convergence Phase 1"): 16 transport-agnostic
+`context_*` operations (`context_get`, `context_query`, `context_search`,
+`context_create`, …) with Zod input/output schemas, JSON Schema generation, an
+executable runtime (`createEngineApi().run(name, input, ctx)`), legacy-alias
+lookup (the OSS MCP names `read_document`/`resolve`/… are recorded as
+`aliases`), and namespace discovery (`core` / `governance` / `workflow` /
+`sync`). Its own roadmap ends at exactly this feature: *"Phase 4 — one `ctx`
+CLI with `local` and `remote` backends."*
 
-- The CLI gains an **MCP client** that maps `ctx` subcommands onto those same
-  tool names.
-- Any endpoint speaking that tool contract is a valid remote nest — our own
-  server over stdio, the same server behind an HTTP gateway, or a hosted
-  ContextNest implementation.
-- No second wire protocol to design, document, or keep in sync; the MCP server
-  test suite doubles as the protocol conformance suite.
+**Current state (important):** the catalog is *not yet wired in*. The MCP
+server's 19 tools and the CLI still hand-write their schemas inline — two
+sources of truth, with the catalog intended to win (its Phase 2).
+
+So the remote protocol is not "the 19 legacy tool names" — it is **the catalog,
+exposed over MCP**:
+
+- The wire contract is the canonical `context_*` operation names with
+  catalog-generated schemas; the legacy tool names remain available as
+  deprecated aliases via the catalog's alias table (the PRD's 2-release
+  migration window).
+- The CLI gains an **MCP client** that maps catalog operations onto MCP tool
+  calls. Any endpoint exposing the catalog's `core` namespace is a valid
+  remote nest — our own server over stdio, the same server behind an HTTP
+  gateway, or a hosted ContextNest implementation.
+- The catalog's `NAMESPACES` discovery (advertised via MCP `initialize` /
+  server capabilities) tells the client which surfaces a given remote actually
+  implements — e.g. a remote with `core` but no `governance` cleanly rejects
+  `ctx drift` instead of failing mid-call.
+- No second wire protocol to design, document, or keep in sync; the catalog's
+  conformance suite (its Phase 3) doubles as the protocol conformance suite.
+
+This makes **API Convergence Phase 2 (bind the MCP server + CLI to the
+catalog) a prerequisite** of this plan rather than a parallel effort — see the
+delivery phases in §8.
 
 ## 3. Configuration Model
 
@@ -123,49 +147,40 @@ positional arg / default) can now land on a `remotes` entry. Steps 3, 5, 7
 local vault") when resolution lands on a remote. Every existing caller keeps
 compiling and behaving identically for local aliases.
 
-### 4.2 `NestClient` — one interface, two implementations
+### 4.2 Backends for the operation catalog — not a new interface
 
-New module `nest-client.ts` defining the operation surface the CLI needs,
-named after the MCP tool contract:
+There is **no new bespoke `NestClient` interface to design**: the catalog's
+runtime shape *is* the interface. Both backends expose the same call:
 
 ```ts
-interface NestClient {
-  vaultInfo(): Promise<VaultInfo>;
-  resolve(selector: string): Promise<ResolveResult>;
-  query(selector: string, opts): Promise<QueryResult>;
-  search(q: string, opts): Promise<SearchResult>;
-  listDocuments(filter): Promise<...>;
-  readDocument(path: string, opts): Promise<...>;
-  readIndex(): Promise<...>;
-  readPack(name: string): Promise<...>;
-  verifyIntegrity(): Promise<...>;
-  listCheckpoints(): Promise<...>;
-  readVersion(path: string, v: number): Promise<...>;
-  createDocument(...): Promise<...>;    // write surface
-  updateDocument(...): Promise<...>;
-  deleteDocument(...): Promise<...>;
-  publishDocument(...): Promise<...>;
-  stageDriftSuggestion(...): Promise<...>;  // governance surface
-  listSuggestions(...): Promise<...>;
-  approveSuggestion(...): Promise<...>;
-  rejectSuggestion(...): Promise<...>;
+interface ApiBackend {
+  run(name: string, input: unknown, ctx: OperationContext): Promise<unknown>;
+  namespaces(): Promise<CapabilityNamespace[]>;  // what this nest implements
   close(): Promise<void>;
 }
 ```
 
-- **`LocalNestClient`** wraps today's engine calls (`NestStorage`, selector
-  evaluator, etc.). Mostly mechanical extraction of logic that currently lives
-  inline in CLI command actions and in the MCP server's tool handlers — which
-  also deduplicates those two surfaces (they reimplement the same glue today).
-- **`RemoteNestClient`** wraps an MCP SDK `Client` and calls the corresponding
-  tools by name, parsing their JSON payloads with Zod schemas. Transports:
+- **Local backend** — `createEngineApi()` already exists and is tested
+  (`api/runtime.ts`, `api/core-executors.ts`). The "extract shared glue from
+  CLI actions and MCP handlers" work is already done there; the CLI just needs
+  to migrate onto it (API Convergence Phase 2).
+- **Remote backend** — wraps an MCP SDK `Client`; `run(name, input)` becomes
+  `callTool({ name, arguments: input })`, with results validated against the
+  catalog's *output* Zod schemas and MCP `isError` payloads mapped back to the
+  catalog's typed `ErrorCode`s (`api/types.ts`) so the CLI renders local and
+  remote failures identically. Operations are looked up via `getOperation()`
+  (which resolves legacy aliases too), so the client can talk to both
+  catalog-native servers and pre-migration servers exposing only the old
+  19-tool names. Transports:
   - `stdio`: `StdioClientTransport` with `command` + `args` array (never a
     shell string — Windows correctness, and no shell-injection surface).
   - `http`: `StreamableHTTPClientTransport` with auth headers resolved from
     the referenced env vars at call time.
-- Both structured results and error mapping (`isError` tool results → typed
-  engine errors) live behind the interface so the CLI renders local and remote
-  failures the same way.
+- **Capability gating:** `namespaces()` reads the advertised namespace set;
+  `governance`, `workflow`, and `sync` are declared-but-unpopulated in the
+  catalog today (`implemented: false`), so remote governance commands
+  (`ctx drift …`) fail fast with `NOT_IMPLEMENTED` until those namespaces land
+  rather than being frozen into the v1 wire contract.
 
 **Dependency note:** `@modelcontextprotocol/sdk` becomes a dependency of the
 engine (or of a small new `packages/mcp-client` package if we want the engine
@@ -205,7 +220,9 @@ ctx vault default team    # a remote may be the default
 
 ### 5.2 Command routing
 
-Replace `getStorage()` call sites with `getNest(): Promise<NestClient>`:
+Replace `getStorage()` call sites with `getNest(): Promise<ApiBackend>` and
+route command actions through catalog operations (this is simultaneously the
+CLI half of API Convergence Phase 2):
 
 - **Remote-capable (Phase A — read/query surface):** `query`, `search`,
   `resolve`, `list`, `read`, `pack list/show`, `verify`, `history`,
@@ -254,12 +271,13 @@ Deliberately minimal — the CLI does the heavy lifting:
 - **Unit (engine):** registry round-trip with `remotes:` (old-schema file still
   parses; new file read by the *old* schema shape parses too — assert via a
   frozen copy of the v-current schema); alias-collision rules; `resolveNest`
-  precedence including remote default / remote env alias; `RemoteNestClient`
+  precedence including remote default / remote env alias; the remote backend
   against the MCP SDK's `InMemoryTransport` linked pair with a stub server —
-  no subprocess, runs in `pnpm test`.
+  no subprocess, runs in `pnpm test`. Catalog conformance (its Phase 3): no
+  inline `inputSchema` literals left in mcp-server/CLI.
 - **Regression:** the killer fixture is already in-repo — spawn the **built**
   `contextnest-mcp` (`dist/index.js`) over stdio against a throwaway vault and
-  point `RemoteNestClient` at it; then drive the **built** `ctx` with a
+  point the remote backend at it; then drive the **built** `ctx` with a
   registry whose `remotes:` entry uses that stdio command. Asserts CLI ↔
   server contract end-to-end, cross-platform (ubuntu/windows/macos × Node
   20/22 — argv arrays only, CRLF-safe assertions).
@@ -271,22 +289,26 @@ Deliberately minimal — the CLI does the heavy lifting:
 | Phase | Scope | Ships value |
 |-------|-------|-------------|
 | 1 | Registry `remotes:` schema + `resolveNest()` + `ctx vault add/list/remove/which/default` for remotes (no command routing yet) | Registration UX; foundation |
-| 2 | `NestClient` interface + `LocalNestClient` extraction + `RemoteNestClient` (stdio + HTTP) with timeouts/auth | Protocol layer, unit-tested |
-| 3 | CLI routing for the read/query surface (§5.2 Phase A) + exit-code contract | Plugins retrieve from remote nests |
-| 4 | Write/governance surface (§5.2 Phase B) | Auto-capture into remote nests |
+| 2 | **API Convergence Phase 2**: MCP server + CLI bind to the operation catalog (`context_*` canonical names, legacy tool names as deprecated aliases); delete inline schemas | Single schema source; the wire contract exists |
+| 3 | Remote `ApiBackend` (stdio + HTTP) with timeouts/auth/capability gating, unit-tested via `InMemoryTransport` | Protocol layer |
+| 3b | CLI routing for the read/query surface (§5.2 Phase A) + exit-code contract | Plugins retrieve from remote nests |
+| 4 | Write surface (§5.2 Phase B: `context_create/update/publish/delete/import`); governance ops follow once the catalog's `governance` namespace is populated | Auto-capture into remote nests |
 | 5 | Plugin polish (§6), regression suites, docs: README, `CONTEXT_NEST_SPEC.md` addendum (registry `remotes:` shape + remote command matrix), changeset (minor, all three packages) | GA |
 
-Phases 1–3 are the MVP the plugin story needs; 4–5 complete the loop.
+Phases 1–3b are the MVP the plugin story needs; 4–5 complete the loop.
+Phase 2 is a standalone, independently valuable refactor (it was already the
+catalog's own roadmap) and can land in parallel with Phase 1.
 
 ## 9. Follow-ups (explicitly out of scope here)
 
-- **Source-node hydration:** reuse `RemoteNestClient`'s transport layer to call
+- **Source-node hydration:** reuse the remote backend's transport layer to call
   arbitrary (non-ContextNest) MCP servers declared in vault-local `sources:`
   for `source` node refresh (`transport: mcp`, spec §1.9.4) — the multi-MCP
   story beyond nests.
 - **Response caching** for HTTP remotes (etag/short-TTL) if hook latency needs it.
-- **`ctx push` convergence:** re-express push as `publish_document` calls
-  against a remote alias, retiring the bespoke REST payload.
+- **`ctx push` convergence:** re-express push as `context_import` (bulk
+  create+publish, one checkpoint) against a remote alias, retiring the bespoke
+  REST payload.
 - **Keychain-backed auth** as an alternative to env-var references.
 
 ## 10. Open Questions
