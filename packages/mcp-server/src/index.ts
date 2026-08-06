@@ -3,6 +3,7 @@
  * Exposes vault operations as tools for AI agents via the Model Context Protocol.
  */
 
+import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -55,9 +56,16 @@ try {
 }
 const storage = new NestStorage(vaultPath);
 
+// Read from package.json rather than hardcoding: this is the version MCP
+// clients and directories display, and a second copy drifts from the published
+// one. dist/index.js sits one level below the manifest.
+const { version } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
+
 const server = new McpServer({
   name: "contextnest",
-  version: "0.1.0",
+  version,
 });
 
 const regenerateIndex = () => storage.regenerateIndex();

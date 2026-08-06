@@ -205,6 +205,33 @@ describe("createEngineApi — executable core operations", () => {
     expect(out.versions[0].chain_hash).toMatch(/^sha256:/);
   });
 
+  it("context_versions attaches change logs only when asked", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Logged", content: "first" }, ctx);
+    await api.run(
+      "context_update",
+      { id: "nodes/logged", content: "second body" },
+      ctx,
+    );
+
+    type Out = { versions: Array<{ version: number; keyframe: boolean; diff?: string }> };
+    // Default stays lean — a history listing must not push patches at an agent.
+    const lean = await api.run<Out>("context_versions", { id: "nodes/logged" }, ctx);
+    expect(lean.versions.every((v) => v.diff === undefined)).toBe(true);
+
+    const full = await api.run<Out>(
+      "context_versions",
+      { id: "nodes/logged", include_diff: true },
+      ctx,
+    );
+    const patched = full.versions.filter((v) => !v.keyframe);
+    expect(patched.length).toBeGreaterThan(0);
+    // A real unified diff, same bytes the v{N}.diff file holds.
+    expect(patched[0].diff).toContain("@@");
+    // Keyframes are full snapshots, so they carry no patch.
+    expect(full.versions.filter((v) => v.keyframe).every((v) => !v.diff)).toBe(true);
+  });
+
   it("context_overview reports counts, tags, and the node list", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Alpha", content: "b", tags: ["#x"] }, ctx);
@@ -238,7 +265,7 @@ describe("createEngineApi — executable core operations", () => {
   it("context_reconstruct honors its error contract (coded errors)", async () => {
     const api = createEngineApi();
     // A doc on disk with NO version history (never published) → reconstructVersion
-    // throws a plain Error; the executor must surface it as VALIDATION_FAILED.
+    // throws a coded VERSION_NOT_FOUND, which the executor passes through.
     const node: ContextNode = {
       id: "nodes/nohist",
       filePath: "",
@@ -249,7 +276,7 @@ describe("createEngineApi — executable core operations", () => {
     await ctx.storage.writeDocument("nodes/nohist", serializeDocument(node));
     await expect(
       api.run("context_reconstruct", { id: "nodes/nohist", version: 1 }, ctx),
-    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    ).rejects.toMatchObject({ code: "VERSION_NOT_FOUND" });
     // Bogus id → DOCUMENT_NOT_FOUND (as advertised), not an un-coded error.
     await expect(
       api.run("context_reconstruct", { id: "nodes/ghost", version: 1 }, ctx),

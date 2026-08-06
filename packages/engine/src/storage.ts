@@ -3,7 +3,7 @@
  * Supports both structured and Obsidian-compatible layouts (§1.1).
  */
 
-import { readFile, writeFile, mkdir, stat, unlink, rm, rename } from "node:fs/promises";
+import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import fg from "fast-glob";
 import yaml from "js-yaml";
@@ -21,13 +21,19 @@ import type {
   ContextNode,
   NestConfig,
   DocumentHistory,
+  VersionEntry,
   CheckpointHistory,
   Pack,
   ContextYaml,
   PendingChange,
   VerificationReport,
 } from "./types.js";
-import { ContextNestError, DocumentNotFoundError } from "./errors.js";
+import {
+  ContextNestError,
+  CorruptHistoryError,
+  DocumentNotFoundError,
+  VersionArtifactExistsError,
+} from "./errors.js";
 import {
   packSchema,
   documentHistorySchema,
@@ -96,6 +102,33 @@ export interface ReadDocumentOptions {
 
 export type LayoutMode = "structured" | "obsidian";
 
+/**
+ * `rename` onto an existing target is atomic on POSIX but contended on Windows:
+ * if any other handle has the destination open — a concurrent replace of the
+ * same file, an antivirus scanner, the search indexer — MoveFileEx fails with
+ * EPERM/EACCES/EBUSY rather than waiting. The contention is transient, so retry
+ * briefly before giving up.
+ *
+ * ponytail: fixed backoff schedule, ~500ms total across 10 attempts. If a real
+ * workload starts losing writes here, the fix is a per-path write queue, not a
+ * longer sleep.
+ */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  const RETRYABLE = new Set(["EPERM", "EACCES", "EBUSY"]);
+  const MAX_ATTEMPTS = 10;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      if (attempt >= MAX_ATTEMPTS - 1 || !RETRYABLE.has(code)) throw err;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2 ** attempt, 250)));
+    }
+  }
+}
+
 export class NestStorage {
   constructor(public readonly root: string) {}
 
@@ -104,6 +137,9 @@ export class NestStorage {
    * read-modify-write. See `withCheckpointLock`.
    */
   private checkpointWriteChain: Promise<unknown> = Promise.resolve();
+
+  /** Disambiguates concurrent `writeFileDurable` temp files. See that method. */
+  private tmpWriteCounter = 0;
 
   /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
@@ -378,11 +414,21 @@ export class NestStorage {
    *   - content_hash_mismatch / chain_hash_mismatch in version history
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
+   *   - unreadable_history when a history.yaml exists but cannot be parsed
    */
   async verifyVaultIntegrity(): Promise<VerificationReport> {
-    const allHistories = await this.findAllHistories();
-    const checkpointHistory = await this.readCheckpointHistory();
     const errors: VerificationReport["errors"] = [];
+    // A history we cannot parse is an unverifiable document, not a clean one —
+    // report it instead of letting the crawl skip it into a silent pass.
+    const allHistories = await this.findAllHistories((docId, reason) => {
+      errors.push({
+        type: "unreadable_history",
+        document: docId,
+        expected: null,
+        actual: reason,
+      });
+    });
+    const checkpointHistory = await this.readCheckpointHistory();
 
     for (const [docId, history] of allHistories) {
       // Pre-load keyframe bytes so the (synchronous) verifyDocumentChain
@@ -390,16 +436,27 @@ export class NestStorage {
       // skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
       // left intact — goes undetected. Keyframe files are small; the reads are
       // cheap, and the chain check below still works when one is missing.
+      //
+      // Non-keyframe entries hash their change log, which now lives in a
+      // v{N}.diff file rather than inline on the entry — pre-load those too, or
+      // a tampered diff file goes unchecked exactly the way a tampered keyframe
+      // used to.
       const keyframeContent = new Map<number, string>();
+      const diffContent = new Map<number, string>();
       for (const entry of history.versions) {
-        if (!entry.keyframe) continue;
-        const content = await this.readKeyframe(docId, entry.version);
-        if (content !== null) keyframeContent.set(entry.version, content);
+        if (entry.keyframe) {
+          const content = await this.readKeyframe(docId, entry.version);
+          if (content !== null) keyframeContent.set(entry.version, content);
+        } else {
+          const diff = await this.readDiff(docId, entry.version);
+          if (diff !== null) diffContent.set(entry.version, diff);
+        }
       }
       const report = verifyDocumentChain(
         docId,
         history,
         (version) => keyframeContent.get(version) ?? null,
+        (version) => diffContent.get(version) ?? null,
       );
       if (!report.valid) errors.push(...report.errors);
     }
@@ -583,37 +640,199 @@ export class NestStorage {
 
   /**
    * Read document history from .versions/{docName}/history.yaml (§6.2).
+   *
+   * `null` means "this document has no history yet" and nothing else. A file
+   * that is present but unreadable raises {@link CorruptHistoryError}.
+   *
+   * The distinction is load-bearing. Every write path reads this, and each one
+   * treats `null` as a brand-new document; because history.yaml is rewritten
+   * whole rather than appended to, a corrupt file that read as `null` was
+   * silently replaced by a two-entry history on the next publish — orphaning the
+   * recorded versions' keyframe/diff files and taking `reconstruct` with them.
    */
   async readHistory(docId: string): Promise<DocumentHistory | null> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const historyPath = join(
-      this.root,
-      docDir,
-      ".versions",
-      docName,
-      "history.yaml",
-    );
+    let content: string;
     try {
-      const content = await readFile(historyPath, "utf-8");
-      const raw = yaml.load(content);
-      const result = documentHistorySchema.safeParse(raw);
-      return result.success ? (result.data as DocumentHistory) : null;
-    } catch {
-      return null;
+      content = await readFile(this.historyPath(docId), "utf-8");
+    } catch (err) {
+      // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
+      // an I/O error) must not read as a fresh document either.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new CorruptHistoryError(
+        docId,
+        err instanceof Error ? err.message : String(err),
+      );
     }
+
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      throw new CorruptHistoryError(
+        docId,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
+    const result = documentHistorySchema.safeParse(raw);
+    if (!result.success) {
+      throw new CorruptHistoryError(
+        docId,
+        `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
+      );
+    }
+    return result.data as DocumentHistory;
   }
 
   /**
-   * Write document history to .versions/{docName}/history.yaml.
+   * Durable write for the hash-chain files: write a sibling temp file, flush it
+   * to disk, then rename over the target.
+   *
+   * A plain `writeFile` truncates and extends in place. If the process dies (or
+   * the machine loses power) after the metadata grows but before the data is
+   * flushed, the file comes back zero-filled — the "null byte is not allowed in
+   * input" YAMLException seen from `findAllHistories`. Reserved for
+   * history.yaml / context_history.yaml: they are the integrity anchors, and a
+   * torn one is unrecoverable, unlike a regenerable index.
+   *
+   * The temp name is unique per call. A shared `{path}.tmp` would make
+   * concurrent writers to the same target collide: both open and truncate the
+   * same temp file, the first rename consumes it, and the second fails ENOENT.
+   * That is not hypothetical — `rebuildCheckpointHistory` deliberately writes
+   * context_history.yaml outside `withCheckpointLock` (holding it would deadlock
+   * against the publishes it retries around), so it can overlap a publish's
+   * write. Unique temps keep the old last-write-wins semantics instead of
+   * turning that overlap into a throw.
+   */
+  private async writeFileDurable(path: string, content: string): Promise<void> {
+    const tmp = `${path}.${process.pid}.${++this.tmpWriteCounter}.tmp`;
+    const handle = await open(tmp, "w");
+    try {
+      await handle.writeFile(content, "utf-8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await renameWithRetry(tmp, path);
+    } catch (err) {
+      // Never leave the temp behind if the rename itself failed.
+      await unlink(tmp).catch(() => {});
+      throw err;
+    }
+  }
+
+  /** Absolute path of a document's history.yaml. */
+  private historyPath(docId: string): string {
+    return join(
+      this.root,
+      dirname(docId),
+      ".versions",
+      basename(docId),
+      "history.yaml",
+    );
+  }
+
+  /**
+   * Rewrite a document's history.yaml in full.
+   *
+   * Only for the paths that genuinely MUTATE existing entries — re-anchoring a
+   * version, moving inline patches into files. Recording a NEW version goes
+   * through {@link appendVersionEntry}, which cannot touch the bytes of the
+   * entries already on disk. Prefer that: a full rewrite is only ever as correct
+   * as the object handed to it, and an object built from a bad read is how a
+   * corrupt history silently became a two-entry one.
+   *
+   * `versions` is forced last so the serialized list stays open at the end of
+   * the file for appending. Anything else here is a latent break in append.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const historyDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(historyDir, { recursive: true });
-    const content = yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(historyDir, "history.yaml"), content, "utf-8");
+    const { versions, ...rest } = history;
+    await mkdir(dirname(this.historyPath(docId)), { recursive: true });
+    const content = yaml.dump(
+      { ...rest, versions },
+      { lineWidth: -1, noRefs: true },
+    );
+    await this.writeFileDurable(this.historyPath(docId), content);
+  }
+
+  /**
+   * Record one new version by APPENDING it to history.yaml.
+   *
+   * The bytes of every previously recorded version are never reopened for
+   * writing, so no bug in a caller — and no failed read — can drop them. That is
+   * the difference between "we check before rewriting" and "there is nothing to
+   * rewrite": the old full-rewrite path lost v1–v4 whenever the read that fed it
+   * came back empty, and a guard on the read is only as good as the next code
+   * path that forgets it.
+   *
+   * The file's header (`keyframe_interval` + the `versions:` key) belongs to
+   * whichever caller CREATES the file, and it is written in the same operation
+   * as that caller's own entry. Deciding on the header from an observed size
+   * would be a check-then-act race: concurrent first-time appends each see an
+   * empty file and each prepend a header, leaving two `versions:` keys and an
+   * unparseable history (measured: ~70% of documents corrupted under load).
+   * Exclusive create is what makes it exact — the OS picks one winner, and it
+   * holds across processes, which an in-process lock would not.
+   *
+   * Every write goes out under O_APPEND and is fsynced. `writeHistory` keeps
+   * `versions` last so the list stays open at EOF for these appends.
+   */
+  async appendVersionEntry(
+    docId: string,
+    entry: VersionEntry,
+    keyframeInterval: number,
+  ): Promise<void> {
+    const path = this.historyPath(docId);
+    await mkdir(dirname(path), { recursive: true });
+
+    // One list item, indented to sit under `versions:`. Indenting a whole YAML
+    // document by a fixed amount keeps it valid, including multi-line scalars.
+    const block = yaml
+      .dump([entry], { lineWidth: -1, noRefs: true })
+      .split("\n")
+      .map((line) => (line.length > 0 ? `  ${line}` : line))
+      .join("\n");
+    const header = `keyframe_interval: ${keyframeInterval}\nversions:\n`;
+
+    // Create-and-write in one shot. Exactly one caller can win `wx`, so exactly
+    // one header is ever written — and it lands together with its entry, so the
+    // file is never left as a header with no versions under it.
+    try {
+      const created = await open(path, "wx");
+      try {
+        await created.write(header + block);
+        await created.sync();
+      } finally {
+        await created.close();
+      }
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+
+    const handle = await open(path, "a");
+    try {
+      // The file exists. A zero-length one normally means an external
+      // truncation, so write the header rather than append into a headerless
+      // file.
+      //
+      // Known residual window: the winner's `wx` open creates a 0-byte file and
+      // resolves BEFORE its write lands, so a loser that gets EEXIST, reopens
+      // and stats inside that gap would also see 0 and also write a header,
+      // giving two `versions:` keys. Not closed here because it needs the loser
+      // to complete three threadpool round-trips inside the winner's single
+      // queued write, and it did not occur in 60 rounds of 32-way contention on
+      // a single new file (nor 1200 docs of 3-way). If it ever does, the result
+      // is an unparseable history — loud (CorruptHistoryError), not silent — and
+      // the fix is to have the loser re-stat with a bounded wait instead of
+      // trusting the first observation.
+      const { size } = await handle.stat();
+      await handle.write(size === 0 ? header + block : block);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -637,18 +856,122 @@ export class NestStorage {
   }
 
   /**
-   * Write a keyframe version file.
+   * Write a version artifact (`v{N}.md` / `v{N}.diff`).
+   *
+   * Sealed versions are immutable: the artifact's bytes are hashed into
+   * `content_hash` and chained, so overwriting one destroys the only copy of
+   * that version's content AND silently breaks the chain. The default refuses,
+   * via an exclusive create rather than an exists-check, so two writers cannot
+   * race past the guard. Repair paths that must genuinely re-anchor an artifact
+   * opt in with `overwrite`.
+   */
+  private async writeVersionArtifact(
+    docId: string,
+    version: number,
+    fileName: string,
+    content: string,
+    overwrite: boolean,
+  ): Promise<void> {
+    const docName = basename(docId);
+    const docDir = dirname(docId);
+    const dir = join(this.root, docDir, ".versions", docName);
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, fileName);
+
+    if (overwrite) {
+      await this.writeFileDurable(path, content);
+      return;
+    }
+
+    let handle;
+    try {
+      handle = await open(path, "wx");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new VersionArtifactExistsError(docId, version, fileName);
+      }
+      throw err;
+    }
+    try {
+      await handle.writeFile(content, "utf-8");
+      // Flush before the history entry that hashes this content is recorded.
+      // history.yaml is fsynced; without this the artifact it points at could
+      // still be in the page cache, so a power loss could leave a durable entry
+      // referencing truncated or missing content.
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Write a keyframe version file. Refuses to overwrite a sealed one unless
+   * `options.overwrite` is set — see {@link writeVersionArtifact}.
    */
   async writeKeyframe(
     docId: string,
     version: number,
     content: string,
+    options: { overwrite?: boolean } = {},
   ): Promise<void> {
+    await this.writeVersionArtifact(
+      docId,
+      version,
+      `v${version}.md`,
+      content,
+      options.overwrite ?? false,
+    );
+  }
+
+  /**
+   * Read the change log for a non-keyframe version — the unified diff taking
+   * v{version-1} to v{version}, stored beside the keyframes as v{version}.diff.
+   *
+   * Returns null when there is no diff file. Histories written before diffs
+   * were externalized carry the patch inline on the version entry instead, so
+   * callers fall back to `entry.diff` (see VersionManager.reconstructVersion) —
+   * that fallback is what keeps pre-existing nests readable without migration.
+   */
+  async readDiff(docId: string, version: number): Promise<string | null> {
     const docName = basename(docId);
     const docDir = dirname(docId);
-    const keyframeDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(keyframeDir, { recursive: true });
-    await writeFile(join(keyframeDir, `v${version}.md`), content, "utf-8");
+    const diffPath = join(
+      this.root,
+      docDir,
+      ".versions",
+      docName,
+      `v${version}.diff`,
+    );
+    try {
+      return await readFile(diffPath, "utf-8");
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Write the change log for a non-keyframe version.
+   *
+   * Content is the unified diff exactly as produced by `createPatch` — hunk
+   * headers included — so the file is readable on its own and applies with
+   * standard patch tooling.
+   *
+   * Refuses to overwrite a sealed change log unless `options.overwrite` is set
+   * — see {@link writeVersionArtifact}.
+   */
+  async writeDiff(
+    docId: string,
+    version: number,
+    diff: string,
+    options: { overwrite?: boolean } = {},
+  ): Promise<void> {
+    await this.writeVersionArtifact(
+      docId,
+      version,
+      `v${version}.diff`,
+      diff,
+      options.overwrite ?? false,
+    );
   }
 
   /**
@@ -784,7 +1107,7 @@ export class NestStorage {
     const content =
       "# Auto-generated. Do not edit manually.\n" +
       yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(dir, "context_history.yaml"), content, "utf-8");
+    await this.writeFileDurable(join(dir, "context_history.yaml"), content);
   }
 
   /**
@@ -884,8 +1207,19 @@ export class NestStorage {
   /**
    * Find all document history files across the nest.
    * Used for checkpoint rebuild (§7.3).
+   *
+   * A history file that cannot be parsed (truncated / null-byte-padded by an
+   * interrupted write, hand-edited into invalid YAML, failing the schema) is
+   * SKIPPED rather than thrown from: one corrupt file used to abort the whole
+   * crawl, taking `ctx verify`, `ctx publish`'s checkpoint seal and the §7.3
+   * rebuild down with it. Skipping alone would be a silent green though —
+   * `verifyCheckpointChain` treats a missing history as "nothing to check" — so
+   * callers that verify pass `onUnreadable` and report the file as an
+   * `unreadable_history` integrity error.
    */
-  async findAllHistories(): Promise<Map<string, DocumentHistory>> {
+  async findAllHistories(
+    onUnreadable?: (docId: string, reason: string) => void,
+  ): Promise<Map<string, DocumentHistory>> {
     const historyFiles = await fg("**/.versions/*/history.yaml", {
       cwd: this.root,
       dot: true,
@@ -904,11 +1238,19 @@ export class NestStorage {
       const docName = parts[versionsIdx + 1];
       const docId = docDir ? `${docDir}/${docName}` : docName;
 
-      const content = await readFile(join(this.root, file), "utf-8");
-      const raw = yaml.load(content);
+      let raw: unknown;
+      try {
+        raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+      } catch (err) {
+        onUnreadable?.(docId, err instanceof Error ? err.message : String(err));
+        continue;
+      }
+
       const result = documentHistorySchema.safeParse(raw);
       if (result.success) {
         histories.set(docId, result.data as DocumentHistory);
+      } else {
+        onUnreadable?.(docId, `history.yaml failed schema validation`);
       }
     }
 

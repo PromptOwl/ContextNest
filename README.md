@@ -114,6 +114,7 @@ context-nest/
 │   ├── engine/        # Core library — parsing, storage, versioning, integrity
 │   ├── cli/           # Command-line tool (ctx)
 │   └── mcp-server/    # MCP server for AI agent access
+├── plugins/           # Coding-agent plugins driving the ctx CLI (not published to npm)
 ├── fixtures/
 │   └── minimal-vault/ # Example vault for reference and testing
 └── CONTEXT_NEST_SPEC.md   # Full specification
@@ -370,7 +371,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | Command | Description |
 |---|---|
 | `ctx init` | Initialize a new vault (supports `--starter` recipes) |
-| `ctx add <path>` | Create a new document (auto-publishes and regenerates index) |
+| `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
 | `ctx update <path>` | Update a document's title, tags, or body (auto-publishes) |
 | `ctx delete <path>` | Delete a document and its version history |
@@ -409,7 +410,11 @@ ctx query "#api + status:published"       # Intersection
 |---|---|
 | `ctx history <path>` | Show version history |
 | `ctx reconstruct <path> <version>` | Reconstruct a specific version |
-| `ctx verify` | Verify integrity of all hash chains |
+| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped) |
+
+Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
+errors, plain `Error: message` for the rest. Set `CONTEXTNEST_DEBUG=1` to get the
+full stack trace back.
 
 ### Packs, Checkpoints & Index
 
@@ -432,6 +437,19 @@ The MCP server exposes vault operations as 19 tools for AI agents over stdio tra
 ```bash
 node packages/mcp-server/dist/index.js /path/to/your/vault
 ```
+
+### Running the server in Docker
+
+For Glama.ai and any MCP client that runs servers as containers:
+
+```bash
+docker build -t contextnest-mcp .
+
+docker run -i --rm contextnest-mcp                    # demo vault baked into the image
+docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
+```
+
+The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
 
 ### Configuring with Claude Code
 

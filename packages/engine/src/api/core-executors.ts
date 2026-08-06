@@ -21,6 +21,7 @@ import {
 } from "../parser.js";
 import { normalizeDocumentId } from "../storage.js";
 import { publishDocument, publishDocuments } from "../publish.js";
+import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
@@ -293,19 +294,28 @@ const versions: OperationExecutor = async (ctx, input: any) => {
     await ctx.storage.readDocument(id);
     return { id, keyframe_interval: 0, versions: [] };
   }
+  // Change logs are opt-in — see the `include_diff` note on the descriptor.
+  const versionManager = input?.include_diff
+    ? new VersionManager(ctx.storage)
+    : null;
   return {
     id,
     keyframe_interval: history.keyframe_interval,
-    versions: history.versions.map((v) => ({
-      version: v.version,
-      keyframe: v.keyframe ?? false,
-      edited_by: v.edited_by,
-      edited_at: v.edited_at,
-      published_at: v.published_at,
-      note: v.note,
-      content_hash: v.content_hash,
-      chain_hash: v.chain_hash,
-    })),
+    versions: await Promise.all(
+      history.versions.map(async (v) => ({
+        version: v.version,
+        keyframe: v.keyframe ?? false,
+        edited_by: v.edited_by,
+        edited_at: v.edited_at,
+        published_at: v.published_at,
+        note: v.note,
+        content_hash: v.content_hash,
+        chain_hash: v.chain_hash,
+        ...(versionManager
+          ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
+          : {}),
+      })),
+    ),
   };
 };
 
@@ -338,10 +348,11 @@ const reconstruct: OperationExecutor = async (ctx, input: any) => {
     const content = await ctx.versions.reconstructVersion(id, input.version);
     return { id, version: input.version, content };
   } catch (err) {
+    // reconstructVersion codes its own failures (VERSION_NOT_FOUND,
+    // RECONSTRUCTION_FAILED) — pass those through. Anything uncoded that leaks
+    // from the storage layer still gets a code so callers can dispatch on the
+    // advertised error contract.
     if (err instanceof ContextNestError) throw err;
-    // reconstructVersion throws plain Error (no .code) for missing history,
-    // an out-of-range version, or a corrupt keyframe. Map to VALIDATION_FAILED
-    // so callers can dispatch on the advertised error contract.
     throw new ContextNestError(
       err instanceof Error ? err.message : String(err),
       "VALIDATION_FAILED",
