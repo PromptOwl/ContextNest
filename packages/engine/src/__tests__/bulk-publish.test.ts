@@ -111,6 +111,33 @@ describe("publishDocuments — bulk import", () => {
     expect(ticks.every(([, total]) => total === 3)).toBe(true);
   });
 
+  it("rejects a traversal id without touching anything outside the vault", async () => {
+    const good = await writeDraft(storage, "in-vault");
+    const escape = "../../../../outside-the-vault";
+
+    const result = await publishDocuments(storage, [escape, good], {
+      editedBy: "importer",
+    });
+
+    expect(result.published.map((p) => p.id)).toEqual([good]);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].id).toBe(escape);
+    expect(result.failed[0].error).toMatch(/path traversal/);
+  });
+
+  it("collapses duplicate ids so one doc can't be published twice concurrently", async () => {
+    const doc = await writeDraft(storage, "dupe");
+
+    const result = await publishDocuments(storage, [doc, doc, doc], {
+      editedBy: "importer",
+    });
+
+    // One publish, one version bump — not three racing on the same history.
+    expect(result.published).toHaveLength(1);
+    expect(result.published[0].version).toBe(1);
+    expect(result.failed).toHaveLength(0);
+  });
+
   it("returns null checkpoint when nothing publishes", async () => {
     const bad = await writeDraft(storage, "only-rejected", { status: "rejected" });
     const result = await publishDocuments(storage, [bad], { editedBy: "importer" });

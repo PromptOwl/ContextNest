@@ -1184,6 +1184,9 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
   for (const f of result.failed) {
     console.log(chalk.yellow(`  failed ${f.id ?? f.title}: ${f.error}`));
   }
+  // Same contract as `ctx validate` / `ctx verify`: a batch with failures exits
+  // non-zero so CI notices. exitCode, not exit(), so the summary still flushes.
+  if (result.failed.length > 0) process.exitCode = 1;
 }
 
 // ─── ctx history ───────────────────────────────────────────────────────────────
