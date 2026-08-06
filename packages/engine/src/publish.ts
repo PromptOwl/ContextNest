@@ -109,6 +109,10 @@ export interface BulkPublishOptions extends PublishOptions {
   concurrency?: number;
   /** Regenerate context.yaml / INDEX.md once after the batch (default true). */
   regenerateIndex?: boolean;
+  /** Fires once per document as it settles, published or failed. Advisory: with
+   * concurrency > 1 docs finish out of input order, so only the count is
+   * monotonic — it drives progress bars, not per-doc reporting. */
+  onProgress?: (done: number, total: number) => void;
 }
 
 export interface BulkPublishResult {
@@ -143,6 +147,7 @@ export async function publishDocuments(
   const concurrency = Math.max(1, options.concurrency ?? 16);
   const published: BulkPublishResult["published"] = [];
   const failed: BulkPublishResult["failed"] = [];
+  let settled = 0;
 
   const publishOne = async (docId: string): Promise<void> => {
     try {
@@ -179,6 +184,10 @@ export async function publishDocuments(
       });
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      // Counter increments are safe unsynchronized — JS runs them on one thread;
+      // only the awaited I/O above overlaps.
+      options.onProgress?.(++settled, docIds.length);
     }
   };
 

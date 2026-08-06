@@ -300,13 +300,15 @@ describe("createEngineApi — executable core operations", () => {
       tags: ["#bulk"],
     }));
     const out = await api.run<{
-      created: Array<{ id: string; version: number }>;
+      published: Array<{ id: string; version: number }>;
       failed: unknown[];
+      checkpoint: number | null;
     }>("context_import", { documents }, ctx);
 
-    expect(out.created).toHaveLength(6);
+    expect(out.published).toHaveLength(6);
     expect(out.failed).toHaveLength(0);
-    expect(out.created.every((c) => c.version === 1)).toBe(true);
+    expect(out.published.every((c) => c.version === 1)).toBe(true);
+    expect(out.checkpoint).not.toBeNull();
     // Whole batch sealed one checkpoint, not one-per-doc.
     const history = await ctx.storage.readCheckpointHistory();
     expect(history?.checkpoints).toHaveLength(1);
@@ -322,8 +324,8 @@ describe("createEngineApi — executable core operations", () => {
   it("context_import reports per-document failures without aborting the batch", async () => {
     const api = createEngineApi();
     const out = await api.run<{
-      created: Array<{ id: string }>;
-      failed: Array<{ title: string; error: string }>;
+      published: Array<{ id: string }>;
+      failed: Array<{ title?: string; error: string }>;
     }>(
       "context_import",
       {
@@ -335,9 +337,80 @@ describe("createEngineApi — executable core operations", () => {
       },
       ctx,
     );
-    expect(out.created).toHaveLength(2);
+    expect(out.published).toHaveLength(2);
     expect(out.failed).toHaveLength(1);
     expect(out.failed[0].title).toBe("日本語のみ");
+  });
+
+  it("context_import publishes ids already in the vault, preserving their ids", async () => {
+    const api = createEngineApi();
+    // Files dropped straight into the vault (folder import) — nested paths and
+    // frontmatter of their own, never routed through buildDraftNode.
+    const ids = ["nodes/team/handbook", "nodes/team/deep/onboarding"];
+    for (const id of ids) {
+      await ctx.storage.writeDocument(
+        id,
+        `---\ntitle: ${id}\ntype: document\nstatus: draft\n---\n\nbody\n`,
+      );
+    }
+
+    const out = await api.run<{
+      published: Array<{ id: string; version: number }>;
+      failed: unknown[];
+      checkpoint: number | null;
+    }>("context_import", { ids }, ctx);
+
+    expect(out.published.map((p) => p.id).sort()).toEqual([...ids].sort());
+    expect(out.failed).toHaveLength(0);
+    // ONE checkpoint for the batch, same as the documents[] path.
+    const history = await ctx.storage.readCheckpointHistory();
+    expect(history?.checkpoints).toHaveLength(1);
+    const got = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: "nodes/team/deep/onboarding" },
+      ctx,
+    );
+    expect(got.frontmatter.status).toBe("published");
+  });
+
+  it("context_import publishes documents[] and ids[] under ONE checkpoint", async () => {
+    const api = createEngineApi();
+    await ctx.storage.writeDocument(
+      "nodes/existing-one",
+      "---\ntitle: Existing One\ntype: document\nstatus: draft\n---\n\nbody\n",
+    );
+    const out = await api.run<{
+      published: Array<{ id: string }>;
+      failed: unknown[];
+    }>(
+      "context_import",
+      { documents: [{ title: "Fresh One", content: "b" }], ids: ["nodes/existing-one"] },
+      ctx,
+    );
+    expect(out.published.map((p) => p.id).sort()).toEqual([
+      "nodes/existing-one",
+      "nodes/fresh-one",
+    ]);
+    const history = await ctx.storage.readCheckpointHistory();
+    expect(history?.checkpoints).toHaveLength(1);
+  });
+
+  it("context_import reports progress through the context sink", async () => {
+    const api = createEngineApi();
+    const ticks: Array<[number, number]> = [];
+    await api.run(
+      "context_import",
+      { documents: Array.from({ length: 4 }, (_, i) => ({ title: `Tick ${i}`, content: "b" })) },
+      { ...ctx, onProgress: (done, total) => ticks.push([done, total]) },
+    );
+    expect(ticks).toHaveLength(4);
+    expect(ticks.map(([done]) => done)).toEqual([1, 2, 3, 4]);
+    expect(ticks.every(([, total]) => total === 4)).toBe(true);
+  });
+
+  it("context_import rejects a call with neither documents nor ids", async () => {
+    const api = createEngineApi();
+    await expect(api.run("context_import", {}, ctx)).rejects.toThrow(/documents\[\] or ids\[\]/);
   });
 
   it("normalizes tags to #-prefixed form on create (S7)", async () => {

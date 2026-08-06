@@ -95,6 +95,22 @@ describe("publishDocuments — bulk import", () => {
     expect((await storage.readDocument(bad)).frontmatter.status).toBe("rejected");
   });
 
+  it("ticks onProgress once per doc, failures included", async () => {
+    const good1 = await writeDraft(storage, "prog-1");
+    const bad = await writeDraft(storage, "prog-rejected", { status: "rejected" });
+    const good2 = await writeDraft(storage, "prog-2");
+    const ticks: Array<[number, number]> = [];
+
+    await publishDocuments(storage, [good1, bad, good2], {
+      editedBy: "importer",
+      onProgress: (done, total) => ticks.push([done, total]),
+    });
+
+    // One tick per input id — a failed doc still advances the bar.
+    expect(ticks.map(([done]) => done)).toEqual([1, 2, 3]);
+    expect(ticks.every(([, total]) => total === 3)).toBe(true);
+  });
+
   it("returns null checkpoint when nothing publishes", async () => {
     const bad = await writeDraft(storage, "only-rejected", { status: "rejected" });
     const result = await publishDocuments(storage, [bad], { editedBy: "importer" });
