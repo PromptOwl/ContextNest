@@ -46,6 +46,9 @@ const EXPECTED_TOOLS = [
   "list_suggestions",
   "approve_suggestion",
   "reject_suggestion",
+  // Catalog-driven: name, description and schema come from the engine's
+  // operation catalog rather than being declared here.
+  "context_import",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -145,7 +148,7 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
     await rm(vault, { recursive: true, force: true });
   });
 
-  it("exposes exactly the 19 expected tools, each with a description and input schema", async () => {
+  it(`exposes exactly the ${EXPECTED_TOOLS.length} expected tools, each with a description and input schema`, async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual([...EXPECTED_TOOLS].sort());
