@@ -194,8 +194,11 @@ describe("[regression] ctx add", () => {
   it("creates and auto-publishes a document at checkpoint 1", () => {
     const out = runCtx(tmp, ["add", "nodes/alpha", "--title", "Alpha Doc"]);
     expect(out).toMatch(/Created and published nodes\/alpha\.md/);
-    // init seeds v1; the publish on add bumps to v2.
-    expect(out).toMatch(/Version: 2/);
+    // A brand-new document's first published version is 1. `add` used to
+    // pre-set version:1 in frontmatter and let publish bump it, so the doc's
+    // history started at v2 with no v1 keyframe at all. Publish owns version
+    // assignment (spec §6) — the shared create path enforces that.
+    expect(out).toMatch(/Version: 1/);
     expect(out).toMatch(/Checkpoint: 1/);
 
     const onDisk = readFileSync(join(tmp, "nodes", "alpha.md"), "utf-8");
@@ -420,8 +423,8 @@ describe("[regression] ctx update", () => {
   it("a content edit auto-publishes and bumps the version", () => {
     const out = runCtx(tmp, ["update", "nodes/mutable", "--body", "Revised body"]);
     expect(out).toMatch(/Updated and published nodes\/mutable/);
-    // add landed at v2; a content update cuts v3.
-    expect(out).toMatch(/Version: 3/);
+    // add landed at v1; a content update cuts v2.
+    expect(out).toMatch(/Version: 2/);
 
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
     expect(onDisk).toMatch(/Revised body/);
@@ -465,7 +468,7 @@ describe("[regression] ctx publish, history & reconstruct", () => {
   it("publish bumps the version, advances the checkpoint, and reports a chain hash", () => {
     const out = runCtx(tmp, ["publish", "nodes/release", "-m", "second cut"]);
     expect(out).toMatch(/Published nodes\/release/);
-    expect(out).toMatch(/Version: 3/);
+    expect(out).toMatch(/Version: 2/);
     expect(out).toMatch(/Chain hash: sha256:/);
   });
 
@@ -473,8 +476,8 @@ describe("[regression] ctx publish, history & reconstruct", () => {
     runCtx(tmp, ["publish", "nodes/release", "-m", "cut"]);
     const history = JSON.parse(runCtx(tmp, ["history", "nodes/release", "--json"]));
     const versions = history.versions.map((v: { version: number }) => v.version);
+    expect(versions).toContain(1);
     expect(versions).toContain(2);
-    expect(versions).toContain(3);
     for (const v of history.versions) {
       expect(v.chain_hash).toMatch(/^sha256:/);
     }
@@ -554,7 +557,7 @@ describe("[regression] ctx verify", () => {
 
   it("detects a tampered keyframe and exits non-zero", () => {
     appendFileSync(
-      join(tmp, "nodes", ".versions", "sealed", "v2.md"),
+      join(tmp, "nodes", ".versions", "sealed", "v1.md"),
       "\ntampered content\n",
     );
     const res = runCtxResult(tmp, ["verify"]);
@@ -929,25 +932,25 @@ describe("[regression] flows", () => {
   beforeEach(() => initVault(tmp));
 
   it("full document lifecycle: add → read → update → history → reconstruct → delete", () => {
-    // add (auto-publishes the seeded doc to v2)
+    // add (auto-publishes the new doc at v1)
     const added = runCtx(tmp, ["add", "nodes/lc", "--title", "Lifecycle", "--body", "first body"]);
-    expect(added).toMatch(/Version: 2/);
+    expect(added).toMatch(/Version: 1/);
 
     // read shows the current body
     expect(runCtx(tmp, ["read", "nodes/lc"])).toContain("first body");
 
     // a content edit auto-publishes a new version
     const updated = runCtx(tmp, ["update", "nodes/lc", "--body", "second body"]);
-    expect(updated).toMatch(/Version: 3/);
+    expect(updated).toMatch(/Version: 2/);
 
     // history records both published versions with chain hashes
     const history = JSON.parse(runCtx(tmp, ["history", "nodes/lc", "--json"]));
     const versions = history.versions.map((v: { version: number }) => v.version);
-    expect(versions).toEqual(expect.arrayContaining([2, 3]));
+    expect(versions).toEqual(expect.arrayContaining([1, 2]));
 
     // each version reconstructs to the body it was published with
-    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "2"])).toContain("first body");
-    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "3"])).toContain("second body");
+    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "1"])).toContain("first body");
+    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "2"])).toContain("second body");
 
     // delete removes the doc and its version history; reads then fail
     runCtx(tmp, ["delete", "nodes/lc"]);
@@ -1001,7 +1004,7 @@ describe("[regression] flows", () => {
 
     // approving merges the edit and bumps the version
     const approved = JSON.parse(runCtx(tmp, ["drift", "approve", "nodes/policy", sid, "--json"]));
-    expect(approved.versionEntry.version).toBe(3);
+    expect(approved.versionEntry.version).toBe(2);
 
     // the suggestion is archived and the vault is clean again
     expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy", "--json"])).count).toBe(0);
@@ -1110,7 +1113,7 @@ describe("[regression] integrity — keyframe tamper", () => {
   it("ctx verify reports content_hash_mismatch when a version keyframe is tampered", () => {
     // Canonical .md and history.yaml are untouched — only a keyframe re-hash
     // can surface this corruption.
-    appendFileSync(join(tmp, "nodes", ".versions", "archived", "v2.md"), "\nrewritten history\n");
+    appendFileSync(join(tmp, "nodes", ".versions", "archived", "v1.md"), "\nrewritten history\n");
     const res = runCtxResult(tmp, ["verify", "--json"]);
     expect(res.status).toBe(1);
     const parsed = JSON.parse(res.stdout);

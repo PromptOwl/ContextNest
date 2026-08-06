@@ -244,6 +244,22 @@ const permissiveRbac: RbacHook = {
   isDocOwner: () => true,
 };
 
+/** Engine primitives an operation runs against, for one vault. */
+function opContext(
+  storage: NestStorage,
+  actor: string,
+  onProgress?: (done: number, total: number) => void,
+): OperationContext {
+  return {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    rbac: permissiveRbac,
+    actor,
+    onProgress,
+  };
+}
+
 // Interactively prompt the user to pick a starter recipe using an arrow-key
 // navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
 // chosen recipe id, or null if the user skips. Callers MUST only invoke this
@@ -958,27 +974,30 @@ program
       body = `\n# ${title}\n\n`;
     }
 
-    const node: ContextNode = {
-      id,
-      filePath: "",
-      frontmatter,
-      body,
-      rawContent: "",
-    };
+    // Scaffolding above stays a CLI concern (heading/steps templates are an
+    // authoring nicety, not vault semantics); the write + publish + index pass
+    // goes through the catalog so this matches every other surface.
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number | null;
+    }>(
+      "context_create",
+      {
+        id,
+        title,
+        content: body,
+        type: opts.type,
+        ...(tagList ? { tags: tagList } : {}),
+        ...(frontmatter.skill ?? {}),
+        note: "Created via CLI",
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
-    const content = serializeDocument(node);
-    await storage.writeDocument(id, content);
-
-    const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
-      note: "Created via CLI",
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Created and published ${id}.md`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
+    console.log(chalk.green(`Created and published ${result.id}.md`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
   });
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
@@ -1156,21 +1175,14 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
     return;
   }
 
-  const ctx: OperationContext = {
-    storage,
-    query: new GraphQueryEngine(storage),
-    versions: new VersionManager(storage),
-    rbac: permissiveRbac,
-    actor: author,
-    onProgress: (done, total) => {
-      // Single rewritten line; fall back to plain lines when piped to a file.
-      if (process.stdout.isTTY) {
-        process.stdout.write(`\rPublishing ${done}/${total}…`);
-      } else if (done === total) {
-        console.log(`Publishing ${done}/${total}`);
-      }
-    },
-  };
+  const ctx = opContext(storage, author, (done, total) => {
+    // Single rewritten line; fall back to plain lines when piped to a file.
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\rPublishing ${done}/${total}…`);
+    } else if (done === total) {
+      console.log(`Publishing ${done}/${total}`);
+    }
+  });
 
   const result = await createEngineApi().run<{
     published: { id: string; version: number }[];

@@ -211,10 +211,45 @@ const createOp: OperationDescriptor = {
       .record(z.unknown())
       .optional()
       .describe("Extra frontmatter metadata (e.g. a binding's scope). Merged into frontmatter.metadata."),
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Explicit document id, overriding the one derived from title + folder. For callers that mint their own ids (deterministic/system nodes) or address documents by path.",
+      ),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish on create (default true). Pass false to leave the node a draft — governed surfaces use this when a write must clear review before becoming retrievable.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    // These assemble the `skill` block, which is REQUIRED for type:"skill" and
+    // must be absent on every other type — so they cannot ride inside
+    // `metadata`. Supplying `trigger` is what creates the block.
+    trigger: z.string().optional().describe("Skill trigger description (required for type:skill)"),
+    tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("Skill output format"),
+    // Shape-checked by frontmatter validation rather than restated here, so the
+    // skill block has exactly one authoritative schema.
+    inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
   }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
+    status: z.enum(STATUSES).describe("Resulting status — draft when publish:false"),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null when created as a draft"),
   }),
   errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
   aliases: ["create_document"],

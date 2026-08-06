@@ -582,7 +582,7 @@ server.tool(
 
 server.tool(
   "create_document",
-  "Create a new document in the vault with frontmatter and optional body content",
+  "DEPRECATED — use context_create. Create a new document in the vault with frontmatter and optional body content. Kept for existing clients: it wraps the body in a heading and fills skill defaults, which context_create does not.",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().describe("Document title"),
@@ -1101,22 +1101,28 @@ server.tool(
   },
 );
 
-// ─── Tool: context_import ──────────────────────────────────────────────────────
+// ─── Catalog-driven tools (canonical `context_*` names) ───────────────────────
 
-// First catalog-driven tool in this server: the schema, description and
-// implementation all come from the engine's operation catalog, so this surface
-// cannot drift from the CLI/Community ones. The SDK wants a ZodRawShape, so we
-// hand it the descriptor's own `.shape` rather than restating the schema here.
-const importOp = engineApi.getOperation("context_import");
-if (importOp) {
+/**
+ * Register an engine catalog operation as an MCP tool. Name, description and
+ * schema all come from the descriptor, so this surface cannot drift from the
+ * CLI and Community ones. The SDK wants a ZodRawShape, hence the `.shape`.
+ *
+ * These are the canonical names. The legacy tools above (`create_document`,
+ * `read_document`, …) stay registered and behave exactly as before; they are
+ * deprecated in favour of these and will be removed in a future major.
+ */
+function registerCatalogTool(name: string): void {
+  const op = engineApi.getOperation(name);
+  if (!op) return;
   server.tool(
-    importOp.name,
-    importOp.description,
-    (importOp.input as z.ZodObject<z.ZodRawShape>).shape,
+    op.name,
+    op.description,
+    (op.input as z.ZodObject<z.ZodRawShape>).shape,
     async (input) => {
-      // No onProgress — MCP has no progress channel; the operation is identical
+      // No onProgress — MCP has no progress channel; operations are identical
       // without one.
-      const result = await engineApi.run(importOp.name, input, {
+      const result = await engineApi.run(op.name, input, {
         storage,
         query: new GraphQueryEngine(storage),
         versions: new VersionManager(storage),
@@ -1129,6 +1135,9 @@ if (importOp) {
     },
   );
 }
+
+registerCatalogTool("context_import");
+registerCatalogTool("context_create");
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 

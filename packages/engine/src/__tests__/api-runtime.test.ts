@@ -319,6 +319,63 @@ describe("createEngineApi — executable core operations", () => {
     expect(Array.isArray(out.packs)).toBe(true);
   });
 
+  it("context_create with publish:false leaves the node a draft", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ id: string; version: number; status: string }>(
+      "context_create",
+      { title: "Needs Review", content: "body", publish: false },
+      ctx,
+    );
+    expect(out.status).toBe("draft");
+    const got = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: out.id },
+      ctx,
+    );
+    expect(got.frontmatter.status).toBe("draft");
+  });
+
+  it("context_create honours an explicit id over the title slug", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ id: string; status: string }>(
+      "context_create",
+      { title: "Human Title", content: "body", id: "nodes/system/deterministic-id" },
+      ctx,
+    );
+    expect(out.id).toBe("nodes/system/deterministic-id");
+    expect(out.status).toBe("published");
+  });
+
+  it("context_create rejects an explicit id that escapes the vault", async () => {
+    const api = createEngineApi();
+    await expect(
+      api.run("context_create", { title: "Escape", content: "b", id: "../../outside" }, ctx),
+    ).rejects.toThrow(/path traversal/);
+  });
+
+  it("context_create builds a valid skill node from the skill fields", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ id: string }>(
+      "context_create",
+      {
+        title: "Deploy Skill",
+        content: "steps",
+        type: "skill",
+        trigger: "when asked to deploy",
+        tools_required: ["bash"],
+        output_format: "markdown",
+      },
+      ctx,
+    );
+    const got = await api.run<{ frontmatter: any }>("context_get", { id: out.id }, ctx);
+    // A `skill` block, not loose top-level keys — validation requires it.
+    expect(got.frontmatter.skill).toMatchObject({
+      trigger: "when asked to deploy",
+      tools_required: ["bash"],
+      output_format: "markdown",
+    });
+  });
+
   it("context_import bulk-creates many nodes under ONE checkpoint", async () => {
     const api = createEngineApi();
     const documents = Array.from({ length: 6 }, (_, i) => ({

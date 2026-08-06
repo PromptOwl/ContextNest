@@ -47,8 +47,10 @@ const EXPECTED_TOOLS = [
   "approve_suggestion",
   "reject_suggestion",
   // Catalog-driven: name, description and schema come from the engine's
-  // operation catalog rather than being declared here.
+  // operation catalog rather than being declared here. The legacy twin of a
+  // catalog tool (e.g. create_document) stays registered but is deprecated.
   "context_import",
+  "context_create",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

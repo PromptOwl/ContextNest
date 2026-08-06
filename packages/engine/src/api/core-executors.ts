@@ -11,7 +11,7 @@
  * existing surfaces (published-only search, index regeneration after publish,
  * status/tag normalization, document validation before write).
  */
-import type { ContextNode, Frontmatter } from "../types.js";
+import type { ContextNode, Frontmatter, SkillMeta } from "../types.js";
 import {
   serializeDocument,
   validateDocument,
@@ -111,13 +111,20 @@ function assertValid(node: ContextNode): void {
 }
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
-async function publishAndIndex(ctx: OperationContext, id: string): Promise<{ version: number }> {
-  const res = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
+async function publishAndIndex(
+  ctx: OperationContext,
+  id: string,
+  note?: string,
+): Promise<{ version: number; checkpoint: number }> {
+  const res = await publishDocument(ctx.storage, id, {
+    editedBy: ctx.actor ?? "engine",
+    ...(note ? { note } : {}),
+  });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
   // mcp-server/CLI both regenerate here.
   await ctx.storage.regenerateIndex();
-  return { version: res.versionEntry.version };
+  return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
 const query: OperationExecutor = async (ctx, input: any) => {
@@ -215,32 +222,81 @@ function buildDraftNode(input: {
   tags?: unknown[];
   folder?: string;
   metadata?: Record<string, unknown>;
+  id?: string;
+  trigger?: string;
+  tools_required?: string[];
+  output_format?: SkillMeta["output_format"];
+  inputs?: SkillMeta["inputs"];
+  guard_rails?: string[];
 }): ContextNode {
+  const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
     .split("/")
     .map(slugify)
     .filter(Boolean);
-  const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  // An explicit id wins outright — callers that mint their own ids (system
+  // nodes, path-addressed tools) still get the traversal/prefix normalization.
+  const id = input.id
+    ? normalizeDocumentId(input.id)
+    : normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
   const frontmatter: Frontmatter = {
     title: input.title,
     type: (input.type as Frontmatter["type"]) ?? "document",
     ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
+    // Skill nodes carry a `skill` block — `trigger` is required there for
+    // type:"skill" and the block must be ABSENT on every other type, so these
+    // cannot ride along inside `metadata`.
+    ...(input.trigger
+      ? {
+          skill: {
+            trigger: input.trigger,
+            ...(input.inputs ? { inputs: input.inputs } : {}),
+            ...(input.tools_required ? { tools_required: input.tools_required } : {}),
+            ...(input.output_format ? { output_format: input.output_format } : {}),
+            ...(input.guard_rails ? { guard_rails: input.guard_rails } : {}),
+          },
+        }
+      : {}),
     status: "draft",
-    created_at: new Date().toISOString(),
+    created_at: now,
+    // A node is "updated" at birth; without this a draft carries no
+    // updated_at until its first edit, and every surface renders it blank.
+    updated_at: now,
   };
   return { id, filePath: "", rawContent: "", frontmatter, body: input.content };
 }
 
 const create: OperationExecutor = async (ctx, input: any) => {
   const node = buildDraftNode(input);
+  // Publish assigns the version (spec §6), so a published node must go to disk
+  // WITHOUT one — pre-setting it makes the first published version 2 and leaves
+  // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
+  if (input.publish === false) node.frontmatter.version = 1;
   assertValid(node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
   // the way the pre-check + separate write could race.
   await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
-  const result = await publishAndIndex(ctx, node.id);
-  return { id: node.id, version: result.version };
+  // Governed callers create the node WITHOUT publishing: the write has to clear
+  // review before it becomes retrievable. Still regenerate the index so the
+  // draft is discoverable to the surfaces that list drafts.
+  if (input.publish === false) {
+    await ctx.storage.regenerateIndex();
+    return {
+      id: node.id,
+      version: node.frontmatter.version ?? 1,
+      status: "draft",
+      checkpoint: null,
+    };
+  }
+  const result = await publishAndIndex(ctx, node.id, input.note);
+  return {
+    id: node.id,
+    version: result.version,
+    status: "published",
+    checkpoint: result.checkpoint,
+  };
 };
 
 const update: OperationExecutor = async (ctx, input: any) => {
