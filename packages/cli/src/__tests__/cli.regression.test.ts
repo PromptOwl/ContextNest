@@ -484,6 +484,39 @@ describe("[regression] ctx publish, history & reconstruct", () => {
     const content = runCtx(tmp, ["reconstruct", "nodes/release", "2"]);
     expect(content).toMatch(/title:\s*Release Doc/);
   });
+
+  /** Highest checkpoint number currently sealed in the vault. */
+  const latestCheckpoint = (): number =>
+    JSON.parse(runCtx(tmp, ["checkpoint", "list", "--json", "-n", "1"]))[0].checkpoint;
+
+  it("publish --all publishes every draft in one batch, under ONE checkpoint", () => {
+    // Drafts written straight to disk, as a folder import leaves them —
+    // `ctx add` publishes on create, so it cannot produce this state.
+    for (const slug of ["draft-a", "draft-b", "draft-c"]) {
+      writeFileSync(
+        join(tmp, "nodes", `${slug}.md`),
+        `---\ntitle: ${slug}\ntype: document\nstatus: draft\nversion: 1\n---\n\nbody\n`,
+      );
+    }
+    const before = latestCheckpoint();
+
+    const out = runCtx(tmp, ["publish", "--all"]);
+    expect(out).toMatch(/Published 3 document\(s\)/);
+
+    // One checkpoint for the whole batch — a publish-per-doc loop adds three.
+    expect(latestCheckpoint() - before).toBe(1);
+    expect(runCtx(tmp, ["read", "nodes/draft-b"])).toMatch(/status:\s*published/);
+  });
+
+  it("publish --all is a no-op when nothing is unpublished", () => {
+    expect(runCtx(tmp, ["publish", "--all"])).toMatch(/Nothing to publish/);
+  });
+
+  it("publish rejects a path and --all together", () => {
+    const { status, stderr } = runCtxResult(tmp, ["publish", "nodes/release", "--all"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/Pass a path or --all, not both/);
+  });
 });
 
 // ─── delete ──────────────────────────────────────────────────────────────────

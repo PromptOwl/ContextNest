@@ -63,16 +63,25 @@ export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
  */
 export function normalizeDocumentId(raw: string): string {
   const trimmed = raw.replace(/\.md$/, "").replace(/^\/+/, "");
-  // A legitimate document id never contains a `..` segment; treating one as a
-  // path would let it escape the vault root. Reject it at this single choke
-  // point that every CLI/MCP path conversion flows through.
-  if (trimmed.split(/[/\\]/).some((seg) => seg === "..")) {
+  assertSafeDocumentId(trimmed);
+  return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
+}
+
+/**
+ * Reject an id that would escape the vault root. Callers join ids against the
+ * root verbatim, so every id arriving from outside must clear this.
+ *
+ * Split out of `normalizeDocumentId` because that also re-roots a bare slug
+ * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
+ * needs the traversal check WITHOUT the rewrite.
+ */
+export function assertSafeDocumentId(raw: string): void {
+  if (raw.split(/[/\\]/).some((seg) => seg === "..")) {
     throw new ContextNestError(
       `Invalid document id "${raw}": path traversal ("..") is not allowed.`,
       "INVALID_DOCUMENT_ID",
     );
   }
-  return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
 }
 
 /** Options for `NestStorage.readDocument`. */

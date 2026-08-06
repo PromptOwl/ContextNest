@@ -383,37 +383,53 @@ const packs: OperationExecutor = async (ctx) => {
 };
 
 const importDocs: OperationExecutor = async (ctx, input: any) => {
-  const created: { id: string; version: number }[] = [];
-  const failed: { title: string; error: string }[] = [];
+  const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
 
-  // Stage 1: write every doc as a draft (exclusive → dup/invalid go to failed).
-  const writtenIds: string[] = [];
-  for (const doc of input.documents) {
+  // Ids of documents already in the vault publish as-is — their paths ARE their
+  // ids, and the caller owns their frontmatter. Nothing is rewritten here.
+  const batch: string[] = [...(input.ids ?? [])];
+
+  // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
+  for (const doc of input.documents ?? []) {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
       await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
-      writtenIds.push(node.id);
+      batch.push(node.id);
       titleById.set(node.id, doc.title);
     } catch (err) {
       failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
-  // Stage 2: bulk-publish the drafts — ONE checkpoint + ONE index regen for the
-  // whole batch (the O(N) path), instead of a checkpoint per document.
-  if (writtenIds.length > 0) {
-    const result = await publishDocuments(ctx.storage, writtenIds, {
+  // An empty call is a caller bug, not an empty result — but a batch where every
+  // document failed to stage is a legitimate (fully-failed) result.
+  if (batch.length === 0 && failed.length === 0) {
+    throw new ContextNestError(
+      "context_import requires documents[] or ids[]",
+      "VALIDATION_FAILED",
+    );
+  }
+
+  // Stage 2: ONE bulk publish for both modes — one checkpoint + one index regen
+  // for the whole batch (the O(N) path), instead of a checkpoint per document.
+  let published: { id: string; version: number }[] = [];
+  let checkpoint: number | null = null;
+  if (batch.length > 0) {
+    const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
+      onProgress: ctx.onProgress,
     });
-    for (const p of result.published) created.push({ id: p.id, version: p.version });
+    published = result.published.map((p) => ({ id: p.id, version: p.version }));
+    checkpoint = result.checkpointNumber;
     for (const f of result.failed) {
-      failed.push({ title: titleById.get(f.id) ?? f.id, error: f.error });
+      const title = titleById.get(f.id);
+      failed.push(title ? { title, error: f.error } : { id: f.id, error: f.error });
     }
   }
 
-  return { created, failed };
+  return { published, failed, checkpoint };
 };
 
 /** name → executor for the built-in `core` namespace. */
