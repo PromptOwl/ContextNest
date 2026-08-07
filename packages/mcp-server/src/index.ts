@@ -694,7 +694,7 @@ server.tool(
 
 server.tool(
   "update_document",
-  "Update an existing document's frontmatter fields and/or body content",
+  "DEPRECATED — use context_update. Update an existing document's frontmatter fields and/or body content. Kept for existing clients: it accepts status aliases and wraps the body, which context_update does not.",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().optional().describe("New title"),
@@ -1138,6 +1138,7 @@ function registerCatalogTool(name: string): void {
 
 registerCatalogTool("context_import");
 registerCatalogTool("context_create");
+registerCatalogTool("context_update");
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 

@@ -88,17 +88,27 @@ describe("createEngineApi — executable core operations", () => {
     expect(listed.documents.some((d) => d.id === created.id)).toBe(true);
   });
 
-  it("update by title (not id) resolves the real doc (regression: C2)", async () => {
+  it("title selects the real doc, and on update it renames instead (regression: C2)", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "My Cool Title", content: "orig" }, ctx);
-    const updated = await api.run<{ id: string; version: number }>(
+    // Selecting by title still resolves the real doc rather than a slug guess —
+    // the C2 guard, now carried by the selector ops that kept that input.
+    const got = await api.run<{ id: string }>("context_get", { title: "My Cool Title" }, ctx);
+    expect(got.id).toBe("nodes/my-cool-title");
+    // On context_update `title` is the NEW title: it renames, leaving the id be.
+    const updated = await api.run<{ id: string }>(
       "context_update",
-      { title: "My Cool Title", append: "more" },
+      { id: got.id, title: "Renamed", append: "more" },
       ctx,
     );
     expect(updated.id).toBe("nodes/my-cool-title");
-    const got = await api.run<{ body: string }>("context_get", { title: "My Cool Title" }, ctx);
-    expect(got.body).toContain("more");
+    const after = await api.run<{ frontmatter: { title: string }; body: string }>(
+      "context_get",
+      { id: got.id },
+      ctx,
+    );
+    expect(after.frontmatter.title).toBe("Renamed");
+    expect(after.body).toContain("more");
   });
 
   it("published doc is visible to graph-mode query after create (regression: S3 index regen)", async () => {
@@ -657,15 +667,112 @@ describe("core executors — review-fix regressions", () => {
     ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
   });
 
-  it("context_update de-duplicates merged tags", async () => {
+  it("context_update replaces tags and de-duplicates them", async () => {
     const api = createEngineApi();
-    await api.run("context_create", { title: "Dedupe", content: "b", tags: ["#api"] }, ctx);
+    await api.run(
+      "context_create",
+      { title: "Dedupe", content: "b", tags: ["#api", "#legacy"] },
+      ctx,
+    );
     await api.run("context_update", { id: "nodes/dedupe", tags: ["api", "#api", "ml"] }, ctx);
     const got = await api.run<{ frontmatter: { tags?: string[] } }>(
       "context_get",
       { id: "nodes/dedupe" },
       ctx,
     );
+    // #legacy is gone: the list replaces rather than merges, matching the CLI,
+    // mcp-server and context_create.
     expect(got.frontmatter.tags).toEqual(["#api", "#ml"]);
+  });
+});
+
+// ─── context_update — publish resolution ─────────────────────────────────────
+//
+// The CLI and mcp-server each hand-rolled "a lifecycle status change is
+// metadata, not a release". The op owns that rule now, so it is pinned here.
+
+describe("context_update — when it publishes", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+  const historyLength = async (id: string) =>
+    (await ctx.storage.readHistory(id))?.versions.length ?? 0;
+
+  it("publishes a content edit", async () => {
+    await api.run("context_create", { title: "Live", content: "one" }, ctx);
+    const before = await historyLength("nodes/live");
+    const res = await api.run<{ status: string; checkpoint: number | null }>(
+      "context_update",
+      { id: "nodes/live", content: "two" },
+      ctx,
+    );
+    expect(res.status).toBe("published");
+    expect(res.checkpoint).not.toBeNull();
+    expect(await historyLength("nodes/live")).toBe(before + 1);
+  });
+
+  it.each(["draft", "pending_review", "approved", "rejected"])(
+    "treats a %s transition as metadata — no version cut",
+    async (status) => {
+      await api.run("context_create", { title: "Cycle", content: "one" }, ctx);
+      const before = await historyLength("nodes/cycle");
+      const res = await api.run<{ status: string; checkpoint: number | null }>(
+        "context_update",
+        { id: "nodes/cycle", status },
+        ctx,
+      );
+      expect(res.status).toBe(status);
+      expect(res.checkpoint).toBeNull();
+      expect(await historyLength("nodes/cycle")).toBe(before);
+    },
+  );
+
+  it("honours an explicit publish:false over the derived default", async () => {
+    await api.run("context_create", { title: "Held", content: "one" }, ctx);
+    const before = await historyLength("nodes/held");
+    const res = await api.run<{ version: number; checkpoint: number | null }>(
+      "context_update",
+      { id: "nodes/held", content: "two", publish: false, version: 7 },
+      ctx,
+    );
+    // A governed caller assigns its own version for a revision awaiting review.
+    expect(res.version).toBe(7);
+    expect(res.checkpoint).toBeNull();
+    expect(await historyLength("nodes/held")).toBe(before);
+    const got = await api.run<{ frontmatter: { checksum?: string }; body: string }>(
+      "context_get",
+      { id: "nodes/held" },
+      ctx,
+    );
+    expect(got.body).toContain("two");
+    // Stale published-state checksum dropped, or the next verified read reports
+    // this write as external drift.
+    expect(got.frontmatter.checksum).toBeUndefined();
+  });
+
+  it("revives a rejected doc when the caller names a new status", async () => {
+    await api.run("context_create", { title: "Retired", content: "one" }, ctx);
+    await api.run("context_update", { id: "nodes/retired", status: "rejected" }, ctx);
+    // Content-only edit stays refused …
+    await expect(
+      api.run("context_update", { id: "nodes/retired", content: "sneaky" }, ctx),
+    ).rejects.toMatchObject({ code: "REJECTED_DOCUMENT" });
+    // … but declaring a status revives it.
+    const res = await api.run<{ status: string }>(
+      "context_update",
+      { id: "nodes/retired", status: "draft", content: "revived" },
+      ctx,
+    );
+    expect(res.status).toBe("draft");
+    const got = await api.run<{ body: string }>("context_get", { id: "nodes/retired" }, ctx);
+    expect(got.body).toContain("revived");
   });
 });

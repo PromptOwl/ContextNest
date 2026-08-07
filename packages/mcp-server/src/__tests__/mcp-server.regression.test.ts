@@ -51,6 +51,7 @@ const EXPECTED_TOOLS = [
   // catalog tool (e.g. create_document) stays registered but is deprecated.
   "context_import",
   "context_create",
+  "context_update",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

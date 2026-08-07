@@ -266,25 +266,60 @@ const createOp: OperationDescriptor = {
 const updateOp: OperationDescriptor = {
   name: "context_update",
   namespace: "core",
-  description: "Update an existing node — replace content, append, or add tags.",
-  input: z
-    .object({
-      id: z.string().optional().describe("Id of node to update"),
-      title: z.string().optional().describe("Title of node to update"),
-      content: z.string().optional().describe("New content (replaces body)"),
-      append: z.string().optional().describe("Content to append"),
-      tags: z.array(tag).optional().describe("Tags to add"),
-      metadata: z
-        .record(z.unknown())
-        .optional()
-        .describe("Extra frontmatter metadata to merge into frontmatter.metadata."),
-    })
-    .refine((v) => Boolean(v.id || v.title), {
-      message: "One of id or title is required",
-    }),
+  description: "Update an existing node — edit frontmatter fields and/or body, then publish.",
+  // `title` is the NEW title, not a selector: every surface addresses a node by
+  // id/path and sends title only to rename. Selecting by title here collided
+  // with that and served no caller.
+  input: z.object({
+    id: z
+      .string()
+      .describe(
+        "Id of the node to update, exactly as stored (e.g. \"nodes/api-design\"). Not re-rooted — a flat-layout vault's ids carry no nodes/ prefix.",
+      ),
+    title: z.string().optional().describe("New title"),
+    content: z.string().optional().describe("New content (replaces body)"),
+    append: z.string().optional().describe("Content to append"),
+    tags: z.array(tag).optional().describe("New tags (replaces existing)"),
+    metadata: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Frontmatter metadata to merge into frontmatter.metadata. A null value clears that key.",
+      ),
+    status: z
+      .enum(STATUSES)
+      .optional()
+      .describe(
+        "New lifecycle status. Canonical values only — normalize aliases with `normalizeStatus` before calling.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish the edit (default true). Defaults to FALSE when `status` names a non-published lifecycle value — those are metadata transitions, not content releases. An explicit value always wins.",
+      ),
+    version: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "Explicit version to stamp, for governed callers that assign version numbers themselves (a draft revision awaiting review). Ignored when publishing, which assigns the version.",
+      ),
+  }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
+    status: z.enum(STATUSES).describe("Resulting status — `published` unless the edit stayed a draft"),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null when the edit did not publish"),
   }),
   errors: [
     "VALIDATION_FAILED",

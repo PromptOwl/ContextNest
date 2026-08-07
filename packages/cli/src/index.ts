@@ -1617,67 +1617,53 @@ program
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
+    // takes canonical statuses only. It decides from that status whether this
+    // is a content release or a lifecycle transition, so the CLI no longer
+    // carries its own copy of that rule.
+    const status = opts.status !== undefined ? normalizeStatus(opts.status) : undefined;
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      status: string;
+      checkpoint: number | null;
+    }>(
+      "context_update",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.title !== undefined ? { title: opts.title } : {}),
+        ...(status !== undefined ? { status } : {}),
+        ...(opts.tags !== undefined
+          ? {
+              tags: opts.tags
+                .split(/[,\s]+/)
+                .filter((t: string) => t.length > 0)
+                .map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
+            }
+          : {}),
+        ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
+        note: "Updated via CLI",
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
-    if (opts.title !== undefined) doc.frontmatter.title = opts.title;
-    if (opts.status !== undefined) {
-      doc.frontmatter.status = normalizeStatus(opts.status);
-    }
-    if (opts.tags !== undefined) {
-      doc.frontmatter.tags = opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
-    }
-    doc.frontmatter.updated_at = new Date().toISOString();
-
-    if (opts.body !== undefined) {
-      doc.body = `\n${opts.body}\n`;
-    }
-
-    const validation = validateDocument(doc);
-    if (!validation.valid) {
-      console.log(chalk.red("Validation failed:"));
-      for (const err of validation.errors) {
-        console.log(`  Rule ${err.rule}: ${err.message}${err.field ? ` (${err.field})` : ""}`);
-      }
-      process.exit(1);
-    }
-
-    const content = serializeDocument(doc);
-    await storage.writeDocument(id, content);
-
-    // Non-published lifecycle paths skip auto-publish — those are metadata
-    // changes, not content releases. Mirrors MCP `update_document`.
-    if (
-      opts.status !== undefined &&
-      (doc.frontmatter.status === "rejected" ||
-        doc.frontmatter.status === "approved" ||
-        doc.frontmatter.status === "pending_review" ||
-        doc.frontmatter.status === "draft")
-    ) {
-      await regenerateIndex(storage);
+    if (result.checkpoint === null) {
       const label =
-        doc.frontmatter.status === "rejected"
+        result.status === "rejected"
           ? "retired"
-          : doc.frontmatter.status === "pending_review"
+          : result.status === "pending_review"
             ? "submitted for review"
-            : doc.frontmatter.status === "approved"
+            : result.status === "approved"
               ? "marked approved"
               : "reverted to draft";
-      console.log(chalk.green(`Updated and ${label}: ${id}`));
+      console.log(chalk.green(`Updated and ${label}: ${result.id}`));
       console.log(chalk.dim("  No new version cut. Run `ctx publish` to release."));
       return;
     }
 
-    const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
-      note: "Updated via CLI",
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Updated and published ${id}`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
+    console.log(chalk.green(`Updated and published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────

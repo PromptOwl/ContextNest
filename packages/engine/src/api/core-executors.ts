@@ -19,7 +19,7 @@ import {
   normalizeStatus,
   isRejected,
 } from "../parser.js";
-import { normalizeDocumentId } from "../storage.js";
+import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
@@ -301,29 +301,77 @@ const create: OperationExecutor = async (ctx, input: any) => {
   };
 };
 
+/**
+ * Statuses that describe where a node sits in review, not a content release.
+ * Setting one is a metadata transition, so it doesn't publish by default — the
+ * rule CLI and mcp-server each hand-rolled before this op absorbed it.
+ */
+const UNPUBLISHED_STATUSES = new Set(["draft", "pending_review", "approved", "rejected"]);
+
 const update: OperationExecutor = async (ctx, input: any) => {
-  const id = await resolveId(ctx, input);
+  // Vetted, NOT normalized: normalizeDocumentId re-roots a bare slug under
+  // `nodes/`, which silently redirects every id from a flat-layout vault (they
+  // carry no prefix) to a document that doesn't exist. The storage layer
+  // already resolves an id for its own layout — all this has to do is refuse
+  // one that would escape the vault root.
+  const id: string = input.id;
+  assertSafeDocumentId(id);
   const existing = await ctx.storage.readDocument(id);
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
-  // rejects (no version/checksum/history). Mirrors OSS update_document.
-  if (isRejected(existing)) throw new RejectedDocumentError(id);
+  // rejects (no version/checksum/history). Naming a `status` is how a caller
+  // revives one, so only a status-less edit is refused — mirrors OSS
+  // update_document.
+  if (isRejected(existing) && input.status === undefined) throw new RejectedDocumentError(id);
   const frontmatter: Frontmatter = { ...existing.frontmatter };
-  if (input.tags) {
-    const merged = [...(frontmatter.tags ?? []), ...input.tags];
-    frontmatter.tags = normalizeUniqueTags(merged);
-  }
+  if (input.title) frontmatter.title = input.title;
+  if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
   if (input.metadata) {
-    frontmatter.metadata = { ...(frontmatter.metadata ?? {}), ...input.metadata };
+    const merged: Record<string, unknown> = {
+      ...(frontmatter.metadata ?? {}),
+      ...input.metadata,
+    };
+    // A null value CLEARS the key. Over a JSON wire an absent key is
+    // indistinguishable from "leave this alone", so a merge with no null
+    // convention gives callers no way to remove metadata at all. Only keys the
+    // caller named are considered — a null already on disk is left alone.
+    for (const [key, value] of Object.entries(input.metadata)) {
+      if (value === null) delete merged[key];
+    }
+    frontmatter.metadata = merged;
   }
+  frontmatter.updated_at = new Date().toISOString();
   let body = existing.body;
   if (typeof input.content === "string") body = input.content;
   if (typeof input.append === "string") body = `${body}\n${input.append}`;
+  // The checksum describes the PUBLISHED body, so any body change invalidates
+  // it — including one whose publish then fails, which would otherwise leave a
+  // stale checksum on disk and make the next verified read cry external drift.
+  // Frontmatter-only edits keep it: the checksum covers the body alone.
+  if (typeof input.content === "string" || typeof input.append === "string") {
+    delete frontmatter.checksum;
+  }
+
+  const publish = input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status));
+  // Only an unpublished write may carry a caller-assigned version: publish
+  // assigns its own, and stamping one first would put the node a version ahead
+  // of its history (the same trap context_create avoids).
+  if (!publish && input.version !== undefined) frontmatter.version = input.version;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
   await ctx.storage.writeDocument(id, serializeDocument(node));
-  const result = await publishAndIndex(ctx, id);
-  return { id, version: result.version };
+  if (!publish) {
+    await ctx.storage.regenerateIndex();
+    return {
+      id,
+      version: frontmatter.version ?? 1,
+      status: frontmatter.status ?? "draft",
+      checkpoint: null,
+    };
+  }
+  const result = await publishAndIndex(ctx, id, input.note);
+  return { id, version: result.version, status: "published", checkpoint: result.checkpoint };
 };
 
 const publish: OperationExecutor = async (ctx, input: any) => {
