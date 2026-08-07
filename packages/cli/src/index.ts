@@ -1278,6 +1278,74 @@ program
     console.log(content);
   });
 
+// ─── ctx info ─────────────────────────────────────────────────────────────────
+//
+// Named `info`, not `init`: `ctx init` CREATES a vault, while the operation
+// behind this one opens an existing vault (its instructions, config and what it
+// holds). Same word, opposite meaning — worth keeping apart on the CLI.
+
+program
+  .command("info")
+  .description("Show the vault's instructions, configuration and contents")
+  .option("--nodes", "Also list every node")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const out = await createEngineApi().run<{
+      context_md: string | null;
+      vault_path: string;
+      config: { name: string; description?: string; servers: string[] } | null;
+      total: number;
+      by_type: Record<string, number>;
+      by_status: Record<string, number>;
+      tags: string[];
+      nodes?: Array<{ id: string; title: string; type: string }>;
+    }>(
+      "context_init",
+      opts.nodes ? { include_nodes: true } : {},
+      opContext(storage, "cli@contextnest.local"),
+    );
+
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold(out.config?.name ?? "Vault"));
+    if (out.config?.description) console.log(chalk.dim(out.config.description));
+    console.log(chalk.dim(out.vault_path));
+    console.log();
+    console.log(`${chalk.bold(String(out.total))} node(s)`);
+    for (const [type, count] of Object.entries(out.by_type).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${chalk.cyan(type)}: ${count}`);
+    }
+    if (Object.keys(out.by_status).length) {
+      console.log(chalk.dim("status:"));
+      for (const [status, count] of Object.entries(out.by_status).sort((a, b) => b[1] - a[1])) {
+        console.log(`  ${status}: ${count}`);
+      }
+    }
+    if (out.tags.length) {
+      console.log(chalk.dim("tags:") + " " + out.tags.map((t) => chalk.cyan(t)).join(" "));
+    }
+    if (out.config?.servers.length) {
+      console.log(chalk.dim("servers:") + " " + out.config.servers.join(", "));
+    }
+    if (out.nodes) {
+      console.log();
+      for (const n of out.nodes) {
+        console.log(`  ${chalk.cyan(n.id)} [${n.type}]`);
+        console.log(`    ${n.title}`);
+      }
+    }
+    console.log();
+    console.log(
+      out.context_md
+        ? chalk.dim("CONTEXT.md:\n") + out.context_md
+        : chalk.yellow("No CONTEXT.md — run `ctx init` to scaffold one."),
+    );
+  });
+
 // ─── ctx verify ────────────────────────────────────────────────────────────────
 
 program

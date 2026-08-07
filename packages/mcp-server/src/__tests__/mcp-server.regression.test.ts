@@ -55,6 +55,9 @@ const EXPECTED_TOOLS = [
   "context_list",
   "context_versions",
   "context_get",
+  "context_init",
+  "context_verify",
+  "context_packs",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -176,6 +179,7 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
     ["context_list", ["type", "tag", "status", "limit"]],
     ["context_versions", ["id", "title", "include_diff"]],
     ["context_get", ["uri", "id", "title", "include_raw", "allow_rejected"]],
+    ["context_init", ["include_nodes", "limit"]],
     ["context_import", ["documents", "ids"]],
   ])("%s advertises its declared inputs", async (name, expected) => {
     const { tools } = await client.listTools();

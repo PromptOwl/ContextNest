@@ -454,26 +454,6 @@ const versions: OperationExecutor = async (ctx, input: any) => {
   };
 };
 
-const overview: OperationExecutor = async (ctx) => {
-  const docs = await ctx.storage.discoverDocuments();
-  const byType: Record<string, number> = {};
-  const byStatus: Record<string, number> = {};
-  const tags = new Set<string>();
-  for (const d of docs) {
-    const t = d.frontmatter.type ?? "document";
-    byType[t] = (byType[t] ?? 0) + 1;
-    const s = d.frontmatter.status ?? "draft";
-    byStatus[s] = (byStatus[s] ?? 0) + 1;
-    for (const tag of d.frontmatter.tags ?? []) tags.add(tag);
-  }
-  return {
-    total: docs.length,
-    by_type: byType,
-    by_status: byStatus,
-    tags: [...tags].sort(),
-    nodes: docs.map((d) => toSummary(d)),
-  };
-};
 
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
@@ -500,8 +480,44 @@ const verify: OperationExecutor = async (ctx) => {
   return { valid: report.valid, errors: report.errors };
 };
 
-const init: OperationExecutor = async (ctx) => {
-  return { context_md: await ctx.storage.readContextMd() };
+const init: OperationExecutor = async (ctx, input: any) => {
+  // includeRetired so `by_status` can report `rejected` at all — discovery drops
+  // retired documents otherwise, and a manifest that silently omits a whole
+  // status is worse than one that reports zero.
+  const [context_md, config, docs] = await Promise.all([
+    ctx.storage.readContextMd(),
+    ctx.storage.readConfig(),
+    ctx.storage.discoverDocuments({ includeRetired: true }),
+  ]);
+  const byType: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const tags = new Set<string>();
+  for (const d of docs) {
+    const t = d.frontmatter.type ?? "document";
+    byType[t] = (byType[t] ?? 0) + 1;
+    const s = d.frontmatter.status ?? "draft";
+    byStatus[s] = (byStatus[s] ?? 0) + 1;
+    for (const tag of d.frontmatter.tags ?? []) tags.add(tag);
+  }
+  const listed = input?.limit ? docs.slice(0, input.limit) : docs;
+  return {
+    context_md,
+    vault_path: ctx.storage.root,
+    config: config
+      ? {
+          name: config.name,
+          ...(config.description ? { description: config.description } : {}),
+          servers: config.servers ? Object.keys(config.servers) : [],
+        }
+      : null,
+    total: docs.length,
+    by_type: byType,
+    by_status: byStatus,
+    tags: [...tags].sort(),
+    // Counts and tags answer most opening questions; a large vault's node list
+    // dwarfs them, so it is opt-in.
+    ...(input?.include_nodes ? { nodes: listed.map((d) => toSummary(d)) } : {}),
+  };
 };
 
 const packs: OperationExecutor = async (ctx) => {
@@ -580,7 +596,6 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_delete: del,
   context_versions: versions,
   context_reconstruct: reconstruct,
-  context_overview: overview,
   context_verify: verify,
   context_init: init,
   context_packs: packs,

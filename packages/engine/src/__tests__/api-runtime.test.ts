@@ -242,21 +242,46 @@ describe("createEngineApi — executable core operations", () => {
     expect(full.versions.filter((v) => v.keyframe).every((v) => !v.diff)).toBe(true);
   });
 
-  it("context_overview reports counts, tags, and the node list", async () => {
+  it("context_init opens the vault in one call: instructions, config and counts", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Alpha", content: "b", tags: ["#x"] }, ctx);
     await api.run("context_create", { title: "Beta", content: "b", type: "glossary" }, ctx);
-    const out = await api.run<{
+    type Init = {
+      context_md: string | null;
+      vault_path: string;
+      config: { name: string } | null;
       total: number;
       by_type: Record<string, number>;
       tags: string[];
-      nodes: Array<{ id: string }>;
-    }>("context_overview", {}, ctx);
+      nodes?: Array<{ id: string }>;
+    };
+    const out = await api.run<Init>("context_init", {}, ctx);
     expect(out.total).toBeGreaterThanOrEqual(2);
     expect(out.by_type.document).toBeGreaterThanOrEqual(1);
     expect(out.by_type.glossary).toBeGreaterThanOrEqual(1);
     expect(out.tags).toContain("#x");
-    expect(out.nodes.some((n) => n.id === "nodes/alpha")).toBe(true);
+    expect(out.vault_path).toBe(dir);
+    // The node list is the expensive part, so it is opt-in.
+    expect(out.nodes).toBeUndefined();
+
+    const withNodes = await api.run<Init>("context_init", { include_nodes: true }, ctx);
+    expect(withNodes.nodes?.some((n) => n.id === "nodes/alpha")).toBe(true);
+    expect((await api.run<Init>("context_init", { include_nodes: true, limit: 1 }, ctx)).nodes)
+      .toHaveLength(1);
+  });
+
+  it("context_init counts retired nodes, which discovery drops by default", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Live One", content: "b" }, ctx);
+    await api.run("context_create", { title: "Dead One", content: "b" }, ctx);
+    await api.run("context_update", { id: "nodes/dead-one", status: "rejected" }, ctx);
+    const out = await api.run<{ by_status: Record<string, number>; total: number }>(
+      "context_init",
+      {},
+      ctx,
+    );
+    expect(out.by_status.rejected).toBe(1);
+    expect(out.total).toBe(2);
   });
 
   it("context_reconstruct returns a past version's content", async () => {

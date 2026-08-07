@@ -82,7 +82,7 @@ const permissiveRbac: RbacHook = {
 
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
-server.tool("vault_info", "Get vault identity (CONTEXT.md) and configuration summary", {}, async () => {
+server.tool("vault_info", "DEPRECATED — use context_init, which returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary", {}, async () => {
   const contextMd = await storage.readContextMd();
   const config = await storage.readConfig();
 
@@ -513,7 +513,7 @@ server.tool(
 
 // ─── Tool: verify_integrity ────────────────────────────────────────────────────
 
-server.tool("verify_integrity", "Verify integrity of all hash chains in the vault", {}, async () => {
+server.tool("verify_integrity", "DEPRECATED — use context_verify. Verify integrity of all hash chains in the vault", {}, async () => {
   const report = await storage.verifyVaultIntegrity();
   return {
     content: [
@@ -1141,6 +1141,9 @@ registerCatalogTool("context_create");
 registerCatalogTool("context_update");
 registerCatalogTool("context_list");
 registerCatalogTool("context_get");
+registerCatalogTool("context_init");
+registerCatalogTool("context_verify");
+registerCatalogTool("context_packs");
 // No legacy twin: nothing here listed version history before — read_version
 // fetches one version's content, which is a different question.
 registerCatalogTool("context_versions");

@@ -459,24 +459,10 @@ const versionsOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
 };
 
-// ─── context_overview ────────────────────────────────────────────────────────
-
-const overviewOp: OperationDescriptor = {
-  name: "context_overview",
-  namespace: "core",
-  description:
-    "Vault manifest: node counts by type and status, the tag set, and a node list.",
-  input: z.object({}),
-  output: z.object({
-    total: z.number().int(),
-    by_type: z.record(z.number().int()),
-    by_status: z.record(z.number().int()),
-    tags: z.array(z.string()),
-    nodes: z.array(nodeSummary),
-  }),
-  errors: ["VALIDATION_FAILED"],
-  aliases: ["vault_info"],
-};
+// context_overview is gone: it returned counts, tags and a node list, all of
+// which context_init now returns alongside the vault's instructions and config.
+// Two operations meant two round trips to open a vault, and a `vault_info`
+// alias sitting on the one that returned none of what vault_info returns.
 
 // ─── context_reconstruct ─────────────────────────────────────────────────────
 
@@ -538,10 +524,37 @@ const verifyOp: OperationDescriptor = {
 const initOp: OperationDescriptor = {
   name: "context_init",
   namespace: "core",
-  description: "Load the vault's CONTEXT.md operating instructions (null if none).",
-  input: z.object({}),
-  output: z.object({ context_md: z.string().nullable() }),
+  description:
+    "Open a vault: its CONTEXT.md operating instructions, its configuration, and what it holds. Call this first in a session — it answers both 'how do I behave here' and 'what is here' in one round trip.",
+  input: z.object({
+    include_nodes: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also list every node. Off by default: the counts and tags below answer most opening questions, and a large vault's node list dwarfs them.",
+      ),
+    limit: z.number().int().positive().optional().describe("Max nodes to list, with include_nodes"),
+  }),
+  output: z.object({
+    context_md: z.string().nullable().describe("The vault's operating instructions, if it has any"),
+    vault_path: z.string(),
+    config: z
+      .object({
+        name: z.string(),
+        description: z.string().optional(),
+        servers: z.array(z.string()).describe("Names of the MCP servers the vault declares"),
+      })
+      .nullable(),
+    total: z.number().int(),
+    by_type: z.record(z.number().int()),
+    by_status: z.record(z.number().int()),
+    tags: z.array(z.string()),
+    nodes: z.array(nodeSummary).optional().describe("Only with include_nodes"),
+  }),
   errors: ["VALIDATION_FAILED"],
+  // `vault_info` returns CONTEXT.md, the config and the vault path — this
+  // operation, not context_overview, which shares none of those fields.
+  aliases: ["vault_info"],
 };
 
 // ─── context_packs ───────────────────────────────────────────────────────────
@@ -626,7 +639,6 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   deleteOp,
   versionsOp,
   reconstructOp,
-  overviewOp,
   verifyOp,
   initOp,
   packsOp,
