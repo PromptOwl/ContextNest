@@ -1130,6 +1130,32 @@ if (importOp) {
   );
 }
 
+// ─── Tool: context_nests ───────────────────────────────────────────────────────
+
+// Registry-scoped, not vault-scoped: the executor ignores the context entirely
+// (see packages/engine/src/api/README.md). A real one is passed anyway so an
+// extension `authorize` hook has something to inspect. Including `path` is fine
+// here — stdio MCP already runs with this process's filesystem access.
+const nestsOp = engineApi.getOperation("context_nests");
+if (nestsOp) {
+  server.tool(nestsOp.name, nestsOp.description, {}, async () => {
+    const result = await engineApi.run(
+      nestsOp.name,
+      {},
+      {
+        storage,
+        query: new GraphQueryEngine(storage),
+        versions: new VersionManager(storage),
+        rbac: permissiveRbac,
+        actor: "mcp@contextnest.local",
+      },
+    );
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+    };
+  });
+}
+
 // ─── Start server ──────────────────────────────────────────────────────────────
 
 async function main() {

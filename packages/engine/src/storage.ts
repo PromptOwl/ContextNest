@@ -1272,6 +1272,7 @@ export class NestStorage {
   async init(
     name: string,
     layout: LayoutMode = "structured",
+    description?: string,
   ): Promise<void> {
     await mkdir(this.root, { recursive: true });
 
@@ -1284,10 +1285,12 @@ export class NestStorage {
     await mkdir(join(this.root, ".context"), { recursive: true });
     await mkdir(join(this.root, ".versions"), { recursive: true });
 
-    // Write default config
+    // Write default config. The description is the nest's OWN (spec §11.1) — it
+    // travels with the vault, unlike the registry entry's machine-local label.
     const config: NestConfig = {
       version: 1,
       name,
+      ...(description?.trim() ? { description } : {}),
       defaults: { status: "draft" },
     };
     await this.writeConfig(config);
