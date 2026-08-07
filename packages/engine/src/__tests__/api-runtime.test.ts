@@ -776,3 +776,108 @@ describe("context_update — when it publishes", () => {
     expect(got.body).toContain("revived");
   });
 });
+
+// ─── context_list — filters ──────────────────────────────────────────────────
+//
+// The CLI, mcp-server and Community each grew a private copy of this filter and
+// each got a different subset of the rules right. These pin the shared one.
+
+describe("context_list — filters", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+  const ids = (r: { documents: Array<{ id: string }> }) => r.documents.map((d) => d.id).sort();
+  const list = (input: object = {}) =>
+    api.run<{ documents: Array<{ id: string }> }>("context_list", input, ctx);
+
+  /** A document with NO `type:` field — the common case, and the one a literal
+   *  type comparison used to skip. */
+  const writeUntyped = async (id: string, status: string, tags = "") =>
+    ctx.storage.writeDocument(
+      id,
+      `---\ntitle: ${id}\nstatus: ${status}\n${tags}---\n\nbody\n`,
+    );
+
+  it("matches untyped documents against type:document", async () => {
+    await writeUntyped("nodes/plain", "published");
+    await api.run("context_create", { title: "A Skill", content: "b", type: "skill", trigger: "when asked" }, ctx);
+    expect(await list({ type: "document" }).then(ids)).toEqual(["nodes/plain"]);
+  });
+
+  it("accepts several types at once", async () => {
+    await writeUntyped("nodes/plain", "published");
+    await api.run("context_create", { title: "A Skill", content: "b", type: "skill", trigger: "when asked" }, ctx);
+    await api.run("context_create", { title: "An Agent", content: "b", type: "agent" }, ctx);
+    expect(await list({ type: ["skill", "agent"] }).then(ids)).toEqual([
+      "nodes/a-skill",
+      "nodes/an-agent",
+    ]);
+  });
+
+  it("finds retired documents on status:rejected, and hides them otherwise", async () => {
+    await writeUntyped("nodes/live", "published");
+    await writeUntyped("nodes/dead", "rejected");
+    // Discovery drops retired docs, so this filter used to match nothing at all.
+    expect(await list({ status: "rejected" }).then(ids)).toEqual(["nodes/dead"]);
+    expect(await list().then(ids)).toEqual(["nodes/live"]);
+  });
+
+  it("normalizes status aliases", async () => {
+    await writeUntyped("nodes/live", "published");
+    expect(await list({ status: "active" }).then(ids)).toEqual(["nodes/live"]);
+  });
+
+  it("matches a tag with or without its # and regardless of case", async () => {
+    await writeUntyped("nodes/tagged", "published", "tags:\n  - '#API'\n");
+    await writeUntyped("nodes/untagged", "published");
+    for (const tag of ["#API", "API", "api", "#api"]) {
+      expect(await list({ tag }).then(ids)).toEqual(["nodes/tagged"]);
+    }
+  });
+
+  it("applies limit last", async () => {
+    await writeUntyped("nodes/a", "published");
+    await writeUntyped("nodes/b", "published");
+    await writeUntyped("nodes/c", "rejected");
+    // Retired doc is excluded before the limit counts, not after.
+    expect((await list({ limit: 2 })).documents).toHaveLength(2);
+  });
+
+  it("include_retired keeps retired nodes with no status filter", async () => {
+    await writeUntyped("nodes/live", "published");
+    await writeUntyped("nodes/dead", "rejected");
+    // Governed surfaces list a rejected node as one its stewards still act on.
+    expect(await list({ include_retired: true }).then(ids)).toEqual([
+      "nodes/dead",
+      "nodes/live",
+    ]);
+  });
+
+  it("full returns frontmatter and body so callers need not re-read the files", async () => {
+    await ctx.storage.writeDocument(
+      "nodes/rich",
+      `---\ntitle: Rich\nstatus: published\nversion: 4\nauthor: someone@example.com\ncreated_at: '2024-01-01T00:00:00.000Z'\n---\n\nthe body\n`,
+    );
+    const summary = (await list()).documents[0] as Record<string, unknown>;
+    expect(summary.frontmatter).toBeUndefined();
+    expect(summary.body).toBeUndefined();
+
+    const full = (await list({ full: true })).documents[0] as {
+      body: string;
+      frontmatter: { version?: number; author?: string; created_at?: string };
+    };
+    expect(full.body).toContain("the body");
+    // The fields a summary drops are exactly why `full` exists.
+    expect(full.frontmatter.version).toBe(4);
+    expect(full.frontmatter.author).toBe("someone@example.com");
+    expect(full.frontmatter.created_at).toBeTruthy();
+  });
+});

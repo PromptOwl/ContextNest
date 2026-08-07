@@ -206,7 +206,7 @@ server.tool(
 
 server.tool(
   "list_documents",
-  "List all documents with optional filters",
+  "DEPRECATED — use context_list. List all documents with optional filters.",
   {
     type: z.string().optional().describe("Filter by node type"),
     status: z
@@ -1139,6 +1139,10 @@ function registerCatalogTool(name: string): void {
 registerCatalogTool("context_import");
 registerCatalogTool("context_create");
 registerCatalogTool("context_update");
+registerCatalogTool("context_list");
+// No legacy twin: nothing here listed version history before — read_version
+// fetches one version's content, which is a different question.
+registerCatalogTool("context_versions");
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 

@@ -52,6 +52,8 @@ const EXPECTED_TOOLS = [
   "context_import",
   "context_create",
   "context_update",
+  "context_list",
+  "context_versions",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

@@ -1206,29 +1206,43 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
 program
   .command("history <path>")
   .description("Show version history for a document")
+  .option("--diff", "Include each version's unified diff from the one before")
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const vm = new VersionManager(storage);
-    const history = await vm.getHistory(id);
+    const history = await createEngineApi().run<{
+      id: string;
+      keyframe_interval: number;
+      versions: Array<{
+        version: number;
+        keyframe: boolean;
+        edited_by: string;
+        edited_at: string;
+        published_at?: string;
+        note?: string;
+        chain_hash: string;
+        diff?: string;
+      }>;
+    }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
-    if (!history) {
+    if (history.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${id}`));
       return;
     }
 
     if (opts.json) {
       console.log(JSON.stringify(history, null, 2));
-    } else {
-      console.log(chalk.bold(`Version history for ${id}:\n`));
-      for (const entry of history.versions) {
-        const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
-        const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
-        console.log(`  v${entry.version}${keyframe}${published}`);
-        console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
-        if (entry.note) console.log(`    Note: ${entry.note}`);
-      }
+      return;
+    }
+    console.log(chalk.bold(`Version history for ${id}:\n`));
+    for (const entry of history.versions) {
+      const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
+      const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
+      console.log(`  v${entry.version}${keyframe}${published}`);
+      console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
+      if (entry.note) console.log(`    Note: ${entry.note}`);
+      if (entry.diff) console.log(entry.diff.replace(/^/gm, "    "));
     }
   });
 
@@ -1552,57 +1566,49 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
+  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    // Include retired so users can list them with `--status rejected`; the
-    // default branch below re-filters them out when no status is requested.
-    let docs = await storage.discoverDocuments({ includeRetired: true });
-
-    if (opts.type) docs = docs.filter((d) => (d.frontmatter.type || "document") === opts.type);
-    if (opts.status) {
-      const wanted = normalizeStatus(opts.status);
-      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
-    } else {
-      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
-    }
-    if (opts.tag) {
-      const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
-      docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
-    }
+    // Aliases collapse here; the operation owns the rest of the filtering,
+    // including hiding retired documents when no status was asked for.
+    const { documents } = await createEngineApi().run<{
+      documents: Array<{
+        id: string;
+        title: string;
+        type: string;
+        status: string;
+        tags?: string[];
+      }>;
+    }>(
+      "context_list",
+      {
+        ...(opts.type ? { type: opts.type } : {}),
+        ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
+        ...(opts.tag ? { tag: opts.tag } : {}),
+        ...(opts.limit ? { limit: opts.limit } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
-      console.log(
-        JSON.stringify(
-          docs.map((d) => ({
-            id: d.id,
-            title: d.frontmatter.title,
-            type: d.frontmatter.type || "document",
-            status: d.frontmatter.status || "draft",
-            tags: d.frontmatter.tags,
-          })),
-          null,
-          2,
-        ),
-      );
-    } else {
-      if (docs.length === 0) {
-        console.log(chalk.yellow("No documents found."));
-      } else {
-        console.log(chalk.bold(`${docs.length} document(s):\n`));
-        for (const doc of docs) {
-          const type = doc.frontmatter.type || "document";
-          const status = doc.frontmatter.status || "draft";
-          const statusColor =
-            status === "published" ? chalk.green
-            : status === "approved" ? chalk.cyan
-            : status === "pending_review" ? chalk.magenta
-            : status === "rejected" ? chalk.red
-            : chalk.yellow;
-          console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
-          console.log(`    ${doc.frontmatter.title}`);
-        }
-      }
+      console.log(JSON.stringify(documents, null, 2));
+      return;
+    }
+    if (documents.length === 0) {
+      console.log(chalk.yellow("No documents found."));
+      return;
+    }
+    console.log(chalk.bold(`${documents.length} document(s):\n`));
+    for (const doc of documents) {
+      const statusColor =
+        doc.status === "published" ? chalk.green
+        : doc.status === "approved" ? chalk.cyan
+        : doc.status === "pending_review" ? chalk.magenta
+        : doc.status === "rejected" ? chalk.red
+        : chalk.yellow;
+      console.log(`  ${chalk.cyan(doc.id)} [${doc.type}] ${statusColor(doc.status)}`);
+      console.log(`    ${doc.title}`);
     }
   });
 

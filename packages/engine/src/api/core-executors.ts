@@ -20,6 +20,7 @@ import {
   isRejected,
 } from "../parser.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
+import { filterDocuments } from "../filters.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
@@ -30,7 +31,7 @@ import type { OperationContext, OperationExecutor } from "./context.js";
 const MAX_HOPS = 10;
 
 /** ContextNode → the wire `nodeSummary` shape. Source nodes keep their block. */
-function toSummary(node: ContextNode, includeBody = false) {
+function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = false) {
   return {
     id: node.id,
     title: node.frontmatter.title,
@@ -41,6 +42,7 @@ function toSummary(node: ContextNode, includeBody = false) {
       ? { source: node.frontmatter.source }
       : {}),
     ...(includeBody ? { body: node.body } : {}),
+    ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
 }
 
@@ -194,18 +196,12 @@ const get: OperationExecutor = async (ctx, input: any) => {
 };
 
 const list: OperationExecutor = async (ctx, input: any) => {
-  let docs = await ctx.storage.discoverDocuments();
-  if (input.type) docs = docs.filter((d) => d.frontmatter.type === input.type);
-  if (input.status) {
-    const want = normalizeStatus(input.status);
-    docs = docs.filter((d) => normalizeStatus(d.frontmatter.status ?? "draft") === want);
-  }
-  if (input.tag) {
-    const want = String(input.tag).replace(/^#/, "");
-    docs = docs.filter((d) => d.frontmatter.tags?.some((t) => t.replace(/^#/, "") === want));
-  }
-  if (input.limit) docs = docs.slice(0, input.limit);
-  return { documents: docs.map((d) => toSummary(d)) };
+  // includeRetired, or `status: "rejected"` matches nothing: discovery drops
+  // retired documents before the filter ever sees them. filterDocuments hides
+  // them again whenever no status was asked for.
+  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
+  const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
 
 /**

@@ -31,6 +31,10 @@ const nodeSummary = z.object({
   status: z.enum(STATUSES).default("draft"),
   tags: z.array(tag).optional(),
   body: z.string().optional(),
+  // Whole frontmatter, on request. Summaries carry the fields a browser needs;
+  // a caller that renders or gates the document needs the rest (version,
+  // author, timestamps, metadata) and would otherwise re-read every file.
+  frontmatter: frontmatterSchema.optional(),
   // Source nodes carry their `source` block so agents can hydrate them
   // (spec §1.9, §5). Present only for type:"source".
   source: z.record(z.unknown()).optional(),
@@ -178,12 +182,32 @@ const listOp: OperationDescriptor = {
   namespace: "core",
   description: "Browse vault contents with optional type, tag, status, or limit filters.",
   input: z.object({
-    type: z.enum(NODE_TYPES).optional().describe("Filter by node type"),
-    tag: tag.optional().describe("Filter by tag"),
+    // An array as well as a single value: callers that browse a family of types
+    // (every runnable type, say) would otherwise have to list, then re-filter.
+    type: z
+      .union([z.enum(NODE_TYPES), z.array(z.enum(NODE_TYPES))])
+      .optional()
+      .describe("Filter by node type, or by several"),
+    tag: tag.optional().describe("Filter by tag (leading # optional, case-insensitive)"),
     // Accept status synonyms (spec §1.5.1 "implementations SHOULD accept
     // synonyms and normalize"); the executor normalizes before comparing.
-    status: z.string().optional().describe("Filter by status (aliases normalized)"),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by status (aliases normalized). Retired nodes are hidden unless asked for."),
     limit: z.number().int().positive().optional().describe("Max nodes to return"),
+    include_retired: z
+      .boolean()
+      .optional()
+      .describe(
+        "Keep retired nodes even with no status filter. For governed surfaces, where a rejected node is still something its stewards act on rather than one removed from the vault.",
+      ),
+    full: z
+      .boolean()
+      .optional()
+      .describe(
+        "Return each node's full frontmatter and body instead of a summary. For callers that go on to render or gate the documents themselves and would otherwise have to read them all again.",
+      ),
   }),
   output: z.object({
     documents: z.array(nodeSummary),
