@@ -620,12 +620,12 @@ describe("context_nests — registry-scoped operation", () => {
   let tmp: string;
   let savedConfigDir: string | undefined;
 
-  /** A directory that looks like a vault, optionally with its own description. */
-  function makeVault(dir: string, name: string, description?: string): string {
+  /** A directory that looks like a vault, optionally with its own name/description. */
+  function makeVault(dir: string, name?: string, description?: string): string {
     mkdirSync(join(dir, ".context"), { recursive: true });
     writeFileSync(
       join(dir, ".context", "config.yaml"),
-      `version: 1\nname: "${name}"\n${description ? `description: "${description}"\n` : ""}`,
+      `version: 1\n${name ? `name: "${name}"\n` : ""}${description ? `description: "${description}"\n` : ""}`,
     );
     return dir;
   }
@@ -649,6 +649,11 @@ describe("context_nests — registry-scoped operation", () => {
     });
     addVault("described", makeVault(join(tmp, "b"), "B", "config desc"));
     addVault("bare", makeVault(join(tmp, "c"), "C"), {});
+    addVault("unlabelled", makeVault(join(tmp, "d")), {});
+    // Registered, then deleted from disk — the only way to reach `exists: false`,
+    // since addVault rejects a path that is not already a vault.
+    addVault("gone", makeVault(join(tmp, "e"), "E"), {});
+    rmSync(join(tmp, "e"), { recursive: true, force: true });
     setDefaultVault("described");
 
     // Registry-scoped: the executor ignores ctx, so an empty one is enough.
@@ -664,12 +669,20 @@ describe("context_nests — registry-scoped operation", () => {
     };
     const byAlias = Object.fromEntries(parsed.nests.map((n) => [n.alias, n]));
 
-    expect(Object.keys(byAlias).sort()).toEqual(["bare", "described", "labelled"]);
+    expect(Object.keys(byAlias).sort()).toEqual([
+      "bare",
+      "described",
+      "gone",
+      "labelled",
+      "unlabelled",
+    ]);
     expect(byAlias.labelled.description).toBe("registry desc");
     expect(byAlias.described.description).toBe("config desc");
     expect(byAlias.bare.description).toBe("C"); // falls back to config `name`
+    expect(byAlias.unlabelled.description).toBeUndefined();
     expect(byAlias.described.isDefault).toBe(true);
     expect(byAlias.labelled.isDefault).toBe(false);
-    expect(parsed.nests.every((n) => n.exists)).toBe(true);
+    expect(byAlias.bare.exists).toBe(true);
+    expect(byAlias.gone.exists).toBe(false);
   });
 });

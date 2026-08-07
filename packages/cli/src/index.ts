@@ -42,6 +42,7 @@ import {
   addVault,
   removeVault,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   readRegistry,
   findLocalVault,
@@ -699,7 +700,7 @@ program
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
   .option("--set-default", "Make the new vault the registry default")
-  .option("--description <text>", "Description/label for the registry entry")
+  .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -713,14 +714,12 @@ program
     }
 
     const root = getInitRoot();
-    const storage = new NestStorage(root);
-    await storage.init(opts.name, opts.layout as LayoutMode);
-    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
 
-    // Register the new vault in the central registry so it can be targeted from
-    // any directory via `ctx --vault <alias> ...`. The alias comes from an
-    // explicit --vault flag, an interactive prompt, or (non-interactively) a
-    // directory-derived default — so init always registers the vault.
+    // Resolve the registry alias and description BEFORE creating the vault: the
+    // description is written into .context/config.yaml by init(), so a prompted
+    // one has to be in hand first. The alias comes from an explicit --vault
+    // flag, an interactive prompt, or (non-interactively) a directory-derived
+    // default — so init always registers the vault.
     let registerAlias = selectedVaultAlias;
     let registerDescription = opts.description as string | undefined;
     const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -739,6 +738,10 @@ program
         registerAlias = defaultAlias;
       }
     }
+
+    const storage = new NestStorage(root);
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription);
+    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
 
     // Registration is performed AFTER the starter is applied (see registerVault
     // below) so an interruption mid-starter never leaves a registry alias
@@ -2187,6 +2190,23 @@ vaultCmd
       const isDefault = reg.default === alias;
       console.log(
         chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${target}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("describe <alias> [description]")
+  .description("Set the description for a registered alias (omit the text to clear it)")
+  .action((alias: string, description: string | undefined) => {
+    try {
+      setVaultDescription(alias, description);
+      console.log(
+        description
+          ? chalk.green(`Described "${chalk.bold(alias)}": ${description}`)
+          : chalk.yellow(`Cleared the description for "${alias}"`),
       );
     } catch (err) {
       console.log(chalk.red((err as Error).message));

@@ -44,7 +44,8 @@ Every other `core` op runs against the one vault in its `OperationContext`.
 `context_nests` reads the **central registry** (`~/.contextnest/config.yaml`,
 `listVaults()`) and therefore ignores `ctx` entirely — `storage`, `query`, and
 `versions` are unused. Do not wire them in; there is no single vault this
-operation belongs to.
+operation belongs to. Bindings should still pass a real `OperationContext` —
+extension `authorize` hooks run before the executor and may dereference it.
 
 ```text
 input:  {}

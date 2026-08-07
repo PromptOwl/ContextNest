@@ -49,6 +49,7 @@ const EXPECTED_TOOLS = [
   // Catalog-driven: name, description and schema come from the engine's
   // operation catalog rather than being declared here.
   "context_import",
+  "context_nests",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

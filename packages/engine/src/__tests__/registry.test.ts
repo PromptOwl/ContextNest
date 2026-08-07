@@ -6,12 +6,14 @@ import {
   addVault,
   removeVault,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   readRegistry,
   getRegistryDir,
   getRegistryPath,
   resolveVaultPath,
 } from "../registry.js";
+import { NestStorage } from "../storage.js";
 import { ConfigError } from "../errors.js";
 
 /** Create a directory that looks like a vault (has .context/config.yaml). */
@@ -60,6 +62,42 @@ describe("vault registry", () => {
     expect(list[0]).toMatchObject({ alias: "alpha", path: v, isDefault: true, exists: true });
     // description falls back to the vault's own name
     expect(list[0].description).toBe("Test Vault");
+  });
+
+  it("sets, replaces and clears an alias description after the fact", () => {
+    const v = makeVault(join(tmp, "alpha"));
+    addVault("alpha", v);
+    setVaultDescription("alpha", "first");
+    expect(listVaults()[0].description).toBe("first");
+    setVaultDescription("alpha", "second");
+    expect(listVaults()[0].description).toBe("second");
+    // Cleared (and blank counts as cleared): the key goes away, so the vault's
+    // own config label takes over again rather than an empty string winning.
+    setVaultDescription("alpha", "   ");
+    expect(readRegistry().vaults.alpha.description).toBeUndefined();
+    expect(listVaults()[0].description).toBe("Test Vault");
+    expect(() => setVaultDescription("nope", "x")).toThrow(ConfigError);
+  });
+
+  it("round-trips an init description through .context/config.yaml", async () => {
+    const root = join(tmp, "described");
+    await new NestStorage(root).init("Described Vault", "structured", "The nest's own purpose");
+    expect((await new NestStorage(root).readConfig())?.description).toBe("The nest's own purpose");
+
+    // Tier 2 of the precedence chain: no registry description, so the config's
+    // travels-with-the-vault description is what listVaults reports.
+    addVault("described", root);
+    expect(listVaults()[0].description).toBe("The nest's own purpose");
+
+    // Tier 1: the registry entry is a machine-local override and outranks it.
+    addVault("described", root, { description: "local label", force: true });
+    expect(listVaults()[0].description).toBe("local label");
+  });
+
+  it("leaves description out of config.yaml when init gets none", async () => {
+    const root = join(tmp, "plain");
+    await new NestStorage(root).init("Plain Vault");
+    expect((await new NestStorage(root).readConfig())?.description).toBeUndefined();
   });
 
   it("rejects a non-vault path", () => {

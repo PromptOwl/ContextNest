@@ -232,10 +232,27 @@ export function setDefaultVault(alias: string): VaultRegistry {
   return registry;
 }
 
+/**
+ * Set the description on a registered alias, or clear it when `description` is
+ * empty/omitted. Clearing removes the key rather than storing `""` so the
+ * config-description fallback in listVaults() takes over again.
+ */
+export function setVaultDescription(alias: string, description?: string): VaultRegistry {
+  const registry = readRegistry();
+  const entry = registry.vaults[alias];
+  if (!entry) {
+    throw new ConfigError(`No vault registered under alias "${alias}".`);
+  }
+  if (description?.trim()) entry.description = description;
+  else delete entry.description;
+  writeRegistry(registry);
+  return registry;
+}
+
 export interface VaultListEntry {
   alias: string;
   path: string;
-  /** Registry description, or the vault's own config name when unset. */
+  /** Registry description, else the vault config's own `description` or `name`. */
   description?: string;
   isDefault: boolean;
   /** Whether the path currently resolves to a real vault. */
@@ -248,7 +265,9 @@ export function listVaults(): VaultListEntry[] {
   return Object.entries(registry.vaults).map(([alias, entry]) => ({
     alias,
     path: entry.path,
-    description: entry.description ?? readVaultLabel(entry.path),
+    // Blank is treated as unset (same rule readVaultLabel applies to the config),
+    // so a hand-edited `description: ""` falls through instead of winning.
+    description: entry.description?.trim() ? entry.description : readVaultLabel(entry.path),
     isDefault: registry.default === alias,
     exists: isVaultRoot(entry.path),
   }));
