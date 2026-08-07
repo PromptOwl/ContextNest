@@ -749,7 +749,12 @@ program
     const registerVault = (): void => {
       if (!registerAlias) return;
       const resolvedRoot = pathMod.resolve(root);
-      const existing = registrySnapshot.vaults[registerAlias];
+      // Own-property check: a `--vault __proto__` would otherwise read back
+      // Object.prototype here and crash on `resolve(existing.path)` before
+      // addVault got the chance to reject the alias.
+      const existing = Object.hasOwn(registrySnapshot.vaults, registerAlias)
+        ? registrySnapshot.vaults[registerAlias]
+        : undefined;
       if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
         // The alias is already taken by a *different* vault. Don't silently
         // clobber it — the vault was still created; just skip registration.

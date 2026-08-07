@@ -106,6 +106,24 @@ describe("vault registry", () => {
     expect(() => addVault("bad", notVault)).toThrow(ConfigError);
   });
 
+  it("refuses prototype-chain names as aliases, on every path", () => {
+    const v = makeVault(join(tmp, "proto"));
+    addVault("real", v);
+    for (const bad of ["__proto__", "constructor", "prototype"]) {
+      // Writing: `vaults[bad] = entry` would hijack the prototype or shadow a
+      // built-in; `vaults["__proto__"]` reads back truthy and slips past a
+      // `if (!entry)` guard, so the assignment lands on Object.prototype.
+      expect(() => addVault(bad, v)).toThrow(ConfigError);
+      expect(() => setVaultDescription(bad, "pwned")).toThrow(ConfigError);
+      expect(() => setDefaultVault(bad)).toThrow(ConfigError);
+      expect(() => removeVault(bad)).toThrow(ConfigError);
+      // Reading: an unknown alias, not a match — and no throw from the env path.
+      expect(() => resolveVaultPath({ vaultAlias: bad })).toThrow();
+    }
+    expect(({} as Record<string, unknown>).description).toBeUndefined();
+    expect(listVaults().map((x) => x.alias)).toEqual(["real"]);
+  });
+
   it("rejects an alias with disallowed characters", () => {
     const v = makeVault(join(tmp, "v"));
     for (const bad of ["my vault", "a/b", "a:b", ""]) {
