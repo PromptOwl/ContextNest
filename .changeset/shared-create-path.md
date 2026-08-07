@@ -31,6 +31,20 @@ triggers — stay with their surface. `create_document` keeps its exact behaviou
 and registration and is now marked deprecated in favour of `context_create`, so
 existing MCP clients are unaffected.
 
+**Vocabulary now covers what the ecosystem actually stores.** Adopting the shared
+create path made Community validate its documents against the engine schema for
+the first time, and three shapes it has always written turned out to be invalid:
+
+- `agent`, `artifact` and `table` join `NODE_TYPES`. Vaults holding them failed
+  `ctx validate` even though every surface reads and writes them.
+- `TAG_PATTERN` accepts `:`, so namespaced tags (`#dept:engineering`) validate.
+  Strictly a widening — every previously valid tag still matches. Note the
+  selector lexer does not tokenize `:` inside a tag, so namespaced tags are not
+  yet addressable in a query.
+- `context_create` accepts an initial `status`, for callers that create a node
+  directly into a lifecycle state other than draft (only meaningful alongside
+  `publish: false`).
+
 **Behaviour fix — new-document version numbering.** `ctx add` wrote
 `version: 1` into frontmatter and let publish bump it, so a brand-new document's
 history began at **v2 with no v1 keyframe**. Publish owns version assignment

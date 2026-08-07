@@ -223,6 +223,7 @@ function buildDraftNode(input: {
   folder?: string;
   metadata?: Record<string, unknown>;
   id?: string;
+  status?: Frontmatter["status"];
   trigger?: string;
   tools_required?: string[];
   output_format?: SkillMeta["output_format"];
@@ -258,7 +259,7 @@ function buildDraftNode(input: {
           },
         }
       : {}),
-    status: "draft",
+    status: (input.status as Frontmatter["status"]) ?? "draft",
     created_at: now,
     // A node is "updated" at birth; without this a draft carries no
     // updated_at until its first edit, and every surface renders it blank.
@@ -273,6 +274,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // WITHOUT one — pre-setting it makes the first published version 2 and leaves
   // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
   if (input.publish === false) node.frontmatter.version = 1;
+  const createdStatus = node.frontmatter.status;
   assertValid(node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
@@ -286,7 +288,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
     return {
       id: node.id,
       version: node.frontmatter.version ?? 1,
-      status: "draft",
+      status: createdStatus,
       checkpoint: null,
     };
   }

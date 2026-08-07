@@ -227,6 +227,12 @@ const createOp: OperationDescriptor = {
       .string()
       .optional()
       .describe("Version-history note recorded against the publish (audit trail)."),
+    status: z
+      .enum(STATUSES)
+      .optional()
+      .describe(
+        "Initial lifecycle status (default draft). Only meaningful with publish:false — publishing sets `published` regardless.",
+      ),
     // These assemble the `skill` block, which is REQUIRED for type:"skill" and
     // must be absent on every other type — so they cannot ride inside
     // `metadata`. Supplying `trigger` is what creates the block.
