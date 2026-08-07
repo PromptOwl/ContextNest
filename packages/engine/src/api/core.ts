@@ -45,19 +45,40 @@ const documentPayload = z.object({
   id: z.string(),
   frontmatter: frontmatterSchema,
   body: z.string(),
+  /** Exact stored bytes, frontmatter block included. Only with `include_raw`. */
+  raw: z.string().optional(),
+  /** Only with `verify_checksum`, and only when the live bytes have drifted. */
+  pendingChange: z
+    .object({
+      suggestion_id: z.string(),
+      detected_at: z.string(),
+      source: z.string(),
+      proposed_hash: z.string(),
+    })
+    .optional(),
 });
 
 /** Address a single node by URI, id, or title — shared by get/delete/publish/versions. */
 const nodeSelectorShape = {
   uri: z.string().optional().describe("Document URI, e.g. contextnest://nodes/api-design"),
-  id: z.string().optional().describe("Document id / path"),
+  id: z
+    .string()
+    .optional()
+    .describe(
+      "Document id / path, exactly as stored (e.g. \"nodes/api-design\"). Not re-rooted — a flat-layout vault's ids carry no nodes/ prefix.",
+    ),
   title: z.string().optional().describe("Document title"),
 };
-const SELECTOR_REQUIRED = { message: "One of uri, id, or title is required" };
-const hasSelector = (v: { uri?: string; id?: string; title?: string }) =>
-  Boolean(v.uri || v.id || v.title);
-
-const nodeSelector = z.object(nodeSelectorShape).refine(hasSelector, SELECTOR_REQUIRED);
+/**
+ * Deliberately a plain object, NOT `.refine(one of uri/id/title)`.
+ *
+ * A refine makes the input a ZodEffects, which has no `.shape` — and an MCP
+ * tool is registered from exactly that. The SDK accepts the undefined shape and
+ * publishes a tool advertising NO parameters at all, so a client cannot tell
+ * what to send. `resolveId` raises the same VALIDATION_FAILED at execution
+ * time, which every transport surfaces identically.
+ */
+const nodeSelector = z.object(nodeSelectorShape);
 
 // ─── context_search ──────────────────────────────────────────────────────────
 
@@ -152,18 +173,28 @@ const getOp: OperationDescriptor = {
   namespace: "core",
   description:
     "Get the full content of a single node by contextnest:// URI, id, or title.",
-  input: z
-    .object({
-      uri: z
-        .string()
-        .optional()
-        .describe("Document URI, e.g. contextnest://nodes/api-design"),
-      id: z.string().optional().describe("Document id / path"),
-      title: z.string().optional().describe("Document title"),
-    })
-    .refine((v) => Boolean(v.uri || v.id || v.title), {
-      message: "One of uri, id, or title is required",
-    }),
+  // Plain object, no `.refine` — see the note on nodeSelector.
+  input: z.object({
+    ...nodeSelectorShape,
+    include_raw: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also return the exact stored bytes (frontmatter block included) as `raw`, for callers that render or re-serve the file verbatim.",
+      ),
+    verify_checksum: z
+      .boolean()
+      .optional()
+      .describe(
+        "Detect drift on read. When the live bytes no longer match the published checksum, the last-approved content is returned with `pendingChange` describing the difference, instead of the live bytes.",
+      ),
+    allow_rejected: z
+      .boolean()
+      .optional()
+      .describe(
+        "Return a rejected node instead of refusing. Reading one is not the same as republishing it — surfaces that let a steward see and revive retired documents set this.",
+      ),
+  }),
   output: documentPayload,
   errors: [
     "VALIDATION_FAILED",
@@ -409,18 +440,17 @@ const versionsOp: OperationDescriptor = {
   name: "context_versions",
   namespace: "core",
   description: "Version history of a node (newest entries last).",
-  input: z
-    .object({
-      ...nodeSelectorShape,
-      // Off by default on purpose: a doc with dozens of versions would other-
-      // wise return dozens of patches, which is a lot of tokens to push into an
-      // agent that only asked who edited what and when.
-      include_diff: z
-        .boolean()
-        .optional()
-        .describe("Attach each version's change log (unified diff from the previous version)"),
-    })
-    .refine(hasSelector, SELECTOR_REQUIRED),
+  // Plain object, no `.refine` — see the note on nodeSelector.
+  input: z.object({
+    ...nodeSelectorShape,
+    // Off by default on purpose: a doc with dozens of versions would other-
+    // wise return dozens of patches, which is a lot of tokens to push into an
+    // agent that only asked who edited what and when.
+    include_diff: z
+      .boolean()
+      .optional()
+      .describe("Attach each version's change log (unified diff from the previous version)"),
+  }),
   output: z.object({
     id: z.string(),
     keyframe_interval: z.number().int(),
@@ -454,16 +484,11 @@ const reconstructOp: OperationDescriptor = {
   name: "context_reconstruct",
   namespace: "core",
   description: "Reconstruct the full content of a specific past version of a node.",
-  input: z
-    .object({
-      uri: z.string().optional().describe("Document URI"),
-      id: z.string().optional().describe("Document id / path"),
-      title: z.string().optional().describe("Document title"),
-      version: z.number().int().positive().describe("Version number to reconstruct"),
-    })
-    .refine((v) => Boolean(v.uri || v.id || v.title), {
-      message: "One of uri, id, or title is required",
-    }),
+  // Plain object, no `.refine` — see the note on nodeSelector.
+  input: z.object({
+    ...nodeSelectorShape,
+    version: z.number().int().positive().describe("Version number to reconstruct"),
+  }),
   output: z.object({
     id: z.string(),
     version: z.number().int(),

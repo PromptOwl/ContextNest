@@ -870,7 +870,7 @@ describe("context_list — filters", () => {
     expect(summary.frontmatter).toBeUndefined();
     expect(summary.body).toBeUndefined();
 
-    const full = (await list({ full: true })).documents[0] as {
+    const full = (await list({ full: true })).documents[0] as unknown as {
       body: string;
       frontmatter: { version?: number; author?: string; created_at?: string };
     };
@@ -879,5 +879,66 @@ describe("context_list — filters", () => {
     expect(full.frontmatter.version).toBe(4);
     expect(full.frontmatter.author).toBe("someone@example.com");
     expect(full.frontmatter.created_at).toBeTruthy();
+  });
+});
+
+// ─── context_get — what each surface needs beyond {id, frontmatter, body} ────
+
+describe("context_get — raw, rejected, selector", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("include_raw returns the exact stored bytes, frontmatter block and all", async () => {
+    await api.run("context_create", { title: "Raw Doc", content: "the body" }, ctx);
+    const plain = await api.run<{ raw?: string }>("context_get", { id: "nodes/raw-doc" }, ctx);
+    expect(plain.raw).toBeUndefined();
+
+    const withRaw = await api.run<{ raw: string; body: string }>(
+      "context_get",
+      { id: "nodes/raw-doc", include_raw: true },
+      ctx,
+    );
+    // `body` is the parsed body; `raw` still carries the frontmatter block, so
+    // a caller can re-serve the file verbatim.
+    expect(withRaw.raw).toContain("---");
+    expect(withRaw.raw).toContain("title: Raw Doc");
+    expect(withRaw.raw).toContain("the body");
+    expect(withRaw.body).not.toContain("title: Raw Doc");
+  });
+
+  it("refuses a rejected node, unless the caller allows it", async () => {
+    await api.run("context_create", { title: "Retired Doc", content: "body" }, ctx);
+    await api.run("context_update", { id: "nodes/retired-doc", status: "rejected" }, ctx);
+
+    await expect(api.run("context_get", { id: "nodes/retired-doc" }, ctx)).rejects.toMatchObject({
+      code: "REJECTED_DOCUMENT",
+    });
+    // Reading one is not republishing it — governed surfaces show retired docs.
+    const allowed = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: "nodes/retired-doc", allow_rejected: true },
+      ctx,
+    );
+    expect(allowed.frontmatter.status).toBe("rejected");
+  });
+
+  it("still demands a selector now that the schema no longer refines one", async () => {
+    // The `.refine` came off so MCP can register these ops at all; the same
+    // error has to survive as a runtime check.
+    await expect(api.run("context_get", {}, ctx)).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
+    await expect(api.run("context_versions", {}, ctx)).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
   });
 });

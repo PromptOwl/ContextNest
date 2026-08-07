@@ -54,6 +54,7 @@ const EXPECTED_TOOLS = [
   "context_update",
   "context_list",
   "context_versions",
+  "context_get",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -162,6 +163,28 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
       expect((t.description ?? "").length).toBeGreaterThan(0);
       expect(t.inputSchema).toBeDefined();
     }
+  });
+
+  // A catalog tool is registered from `op.input.shape`, which is undefined on
+  // any descriptor whose input is a ZodEffects (i.e. one carrying a `.refine`).
+  // The SDK accepts that and publishes a tool advertising NO parameters at all,
+  // so a client cannot tell what to send — and asserting only that inputSchema
+  // "is defined" above sails straight past it.
+  it.each([
+    ["context_create", ["title", "content"]],
+    ["context_update", ["id", "content", "status"]],
+    ["context_list", ["type", "tag", "status", "limit"]],
+    ["context_versions", ["id", "title", "include_diff"]],
+    ["context_get", ["uri", "id", "title", "include_raw", "allow_rejected"]],
+    ["context_import", ["documents", "ids"]],
+  ])("%s advertises its declared inputs", async (name, expected) => {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === name);
+    expect(tool).toBeDefined();
+    const props = Object.keys(
+      (tool!.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
+    );
+    expect(props).toEqual(expect.arrayContaining(expected));
   });
 
   it("vault_info returns identity and the configured servers", async () => {

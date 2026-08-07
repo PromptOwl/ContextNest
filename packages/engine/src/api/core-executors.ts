@@ -91,8 +91,30 @@ async function resolveId(
   ctx: OperationContext,
   sel: { id?: string; uri?: string; title?: string },
 ): Promise<string> {
-  if (sel.id) return normalizeDocumentId(sel.id);
-  if (sel.uri) return normalizeDocumentId(parseUri(sel.uri).path);
+  // Enforced here rather than as a `.refine` on the descriptors: a refine turns
+  // the input into a ZodEffects with no `.shape`, and an MCP tool registered
+  // from that advertises no parameters at all. Same error, raised a moment
+  // later, and every transport reports it the same way.
+  if (!sel.id && !sel.uri && !sel.title) {
+    throw new ContextNestError(
+      "One of uri, id, or title is required",
+      "VALIDATION_FAILED",
+    );
+  }
+  // Vetted, NOT normalized: normalizeDocumentId re-roots a bare slug under
+  // `nodes/`, which silently redirects every id from a flat-layout vault (they
+  // carry no prefix) to a document that does not exist. The storage layer
+  // resolves an id for its own layout — same rule context_update and
+  // context_import's `ids` already follow.
+  if (sel.id) {
+    assertSafeDocumentId(sel.id);
+    return sel.id;
+  }
+  if (sel.uri) {
+    const path = parseUri(sel.uri).path;
+    assertSafeDocumentId(path);
+    return path;
+  }
   const docs = await ctx.storage.discoverDocuments();
   const match = docs.find(
     (d) => d.frontmatter.title.toLowerCase() === String(sel.title).toLowerCase(),
@@ -189,10 +211,21 @@ const search: OperationExecutor = async (ctx, input: any) => {
 
 const get: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  const node = await ctx.storage.readDocument(id);
+  const node = await ctx.storage.readDocument(
+    id,
+    input.verify_checksum ? { verifyChecksum: true } : undefined,
+  );
   // Consistent rejected handling (the descriptor advertises REJECTED_DOCUMENT).
-  if (isRejected(node)) throw new RejectedDocumentError(node.id);
-  return { id: node.id, frontmatter: node.frontmatter, body: node.body };
+  // Surfaces that let a steward see and revive a retired document opt out —
+  // reading one is not the same as republishing it.
+  if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  return {
+    id: node.id,
+    frontmatter: node.frontmatter,
+    body: node.body,
+    ...(input.include_raw ? { raw: node.rawContent } : {}),
+    ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
+  };
 };
 
 const list: OperationExecutor = async (ctx, input: any) => {

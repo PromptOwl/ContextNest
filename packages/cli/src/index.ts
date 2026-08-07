@@ -851,7 +851,26 @@ program
   .action(async (path, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    // allow_rejected: `ctx read` has always shown a retired document — reading
+    // one is not republishing it, and refusing would hide it from the person
+    // deciding whether to revive it.
+    const got = await createEngineApi().run<{
+      id: string;
+      frontmatter: ContextNode["frontmatter"];
+      body: string;
+      raw?: string;
+    }>(
+      "context_get",
+      { id, include_raw: true, allow_rejected: true },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    const doc: ContextNode = {
+      id: got.id,
+      filePath: "",
+      rawContent: got.raw ?? "",
+      frontmatter: got.frontmatter,
+      body: got.body,
+    };
 
     if (opts.raw) {
       console.log(doc.rawContent);

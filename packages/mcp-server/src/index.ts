@@ -168,7 +168,7 @@ server.tool(
 
 server.tool(
   "read_document",
-  "Read a single document by its contextnest:// URI or path",
+  "DEPRECATED — use context_get. Read a single document by its contextnest:// URI or path. Kept for existing clients: it takes URI and path in one field, where context_get separates uri, id and title.",
   { uri: z.string().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')") },
   async ({ uri }) => {
     let docId: string;
@@ -1140,6 +1140,7 @@ registerCatalogTool("context_import");
 registerCatalogTool("context_create");
 registerCatalogTool("context_update");
 registerCatalogTool("context_list");
+registerCatalogTool("context_get");
 // No legacy twin: nothing here listed version history before — read_version
 // fetches one version's content, which is a different question.
 registerCatalogTool("context_versions");
