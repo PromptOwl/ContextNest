@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import { NestStorage } from "../storage.js";
@@ -11,10 +12,12 @@ import { UnauthorizedActionError } from "../errors.js";
 import type { ContextNode } from "../types.js";
 import {
   createEngineApi,
+  OPERATIONS,
   type OperationContext,
   type EngineExtension,
   type OperationDescriptor,
 } from "../api/index.js";
+import { addVault, setDefaultVault } from "../registry.js";
 
 async function makeContext(): Promise<{ ctx: OperationContext; dir: string }> {
   const dir = await mkdtemp(join(tmpdir(), "contextnest-api-runtime-"));
@@ -610,5 +613,63 @@ describe("core executors — review-fix regressions", () => {
       ctx,
     );
     expect(got.frontmatter.tags).toEqual(["#api", "#ml"]);
+  });
+});
+
+describe("context_nests — registry-scoped operation", () => {
+  let tmp: string;
+  let savedConfigDir: string | undefined;
+
+  /** A directory that looks like a vault, optionally with its own description. */
+  function makeVault(dir: string, name: string, description?: string): string {
+    mkdirSync(join(dir, ".context"), { recursive: true });
+    writeFileSync(
+      join(dir, ".context", "config.yaml"),
+      `version: 1\nname: "${name}"\n${description ? `description: "${description}"\n` : ""}`,
+    );
+    return dir;
+  }
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "cn-api-nests-"));
+    savedConfigDir = process.env.CONTEXTNEST_CONFIG_DIR;
+    process.env.CONTEXTNEST_CONFIG_DIR = join(tmp, "cfg");
+  });
+  afterEach(() => {
+    if (savedConfigDir === undefined) delete process.env.CONTEXTNEST_CONFIG_DIR;
+    else process.env.CONTEXTNEST_CONFIG_DIR = savedConfigDir;
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("lists every registered nest and resolves description precedence", async () => {
+    // Registry description wins; config `description` beats config `name`;
+    // neither present → undefined.
+    addVault("labelled", makeVault(join(tmp, "a"), "A", "config desc"), {
+      description: "registry desc",
+    });
+    addVault("described", makeVault(join(tmp, "b"), "B", "config desc"));
+    addVault("bare", makeVault(join(tmp, "c"), "C"), {});
+    setDefaultVault("described");
+
+    // Registry-scoped: the executor ignores ctx, so an empty one is enough.
+    const result = await createEngineApi().run(
+      "context_nests",
+      {},
+      {} as unknown as OperationContext,
+    );
+
+    // The op's own output schema is the contract — validate against it.
+    const parsed = OPERATIONS.context_nests.output.parse(result) as {
+      nests: { alias: string; description?: string; isDefault: boolean; exists: boolean }[];
+    };
+    const byAlias = Object.fromEntries(parsed.nests.map((n) => [n.alias, n]));
+
+    expect(Object.keys(byAlias).sort()).toEqual(["bare", "described", "labelled"]);
+    expect(byAlias.labelled.description).toBe("registry desc");
+    expect(byAlias.described.description).toBe("config desc");
+    expect(byAlias.bare.description).toBe("C"); // falls back to config `name`
+    expect(byAlias.described.isDefault).toBe(true);
+    expect(byAlias.labelled.isDefault).toBe(false);
+    expect(parsed.nests.every((n) => n.exists)).toBe(true);
   });
 });

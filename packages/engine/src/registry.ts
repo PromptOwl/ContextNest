@@ -248,18 +248,26 @@ export function listVaults(): VaultListEntry[] {
   return Object.entries(registry.vaults).map(([alias, entry]) => ({
     alias,
     path: entry.path,
-    description: entry.description ?? readVaultName(entry.path),
+    description: entry.description ?? readVaultLabel(entry.path),
     isDefault: registry.default === alias,
     exists: isVaultRoot(entry.path),
   }));
 }
 
-/** Read a vault's own `name` from its config (best-effort, for display). */
-function readVaultName(vaultPath: string): string | undefined {
+/**
+ * A vault's own label from its config (best-effort, for display). Prefers the
+ * config's `description` — the nest's own description, which travels with the
+ * vault — over its `name`. The registry entry's description still wins over
+ * both; it is a machine-local override.
+ */
+function readVaultLabel(vaultPath: string): string | undefined {
   try {
     const raw = yaml.load(readFileSync(join(vaultPath, ".context", "config.yaml"), "utf-8"));
-    const name = (raw as { name?: unknown })?.name;
-    return typeof name === "string" ? name : undefined;
+    const config = raw as { description?: unknown; name?: unknown };
+    for (const value of [config?.description, config?.name]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    return undefined;
   } catch {
     return undefined;
   }
