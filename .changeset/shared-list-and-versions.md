@@ -55,6 +55,12 @@ carry no such prefix pointed at a document that does not exist — the same fix
 `context_update` and `context_import` already took, now applied to every
 selector-based operation.
 
+An id is therefore taken **exactly as stored**: a bare slug is no longer
+re-rooted under `nodes/`, so a caller migrating from `read_document` (which did
+re-root) must pass the full id. A trailing `.md` and leading slashes are still
+stripped, since callers build ids from file paths and storage appends `.md`
+itself.
+
 `context_get` gains three inputs, each one a thing a surface previously had to
 bypass the operation to do: `include_raw` returns the exact stored bytes for
 callers that re-serve the file verbatim, `verify_checksum` detects drift on read,

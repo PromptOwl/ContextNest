@@ -103,26 +103,33 @@ async function resolveId(
       "VALIDATION_FAILED",
     );
   }
-  // Vetted, NOT normalized: normalizeDocumentId re-roots a bare slug under
-  // `nodes/`, which silently redirects every id from a flat-layout vault (they
-  // carry no prefix) to a document that does not exist. The storage layer
-  // resolves an id for its own layout — same rule context_update and
-  // context_import's `ids` already follow.
-  if (sel.id) {
-    assertSafeDocumentId(sel.id);
-    return sel.id;
-  }
-  if (sel.uri) {
-    const path = parseUri(sel.uri).path;
-    assertSafeDocumentId(path);
-    return path;
-  }
-  const docs = await ctx.storage.discoverDocuments();
+  if (sel.id) return sanitizeId(sel.id);
+  if (sel.uri) return sanitizeId(parseUri(sel.uri).path);
+  // includeRetired, or a title lookup cannot see a rejected document at all and
+  // falls through to the slug guess below — which quietly resolves to whatever
+  // sits at that slug, or to nothing for a doc created with a custom id. The
+  // ops that let a steward read and revive a retired doc need this to work.
+  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
   const match = docs.find(
     (d) => d.frontmatter.title.toLowerCase() === String(sel.title).toLowerCase(),
   );
   if (match) return match.id;
   return normalizeDocumentId(requireSlug(String(sel.title)));
+}
+
+/**
+ * Clean a caller-supplied id without re-rooting it.
+ *
+ * `normalizeDocumentId` also prepends `nodes/` to any id with no slash, which
+ * silently redirects every id from a flat-layout vault (they carry no prefix)
+ * to a document that does not exist. The tidying half is still wanted: callers
+ * naturally build an id from a file path, and storage appends `.md` itself, so
+ * an un-stripped suffix resolves to `<id>.md.md`.
+ */
+function sanitizeId(raw: string): string {
+  const cleaned = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+  assertSafeDocumentId(cleaned);
+  return cleaned;
 }
 
 /** Validate a node against the spec (§13) before it is written/published. */
@@ -302,10 +309,16 @@ function buildDraftNode(input: {
 
 const create: OperationExecutor = async (ctx, input: any) => {
   const node = buildDraftNode(input);
+  // A rejected node cannot be published — publish refuses one by design. Left
+  // to fall through, the write below lands and publish then throws, stranding a
+  // file on disk with no version and no history, and making the caller's retry
+  // fail with DOCUMENT_ALREADY_EXISTS for a create it believes never happened.
+  // Refuse before anything is written.
+  const publish = node.frontmatter.status === "rejected" ? false : input.publish !== false;
   // Publish assigns the version (spec §6), so a published node must go to disk
   // WITHOUT one — pre-setting it makes the first published version 2 and leaves
   // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
-  if (input.publish === false) node.frontmatter.version = 1;
+  if (!publish) node.frontmatter.version = 1;
   const createdStatus = node.frontmatter.status;
   assertValid(node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
@@ -315,7 +328,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // Governed callers create the node WITHOUT publishing: the write has to clear
   // review before it becomes retrievable. Still regenerate the index so the
   // draft is discoverable to the surfaces that list drafts.
-  if (input.publish === false) {
+  if (!publish) {
     await ctx.storage.regenerateIndex();
     return {
       id: node.id,
@@ -351,10 +364,13 @@ const update: OperationExecutor = async (ctx, input: any) => {
   const existing = await ctx.storage.readDocument(id);
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
-  // rejects (no version/checksum/history). Naming a `status` is how a caller
-  // revives one, so only a status-less edit is refused — mirrors OSS
-  // update_document.
-  if (isRejected(existing) && input.status === undefined) throw new RejectedDocumentError(id);
+  // rejects (no version/checksum/history). Reviving one — moving it to some
+  // OTHER status — is allowed; re-asserting `rejected` is not, or a client that
+  // echoes the current status back alongside an edit silently rewrites the body
+  // of a document that stays rejected.
+  if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
+    throw new RejectedDocumentError(id);
+  }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
   if (input.title) frontmatter.title = input.title;
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
@@ -385,7 +401,15 @@ const update: OperationExecutor = async (ctx, input: any) => {
     delete frontmatter.checksum;
   }
 
-  const publish = input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status));
+  // A rejected result never publishes, whatever the caller asked for: publish
+  // refuses a rejected doc, so an explicit `publish: true` alongside
+  // `status: "rejected"` would write the edit and then throw, leaving the file
+  // mutated and its checksum dropped. The derived default already lands here;
+  // this makes it true of the explicit flag too.
+  const publish =
+    frontmatter.status === "rejected"
+      ? false
+      : (input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status)));
   // Only an unpublished write may carry a caller-assigned version: publish
   // assigns its own, and stamping one first would put the node a version ahead
   // of its history (the same trap context_create avoids).

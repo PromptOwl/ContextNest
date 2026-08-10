@@ -1081,3 +1081,121 @@ describe("context_reconstruct — asking for a version that isn't there", () => 
     expect(v1.content).toContain("first");
   });
 });
+
+// ─── Review follow-ups: rejected handling and id tolerance ───────────────────
+
+describe("a rejected status never publishes, and never strands a file", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("creates a rejected node as a draft instead of writing then crashing", async () => {
+    // Publish refuses a rejected doc. This used to write the file, throw from
+    // publish, and leave an orphan with no version — so the caller's retry hit
+    // DOCUMENT_ALREADY_EXISTS for a create it believed had failed.
+    const res = await api.run<{ id: string; status: string; checkpoint: number | null }>(
+      "context_create",
+      { title: "Born Rejected", content: "x", status: "rejected" },
+      ctx,
+    );
+    expect(res.status).toBe("rejected");
+    expect(res.checkpoint).toBeNull();
+    const got = await api.run<{ frontmatter: { version?: number } }>(
+      "context_get",
+      { id: res.id, allow_rejected: true },
+      ctx,
+    );
+    expect(got.frontmatter.version).toBe(1);
+  });
+
+  it("ignores an explicit publish:true when the edit lands on rejected", async () => {
+    await api.run("context_create", { title: "Going Away", content: "original" }, ctx);
+    const res = await api.run<{ checkpoint: number | null }>(
+      "context_update",
+      { id: "nodes/going-away", status: "rejected", publish: true },
+      ctx,
+    );
+    expect(res.checkpoint).toBeNull();
+  });
+
+  it("refuses an edit that re-asserts rejected, rather than rewriting the body", async () => {
+    await api.run("context_create", { title: "Stay Put", content: "original" }, ctx);
+    await api.run("context_update", { id: "nodes/stay-put", status: "rejected" }, ctx);
+    // A client echoing the current status back alongside an edit used to slip
+    // past the guard and mutate a document that stayed rejected.
+    await expect(
+      api.run(
+        "context_update",
+        { id: "nodes/stay-put", status: "rejected", content: "MUTATED" },
+        ctx,
+      ),
+    ).rejects.toMatchObject({ code: "REJECTED_DOCUMENT" });
+    const got = await api.run<{ body: string }>(
+      "context_get",
+      { id: "nodes/stay-put", allow_rejected: true },
+      ctx,
+    );
+    expect(got.body).toContain("original");
+    expect(got.body).not.toContain("MUTATED");
+  });
+});
+
+describe("id and title tolerance", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("accepts an id built from a file path (.md suffix, leading slash)", async () => {
+    await api.run("context_create", { title: "Path Doc", content: "body" }, ctx);
+    // Storage appends `.md` itself, so an un-stripped suffix resolved to
+    // `<id>.md.md` and 404'd. Callers build ids from file paths all the time.
+    for (const id of ["nodes/path-doc", "nodes/path-doc.md", "/nodes/path-doc"]) {
+      const got = await api.run<{ id: string }>("context_get", { id }, ctx);
+      expect(got.id).toBe("nodes/path-doc");
+    }
+  });
+
+  it("still does NOT re-root a bare id, which a flat-layout vault depends on", async () => {
+    // The contract is "exactly as stored". Re-rooting `flat-doc` to
+    // `nodes/flat-doc` is what broke every read in an imported vault.
+    await ctx.storage.writeDocument(
+      "flat-doc",
+      `---\ntitle: Flat Doc\nstatus: published\n---\n\nbody\n`,
+    );
+    const got = await api.run<{ id: string }>("context_get", { id: "flat-doc" }, ctx);
+    expect(got.id).toBe("flat-doc");
+  });
+
+  it("finds a retired document by title, not just by id", async () => {
+    // A custom id means the slug guess cannot rescue this: title lookup has to
+    // actually see the retired doc.
+    await api.run(
+      "context_create",
+      { id: "nodes/custom/slot-7", title: "Quarterly Plan", content: "body" },
+      ctx,
+    );
+    await api.run("context_update", { id: "nodes/custom/slot-7", status: "rejected" }, ctx);
+    const got = await api.run<{ id: string }>(
+      "context_get",
+      { title: "Quarterly Plan", allow_rejected: true },
+      ctx,
+    );
+    expect(got.id).toBe("nodes/custom/slot-7");
+  });
+});
