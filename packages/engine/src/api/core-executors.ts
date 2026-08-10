@@ -372,7 +372,13 @@ const update: OperationExecutor = async (ctx, input: any) => {
     throw new RejectedDocumentError(id);
   }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
-  if (input.title) frontmatter.title = input.title;
+  // Same title rule as create, even though a rename leaves the id alone: a
+  // title with nothing slug-able is unusable everywhere it is read back —
+  // title→id resolution, search, wiki links — so it is rejected on both paths.
+  if (input.title) {
+    requireSlug(String(input.title));
+    frontmatter.title = input.title;
+  }
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
   if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
   if (input.metadata) {

@@ -114,6 +114,24 @@ describe("createEngineApi — executable core operations", () => {
     expect(after.body).toContain("more");
   });
 
+  it("rejects a title with nothing slug-able on create AND on rename", async () => {
+    const api = createEngineApi();
+    await expect(
+      api.run("context_create", { title: "###", content: "body" }, ctx),
+    ).rejects.toThrow(/no slug-able/);
+
+    const doc = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Real Title", content: "body" },
+      ctx,
+    );
+    // A rename keeps the id, but an unusable title is still unusable — title→id
+    // resolution, search and wiki links all read it back.
+    await expect(
+      api.run("context_update", { id: doc.id, title: "..." }, ctx),
+    ).rejects.toThrow(/no slug-able/);
+  });
+
   it("published doc is visible to graph-mode query after create (regression: S3 index regen)", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Findable", content: "body", tags: ["#api"] }, ctx);
