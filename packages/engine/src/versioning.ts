@@ -156,6 +156,19 @@ export class VersionManager {
       );
     }
 
+    // The walk below starts at the nearest keyframe at or before the target and
+    // replays diffs forward. Ask for a version the history does not contain and
+    // there are no diffs to replay, so it returns the keyframe's content as
+    // though it were the version requested — a silently wrong answer in the one
+    // place that must never give one. Refuse instead.
+    if (!history.versions.some((entry) => entry.version === targetVersion)) {
+      throw new ContextNestError(
+        `Version ${targetVersion} not found for ${docId}`,
+        "VERSION_NOT_FOUND",
+        "§6",
+      );
+    }
+
     // Find the nearest keyframe at or before target version
     let keyframeVersion = -1;
     for (const entry of history.versions) {

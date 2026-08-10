@@ -152,7 +152,10 @@ function buildCoreInstructions(input: AgentConfigInput): string {
   lines.push("## How to Use This Vault");
   lines.push("");
   if (hasMcpServer) {
-    lines.push("**Preferred: MCP Server** — Use the `contextnest` MCP tools (`resolve`, `read_document`, `search`).");
+    lines.push(
+      "**Preferred: MCP Server** — Use the `contextnest` MCP tools: `context_init` to open the vault, " +
+        "`context_query` / `context_search` to find nodes, `context_get` to read one.",
+    );
     lines.push("");
   }
   lines.push("**CLI fallback** — Run `ctx query <selector>` to load context:");

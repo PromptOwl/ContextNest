@@ -42,6 +42,7 @@ import {
   addVault,
   removeVault,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   readRegistry,
   findLocalVault,
@@ -49,7 +50,11 @@ import {
   ALIAS_PATTERN,
   normalizeStatus,
   normalizeDocumentId,
+  isPublished,
+  isRejected,
 } from "@promptowl/contextnest-engine";
+import { createEngineApi } from "@promptowl/contextnest-engine/api";
+import type { OperationContext } from "@promptowl/contextnest-engine/api";
 import type {
   ContextNode,
   Frontmatter,
@@ -239,6 +244,22 @@ const permissiveRbac: RbacHook = {
   canIngest: () => true,
   isDocOwner: () => true,
 };
+
+/** Engine primitives an operation runs against, for one vault. */
+function opContext(
+  storage: NestStorage,
+  actor: string,
+  onProgress?: (done: number, total: number) => void,
+): OperationContext {
+  return {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    rbac: permissiveRbac,
+    actor,
+    onProgress,
+  };
+}
 
 // Interactively prompt the user to pick a starter recipe using an arrow-key
 // navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
@@ -695,7 +716,7 @@ program
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
   .option("--set-default", "Make the new vault the registry default")
-  .option("--description <text>", "Description/label for the registry entry")
+  .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -709,14 +730,12 @@ program
     }
 
     const root = getInitRoot();
-    const storage = new NestStorage(root);
-    await storage.init(opts.name, opts.layout as LayoutMode);
-    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
 
-    // Register the new vault in the central registry so it can be targeted from
-    // any directory via `ctx --vault <alias> ...`. The alias comes from an
-    // explicit --vault flag, an interactive prompt, or (non-interactively) a
-    // directory-derived default — so init always registers the vault.
+    // Resolve the registry alias and description BEFORE creating the vault: the
+    // description is written into .context/config.yaml by init(), so a prompted
+    // one has to be in hand first. The alias comes from an explicit --vault
+    // flag, an interactive prompt, or (non-interactively) a directory-derived
+    // default — so init always registers the vault.
     let registerAlias = selectedVaultAlias;
     let registerDescription = opts.description as string | undefined;
     const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -736,13 +755,22 @@ program
       }
     }
 
+    const storage = new NestStorage(root);
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription);
+    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
+
     // Registration is performed AFTER the starter is applied (see registerVault
     // below) so an interruption mid-starter never leaves a registry alias
     // pointing at a half-populated vault.
     const registerVault = (): void => {
       if (!registerAlias) return;
       const resolvedRoot = pathMod.resolve(root);
-      const existing = registrySnapshot.vaults[registerAlias];
+      // Own-property check: a `--vault __proto__` would otherwise read back
+      // Object.prototype here and crash on `resolve(existing.path)` before
+      // addVault got the chance to reject the alias.
+      const existing = Object.hasOwn(registrySnapshot.vaults, registerAlias)
+        ? registrySnapshot.vaults[registerAlias]
+        : undefined;
       if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
         // The alias is already taken by a *different* vault. Don't silently
         // clobber it — the vault was still created; just skip registration.
@@ -831,7 +859,26 @@ program
   .action(async (path, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    // allow_rejected: `ctx read` has always shown a retired document — reading
+    // one is not republishing it, and refusing would hide it from the person
+    // deciding whether to revive it.
+    const got = await createEngineApi().run<{
+      id: string;
+      frontmatter: ContextNode["frontmatter"];
+      body: string;
+      raw?: string;
+    }>(
+      "context_get",
+      { id, include_raw: true, allow_rejected: true },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    const doc: ContextNode = {
+      id: got.id,
+      filePath: "",
+      rawContent: got.raw ?? "",
+      frontmatter: got.frontmatter,
+      body: got.body,
+    };
 
     if (opts.raw) {
       console.log(doc.rawContent);
@@ -954,27 +1001,30 @@ program
       body = `\n# ${title}\n\n`;
     }
 
-    const node: ContextNode = {
-      id,
-      filePath: "",
-      frontmatter,
-      body,
-      rawContent: "",
-    };
+    // Scaffolding above stays a CLI concern (heading/steps templates are an
+    // authoring nicety, not vault semantics); the write + publish + index pass
+    // goes through the catalog so this matches every other surface.
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number | null;
+    }>(
+      "context_create",
+      {
+        id,
+        title,
+        content: body,
+        type: opts.type,
+        ...(tagList ? { tags: tagList } : {}),
+        ...(frontmatter.skill ?? {}),
+        note: "Created via CLI",
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
-    const content = serializeDocument(node);
-    await storage.writeDocument(id, content);
-
-    const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
-      note: "Created via CLI",
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Created and published ${id}.md`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
+    console.log(chalk.green(`Created and published ${result.id}.md`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
   });
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
@@ -1100,55 +1150,131 @@ program
 // ─── ctx publish ───────────────────────────────────────────────────────────────
 
 program
-  .command("publish <path>")
-  .description("Publish a document (bump version, create checkpoint)")
+  .command("publish [path]")
+  .description("Publish a document, or every unpublished document with --all")
   .option("-a, --author <email>", "Author email", "cli@contextnest.local")
   .option("-m, --message <note>", "Version note")
+  .option("--all", "Publish every unpublished document in the vault, in one batch")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
 
-    const result = await publishDocument(storage, id, {
-      editedBy: opts.author,
-      note: opts.message,
-    });
+    if (opts.all) {
+      if (path) {
+        console.error(chalk.red("Pass a path or --all, not both"));
+        process.exit(1);
+      }
+      await publishAll(storage, opts.author);
+      return;
+    }
+    if (!path) {
+      console.error(chalk.red("Missing path (or pass --all)"));
+      process.exit(1);
+    }
 
-    await regenerateIndex(storage);
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number;
+      chain_hash: string;
+    }>(
+      "context_publish",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.message ? { note: opts.message } : {}),
+      },
+      opContext(storage, opts.author),
+    );
 
-    console.log(chalk.green(`Published ${id}`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
-    console.log(`  Chain hash: ${result.versionEntry.chain_hash}`);
+    console.log(chalk.green(`Published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
+    console.log(`  Chain hash: ${result.chain_hash}`);
   });
+
+/**
+ * `ctx publish --all` — bulk-publish through the engine's `context_import`
+ * operation rather than looping `publishDocument`. The loop is O(N²): every
+ * publish seals its own checkpoint and every checkpoint re-scans the whole
+ * vault. The operation seals ONE checkpoint and regenerates the index once.
+ */
+async function publishAll(storage: NestStorage, author: string): Promise<void> {
+  const docs = await storage.discoverDocuments();
+  // Rejected docs are deliberately excluded — the engine refuses to republish
+  // them (silent resurrection guard), so including them only fills failed[].
+  const ids = docs.filter((d) => !isPublished(d) && !isRejected(d)).map((d) => d.id);
+  if (ids.length === 0) {
+    console.log(chalk.dim("Nothing to publish — every document is already published."));
+    return;
+  }
+
+  const ctx = opContext(storage, author, (done, total) => {
+    // Single rewritten line; fall back to plain lines when piped to a file.
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\rPublishing ${done}/${total}…`);
+    } else if (done === total) {
+      console.log(`Publishing ${done}/${total}`);
+    }
+  });
+
+  const result = await createEngineApi().run<{
+    published: { id: string; version: number }[];
+    failed: { id?: string; title?: string; error: string }[];
+    checkpoint: number | null;
+  }>("context_import", { ids }, ctx);
+
+  if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+  console.log(chalk.green(`Published ${result.published.length} document(s)`));
+  if (result.checkpoint !== null) console.log(`  Checkpoint: ${result.checkpoint}`);
+  for (const f of result.failed) {
+    console.log(chalk.yellow(`  failed ${f.id ?? f.title}: ${f.error}`));
+  }
+  // Same contract as `ctx validate` / `ctx verify`: a batch with failures exits
+  // non-zero so CI notices. exitCode, not exit(), so the summary still flushes.
+  if (result.failed.length > 0) process.exitCode = 1;
+}
 
 // ─── ctx history ───────────────────────────────────────────────────────────────
 
 program
   .command("history <path>")
   .description("Show version history for a document")
+  .option("--diff", "Include each version's unified diff from the one before")
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const vm = new VersionManager(storage);
-    const history = await vm.getHistory(id);
+    const history = await createEngineApi().run<{
+      id: string;
+      keyframe_interval: number;
+      versions: Array<{
+        version: number;
+        keyframe: boolean;
+        edited_by: string;
+        edited_at: string;
+        published_at?: string;
+        note?: string;
+        chain_hash: string;
+        diff?: string;
+      }>;
+    }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
-    if (!history) {
+    if (history.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${id}`));
       return;
     }
 
     if (opts.json) {
       console.log(JSON.stringify(history, null, 2));
-    } else {
-      console.log(chalk.bold(`Version history for ${id}:\n`));
-      for (const entry of history.versions) {
-        const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
-        const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
-        console.log(`  v${entry.version}${keyframe}${published}`);
-        console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
-        if (entry.note) console.log(`    Note: ${entry.note}`);
-      }
+      return;
+    }
+    console.log(chalk.bold(`Version history for ${id}:\n`));
+    for (const entry of history.versions) {
+      const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
+      const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
+      console.log(`  v${entry.version}${keyframe}${published}`);
+      console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
+      if (entry.note) console.log(`    Note: ${entry.note}`);
+      if (entry.diff) console.log(entry.diff.replace(/^/gm, "    "));
     }
   });
 
@@ -1159,10 +1285,80 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-    const vm = new VersionManager(storage);
-    const content = await vm.reconstructVersion(id, parseInt(version, 10));
+    const { content } = await createEngineApi().run<{ content: string }>(
+      "context_reconstruct",
+      { id: normalizeDocumentId(path), version: parseInt(version, 10) },
+      opContext(storage, "cli@contextnest.local"),
+    );
     console.log(content);
+  });
+
+// ─── ctx info ─────────────────────────────────────────────────────────────────
+//
+// Named `info`, not `init`: `ctx init` CREATES a vault, while the operation
+// behind this one opens an existing vault (its instructions, config and what it
+// holds). Same word, opposite meaning — worth keeping apart on the CLI.
+
+program
+  .command("info")
+  .description("Show the vault's instructions, configuration and contents")
+  .option("--nodes", "Also list every node")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const out = await createEngineApi().run<{
+      context_md: string | null;
+      vault_path: string;
+      config: { name: string; description?: string; servers: string[] } | null;
+      total: number;
+      by_type: Record<string, number>;
+      by_status: Record<string, number>;
+      tags: string[];
+      nodes?: Array<{ id: string; title: string; type: string }>;
+    }>(
+      "context_init",
+      opts.nodes ? { include_nodes: true } : {},
+      opContext(storage, "cli@contextnest.local"),
+    );
+
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold(out.config?.name ?? "Vault"));
+    if (out.config?.description) console.log(chalk.dim(out.config.description));
+    console.log(chalk.dim(out.vault_path));
+    console.log();
+    console.log(`${chalk.bold(String(out.total))} node(s)`);
+    for (const [type, count] of Object.entries(out.by_type).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${chalk.cyan(type)}: ${count}`);
+    }
+    if (Object.keys(out.by_status).length) {
+      console.log(chalk.dim("status:"));
+      for (const [status, count] of Object.entries(out.by_status).sort((a, b) => b[1] - a[1])) {
+        console.log(`  ${status}: ${count}`);
+      }
+    }
+    if (out.tags.length) {
+      console.log(chalk.dim("tags:") + " " + out.tags.map((t) => chalk.cyan(t)).join(" "));
+    }
+    if (out.config?.servers.length) {
+      console.log(chalk.dim("servers:") + " " + out.config.servers.join(", "));
+    }
+    if (out.nodes) {
+      console.log();
+      for (const n of out.nodes) {
+        console.log(`  ${chalk.cyan(n.id)} [${n.type}]`);
+        console.log(`    ${n.title}`);
+      }
+    }
+    console.log();
+    console.log(
+      out.context_md
+        ? chalk.dim("CONTEXT.md:\n") + out.context_md
+        : chalk.yellow("No CONTEXT.md — run `ctx init` to scaffold one."),
+    );
   });
 
 // ─── ctx verify ────────────────────────────────────────────────────────────────
@@ -1417,12 +1613,21 @@ program
 
     // Local query — graph-aware traversal
     const storage = getStorage();
-    const engine = new GraphQueryEngine(storage);
-    const result = await engine.query(selector, {
-      hops: opts.hops ?? 2,
-      full: opts.full ?? false,
-      includeDrafts: opts.includeDrafts ?? false,
-    });
+    type Doc = { id: string; title: string; body?: string; source?: unknown };
+    const result = await createEngineApi().run<{
+      documents: Doc[];
+      source_nodes?: Doc[];
+      traversal?: { mode: string; hops_used: number; nodes_traversed: number };
+    }>(
+      "context_query",
+      {
+        query: selector,
+        ...(opts.hops !== undefined ? { hops: opts.hops } : {}),
+        ...(opts.full ? { full: true } : {}),
+        ...(opts.includeDrafts ? { include_drafts: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
       console.log(
@@ -1430,19 +1635,18 @@ program
           {
             documents: result.documents.map((d) => ({
               id: d.id,
-              title: d.frontmatter.title,
+              title: d.title,
               body: d.body,
             })),
-            sourceNodes: result.sourceNodes.map((d) => ({
+            sourceNodes: (result.source_nodes ?? []).map((d) => ({
               id: d.id,
-              title: d.frontmatter.title,
-              source: d.frontmatter.source,
+              title: d.title,
+              source: d.source,
               body: d.body,
             })),
-            traceCount: result.traces.length,
-            mode: result.mode,
-            hopsUsed: result.hopsUsed,
-            nodesTraversed: result.nodesTraversed,
+            mode: result.traversal?.mode,
+            hopsUsed: result.traversal?.hops_used,
+            nodesTraversed: result.traversal?.nodes_traversed,
           },
           null,
           2,
@@ -1451,16 +1655,21 @@ program
     } else {
       console.log(chalk.bold("Documents:"));
       for (const doc of result.documents) {
-        console.log(`  ${chalk.cyan(doc.id)}: ${doc.frontmatter.title}`);
+        console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
       }
-      if (result.sourceNodes.length > 0) {
+      const sources = result.source_nodes ?? [];
+      if (sources.length > 0) {
         console.log(chalk.bold("\nSource Nodes (hydration order):"));
-        for (const doc of result.sourceNodes) {
-          console.log(`  ${chalk.magenta(doc.id)}: ${doc.frontmatter.title}`);
-          console.log(`    Transport: ${doc.frontmatter.source?.transport}, Server: ${doc.frontmatter.source?.server || "n/a"}`);
+        for (const doc of sources) {
+          const src = doc.source as { transport?: string; server?: string } | undefined;
+          console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+          console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
         }
       }
-      console.log(chalk.dim(`\n${result.mode} mode | ${result.hopsUsed} hops | ${result.nodesTraversed} nodes | ${result.traces.length} traces`));
+      const t = result.traversal;
+      console.log(
+        chalk.dim(`\n${t?.mode} mode | ${t?.hops_used} hops | ${t?.nodes_traversed} nodes`),
+      );
     }
   });
 
@@ -1472,57 +1681,49 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
+  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    // Include retired so users can list them with `--status rejected`; the
-    // default branch below re-filters them out when no status is requested.
-    let docs = await storage.discoverDocuments({ includeRetired: true });
-
-    if (opts.type) docs = docs.filter((d) => (d.frontmatter.type || "document") === opts.type);
-    if (opts.status) {
-      const wanted = normalizeStatus(opts.status);
-      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
-    } else {
-      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
-    }
-    if (opts.tag) {
-      const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
-      docs = docs.filter((d) => d.frontmatter.tags?.includes(normalizedTag));
-    }
+    // Aliases collapse here; the operation owns the rest of the filtering,
+    // including hiding retired documents when no status was asked for.
+    const { documents } = await createEngineApi().run<{
+      documents: Array<{
+        id: string;
+        title: string;
+        type: string;
+        status: string;
+        tags?: string[];
+      }>;
+    }>(
+      "context_list",
+      {
+        ...(opts.type ? { type: opts.type } : {}),
+        ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
+        ...(opts.tag ? { tag: opts.tag } : {}),
+        ...(opts.limit ? { limit: opts.limit } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
-      console.log(
-        JSON.stringify(
-          docs.map((d) => ({
-            id: d.id,
-            title: d.frontmatter.title,
-            type: d.frontmatter.type || "document",
-            status: d.frontmatter.status || "draft",
-            tags: d.frontmatter.tags,
-          })),
-          null,
-          2,
-        ),
-      );
-    } else {
-      if (docs.length === 0) {
-        console.log(chalk.yellow("No documents found."));
-      } else {
-        console.log(chalk.bold(`${docs.length} document(s):\n`));
-        for (const doc of docs) {
-          const type = doc.frontmatter.type || "document";
-          const status = doc.frontmatter.status || "draft";
-          const statusColor =
-            status === "published" ? chalk.green
-            : status === "approved" ? chalk.cyan
-            : status === "pending_review" ? chalk.magenta
-            : status === "rejected" ? chalk.red
-            : chalk.yellow;
-          console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
-          console.log(`    ${doc.frontmatter.title}`);
-        }
-      }
+      console.log(JSON.stringify(documents, null, 2));
+      return;
+    }
+    if (documents.length === 0) {
+      console.log(chalk.yellow("No documents found."));
+      return;
+    }
+    console.log(chalk.bold(`${documents.length} document(s):\n`));
+    for (const doc of documents) {
+      const statusColor =
+        doc.status === "published" ? chalk.green
+        : doc.status === "approved" ? chalk.cyan
+        : doc.status === "pending_review" ? chalk.magenta
+        : doc.status === "rejected" ? chalk.red
+        : chalk.yellow;
+      console.log(`  ${chalk.cyan(doc.id)} [${doc.type}] ${statusColor(doc.status)}`);
+      console.log(`    ${doc.title}`);
     }
   });
 
@@ -1537,67 +1738,53 @@ program
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
+    // takes canonical statuses only. It decides from that status whether this
+    // is a content release or a lifecycle transition, so the CLI no longer
+    // carries its own copy of that rule.
+    const status = opts.status !== undefined ? normalizeStatus(opts.status) : undefined;
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      status: string;
+      checkpoint: number | null;
+    }>(
+      "context_update",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.title !== undefined ? { title: opts.title } : {}),
+        ...(status !== undefined ? { status } : {}),
+        ...(opts.tags !== undefined
+          ? {
+              tags: opts.tags
+                .split(/[,\s]+/)
+                .filter((t: string) => t.length > 0)
+                .map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
+            }
+          : {}),
+        ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
+        note: "Updated via CLI",
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
-    if (opts.title !== undefined) doc.frontmatter.title = opts.title;
-    if (opts.status !== undefined) {
-      doc.frontmatter.status = normalizeStatus(opts.status);
-    }
-    if (opts.tags !== undefined) {
-      doc.frontmatter.tags = opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`));
-    }
-    doc.frontmatter.updated_at = new Date().toISOString();
-
-    if (opts.body !== undefined) {
-      doc.body = `\n${opts.body}\n`;
-    }
-
-    const validation = validateDocument(doc);
-    if (!validation.valid) {
-      console.log(chalk.red("Validation failed:"));
-      for (const err of validation.errors) {
-        console.log(`  Rule ${err.rule}: ${err.message}${err.field ? ` (${err.field})` : ""}`);
-      }
-      process.exit(1);
-    }
-
-    const content = serializeDocument(doc);
-    await storage.writeDocument(id, content);
-
-    // Non-published lifecycle paths skip auto-publish — those are metadata
-    // changes, not content releases. Mirrors MCP `update_document`.
-    if (
-      opts.status !== undefined &&
-      (doc.frontmatter.status === "rejected" ||
-        doc.frontmatter.status === "approved" ||
-        doc.frontmatter.status === "pending_review" ||
-        doc.frontmatter.status === "draft")
-    ) {
-      await regenerateIndex(storage);
+    if (result.checkpoint === null) {
       const label =
-        doc.frontmatter.status === "rejected"
+        result.status === "rejected"
           ? "retired"
-          : doc.frontmatter.status === "pending_review"
+          : result.status === "pending_review"
             ? "submitted for review"
-            : doc.frontmatter.status === "approved"
+            : result.status === "approved"
               ? "marked approved"
               : "reverted to draft";
-      console.log(chalk.green(`Updated and ${label}: ${id}`));
+      console.log(chalk.green(`Updated and ${label}: ${result.id}`));
       console.log(chalk.dim("  No new version cut. Run `ctx publish` to release."));
       return;
     }
 
-    const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
-      note: "Updated via CLI",
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Updated and published ${id}`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
+    console.log(chalk.green(`Updated and published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────
@@ -1607,13 +1794,12 @@ program
   .description("Delete a document and its version history")
   .action(async (path) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-
-    const doc = await storage.readDocument(id);
-    await storage.deleteDocument(id);
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Deleted ${id} (${doc.frontmatter.title})`));
+    const result = await createEngineApi().run<{ id: string; title: string }>(
+      "context_delete",
+      { id: normalizeDocumentId(path) },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
   });
 
 // ─── ctx search ───────────────────────────────────────────────────────────────
@@ -1622,36 +1808,39 @@ program
   .command("search <query>")
   .description("Full-text search across vault documents")
   .option("--json", "Output as JSON")
+  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
   .action(async (query, opts) => {
     const storage = getStorage();
-    const docs = await storage.discoverDocuments();
-    const resolver = new Resolver({ documents: docs });
-
-    const uri = parseUri(`contextnest://search/${query.replace(/\s+/g, "+")}`);
-    const results = await resolver.resolve(uri);
+    const { results } = await createEngineApi().run<{
+      results: Array<{ id: string; title: string; description?: string; type: string }>;
+    }>(
+      "context_search",
+      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
       console.log(
         JSON.stringify(
           results.map((d) => ({
             id: d.id,
-            title: d.frontmatter.title,
-            description: d.frontmatter.description,
-            type: d.frontmatter.type || "document",
+            title: d.title,
+            description: d.description,
+            type: d.type,
           })),
           null,
           2,
         ),
       );
-    } else {
-      if (results.length === 0) {
-        console.log(chalk.yellow("No results found."));
-      } else {
-        console.log(chalk.bold(`${results.length} result(s):\n`));
-        for (const doc of results) {
-          console.log(`  ${chalk.cyan(doc.id)}: ${doc.frontmatter.title}`);
-        }
-      }
+      return;
+    }
+    if (results.length === 0) {
+      console.log(chalk.yellow("No results found."));
+      return;
+    }
+    console.log(chalk.bold(`${results.length} result(s):\n`));
+    for (const doc of results) {
+      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
     }
   });
 
@@ -1665,19 +1854,21 @@ packCmd
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const packs = await storage.readPacks();
+    const { packs } = await createEngineApi().run<{
+      packs: Array<{ id: string; label: string; description?: string }>;
+    }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
 
     if (opts.json) {
       console.log(JSON.stringify(packs, null, 2));
-    } else {
-      if (packs.length === 0) {
-        console.log(chalk.yellow("No packs found."));
-      } else {
-        for (const pack of packs) {
-          console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
-          if (pack.description) console.log(`    ${pack.description}`);
-        }
-      }
+      return;
+    }
+    if (packs.length === 0) {
+      console.log(chalk.yellow("No packs found."));
+      return;
+    }
+    for (const pack of packs) {
+      console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
+      if (pack.description) console.log(`    ${pack.description}`);
     }
   });
 
@@ -2119,6 +2310,23 @@ vaultCmd
       const isDefault = reg.default === alias;
       console.log(
         chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${target}`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
+  .command("describe <alias> [description]")
+  .description("Set the description for a registered alias (omit the text to clear it)")
+  .action((alias: string, description: string | undefined) => {
+    try {
+      setVaultDescription(alias, description);
+      console.log(
+        description
+          ? chalk.green(`Described "${chalk.bold(alias)}": ${description}`)
+          : chalk.yellow(`Cleared the description for "${alias}"`),
       );
     } catch (err) {
       console.log(chalk.red((err as Error).message));

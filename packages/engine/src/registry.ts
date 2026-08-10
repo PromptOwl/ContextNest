@@ -40,6 +40,38 @@ import type { VaultRegistry, VaultRegistryEntry } from "./types.js";
  */
 export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
+/**
+ * Names that ALIAS_PATTERN happens to match but that must never be used as a
+ * key into `registry.vaults`: they resolve to inherited `Object.prototype`
+ * members instead of a real entry. `vaults["__proto__"]` returns the prototype
+ * itself — truthy, so it slips past an `if (!entry)` guard, and writing to it
+ * would alter `Object.prototype` for the whole process.
+ */
+const RESERVED_ALIASES = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Validate an alias before it is used as a `registry.vaults` key. Every entry
+ * point that looks an alias up or writes one must call this — the guard belongs
+ * at the boundary, not at each individual property access.
+ */
+function lookupVault(registry: VaultRegistry, alias: string): VaultRegistryEntry | undefined {
+  // Own-property check, not a bare index: `vaults["__proto__"]` would otherwise
+  // hand back Object.prototype and read as a registered alias. Resolution paths
+  // want "unknown alias" here, not the hard error assertSafeAlias raises.
+  return Object.hasOwn(registry.vaults, alias) ? registry.vaults[alias] : undefined;
+}
+
+function assertSafeAlias(alias: string): void {
+  if (!alias.trim()) {
+    throw new ConfigError("Vault alias must not be empty");
+  }
+  if (!ALIAS_PATTERN.test(alias) || RESERVED_ALIASES.has(alias)) {
+    throw new ConfigError(
+      `Vault alias "${alias}" is invalid — use only letters, digits, hyphens, or underscores.`,
+    );
+  }
+}
+
 const vaultRegistryEntrySchema = z.object({
   path: z.string().min(1),
   description: z.string().optional(),
@@ -165,14 +197,7 @@ export interface AddVaultOptions {
  * If the registry has no default yet, the first added vault becomes default.
  */
 export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions = {}): VaultRegistry {
-  if (!alias.trim()) {
-    throw new ConfigError("Vault alias must not be empty");
-  }
-  if (!ALIAS_PATTERN.test(alias)) {
-    throw new ConfigError(
-      `Vault alias "${alias}" is invalid — use only letters, digits, hyphens, or underscores.`,
-    );
-  }
+  assertSafeAlias(alias);
   // Store absolute paths only: the registry is read from arbitrary working
   // directories, so a relative path would resolve differently at lookup time.
   if (!isAbsolute(vaultPath)) {
@@ -209,6 +234,7 @@ export interface RemoveVaultResult {
 }
 
 export function removeVault(alias: string): RemoveVaultResult {
+  assertSafeAlias(alias);
   const registry = readRegistry();
   if (!registry.vaults[alias]) {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
@@ -223,6 +249,7 @@ export function removeVault(alias: string): RemoveVaultResult {
 }
 
 export function setDefaultVault(alias: string): VaultRegistry {
+  assertSafeAlias(alias);
   const registry = readRegistry();
   if (!registry.vaults[alias]) {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
@@ -232,10 +259,28 @@ export function setDefaultVault(alias: string): VaultRegistry {
   return registry;
 }
 
+/**
+ * Set the description on a registered alias, or clear it when `description` is
+ * empty/omitted. Clearing removes the key rather than storing `""` so the
+ * config-description fallback in listVaults() takes over again.
+ */
+export function setVaultDescription(alias: string, description?: string): VaultRegistry {
+  assertSafeAlias(alias);
+  const registry = readRegistry();
+  const entry = registry.vaults[alias];
+  if (!entry) {
+    throw new ConfigError(`No vault registered under alias "${alias}".`);
+  }
+  if (description?.trim()) entry.description = description;
+  else delete entry.description;
+  writeRegistry(registry);
+  return registry;
+}
+
 export interface VaultListEntry {
   alias: string;
   path: string;
-  /** Registry description, or the vault's own config name when unset. */
+  /** Registry description, else the vault config's own `description` or `name`. */
   description?: string;
   isDefault: boolean;
   /** Whether the path currently resolves to a real vault. */
@@ -248,18 +293,28 @@ export function listVaults(): VaultListEntry[] {
   return Object.entries(registry.vaults).map(([alias, entry]) => ({
     alias,
     path: entry.path,
-    description: entry.description ?? readVaultName(entry.path),
+    // Blank is treated as unset (same rule readVaultLabel applies to the config),
+    // so a hand-edited `description: ""` falls through instead of winning.
+    description: entry.description?.trim() ? entry.description : readVaultLabel(entry.path),
     isDefault: registry.default === alias,
     exists: isVaultRoot(entry.path),
   }));
 }
 
-/** Read a vault's own `name` from its config (best-effort, for display). */
-function readVaultName(vaultPath: string): string | undefined {
+/**
+ * A vault's own label from its config (best-effort, for display). Prefers the
+ * config's `description` — the nest's own description, which travels with the
+ * vault — over its `name`. The registry entry's description still wins over
+ * both; it is a machine-local override.
+ */
+function readVaultLabel(vaultPath: string): string | undefined {
   try {
     const raw = yaml.load(readFileSync(join(vaultPath, ".context", "config.yaml"), "utf-8"));
-    const name = (raw as { name?: unknown })?.name;
-    return typeof name === "string" ? name : undefined;
+    const config = raw as { description?: unknown; name?: unknown };
+    for (const value of [config?.description, config?.name]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    return undefined;
   } catch {
     return undefined;
   }
@@ -271,7 +326,7 @@ function readVaultName(vaultPath: string): string | undefined {
  * caller has one in hand.
  */
 function resolveAliasOrThrow(alias: string, registry: VaultRegistry = readRegistry()): string {
-  const entry = registry.vaults[alias];
+  const entry = lookupVault(registry, alias);
   if (!entry) {
     const known = Object.keys(registry.vaults);
     const hint = known.length ? ` Known aliases: ${known.join(", ")}.` : " No vaults registered yet — add one with `ctx vault add`.";
@@ -347,7 +402,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   // of every command — use it when valid, otherwise warn and fall through.
   const envAlias = process.env.CONTEXTNEST_VAULT;
   if (envAlias) {
-    const entry = getRegistry().vaults[envAlias];
+    const entry = lookupVault(getRegistry(), envAlias);
     if (entry && isVaultRoot(entry.path)) {
       return { path: entry.path, source: "env-alias", alias: envAlias };
     }
@@ -374,7 +429,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   // absolute path that isn't (yet) a vault.
   if (opts.argPath) {
     const arg = opts.argPath;
-    if (getRegistry().vaults[arg]) {
+    if (lookupVault(getRegistry(), arg)) {
       return { path: resolveAliasOrThrow(arg, getRegistry()), source: "arg", alias: arg };
     }
     // Not an alias → treat as a path. A relative path is resolved against cwd

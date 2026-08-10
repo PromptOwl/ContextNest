@@ -56,3 +56,25 @@ jobs:
 
       - name: Regression tests (CLI + MCP server)
         run: pnpm test:regression
+
+  docker:
+    name: Docker image (MCP server)
+    runs-on: ubuntu-latest
+    # The smoke test below relies on the server exiting when stdin closes; cap
+    # the job so a regression there fails fast instead of hanging for 6 hours.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t contextnest-mcp .
+
+      # Catches what `docker build` alone cannot: a wrong ENTRYPOINT path, or a
+      # vault the server can't resolve/read at runtime.
+      - name: Smoke-test the server over stdio
+        run: |
+          out=$(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' | docker run -i --rm contextnest-mcp)
+          echo "$out"
+          echo "$out" | grep -q '"serverInfo"'

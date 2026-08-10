@@ -3,6 +3,7 @@
  * Exposes vault operations as tools for AI agents via the Model Context Protocol.
  */
 
+import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -37,7 +38,11 @@ import type {
   GovernanceTier,
   RbacHook,
 } from "@promptowl/contextnest-engine";
+import { createEngineApi } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
+
+/** Engine operation catalog — schemas and implementations for `context_*` tools. */
+const engineApi = createEngineApi();
 
 // Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
 // throw; catch it here so the user gets a clean message on stderr instead of an
@@ -51,9 +56,16 @@ try {
 }
 const storage = new NestStorage(vaultPath);
 
+// Read from package.json rather than hardcoding: this is the version MCP
+// clients and directories display, and a second copy drifts from the published
+// one. dist/index.js sits one level below the manifest.
+const { version } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
+
 const server = new McpServer({
   name: "contextnest",
-  version: "0.1.0",
+  version,
 });
 
 const regenerateIndex = () => storage.regenerateIndex();
@@ -70,7 +82,7 @@ const permissiveRbac: RbacHook = {
 
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
-server.tool("vault_info", "Get vault identity (CONTEXT.md) and configuration summary", {}, async () => {
+server.tool("vault_info", "DEPRECATED — use context_init, which returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary", {}, async () => {
   const contextMd = await storage.readContextMd();
   const config = await storage.readConfig();
 
@@ -104,7 +116,7 @@ server.tool("vault_info", "Get vault identity (CONTEXT.md) and configuration sum
 
 server.tool(
   "resolve",
-  "Execute a selector query to find matching documents using graph traversal",
+  "DEPRECATED — use context_query, which this has always been: a graph-traversal selector query. (context_resolve is a different operation — it returns full bodies within a token budget.) Execute a selector query to find matching documents using graph traversal",
   {
     selector: z.string().describe("Selector query expression (e.g., '#engineering + type:document')"),
     hops: z.number().optional().describe("Graph traversal depth (default: 2). More hops = more context, slower. Fewer hops = faster, less context."),
@@ -156,7 +168,7 @@ server.tool(
 
 server.tool(
   "read_document",
-  "Read a single document by its contextnest:// URI or path",
+  "DEPRECATED — use context_get. Read a single document by its contextnest:// URI or path. Kept for existing clients: it takes URI and path in one field, where context_get separates uri, id and title.",
   { uri: z.string().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')") },
   async ({ uri }) => {
     let docId: string;
@@ -194,7 +206,7 @@ server.tool(
 
 server.tool(
   "list_documents",
-  "List all documents with optional filters",
+  "DEPRECATED — use context_list. List all documents with optional filters.",
   {
     type: z.string().optional().describe("Filter by node type"),
     status: z
@@ -457,7 +469,7 @@ server.tool(
 
 server.tool(
   "search",
-  "Full-text search across vault documents with graph traversal",
+  "DEPRECATED — use context_search. Full-text search across vault documents with graph traversal",
   {
     query: z.string().describe("Search query"),
     hops: z.number().optional().describe("Graph traversal depth from search results (default: 2)"),
@@ -501,7 +513,7 @@ server.tool(
 
 // ─── Tool: verify_integrity ────────────────────────────────────────────────────
 
-server.tool("verify_integrity", "Verify integrity of all hash chains in the vault", {}, async () => {
+server.tool("verify_integrity", "DEPRECATED — use context_verify. Verify integrity of all hash chains in the vault", {}, async () => {
   const report = await storage.verifyVaultIntegrity();
   return {
     content: [
@@ -545,7 +557,7 @@ server.tool(
 
 server.tool(
   "read_version",
-  "Read a specific version of a document",
+  "DEPRECATED — use context_reconstruct. Read a specific version of a document",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     version: z.number().describe("Version number to reconstruct"),
@@ -570,7 +582,7 @@ server.tool(
 
 server.tool(
   "create_document",
-  "Create a new document in the vault with frontmatter and optional body content",
+  "DEPRECATED — use context_create. Create a new document in the vault with frontmatter and optional body content. Kept for existing clients: it wraps the body in a heading and fills skill defaults, which context_create does not.",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().describe("Document title"),
@@ -682,7 +694,7 @@ server.tool(
 
 server.tool(
   "update_document",
-  "Update an existing document's frontmatter fields and/or body content",
+  "DEPRECATED — use context_update. Update an existing document's frontmatter fields and/or body content. Kept for existing clients: it accepts status aliases and wraps the body, which context_update does not.",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().optional().describe("New title"),
@@ -830,7 +842,7 @@ server.tool(
 
 server.tool(
   "delete_document",
-  "Delete a document and its version history from the vault",
+  "DEPRECATED — use context_delete. Delete a document and its version history from the vault",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
   },
@@ -862,7 +874,7 @@ server.tool(
 
 server.tool(
   "publish_document",
-  "Publish a document: bump version, compute checksum, create version entry and checkpoint",
+  "DEPRECATED — use context_publish. Publish a document: bump version, compute checksum, create version entry and checkpoint",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),
@@ -1088,6 +1100,60 @@ server.tool(
     };
   },
 );
+
+// ─── Catalog-driven tools (canonical `context_*` names) ───────────────────────
+
+/**
+ * Register an engine catalog operation as an MCP tool. Name, description and
+ * schema all come from the descriptor, so this surface cannot drift from the
+ * CLI and Community ones. The SDK wants a ZodRawShape, hence the `.shape`.
+ *
+ * These are the canonical names. The legacy tools above (`create_document`,
+ * `read_document`, …) stay registered and behave exactly as before; they are
+ * deprecated in favour of these and will be removed in a future major.
+ */
+function registerCatalogTool(name: string): void {
+  const op = engineApi.getOperation(name);
+  if (!op) return;
+  server.tool(
+    op.name,
+    op.description,
+    (op.input as z.ZodObject<z.ZodRawShape>).shape,
+    async (input) => {
+      // No onProgress — MCP has no progress channel; operations are identical
+      // without one.
+      const result = await engineApi.run(op.name, input, {
+        storage,
+        query: new GraphQueryEngine(storage),
+        versions: new VersionManager(storage),
+        rbac: permissiveRbac,
+        actor: "mcp@contextnest.local",
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+}
+
+registerCatalogTool("context_import");
+registerCatalogTool("context_create");
+registerCatalogTool("context_update");
+registerCatalogTool("context_list");
+registerCatalogTool("context_get");
+registerCatalogTool("context_init");
+registerCatalogTool("context_verify");
+registerCatalogTool("context_packs");
+registerCatalogTool("context_search");
+registerCatalogTool("context_query");
+registerCatalogTool("context_resolve");
+registerCatalogTool("context_publish");
+registerCatalogTool("context_delete");
+registerCatalogTool("context_reconstruct");
+// No legacy twin: nothing here listed version history before — read_version
+// fetches one version's content, which is a different question.
+registerCatalogTool("context_versions");
+registerCatalogTool("context_nests");
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 

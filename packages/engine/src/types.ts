@@ -3,7 +3,7 @@
  * See CONTEXT_NEST_SPEC-v3.md for the full specification.
  */
 
-/** Node types (§1.6) */
+/** Node types (§1.6). Keep in lockstep with `NODE_TYPES` in schemas.ts. */
 export type NodeType =
   | "document"
   | "snippet"
@@ -13,7 +13,10 @@ export type NodeType =
   | "source"
   | "tool"
   | "reference"
-  | "skill";
+  | "skill"
+  | "agent"
+  | "artifact"
+  | "table";
 
 /** Document status (§1.5)
  *

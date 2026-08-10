@@ -8,7 +8,9 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **19 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **35 tools** over stdio transport.
+
+> **New in 2.0** — sixteen canonical `context_*` tools are generated straight from the engine's operation catalog, so this server, the `ctx` CLI and the PromptOwl cloud now advertise the same names, schemas and error codes. The older tools still work and are marked deprecated. See [Upgrading to 2.0](#upgrading-to-20).
 
 ## Install
 
@@ -83,23 +85,58 @@ directory.
 
 ## Tools
 
+### Canonical tools (`context_*`)
+
+Name, description and input schema for each of these come from the engine's
+operation catalog, so this surface cannot drift from the CLI or the cloud. Prefer
+them over the legacy tools below.
+
 | Tool | Description |
 |------|-------------|
-| `vault_info` | Get vault identity and configuration summary |
-| `resolve` | Execute a selector query with graph traversal |
-| `read_document` | Read a single document by URI or path |
-| `list_documents` | List documents with optional type/status/tag filters |
-| `search` | Full-text search with graph traversal |
-| `read_pack` | Resolve and return a context pack |
+| `context_init` | Open a vault: its `CONTEXT.md` instructions, configuration, path, and what it holds (totals, counts by type and status, tag set). `include_nodes` to also list nodes |
+| `context_nests` | List every nest in the central registry — alias, path, description, which is default, whether it exists |
+| `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
+| `context_list` | List nodes with type / status / tag filters. Takes an array of types, `include_retired`, `full`, `limit` |
+| `context_search` | Full-text search with graph traversal |
+| `context_query` | Selector query with graph traversal. `include_drafts` for authoring surfaces |
+| `context_resolve` | Resolve a selector to full bodies within a token budget |
+| `context_versions` | List a document's version history (new capability — nothing exposed this before) |
+| `context_reconstruct` | Reconstruct a specific version. Refuses a version the history does not contain, instead of returning a neighbour's content |
+| `context_packs` | List packs, each with its `includes` and `excludes` |
+| `context_verify` | Verify every hash chain in the vault |
+| `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |
+| `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
+| `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |
+| `context_delete` | Delete a node and its version history; returns the deleted node's `title` |
+| `context_import` | Bulk create-and-publish. Takes `documents` (title + content) and/or `ids` (files already in the vault, published as-is) — a mixed batch seals **one** checkpoint and regenerates the index **once** |
+
+### Vault tools
+
+| Tool | Description |
+|------|-------------|
 | `document_format` | Get the document format spec (call before creating docs) |
-| `create_document` | Create a new document (supports all types including skill nodes) |
-| `update_document` | Update an existing document |
-| `delete_document` | Delete a document and its version history |
-| `publish_document` | Publish a document (bump version, checkpoint) |
 | `read_index` | Return the context.yaml graph index |
-| `read_version` | Reconstruct a specific version of a document |
-| `verify_integrity` | Verify all hash chains in the vault |
+| `read_pack` | Resolve and return a context pack |
 | `list_checkpoints` | List recent checkpoints |
+
+### Deprecated tools
+
+Registered and behaving exactly as before, so existing clients keep working. They
+will be removed in a future major.
+
+| Deprecated | Use instead |
+|------|-------------|
+| `vault_info` | `context_init` |
+| `read_document` | `context_get` |
+| `list_documents` | `context_list` |
+| `search` | `context_search` |
+| `resolve` | `context_resolve` |
+| `read_version` | `context_reconstruct` |
+| `verify_integrity` | `context_verify` |
+| `create_document` | `context_create` |
+| `update_document` | `context_update` |
+| `publish_document` | `context_publish` |
+| `delete_document` | `context_delete` |
 
 ### Drift Governance
 
@@ -136,10 +173,42 @@ The `resolve`, `search`, and `read_pack` tools support graph-aware queries:
 Agents can discover and use skill nodes — governed procedures with triggers, inputs, and guard rails:
 
 ```
-resolve({ selector: "type:skill + #engineering" })  → all engineering skills
-list_documents({ type: "skill" })                    → all skill nodes
-create_document({ type: "skill", trigger: "..." })   → create a new skill
+context_resolve({ selector: "type:skill + #engineering" })  → all engineering skills
+context_list({ type: "skill" })                             → all skill nodes
+context_create({ type: "skill", trigger: "..." })           → create a new skill
 ```
+
+## Upgrading to 2.0
+
+Nothing in your MCP client config changes. The old tools are all still
+registered. Four things do change:
+
+**`context_overview` is removed.** It returned counts and a node list.
+`context_init` now returns everything it did *plus* the vault's `CONTEXT.md`
+instructions, its configuration and its path — so opening a vault is one call
+instead of two. `vault_info` is an alias for `context_init` now, which is what
+that name always promised. Node lists are opt-in behind `include_nodes`.
+
+**Document ids are taken exactly as stored.** A bare slug is no longer re-rooted
+under `nodes/`. If you were passing `api-design` to `read_document` and relying on
+it finding `nodes/api-design`, pass the full id to `context_get`. This is what
+makes flat-layout vaults work at all — every id from one used to resolve to a
+document that does not exist. A trailing `.md` and leading slashes are still
+stripped.
+
+**`context_import` output changed:** `created` → `published`, and `checkpoint` is
+added. `failed` entries carry `id` (for the `ids` path) or `title` (for the
+`documents` path), not `title` unconditionally.
+
+**`context_update` semantics:** `title` now sets a *new* title rather than
+selecting the node to update — select by `id`. `tags` replaces the tag set rather
+than merging into it; send the merged set if you want the old behaviour. A `null`
+metadata value clears that key.
+
+Two long-standing filter bugs are fixed in `context_list`, which may return
+results where it previously returned nothing: `status: "rejected"` could never
+match, and `type: "document"` skipped every document that omitted the optional
+`type` field. Tags now match with or without a leading `#` and regardless of case.
 
 ## Ecosystem
 
