@@ -1171,19 +1171,24 @@ program
       process.exit(1);
     }
 
-    const id = normalizeDocumentId(path);
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number;
+      chain_hash: string;
+    }>(
+      "context_publish",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.message ? { note: opts.message } : {}),
+      },
+      opContext(storage, opts.author),
+    );
 
-    const result = await publishDocument(storage, id, {
-      editedBy: opts.author,
-      note: opts.message,
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Published ${id}`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
-    console.log(`  Chain hash: ${result.versionEntry.chain_hash}`);
+    console.log(chalk.green(`Published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
+    console.log(`  Chain hash: ${result.chain_hash}`);
   });
 
 /**
@@ -1280,9 +1285,11 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-    const vm = new VersionManager(storage);
-    const content = await vm.reconstructVersion(id, parseInt(version, 10));
+    const { content } = await createEngineApi().run<{ content: string }>(
+      "context_reconstruct",
+      { id: normalizeDocumentId(path), version: parseInt(version, 10) },
+      opContext(storage, "cli@contextnest.local"),
+    );
     console.log(content);
   });
 
@@ -1606,12 +1613,21 @@ program
 
     // Local query — graph-aware traversal
     const storage = getStorage();
-    const engine = new GraphQueryEngine(storage);
-    const result = await engine.query(selector, {
-      hops: opts.hops ?? 2,
-      full: opts.full ?? false,
-      includeDrafts: opts.includeDrafts ?? false,
-    });
+    type Doc = { id: string; title: string; body?: string; source?: unknown };
+    const result = await createEngineApi().run<{
+      documents: Doc[];
+      source_nodes?: Doc[];
+      traversal?: { mode: string; hops_used: number; nodes_traversed: number };
+    }>(
+      "context_query",
+      {
+        query: selector,
+        ...(opts.hops !== undefined ? { hops: opts.hops } : {}),
+        ...(opts.full ? { full: true } : {}),
+        ...(opts.includeDrafts ? { include_drafts: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
       console.log(
@@ -1619,19 +1635,18 @@ program
           {
             documents: result.documents.map((d) => ({
               id: d.id,
-              title: d.frontmatter.title,
+              title: d.title,
               body: d.body,
             })),
-            sourceNodes: result.sourceNodes.map((d) => ({
+            sourceNodes: (result.source_nodes ?? []).map((d) => ({
               id: d.id,
-              title: d.frontmatter.title,
-              source: d.frontmatter.source,
+              title: d.title,
+              source: d.source,
               body: d.body,
             })),
-            traceCount: result.traces.length,
-            mode: result.mode,
-            hopsUsed: result.hopsUsed,
-            nodesTraversed: result.nodesTraversed,
+            mode: result.traversal?.mode,
+            hopsUsed: result.traversal?.hops_used,
+            nodesTraversed: result.traversal?.nodes_traversed,
           },
           null,
           2,
@@ -1640,16 +1655,21 @@ program
     } else {
       console.log(chalk.bold("Documents:"));
       for (const doc of result.documents) {
-        console.log(`  ${chalk.cyan(doc.id)}: ${doc.frontmatter.title}`);
+        console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
       }
-      if (result.sourceNodes.length > 0) {
+      const sources = result.source_nodes ?? [];
+      if (sources.length > 0) {
         console.log(chalk.bold("\nSource Nodes (hydration order):"));
-        for (const doc of result.sourceNodes) {
-          console.log(`  ${chalk.magenta(doc.id)}: ${doc.frontmatter.title}`);
-          console.log(`    Transport: ${doc.frontmatter.source?.transport}, Server: ${doc.frontmatter.source?.server || "n/a"}`);
+        for (const doc of sources) {
+          const src = doc.source as { transport?: string; server?: string } | undefined;
+          console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+          console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
         }
       }
-      console.log(chalk.dim(`\n${result.mode} mode | ${result.hopsUsed} hops | ${result.nodesTraversed} nodes | ${result.traces.length} traces`));
+      const t = result.traversal;
+      console.log(
+        chalk.dim(`\n${t?.mode} mode | ${t?.hops_used} hops | ${t?.nodes_traversed} nodes`),
+      );
     }
   });
 
@@ -1774,13 +1794,12 @@ program
   .description("Delete a document and its version history")
   .action(async (path) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-
-    const doc = await storage.readDocument(id);
-    await storage.deleteDocument(id);
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Deleted ${id} (${doc.frontmatter.title})`));
+    const result = await createEngineApi().run<{ id: string; title: string }>(
+      "context_delete",
+      { id: normalizeDocumentId(path) },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
   });
 
 // ─── ctx search ───────────────────────────────────────────────────────────────
@@ -1789,36 +1808,39 @@ program
   .command("search <query>")
   .description("Full-text search across vault documents")
   .option("--json", "Output as JSON")
+  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
   .action(async (query, opts) => {
     const storage = getStorage();
-    const docs = await storage.discoverDocuments();
-    const resolver = new Resolver({ documents: docs });
-
-    const uri = parseUri(`contextnest://search/${query.replace(/\s+/g, "+")}`);
-    const results = await resolver.resolve(uri);
+    const { results } = await createEngineApi().run<{
+      results: Array<{ id: string; title: string; description?: string; type: string }>;
+    }>(
+      "context_search",
+      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
       console.log(
         JSON.stringify(
           results.map((d) => ({
             id: d.id,
-            title: d.frontmatter.title,
-            description: d.frontmatter.description,
-            type: d.frontmatter.type || "document",
+            title: d.title,
+            description: d.description,
+            type: d.type,
           })),
           null,
           2,
         ),
       );
-    } else {
-      if (results.length === 0) {
-        console.log(chalk.yellow("No results found."));
-      } else {
-        console.log(chalk.bold(`${results.length} result(s):\n`));
-        for (const doc of results) {
-          console.log(`  ${chalk.cyan(doc.id)}: ${doc.frontmatter.title}`);
-        }
-      }
+      return;
+    }
+    if (results.length === 0) {
+      console.log(chalk.yellow("No results found."));
+      return;
+    }
+    console.log(chalk.bold(`${results.length} result(s):\n`));
+    for (const doc of results) {
+      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
     }
   });
 

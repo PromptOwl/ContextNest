@@ -1040,3 +1040,44 @@ describe("context_nests — registry-scoped operation", () => {
     expect(byAlias.gone.exists).toBe(false);
   });
 });
+
+describe("context_reconstruct — asking for a version that isn't there", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("refuses a version the history does not contain", async () => {
+    await api.run("context_create", { title: "Only V1", content: "first" }, ctx);
+    // Reconstruction starts at the nearest keyframe at or before the target and
+    // replays diffs forward, so v99 used to land on v1's keyframe, find nothing
+    // to replay, and return v1's content AS v99.
+    await expect(
+      api.run("context_reconstruct", { id: "nodes/only-v1", version: 99 }, ctx),
+    ).rejects.toMatchObject({ code: "VERSION_NOT_FOUND" });
+  });
+
+  it("still reconstructs a version that does exist", async () => {
+    await api.run("context_create", { title: "Two Versions", content: "first" }, ctx);
+    await api.run("context_update", { id: "nodes/two-versions", content: "second" }, ctx);
+    const v2 = await api.run<{ content: string }>(
+      "context_reconstruct",
+      { id: "nodes/two-versions", version: 2 },
+      ctx,
+    );
+    expect(v2.content).toContain("second");
+    const v1 = await api.run<{ content: string }>(
+      "context_reconstruct",
+      { id: "nodes/two-versions", version: 1 },
+      ctx,
+    );
+    expect(v1.content).toContain("first");
+  });
+});

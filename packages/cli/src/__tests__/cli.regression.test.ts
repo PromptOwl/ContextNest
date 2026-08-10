@@ -484,8 +484,14 @@ describe("[regression] ctx publish, history & reconstruct", () => {
   });
 
   it("reconstruct returns the serialized content for a known version", () => {
+    // beforeEach leaves the doc at v1, so v2 has to be cut here. This asked for
+    // v2 without publishing and passed anyway: reconstruct fell back to the
+    // nearest keyframe and handed back v1, which carries the same title.
+    runCtx(tmp, ["publish", "nodes/release", "-m", "cut"]);
     const content = runCtx(tmp, ["reconstruct", "nodes/release", "2"]);
     expect(content).toMatch(/title:\s*Release Doc/);
+    // Assert the VERSION, not just the title — that is what tells v2 from v1.
+    expect(content).toMatch(/version:\s*2/);
   });
 
   /** Highest checkpoint number currently sealed in the vault. */
@@ -1079,8 +1085,19 @@ describe("[regression] add/update edge cases", () => {
     expect(res.stderr).not.toMatch(/^\s+at\s/m);
   });
 
-  it("reconstruct without version history fails with a friendly error, no stack trace", () => {
+  it("reconstruct names the missing document, not a missing version, no stack trace", () => {
+    // Asking for v1 of a document that does not exist is a missing DOCUMENT.
+    // Saying VERSION_NOT_FOUND sends the reader hunting through a history that
+    // was never going to be there either.
     const res = runCtxResult(tmp, ["reconstruct", "nodes/never-existed", "1"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/Error \[DOCUMENT_NOT_FOUND\]/);
+    expect(res.stderr).not.toMatch(/^\s+at\s/m);
+  });
+
+  it("reconstruct reports a missing VERSION of a document that does exist", () => {
+    runCtx(tmp, ["add", "nodes/only-v1", "--title", "Only V1"]);
+    const res = runCtxResult(tmp, ["reconstruct", "nodes/only-v1", "99"]);
     expect(res.status).not.toBe(0);
     expect(res.stderr).toMatch(/Error \[VERSION_NOT_FOUND\]/);
     expect(res.stderr).not.toMatch(/^\s+at\s/m);

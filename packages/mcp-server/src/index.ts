@@ -116,7 +116,7 @@ server.tool("vault_info", "DEPRECATED — use context_init, which returns this p
 
 server.tool(
   "resolve",
-  "Execute a selector query to find matching documents using graph traversal",
+  "DEPRECATED — use context_query, which this has always been: a graph-traversal selector query. (context_resolve is a different operation — it returns full bodies within a token budget.) Execute a selector query to find matching documents using graph traversal",
   {
     selector: z.string().describe("Selector query expression (e.g., '#engineering + type:document')"),
     hops: z.number().optional().describe("Graph traversal depth (default: 2). More hops = more context, slower. Fewer hops = faster, less context."),
@@ -469,7 +469,7 @@ server.tool(
 
 server.tool(
   "search",
-  "Full-text search across vault documents with graph traversal",
+  "DEPRECATED — use context_search. Full-text search across vault documents with graph traversal",
   {
     query: z.string().describe("Search query"),
     hops: z.number().optional().describe("Graph traversal depth from search results (default: 2)"),
@@ -557,7 +557,7 @@ server.tool(
 
 server.tool(
   "read_version",
-  "Read a specific version of a document",
+  "DEPRECATED — use context_reconstruct. Read a specific version of a document",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     version: z.number().describe("Version number to reconstruct"),
@@ -842,7 +842,7 @@ server.tool(
 
 server.tool(
   "delete_document",
-  "Delete a document and its version history from the vault",
+  "DEPRECATED — use context_delete. Delete a document and its version history from the vault",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
   },
@@ -874,7 +874,7 @@ server.tool(
 
 server.tool(
   "publish_document",
-  "Publish a document: bump version, compute checksum, create version entry and checkpoint",
+  "DEPRECATED — use context_publish. Publish a document: bump version, compute checksum, create version entry and checkpoint",
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),
@@ -1144,6 +1144,12 @@ registerCatalogTool("context_get");
 registerCatalogTool("context_init");
 registerCatalogTool("context_verify");
 registerCatalogTool("context_packs");
+registerCatalogTool("context_search");
+registerCatalogTool("context_query");
+registerCatalogTool("context_resolve");
+registerCatalogTool("context_publish");
+registerCatalogTool("context_delete");
+registerCatalogTool("context_reconstruct");
 // No legacy twin: nothing here listed version history before — read_version
 // fetches one version's content, which is a different question.
 registerCatalogTool("context_versions");

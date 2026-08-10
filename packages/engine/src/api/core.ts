@@ -30,6 +30,7 @@ const nodeSummary = z.object({
   type: z.enum(NODE_TYPES).default("document"),
   status: z.enum(STATUSES).default("draft"),
   tags: z.array(tag).optional(),
+  description: z.string().optional(),
   body: z.string().optional(),
   // Whole frontmatter, on request. Summaries carry the fields a browser needs;
   // a caller that renders or gates the document needs the rest (version,
@@ -123,6 +124,12 @@ const queryOp: OperationDescriptor = {
       .boolean()
       .optional()
       .describe("Force full-load mode, bypassing graph traversal"),
+    include_drafts: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include unpublished documents (default: published only). For authoring surfaces, where the point is to find the draft you are working on.",
+      ),
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -392,11 +399,18 @@ const publishOp: OperationDescriptor = {
   namespace: "core",
   description:
     "Publish a node: bump version, compute checksum, seal a version entry + checkpoint.",
-  input: nodeSelector,
+  input: z.object({
+    ...nodeSelectorShape,
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+  }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
     checkpoint: z.number().int().min(1),
+    chain_hash: z.string().describe("Hash chaining this version to the one before it"),
   }),
   errors: [
     "VALIDATION_FAILED",
@@ -415,7 +429,11 @@ const deleteOp: OperationDescriptor = {
   namespace: "core",
   description: "Delete a node and its version history from the vault.",
   input: nodeSelector,
-  output: z.object({ id: z.string(), deleted: z.literal(true) }),
+  output: z.object({
+    id: z.string(),
+    title: z.string().describe("Title of the deleted node, read before removal"),
+    deleted: z.literal(true),
+  }),
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
   aliases: ["delete_document"],
 };

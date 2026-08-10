@@ -39,6 +39,7 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     type: node.frontmatter.type ?? "document",
     status: node.frontmatter.status ?? "draft",
     tags: node.frontmatter.tags,
+    ...(node.frontmatter.description ? { description: node.frontmatter.description } : {}),
     ...(node.frontmatter.type === "source" && node.frontmatter.source
       ? { source: node.frontmatter.source }
       : {}),
@@ -156,6 +157,7 @@ const query: OperationExecutor = async (ctx, input: any) => {
   const result = await ctx.query.query(input.query, {
     hops: clampHops(input.hops),
     full: input.full ?? false,
+    includeDrafts: input.include_drafts ?? false,
   });
   return {
     documents: result.documents.map((d) => toSummary(d, true)),
@@ -408,17 +410,28 @@ const publish: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // publishDocument guards rejected docs and seals a checkpoint; regenerate the
   // index so graph-mode reads see the freshly-published node (same as create/update).
-  const result = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
+  const result = await publishDocument(ctx.storage, id, {
+    editedBy: ctx.actor ?? "engine",
+    ...(input.note ? { note: input.note } : {}),
+  });
   await ctx.storage.regenerateIndex();
-  return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
+  return {
+    id,
+    version: result.versionEntry.version,
+    checkpoint: result.checkpointNumber,
+    chain_hash: result.versionEntry.chain_hash,
+  };
 };
 
 const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
+  // Read the title BEFORE removing the file — callers report what they deleted,
+  // and after the delete there is nothing left to ask.
+  const { frontmatter } = await ctx.storage.readDocument(id);
   // deleteDocument throws DOCUMENT_NOT_FOUND when the id doesn't exist.
   await ctx.storage.deleteDocument(id);
   await ctx.storage.regenerateIndex();
-  return { id, deleted: true as const };
+  return { id, title: frontmatter.title, deleted: true as const };
 };
 
 const versions: OperationExecutor = async (ctx, input: any) => {
