@@ -69,7 +69,7 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-19 tools over stdio: `vault_info`, `resolve`, `read_document`, `list_documents`, `document_format`, `read_index`, `read_pack`, `search`, `verify_integrity`, `list_checkpoints`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`.
+21 tools over stdio: `vault_info`, `resolve`, `read_document`, `list_documents`, `document_format`, `read_index`, `read_pack`, `search`, `verify_integrity`, `list_checkpoints`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`, plus the catalog-driven `context_import` and `context_nests` (name, description and schema come from the engine's operation catalog).
 
 ### Plugins (`plugins/`)
 

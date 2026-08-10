@@ -11,7 +11,7 @@
  * existing surfaces (published-only search, index regeneration after publish,
  * status/tag normalization, document validation before write).
  */
-import type { ContextNode, Frontmatter } from "../types.js";
+import type { ContextNode, Frontmatter, SkillMeta } from "../types.js";
 import {
   serializeDocument,
   validateDocument,
@@ -19,7 +19,9 @@ import {
   normalizeStatus,
   isRejected,
 } from "../parser.js";
-import { normalizeDocumentId } from "../storage.js";
+import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
+import { filterDocuments } from "../filters.js";
+import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
@@ -30,17 +32,19 @@ import type { OperationContext, OperationExecutor } from "./context.js";
 const MAX_HOPS = 10;
 
 /** ContextNode → the wire `nodeSummary` shape. Source nodes keep their block. */
-function toSummary(node: ContextNode, includeBody = false) {
+function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = false) {
   return {
     id: node.id,
     title: node.frontmatter.title,
     type: node.frontmatter.type ?? "document",
     status: node.frontmatter.status ?? "draft",
     tags: node.frontmatter.tags,
+    ...(node.frontmatter.description ? { description: node.frontmatter.description } : {}),
     ...(node.frontmatter.type === "source" && node.frontmatter.source
       ? { source: node.frontmatter.source }
       : {}),
     ...(includeBody ? { body: node.body } : {}),
+    ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
 }
 
@@ -89,14 +93,43 @@ async function resolveId(
   ctx: OperationContext,
   sel: { id?: string; uri?: string; title?: string },
 ): Promise<string> {
-  if (sel.id) return normalizeDocumentId(sel.id);
-  if (sel.uri) return normalizeDocumentId(parseUri(sel.uri).path);
-  const docs = await ctx.storage.discoverDocuments();
+  // Enforced here rather than as a `.refine` on the descriptors: a refine turns
+  // the input into a ZodEffects with no `.shape`, and an MCP tool registered
+  // from that advertises no parameters at all. Same error, raised a moment
+  // later, and every transport reports it the same way.
+  if (!sel.id && !sel.uri && !sel.title) {
+    throw new ContextNestError(
+      "One of uri, id, or title is required",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (sel.id) return sanitizeId(sel.id);
+  if (sel.uri) return sanitizeId(parseUri(sel.uri).path);
+  // includeRetired, or a title lookup cannot see a rejected document at all and
+  // falls through to the slug guess below — which quietly resolves to whatever
+  // sits at that slug, or to nothing for a doc created with a custom id. The
+  // ops that let a steward read and revive a retired doc need this to work.
+  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
   const match = docs.find(
     (d) => d.frontmatter.title.toLowerCase() === String(sel.title).toLowerCase(),
   );
   if (match) return match.id;
   return normalizeDocumentId(requireSlug(String(sel.title)));
+}
+
+/**
+ * Clean a caller-supplied id without re-rooting it.
+ *
+ * `normalizeDocumentId` also prepends `nodes/` to any id with no slash, which
+ * silently redirects every id from a flat-layout vault (they carry no prefix)
+ * to a document that does not exist. The tidying half is still wanted: callers
+ * naturally build an id from a file path, and storage appends `.md` itself, so
+ * an un-stripped suffix resolves to `<id>.md.md`.
+ */
+function sanitizeId(raw: string): string {
+  const cleaned = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+  assertSafeDocumentId(cleaned);
+  return cleaned;
 }
 
 /** Validate a node against the spec (§13) before it is written/published. */
@@ -111,19 +144,27 @@ function assertValid(node: ContextNode): void {
 }
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
-async function publishAndIndex(ctx: OperationContext, id: string): Promise<{ version: number }> {
-  const res = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
+async function publishAndIndex(
+  ctx: OperationContext,
+  id: string,
+  note?: string,
+): Promise<{ version: number; checkpoint: number }> {
+  const res = await publishDocument(ctx.storage, id, {
+    editedBy: ctx.actor ?? "engine",
+    ...(note ? { note } : {}),
+  });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
   // mcp-server/CLI both regenerate here.
   await ctx.storage.regenerateIndex();
-  return { version: res.versionEntry.version };
+  return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
 const query: OperationExecutor = async (ctx, input: any) => {
   const result = await ctx.query.query(input.query, {
     hops: clampHops(input.hops),
     full: input.full ?? false,
+    includeDrafts: input.include_drafts ?? false,
   });
   return {
     documents: result.documents.map((d) => toSummary(d, true)),
@@ -180,25 +221,30 @@ const search: OperationExecutor = async (ctx, input: any) => {
 
 const get: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  const node = await ctx.storage.readDocument(id);
+  const node = await ctx.storage.readDocument(
+    id,
+    input.verify_checksum ? { verifyChecksum: true } : undefined,
+  );
   // Consistent rejected handling (the descriptor advertises REJECTED_DOCUMENT).
-  if (isRejected(node)) throw new RejectedDocumentError(node.id);
-  return { id: node.id, frontmatter: node.frontmatter, body: node.body };
+  // Surfaces that let a steward see and revive a retired document opt out —
+  // reading one is not the same as republishing it.
+  if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  return {
+    id: node.id,
+    frontmatter: node.frontmatter,
+    body: node.body,
+    ...(input.include_raw ? { raw: node.rawContent } : {}),
+    ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
+  };
 };
 
 const list: OperationExecutor = async (ctx, input: any) => {
-  let docs = await ctx.storage.discoverDocuments();
-  if (input.type) docs = docs.filter((d) => d.frontmatter.type === input.type);
-  if (input.status) {
-    const want = normalizeStatus(input.status);
-    docs = docs.filter((d) => normalizeStatus(d.frontmatter.status ?? "draft") === want);
-  }
-  if (input.tag) {
-    const want = String(input.tag).replace(/^#/, "");
-    docs = docs.filter((d) => d.frontmatter.tags?.some((t) => t.replace(/^#/, "") === want));
-  }
-  if (input.limit) docs = docs.slice(0, input.limit);
-  return { documents: docs.map((d) => toSummary(d)) };
+  // includeRetired, or `status: "rejected"` matches nothing: discovery drops
+  // retired documents before the filter ever sees them. filterDocuments hides
+  // them again whenever no status was asked for.
+  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
+  const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
 
 /**
@@ -215,74 +261,201 @@ function buildDraftNode(input: {
   tags?: unknown[];
   folder?: string;
   metadata?: Record<string, unknown>;
+  id?: string;
+  status?: Frontmatter["status"];
+  trigger?: string;
+  tools_required?: string[];
+  output_format?: SkillMeta["output_format"];
+  inputs?: SkillMeta["inputs"];
+  guard_rails?: string[];
 }): ContextNode {
+  const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
     .split("/")
     .map(slugify)
     .filter(Boolean);
-  const id = normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  // An explicit id wins outright — callers that mint their own ids (system
+  // nodes, path-addressed tools) still get the traversal/prefix normalization.
+  const id = input.id
+    ? normalizeDocumentId(input.id)
+    : normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
   const frontmatter: Frontmatter = {
     title: input.title,
     type: (input.type as Frontmatter["type"]) ?? "document",
     ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
-    status: "draft",
-    created_at: new Date().toISOString(),
+    // Skill nodes carry a `skill` block — `trigger` is required there for
+    // type:"skill" and the block must be ABSENT on every other type, so these
+    // cannot ride along inside `metadata`.
+    ...(input.trigger
+      ? {
+          skill: {
+            trigger: input.trigger,
+            ...(input.inputs ? { inputs: input.inputs } : {}),
+            ...(input.tools_required ? { tools_required: input.tools_required } : {}),
+            ...(input.output_format ? { output_format: input.output_format } : {}),
+            ...(input.guard_rails ? { guard_rails: input.guard_rails } : {}),
+          },
+        }
+      : {}),
+    status: (input.status as Frontmatter["status"]) ?? "draft",
+    created_at: now,
+    // A node is "updated" at birth; without this a draft carries no
+    // updated_at until its first edit, and every surface renders it blank.
+    updated_at: now,
   };
   return { id, filePath: "", rawContent: "", frontmatter, body: input.content };
 }
 
 const create: OperationExecutor = async (ctx, input: any) => {
   const node = buildDraftNode(input);
+  // A rejected node cannot be published — publish refuses one by design. Left
+  // to fall through, the write below lands and publish then throws, stranding a
+  // file on disk with no version and no history, and making the caller's retry
+  // fail with DOCUMENT_ALREADY_EXISTS for a create it believes never happened.
+  // Refuse before anything is written.
+  const publish = node.frontmatter.status === "rejected" ? false : input.publish !== false;
+  // Publish assigns the version (spec §6), so a published node must go to disk
+  // WITHOUT one — pre-setting it makes the first published version 2 and leaves
+  // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
+  if (!publish) node.frontmatter.version = 1;
+  const createdStatus = node.frontmatter.status;
   assertValid(node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
   // the way the pre-check + separate write could race.
   await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
-  const result = await publishAndIndex(ctx, node.id);
-  return { id: node.id, version: result.version };
+  // Governed callers create the node WITHOUT publishing: the write has to clear
+  // review before it becomes retrievable. Still regenerate the index so the
+  // draft is discoverable to the surfaces that list drafts.
+  if (!publish) {
+    await ctx.storage.regenerateIndex();
+    return {
+      id: node.id,
+      version: node.frontmatter.version ?? 1,
+      status: createdStatus,
+      checkpoint: null,
+    };
+  }
+  const result = await publishAndIndex(ctx, node.id, input.note);
+  return {
+    id: node.id,
+    version: result.version,
+    status: "published",
+    checkpoint: result.checkpoint,
+  };
 };
 
+/**
+ * Statuses that describe where a node sits in review, not a content release.
+ * Setting one is a metadata transition, so it doesn't publish by default — the
+ * rule CLI and mcp-server each hand-rolled before this op absorbed it.
+ */
+const UNPUBLISHED_STATUSES = new Set(["draft", "pending_review", "approved", "rejected"]);
+
 const update: OperationExecutor = async (ctx, input: any) => {
-  const id = await resolveId(ctx, input);
+  // Vetted, NOT normalized: normalizeDocumentId re-roots a bare slug under
+  // `nodes/`, which silently redirects every id from a flat-layout vault (they
+  // carry no prefix) to a document that doesn't exist. The storage layer
+  // already resolves an id for its own layout — all this has to do is refuse
+  // one that would escape the vault root.
+  const id: string = input.id;
+  assertSafeDocumentId(id);
   const existing = await ctx.storage.readDocument(id);
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
-  // rejects (no version/checksum/history). Mirrors OSS update_document.
-  if (isRejected(existing)) throw new RejectedDocumentError(id);
+  // rejects (no version/checksum/history). Reviving one — moving it to some
+  // OTHER status — is allowed; re-asserting `rejected` is not, or a client that
+  // echoes the current status back alongside an edit silently rewrites the body
+  // of a document that stays rejected.
+  if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
+    throw new RejectedDocumentError(id);
+  }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
-  if (input.tags) {
-    const merged = [...(frontmatter.tags ?? []), ...input.tags];
-    frontmatter.tags = normalizeUniqueTags(merged);
-  }
+  if (input.title) frontmatter.title = input.title;
+  if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
   if (input.metadata) {
-    frontmatter.metadata = { ...(frontmatter.metadata ?? {}), ...input.metadata };
+    const merged: Record<string, unknown> = {
+      ...(frontmatter.metadata ?? {}),
+      ...input.metadata,
+    };
+    // A null value CLEARS the key. Over a JSON wire an absent key is
+    // indistinguishable from "leave this alone", so a merge with no null
+    // convention gives callers no way to remove metadata at all. Only keys the
+    // caller named are considered — a null already on disk is left alone.
+    for (const [key, value] of Object.entries(input.metadata)) {
+      if (value === null) delete merged[key];
+    }
+    frontmatter.metadata = merged;
   }
+  frontmatter.updated_at = new Date().toISOString();
   let body = existing.body;
   if (typeof input.content === "string") body = input.content;
   if (typeof input.append === "string") body = `${body}\n${input.append}`;
+  // The checksum describes the PUBLISHED body, so any body change invalidates
+  // it — including one whose publish then fails, which would otherwise leave a
+  // stale checksum on disk and make the next verified read cry external drift.
+  // Frontmatter-only edits keep it: the checksum covers the body alone.
+  if (typeof input.content === "string" || typeof input.append === "string") {
+    delete frontmatter.checksum;
+  }
+
+  // A rejected result never publishes, whatever the caller asked for: publish
+  // refuses a rejected doc, so an explicit `publish: true` alongside
+  // `status: "rejected"` would write the edit and then throw, leaving the file
+  // mutated and its checksum dropped. The derived default already lands here;
+  // this makes it true of the explicit flag too.
+  const publish =
+    frontmatter.status === "rejected"
+      ? false
+      : (input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status)));
+  // Only an unpublished write may carry a caller-assigned version: publish
+  // assigns its own, and stamping one first would put the node a version ahead
+  // of its history (the same trap context_create avoids).
+  if (!publish && input.version !== undefined) frontmatter.version = input.version;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
   await ctx.storage.writeDocument(id, serializeDocument(node));
-  const result = await publishAndIndex(ctx, id);
-  return { id, version: result.version };
+  if (!publish) {
+    await ctx.storage.regenerateIndex();
+    return {
+      id,
+      version: frontmatter.version ?? 1,
+      status: frontmatter.status ?? "draft",
+      checkpoint: null,
+    };
+  }
+  const result = await publishAndIndex(ctx, id, input.note);
+  return { id, version: result.version, status: "published", checkpoint: result.checkpoint };
 };
 
 const publish: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // publishDocument guards rejected docs and seals a checkpoint; regenerate the
   // index so graph-mode reads see the freshly-published node (same as create/update).
-  const result = await publishDocument(ctx.storage, id, { editedBy: ctx.actor ?? "engine" });
+  const result = await publishDocument(ctx.storage, id, {
+    editedBy: ctx.actor ?? "engine",
+    ...(input.note ? { note: input.note } : {}),
+  });
   await ctx.storage.regenerateIndex();
-  return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
+  return {
+    id,
+    version: result.versionEntry.version,
+    checkpoint: result.checkpointNumber,
+    chain_hash: result.versionEntry.chain_hash,
+  };
 };
 
 const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
+  // Read the title BEFORE removing the file — callers report what they deleted,
+  // and after the delete there is nothing left to ask.
+  const { frontmatter } = await ctx.storage.readDocument(id);
   // deleteDocument throws DOCUMENT_NOT_FOUND when the id doesn't exist.
   await ctx.storage.deleteDocument(id);
   await ctx.storage.regenerateIndex();
-  return { id, deleted: true as const };
+  return { id, title: frontmatter.title, deleted: true as const };
 };
 
 const versions: OperationExecutor = async (ctx, input: any) => {
@@ -319,26 +492,6 @@ const versions: OperationExecutor = async (ctx, input: any) => {
   };
 };
 
-const overview: OperationExecutor = async (ctx) => {
-  const docs = await ctx.storage.discoverDocuments();
-  const byType: Record<string, number> = {};
-  const byStatus: Record<string, number> = {};
-  const tags = new Set<string>();
-  for (const d of docs) {
-    const t = d.frontmatter.type ?? "document";
-    byType[t] = (byType[t] ?? 0) + 1;
-    const s = d.frontmatter.status ?? "draft";
-    byStatus[s] = (byStatus[s] ?? 0) + 1;
-    for (const tag of d.frontmatter.tags ?? []) tags.add(tag);
-  }
-  return {
-    total: docs.length,
-    by_type: byType,
-    by_status: byStatus,
-    tags: [...tags].sort(),
-    nodes: docs.map((d) => toSummary(d)),
-  };
-};
 
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
@@ -365,8 +518,44 @@ const verify: OperationExecutor = async (ctx) => {
   return { valid: report.valid, errors: report.errors };
 };
 
-const init: OperationExecutor = async (ctx) => {
-  return { context_md: await ctx.storage.readContextMd() };
+const init: OperationExecutor = async (ctx, input: any) => {
+  // includeRetired so `by_status` can report `rejected` at all — discovery drops
+  // retired documents otherwise, and a manifest that silently omits a whole
+  // status is worse than one that reports zero.
+  const [context_md, config, docs] = await Promise.all([
+    ctx.storage.readContextMd(),
+    ctx.storage.readConfig(),
+    ctx.storage.discoverDocuments({ includeRetired: true }),
+  ]);
+  const byType: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const tags = new Set<string>();
+  for (const d of docs) {
+    const t = d.frontmatter.type ?? "document";
+    byType[t] = (byType[t] ?? 0) + 1;
+    const s = d.frontmatter.status ?? "draft";
+    byStatus[s] = (byStatus[s] ?? 0) + 1;
+    for (const tag of d.frontmatter.tags ?? []) tags.add(tag);
+  }
+  const listed = input?.limit ? docs.slice(0, input.limit) : docs;
+  return {
+    context_md,
+    vault_path: ctx.storage.root,
+    config: config
+      ? {
+          name: config.name,
+          ...(config.description ? { description: config.description } : {}),
+          servers: config.servers ? Object.keys(config.servers) : [],
+        }
+      : null,
+    total: docs.length,
+    by_type: byType,
+    by_status: byStatus,
+    tags: [...tags].sort(),
+    // Counts and tags answer most opening questions; a large vault's node list
+    // dwarfs them, so it is opt-in.
+    ...(input?.include_nodes ? { nodes: listed.map((d) => toSummary(d)) } : {}),
+  };
 };
 
 const packs: OperationExecutor = async (ctx) => {
@@ -378,42 +567,63 @@ const packs: OperationExecutor = async (ctx) => {
       description: p.description,
       query: p.query,
       agent_instructions: p.agent_instructions,
+      ...(p.includes ? { includes: p.includes } : {}),
+      ...(p.excludes ? { excludes: p.excludes } : {}),
     })),
   };
 };
 
+// Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
+const nests: OperationExecutor = () => ({ nests: listVaults() });
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
-  const created: { id: string; version: number }[] = [];
-  const failed: { title: string; error: string }[] = [];
+  const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
 
-  // Stage 1: write every doc as a draft (exclusive → dup/invalid go to failed).
-  const writtenIds: string[] = [];
-  for (const doc of input.documents) {
+  // Ids of documents already in the vault publish as-is — their paths ARE their
+  // ids, and the caller owns their frontmatter. Nothing is rewritten here.
+  const batch: string[] = [...(input.ids ?? [])];
+
+  // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
+  for (const doc of input.documents ?? []) {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
       await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
-      writtenIds.push(node.id);
+      batch.push(node.id);
       titleById.set(node.id, doc.title);
     } catch (err) {
       failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
-  // Stage 2: bulk-publish the drafts — ONE checkpoint + ONE index regen for the
-  // whole batch (the O(N) path), instead of a checkpoint per document.
-  if (writtenIds.length > 0) {
-    const result = await publishDocuments(ctx.storage, writtenIds, {
+  // An empty call is a caller bug, not an empty result — but a batch where every
+  // document failed to stage is a legitimate (fully-failed) result.
+  if (batch.length === 0 && failed.length === 0) {
+    throw new ContextNestError(
+      "context_import requires documents[] or ids[]",
+      "VALIDATION_FAILED",
+    );
+  }
+
+  // Stage 2: ONE bulk publish for both modes — one checkpoint + one index regen
+  // for the whole batch (the O(N) path), instead of a checkpoint per document.
+  let published: { id: string; version: number }[] = [];
+  let checkpoint: number | null = null;
+  if (batch.length > 0) {
+    const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
+      onProgress: ctx.onProgress,
     });
-    for (const p of result.published) created.push({ id: p.id, version: p.version });
+    published = result.published.map((p) => ({ id: p.id, version: p.version }));
+    checkpoint = result.checkpointNumber;
     for (const f of result.failed) {
-      failed.push({ title: titleById.get(f.id) ?? f.id, error: f.error });
+      const title = titleById.get(f.id);
+      failed.push(title ? { title, error: f.error } : { id: f.id, error: f.error });
     }
   }
 
-  return { created, failed };
+  return { published, failed, checkpoint };
 };
 
 /** name → executor for the built-in `core` namespace. */
@@ -429,9 +639,9 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_delete: del,
   context_versions: versions,
   context_reconstruct: reconstruct,
-  context_overview: overview,
   context_verify: verify,
   context_init: init,
   context_packs: packs,
+  context_nests: nests,
   context_import: importDocs,
 });
