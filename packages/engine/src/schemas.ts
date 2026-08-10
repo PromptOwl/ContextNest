@@ -15,6 +15,12 @@ export const NODE_TYPES = [
   "tool",
   "reference",
   "skill",
+  // Types the ecosystem already stores. Their absence here meant a vault
+  // holding them failed validation even though every surface writes and reads
+  // them — the vocabulary has to cover what is actually on disk.
+  "agent",
+  "artifact",
+  "table",
 ] as const;
 
 export const STATUSES = [
@@ -139,7 +145,10 @@ export const HASH_CHAIN_EVENT_TYPES = [
 export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
 
 /** Tag pattern: optional # prefix, then letter, then alphanumeric/underscore/hyphen (§13 rule 5) */
-export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_-]*$/;
+// `:` allows namespaced tags (`#dept:engineering`, `#team:platform`), which the
+// ecosystem already writes. Strictly a widening — every previously valid tag
+// still matches.
+export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_:-]*$/;
 
 /** Checksum pattern (§13 rule 8) */
 export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -147,7 +156,9 @@ export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 /** contextnest:// URI pattern */
 export const CONTEXT_NEST_URI_PATTERN = /^contextnest:\/\//;
 
-const tagSchema = z.string().regex(TAG_PATTERN, "Tag must match pattern: ^#?[a-zA-Z][a-zA-Z0-9_-]*$");
+const tagSchema = z
+  .string()
+  .regex(TAG_PATTERN, `Tag must match pattern: ${TAG_PATTERN.source}`);
 
 const skillInputSchema = z.object({
   name: z.string().min(1),

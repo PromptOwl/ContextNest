@@ -47,9 +47,24 @@ const EXPECTED_TOOLS = [
   "approve_suggestion",
   "reject_suggestion",
   // Catalog-driven: name, description and schema come from the engine's
-  // operation catalog rather than being declared here.
+  // operation catalog rather than being declared here. The legacy twin of a
+  // catalog tool (e.g. create_document) stays registered but is deprecated.
   "context_import",
+  "context_create",
+  "context_update",
+  "context_list",
+  "context_versions",
+  "context_get",
+  "context_init",
+  "context_verify",
+  "context_packs",
   "context_nests",
+  "context_search",
+  "context_query",
+  "context_resolve",
+  "context_publish",
+  "context_delete",
+  "context_reconstruct",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -158,6 +173,32 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
       expect((t.description ?? "").length).toBeGreaterThan(0);
       expect(t.inputSchema).toBeDefined();
     }
+  });
+
+  // A catalog tool is registered from `op.input.shape`, which is undefined on
+  // any descriptor whose input is a ZodEffects (i.e. one carrying a `.refine`).
+  // The SDK accepts that and publishes a tool advertising NO parameters at all,
+  // so a client cannot tell what to send — and asserting only that inputSchema
+  // "is defined" above sails straight past it.
+  it.each([
+    ["context_create", ["title", "content"]],
+    ["context_update", ["id", "content", "status"]],
+    ["context_list", ["type", "tag", "status", "limit"]],
+    ["context_versions", ["id", "title", "include_diff"]],
+    ["context_get", ["uri", "id", "title", "include_raw", "allow_rejected"]],
+    ["context_init", ["include_nodes", "limit"]],
+    ["context_search", ["query", "limit"]],
+    ["context_query", ["query", "hops", "full", "include_drafts"]],
+    ["context_resolve", ["selector", "max_tokens", "hops"]],
+    ["context_import", ["documents", "ids"]],
+  ])("%s advertises its declared inputs", async (name, expected) => {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === name);
+    expect(tool).toBeDefined();
+    const props = Object.keys(
+      (tool!.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
+    );
+    expect(props).toEqual(expect.arrayContaining(expected));
   });
 
   it("vault_info returns identity and the configured servers", async () => {

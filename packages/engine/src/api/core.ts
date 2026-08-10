@@ -30,7 +30,12 @@ const nodeSummary = z.object({
   type: z.enum(NODE_TYPES).default("document"),
   status: z.enum(STATUSES).default("draft"),
   tags: z.array(tag).optional(),
+  description: z.string().optional(),
   body: z.string().optional(),
+  // Whole frontmatter, on request. Summaries carry the fields a browser needs;
+  // a caller that renders or gates the document needs the rest (version,
+  // author, timestamps, metadata) and would otherwise re-read every file.
+  frontmatter: frontmatterSchema.optional(),
   // Source nodes carry their `source` block so agents can hydrate them
   // (spec §1.9, §5). Present only for type:"source".
   source: z.record(z.unknown()).optional(),
@@ -41,19 +46,40 @@ const documentPayload = z.object({
   id: z.string(),
   frontmatter: frontmatterSchema,
   body: z.string(),
+  /** Exact stored bytes, frontmatter block included. Only with `include_raw`. */
+  raw: z.string().optional(),
+  /** Only with `verify_checksum`, and only when the live bytes have drifted. */
+  pendingChange: z
+    .object({
+      suggestion_id: z.string(),
+      detected_at: z.string(),
+      source: z.string(),
+      proposed_hash: z.string(),
+    })
+    .optional(),
 });
 
 /** Address a single node by URI, id, or title — shared by get/delete/publish/versions. */
 const nodeSelectorShape = {
   uri: z.string().optional().describe("Document URI, e.g. contextnest://nodes/api-design"),
-  id: z.string().optional().describe("Document id / path"),
+  id: z
+    .string()
+    .optional()
+    .describe(
+      "Document id / path, exactly as stored (e.g. \"nodes/api-design\"). Not re-rooted — a flat-layout vault's ids carry no nodes/ prefix.",
+    ),
   title: z.string().optional().describe("Document title"),
 };
-const SELECTOR_REQUIRED = { message: "One of uri, id, or title is required" };
-const hasSelector = (v: { uri?: string; id?: string; title?: string }) =>
-  Boolean(v.uri || v.id || v.title);
-
-const nodeSelector = z.object(nodeSelectorShape).refine(hasSelector, SELECTOR_REQUIRED);
+/**
+ * Deliberately a plain object, NOT `.refine(one of uri/id/title)`.
+ *
+ * A refine makes the input a ZodEffects, which has no `.shape` — and an MCP
+ * tool is registered from exactly that. The SDK accepts the undefined shape and
+ * publishes a tool advertising NO parameters at all, so a client cannot tell
+ * what to send. `resolveId` raises the same VALIDATION_FAILED at execution
+ * time, which every transport surfaces identically.
+ */
+const nodeSelector = z.object(nodeSelectorShape);
 
 // ─── context_search ──────────────────────────────────────────────────────────
 
@@ -98,6 +124,12 @@ const queryOp: OperationDescriptor = {
       .boolean()
       .optional()
       .describe("Force full-load mode, bypassing graph traversal"),
+    include_drafts: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include unpublished documents (default: published only). For authoring surfaces, where the point is to find the draft you are working on.",
+      ),
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -148,18 +180,28 @@ const getOp: OperationDescriptor = {
   namespace: "core",
   description:
     "Get the full content of a single node by contextnest:// URI, id, or title.",
-  input: z
-    .object({
-      uri: z
-        .string()
-        .optional()
-        .describe("Document URI, e.g. contextnest://nodes/api-design"),
-      id: z.string().optional().describe("Document id / path"),
-      title: z.string().optional().describe("Document title"),
-    })
-    .refine((v) => Boolean(v.uri || v.id || v.title), {
-      message: "One of uri, id, or title is required",
-    }),
+  // Plain object, no `.refine` — see the note on nodeSelector.
+  input: z.object({
+    ...nodeSelectorShape,
+    include_raw: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also return the exact stored bytes (frontmatter block included) as `raw`, for callers that render or re-serve the file verbatim.",
+      ),
+    verify_checksum: z
+      .boolean()
+      .optional()
+      .describe(
+        "Detect drift on read. When the live bytes no longer match the published checksum, the last-approved content is returned with `pendingChange` describing the difference, instead of the live bytes.",
+      ),
+    allow_rejected: z
+      .boolean()
+      .optional()
+      .describe(
+        "Return a rejected node instead of refusing. Reading one is not the same as republishing it — surfaces that let a steward see and revive retired documents set this.",
+      ),
+  }),
   output: documentPayload,
   errors: [
     "VALIDATION_FAILED",
@@ -178,12 +220,32 @@ const listOp: OperationDescriptor = {
   namespace: "core",
   description: "Browse vault contents with optional type, tag, status, or limit filters.",
   input: z.object({
-    type: z.enum(NODE_TYPES).optional().describe("Filter by node type"),
-    tag: tag.optional().describe("Filter by tag"),
+    // An array as well as a single value: callers that browse a family of types
+    // (every runnable type, say) would otherwise have to list, then re-filter.
+    type: z
+      .union([z.enum(NODE_TYPES), z.array(z.enum(NODE_TYPES))])
+      .optional()
+      .describe("Filter by node type, or by several"),
+    tag: tag.optional().describe("Filter by tag (leading # optional, case-insensitive)"),
     // Accept status synonyms (spec §1.5.1 "implementations SHOULD accept
     // synonyms and normalize"); the executor normalizes before comparing.
-    status: z.string().optional().describe("Filter by status (aliases normalized)"),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by status (aliases normalized). Retired nodes are hidden unless asked for."),
     limit: z.number().int().positive().optional().describe("Max nodes to return"),
+    include_retired: z
+      .boolean()
+      .optional()
+      .describe(
+        "Keep retired nodes even with no status filter. For governed surfaces, where a rejected node is still something its stewards act on rather than one removed from the vault.",
+      ),
+    full: z
+      .boolean()
+      .optional()
+      .describe(
+        "Return each node's full frontmatter and body instead of a summary. For callers that go on to render or gate the documents themselves and would otherwise have to read them all again.",
+      ),
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -211,10 +273,51 @@ const createOp: OperationDescriptor = {
       .record(z.unknown())
       .optional()
       .describe("Extra frontmatter metadata (e.g. a binding's scope). Merged into frontmatter.metadata."),
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Explicit document id, overriding the one derived from title + folder. For callers that mint their own ids (deterministic/system nodes) or address documents by path.",
+      ),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish on create (default true). Pass false to leave the node a draft — governed surfaces use this when a write must clear review before becoming retrievable.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    status: z
+      .enum(STATUSES)
+      .optional()
+      .describe(
+        "Initial lifecycle status (default draft). Only meaningful with publish:false — publishing sets `published` regardless.",
+      ),
+    // These assemble the `skill` block, which is REQUIRED for type:"skill" and
+    // must be absent on every other type — so they cannot ride inside
+    // `metadata`. Supplying `trigger` is what creates the block.
+    trigger: z.string().optional().describe("Skill trigger description (required for type:skill)"),
+    tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("Skill output format"),
+    // Shape-checked by frontmatter validation rather than restated here, so the
+    // skill block has exactly one authoritative schema.
+    inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
   }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
+    status: z.enum(STATUSES).describe("Resulting status — draft when publish:false"),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null when created as a draft"),
   }),
   errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
   aliases: ["create_document"],
@@ -225,25 +328,60 @@ const createOp: OperationDescriptor = {
 const updateOp: OperationDescriptor = {
   name: "context_update",
   namespace: "core",
-  description: "Update an existing node — replace content, append, or add tags.",
-  input: z
-    .object({
-      id: z.string().optional().describe("Id of node to update"),
-      title: z.string().optional().describe("Title of node to update"),
-      content: z.string().optional().describe("New content (replaces body)"),
-      append: z.string().optional().describe("Content to append"),
-      tags: z.array(tag).optional().describe("Tags to add"),
-      metadata: z
-        .record(z.unknown())
-        .optional()
-        .describe("Extra frontmatter metadata to merge into frontmatter.metadata."),
-    })
-    .refine((v) => Boolean(v.id || v.title), {
-      message: "One of id or title is required",
-    }),
+  description: "Update an existing node — edit frontmatter fields and/or body, then publish.",
+  // `title` is the NEW title, not a selector: every surface addresses a node by
+  // id/path and sends title only to rename. Selecting by title here collided
+  // with that and served no caller.
+  input: z.object({
+    id: z
+      .string()
+      .describe(
+        "Id of the node to update, exactly as stored (e.g. \"nodes/api-design\"). Not re-rooted — a flat-layout vault's ids carry no nodes/ prefix.",
+      ),
+    title: z.string().optional().describe("New title"),
+    content: z.string().optional().describe("New content (replaces body)"),
+    append: z.string().optional().describe("Content to append"),
+    tags: z.array(tag).optional().describe("New tags (replaces existing)"),
+    metadata: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Frontmatter metadata to merge into frontmatter.metadata. A null value clears that key.",
+      ),
+    status: z
+      .enum(STATUSES)
+      .optional()
+      .describe(
+        "New lifecycle status. Canonical values only — normalize aliases with `normalizeStatus` before calling.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish the edit (default true). Defaults to FALSE when `status` names a non-published lifecycle value — those are metadata transitions, not content releases. An explicit value always wins.",
+      ),
+    version: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "Explicit version to stamp, for governed callers that assign version numbers themselves (a draft revision awaiting review). Ignored when publishing, which assigns the version.",
+      ),
+  }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
+    status: z.enum(STATUSES).describe("Resulting status — `published` unless the edit stayed a draft"),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null when the edit did not publish"),
   }),
   errors: [
     "VALIDATION_FAILED",
@@ -261,11 +399,18 @@ const publishOp: OperationDescriptor = {
   namespace: "core",
   description:
     "Publish a node: bump version, compute checksum, seal a version entry + checkpoint.",
-  input: nodeSelector,
+  input: z.object({
+    ...nodeSelectorShape,
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+  }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
     checkpoint: z.number().int().min(1),
+    chain_hash: z.string().describe("Hash chaining this version to the one before it"),
   }),
   errors: [
     "VALIDATION_FAILED",
@@ -284,7 +429,11 @@ const deleteOp: OperationDescriptor = {
   namespace: "core",
   description: "Delete a node and its version history from the vault.",
   input: nodeSelector,
-  output: z.object({ id: z.string(), deleted: z.literal(true) }),
+  output: z.object({
+    id: z.string(),
+    title: z.string().describe("Title of the deleted node, read before removal"),
+    deleted: z.literal(true),
+  }),
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
   aliases: ["delete_document"],
 };
@@ -309,18 +458,17 @@ const versionsOp: OperationDescriptor = {
   name: "context_versions",
   namespace: "core",
   description: "Version history of a node (newest entries last).",
-  input: z
-    .object({
-      ...nodeSelectorShape,
-      // Off by default on purpose: a doc with dozens of versions would other-
-      // wise return dozens of patches, which is a lot of tokens to push into an
-      // agent that only asked who edited what and when.
-      include_diff: z
-        .boolean()
-        .optional()
-        .describe("Attach each version's change log (unified diff from the previous version)"),
-    })
-    .refine(hasSelector, SELECTOR_REQUIRED),
+  // Plain object, no `.refine` — see the note on nodeSelector.
+  input: z.object({
+    ...nodeSelectorShape,
+    // Off by default on purpose: a doc with dozens of versions would other-
+    // wise return dozens of patches, which is a lot of tokens to push into an
+    // agent that only asked who edited what and when.
+    include_diff: z
+      .boolean()
+      .optional()
+      .describe("Attach each version's change log (unified diff from the previous version)"),
+  }),
   output: z.object({
     id: z.string(),
     keyframe_interval: z.number().int(),
@@ -329,24 +477,10 @@ const versionsOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
 };
 
-// ─── context_overview ────────────────────────────────────────────────────────
-
-const overviewOp: OperationDescriptor = {
-  name: "context_overview",
-  namespace: "core",
-  description:
-    "Vault manifest: node counts by type and status, the tag set, and a node list.",
-  input: z.object({}),
-  output: z.object({
-    total: z.number().int(),
-    by_type: z.record(z.number().int()),
-    by_status: z.record(z.number().int()),
-    tags: z.array(z.string()),
-    nodes: z.array(nodeSummary),
-  }),
-  errors: ["VALIDATION_FAILED"],
-  aliases: ["vault_info"],
-};
+// context_overview is gone: it returned counts, tags and a node list, all of
+// which context_init now returns alongside the vault's instructions and config.
+// Two operations meant two round trips to open a vault, and a `vault_info`
+// alias sitting on the one that returned none of what vault_info returns.
 
 // ─── context_reconstruct ─────────────────────────────────────────────────────
 
@@ -354,16 +488,11 @@ const reconstructOp: OperationDescriptor = {
   name: "context_reconstruct",
   namespace: "core",
   description: "Reconstruct the full content of a specific past version of a node.",
-  input: z
-    .object({
-      uri: z.string().optional().describe("Document URI"),
-      id: z.string().optional().describe("Document id / path"),
-      title: z.string().optional().describe("Document title"),
-      version: z.number().int().positive().describe("Version number to reconstruct"),
-    })
-    .refine((v) => Boolean(v.uri || v.id || v.title), {
-      message: "One of uri, id, or title is required",
-    }),
+  // Plain object, no `.refine` — see the note on nodeSelector.
+  input: z.object({
+    ...nodeSelectorShape,
+    version: z.number().int().positive().describe("Version number to reconstruct"),
+  }),
   output: z.object({
     id: z.string(),
     version: z.number().int(),
@@ -413,10 +542,37 @@ const verifyOp: OperationDescriptor = {
 const initOp: OperationDescriptor = {
   name: "context_init",
   namespace: "core",
-  description: "Load the vault's CONTEXT.md operating instructions (null if none).",
-  input: z.object({}),
-  output: z.object({ context_md: z.string().nullable() }),
+  description:
+    "Open a vault: its CONTEXT.md operating instructions, its configuration, and what it holds. Call this first in a session — it answers both 'how do I behave here' and 'what is here' in one round trip.",
+  input: z.object({
+    include_nodes: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also list every node. Off by default: the counts and tags below answer most opening questions, and a large vault's node list dwarfs them.",
+      ),
+    limit: z.number().int().positive().optional().describe("Max nodes to list, with include_nodes"),
+  }),
+  output: z.object({
+    context_md: z.string().nullable().describe("The vault's operating instructions, if it has any"),
+    vault_path: z.string(),
+    config: z
+      .object({
+        name: z.string(),
+        description: z.string().optional(),
+        servers: z.array(z.string()).describe("Names of the MCP servers the vault declares"),
+      })
+      .nullable(),
+    total: z.number().int(),
+    by_type: z.record(z.number().int()),
+    by_status: z.record(z.number().int()),
+    tags: z.array(z.string()),
+    nodes: z.array(nodeSummary).optional().describe("Only with include_nodes"),
+  }),
   errors: ["VALIDATION_FAILED"],
+  // `vault_info` returns CONTEXT.md, the config and the vault path — this
+  // operation, not context_overview, which shares none of those fields.
+  aliases: ["vault_info"],
 };
 
 // ─── context_packs ───────────────────────────────────────────────────────────
@@ -427,6 +583,11 @@ const packSummary = z.object({
   description: z.string().optional(),
   query: z.string().optional(),
   agent_instructions: z.string().optional(),
+  // A pack's membership rules are part of the pack. Omitting them made this a
+  // lossy view of what is on disk, so a caller listing packs had to read the
+  // file itself to see what a pack actually selects.
+  includes: z.array(z.string()).optional(),
+  excludes: z.array(z.string()).optional(),
 });
 
 const packsOp: OperationDescriptor = {
@@ -527,7 +688,6 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   deleteOp,
   versionsOp,
   reconstructOp,
-  overviewOp,
   verifyOp,
   initOp,
   packsOp,
