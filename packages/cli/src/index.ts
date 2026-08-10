@@ -1854,19 +1854,21 @@ packCmd
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const packs = await storage.readPacks();
+    const { packs } = await createEngineApi().run<{
+      packs: Array<{ id: string; label: string; description?: string }>;
+    }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
 
     if (opts.json) {
       console.log(JSON.stringify(packs, null, 2));
-    } else {
-      if (packs.length === 0) {
-        console.log(chalk.yellow("No packs found."));
-      } else {
-        for (const pack of packs) {
-          console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
-          if (pack.description) console.log(`    ${pack.description}`);
-        }
-      }
+      return;
+    }
+    if (packs.length === 0) {
+      console.log(chalk.yellow("No packs found."));
+      return;
+    }
+    for (const pack of packs) {
+      console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
+      if (pack.description) console.log(`    ${pack.description}`);
     }
   });
 

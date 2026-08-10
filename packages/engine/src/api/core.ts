@@ -583,6 +583,11 @@ const packSummary = z.object({
   description: z.string().optional(),
   query: z.string().optional(),
   agent_instructions: z.string().optional(),
+  // A pack's membership rules are part of the pack. Omitting them made this a
+  // lossy view of what is on disk, so a caller listing packs had to read the
+  // file itself to see what a pack actually selects.
+  includes: z.array(z.string()).optional(),
+  excludes: z.array(z.string()).optional(),
 });
 
 const packsOp: OperationDescriptor = {

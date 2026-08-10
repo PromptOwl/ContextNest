@@ -543,6 +543,8 @@ const packs: OperationExecutor = async (ctx) => {
       description: p.description,
       query: p.query,
       agent_instructions: p.agent_instructions,
+      ...(p.includes ? { includes: p.includes } : {}),
+      ...(p.excludes ? { excludes: p.excludes } : {}),
     })),
   };
 };
