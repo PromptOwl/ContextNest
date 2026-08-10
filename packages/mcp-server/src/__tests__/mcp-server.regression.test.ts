@@ -58,6 +58,7 @@ const EXPECTED_TOOLS = [
   "context_init",
   "context_verify",
   "context_packs",
+  "context_nests",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

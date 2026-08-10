@@ -21,6 +21,7 @@ import {
 } from "../parser.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
+import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
@@ -533,6 +534,9 @@ const packs: OperationExecutor = async (ctx) => {
   };
 };
 
+// Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
+const nests: OperationExecutor = () => ({ nests: listVaults() });
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
@@ -599,5 +603,6 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_verify: verify,
   context_init: init,
   context_packs: packs,
+  context_nests: nests,
   context_import: importDocs,
 });

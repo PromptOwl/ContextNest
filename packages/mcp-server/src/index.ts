@@ -1147,6 +1147,7 @@ registerCatalogTool("context_packs");
 // No legacy twin: nothing here listed version history before — read_version
 // fetches one version's content, which is a different question.
 registerCatalogTool("context_versions");
+registerCatalogTool("context_nests");
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 

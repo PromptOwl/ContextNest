@@ -576,6 +576,32 @@ const packsOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED"],
 };
 
+// ─── context_nests ───────────────────────────────────────────────────────────
+
+/** One registered nest as returned by `context_nests`. */
+const nestSummary = z.object({
+  alias: z.string(),
+  path: z.string(),
+  description: z.string().optional(),
+  isDefault: z.boolean(),
+  exists: z.boolean(),
+});
+
+/**
+ * The one `core` op that is REGISTRY-scoped rather than vault-scoped: it reads
+ * the central registry (`~/.contextnest/config.yaml`) and ignores its
+ * `OperationContext` entirely — there is no single vault it belongs to.
+ */
+const nestsOp: OperationDescriptor = {
+  name: "context_nests",
+  namespace: "core",
+  description:
+    "List every nest registered in the central registry, with its alias, path, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
+  input: z.object({}),
+  output: z.object({ nests: z.array(nestSummary) }),
+  errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
+};
+
 // ─── context_import ──────────────────────────────────────────────────────────
 
 /** One node to create in a bulk import — same shape as context_create input. */
@@ -642,5 +668,6 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   verifyOp,
   initOp,
   packsOp,
+  nestsOp,
   importOp,
 ];

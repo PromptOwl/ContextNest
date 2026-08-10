@@ -430,7 +430,7 @@ full stack trace back.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 19 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 21 tools for AI agents over stdio transport.
 
 ### Running the server
 

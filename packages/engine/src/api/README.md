@@ -19,23 +19,49 @@ divergence stops at the root.
 
 | Piece | What |
 |---|---|
-| **Catalog (schemas)** | `core` namespace — 7 ops. Zod input/output + draft-07 JSON Schema per op. Canonical names are `context_*`; OSS legacy names are captured as `aliases`. Schemas compose the engine's existing domain schemas (`frontmatterSchema`, `NODE_TYPES`, …) — no duplication. |
+| **Catalog (schemas)** | `core` namespace — 17 ops. Zod input/output + draft-07 JSON Schema per op. Canonical names are `context_*`; OSS legacy names are captured as `aliases`. Schemas compose the engine's existing domain schemas (`frontmatterSchema`, `NODE_TYPES`, …) — no duplication. |
 | **Executable ops** | `createEngineApi().run(name, input, ctx)` — one implementation bound to engine primitives (`GraphQueryEngine`, `NestStorage`, `publishDocument`). Ungated mechanics only; no governance policy in the engine (preserves the AGPL↔Commercial line). |
 | **Extension framework** | `EngineExtension` lets consumers register new ops (governance/workflow/sync) and wrap every op with `authorize` + `onResult`, without forking the engine. |
 | **Namespace discovery** | `NAMESPACES` advertises the implemented set for MCP `initialize` / REST manifest. |
 
-### `core` operations (16)
+### `core` operations (17)
 
 Read: `context_get` · `context_query` · `context_resolve` · `context_list` ·
 `context_search` · `context_overview` · `context_packs` · `context_init`
 Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
 `context_delete` · `context_import` (bulk create+publish, one checkpoint)
 History/audit: `context_versions` · `context_reconstruct` · `context_verify`
+Registry: `context_nests` (list every registered nest)
 
 These cover the operations all three surfaces (OSS MCP, CLI, Community MCP)
 expose, so Phase 2 bindings import them instead of hand-rolling. `governance`,
 `workflow`, and `sync` namespaces are **declared but not yet populated**
 (`implemented: false`) — those come in later phases.
+
+#### `context_nests` is registry-scoped, not vault-scoped
+
+Every other `core` op runs against the one vault in its `OperationContext`.
+`context_nests` reads the **central registry** (`~/.contextnest/config.yaml`,
+`listVaults()`) and therefore ignores `ctx` entirely — `storage`, `query`, and
+`versions` are unused. Do not wire them in; there is no single vault this
+operation belongs to. Bindings should still pass a real `OperationContext` —
+extension `authorize` hooks run before the executor and may dereference it.
+
+```text
+input:  {}
+output: { nests: [{ alias, path, description?, isDefault, exists }] }
+errors: CONFIG_ERROR | VALIDATION_FAILED
+```
+
+`description` resolves registry-entry description first, falling back to the
+nest's own `.context/config.yaml` `description` (spec §11.1), then its `name`.
+The registry entry is a machine-local label; the config value is the nest's own
+description and travels with the vault.
+
+Bindings exposing this over a network transport should note that `path` leaks
+filesystem topology across vaults — the registry file is written `0600` for
+exactly that reason. Local stdio MCP and the CLI already have filesystem
+access, so both include it.
 
 ## Public API
 

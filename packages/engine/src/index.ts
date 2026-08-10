@@ -189,6 +189,7 @@ export {
   addVault,
   removeVault,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   resolveVaultPath,
 } from "./registry.js";
