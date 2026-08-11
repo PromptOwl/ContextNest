@@ -129,7 +129,26 @@ describe("createEngineApi — executable core operations", () => {
     // resolution, search and wiki links all read it back.
     await expect(
       api.run("context_update", { id: doc.id, title: "..." }, ctx),
-    ).rejects.toThrow(/no slug-able/);
+    ).rejects.toThrow(/no letter or number/);
+  });
+
+  it("keeps a non-Latin title renameable when the id was supplied explicitly", async () => {
+    const api = createEngineApi();
+    // Slugifies to nothing, so create only accepts it alongside an explicit id —
+    // and update must then apply the same rule, or the document is stuck with a
+    // title it can never re-save.
+    const doc = await api.run<{ id: string }>(
+      "context_create",
+      { title: "日本語のみ", content: "body", id: "nodes/system/jp" },
+      ctx,
+    );
+    await api.run("context_update", { id: doc.id, title: "日本語のみ", content: "more" }, ctx);
+    const after = await api.run<{ frontmatter: { title: string } }>(
+      "context_get",
+      { id: doc.id },
+      ctx,
+    );
+    expect(after.frontmatter.title).toBe("日本語のみ");
   });
 
   it("published doc is visible to graph-mode query after create (regression: S3 index regen)", async () => {

@@ -78,6 +78,22 @@ function requireSlug(title: string): string {
   return slug;
 }
 
+/**
+ * Reject a title that carries no usable character at all — "###", "...", "   ".
+ *
+ * Same `\p{L}`/`\p{N}` rule as `assertSafeDocumentId`, NOT `requireSlug`: this
+ * runs where the title does not derive an id, and a document created with an
+ * explicit id may legitimately be titled "日本語" — which slugifies to nothing.
+ */
+function assertUsableTitle(title: string): void {
+  if (!/[\p{L}\p{N}]/u.test(title)) {
+    throw new ContextNestError(
+      `Title "${title}" has no letter or number; it cannot be read back by search or wiki links`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
 /** Normalize (#-prefix) and de-duplicate a tag list. */
 function normalizeUniqueTags(tags?: unknown[]): string[] | undefined {
   const normalized = normalizeTags(tags);
@@ -372,11 +388,12 @@ const update: OperationExecutor = async (ctx, input: any) => {
     throw new RejectedDocumentError(id);
   }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
-  // Same title rule as create, even though a rename leaves the id alone: a
-  // title with nothing slug-able is unusable everywhere it is read back —
-  // title→id resolution, search, wiki links — so it is rejected on both paths.
+  // A rename leaves the id alone, so this is the id-free rule, not create's
+  // slug rule: a title with no letter or number anywhere is unusable everywhere
+  // it is read back (search, wiki links), but "日本語" is fine — create accepts
+  // it too whenever the caller supplies the id.
   if (input.title) {
-    requireSlug(String(input.title));
+    assertUsableTitle(String(input.title));
     frontmatter.title = input.title;
   }
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
