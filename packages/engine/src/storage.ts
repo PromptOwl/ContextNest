@@ -68,17 +68,33 @@ export function normalizeDocumentId(raw: string): string {
 }
 
 /**
- * Reject an id that would escape the vault root. Callers join ids against the
- * root verbatim, so every id arriving from outside must clear this.
+ * Reject an id that would escape the vault root, or that names no document.
+ * Callers join ids against the root verbatim, so every id arriving from outside
+ * must clear this.
  *
  * Split out of `normalizeDocumentId` because that also re-roots a bare slug
  * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
  * needs the traversal check WITHOUT the rewrite.
  */
 export function assertSafeDocumentId(raw: string): void {
-  if (raw.split(/[/\\]/).some((seg) => seg === "..")) {
+  const segments = raw.split(/[/\\]/);
+  if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(
       `Invalid document id "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  // A segment with no letter or digit anywhere means a caller derived this id
+  // from a title that carries none — "###", "...", "   ". Empty lands the write
+  // at `nodes/.md`: a dotfile discovery never lists, no id can address, and the
+  // next such title collides with. Punctuation-only segments are addressable but
+  // just as unusable. Reject the id rather than store the ghost.
+  //
+  // Any script counts (\p{L}/\p{N}), NOT the a-z0-9 slug rule: ids for existing
+  // documents get read back through here, and a vault may hold "nodes/日本語".
+  if (segments.some((seg) => !/[\p{L}\p{N}]/u.test(seg))) {
+    throw new ContextNestError(
+      `Invalid document id "${raw}": every path segment needs at least one letter or number.`,
       "INVALID_DOCUMENT_ID",
     );
   }
