@@ -29,13 +29,13 @@ importers:
 
   packages/cli:
     dependencies:
-      '@promptowl/contextnest-engine':
-        specifier: workspace:^
-        version: link:../engine
       commander:
         specifier: ^13.0.0
         version: 13.1.0
     devDependencies:
+      '@promptowl/contextnest-engine':
+        specifier: workspace:^
+        version: link:../engine
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.13
@@ -97,17 +97,13 @@ importers:
         version: 4.1.9(@types/node@22.19.13)(@vitest/coverage-v8@4.1.9)(vite@7.3.2(@types/node@22.19.13))
 
   packages/mcp-server:
-    dependencies:
+    devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@3.25.76)
       '@promptowl/contextnest-engine':
         specifier: workspace:^
         version: link:../engine
-      zod:
-        specifier: ^3.24.0
-        version: 3.25.76
-    devDependencies:
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.13
@@ -120,6 +116,9 @@ importers:
       vitest:
         specifier: ^4.1.9
         version: 4.1.9(@types/node@22.19.13)(@vitest/coverage-v8@4.1.9)(vite@7.3.2(@types/node@22.19.13))
+      zod:
+        specifier: ^3.24.0
+        version: 3.25.76
 
 packages:
 

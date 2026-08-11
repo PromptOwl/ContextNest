@@ -16,6 +16,7 @@
 import { readFileSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { builtinModules } from "node:module";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MARKDOWN = join(ROOT, "DEPENDENCIES.md");
@@ -28,6 +29,25 @@ const PUBLISHED = [
   "@promptowl/contextnest-engine",
   "@promptowl/contextnest-mcp-server",
 ];
+
+/**
+ * Packages inlined into a published package's `dist/` at build time, and so
+ * declared as devDependencies rather than installed by the user.
+ *
+ * Bundling is why the install counts are what they are, so it is disclosed
+ * rather than left implicit: the code still reaches the user's disk, it just
+ * arrives inside our tarball instead of as its own `node_modules` entry. Must
+ * match the `noExternal` list in each package's tsup config.
+ */
+const BUNDLED = {
+  "@promptowl/contextnest-cli": ["@promptowl/contextnest-engine"],
+  "@promptowl/contextnest-engine": [],
+  "@promptowl/contextnest-mcp-server": [
+    "@modelcontextprotocol/sdk",
+    "@promptowl/contextnest-engine",
+    "zod",
+  ],
+};
 
 /**
  * Why each direct runtime dependency is there. Every direct dependency of a
@@ -84,14 +104,14 @@ function resolveDep(fromDir, name) {
  * `pnpm list --prod` omits optionalDependencies — which would hide exactly the
  * packages the minimal install profile is about.
  */
-function resolveTree(rootDir, rootName) {
+function resolveTree(rootDir, rootName, seeds) {
   // name -> { version, license, depth, parents }
   const packages = new Map();
   let maxDepth = 0;
 
-  function walk(dir, owner, depth) {
+  function walk(dir, owner, depth, explicitSeeds) {
     const pkg = manifest(dir);
-    const deps = [
+    const deps = explicitSeeds ?? [
       ...Object.keys(pkg.dependencies ?? {}).map((name) => ({ name, optional: false })),
       ...Object.keys(pkg.optionalDependencies ?? {}).map((name) => ({ name, optional: true })),
     ];
@@ -126,8 +146,33 @@ function resolveTree(rootDir, rootName) {
     }
   }
 
-  walk(rootDir, rootName, 1);
+  walk(rootDir, rootName, 1, seeds);
   return { packages, maxDepth };
+}
+
+/**
+ * Every bare module a built bundle imports at runtime, excluding Node builtins.
+ * Each one must be a declared dependency of the published package, or the
+ * tarball is broken for anyone who installs it.
+ */
+function bundleImports(distFile) {
+  const source = readFileSync(distFile, "utf-8");
+  const specifiers = new Set();
+
+  for (const match of source.matchAll(/(?:^|\n)import[^;'"]*from\s*"([^"]+)"/g)) {
+    specifiers.add(match[1]);
+  }
+  for (const match of source.matchAll(/\bimport\(\s*"([^"]+)"\s*\)/g)) {
+    specifiers.add(match[1]);
+  }
+
+  const builtins = new Set([...builtinModules, ...builtinModules.map((m) => `node:${m}`)]);
+  return [...specifiers]
+    .filter((spec) => !spec.startsWith(".") && !builtins.has(spec))
+    // A subpath import (`pkg/sub/thing.js`) still resolves to the root package.
+    .map((spec) => (spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0]))
+    .filter((name, index, all) => all.indexOf(name) === index)
+    .sort();
 }
 
 /** Build the full report for every published package. */
@@ -152,6 +197,38 @@ function buildReport() {
     }
 
     const { packages, maxDepth } = resolveTree(dir, name);
+
+    // Everything inlined into dist/, including what those roots pull in.
+    const bundledRoots = (BUNDLED[name] ?? []).map((dep) => ({ name: dep, optional: false }));
+    const { packages: bundled } = resolveTree(dir, name, bundledRoots);
+
+    // The published tarball must be able to resolve everything it imports.
+    const dist = join(dir, "dist", "index.js");
+    if (!existsSync(dist)) {
+      throw new Error(`${name} has not been built. Run \`pnpm build\` before generating the graph.`);
+    }
+    const declared = new Set([...required, ...optional]);
+    const unresolvable = bundleImports(dist).filter((dep) => !declared.has(dep));
+    if (unresolvable.length) {
+      throw new Error(
+        `${name}'s bundle imports ${unresolvable.join(", ")} at runtime, but ${unresolvable.length > 1 ? "they are" : "it is"} ` +
+          `not a declared dependency. Either bundle ${unresolvable.length > 1 ? "them" : "it"} (tsup \`noExternal\`) or move ` +
+          `${unresolvable.length > 1 ? "them" : "it"} back into \`dependencies\` — otherwise the published package is broken on install.`,
+      );
+    }
+
+    const describe = (map, isOptional) =>
+      [...map.entries()]
+        .map(([dep, info]) => ({
+          name: dep,
+          version: info.version,
+          license: info.license,
+          depth: info.depth,
+          optional: isOptional(dep),
+          via: [...info.parents].sort(),
+        }))
+        .sort((a, b) => a.depth - b.depth || a.name.localeCompare(b.name));
+
     report.push({
       name,
       version: pkg.version,
@@ -160,16 +237,8 @@ function buildReport() {
       maxDepth,
       total: packages.size,
       minimalTotal: packages.size - optional.length,
-      packages: [...packages.entries()]
-        .map(([dep, info]) => ({
-          name: dep,
-          version: info.version,
-          license: info.license,
-          depth: info.depth,
-          optional: optional.includes(dep),
-          via: [...info.parents].sort(),
-        }))
-        .sort((a, b) => a.depth - b.depth || a.name.localeCompare(b.name)),
+      packages: describe(packages, (dep) => optional.includes(dep)),
+      bundled: describe(bundled, () => false),
     });
   }
 
@@ -205,6 +274,21 @@ function renderMarkdown(report) {
   out.push(
     "Counts are unique packages in the resolved production tree, including the monorepo's own " +
       "packages. Depth is measured from the package you install.",
+  );
+  out.push("");
+
+  out.push(
+    "The CLI and the MCP server are binaries rather than libraries, so their dependencies are " +
+      "compiled into `dist/` at build time and declared as devDependencies. That code still " +
+      "reaches your disk — it arrives inside our tarball instead of as its own `node_modules` " +
+      "entry — so every bundled package is listed below too. Nothing is hidden by being bundled; " +
+      "it is just delivered as one reviewed artifact with a version you can pin.",
+  );
+  out.push("");
+  out.push(
+    "The trade-off is explicit: a bundled package cannot be patched by `npm audit fix` in your " +
+      "tree, so security updates come from us as a release. In exchange the install is " +
+      "deterministic, has no resolution surprises, and ships nothing the code does not use.",
   );
   out.push("");
 
@@ -268,6 +352,24 @@ function renderMarkdown(report) {
         out.push(
           `| \`${dep.name}\` | ${dep.version} | ${dep.license} | ${dep.depth} | ${dep.via.map((v) => `\`${v}\``).join(", ")} |`,
         );
+      }
+    }
+    out.push("");
+
+    out.push("### Bundled into `dist/` at build time");
+    out.push("");
+    if (pkg.bundled.length === 0) {
+      out.push("None. This package ships its own source only.");
+    } else {
+      out.push(
+        `Not installed into your \`node_modules\` — compiled into the published bundle, with ` +
+          `unused code removed. ${pkg.bundled.length} package(s):`,
+      );
+      out.push("");
+      out.push("| Package | Version | Licence |");
+      out.push("| --- | --- | --- |");
+      for (const dep of pkg.bundled) {
+        out.push(`| \`${dep.name}\` | ${dep.version} | ${dep.license} |`);
       }
     }
     out.push("");

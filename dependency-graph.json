@@ -4,26 +4,15 @@
       "name": "@promptowl/contextnest-cli",
       "version": "2.0.0",
       "required": [
-        "@promptowl/contextnest-engine",
         "commander"
       ],
       "optional": [
         "chalk"
       ],
-      "maxDepth": 3,
-      "total": 10,
-      "minimalTotal": 9,
+      "maxDepth": 1,
+      "total": 2,
+      "minimalTotal": 1,
       "packages": [
-        {
-          "name": "@promptowl/contextnest-engine",
-          "version": "2.0.0",
-          "license": "AGPL-3.0",
-          "depth": 1,
-          "optional": false,
-          "via": [
-            "@promptowl/contextnest-cli"
-          ]
-        },
         {
           "name": "chalk",
           "version": "5.6.2",
@@ -38,6 +27,18 @@
           "name": "commander",
           "version": "13.1.0",
           "license": "MIT",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-cli"
+          ]
+        }
+      ],
+      "bundled": [
+        {
+          "name": "@promptowl/contextnest-engine",
+          "version": "2.0.0",
+          "license": "AGPL-3.0",
           "depth": 1,
           "optional": false,
           "via": [
@@ -202,21 +203,19 @@
             "js-yaml"
           ]
         }
-      ]
+      ],
+      "bundled": []
     },
     {
       "name": "@promptowl/contextnest-mcp-server",
       "version": "2.0.0",
-      "required": [
-        "@modelcontextprotocol/sdk",
-        "@promptowl/contextnest-engine",
-        "zod"
-      ],
+      "required": [],
       "optional": [],
-      "maxDepth": 11,
-      "total": 97,
-      "minimalTotal": 97,
-      "packages": [
+      "maxDepth": 0,
+      "total": 0,
+      "minimalTotal": 0,
+      "packages": [],
+      "bundled": [
         {
           "name": "@modelcontextprotocol/sdk",
           "version": "1.29.0",

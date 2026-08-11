@@ -45,13 +45,13 @@
     "lint": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@promptowl/contextnest-engine": "workspace:^",
     "commander": "^13.0.0"
   },
   "optionalDependencies": {
     "chalk": "^5.4.0"
   },
   "devDependencies": {
+    "@promptowl/contextnest-engine": "workspace:^",
     "@types/node": "^22.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",

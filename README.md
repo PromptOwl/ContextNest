@@ -28,13 +28,16 @@ See all starters: `ctx init --list-starters`
 
 ### What the install puts on your disk
 
-Ten packages, three levels deep, and **no install scripts** — nothing of ours executes when you install. For a lean install without terminal colour:
+**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install.
+The MCP server installs zero dependencies. For a lean install without terminal colour:
 
 ```bash
 npm install -g @promptowl/contextnest-cli --omit=optional
 ```
 
-Every runtime package, why it is there, and its licence is published in
+That leaves exactly one package. The rest of the code is compiled into the published bundle rather
+than resolved from npm, so the install is deterministic — and every bundled package is listed with
+its version and licence alongside the installed ones in
 **[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
 uploads the machine-readable graph as the `dependency-graph` build artifact.
 

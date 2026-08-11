@@ -79,6 +79,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The graph inspects each built bundle to prove every module it imports at
+      # runtime is a declared dependency, so the dist/ output has to exist.
+      - name: Build
+        run: pnpm build
+
       # Fails if DEPENDENCIES.md no longer matches the installed tree — adding
       # or removing a dependency must land together with the published graph.
       - name: Verify the published dependency graph is current
