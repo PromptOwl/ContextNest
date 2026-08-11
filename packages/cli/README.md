@@ -123,6 +123,11 @@ ctx read nodes/spec --html --out out.html     # refuses to clobber out.html with
 and after — so it reflects what actually happened, not what was intended. The
 log goes to **stderr**, leaving `--json` output and redirected stdout clean.
 
+`--dry-run` covers the vault registry too: `ctx vault add|remove|default|describe`
+run against a throwaway copy of `~/.contextnest/`, so a preview fails on an
+alias collision or an unregistered alias exactly where the real command would,
+rather than promising something that can't happen.
+
 **Confirmation.** On a terminal, write commands ask before proceeding.
 Destructive ones (`delete`, `checkpoint rebuild`, `drift approve`,
 `vault remove`, re-running `init` over an existing vault, overwriting an

@@ -88,9 +88,20 @@ describe("assertSafeEndpoint", () => {
     expect(assertSafeEndpoint("https://api.example.com", "--server").protocol).toBe("https:");
   });
 
-  it("accepts plaintext http on loopback", () => {
-    expect(assertSafeEndpoint("http://localhost:3737", "--server").hostname).toBe("localhost");
-    expect(assertSafeEndpoint("http://127.0.0.1:3737", "--server").hostname).toBe("127.0.0.1");
+  it("accepts plaintext http anywhere in the loopback range", () => {
+    // 127.0.0.0/8 is all loopback, not just 127.0.0.1 — some local setups bind
+    // elsewhere in the block.
+    for (const host of ["localhost", "127.0.0.1", "127.0.0.2", "127.1.2.3", "[::1]"]) {
+      expect(assertSafeEndpoint(`http://${host}:3737`, "--server").protocol).toBe("http:");
+    }
+  });
+
+  it("does not mistake a non-loopback host for one", () => {
+    // "1270.0.0.1" is deliberately absent — Node rejects it at URL parse time,
+    // so it never reaches the loopback check and throws a different message.
+    for (const host of ["127.example.com", "12.7.0.1", "227.0.0.1"]) {
+      expect(() => assertSafeEndpoint(`http://${host}`, "--server")).toThrow(/plaintext HTTP/);
+    }
   });
 
   it("refuses plaintext http to a remote host", () => {

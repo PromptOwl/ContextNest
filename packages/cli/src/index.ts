@@ -47,6 +47,7 @@ import {
   readRegistry,
   findLocalVault,
   getRegistryPath,
+  getRegistryDir,
   ALIAS_PATTERN,
   normalizeStatus,
   normalizeDocumentId,
@@ -72,6 +73,8 @@ import {
   openWriteScope,
   closeWriteScope,
   noteExternalWrite,
+  openRegistrySandbox,
+  registryPathForLog,
   sandboxPath,
   realRootPath,
   isDryRun,
@@ -231,7 +234,8 @@ let selectedVaultAlias: string | undefined;
  * of the vault, and `ctx query` sits on the hot path for every agent turn.
  *
  * Commands that write OUTSIDE the vault (`vault *`, `push`, `read --out`)
- * are absent on purpose — they report through `recordExternalWrite` instead.
+ * are absent on purpose — they report through `noteExternalWrite` or, for the
+ * registry, through `REGISTRY_WRITE_COMMANDS` below.
  */
 const VAULT_WRITE_COMMANDS = new Set([
   "init",
@@ -247,6 +251,18 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift reject",
 ]);
 
+/**
+ * Commands whose write target is the global registry rather than a vault.
+ * They get the registry redirected into a throwaway copy under --dry-run, so
+ * the real engine calls still run and still refuse what they would refuse.
+ */
+const REGISTRY_WRITE_COMMANDS = new Set([
+  "vault add",
+  "vault describe",
+  "vault remove",
+  "vault default",
+]);
+
 /** Full space-separated path of a command, e.g. `drift approve`. */
 function commandPath(cmd: Command): string {
   const parts: string[] = [];
@@ -260,11 +276,38 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
   configureSafety({ dryRun: opts.dryRun, yes: opts.yes, force: opts.force });
 
   const name = commandPath(actionCommand);
+
+  if (REGISTRY_WRITE_COMMANDS.has(name)) {
+    // openRegistrySandbox redirects CONTEXTNEST_CONFIG_DIR under --dry-run and
+    // returns the real directory, so the log names the registry the user has
+    // rather than the throwaway copy the run wrote into.
+    const realRegistryDir = await openRegistrySandbox();
+    await openWriteScope(getRegistryDir(), {
+      sandbox: false,
+      absolutePaths: true,
+      displayRoot: realRegistryDir,
+    });
+    return;
+  }
+
   if (!VAULT_WRITE_COMMANDS.has(name)) return;
-  // `init` targets a directory that is not a vault yet — and often an entire
-  // source tree — so its sandbox starts empty rather than as a copy.
-  const isInit = name === "init";
-  await openWriteScope(isInit ? getInitRoot() : getVaultRoot(), { copy: !isInit });
+
+  if (name === "init") {
+    // A first-time init targets a directory that is not a vault yet — and is
+    // often an entire source tree — so there is nothing worth copying. But
+    // init is ALSO how a vault is re-initialized, and that rewrites
+    // config.yaml, agent configs and the index. Seeding the sandbox from an
+    // existing vault is what makes those log as modified rather than created.
+    const root = getInitRoot();
+    const alreadyAVault = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
+    // Registering the alias runs for real against a throwaway registry, so a
+    // dry-run init surfaces an alias collision instead of glossing over it.
+    await openRegistrySandbox();
+    await openWriteScope(root, { copy: alreadyAVault });
+    return;
+  }
+
+  await openWriteScope(getVaultRoot());
 });
 
 program.hook("postAction", () => {
@@ -863,14 +906,6 @@ program
     const registerVault = (): void => {
       if (!registerAlias) return;
       const resolvedRoot = pathMod.resolve(displayRoot);
-      // The registry lives in ~/.contextnest/ — outside the dry-run sandbox,
-      // so it has to be skipped by hand rather than redirected.
-      if (isDryRun()) {
-        console.error(
-          chalk.dim(`  [dry run] would register vault alias "${registerAlias}" → ${resolvedRoot}`),
-        );
-        return;
-      }
       // Own-property check: a `--vault __proto__` would otherwise read back
       // Object.prototype here and crash on `resolve(existing.path)` before
       // addVault got the chance to reject the alias.
@@ -895,8 +930,14 @@ program
       try {
         // force is safe here: the alias is either free or already points to
         // this same vault (idempotent re-init).
-        noteExternalWrite(getRegistryPath());
-        const reg = addVault(registerAlias, resolvedRoot, {
+        //
+        // Register the directory that was actually initialized: under
+        // --dry-run that is the sandbox, and addVault refuses a path with no
+        // .context/config.yaml — the real one has none yet. The registry it
+        // writes to is a throwaway copy in that case, so the alias rules,
+        // collision check and --force handling all still run for real.
+        noteExternalWrite(registryPathForLog());
+        const reg = addVault(registerAlias, pathMod.resolve(root), {
           description: registerDescription,
           setDefault: opts.setDefault,
           force: true,
@@ -1006,8 +1047,11 @@ program
       if (opts.out) await ensureOverwritable(outPath, "Output file");
 
       if (isDryRun()) {
+        // Same created/modified distinction the snapshot diff makes elsewhere;
+        // previewing an overwrite must not read as a fresh file.
+        const existed = fs.existsSync(outPath);
         console.error(chalk.bold.cyan("Dry run — no files were written."));
-        console.error(`  ${chalk.green("+")} ${outPath}`);
+        console.error(`  ${existed ? chalk.yellow("~") : chalk.green("+")} ${outPath}`);
         return;
       }
 
@@ -1331,7 +1375,7 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
     return;
   }
 
-  for (const id of ids) console.log(chalk.dim(`  ${id}`));
+  for (const id of ids) console.error(chalk.dim(`  ${id}`));
   await confirmOrExit(`Publish the ${ids.length} document(s) above?`);
 
   const ctx = opContext(storage, author, (done, total) => {
@@ -2172,7 +2216,9 @@ program
 
     // Egress is the one action here that can't be undone by deleting a file,
     // so show what leaves the machine before it leaves.
-    for (const doc of filtered) console.log(chalk.dim(`  ${doc.id}`));
+    // stderr, like the action log: this is disclosure about the run, not the
+    // command's result, and stdout has to stay clean for redirection.
+    for (const doc of filtered) console.error(chalk.dim(`  ${doc.id}`));
     await confirmOrExit(
       `Send the ${documents.length} document(s) above${contextMd ? " and CONTEXT.md" : ""} to ${serverUrl}?`,
       { destructive: true },
@@ -2445,7 +2491,7 @@ vaultCmd
       console.log(
         chalk.dim(`No vaults registered. Add one with: ${chalk.yellow("ctx vault add <alias> [path]")}`),
       );
-      console.log(chalk.dim(`Registry: ${getRegistryPath()}`));
+      console.log(chalk.dim(`Registry: ${registryPathForLog()}`));
       return;
     }
     console.log(chalk.bold("\nRegistered vaults:\n"));
@@ -2456,7 +2502,7 @@ vaultCmd
       if (v.description) console.log(`     ${chalk.dim(v.description)}`);
       console.log(`     ${chalk.dim(v.path)}`);
     }
-    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + getRegistryPath())}\n`);
+    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
   });
 
 vaultCmd
@@ -2483,15 +2529,10 @@ vaultCmd
         }
         target = pathMod.resolve(local);
       }
-      // The registry is a single shared file outside any vault, so the sandbox
-      // can't cover it — dry runs report and stop instead.
-      if (isDryRun()) {
-        console.error(chalk.bold.cyan("Dry run — no files were written."));
-        console.error(`  ${chalk.yellow("~")} ${getRegistryPath()}  (would map "${alias}" → ${target})`);
-        return;
-      }
-      await confirmOrExit(`Register "${alias}" → ${target} in ${getRegistryPath()}?`);
-      noteExternalWrite(getRegistryPath());
+      // Under --dry-run the registry directory is a throwaway copy, so addVault
+      // runs for real: an alias collision or a path that isn't a vault fails
+      // here exactly as it would without the flag.
+      await confirmOrExit(`Register "${alias}" → ${target} in ${registryPathForLog()}?`);
       const reg = addVault(alias, target, {
         description: opts.description,
         setDefault: opts.setDefault,
@@ -2513,13 +2554,7 @@ vaultCmd
   .description("Set the description for a registered alias (omit the text to clear it)")
   .action(async (alias: string, description: string | undefined) => {
     try {
-      if (isDryRun()) {
-        console.error(chalk.bold.cyan("Dry run — no files were written."));
-        console.error(`  ${chalk.yellow("~")} ${getRegistryPath()}  (would describe "${alias}")`);
-        return;
-      }
-      await confirmOrExit(`Update the description of "${alias}" in ${getRegistryPath()}?`);
-      noteExternalWrite(getRegistryPath());
+      await confirmOrExit(`Update the description of "${alias}" in ${registryPathForLog()}?`);
       setVaultDescription(alias, description);
       console.log(
         description
@@ -2538,17 +2573,11 @@ vaultCmd
   .description("Unregister a vault alias")
   .action(async (alias: string) => {
     try {
-      if (isDryRun()) {
-        console.error(chalk.bold.cyan("Dry run — no files were written."));
-        console.error(`  ${chalk.yellow("~")} ${getRegistryPath()}  (would unregister "${alias}")`);
-        return;
-      }
       await confirmOrExit(
-        `Unregister "${alias}" from ${getRegistryPath()}? The vault's files are left alone.`,
+        `Unregister "${alias}" from ${registryPathForLog()}? The vault's files are left alone.`,
         { destructive: true },
       );
       // removeVault reports wasDefault from its single read — no pre-read needed.
-      noteExternalWrite(getRegistryPath());
       const { wasDefault } = removeVault(alias);
       console.log(chalk.yellow(`Removed vault alias "${alias}"`));
       if (wasDefault) {
@@ -2572,13 +2601,7 @@ vaultCmd
   .description("Set the default vault")
   .action(async (alias: string) => {
     try {
-      if (isDryRun()) {
-        console.error(chalk.bold.cyan("Dry run — no files were written."));
-        console.error(`  ${chalk.yellow("~")} ${getRegistryPath()}  (would default to "${alias}")`);
-        return;
-      }
-      await confirmOrExit(`Make "${alias}" the default vault in ${getRegistryPath()}?`);
-      noteExternalWrite(getRegistryPath());
+      await confirmOrExit(`Make "${alias}" the default vault in ${registryPathForLog()}?`);
       setDefaultVault(alias);
       console.log(chalk.green(`Default vault is now "${chalk.bold(alias)}"`));
     } catch (err) {

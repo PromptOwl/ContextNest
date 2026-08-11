@@ -28,6 +28,7 @@ import pathMod from "node:path";
 import readline from "node:readline";
 import { createHash } from "node:crypto";
 import chalk from "chalk";
+import { getRegistryDir } from "@promptowl/contextnest-engine";
 
 // ─── Flags ──────────────────────────────────────────────────────────────────
 
@@ -163,6 +164,10 @@ let baseline: Snapshot | null = null;
 // Only flipped false when a scan bails out on size — commands that log purely
 // external writes never scan, and must not report their log as incomplete.
 let baselineUsable = true;
+let reportAbsolute = false;
+let registrySandbox: string | null = null;
+let realRegistryDir: string | null = null;
+let savedConfigDir: string | undefined;
 const externalChanges: Change[] = [];
 
 /** The temp directory a dry run redirects vault writes into, if active. */
@@ -175,13 +180,23 @@ export function realRootPath(): string | null {
   return originalRoot;
 }
 
+/** Copy a directory tree, skipping pruned subtrees and never resolving links. */
+function copyTree(from: string, to: string): Promise<void> {
+  return fs.promises.cp(from, to, {
+    recursive: true,
+    verbatimSymlinks: true,
+    filter: (src) => !PRUNE.has(pathMod.basename(src)),
+  });
+}
+
 // Belt and braces: a command that calls process.exit() (a declined
 // confirmation, a validation failure) skips closeWriteScope, so clean the
-// sandbox here too rather than leaving temp copies of people's vaults around.
+// sandboxes here too rather than leaving temp copies of people's data around.
 process.on("exit", () => {
-  if (sandboxRoot) {
+  for (const dir of [sandboxRoot, registrySandbox]) {
+    if (!dir) continue;
     try {
-      fs.rmSync(sandboxRoot, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
     } catch {
       /* best effort on the way out */
     }
@@ -189,24 +204,63 @@ process.on("exit", () => {
 });
 
 /**
+ * Point the global vault registry at a throwaway copy for the rest of a dry
+ * run.
+ *
+ * Registry mutations live in `~/.contextnest/config.yaml`, outside any vault,
+ * so the vault sandbox can't cover them. Redirecting the directory lets the
+ * real engine calls run — alias collision checks, "is this actually a vault",
+ * "is this alias even registered" — so a dry run fails exactly where the real
+ * command would, instead of printing an optimistic "would …" for an operation
+ * that cannot succeed.
+ *
+ * No-op outside a dry run. `getRegistryDir()` reads the env var on every call,
+ * so this takes effect for engine code already imported.
+ */
+export async function openRegistrySandbox(): Promise<string> {
+  const real = realRegistryDir ?? getRegistryDir();
+  if (!isDryRun() || registrySandbox) return real;
+  realRegistryDir = real;
+  registrySandbox = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ctx-dryrun-reg-"));
+  if (fs.existsSync(real)) await copyTree(real, registrySandbox);
+  savedConfigDir = process.env.CONTEXTNEST_CONFIG_DIR;
+  process.env.CONTEXTNEST_CONFIG_DIR = registrySandbox;
+  return real;
+}
+
+/**
+ * The registry path to show the user. `getRegistryPath()` follows the env var,
+ * which a dry run has pointed at a throwaway copy — never the path to print.
+ */
+export function registryPathForLog(): string {
+  return pathMod.join(realRegistryDir ?? getRegistryDir(), "config.yaml");
+}
+
+/**
  * Begin auditing writes for one command.
  *
- * @param root  the vault the command targets.
- * @param copy  seed the dry-run sandbox from `root`. False for `ctx init`,
- *              which targets a directory that is not yet a vault (and may be
- *              an entire source tree — copying it would be absurd).
+ * @param root     the directory the command writes into.
+ * @param copy     seed the dry-run sandbox from `root`. False only when there
+ *                 is nothing there worth copying — a first-time `ctx init`
+ *                 targets a directory that is not a vault yet, and may be an
+ *                 entire source tree.
+ * @param sandbox  create a dry-run sandbox. False when the caller already
+ *                 redirected the target (see `openRegistrySandbox`), so `root`
+ *                 is the throwaway copy already.
+ * @param absolutePaths  report changes by absolute path. For roots outside the
+ *                 vault, where a bare "config.yaml" would be ambiguous.
+ * @param displayRoot  the directory to name in output when `root` is already a
+ *                 throwaway copy.
  */
-export async function openWriteScope(root: string, { copy = true } = {}): Promise<void> {
-  originalRoot = root;
-  if (isDryRun()) {
+export async function openWriteScope(
+  root: string,
+  { copy = true, sandbox = true, absolutePaths = false, displayRoot = "" } = {},
+): Promise<void> {
+  originalRoot = displayRoot || root;
+  reportAbsolute = absolutePaths;
+  if (isDryRun() && sandbox) {
     sandboxRoot = fs.mkdtempSync(pathMod.join(os.tmpdir(), "ctx-dryrun-"));
-    if (copy && fs.existsSync(root)) {
-      await fs.promises.cp(root, sandboxRoot, {
-        recursive: true,
-        verbatimSymlinks: true,
-        filter: (src) => !PRUNE.has(pathMod.basename(src)),
-      });
-    }
+    if (copy && fs.existsSync(root)) await copyTree(root, sandboxRoot);
     scopeRoot = sandboxRoot;
   } else {
     scopeRoot = root;
@@ -235,14 +289,30 @@ export function closeWriteScope(): void {
   const changes: Change[] = [...externalChanges];
   if (scopeRoot && baseline) {
     const after = snapshot(scopeRoot);
-    if (after) changes.push(...diffSnapshots(baseline, after));
-    else baselineUsable = false;
+    if (after) {
+      // Report against the directory the user knows about, not the sandbox
+      // copy the dry run actually wrote into.
+      const base = originalRoot ?? scopeRoot;
+      for (const change of diffSnapshots(baseline, after)) {
+        changes.push(
+          reportAbsolute ? { ...change, path: pathMod.join(base, change.path) } : change,
+        );
+      }
+    } else baselineUsable = false;
   }
   printActionLog(changes.sort((a, b) => a.path.localeCompare(b.path)));
 
-  if (sandboxRoot) fs.rmSync(sandboxRoot, { recursive: true, force: true });
-  scopeRoot = sandboxRoot = originalRoot = baseline = null;
+  for (const dir of [sandboxRoot, registrySandbox]) {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  }
+  if (registrySandbox) {
+    if (savedConfigDir === undefined) delete process.env.CONTEXTNEST_CONFIG_DIR;
+    else process.env.CONTEXTNEST_CONFIG_DIR = savedConfigDir;
+  }
+  scopeRoot = sandboxRoot = originalRoot = baseline = registrySandbox = realRegistryDir = null;
+  savedConfigDir = undefined;
   baselineUsable = true;
+  reportAbsolute = false;
   externalChanges.length = 0;
 }
 
@@ -337,7 +407,13 @@ export async function ensureOverwritable(absPath: string, label = "File"): Promi
 
 // ─── Network egress ─────────────────────────────────────────────────────────
 
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const LOOPBACK_NAMES = new Set(["localhost", "::1", "[::1]"]);
+/** The whole of 127.0.0.0/8 is loopback, not just 127.0.0.1. */
+const LOOPBACK_V4 = /^127\.(?:\d{1,3}\.){2}\d{1,3}$/;
+
+function isLoopback(hostname: string): boolean {
+  return LOOPBACK_NAMES.has(hostname) || LOOPBACK_V4.test(hostname);
+}
 
 /**
  * Validate an endpoint before vault contents (or a bearer token) leave the
@@ -355,7 +431,7 @@ export function assertSafeEndpoint(raw: string, what: string): URL {
   if (url.protocol !== "http:") {
     throw new Error(`${what} must be http(s), got "${url.protocol}" — refusing to send vault contents.`);
   }
-  if (LOOPBACK.has(url.hostname)) return url;
+  if (isLoopback(url.hostname)) return url;
   if (isForce()) {
     console.error(
       chalk.yellow(`Warning: sending vault contents to ${url.origin} over plaintext HTTP (--force).`),

@@ -1240,3 +1240,69 @@ describe("[regression] file safety", () => {
     expect(res.stderr).toMatch(/plaintext HTTP/);
   });
 });
+
+// ─── file safety — dry-run fidelity ──────────────────────────────────────────
+// The claim these guard is that --dry-run reports the REAL result. Four spots
+// originally bypassed the sandbox and printed a hand-written "would ..." line,
+// which could disagree with what the command actually does.
+
+describe("[regression] file safety — dry-run fidelity", () => {
+  it("vault add --dry-run fails on an alias collision, like the real command", () => {
+    initVault(tmp);
+    runCtx(tmp, ["vault", "add", "taken", tmp, "--yes"]);
+
+    // Registering a DIFFERENT path under a taken alias needs --force. The dry
+    // run must refuse it too, rather than promising a mapping that can't happen.
+    const other = mkdtempSync(join(tmpdir(), "cn-other-vault-"));
+    try {
+      initVault(other);
+      const dry = runCtxResult(tmp, ["vault", "add", "taken", other, "--dry-run"]);
+      expect(dry.status).not.toBe(0);
+      expect(dry.stdout + dry.stderr).toMatch(/already exists/);
+
+      // And the dry run left the real registry alone.
+      const list = JSON.parse(runCtx(tmp, ["vault", "list", "--json"]));
+      const taken = list.find((v: { alias: string }) => v.alias === "taken");
+      expect(taken.path).toBe(tmp);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("vault remove --dry-run fails for an alias that isn't registered", () => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, ["vault", "remove", "never-registered", "--dry-run"]);
+    expect(res.status).not.toBe(0);
+  });
+
+  it("vault add --dry-run does not write to the registry", () => {
+    initVault(tmp);
+    runCtx(tmp, ["vault", "add", "ghost-alias", tmp, "--dry-run"]);
+    const list = JSON.parse(runCtx(tmp, ["vault", "list", "--json"]));
+    expect(list.map((v: { alias: string }) => v.alias)).not.toContain("ghost-alias");
+  });
+
+  it("init --dry-run on an existing vault reports rewrites as modified, not created", () => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, ["init", "--name", "again", "--yes", "--dry-run"]);
+    expect(res.status).toBe(0);
+    // config.yaml already exists, so re-initializing modifies it. Reporting it
+    // as created would mean the sandbox never saw the existing vault.
+    expect(res.stderr).toMatch(/~ \.context\/config\.yaml/);
+    expect(res.stderr).not.toMatch(/\+ \.context\/config\.yaml/);
+  });
+
+  it("read --out --dry-run marks an existing target as modified, not created", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/previewed", "--title", "Previewed"]);
+    const outFile = join(tmp, "preview.html");
+    writeFileSync(outFile, "PRE-EXISTING");
+
+    const res = runCtxResult(tmp, [
+      "read", "nodes/previewed", "--html", "--out", outFile, "--force", "--dry-run",
+    ]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toContain(`~ ${outFile}`);
+    expect(readFileSync(outFile, "utf-8")).toBe("PRE-EXISTING");
+  });
+});
