@@ -82,6 +82,8 @@ import {
   confirmOrExit,
   ensureOverwritable,
   assertSafeEndpoint,
+  assertNotRedirected,
+  NO_REDIRECT,
 } from "./safety.js";
 
 const program = new Command();
@@ -236,6 +238,13 @@ let selectedVaultAlias: string | undefined;
  * Commands that write OUTSIDE the vault (`vault *`, `push`, `read --out`)
  * are absent on purpose — they report through `noteExternalWrite` or, for the
  * registry, through `REGISTRY_WRITE_COMMANDS` below.
+ *
+ * MUST BE UPDATED when a write command is added or renamed. A command missing
+ * from both sets silently loses --dry-run redirection and its action log; the
+ * confirmation prompt is unaffected, since that lives at the call site. The
+ * `[regression] file safety — command coverage` suite catches a rename (every
+ * listed name has to resolve to a real command) but cannot catch a brand-new
+ * command nobody classified.
  */
 const VAULT_WRITE_COMMANDS = new Set([
   "init",
@@ -1046,17 +1055,13 @@ program
 
       if (opts.out) await ensureOverwritable(outPath, "Output file");
 
-      if (isDryRun()) {
-        // Same created/modified distinction the snapshot diff makes elsewhere;
-        // previewing an overwrite must not read as a fresh file.
-        const existed = fs.existsSync(outPath);
-        console.error(chalk.bold.cyan("Dry run — no files were written."));
-        console.error(`  ${existed ? chalk.yellow("~") : chalk.green("+")} ${outPath}`);
-        return;
-      }
+      // Record before writing, then let closeWriteScope render it — one
+      // implementation of the action log and the dry-run banner, so the two
+      // can't drift. It also picks created vs modified from what is on disk.
+      noteExternalWrite(outPath);
+      if (isDryRun()) return;
 
       await mkdir(pathMod.dirname(outPath), { recursive: true });
-      noteExternalWrite(outPath);
       await writeFile(outPath, html, "utf-8");
 
       if (opts.out) {
@@ -1720,6 +1725,7 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
   console.log(chalk.dim(`  ☁ Fetching from PromptOwl cloud...`));
 
   const res = await fetch(`${apiUrl}/v1/packs/${org}/${packName}/inject`, {
+    ...NO_REDIRECT,
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1727,6 +1733,7 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
     },
     body: JSON.stringify({ selector: `pack:${packName}`, format: "markdown" }),
   });
+  assertNotRedirected(res, "The cloud endpoint");
 
   if (res.status === 429) {
     const body = await res.json() as { message?: string; upgrade_url?: string };
@@ -2236,6 +2243,7 @@ program
 
     try {
       const res = await fetch(url, {
+        ...NO_REDIRECT,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -2243,6 +2251,9 @@ program
         },
         body: JSON.stringify(body),
       });
+      // A validated https:// server that answers 3xx would otherwise resend
+      // every document body to an unvalidated destination.
+      assertNotRedirected(res, "--server");
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -2510,7 +2521,7 @@ vaultCmd
   .description("Register a vault path under an alias (path defaults to the vault in the current directory)")
   .option("--description <text>", "Short label for this alias")
   .option("--set-default", "Make this the default vault")
-  .option("--force", "Overwrite an existing alias")
+  // No local --force: the global one (see the root command) covers it.
   .action(async (alias: string, path: string | undefined, opts) => {
     try {
       // With no explicit path, "register the vault I'm in" — resolve strictly
@@ -2536,8 +2547,7 @@ vaultCmd
       const reg = addVault(alias, target, {
         description: opts.description,
         setDefault: opts.setDefault,
-        // A global --force means the same thing here as the local one.
-        force: opts.force || isForce(),
+        force: isForce(),
       });
       const isDefault = reg.default === alias;
       console.log(

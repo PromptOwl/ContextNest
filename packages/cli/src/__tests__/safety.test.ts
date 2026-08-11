@@ -72,6 +72,39 @@ describe("snapshot + diffSnapshots", () => {
     expect([...snap(root).keys()]).toEqual(["a.md"]);
   });
 
+  it("prunes a nested node_modules — a monorepo vault has several", () => {
+    mkdirSync(join(root, "pkg", "node_modules", "dep"), { recursive: true });
+    writeFileSync(join(root, "pkg", "node_modules", "dep", "i.js"), "x");
+    writeFileSync(join(root, "pkg", "keep.md"), "k");
+    expect([...snap(root).keys()]).toEqual(["pkg/keep.md"]);
+  });
+
+  it("does NOT prune a generic build-ish name below the root", () => {
+    // A vault is free-form: nodes/build/pipeline.md is a legitimate document.
+    // Pruning by basename at any depth would make it invisible to both the
+    // action log and the dry-run sandbox copy.
+    for (const name of ["build", "out", "dist", "target", "coverage", "venv"]) {
+      mkdirSync(join(root, "nodes", name), { recursive: true });
+      writeFileSync(join(root, "nodes", name, "doc.md"), "d");
+    }
+    const keys = [...snap(root).keys()].sort();
+    expect(keys).toEqual([
+      "nodes/build/doc.md",
+      "nodes/coverage/doc.md",
+      "nodes/dist/doc.md",
+      "nodes/out/doc.md",
+      "nodes/target/doc.md",
+      "nodes/venv/doc.md",
+    ]);
+  });
+
+  it("does prune those same names at the vault root", () => {
+    mkdirSync(join(root, "dist"), { recursive: true });
+    writeFileSync(join(root, "dist", "bundle.js"), "x");
+    writeFileSync(join(root, "a.md"), "a");
+    expect([...snap(root).keys()]).toEqual(["a.md"]);
+  });
+
   it("does not follow symlinks out of the tree", () => {
     writeFileSync(join(outside, "secret.txt"), "secret");
     try {

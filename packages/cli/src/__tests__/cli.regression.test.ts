@@ -1306,3 +1306,92 @@ describe("[regression] file safety — dry-run fidelity", () => {
     expect(readFileSync(outFile, "utf-8")).toBe("PRE-EXISTING");
   });
 });
+
+// ─── file safety — consent gate coverage ─────────────────────────────────────
+
+describe("[regression] file safety — command coverage", () => {
+  // VAULT_WRITE_COMMANDS / REGISTRY_WRITE_COMMANDS in index.ts are
+  // hand-maintained. A rename that misses them costs those commands their
+  // --dry-run sandbox and action log with no other symptom, so assert every
+  // listed name still resolves to a real command.
+  const CLASSIFIED = [
+    "init", "add", "update", "delete", "publish", "index", "welcome",
+    "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
+    "vault add", "vault describe", "vault remove", "vault default",
+  ];
+
+  it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {
+    const res = runCtxResult(tmp, [...name.split(" "), "--help"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Usage:/);
+  });
+
+  // Every destructive command must refuse without a TTY unless consent was
+  // given up front. delete / vault remove are covered above; these are the
+  // rest of the set the PR description calls out.
+  it("checkpoint rebuild refuses without --yes", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/cp", "--title", "CP"]);
+    const res = runCtxResult(tmp, ["checkpoint", "rebuild"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Refusing without confirmation/);
+  });
+
+  it("push refuses without --yes", async () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/sendable", "--title", "Sendable"]);
+    const server = await startMockEngine(() => ({
+      published: 1,
+      context_md_updated: false,
+      node_ids: ["n0"],
+    }));
+    try {
+      const res = runCtxResult(tmp, [
+        "push", "--server", server.url, "--nest", "n1", "--key", "cnst_k",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toMatch(/Refusing without confirmation/);
+      // Nothing reached the server.
+      expect(server.lastBody()).toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("drift approve refuses without --yes", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/policy3", "--title", "Policy", "--body", "original"]);
+    appendFileSync(join(tmp, "nodes", "policy3.md"), "\n\nout-of-band edit\n");
+    const staged = JSON.parse(runCtx(tmp, ["drift", "stage", "nodes/policy3", "--json"]));
+
+    const res = runCtxResult(tmp, ["drift", "approve", "nodes/policy3", staged.suggestion_id]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Refusing without confirmation/);
+    // The canonical document was not rewritten.
+    expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy3", "--json"])).count).toBe(1);
+  });
+});
+
+// ─── file safety — vault layout collisions ───────────────────────────────────
+
+describe("[regression] file safety — generic folder names in a vault", () => {
+  // The prune list keeps node_modules out of the snapshot and the dry-run copy.
+  // Matching those names at any depth would make real documents invisible: a
+  // vault is free-form, and "build" / "out" / "target" are ordinary words.
+  beforeEach(() => initVault(tmp));
+
+  it("logs writes to a document folder whose name collides with a build dir", () => {
+    const res = runCtxResult(tmp, ["add", "nodes/build/pipeline", "--title", "Pipeline"]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toContain("+ nodes/build/pipeline.md");
+  });
+
+  it("previews such a document against a complete sandbox copy", () => {
+    runCtx(tmp, ["add", "nodes/out/formats", "--title", "Formats", "--body", "original"]);
+    const res = runCtxResult(tmp, ["update", "nodes/out/formats", "--body", "revised", "--dry-run"]);
+    expect(res.status).toBe(0);
+    // Modified, not created — the subtree made it into the sandbox copy.
+    expect(res.stderr).toContain("~ nodes/out/formats.md");
+    expect(readFileSync(join(tmp, "nodes", "out", "formats.md"), "utf-8")).toContain("original");
+  });
+});

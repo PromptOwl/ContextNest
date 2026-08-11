@@ -55,28 +55,38 @@ export function isForce(): boolean {
 // ─── Vault snapshots ────────────────────────────────────────────────────────
 
 /**
- * Directories never walked or copied. A vault often lives at the root of a
- * real project (`ctx init` in a codebase), so without this the snapshot would
- * hash node_modules and the dry-run copy would duplicate it.
+ * A vault often lives at the root of a real project (`ctx init` in a codebase),
+ * so the snapshot would otherwise hash node_modules and the dry-run copy would
+ * duplicate it. But a vault is also free-form — `ctx add nodes/build/pipeline`
+ * is perfectly legal — so pruning by basename at any depth would make real
+ * documents invisible to both the action log and the sandbox copy.
+ *
+ * Hence two lists. Names that are never a plausible document folder are pruned
+ * wherever they appear (a monorepo has node_modules several levels down).
+ * Ordinary English words that merely happen to be build-output conventions are
+ * pruned only at the vault root, where they are the tool's directory rather
+ * than the user's.
  */
-const PRUNE = new Set([
+const PRUNE_ANYWHERE = new Set([
   "node_modules",
   ".git",
   ".hg",
   ".svn",
-  "dist",
-  "build",
-  "out",
-  "coverage",
   ".next",
   ".nuxt",
   ".turbo",
   ".venv",
-  "venv",
   "__pycache__",
-  "target",
   ".cache",
 ]);
+
+/** Pruned only as a direct child of the scope root. See PRUNE_ANYWHERE. */
+const PRUNE_AT_ROOT = new Set(["dist", "build", "out", "coverage", "target", "venv"]);
+
+/** @param depth 0 for a direct child of the scope root. */
+function shouldPrune(name: string, depth: number): boolean {
+  return PRUNE_ANYWHERE.has(name) || (depth === 0 && PRUNE_AT_ROOT.has(name));
+}
 
 /** Above this, auditing costs more than it's worth — the log is skipped. */
 const MAX_SCAN_FILES = 20_000;
@@ -123,7 +133,8 @@ export function snapshot(root: string): Snapshot | null {
       if (entry.isSymbolicLink()) continue;
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (!PRUNE.has(entry.name)) stack.push(childRel);
+        const depth = rel === "" ? 0 : rel.split("/").length;
+        if (!shouldPrune(entry.name, depth)) stack.push(childRel);
         continue;
       }
       if (!entry.isFile()) continue;
@@ -180,12 +191,29 @@ export function realRootPath(): string | null {
   return originalRoot;
 }
 
-/** Copy a directory tree, skipping pruned subtrees and never resolving links. */
+/**
+ * Copy a directory tree, skipping pruned subtrees and never resolving links.
+ *
+ * The filter must prune on exactly the same rule as `snapshot()`, or a dry run
+ * would preview against a tree the action log then reports differently.
+ *
+ * ponytail: a full byte copy, so a dry run costs the size of the vault rather
+ * than the size of the change. Fine for markdown (and MAX_SCAN_FILES bounds it
+ * anyway). Hardlinks would be cheaper but are unsafe — not every engine write
+ * goes through write-temp-then-rename, and an in-place truncate would reach
+ * through the link into the real vault, which is the one thing a dry run must
+ * never do. If large vaults become a problem, use a filesystem-level reflink
+ * (`cp --reflink`, ReFS/APFS clone) where available.
+ */
 function copyTree(from: string, to: string): Promise<void> {
   return fs.promises.cp(from, to, {
     recursive: true,
     verbatimSymlinks: true,
-    filter: (src) => !PRUNE.has(pathMod.basename(src)),
+    filter: (src) => {
+      const rel = pathMod.relative(from, src);
+      if (rel === "") return true; // the root itself
+      return !shouldPrune(pathMod.basename(src), rel.split(pathMod.sep).length - 1);
+    },
   });
 }
 
@@ -407,7 +435,8 @@ export async function ensureOverwritable(absPath: string, label = "File"): Promi
 
 // ─── Network egress ─────────────────────────────────────────────────────────
 
-const LOOPBACK_NAMES = new Set(["localhost", "::1", "[::1]"]);
+// `new URL(...).hostname` always brackets IPv6, so a bare "::1" never appears.
+const LOOPBACK_NAMES = new Set(["localhost", "[::1]"]);
 /** The whole of 127.0.0.0/8 is loopback, not just 127.0.0.1. */
 const LOOPBACK_V4 = /^127\.(?:\d{1,3}\.){2}\d{1,3}$/;
 
@@ -441,5 +470,32 @@ export function assertSafeEndpoint(raw: string, what: string): URL {
   throw new Error(
     `${what} uses plaintext HTTP (${url.origin}). Vault contents and your API key would be sent unencrypted. ` +
       `Use https://, a localhost address, or pass --force to accept the risk.`,
+  );
+}
+
+/**
+ * `fetch` options that keep a validated endpoint validated.
+ *
+ * Checking the URL we were given only covers the first hop: by default `fetch`
+ * follows a 3xx, so a validated `https://` server could redirect the request —
+ * document bodies and all — to plaintext or to another host. The Fetch spec
+ * strips `Authorization` across origins, but the vault contents still travel.
+ * Refusing to follow makes the endpoint that was checked the endpoint that is
+ * used.
+ */
+export const NO_REDIRECT: RequestInit = { redirect: "manual" };
+
+/**
+ * Reject a response that tried to send us somewhere else. Pair with
+ * `NO_REDIRECT`, which turns a 3xx into a returned response rather than a
+ * silently-followed hop.
+ */
+export function assertNotRedirected(res: Response, what: string): void {
+  if (res.status < 300 || res.status >= 400) return;
+  const location = res.headers.get("location");
+  throw new Error(
+    `${what} redirected (${res.status}${location ? ` → ${location}` : ""}). ` +
+      `Refusing to follow: the destination has not been validated, and vault contents would travel with the request. ` +
+      `Point --server at the final URL instead.`,
   );
 }
