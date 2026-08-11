@@ -15,3 +15,9 @@ fixtures/*
 # Test coverage output
 coverage/
 
+# MCPB bundle build output (see mcpb/README.md) — the manifest is tracked, the
+# vendored deps and the packed bundle are not.
+*.mcpb
+mcpb/package.json
+mcpb/package-lock.json
+

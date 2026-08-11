@@ -1,0 +1,44 @@
+{
+  "manifest_version": "0.3",
+  "name": "contextnest",
+  "display_name": "Context Nest",
+  "version": "1.2.1",
+  "description": "Governed, versioned, AI-ready context — query a structured knowledge base instead of dumping files into the prompt.",
+  "author": {
+    "name": "PromptOwl",
+    "email": "hello@promptowl.ai",
+    "url": "https://promptowl.ai"
+  },
+  "homepage": "https://github.com/PromptOwl/ContextNest",
+  "documentation": "https://github.com/PromptOwl/ContextNest#readme",
+  "support": "https://github.com/PromptOwl/ContextNest/issues",
+  "license": "AGPL-3.0",
+  "keywords": [
+    "context",
+    "governance",
+    "knowledge-base",
+    "rag",
+    "versioning"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "node_modules/@promptowl/contextnest-mcp-server/dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/node_modules/@promptowl/contextnest-mcp-server/dist/index.js"
+      ],
+      "env": {
+        "CONTEXTNEST_VAULT_PATH": "${user_config.context_path}"
+      }
+    }
+  },
+  "user_config": {
+    "context_path": {
+      "type": "directory",
+      "title": "Vault directory",
+      "description": "The directory containing your .context folder.",
+      "required": true
+    }
+  }
+}

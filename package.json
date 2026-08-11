@@ -11,6 +11,7 @@
     "clean": "pnpm -r clean",
     "plugins:sync": "node scripts/sync-plugins.mjs",
     "plugins:check": "node scripts/sync-plugins.mjs --check",
+    "mcpb:check": "node scripts/check-mcpb-version.mjs",
     "prepublish": "pnpm -r build",
     "version-packages": "changeset version && pnpm install --lockfile-only",
     "release": "pnpm prepublish && changeset publish"
