@@ -82,7 +82,11 @@ describe("ctx vault — central registry", () => {
     expect(list).toContain("work");
     expect(list).toContain("Work vault");
 
-    run(["vault", "remove", "work"], tmp);
+    // Unregistering is destructive, so a non-interactive caller must say --yes.
+    expect(() => run(["vault", "remove", "work"], tmp)).toThrow();
+    expect(run(["vault", "list"], tmp)).toContain("work");
+
+    run(["vault", "remove", "work", "--yes"], tmp);
     const listAfter = run(["vault", "list"], tmp);
     expect(listAfter).not.toContain("work");
   });
