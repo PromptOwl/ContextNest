@@ -101,6 +101,41 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx reconstruct <path> <version>` — Reconstruct a specific version. A version the history does not contain is now refused rather than answered with a neighbouring version's content
 - `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it)
 
+### File Safety
+
+No command writes to your working directory without telling you. Three global
+flags govern every write:
+
+| Flag | Effect |
+|------|--------|
+| `--dry-run` | Runs the command against a throwaway copy of the vault, prints the exact files it *would* touch, and leaves your vault untouched |
+| `-y, --yes` | Skips confirmation prompts — the "prior explicit consent" for scripts and CI |
+| `--force`   | Overwrites an existing file, repoints a taken vault alias, or allows a plaintext-HTTP push |
+
+```bash
+ctx add nodes/spec --title "Spec" --dry-run   # preview, writes nothing
+ctx delete nodes/spec --yes                   # destructive, so it needs the flag
+ctx read nodes/spec --html --out out.html     # refuses to clobber out.html without --force
+```
+
+**Action log.** Every write command ends with the list of files it created
+(`+`), modified (`~`) or deleted (`-`), computed by comparing the vault before
+and after — so it reflects what actually happened, not what was intended. The
+log goes to **stderr**, leaving `--json` output and redirected stdout clean.
+
+**Confirmation.** On a terminal, write commands ask before proceeding.
+Destructive ones (`delete`, `checkpoint rebuild`, `drift approve`,
+`vault remove`, re-running `init` over an existing vault, overwriting an
+`--out` file, `push`) default to *no*. Without a TTY nothing blocks on stdin:
+additive commands take their own argv as consent, destructive ones **refuse**
+unless `--yes` or `--force` was passed.
+
+**Network egress.** `ctx push` lists the documents leaving your machine and
+asks before sending them. Plaintext HTTP to a non-loopback host is refused —
+it would put both the documents and your API key on the wire in the clear.
+Prefer `CONTEXTNEST_API_KEY` over `--key`: command-line arguments are visible
+to other processes and land in shell history.
+
 ### Errors
 
 Every failure prints as a single line — `Error [CODE]: message` for engine
