@@ -5,8 +5,8 @@
 
 import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
-import fg from "fast-glob";
 import yaml from "js-yaml";
+import { globFiles } from "./glob.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
@@ -216,25 +216,19 @@ export class NestStorage {
       patterns = ["**/*.md"];
     }
 
-    const files = await fg(patterns, {
-      cwd: this.root,
-      ignore: [
-        "**/node_modules/**",
-        "**/.versions/**",
-        "**/.context/**",
-        "**/INDEX.md",
-        "CONTEXT.md",
-        "context.yaml",
-        // Agent-config / scaffold files are not knowledge nodes.
-        "**/CLAUDE.md",
-        "**/GEMINI.md",
-        "**/AGENTS.md",
-        "**/README.md",
-      ],
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const files = await globFiles(this.root, patterns, [
+      "**/node_modules/**",
+      "**/.versions/**",
+      "**/.context/**",
+      "**/INDEX.md",
+      "CONTEXT.md",
+      "context.yaml",
+      // Agent-config / scaffold files are not knowledge nodes.
+      "**/CLAUDE.md",
+      "**/GEMINI.md",
+      "**/AGENTS.md",
+      "**/README.md",
+    ]);
 
     const nodes: ContextNode[] = [];
     for (const file of files.sort()) {
@@ -1058,9 +1052,8 @@ export class NestStorage {
   /** List all suggestion IDs staged for a document, sorted by file name. */
   async listSuggestionIds(docId: string): Promise<string[]> {
     const dir = this.suggestionDir(docId);
-    const files = await fg("*.meta.yaml", { cwd: dir, dot: false }).catch(
-      () => [] as string[],
-    );
+    // A missing suggestions directory yields no matches rather than throwing.
+    const files = await globFiles(dir, "*.meta.yaml");
     return files
       .map((f) => f.replace(/\.meta\.yaml$/, ""))
       .sort();
@@ -1169,12 +1162,7 @@ export class NestStorage {
    * Read all packs from packs/ directory (§3).
    */
   async readPacks(): Promise<Pack[]> {
-    const packFiles = await fg("packs/**/*.yml", {
-      cwd: this.root,
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const packFiles = await globFiles(this.root, "packs/**/*.yml");
     const packs: Pack[] = [];
     for (const file of packFiles.sort()) {
       const content = await readFile(join(this.root, file), "utf-8");
@@ -1229,13 +1217,10 @@ export class NestStorage {
   async findAllHistories(
     onUnreadable?: (docId: string, reason: string) => void,
   ): Promise<Map<string, DocumentHistory>> {
-    const historyFiles = await fg("**/.versions/*/history.yaml", {
-      cwd: this.root,
-      dot: true,
-      // Skip unreadable directories instead of crashing checkpoint rebuild
-      // on a single permission-denied dir under the vault root.
-      suppressErrors: true,
-    });
+    const historyFiles = await globFiles(
+      this.root,
+      "**/.versions/*/history.yaml",
+    );
 
     const histories = new Map<string, DocumentHistory>();
     for (const file of historyFiles) {

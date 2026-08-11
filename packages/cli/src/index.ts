@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 import { Command, Help } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
-import chalk from "chalk";
+import chalk from "./color.js";
 import {
   NestStorage,
   validateDocument,

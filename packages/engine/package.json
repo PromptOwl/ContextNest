@@ -53,21 +53,15 @@
   },
   "dependencies": {
     "diff": "^9.0.0",
-    "fast-glob": "^3.3.0",
-    "gray-matter": "^4.0.3",
     "js-yaml": "^4.2.0",
     "minisearch": "^7.0.0",
-    "remark-gfm": "^4.0.0",
-    "remark-parse": "^11.0.0",
     "toposort": "^2.0.2",
-    "unified": "^11.0.0",
     "zod": "^3.24.0",
     "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/diff": "^7.0.0",
     "@types/js-yaml": "^4.0.9",
-    "@types/mdast": "^4.0.4",
     "@types/node": "^22.0.0",
     "@types/toposort": "^2.0.7",
     "tsup": "^8.0.0",

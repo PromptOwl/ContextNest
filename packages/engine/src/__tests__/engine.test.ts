@@ -447,6 +447,41 @@ Rate limiting content.
     expect(section).toContain("Error handling content here.");
     expect(section).not.toContain("Rate limiting content.");
   });
+
+  it("ignores links and headings inside fenced code blocks", () => {
+    const body = [
+      "# Title",
+      "",
+      "See [Real](contextnest://nodes/real).",
+      "",
+      "```md",
+      "# Fake Heading",
+      "[Sample](contextnest://nodes/sample)",
+      "```",
+      "",
+      "Also `[Inline](contextnest://nodes/inline)` is code.",
+      "",
+      "## Fake Heading",
+      "",
+      "Body of the real fake-heading section.",
+    ].join("\n");
+
+    expect(extractContextLinks(body)).toEqual(["contextnest://nodes/real"]);
+    // The heading inside the fence must not shadow the real one below it.
+    expect(extractSection(body, "fake-heading")).toBe(
+      "## Fake Heading\n\nBody of the real fake-heading section.",
+    );
+  });
+
+  it("extracts autolinks and handles CRLF bodies", () => {
+    const body =
+      "# Title\r\n\r\nSee <contextnest://nodes/auto>.\r\n\r\n## Error Handling\r\n\r\nContent.\r\n\r\n# Next\r\n\r\nOther.\r\n";
+
+    expect(extractContextLinks(body)).toEqual(["contextnest://nodes/auto"]);
+    const section = extractSection(body, "error-handling");
+    expect(section).toContain("Content.");
+    expect(section).not.toContain("Other.");
+  });
 });
 
 // ─── Integrity Tests ──────────────────────────────────────────────────────────

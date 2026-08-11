@@ -26,6 +26,18 @@ Getting started is one question: *what are you trying to capture?* Point your ag
 
 See all starters: `ctx init --list-starters`
 
+### What the install puts on your disk
+
+Ten packages, three levels deep, and **no install scripts** — nothing of ours executes when you install. For a lean install without terminal colour:
+
+```bash
+npm install -g @promptowl/contextnest-cli --omit=optional
+```
+
+Every runtime package, why it is there, and its licence is published in
+**[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
+uploads the machine-readable graph as the `dependency-graph` build artifact.
+
 ## For the solo developer
 
 Your brain, cached for your agent.

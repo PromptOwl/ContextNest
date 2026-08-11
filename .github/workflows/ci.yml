@@ -57,6 +57,46 @@ jobs:
       - name: Regression tests (CLI + MCP server)
         run: pnpm test:regression
 
+  dependencies:
+    name: Dependency graph
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Fails if DEPENDENCIES.md no longer matches the installed tree — adding
+      # or removing a dependency must land together with the published graph.
+      - name: Verify the published dependency graph is current
+        run: pnpm deps:check
+
+      # What a dev installing from npm actually gets, resolved by npm itself
+      # rather than pnpm. Informational: printed for review, never gates.
+      - name: Resolve the tree with npm
+        run: npm ls --all --omit=dev --prefix packages/cli || true
+
+      - name: Upload the dependency graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph
+          path: |
+            DEPENDENCIES.md
+            dependency-graph.json
+
   docker:
     name: Docker image (MCP server)
     runs-on: ubuntu-latest
