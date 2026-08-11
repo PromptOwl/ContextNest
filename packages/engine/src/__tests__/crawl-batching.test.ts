@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NestStorage } from "../storage.js";
@@ -70,5 +70,35 @@ describe("whole-vault crawls batch without losing or reordering files", () => {
     expect(new Set(unreadable).size).toBe(badCount);
     expect(histories.has("nodes/doc-001")).toBe(true);
     expect(histories.has("nodes/doc-000")).toBe(false);
+  });
+
+  it("writes an INDEX.md for every folder, each listing its own documents", async () => {
+    // regenerateIndex is the third whole-vault pass a publish triggers, and its
+    // per-folder writes batch too. One folder per document puts COUNT distinct
+    // INDEX.md writes through the batching — a fold that dropped a batch, or
+    // reused one batch's content for another, shows up as a missing file or an
+    // index listing the wrong document.
+    for (let i = 0; i < COUNT; i++) {
+      await mkdir(join(root, "nodes", `topic-${pad(i)}`), { recursive: true });
+      await writeFile(
+        join(root, "nodes", `topic-${pad(i)}`, "doc.md"),
+        `---\ntitle: Only ${pad(i)}\ntype: document\nstatus: published\n---\n\nbody ${i}\n`,
+        "utf-8",
+      );
+    }
+
+    await storage.regenerateIndex();
+
+    for (let i = 0; i < COUNT; i++) {
+      const index = await readFile(
+        join(root, "nodes", `topic-${pad(i)}`, "INDEX.md"),
+        "utf-8",
+      );
+      expect(index).toContain(`Only ${pad(i)}`);
+      // Its own document only — not a neighbour's, which is what a batch whose
+      // content got crossed with another's would produce.
+      const neighbour = pad((i + 1) % COUNT);
+      expect(index).not.toContain(`Only ${neighbour}`);
+    }
   });
 });

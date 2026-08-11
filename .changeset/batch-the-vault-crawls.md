@@ -13,3 +13,10 @@ crawls, which is what made importing a few hundred documents take minutes.
 Batching overlaps those round trips. Ordering and error handling are unchanged:
 documents still come back sorted by id, and an unreadable history is still
 skipped and reported through `onUnreadable` exactly once.
+
+Bulk publish already batched its per-document work through its own sliding
+window; both now share one helper, so there is a single implementation of
+"bounded-parallel map, preserving order". Publish keeps its own (lower) default
+and its caller-configurable `concurrency` option — its unit is a document, each
+costing several file operations, so the two bounds describe different amounts of
+in-flight I/O.

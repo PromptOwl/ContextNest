@@ -17,6 +17,7 @@ import {
 import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+import { mapInBatches } from "./concurrency.js";
 import type {
   ContextNode,
   NestConfig,
@@ -43,31 +44,6 @@ import {
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
 
-/** Files read per parallel batch by the whole-vault crawls below. */
-const READ_CONCURRENCY = 32;
-
-/**
- * Map over items in bounded-parallel batches, preserving input order.
- *
- * The vault crawls (discoverDocuments, findAllHistories) used to read every
- * file with `await` inside a `for` loop. On a local disk that is fine; on a
- * network-backed mount (Cloud Storage via gcsfuse) each read is a round trip,
- * so N files cost N latencies in series — and a publish runs three such crawls,
- * which is what made importing a few hundred documents take minutes. Batching
- * overlaps the round trips instead.
- */
-async function mapInBatches<T, R>(
-  items: T[],
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  for (let i = 0; i < items.length; i += READ_CONCURRENCY) {
-    const slice = items.slice(i, i + READ_CONCURRENCY);
-    const done = await Promise.all(slice.map(fn));
-    for (let k = 0; k < done.length; k++) out[i + k] = done[k];
-  }
-  return out;
-}
 
 /**
  * Normalize a user-supplied document path/slug into a canonical document id.
