@@ -17,6 +17,7 @@ import {
 import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+import { mapInBatches } from "./concurrency.js";
 import type {
   ContextNode,
   NestConfig,
@@ -42,6 +43,7 @@ import {
 
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
+
 
 /**
  * Normalize a user-supplied document path/slug into a canonical document id.
@@ -246,8 +248,7 @@ export class NestStorage {
       "**/README.md",
     ]);
 
-    const nodes: ContextNode[] = [];
-    for (const file of files.sort()) {
+    const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
       const content = await readFile(filePath, "utf-8");
       const id = file.replace(/\.md$/, "");
@@ -264,10 +265,11 @@ export class NestStorage {
       const isRootLevel = !file.includes("/");
       const authoredKeys = Object.keys(node.frontmatter).filter((k) => k !== "status");
       if (layout === "structured" && isRootLevel && authoredKeys.length === 0) {
-        continue;
+        return null;
       }
-      nodes.push(node);
-    }
+      return node;
+    });
+    const nodes = parsed.filter((n): n is ContextNode => n !== null);
 
     const includeRetired = options.includeRetired || options.includeSuperseded;
     if (includeRetired) return nodes;
@@ -390,16 +392,19 @@ export class NestStorage {
       folders.get(folder)!.push(doc);
     }
 
-    for (const [folder, folderDocs] of folders) {
-      if (folder === ".") continue;
-      const title = folder
-        .split("/")
-        .pop()!
-        .replace(/-/g, " ")
-        .replace(/\b\w/g, (c) => c.toUpperCase());
-      const indexMd = generateIndexMd(folder, title, folderDocs);
-      await this.writeIndexMd(folder, indexMd);
-    }
+    // Distinct folders write distinct INDEX.md files, so the writes are
+    // independent — batch them (an imported vault can carry hundreds).
+    await mapInBatches(
+      [...folders].filter(([folder]) => folder !== "."),
+      async ([folder, folderDocs]) => {
+        const title = folder
+          .split("/")
+          .pop()!
+          .replace(/-/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+        await this.writeIndexMd(folder, generateIndexMd(folder, title, folderDocs));
+      },
+    );
 
     const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
     const agentConfigs = generateAgentConfigs({
@@ -1238,29 +1243,36 @@ export class NestStorage {
       "**/.versions/*/history.yaml",
     );
 
-    const histories = new Map<string, DocumentHistory>();
-    for (const file of historyFiles) {
+    // Read in batches, then fold in input order so the map's iteration order
+    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
+    const read = await mapInBatches(historyFiles, async (file) => {
       // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
       const parts = file.split("/");
       const versionsIdx = parts.indexOf(".versions");
-      if (versionsIdx === -1) continue;
+      if (versionsIdx === -1) return null;
       const docDir = parts.slice(0, versionsIdx).join("/");
       const docName = parts[versionsIdx + 1];
       const docId = docDir ? `${docDir}/${docName}` : docName;
-
-      let raw: unknown;
       try {
-        raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+        const raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+        return { docId, raw, error: null as string | null };
       } catch (err) {
-        onUnreadable?.(docId, err instanceof Error ? err.message : String(err));
+        return { docId, raw: null, error: err instanceof Error ? err.message : String(err) };
+      }
+    });
+
+    const histories = new Map<string, DocumentHistory>();
+    for (const entry of read) {
+      if (!entry) continue;
+      if (entry.error !== null) {
+        onUnreadable?.(entry.docId, entry.error);
         continue;
       }
-
-      const result = documentHistorySchema.safeParse(raw);
+      const result = documentHistorySchema.safeParse(entry.raw);
       if (result.success) {
-        histories.set(docId, result.data as DocumentHistory);
+        histories.set(entry.docId, result.data as DocumentHistory);
       } else {
-        onUnreadable?.(docId, `history.yaml failed schema validation`);
+        onUnreadable?.(entry.docId, `history.yaml failed schema validation`);
       }
     }
 

@@ -10,6 +10,7 @@ import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
+import { mapInBatches } from "./concurrency.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -217,11 +218,10 @@ export async function publishDocuments(
     }
   };
 
-  // Bounded-concurrency pass — no cross-doc dependency, so a simple sliding
-  // window is enough (avoids pulling in a p-limit dependency).
-  for (let i = 0; i < ids.length; i += concurrency) {
-    await Promise.all(ids.slice(i, i + concurrency).map(publishOne));
-  }
+  // Bounded-concurrency pass — no cross-doc dependency, so batching is enough
+  // (the shared helper avoids pulling in a p-limit dependency). publishOne
+  // records its own outcome, so the returned array is unused.
+  await mapInBatches(ids, publishOne, concurrency);
 
   // ONE checkpoint sealing every doc published above (createCheckpointFromVault
   // snapshots all published docs in the vault under the checkpoint lock).
