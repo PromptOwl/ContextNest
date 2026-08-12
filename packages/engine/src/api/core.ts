@@ -468,11 +468,36 @@ const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-create and publish many nodes in one pass (folder/batch import). Seals one checkpoint for the batch; failures are reported per-document, never aborting the rest.",
-  input: z.object({ documents: z.array(importDoc).min(1) }),
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, and/or `ids` for nodes already written into the vault. Both modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+  // Both inputs are optional and validated in the executor rather than through
+  // a refined union: `.refine()` produces a ZodEffects, which degrades to a
+  // useless JSON Schema through zod-to-json-schema — and MCP publishes
+  // `inputJsonSchema(op)` verbatim as the tool schema.
+  input: z.object({
+    documents: z
+      .array(importDoc)
+      .optional()
+      .describe("New nodes to create and publish"),
+    ids: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Ids of documents ALREADY written into the vault, published in the same batch. Ids are preserved as-is — use this when the files carry their own paths/frontmatter (folder import).",
+      ),
+  }),
   output: z.object({
-    created: z.array(z.object({ id: z.string(), version: z.number().int().min(1) })),
-    failed: z.array(z.object({ title: z.string(), error: z.string() })),
+    published: z.array(z.object({ id: z.string(), version: z.number().int().min(1) })),
+    // `title` identifies a failure from `documents`, `id` one from `ids` —
+    // exactly one is set per entry.
+    failed: z.array(
+      z.object({
+        id: z.string().optional(),
+        title: z.string().optional(),
+        error: z.string(),
+      }),
+    ),
+    /** The single checkpoint sealing the batch, or null if nothing published. */
+    checkpoint: z.number().int().nullable(),
   }),
   errors: ["VALIDATION_FAILED"],
 };

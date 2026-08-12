@@ -52,6 +52,8 @@ import {
   ALIAS_PATTERN,
   normalizeStatus,
   normalizeDocumentId,
+  isPublished,
+  isRejected,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -75,6 +77,8 @@ import {
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
+import { createEngineApi } from "@promptowl/contextnest-engine/api";
+import type { OperationContext } from "@promptowl/contextnest-engine/api";
 import type {
   ContextNode,
   Frontmatter,
@@ -1133,10 +1137,11 @@ program
 // ─── ctx publish ───────────────────────────────────────────────────────────────
 
 program
-  .command("publish <path>")
-  .description("Publish a document (bump version, create checkpoint)")
+  .command("publish [path]")
+  .description("Publish a document, or every unpublished document with --all")
   .option("-a, --author <email>", "Author email", "cli@contextnest.local")
   .option("-m, --message <note>", "Version note")
+  .option("--all", "Publish every unpublished document in the vault, in one batch")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -1144,6 +1149,20 @@ program
       return;
     }
     const storage = getStorage();
+
+    if (opts.all) {
+      if (path) {
+        console.error(chalk.red("Pass a path or --all, not both"));
+        process.exit(1);
+      }
+      await publishAll(storage, opts.author);
+      return;
+    }
+    if (!path) {
+      console.error(chalk.red("Missing path (or pass --all)"));
+      process.exit(1);
+    }
+
     const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
@@ -1158,6 +1177,55 @@ program
     console.log(`  Checkpoint: ${result.checkpointNumber}`);
     console.log(`  Chain hash: ${result.versionEntry.chain_hash}`);
   });
+
+/**
+ * `ctx publish --all` — bulk-publish through the engine's `context_import`
+ * operation rather than looping `publishDocument`. The loop is O(N²): every
+ * publish seals its own checkpoint and every checkpoint re-scans the whole
+ * vault. The operation seals ONE checkpoint and regenerates the index once.
+ */
+async function publishAll(storage: NestStorage, author: string): Promise<void> {
+  const docs = await storage.discoverDocuments();
+  // Rejected docs are deliberately excluded — the engine refuses to republish
+  // them (silent resurrection guard), so including them only fills failed[].
+  const ids = docs.filter((d) => !isPublished(d) && !isRejected(d)).map((d) => d.id);
+  if (ids.length === 0) {
+    console.log(chalk.dim("Nothing to publish — every document is already published."));
+    return;
+  }
+
+  const ctx: OperationContext = {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    rbac: permissiveRbac,
+    actor: author,
+    onProgress: (done, total) => {
+      // Single rewritten line; fall back to plain lines when piped to a file.
+      if (process.stdout.isTTY) {
+        process.stdout.write(`\rPublishing ${done}/${total}…`);
+      } else if (done === total) {
+        console.log(`Publishing ${done}/${total}`);
+      }
+    },
+  };
+
+  const result = await createEngineApi().run<{
+    published: { id: string; version: number }[];
+    failed: { id?: string; title?: string; error: string }[];
+    checkpoint: number | null;
+  }>("context_import", { ids }, ctx);
+
+  if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+  console.log(chalk.green(`Published ${result.published.length} document(s)`));
+  if (result.checkpoint !== null) console.log(`  Checkpoint: ${result.checkpoint}`);
+  for (const f of result.failed) {
+    console.log(chalk.yellow(`  failed ${f.id ?? f.title}: ${f.error}`));
+  }
+  // Same contract as `ctx validate` / `ctx verify`: a batch with failures exits
+  // non-zero so CI notices. exitCode, not exit(), so the summary still flushes.
+  if (result.failed.length > 0) process.exitCode = 1;
+}
 
 // ─── ctx history ───────────────────────────────────────────────────────────────
 

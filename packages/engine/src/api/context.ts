@@ -41,6 +41,14 @@ export interface OperationContext {
   readonly rbac?: RbacHook;
   /** Opaque actor identifier passed through to the rbac hook / audit trail. */
   readonly actor?: string;
+  /**
+   * Optional progress sink for long-running operations (bulk import/publish).
+   * It lives on the context, not in any operation's input, because inputs must
+   * stay JSON-serializable for the MCP/REST wire. In-process callers (CLI,
+   * Community) supply it; wire transports leave it undefined and the operation
+   * behaves identically.
+   */
+  readonly onProgress?: (done: number, total: number) => void;
 }
 
 /**

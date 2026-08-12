@@ -4,7 +4,7 @@
  */
 
 import type { ContextNode, VersionEntry } from "./types.js";
-import { NestStorage } from "./storage.js";
+import { NestStorage, assertSafeDocumentId } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
@@ -113,6 +113,10 @@ export interface BulkPublishOptions extends PublishOptions {
   concurrency?: number;
   /** Regenerate context.yaml / INDEX.md once after the batch (default true). */
   regenerateIndex?: boolean;
+  /** Fires once per document as it settles, published or failed. Advisory: with
+   * concurrency > 1 docs finish out of input order, so only the count is
+   * monotonic — it drives progress bars, not per-doc reporting. */
+  onProgress?: (done: number, total: number) => void;
 }
 
 export interface BulkPublishResult {
@@ -147,6 +151,26 @@ export async function publishDocuments(
   const concurrency = Math.max(1, options.concurrency ?? 16);
   const published: BulkPublishResult["published"] = [];
   const failed: BulkPublishResult["failed"] = [];
+  let settled = 0;
+
+  // Vet the batch before publishing anything. Ids reach here straight from
+  // callers (MCP tool arguments, CLI flags), and the per-doc work joins them
+  // onto the vault root verbatim — a `..` segment would read and OVERWRITE a
+  // file outside the vault. A duplicate is unsafe too: two publishOne calls in
+  // one concurrency window race the same history.yaml, and the losing write
+  // disappears while still being reported as published.
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const docId of docIds) {
+    if (seen.has(docId)) continue;
+    seen.add(docId);
+    try {
+      assertSafeDocumentId(docId);
+      ids.push(docId);
+    } catch (err) {
+      failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
 
   const publishOne = async (docId: string): Promise<void> => {
     try {
@@ -186,13 +210,17 @@ export async function publishDocuments(
       });
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      // Counter increments are safe unsynchronized — JS runs them on one thread;
+      // only the awaited I/O above overlaps.
+      options.onProgress?.(++settled, ids.length);
     }
   };
 
   // Bounded-concurrency pass — no cross-doc dependency, so a simple sliding
   // window is enough (avoids pulling in a p-limit dependency).
-  for (let i = 0; i < docIds.length; i += concurrency) {
-    await Promise.all(docIds.slice(i, i + concurrency).map(publishOne));
+  for (let i = 0; i < ids.length; i += concurrency) {
+    await Promise.all(ids.slice(i, i + concurrency).map(publishOne));
   }
 
   // ONE checkpoint sealing every doc published above (createCheckpointFromVault

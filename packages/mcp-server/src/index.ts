@@ -46,6 +46,9 @@ import {
 import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
 
+/** Engine operation catalog — schemas and implementations for `context_*` tools. */
+const engineApi = createEngineApi();
+
 // Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
 // throw; catch it here so the user gets a clean message on stderr instead of an
 // unhandled Node stack trace, then exit non-zero.
@@ -1135,6 +1138,35 @@ server.tool(
     };
   },
 );
+
+// ─── Tool: context_import ──────────────────────────────────────────────────────
+
+// First catalog-driven tool in this server: the schema, description and
+// implementation all come from the engine's operation catalog, so this surface
+// cannot drift from the CLI/Community ones. The SDK wants a ZodRawShape, so we
+// hand it the descriptor's own `.shape` rather than restating the schema here.
+const importOp = engineApi.getOperation("context_import");
+if (importOp) {
+  server.tool(
+    importOp.name,
+    importOp.description,
+    (importOp.input as z.ZodObject<z.ZodRawShape>).shape,
+    async (input) => {
+      // No onProgress — MCP has no progress channel; the operation is identical
+      // without one.
+      const result = await engineApi.run(importOp.name, input, {
+        storage,
+        query: new GraphQueryEngine(storage),
+        versions: new VersionManager(storage),
+        rbac: permissiveRbac,
+        actor: "mcp@contextnest.local",
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+}
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 
