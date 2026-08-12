@@ -49,7 +49,10 @@
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit -p tsconfig.json"
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "bench": "node bench/run.mjs",
+    "bench:check": "node bench/check.mjs",
+    "bench:profile": "node --cpu-prof --cpu-prof-dir=bench/profiles bench/run.mjs --sizes 1000"
   },
   "dependencies": {
     "diff": "^9.0.0",
