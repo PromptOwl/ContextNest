@@ -44,7 +44,6 @@ import {
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
 
-
 /**
  * Normalize a user-supplied document path/slug into a canonical document id.
  *

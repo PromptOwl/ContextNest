@@ -376,6 +376,26 @@ agent_instructions: |
 
 ## CLI Reference
 
+### File safety
+
+No `ctx` command writes to your working directory without saying so.
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Runs the command against a throwaway copy of the vault, prints the exact files it *would* touch, and leaves your vault untouched |
+| `-y, --yes` | Skips confirmation prompts — the "prior explicit consent" for scripts and CI |
+| `--force` | Overwrites an existing file, repoints a taken vault alias, or allows a plaintext-HTTP push |
+
+Every write command ends with an action log of the files created (`+`), modified
+(`~`) or deleted (`-`), written to stderr so `--json` output and redirected
+stdout stay clean. Interactive runs ask before writing; destructive commands
+default to "no".
+
+**For scripts:** `ctx delete`, `ctx checkpoint rebuild`, `ctx drift approve`,
+`ctx vault remove` and `ctx push` refuse to run without `--yes` (or `--force`)
+when there is no TTY. Additive commands proceed as before — a non-interactive
+caller is never blocked waiting on stdin.
+
 ### Choosing a vault
 
 By default `ctx` operates on the vault in (or above) the current directory. To
