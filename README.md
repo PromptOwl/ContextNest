@@ -26,6 +26,21 @@ Getting started is one question: *what are you trying to capture?* Point your ag
 
 See all starters: `ctx init --list-starters`
 
+### What the install puts on your disk
+
+**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install.
+The MCP server installs zero dependencies. For a lean install without terminal colour:
+
+```bash
+npm install -g @promptowl/contextnest-cli --omit=optional
+```
+
+That leaves exactly one package. The rest of the code is compiled into the published bundle rather
+than resolved from npm, so the install is deterministic — and every bundled package is listed with
+its version and licence alongside the installed ones in
+**[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
+uploads the machine-readable graph as the `dependency-graph` build artifact.
+
 ## For the solo developer
 
 Your brain, cached for your agent.
