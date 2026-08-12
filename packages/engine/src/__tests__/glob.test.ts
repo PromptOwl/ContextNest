@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { globFiles } from "../glob.js";
+import { globFiles, sharedBase } from "../glob.js";
 
 /**
  * Covers the pattern compiler that replaced fast-glob. The storage suites
@@ -73,5 +73,26 @@ describe("globFiles", () => {
 
   it("returns nothing for a directory that does not exist", async () => {
     expect(await globFiles(join(root, "nope"), "*.yaml")).toEqual([]);
+  });
+
+  it("finds scoped patterns without leaving their subtree", async () => {
+    // fast-glob computed a pattern's static base and only read that subtree.
+    // Losing that turned readPacks() — which runs on every query — into a full
+    // recursive scan of the vault, .versions history included.
+    expect(sharedBase(["packs/**/*.yml"])).toBe("packs");
+    expect(sharedBase(["nodes/.versions/victim/v*"])).toBe("nodes/.versions/victim");
+
+    // A leading wildcard, or patterns rooted in different places, still need
+    // the whole tree.
+    expect(sharedBase(["**/.versions/*/history.yaml"])).toBe("");
+    expect(sharedBase(["*.md", "nodes/**/*.md", "sources/**/*.md"])).toBe("");
+    expect(sharedBase(["*.meta.yaml"])).toBe("");
+
+    // Narrowing the walk must not change what comes back: paths stay relative
+    // to cwd, so patterns and ignores are unaffected.
+    expect((await globFiles(root, "packs/**/*.yml")).sort()).toEqual([
+      "packs/basics.yml",
+      "packs/nested/more.yml",
+    ]);
   });
 });

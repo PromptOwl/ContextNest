@@ -45,7 +45,7 @@ function globToRegExp(pattern: string, dot: boolean): RegExp {
  * must survive a single permission-denied subdirectory (this is what
  * fast-glob's `suppressErrors` bought us).
  */
-async function walkFiles(root: string): Promise<string[]> {
+async function walkFiles(root: string, base: string): Promise<string[]> {
   const files: string[] = [];
 
   async function walk(dir: string, prefix: string): Promise<void> {
@@ -67,8 +67,44 @@ async function walkFiles(root: string): Promise<string[]> {
     }
   }
 
-  await walk(root, "");
+  await walk(base ? join(root, base) : root, base);
   return files;
+}
+
+/**
+ * The leading directory segments of a pattern that contain no wildcard.
+ *
+ * `packs/**​/*.yml` can only match inside `packs/`, so there is no reason to
+ * read the rest of the vault. A final segment is never counted — it is the
+ * filename, not a directory to descend into.
+ */
+function staticBase(pattern: string): string[] {
+  const segments = pattern.split("/");
+  const base: string[] = [];
+  for (const segment of segments.slice(0, -1)) {
+    if (segment.includes("*")) break;
+    base.push(segment);
+  }
+  return base;
+}
+
+/**
+ * The deepest directory that could contain a match for every pattern. Patterns
+ * rooted in different places (or starting with a wildcard) fall back to `""`,
+ * which walks the whole tree — the same work fast-glob would have done.
+ *
+ * Exported for tests: the narrowing it performs is not observable in the
+ * returned paths, only in how much of the tree was read to produce them.
+ */
+export function sharedBase(patterns: string[]): string {
+  const bases = patterns.map(staticBase);
+  let shared = bases[0] ?? [];
+  for (const base of bases.slice(1)) {
+    let i = 0;
+    while (i < shared.length && i < base.length && shared[i] === base[i]) i++;
+    shared = shared.slice(0, i);
+  }
+  return shared.join("/");
 }
 
 /**
@@ -81,13 +117,14 @@ export async function globFiles(
   ignore: string[] = [],
   dot = false,
 ): Promise<string[]> {
-  const include = (Array.isArray(patterns) ? patterns : [patterns]).map((p) =>
-    globToRegExp(p, dot),
-  );
+  const list = Array.isArray(patterns) ? patterns : [patterns];
+  const include = list.map((p) => globToRegExp(p, dot));
   // Ignores always see dotted paths, so an exclusion cannot be dodged by one.
   const exclude = ignore.map((p) => globToRegExp(p, true));
 
-  const files = await walkFiles(cwd);
+  // Descend only into the subtree the patterns can match. Paths still come back
+  // relative to `cwd`, so patterns and ignores are unaffected by the narrowing.
+  const files = await walkFiles(cwd, sharedBase(list));
   return files.filter(
     (file) =>
       include.some((re) => re.test(file)) && !exclude.some((re) => re.test(file)),
