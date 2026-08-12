@@ -4,9 +4,9 @@
  */
 
 import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
-import { join, dirname, basename } from "node:path";
-import fg from "fast-glob";
+import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
+import { globFiles } from "./glob.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
@@ -17,6 +17,7 @@ import {
 import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+import { mapInBatches } from "./concurrency.js";
 import type {
   ContextNode,
   NestConfig,
@@ -68,17 +69,33 @@ export function normalizeDocumentId(raw: string): string {
 }
 
 /**
- * Reject an id that would escape the vault root. Callers join ids against the
- * root verbatim, so every id arriving from outside must clear this.
+ * Reject an id that would escape the vault root, or that names no document.
+ * Callers join ids against the root verbatim, so every id arriving from outside
+ * must clear this.
  *
  * Split out of `normalizeDocumentId` because that also re-roots a bare slug
  * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
  * needs the traversal check WITHOUT the rewrite.
  */
 export function assertSafeDocumentId(raw: string): void {
-  if (raw.split(/[/\\]/).some((seg) => seg === "..")) {
+  const segments = raw.split(/[/\\]/);
+  if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(
       `Invalid document id "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  // A segment with no letter or digit anywhere means a caller derived this id
+  // from a title that carries none — "###", "...", "   ". Empty lands the write
+  // at `nodes/.md`: a dotfile discovery never lists, no id can address, and the
+  // next such title collides with. Punctuation-only segments are addressable but
+  // just as unusable. Reject the id rather than store the ghost.
+  //
+  // Any script counts (\p{L}/\p{N}), NOT the a-z0-9 slug rule: ids for existing
+  // documents get read back through here, and a vault may hold "nodes/日本語".
+  if (segments.some((seg) => !/[\p{L}\p{N}]/u.test(seg))) {
+    throw new ContextNestError(
+      `Invalid document id "${raw}": every path segment needs at least one letter or number.`,
       "INVALID_DOCUMENT_ID",
     );
   }
@@ -216,28 +233,21 @@ export class NestStorage {
       patterns = ["**/*.md"];
     }
 
-    const files = await fg(patterns, {
-      cwd: this.root,
-      ignore: [
-        "**/node_modules/**",
-        "**/.versions/**",
-        "**/.context/**",
-        "**/INDEX.md",
-        "CONTEXT.md",
-        "context.yaml",
-        // Agent-config / scaffold files are not knowledge nodes.
-        "**/CLAUDE.md",
-        "**/GEMINI.md",
-        "**/AGENTS.md",
-        "**/README.md",
-      ],
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const files = await globFiles(this.root, patterns, [
+      "**/node_modules/**",
+      "**/.versions/**",
+      "**/.context/**",
+      "**/INDEX.md",
+      "CONTEXT.md",
+      "context.yaml",
+      // Agent-config / scaffold files are not knowledge nodes.
+      "**/CLAUDE.md",
+      "**/GEMINI.md",
+      "**/AGENTS.md",
+      "**/README.md",
+    ]);
 
-    const nodes: ContextNode[] = [];
-    for (const file of files.sort()) {
+    const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
       const content = await readFile(filePath, "utf-8");
       const id = file.replace(/\.md$/, "");
@@ -254,10 +264,11 @@ export class NestStorage {
       const isRootLevel = !file.includes("/");
       const authoredKeys = Object.keys(node.frontmatter).filter((k) => k !== "status");
       if (layout === "structured" && isRootLevel && authoredKeys.length === 0) {
-        continue;
+        return null;
       }
-      nodes.push(node);
-    }
+      return node;
+    });
+    const nodes = parsed.filter((n): n is ContextNode => n !== null);
 
     const includeRetired = options.includeRetired || options.includeSuperseded;
     if (includeRetired) return nodes;
@@ -380,16 +391,19 @@ export class NestStorage {
       folders.get(folder)!.push(doc);
     }
 
-    for (const [folder, folderDocs] of folders) {
-      if (folder === ".") continue;
-      const title = folder
-        .split("/")
-        .pop()!
-        .replace(/-/g, " ")
-        .replace(/\b\w/g, (c) => c.toUpperCase());
-      const indexMd = generateIndexMd(folder, title, folderDocs);
-      await this.writeIndexMd(folder, indexMd);
-    }
+    // Distinct folders write distinct INDEX.md files, so the writes are
+    // independent — batch them (an imported vault can carry hundreds).
+    await mapInBatches(
+      [...folders].filter(([folder]) => folder !== "."),
+      async ([folder, folderDocs]) => {
+        const title = folder
+          .split("/")
+          .pop()!
+          .replace(/-/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+        await this.writeIndexMd(folder, generateIndexMd(folder, title, folderDocs));
+      },
+    );
 
     const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
     const agentConfigs = generateAgentConfigs({
@@ -543,6 +557,39 @@ export class NestStorage {
       }
       throw err;
     }
+  }
+
+  /**
+   * Write a file into the vault VERBATIM at a caller-given relative path.
+   *
+   * For ingesting an existing vault — a folder or archive a user is importing.
+   * Those bytes must land exactly as they arrived: the frontmatter is the
+   * source's own (`version`, `checksum`, custom keys a synthesized draft would
+   * drop), and not every file is a document — `.versions/<doc>/history.yaml`
+   * is what makes an imported version chain reconstruct at all. So this writes
+   * what it is given and parses nothing.
+   *
+   * Path safety is the whole risk surface here, since the path comes from
+   * outside: `..` and absolute paths are rejected so an import cannot write
+   * outside the vault root.
+   */
+  async writeVaultFile(relPath: string, content: string): Promise<void> {
+    const segments = String(relPath ?? "")
+      .split(/[/\\]/)
+      .filter(Boolean);
+    if (
+      segments.length === 0 ||
+      isAbsolute(relPath) ||
+      segments.some((seg) => seg === "..")
+    ) {
+      throw new ContextNestError(
+        `Invalid vault file path "${relPath}": must be a relative path inside the vault.`,
+        "INVALID_DOCUMENT_ID",
+      );
+    }
+    const filePath = join(this.root, ...segments);
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, content, "utf-8");
   }
 
   /**
@@ -1058,9 +1105,8 @@ export class NestStorage {
   /** List all suggestion IDs staged for a document, sorted by file name. */
   async listSuggestionIds(docId: string): Promise<string[]> {
     const dir = this.suggestionDir(docId);
-    const files = await fg("*.meta.yaml", { cwd: dir, dot: false }).catch(
-      () => [] as string[],
-    );
+    // A missing suggestions directory yields no matches rather than throwing.
+    const files = await globFiles(dir, "*.meta.yaml");
     return files
       .map((f) => f.replace(/\.meta\.yaml$/, ""))
       .sort();
@@ -1169,12 +1215,7 @@ export class NestStorage {
    * Read all packs from packs/ directory (§3).
    */
   async readPacks(): Promise<Pack[]> {
-    const packFiles = await fg("packs/**/*.yml", {
-      cwd: this.root,
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const packFiles = await globFiles(this.root, "packs/**/*.yml");
     const packs: Pack[] = [];
     for (const file of packFiles.sort()) {
       const content = await readFile(join(this.root, file), "utf-8");
@@ -1229,37 +1270,41 @@ export class NestStorage {
   async findAllHistories(
     onUnreadable?: (docId: string, reason: string) => void,
   ): Promise<Map<string, DocumentHistory>> {
-    const historyFiles = await fg("**/.versions/*/history.yaml", {
-      cwd: this.root,
-      dot: true,
-      // Skip unreadable directories instead of crashing checkpoint rebuild
-      // on a single permission-denied dir under the vault root.
-      suppressErrors: true,
-    });
+    const historyFiles = await globFiles(
+      this.root,
+      "**/.versions/*/history.yaml",
+    );
 
-    const histories = new Map<string, DocumentHistory>();
-    for (const file of historyFiles) {
+    // Read in batches, then fold in input order so the map's iteration order
+    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
+    const read = await mapInBatches(historyFiles, async (file) => {
       // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
       const parts = file.split("/");
       const versionsIdx = parts.indexOf(".versions");
-      if (versionsIdx === -1) continue;
+      if (versionsIdx === -1) return null;
       const docDir = parts.slice(0, versionsIdx).join("/");
       const docName = parts[versionsIdx + 1];
       const docId = docDir ? `${docDir}/${docName}` : docName;
-
-      let raw: unknown;
       try {
-        raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+        const raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+        return { docId, raw, error: null as string | null };
       } catch (err) {
-        onUnreadable?.(docId, err instanceof Error ? err.message : String(err));
+        return { docId, raw: null, error: err instanceof Error ? err.message : String(err) };
+      }
+    });
+
+    const histories = new Map<string, DocumentHistory>();
+    for (const entry of read) {
+      if (!entry) continue;
+      if (entry.error !== null) {
+        onUnreadable?.(entry.docId, entry.error);
         continue;
       }
-
-      const result = documentHistorySchema.safeParse(raw);
+      const result = documentHistorySchema.safeParse(entry.raw);
       if (result.success) {
-        histories.set(docId, result.data as DocumentHistory);
+        histories.set(entry.docId, result.data as DocumentHistory);
       } else {
-        onUnreadable?.(docId, `history.yaml failed schema validation`);
+        onUnreadable?.(entry.docId, `history.yaml failed schema validation`);
       }
     }
 

@@ -1,0 +1,98 @@
+{
+  "$comment": [
+    "Performance budget, enforced by bench/check.mjs.",
+    "",
+    "Each rule bounds how much an operation's PER-DOCUMENT cost may grow as the",
+    "vault gets 10x bigger. 1.0 is perfectly linear: the cost of a vault is",
+    "proportional to what is in it. A value climbing well above 1 means the",
+    "operation does work that grows faster than the document count, which is the",
+    "failure this budget exists to catch.",
+    "",
+    "Why growth and not milliseconds: CI runners vary by several times in speed",
+    "and are noisy neighbours. Absolute ceilings tight enough to catch a real",
+    "regression would fail constantly on a slow runner; loose enough to survive",
+    "one and they catch nothing. Per-document growth has the same shape on fast",
+    "and slow hardware.",
+    "",
+    "Two tiers, because the two size pairs are not equally trustworthy:",
+    "",
+    "  1000 -> 10000 is the REAL gate. At these sizes a run takes long enough",
+    "  that fixed startup costs and machine jitter are rounding errors, so the",
+    "  measured growth is the engine's actual shape. Every op measures 0.95x to",
+    "  1.15x here today — linear. These ceilings are tight.",
+    "",
+    "  100 -> 1000 is a smoke tripwire only. A 100-document run finishes in",
+    "  10-30ms, where fixed costs dominate and back-to-back runs on the same",
+    "  machine have disagreed by more than 2x. Gating tightly on this pair would",
+    "  produce flaky failures that teach people to ignore the job. The ceilings",
+    "  are loose on purpose: they catch a catastrophic regression on every PR,",
+    "  and nothing subtler. Do not tighten them without first making the small",
+    "  sizes reproducible."
+  ],
+  "scaling": [
+    {
+      "op": "discoverDocuments",
+      "from": 1000,
+      "to": 10000,
+      "maxGrowth": 1.4,
+      "note": "Measured 0.45x. The whole-vault crawl was batched in #66."
+    },
+    {
+      "op": "context_query",
+      "from": 1000,
+      "to": 10000,
+      "maxGrowth": 1.4,
+      "note": "Measured 1.14x. The retrieval path an agent hits on every request."
+    },
+    {
+      "op": "context_search",
+      "from": 1000,
+      "to": 10000,
+      "maxGrowth": 1.4,
+      "note": "Measured 0.75x. Dominated by building the search index."
+    },
+    {
+      "op": "context_list",
+      "from": 1000,
+      "to": 10000,
+      "maxGrowth": 1.4,
+      "note": "Measured 0.77x."
+    },
+    {
+      "op": "regenerateIndex",
+      "from": 1000,
+      "to": 10000,
+      "maxGrowth": 1.4,
+      "note": "Measured 0.98x. Re-reads and re-sorts the whole vault, but linearly."
+    },
+    {
+      "op": "context_import_discover",
+      "from": 1000,
+      "to": 10000,
+      "maxGrowth": 1.4,
+      "note": "Measured 0.95x. Linear, but the largest absolute cost by far — ~108s for 10k documents. Linear is not the same as fast; this is the op to attack on constant factor, not on shape."
+    },
+
+    {
+      "op": "discoverDocuments",
+      "from": 100,
+      "to": 1000,
+      "maxGrowth": 3.0,
+      "note": "Smoke tripwire — see the note on small-size noise above."
+    },
+    {
+      "op": "context_query",
+      "from": 100,
+      "to": 1000,
+      "maxGrowth": 3.0,
+      "note": "Smoke tripwire."
+    },
+    {
+      "op": "context_import_discover",
+      "from": 100,
+      "to": 1000,
+      "maxGrowth": 3.0,
+      "note": "Smoke tripwire."
+    }
+  ]
+}

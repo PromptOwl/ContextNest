@@ -3,13 +3,14 @@
  * Ties together versioning, integrity, checkpoints, and index regeneration.
  */
 
-import type { ContextNode, VersionEntry } from "./types.js";
+import type { ContextNode, Frontmatter, VersionEntry } from "./types.js";
 import { NestStorage, assertSafeDocumentId } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
+import { mapInBatches } from "./concurrency.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -117,6 +118,20 @@ export interface BulkPublishOptions extends PublishOptions {
    * concurrency > 1 docs finish out of input order, so only the count is
    * monotonic — it drives progress bars, not per-doc reporting. */
   onProgress?: (done: number, total: number) => void;
+  /**
+   * Frontmatter to merge into each document just before it is published.
+   *
+   * For importers that must stamp their own metadata (an `author` that is the
+   * importing user, a `title` fallback from the filename) onto every incoming
+   * file. Doing it here folds the stamp into the publish write; a caller doing
+   * it beforehand pays a SECOND full write pass over the vault, which on a
+   * network-backed mount is one extra round trip per document.
+   *
+   * Returning `null`/`undefined` leaves the document's frontmatter alone. The
+   * publish fields (`version`, `status`, `updated_at`, `checksum`) are applied
+   * after this and always win.
+   */
+  frontmatter?: (node: ContextNode) => Partial<Frontmatter> | null | undefined;
 }
 
 export interface BulkPublishResult {
@@ -177,6 +192,12 @@ export async function publishDocuments(
       let node = await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
 
+      // Importer metadata rides along with the publish write below rather than
+      // costing its own pass over the vault. Applied before the version bump so
+      // the publish fields still win.
+      const stamp = options.frontmatter?.(node);
+      if (stamp) node = { ...node, frontmatter: { ...node.frontmatter, ...stamp } };
+
       const versionManager = new VersionManager(storage);
       const existingHistory = await storage.readHistory(docId);
       if (!existingHistory && (node.frontmatter.version || 0) > 1) {
@@ -217,11 +238,10 @@ export async function publishDocuments(
     }
   };
 
-  // Bounded-concurrency pass — no cross-doc dependency, so a simple sliding
-  // window is enough (avoids pulling in a p-limit dependency).
-  for (let i = 0; i < ids.length; i += concurrency) {
-    await Promise.all(ids.slice(i, i + concurrency).map(publishOne));
-  }
+  // Bounded-concurrency pass — no cross-doc dependency, so batching is enough
+  // (the shared helper avoids pulling in a p-limit dependency). publishOne
+  // records its own outcome, so the returned array is unused.
+  await mapInBatches(ids, publishOne, concurrency);
 
   // ONE checkpoint sealing every doc published above (createCheckpointFromVault
   // snapshots all published docs in the vault under the checkpoint lock).
