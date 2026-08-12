@@ -40,8 +40,18 @@ function stripInlineCode(line: string): string {
 // Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
 // Reference definitions are deliberately not matched — they were not links
 // in the AST either.
+//
+// Only ONE `\s*` before the destination: two of them separated by an optional
+// `<` would leave the split between them ambiguous and backtrack quadratically
+// over a long run of spaces (CodeQL js/polynomial-redos). Markdown does not
+// allow whitespace between `<` and the destination anyway.
+//
+// The link text excludes `[` as well as `]` and is length-bounded, for the same
+// reason the rule-4 check in parser.ts is bounded: otherwise a line of many `[`
+// with no closing bracket rescans to the end from every one of them. Unescaped
+// `[` is not valid inline link text, so nothing real is lost.
 const CONTEXT_LINK =
-  /\[[^\]]*\]\(\s*<?\s*(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
+  /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
 
 /** Extract all contextnest:// link targets from a markdown body */
 export function extractContextLinks(body: string): string[] {
@@ -199,14 +209,22 @@ function topLevelHeadings(lines: string[]): Heading[] {
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;
 
-    const atx = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+    // Deliberately does NOT capture the heading text with a trailing `(.*)$`.
+    // Pairing `\s+` with `.*` leaves the boundary between them ambiguous, and
+    // `.` cannot match a line terminator, so a long whitespace run followed by
+    // text and a stray CR makes the engine retry every split — quadratic
+    // (CodeQL js/polynomial-redos). The marker is all the match is needed for;
+    // the text comes from a slice.
+    // Up to 3 leading spaces are allowed on an ATX heading (CommonMark); 4 or
+    // more makes it an indented code block instead.
+    const atx = /^ {0,3}(#{1,6})\s/.exec(lines[i]);
     if (atx) {
-      // Drop an optional closing sequence: `## Title ##`
-      headings.push({
-        depth: atx[1].length,
-        anchor: toAnchor(atx[2].replace(/\s+#+\s*$/, "")),
-        line: i,
-      });
+      const depth = atx[1].length;
+      // Drop an optional closing sequence: `## Title ##`. Trailing whitespace
+      // goes first so the pattern can anchor to the end with nothing ambiguous
+      // in front of it.
+      const text = lines[i].slice(atx[0].length).trimEnd().replace(/#+$/, "");
+      headings.push({ depth, anchor: toAnchor(text), line: i });
       continue;
     }
 
@@ -237,7 +255,14 @@ function topLevelHeadings(lines: string[]): Heading[] {
 function toAnchor(raw: string): string {
   return raw
     .replace(/`+/g, "")
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    // Each span excludes its own opening delimiter as well as its closing one,
+    // and both are length-bounded (CodeQL js/polynomial-redos). Two separate
+    // inputs are quadratic otherwise: a run of `[`, where the text span scans
+    // to end-of-line from every one of them, and a run of `[](`, where the
+    // destination span does the same. Excluding `[` and `(` makes both fail on
+    // the first character instead, and neither is valid unescaped in the span
+    // it is excluded from.
+    .replace(/!?\[([^\][]{0,2048})\]\([^()]{0,2048}\)/g, "$1")
     .replace(/[*_~]+/g, "")
     .trim()
     .toLowerCase()

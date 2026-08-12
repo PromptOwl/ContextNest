@@ -135,8 +135,11 @@ function splitFrontmatter(raw: string): { data: Record<string, unknown>; body: s
 
   const block = rest.slice(0, closeIndex === -1 ? rest.length : closeIndex);
 
-  // A block of nothing but YAML comments carries no data.
-  const stripped = block.replace(/^\s*#[^\n]+/gm, "").trim();
+  // A block of nothing but YAML comments carries no data. The indent is matched
+  // with `[ \t]*` rather than `\s*` because `\s` spans newlines, which under
+  // the `m` flag lets the match start at any preceding line — ambiguous, and
+  // quadratic on a run of blank lines (CodeQL js/polynomial-redos).
+  const stripped = block.replace(/^[ \t]*#[^\n]*$/gm, "").trim();
   const data = stripped === "" ? {} : ((yaml.load(block) as Record<string, unknown>) ?? {});
 
   if (closeIndex === -1) return { data, body: "" };

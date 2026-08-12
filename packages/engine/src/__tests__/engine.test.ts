@@ -473,6 +473,86 @@ Rate limiting content.
     );
   });
 
+  it("stays linear on pathological input (js/polynomial-redos)", () => {
+    // Each line is the worst case for one of the patterns that was quadratic:
+    // a `\s+`/`.*` split point, a whitespace run before a link destination, a
+    // trailing whitespace run before the `## Title ##` closing strip, and a
+    // bracket run with no closing bracket. Each took ~700ms-1.2s at this size.
+    const runs = 40_000;
+    const body = [
+      "#" + "\t".repeat(runs) + "a\rb",
+      "[x](" + " ".repeat(runs) + "y",
+      "## Heading" + "\t".repeat(runs),
+      "[".repeat(runs),
+      "## " + "[".repeat(runs),
+      // A run of `[](` attacks the link DESTINATION span rather than the text
+      // span, so it survives excluding `[` alone.
+      "[](".repeat(runs / 3),
+      "## " + "[](".repeat(runs / 3),
+    ].join("\n");
+
+    const started = performance.now();
+    extractSection(body, "heading");
+    extractContextLinks(body);
+    const elapsed = performance.now() - started;
+
+    // Quadratic behaviour is seconds here; linear is single-digit milliseconds.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it("parses frontmatter of blank lines without backtracking", () => {
+    // `/^\s*#[^\n]+/gm` let `\s` span newlines while `^` also matched at each
+    // line start, so a run of blank lines was quadratic to strip.
+    const content = `---\n${"\n".repeat(40_000)}title: "Blank Lines"\ntype: document\n---\n\nBody.\n`;
+
+    const started = performance.now();
+    const node = parseDocument("/blank.md", content, "blank");
+    const elapsed = performance.now() - started;
+
+    expect(node.frontmatter.title).toBe("Blank Lines");
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it("allows up to three leading spaces on a heading, but not four", () => {
+    const body = [
+      "   ### Indented Heading",
+      "",
+      "Content.",
+      "",
+      "    #### Four Spaces Is Code",
+      "",
+      "# End",
+    ].join("\n");
+
+    expect(extractSection(body, "indented-heading")).toContain("Content.");
+    expect(extractSection(body, "four-spaces-is-code")).toBeNull();
+  });
+
+  // ── Known, deliberate narrowings vs the previous AST-based extractor ────────
+  // The line scanner that replaced unified/remark does not model every
+  // CommonMark construct. These two cases changed behaviour; they are pinned so
+  // the change stays a conscious one rather than drifting further by accident.
+
+  it("KNOWN GAP: links inside indented (4-space) code blocks are still extracted", () => {
+    // remark parsed an indented block as a single code node with no inline
+    // parsing, so this link was invisible. The scanner masks fenced blocks only.
+    // Not "fixed" because the obvious heuristic — treat any indented line after
+    // a blank as code — would swallow indented list continuations, trading
+    // phantom edges for missing ones.
+    const body = ["Intro.", "", "    [Sample](contextnest://nodes/sample)", ""].join("\n");
+
+    expect(extractContextLinks(body)).toEqual(["contextnest://nodes/sample"]);
+  });
+
+  it("KNOWN GAP: reference-style links are not resolved", () => {
+    // `[text][ref]` used to resolve through its definition into a link node.
+    // Matching the definition line instead would over-report unused definitions,
+    // so the capability is dropped rather than approximated.
+    const body = ["See [the spec][ref].", "", "[ref]: contextnest://nodes/spec"].join("\n");
+
+    expect(extractContextLinks(body)).toEqual([]);
+  });
+
   it("extracts autolinks and handles CRLF bodies", () => {
     const body =
       "# Title\r\n\r\nSee <contextnest://nodes/auto>.\r\n\r\n## Error Handling\r\n\r\nContent.\r\n\r\n# Next\r\n\r\nOther.\r\n";
