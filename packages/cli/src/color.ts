@@ -27,7 +27,10 @@ function plainChalk(): ChalkInstance {
       if (prop === "level") return 0;
       return proxy;
     },
-    apply: (_target, _self, args: unknown[]) => String(args[0] ?? ""),
+    // chalk joins multiple arguments with a space, so match that rather than
+    // silently dropping everything after the first.
+    apply: (_target, _self, args: unknown[]) =>
+      args.map((arg) => String(arg ?? "")).join(" "),
   });
   return proxy as ChalkInstance;
 }

@@ -154,6 +154,12 @@ function resolveTree(rootDir, rootName, seeds) {
  * Every bare module a built bundle imports at runtime, excluding Node builtins.
  * Each one must be a declared dependency of the published package, or the
  * tarball is broken for anyone who installs it.
+ *
+ * Heuristic, not a parse: it matches the double-quoted `import … from "…"` and
+ * `import("…")` forms esbuild currently emits, and would miss a re-export
+ * (`export … from "…"`) or a change in quote style. A miss weakens this guard
+ * rather than shipping a break — a clean install still fails loudly on the
+ * missing module — but tighten it here if the bundler's output shape changes.
  */
 function bundleImports(distFile) {
   const source = readFileSync(distFile, "utf-8");
