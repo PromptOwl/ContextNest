@@ -86,6 +86,26 @@ export function isRejected(node: ContextNode): boolean {
 }
 
 /**
+ * The EXPLICIT lifecycle status the source author wrote, canonicalized, or
+ * `null` when the frontmatter carried no `status:` at all.
+ *
+ * `parseDocument` defaults a missing status to `draft`, so
+ * `node.frontmatter.status` cannot tell an author's deliberate draft from a
+ * status-less hand-authored file — the raw source is the only place that
+ * distinction survives. Folder import needs it: a status-less file is fair game
+ * to publish, an explicit `draft`/`pending_review` must stay unpublished.
+ * Normalizing means aliases (`review`, `submitted`, `in_review`, …) collapse to
+ * their canonical status, so an import cannot smuggle a not-yet-approved
+ * document past that gate by spelling its status differently.
+ */
+export function explicitStatus(node: ContextNode): Status | null {
+  const fm = node.rawContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return null;
+  const m = fm[1].match(/^status:[ \t]*["']?([A-Za-z_-]+)["']?[ \t]*$/m);
+  return m ? normalizeStatus(m[1]) : null;
+}
+
+/**
  * @deprecated The `superseded` status was removed. `parseDocument` normalizes
  * legacy `superseded` values to `draft`, so this predicate always returns
  * `false` for parsed nodes. Use `isRejected` for the terminal-hide state.

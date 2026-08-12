@@ -4,7 +4,7 @@
  */
 
 import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
-import { join, dirname, basename } from "node:path";
+import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
 import { parseDocument } from "./parser.js";
@@ -558,6 +558,39 @@ export class NestStorage {
       }
       throw err;
     }
+  }
+
+  /**
+   * Write a file into the vault VERBATIM at a caller-given relative path.
+   *
+   * For ingesting an existing vault — a folder or archive a user is importing.
+   * Those bytes must land exactly as they arrived: the frontmatter is the
+   * source's own (`version`, `checksum`, custom keys a synthesized draft would
+   * drop), and not every file is a document — `.versions/<doc>/history.yaml`
+   * is what makes an imported version chain reconstruct at all. So this writes
+   * what it is given and parses nothing.
+   *
+   * Path safety is the whole risk surface here, since the path comes from
+   * outside: `..` and absolute paths are rejected so an import cannot write
+   * outside the vault root.
+   */
+  async writeVaultFile(relPath: string, content: string): Promise<void> {
+    const segments = String(relPath ?? "")
+      .split(/[/\\]/)
+      .filter(Boolean);
+    if (
+      segments.length === 0 ||
+      isAbsolute(relPath) ||
+      segments.some((seg) => seg === "..")
+    ) {
+      throw new ContextNestError(
+        `Invalid vault file path "${relPath}": must be a relative path inside the vault.`,
+        "INVALID_DOCUMENT_ID",
+      );
+    }
+    const filePath = join(this.root, ...segments);
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, content, "utf-8");
   }
 
   /**

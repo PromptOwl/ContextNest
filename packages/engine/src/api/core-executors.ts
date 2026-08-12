@@ -18,6 +18,7 @@ import {
   normalizeTags,
   normalizeStatus,
   isRejected,
+  explicitStatus,
 } from "../parser.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
@@ -26,6 +27,7 @@ import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import { mapInBatches } from "../concurrency.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -607,6 +609,22 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // ids, and the caller owns their frontmatter. Nothing is rewritten here.
   const batch: string[] = [...(input.ids ?? [])];
 
+  // Stage 0: land an existing vault's files verbatim. Bounded-parallel because
+  // a vault may sit on a network mount where each write is a round trip, and a
+  // serial loop then costs one full latency per file.
+  const incoming: { path: string; content: string }[] = input.files ?? [];
+  let written = 0;
+  if (incoming.length > 0) {
+    await mapInBatches(incoming, async (f) => {
+      try {
+        await ctx.storage.writeVaultFile(f.path, f.content ?? "");
+        written++;
+      } catch (err) {
+        failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+  }
+
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
   for (const doc of input.documents ?? []) {
     try {
@@ -620,16 +638,43 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     }
   }
 
+  // A staging call — files written, publishing deferred to the caller's final
+  // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
+  if (input.publish === false) {
+    return { published: [], failed, checkpoint: null, written };
+  }
+
+  // Stage 2 (discover): the vault itself is the input. The scan, the metadata
+  // stamp and the publish-vs-hold decision all live here so a folder importer
+  // does not have to walk the vault and rewrite every file before handing the
+  // ids back — that pass cost a second full round trip per document.
+  let held: ContextNode[] = [];
+  let scanned: ContextNode[] = [];
+  if (input.discover) {
+    const exclude = new Set<string>(input.exclude_ids ?? []);
+    for (const doc of await ctx.storage.discoverDocuments()) {
+      if (exclude.has(doc.id)) continue;
+      // Honor the source's own governance state: a file that EXPLICITLY says it
+      // is not published or approved stays unpublished. A status-less file (a
+      // plain Obsidian note) is fair game — see `explicitStatus`.
+      const status = explicitStatus(doc);
+      if (status && status !== "published" && status !== "approved") held.push(doc);
+      else scanned.push(doc);
+    }
+    batch.push(...scanned.map((d) => d.id));
+  }
+
   // An empty call is a caller bug, not an empty result — but a batch where every
-  // document failed to stage is a legitimate (fully-failed) result.
-  if (batch.length === 0 && failed.length === 0) {
+  // document failed to stage is a legitimate (fully-failed) result, and a
+  // `discover` over a folder with nothing new in it is simply done.
+  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0) {
     throw new ContextNestError(
-      "context_import requires documents[] or ids[]",
+      "context_import requires documents[], ids[], files[] or discover",
       "VALIDATION_FAILED",
     );
   }
 
-  // Stage 2: ONE bulk publish for both modes — one checkpoint + one index regen
+  // Stage 3: ONE bulk publish for every mode — one checkpoint + one index regen
   // for the whole batch (the O(N) path), instead of a checkpoint per document.
   let published: { id: string; version: number }[] = [];
   let checkpoint: number | null = null;
@@ -637,6 +682,16 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       onProgress: ctx.onProgress,
+      // The importer's metadata rides along with the publish write instead of
+      // costing its own pass. Title falls back to the filename; the author is
+      // the importing user, since the source's own `author:` names someone who
+      // need not exist on this host.
+      frontmatter: input.discover
+        ? (node) => ({
+            title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+            ...(input.author ? { author: input.author } : {}),
+          })
+        : undefined,
     });
     published = result.published.map((p) => ({ id: p.id, version: p.version }));
     checkpoint = result.checkpointNumber;
@@ -646,7 +701,34 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     }
   }
 
-  return { published, failed, checkpoint };
+  if (!input.discover) {
+    return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
+  }
+
+  // Stage 4 (discover): report every document the scan owned, published or not,
+  // so a governance layer can record the import without re-reading the vault.
+  // A doc that failed to publish is reported at its own version, not dropped —
+  // its imported history is intact and it simply stays a draft.
+  const publishedVersion = new Map(published.map((p) => [p.id, p.version]));
+  const asRecord = (doc: ContextNode) => {
+    const version = publishedVersion.get(doc.id);
+    const own = Number(doc.frontmatter.version);
+    return {
+      id: doc.id,
+      title: doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
+      status: version !== undefined ? ("published" as const) : ("draft" as const),
+      tags: normalizeTags(doc.frontmatter.tags) ?? [],
+      content: doc.body ?? "",
+    };
+  };
+  return {
+    published,
+    failed,
+    checkpoint,
+    ...(incoming.length ? { written } : {}),
+    documents: [...scanned, ...held].map(asRecord),
+  };
 };
 
 /** name → executor for the built-in `core` namespace. */

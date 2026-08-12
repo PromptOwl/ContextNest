@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import { NestStorage } from "../storage.js";
@@ -567,9 +567,156 @@ describe("createEngineApi — executable core operations", () => {
     expect(ticks.every(([, total]) => total === 4)).toBe(true);
   });
 
-  it("context_import rejects a call with neither documents nor ids", async () => {
+  it("context_import rejects a call with no input at all", async () => {
     const api = createEngineApi();
-    await expect(api.run("context_import", {}, ctx)).rejects.toThrow(/documents\[\] or ids\[\]/);
+    await expect(api.run("context_import", {}, ctx)).rejects.toThrow(
+      /documents\[\], ids\[\], files\[\] or discover/,
+    );
+  });
+
+  it("context_import writes files[] verbatim, version history and all", async () => {
+    const api = createEngineApi();
+    // A vault being imported carries its own frontmatter AND its version chain.
+    // Both must land byte-for-byte: a synthesized draft would drop the custom
+    // keys, and without .versions/ the chain can no longer reconstruct.
+    const doc =
+      "---\ntitle: Handbook\ntype: document\nversion: 3\ncustom_key: keep me\n---\n\nbody\n";
+    const history = "keyframe_interval: 10\nversions: []\n";
+    const out = await api.run<{
+      written: number;
+      published: unknown[];
+      checkpoint: number | null;
+    }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/handbook.md", content: doc },
+          { path: "nodes/.versions/handbook/history.yaml", content: history },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(out.written).toBe(2);
+    // publish:false stages only — nothing published, no checkpoint sealed.
+    expect(out.published).toHaveLength(0);
+    expect(out.checkpoint).toBeNull();
+    expect(await readFile(join(dir, "nodes/handbook.md"), "utf-8")).toBe(doc);
+    expect(await readFile(join(dir, "nodes/.versions/handbook/history.yaml"), "utf-8")).toBe(
+      history,
+    );
+  });
+
+  it("context_import refuses a files[] path that escapes the vault", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ failed: Array<{ id?: string; error: string }> }>(
+      "context_import",
+      { files: [{ path: "../escaped.md", content: "nope" }], publish: false },
+      ctx,
+    );
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0].id).toBe("../escaped.md");
+    expect(existsSync(join(dir, "..", "escaped.md"))).toBe(false);
+  });
+
+  it("context_import discover scans, stamps the author, and holds explicit drafts", async () => {
+    const api = createEngineApi();
+    await api.run(
+      "context_import",
+      {
+        files: [
+          // Status-less (a plain hand-authored note) → fair game to publish.
+          { path: "nodes/plain.md", content: "---\ntitle: Plain\ntype: document\n---\n\nbody\n" },
+          // Explicitly not-yet-approved → must stay unpublished.
+          {
+            path: "nodes/wip.md",
+            content: "---\ntitle: WIP\ntype: document\nstatus: draft\n---\n\nbody\n",
+          },
+          // An alias for pending_review — must not sneak past the hold either.
+          {
+            path: "nodes/review.md",
+            content: "---\ntitle: Review\ntype: document\nstatus: in_review\n---\n\nbody\n",
+          },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+
+    const out = await api.run<{
+      published: Array<{ id: string }>;
+      checkpoint: number | null;
+      documents: Array<{ id: string; title: string; status: string; version: number }>;
+    }>("context_import", { discover: true, author: "importer@test.com" }, ctx);
+
+    expect(out.published.map((p) => p.id)).toEqual(["nodes/plain"]);
+    // Every scanned doc is reported, held ones included — the caller records
+    // them all without re-reading the vault.
+    expect(out.documents.map((d) => d.id).sort()).toEqual([
+      "nodes/plain",
+      "nodes/review",
+      "nodes/wip",
+    ]);
+    const byId = new Map(out.documents.map((d) => [d.id, d]));
+    expect(byId.get("nodes/plain")!.status).toBe("published");
+    expect(byId.get("nodes/wip")!.status).toBe("draft");
+    expect(byId.get("nodes/review")!.status).toBe("draft");
+    // The author stamp rode along with the publish write — no second pass.
+    const got = await api.run<{ frontmatter: { author?: string } }>(
+      "context_get",
+      { id: "nodes/plain" },
+      ctx,
+    );
+    expect(got.frontmatter.author).toBe("importer@test.com");
+    // One checkpoint for the whole discovered batch.
+    const history = await ctx.storage.readCheckpointHistory();
+    expect(history?.checkpoints).toHaveLength(1);
+  });
+
+  it("context_import discover titles an untitled doc from its filename", async () => {
+    const api = createEngineApi();
+    await api.run(
+      "context_import",
+      {
+        files: [{ path: "nodes/no-title.md", content: "just a body, no frontmatter\n" }],
+        publish: false,
+      },
+      ctx,
+    );
+    const out = await api.run<{ documents: Array<{ id: string; title: string }> }>(
+      "context_import",
+      { discover: true },
+      ctx,
+    );
+    expect(out.documents.find((d) => d.id === "nodes/no-title")!.title).toBe("no-title");
+  });
+
+  it("context_import discover skips exclude_ids and no-ops on a re-run", async () => {
+    const api = createEngineApi();
+    await api.run(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/a.md", content: "---\ntitle: A\ntype: document\n---\n\nbody\n" },
+          { path: "nodes/b.md", content: "---\ntitle: B\ntype: document\n---\n\nbody\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    const first = await api.run<{ documents: Array<{ id: string }> }>(
+      "context_import",
+      { discover: true, exclude_ids: ["nodes/a"] },
+      ctx,
+    );
+    expect(first.documents.map((d) => d.id)).toEqual(["nodes/b"]);
+    // Re-running with everything already imported is a no-op, not an error.
+    const second = await api.run<{
+      documents: Array<{ id: string }>;
+      checkpoint: number | null;
+    }>("context_import", { discover: true, exclude_ids: ["nodes/a", "nodes/b"] }, ctx);
+    expect(second.documents).toHaveLength(0);
+    expect(second.checkpoint).toBeNull();
   });
 
   it("normalizes tags to #-prefixed form on create (S7)", async () => {
