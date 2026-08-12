@@ -86,6 +86,36 @@ export function isRejected(node: ContextNode): boolean {
 }
 
 /**
+ * The EXPLICIT lifecycle status the source author wrote, canonicalized, or
+ * `null` when the frontmatter carried no `status:` at all.
+ *
+ * `parseDocument` defaults a missing status to `draft`, so
+ * `node.frontmatter.status` cannot tell an author's deliberate draft from a
+ * status-less hand-authored file. Folder import needs that distinction: a
+ * status-less file is fair game to publish, an explicit `draft` or
+ * `pending_review` must stay unpublished. Aliases (`review`, `submitted`,
+ * `in_review`, …) are collapsed to their canonical status, so an import cannot
+ * smuggle a not-yet-approved document past the hold by spelling it differently.
+ *
+ * Reads what the YAML parser already produced (`authoredStatus`) rather than
+ * re-scanning the raw source. A second, hand-rolled frontmatter parse is a
+ * second thing to get wrong, and it was: `status: draft  # not reviewed` — an
+ * ordinary line js-yaml handles fine — did not match the pattern, so the
+ * document read as status-less and published against its author's wishes.
+ *
+ * A node built in memory has no `authoredStatus`, which reads as "not stated".
+ * That is the safe direction for every caller today: import only ever asks this
+ * about documents it parsed off disk.
+ */
+export function explicitStatus(node: ContextNode): Status | null {
+  const authored = node.authoredStatus;
+  if (authored === undefined || authored === null || authored.trim() === "") {
+    return null;
+  }
+  return normalizeStatus(authored);
+}
+
+/**
  * @deprecated The `superseded` status was removed. `parseDocument` normalizes
  * legacy `superseded` values to `draft`, so this predicate always returns
  * `false` for parsed nodes. Use `isRejected` for the terminal-hide state.
@@ -174,6 +204,15 @@ export function parseDocument(
     parsed.data.created_at = normalizeDateField(parsed.data.created_at);
   }
 
+  // Capture what the author wrote BEFORE the line below overwrites it. A
+  // missing status normalizes to `draft`, so this is the only point where an
+  // explicit draft and a status-less file are still distinguishable — see
+  // ContextNode.authoredStatus.
+  const authoredStatus =
+    parsed.data.status === undefined || parsed.data.status === null
+      ? null
+      : String(parsed.data.status);
+
   // Normalize status to canonical before downstream consumers see it.
   // Aliases (`cancelled`, `superseded`, `active`, …) and unknown values are
   // resolved here so zod validation, predicates, retrieval filters, and
@@ -194,6 +233,7 @@ export function parseDocument(
     frontmatter,
     body: parsed.content,
     rawContent: content,
+    authoredStatus,
   };
 }
 

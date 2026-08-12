@@ -101,6 +101,53 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, integrity | AGPL-3.0 |
 | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access | AGPL-3.0 |
 
+## Performance
+
+How the engine behaves as a vault grows. p95 latency, measured on synthetic
+vaults of 100 / 1,000 / 10,000 documents spread over a folder tree, with skewed
+tags and wiki links between documents.
+
+| Operation | 100 docs | 1,000 docs | 10,000 docs | Scaling |
+|---|---|---|---|---|
+| `context_query` (retrieval) | 6ms | 74ms | **841ms** | linear (1.14×) |
+| `context_search` | 21ms | 174ms | **1.3s** | linear (0.76×) |
+| `context_list` | 12ms | 177ms | **1.4s** | linear (0.77×) |
+| `discoverDocuments` (vault crawl) | 11ms | 263ms | **1.2s** | linear (0.45×) |
+| `regenerateIndex` | 66ms | 383ms | **3.8s** | linear (0.98×) |
+| `context_import` (bulk import) | 0.7s | 11.3s | **108s** | linear (0.95×) |
+| Peak RSS | 74 MB | 126 MB | **262 MB** | linear |
+
+"Scaling" is the change in **per-document** cost from 1,000 to 10,000
+documents. 1.0× means the cost of a vault is proportional to what is in it —
+ten times the documents, ten times the work, no worse. Every operation measures
+between 0.45× and 1.15×, so nothing here degrades as a vault grows.
+
+Two honest caveats. Bulk import is linear but expensive in absolute terms:
+importing 10,000 documents takes around two minutes, because every document is
+published, versioned and hash-chained on the way in. And these numbers come
+from a developer machine (Node 22, win32-x64), so read them as orders of
+magnitude and scaling shape, not as a spec your hardware will reproduce.
+
+The suite lives in [`packages/engine/bench`](packages/engine/bench) and runs in
+CI. Reproduce it yourself:
+
+```bash
+pnpm build
+cd packages/engine
+pnpm bench                      # 100 / 1,000 / 10,000 documents
+pnpm bench --sizes 100,1000     # quicker
+pnpm bench:check                # run, then enforce the performance budget
+pnpm bench:profile              # writes a V8 CPU profile to bench/profiles/
+```
+
+`bench:check` is the CI gate. It fails when an operation's per-document cost
+grows beyond its budget — that is, when something stops scaling linearly. The
+budget is expressed as scaling shape rather than millisecond ceilings on
+purpose: CI runners differ in speed by several times, so ceilings tight enough
+to catch a real regression would fail constantly on a slow runner, and loose
+enough to survive one they would catch nothing. See
+[`bench/budget.json`](packages/engine/bench/budget.json).
+
 ## Prerequisites
 
 - **Node.js** >= 20.0.0
