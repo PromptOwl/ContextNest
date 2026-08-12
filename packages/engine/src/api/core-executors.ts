@@ -652,17 +652,32 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   let scanned: ContextNode[] = [];
   if (input.discover) {
     const exclude = new Set<string>(input.exclude_ids ?? []);
+    // Ids the caller supplied itself, via `ids` or staged from `documents`.
+    // The scan walks the whole vault, so it sees those documents too — but they
+    // are the caller's, already in the batch, and carry frontmatter it chose.
+    // Claiming them here would publish them under the scan's rules and stamp
+    // over the author it set.
+    const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
-      if (exclude.has(doc.id)) continue;
-      // Honor the source's own governance state: a file that EXPLICITLY says it
-      // is not published or approved stays unpublished. A status-less file (a
-      // plain Obsidian note) is fair game — see `explicitStatus`.
+      if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      // Publishing is opt-in. Only a file that EXPLICITLY says it is published
+      // or approved gets published; everything else is held as a draft for a
+      // human to approve, including a file that states no status at all.
+      //
+      // Saying nothing is not consent. A vault of hand-authored notes carries
+      // no governance state, and importing it should not decide on the author's
+      // behalf that every note is fit to serve to an AI. Held is recoverable —
+      // approve what belongs — where published-by-default is not: the exposure
+      // has already happened by the time anyone reviews it.
       const status = explicitStatus(doc);
-      if (status && status !== "published" && status !== "approved") held.push(doc);
-      else scanned.push(doc);
+      if (status === "published" || status === "approved") scanned.push(doc);
+      else held.push(doc);
     }
     batch.push(...scanned.map((d) => d.id));
   }
+  // Which ids the scan claimed, so the metadata stamp below can leave a
+  // caller's own staged documents alone.
+  const discovered = new Set(scanned.map((d) => d.id));
 
   // An empty call is a caller bug, not an empty result — but a batch where every
   // document failed to stage is a legitimate (fully-failed) result, and a
@@ -686,11 +701,19 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
       // need not exist on this host.
-      frontmatter: input.discover
-        ? (node) => ({
-            title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
-            ...(input.author ? { author: input.author } : {}),
-          })
+      //
+      // Scoped to the ids the SCAN found. A single call may mix modes — nothing
+      // stops `discover` arriving alongside `ids`/`documents` — and a caller
+      // that staged its own documents chose their frontmatter deliberately.
+      // Stamping the whole batch would silently overwrite the author it set.
+      frontmatter: discovered.size
+        ? (node) =>
+            discovered.has(node.id)
+              ? {
+                  title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...(input.author ? { author: input.author } : {}),
+                }
+              : null
         : undefined,
     });
     published = result.published.map((p) => ({ id: p.id, version: p.version }));
@@ -704,6 +727,43 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   if (!input.discover) {
     return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
   }
+
+  // Stage 3b: held documents never reach the publish write, so this is their
+  // only chance to be stamped. Two things must land.
+  //
+  // An explicit `status: draft` — a held document that states no status reads
+  // back as a draft in memory (the parser's default) but says nothing on disk,
+  // so anything reading the file itself, here or in another tool, is left to
+  // guess. Write the status down rather than leave it implied.
+  //
+  // And the importing user as `author`, for the same reason the publish path
+  // stamps it: the source vault's own `author:` names someone who need not
+  // exist on this host, and carrying it over invents a collaborator.
+  // This is the only write these documents get, so it is not extra work: it
+  // replaces the far heavier publish they used to receive. A document that
+  // already carries everything it needs is skipped outright, which makes a
+  // re-import of an already-stamped vault free.
+  await mapInBatches(held, async (doc) => {
+    const authored = explicitStatus(doc);
+    const stamp: Record<string, unknown> = {};
+
+    const title = doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    if (doc.frontmatter.title !== title) stamp.title = title;
+    if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
+    // Only when the author stated nothing — an explicit `pending_review` or
+    // `rejected` is theirs to keep, not ours to flatten into `draft`.
+    if (authored === null) stamp.status = "draft";
+
+    if (Object.keys(stamp).length === 0) return;
+    try {
+      await ctx.storage.writeDocument(
+        doc.id,
+        serializeDocument({ ...doc, frontmatter: { ...doc.frontmatter, ...stamp } }),
+      );
+    } catch (err) {
+      failed.push({ id: doc.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   // Stage 4 (discover): report every document the scan owned, published or not,
   // so a governance layer can record the import without re-reading the vault.

@@ -625,8 +625,16 @@ describe("createEngineApi — executable core operations", () => {
       "context_import",
       {
         files: [
-          // Status-less (a plain hand-authored note) → fair game to publish.
-          { path: "nodes/plain.md", content: "---\ntitle: Plain\ntype: document\n---\n\nbody\n" },
+          // Explicitly published by its author → the only thing that publishes.
+          {
+            path: "nodes/plain.md",
+            content: "---\ntitle: Plain\ntype: document\nstatus: published\n---\n\nbody\n",
+          },
+          // Status-less: saying nothing is not consent, so it is held.
+          {
+            path: "nodes/silent.md",
+            content: "---\ntitle: Silent\ntype: document\n---\n\nbody\n",
+          },
           // Explicitly not-yet-approved → must stay unpublished.
           {
             path: "nodes/wip.md",
@@ -649,18 +657,21 @@ describe("createEngineApi — executable core operations", () => {
       documents: Array<{ id: string; title: string; status: string; version: number }>;
     }>("context_import", { discover: true, author: "importer@test.com" }, ctx);
 
+    // Only the document whose author said "published" publishes.
     expect(out.published.map((p) => p.id)).toEqual(["nodes/plain"]);
     // Every scanned doc is reported, held ones included — the caller records
     // them all without re-reading the vault.
     expect(out.documents.map((d) => d.id).sort()).toEqual([
       "nodes/plain",
       "nodes/review",
+      "nodes/silent",
       "nodes/wip",
     ]);
     const byId = new Map(out.documents.map((d) => [d.id, d]));
     expect(byId.get("nodes/plain")!.status).toBe("published");
     expect(byId.get("nodes/wip")!.status).toBe("draft");
     expect(byId.get("nodes/review")!.status).toBe("draft");
+    expect(byId.get("nodes/silent")!.status).toBe("draft");
     // The author stamp rode along with the publish write — no second pass.
     const got = await api.run<{ frontmatter: { author?: string } }>(
       "context_get",
@@ -668,9 +679,115 @@ describe("createEngineApi — executable core operations", () => {
       ctx,
     );
     expect(got.frontmatter.author).toBe("importer@test.com");
+    // A held document is stamped too — it gets no publish write, so this pass
+    // is its only chance. A status-less file gets `draft` written down rather
+    // than left implied, and an author's own `pending_review` is not flattened.
+    const silent = await api.run<{ frontmatter: { author?: string; status?: string } }>(
+      "context_get",
+      { id: "nodes/silent" },
+      ctx,
+    );
+    expect(silent.frontmatter.author).toBe("importer@test.com");
+    expect(silent.frontmatter.status).toBe("draft");
+    const review = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: "nodes/review" },
+      ctx,
+    );
+    expect(review.frontmatter.status).toBe("pending_review");
     // One checkpoint for the whole discovered batch.
     const history = await ctx.storage.readCheckpointHistory();
     expect(history?.checkpoints).toHaveLength(1);
+  });
+
+  it("context_import discover honors an explicit status however it is written", async () => {
+    // The hold on not-yet-approved documents must survive ordinary frontmatter
+    // that is not the canonical one-value-per-line form. A trailing YAML
+    // comment used to defeat it: the document read as status-less and was
+    // published against its author's stated wishes.
+    const api = createEngineApi();
+    await api.run(
+      "context_import",
+      {
+        files: [
+          {
+            path: "nodes/commented.md",
+            content:
+              "---\ntitle: Commented\ntype: document\nstatus: draft  # not reviewed yet\n---\n\nbody\n",
+          },
+          {
+            path: "nodes/crlf.md",
+            content:
+              "---\r\ntitle: CRLF\r\ntype: document\r\nstatus: draft\r\n---\r\n\r\nbody\r\n",
+          },
+          {
+            path: "nodes/quoted.md",
+            content: `---\ntitle: Quoted\ntype: document\nstatus: 'pending_review'\n---\n\nbody\n`,
+          },
+          // Explicitly published, written with a trailing comment — the same
+          // parsing that must not lose a `draft` must not lose this either.
+          {
+            path: "nodes/live.md",
+            content:
+              "---\ntitle: Live\ntype: document\nstatus: published  # reviewed\n---\n\nbody\n",
+          },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+
+    const out = await api.run<{
+      published: Array<{ id: string }>;
+      documents: Array<{ id: string; status: string }>;
+    }>("context_import", { discover: true }, ctx);
+
+    expect(out.published.map((p) => p.id)).toEqual(["nodes/live"]);
+    const byId = new Map(out.documents.map((d) => [d.id, d.status]));
+    expect(byId.get("nodes/commented")).toBe("draft");
+    expect(byId.get("nodes/crlf")).toBe("draft");
+    expect(byId.get("nodes/quoted")).toBe("draft");
+    expect(byId.get("nodes/live")).toBe("published");
+  });
+
+  it("context_import discover does not stamp its author onto caller-staged documents", async () => {
+    // A single call may mix modes. Documents the caller staged itself carry
+    // frontmatter it chose deliberately, so the discover stamp must not reach
+    // them — only the ids the scan found.
+    const api = createEngineApi();
+    await ctx.storage.writeDocument(
+      "nodes/mine",
+      "---\ntitle: Mine\ntype: document\nauthor: original@author.com\nstatus: draft\n---\n\nbody\n",
+    );
+    await api.run(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/found.md", content: "---\ntitle: Found\ntype: document\n---\n\nbody\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+
+    await api.run(
+      "context_import",
+      { ids: ["nodes/mine"], discover: true, author: "importer@test.com" },
+      ctx,
+    );
+
+    const mine = await api.run<{ frontmatter: { author?: string } }>(
+      "context_get",
+      { id: "nodes/mine" },
+      ctx,
+    );
+    const found = await api.run<{ frontmatter: { author?: string } }>(
+      "context_get",
+      { id: "nodes/found" },
+      ctx,
+    );
+    expect(mine.frontmatter.author).toBe("original@author.com");
+    expect(found.frontmatter.author).toBe("importer@test.com");
   });
 
   it("context_import discover titles an untitled doc from its filename", async () => {

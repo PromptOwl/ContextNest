@@ -31,6 +31,18 @@ Three additions close that gap:
   record the import without re-reading the vault. `exclude_ids` skips what an
   earlier run already took, so a re-import is idempotent.
 
+**Publishing is opt-in.** Only a document whose frontmatter explicitly says
+`published` or `approved` gets published. Everything else is held as a draft,
+including a document that states no status at all — saying nothing is not
+consent. A vault of hand-authored notes carries no governance state, and
+importing it should not decide on the author's behalf that every note is fit to
+serve to an AI. Held is recoverable, since you can approve what belongs;
+published-by-default is not, because the exposure has already happened by the
+time anyone reviews it. A held document is stamped with an explicit
+`status: draft` rather than left implied, so a file read outside the engine is
+never ambiguous — except where the author already stated `pending_review` or
+`rejected`, which is theirs to keep.
+
 The metadata stamp now rides along with the publish write through a new
 `frontmatter` hook on `publishDocuments`, so it costs no pass of its own.
 

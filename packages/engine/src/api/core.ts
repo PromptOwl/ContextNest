@@ -682,7 +682,7 @@ const importOp: OperationDescriptor = {
       .boolean()
       .optional()
       .describe(
-        "Import every document already in the vault: the engine scans, decides publish-vs-hold from each file's own frontmatter, and returns full per-document detail. For folder import, where the caller has written files in and does not want to scan or rewrite them itself.",
+        "Import every document already in the vault: the engine scans, decides publish-vs-hold from each file's own frontmatter, and returns full per-document detail. For folder import, where the caller has written files in and does not want to scan or rewrite them itself. Publishing is OPT-IN — only a document whose frontmatter explicitly says `published` or `approved` is published; everything else, including a document that states no status at all, is held as a draft for a human to approve.",
       ),
     exclude_ids: z
       .array(z.string())
