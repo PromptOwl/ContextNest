@@ -15,3 +15,8 @@ fixtures/*
 # Test coverage output
 coverage/
 
+
+# Benchmark output — machine-specific timings and V8 profiles. The committed
+# baseline is bench/budget.json, not any one run.
+packages/engine/bench/results-*.json
+packages/engine/bench/profiles/

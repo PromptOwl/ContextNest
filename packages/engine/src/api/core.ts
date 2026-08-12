@@ -637,12 +637,21 @@ const importDoc = z.object({
   metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
 });
 
+/** One file from an existing vault, written in exactly as given. */
+const importFile = z.object({
+  path: z
+    .string()
+    .min(1)
+    .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
+  content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
+});
+
 const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, and/or `ids` for nodes already written into the vault. Both modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
-  // Both inputs are optional and validated in the executor rather than through
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in verbatim, and/or `discover` to let the engine find and publish everything already in the vault. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+  // Every input is optional and validated in the executor rather than through
   // a refined union: `.refine()` produces a ZodEffects, which degrades to a
   // useless JSON Schema through zod-to-json-schema — and MCP publishes
   // `inputJsonSchema(op)` verbatim as the tool schema.
@@ -657,11 +666,39 @@ const importOp: OperationDescriptor = {
       .describe(
         "Ids of documents ALREADY written into the vault, published in the same batch. Ids are preserved as-is — use this when the files carry their own paths/frontmatter (folder import).",
       ),
+    files: z
+      .array(importFile)
+      .optional()
+      .describe(
+        "Files from an existing vault, written in verbatim at their own relative paths. Unlike `documents` nothing is synthesized: the source's frontmatter is preserved, and non-document files (`.versions/<doc>/history.yaml`) travel too, which is what lets an imported version chain still reconstruct.",
+      ),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set false to write `files` without publishing them (default true). For an upload arriving in several batches: stage every batch, then make one final `discover` call so the whole import shares ONE checkpoint instead of one per batch.",
+      ),
+    discover: z
+      .boolean()
+      .optional()
+      .describe(
+        "Import every document already in the vault: the engine scans, decides publish-vs-hold from each file's own frontmatter, and returns full per-document detail. For folder import, where the caller has written files in and does not want to scan or rewrite them itself. Publishing is OPT-IN — only a document whose frontmatter explicitly says `published` or `approved` is published; everything else, including a document that states no status at all, is held as a draft for a human to approve.",
+      ),
+    exclude_ids: z
+      .array(z.string())
+      .optional()
+      .describe("With `discover`: ids to leave alone (already imported on an earlier run)."),
+    author: z
+      .string()
+      .optional()
+      .describe(
+        "With `discover`: stamped as `author` on every imported document. The importing user, not the vault's own `author:` — which names someone who need not exist on this host.",
+      ),
   }),
   output: z.object({
     published: z.array(z.object({ id: z.string(), version: z.number().int().min(1) })),
-    // `title` identifies a failure from `documents`, `id` one from `ids` —
-    // exactly one is set per entry.
+    // `title` identifies a failure from `documents`, `id` one from `ids` or
+    // `files` — exactly one is set per entry.
     failed: z.array(
       z.object({
         id: z.string().optional(),
@@ -671,6 +708,25 @@ const importOp: OperationDescriptor = {
     ),
     /** The single checkpoint sealing the batch, or null if nothing published. */
     checkpoint: z.number().int().nullable(),
+    /** `files` only: how many were written in. */
+    written: z.number().int().optional(),
+    /**
+     * `discover` only: every document the scan took responsibility for,
+     * published or held back. Carries what a governance layer needs to record
+     * the import without re-reading the vault itself.
+     */
+    documents: z
+      .array(
+        z.object({
+          id: z.string(),
+          title: z.string(),
+          version: z.number().int().min(1),
+          status: z.enum(["published", "draft"]),
+          tags: z.array(z.string()),
+          content: z.string(),
+        }),
+      )
+      .optional(),
   }),
   errors: ["VALIDATION_FAILED"],
 };

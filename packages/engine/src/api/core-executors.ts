@@ -18,6 +18,7 @@ import {
   normalizeTags,
   normalizeStatus,
   isRejected,
+  explicitStatus,
 } from "../parser.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
@@ -26,6 +27,7 @@ import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import { mapInBatches } from "../concurrency.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -76,6 +78,22 @@ function requireSlug(title: string): string {
     );
   }
   return slug;
+}
+
+/**
+ * Reject a title that carries no usable character at all — "###", "...", "   ".
+ *
+ * Same `\p{L}`/`\p{N}` rule as `assertSafeDocumentId`, NOT `requireSlug`: this
+ * runs where the title does not derive an id, and a document created with an
+ * explicit id may legitimately be titled "日本語" — which slugifies to nothing.
+ */
+function assertUsableTitle(title: string): void {
+  if (!/[\p{L}\p{N}]/u.test(title)) {
+    throw new ContextNestError(
+      `Title "${title}" has no letter or number; it cannot be read back by search or wiki links`,
+      "VALIDATION_FAILED",
+    );
+  }
 }
 
 /** Normalize (#-prefix) and de-duplicate a tag list. */
@@ -372,7 +390,14 @@ const update: OperationExecutor = async (ctx, input: any) => {
     throw new RejectedDocumentError(id);
   }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
-  if (input.title) frontmatter.title = input.title;
+  // A rename leaves the id alone, so this is the id-free rule, not create's
+  // slug rule: a title with no letter or number anywhere is unusable everywhere
+  // it is read back (search, wiki links), but "日本語" is fine — create accepts
+  // it too whenever the caller supplies the id.
+  if (input.title) {
+    assertUsableTitle(String(input.title));
+    frontmatter.title = input.title;
+  }
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
   if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
   if (input.metadata) {
@@ -584,6 +609,22 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // ids, and the caller owns their frontmatter. Nothing is rewritten here.
   const batch: string[] = [...(input.ids ?? [])];
 
+  // Stage 0: land an existing vault's files verbatim. Bounded-parallel because
+  // a vault may sit on a network mount where each write is a round trip, and a
+  // serial loop then costs one full latency per file.
+  const incoming: { path: string; content: string }[] = input.files ?? [];
+  let written = 0;
+  if (incoming.length > 0) {
+    await mapInBatches(incoming, async (f) => {
+      try {
+        await ctx.storage.writeVaultFile(f.path, f.content ?? "");
+        written++;
+      } catch (err) {
+        failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+  }
+
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
   for (const doc of input.documents ?? []) {
     try {
@@ -597,16 +638,58 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     }
   }
 
+  // A staging call — files written, publishing deferred to the caller's final
+  // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
+  if (input.publish === false) {
+    return { published: [], failed, checkpoint: null, written };
+  }
+
+  // Stage 2 (discover): the vault itself is the input. The scan, the metadata
+  // stamp and the publish-vs-hold decision all live here so a folder importer
+  // does not have to walk the vault and rewrite every file before handing the
+  // ids back — that pass cost a second full round trip per document.
+  let held: ContextNode[] = [];
+  let scanned: ContextNode[] = [];
+  if (input.discover) {
+    const exclude = new Set<string>(input.exclude_ids ?? []);
+    // Ids the caller supplied itself, via `ids` or staged from `documents`.
+    // The scan walks the whole vault, so it sees those documents too — but they
+    // are the caller's, already in the batch, and carry frontmatter it chose.
+    // Claiming them here would publish them under the scan's rules and stamp
+    // over the author it set.
+    const callerIds = new Set(batch);
+    for (const doc of await ctx.storage.discoverDocuments()) {
+      if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      // Publishing is opt-in. Only a file that EXPLICITLY says it is published
+      // or approved gets published; everything else is held as a draft for a
+      // human to approve, including a file that states no status at all.
+      //
+      // Saying nothing is not consent. A vault of hand-authored notes carries
+      // no governance state, and importing it should not decide on the author's
+      // behalf that every note is fit to serve to an AI. Held is recoverable —
+      // approve what belongs — where published-by-default is not: the exposure
+      // has already happened by the time anyone reviews it.
+      const status = explicitStatus(doc);
+      if (status === "published" || status === "approved") scanned.push(doc);
+      else held.push(doc);
+    }
+    batch.push(...scanned.map((d) => d.id));
+  }
+  // Which ids the scan claimed, so the metadata stamp below can leave a
+  // caller's own staged documents alone.
+  const discovered = new Set(scanned.map((d) => d.id));
+
   // An empty call is a caller bug, not an empty result — but a batch where every
-  // document failed to stage is a legitimate (fully-failed) result.
-  if (batch.length === 0 && failed.length === 0) {
+  // document failed to stage is a legitimate (fully-failed) result, and a
+  // `discover` over a folder with nothing new in it is simply done.
+  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0) {
     throw new ContextNestError(
-      "context_import requires documents[] or ids[]",
+      "context_import requires documents[], ids[], files[] or discover",
       "VALIDATION_FAILED",
     );
   }
 
-  // Stage 2: ONE bulk publish for both modes — one checkpoint + one index regen
+  // Stage 3: ONE bulk publish for every mode — one checkpoint + one index regen
   // for the whole batch (the O(N) path), instead of a checkpoint per document.
   let published: { id: string; version: number }[] = [];
   let checkpoint: number | null = null;
@@ -614,6 +697,24 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       onProgress: ctx.onProgress,
+      // The importer's metadata rides along with the publish write instead of
+      // costing its own pass. Title falls back to the filename; the author is
+      // the importing user, since the source's own `author:` names someone who
+      // need not exist on this host.
+      //
+      // Scoped to the ids the SCAN found. A single call may mix modes — nothing
+      // stops `discover` arriving alongside `ids`/`documents` — and a caller
+      // that staged its own documents chose their frontmatter deliberately.
+      // Stamping the whole batch would silently overwrite the author it set.
+      frontmatter: discovered.size
+        ? (node) =>
+            discovered.has(node.id)
+              ? {
+                  title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...(input.author ? { author: input.author } : {}),
+                }
+              : null
+        : undefined,
     });
     published = result.published.map((p) => ({ id: p.id, version: p.version }));
     checkpoint = result.checkpointNumber;
@@ -623,7 +724,71 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     }
   }
 
-  return { published, failed, checkpoint };
+  if (!input.discover) {
+    return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
+  }
+
+  // Stage 3b: held documents never reach the publish write, so this is their
+  // only chance to be stamped. Two things must land.
+  //
+  // An explicit `status: draft` — a held document that states no status reads
+  // back as a draft in memory (the parser's default) but says nothing on disk,
+  // so anything reading the file itself, here or in another tool, is left to
+  // guess. Write the status down rather than leave it implied.
+  //
+  // And the importing user as `author`, for the same reason the publish path
+  // stamps it: the source vault's own `author:` names someone who need not
+  // exist on this host, and carrying it over invents a collaborator.
+  // This is the only write these documents get, so it is not extra work: it
+  // replaces the far heavier publish they used to receive. A document that
+  // already carries everything it needs is skipped outright, which makes a
+  // re-import of an already-stamped vault free.
+  await mapInBatches(held, async (doc) => {
+    const authored = explicitStatus(doc);
+    const stamp: Record<string, unknown> = {};
+
+    const title = doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    if (doc.frontmatter.title !== title) stamp.title = title;
+    if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
+    // Only when the author stated nothing — an explicit `pending_review` or
+    // `rejected` is theirs to keep, not ours to flatten into `draft`.
+    if (authored === null) stamp.status = "draft";
+
+    if (Object.keys(stamp).length === 0) return;
+    try {
+      await ctx.storage.writeDocument(
+        doc.id,
+        serializeDocument({ ...doc, frontmatter: { ...doc.frontmatter, ...stamp } }),
+      );
+    } catch (err) {
+      failed.push({ id: doc.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Stage 4 (discover): report every document the scan owned, published or not,
+  // so a governance layer can record the import without re-reading the vault.
+  // A doc that failed to publish is reported at its own version, not dropped —
+  // its imported history is intact and it simply stays a draft.
+  const publishedVersion = new Map(published.map((p) => [p.id, p.version]));
+  const asRecord = (doc: ContextNode) => {
+    const version = publishedVersion.get(doc.id);
+    const own = Number(doc.frontmatter.version);
+    return {
+      id: doc.id,
+      title: doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
+      status: version !== undefined ? ("published" as const) : ("draft" as const),
+      tags: normalizeTags(doc.frontmatter.tags) ?? [],
+      content: doc.body ?? "",
+    };
+  };
+  return {
+    published,
+    failed,
+    checkpoint,
+    ...(incoming.length ? { written } : {}),
+    documents: [...scanned, ...held].map(asRecord),
+  };
 };
 
 /** name → executor for the built-in `core` namespace. */
