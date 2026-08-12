@@ -362,6 +362,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 |---|---|
 | `ctx vault list` | List registered vaults (`* ` marks the default) |
 | `ctx vault add <alias> [path]` | Register a vault (path defaults to the current vault) |
+| `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
 | `ctx vault remove <alias>` | Unregister an alias |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which` | Show the resolved vault and the reason |
@@ -371,6 +372,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | Command | Description |
 |---|---|
 | `ctx init` | Initialize a new vault (supports `--starter` recipes) |
+| `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
 | `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
 | `ctx update <path>` | Update a document's title, tags, or body (auto-publishes) |
@@ -379,6 +381,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
 | `ctx validate [path]` | Validate documents against the spec |
 | `ctx publish <path>` | Publish a document (creates version + checkpoint) |
+| `ctx publish --all` | Publish every unpublished document in one batch — one checkpoint, one index pass |
 
 ### Querying
 
@@ -387,9 +390,10 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx query <selector>` | Query context with graph traversal (default: 2 hops) |
 | `ctx query <selector> --hops 4` | Deeper traversal for more related context |
 | `ctx query <selector> --full` | Load all documents (bypass graph traversal) |
+| `ctx query <selector> --include-drafts` | Include drafts (default: published only) |
 | `ctx query @org/pack` | Query from a cloud-hosted pack via [PromptOwl](https://promptowl.ai) |
-| `ctx list` | List all documents (filter with `--type`, `--status`, `--tag`) |
-| `ctx search <query>` | Full-text search across vault documents |
+| `ctx list` | List all documents (filter with `--type`, `--status`, `--tag`; cap with `--limit`) |
+| `ctx search <query>` | Full-text search across vault documents (`--limit` to cap) |
 | `ctx resolve <selector>` | Execute a selector query (low-level) |
 
 ### Selectors
@@ -409,7 +413,8 @@ ctx query "#api + status:published"       # Intersection
 | Command | Description |
 |---|---|
 | `ctx history <path>` | Show version history |
-| `ctx reconstruct <path> <version>` | Reconstruct a specific version |
+| `ctx history <path> --diff` | Include each version's unified diff from the one before |
+| `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
 | `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped) |
 
 Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
@@ -430,7 +435,7 @@ full stack trace back.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 19 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 35 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -489,30 +494,54 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ### Available MCP Tools
 
-**Read tools:**
+**Canonical tools** — name, description and input schema come straight from the
+engine's operation catalog, so this surface cannot drift from the CLI or the
+cloud:
 
 | Tool | Description |
 |---|---|
-| `vault_info` | Get vault identity and configuration summary |
-| `resolve` | Execute a selector query with graph traversal |
-| `read_document` | Read a document by URI or path |
-| `list_documents` | List documents with optional type/status/tag filters |
+| `context_init` | Open a vault: instructions, configuration, path, and what it holds (`include_nodes` to also list nodes) |
+| `context_nests` | List every nest in the central registry |
+| `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
+| `context_list` | List nodes with type / status / tag filters (`include_retired`, `full`, `limit`) |
+| `context_search` | Full-text search with graph traversal |
+| `context_query` | Selector query with graph traversal (`include_drafts`) |
+| `context_resolve` | Resolve a selector to full bodies within a token budget |
+| `context_versions` | List a document's version history |
+| `context_reconstruct` | Reconstruct a specific version |
+| `context_packs` | List packs with their `includes` and `excludes` |
+| `context_verify` | Verify every hash chain in the vault |
+| `context_create` | Create a node — own `id`, `publish: false`, initial `status`, `note`, full `skill` block |
+| `context_update` | Update a node — rename, set `status`, stamp a `version`, clear metadata with `null` |
+| `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
+| `context_delete` | Delete a node and its history; returns the deleted node's `title` |
+| `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
+
+**Vault tools:**
+
+| Tool | Description |
+|---|---|
 | `document_format` | Get the document format spec (call before creating docs) |
 | `read_index` | Return the context.yaml index |
 | `read_pack` | Resolve and return a context pack with documents |
-| `search` | Full-text search with graph traversal |
-| `verify_integrity` | Verify all hash chains |
 | `list_checkpoints` | List recent checkpoints |
-| `read_version` | Read a specific version of a document |
 
-**Mutation tools** (all auto-publish and regenerate the index):
+**Deprecated tools** — still registered and unchanged, so existing clients keep
+working; removed in a future major:
 
-| Tool | Description |
+| Deprecated | Use instead |
 |---|---|
-| `create_document` | Create a new document with frontmatter and optional body |
-| `update_document` | Update a document's title, tags, status, or body |
-| `delete_document` | Delete a document and its version history |
-| `publish_document` | Explicitly publish a document (bump version, create checkpoint) |
+| `vault_info` | `context_init` |
+| `read_document` | `context_get` |
+| `list_documents` | `context_list` |
+| `search` | `context_search` |
+| `resolve` | `context_resolve` |
+| `read_version` | `context_reconstruct` |
+| `verify_integrity` | `context_verify` |
+| `create_document` | `context_create` |
+| `update_document` | `context_update` |
+| `publish_document` | `context_publish` |
+| `delete_document` | `context_delete` |
 
 **Drift governance tools** (resolve out-of-band edits without touching the canonical doc or hash chain until approved):
 

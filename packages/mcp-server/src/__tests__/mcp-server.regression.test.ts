@@ -27,7 +27,10 @@ const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.ur
 const FIXTURES = fileURLToPath(new URL("../../../../fixtures/minimal-vault", import.meta.url));
 
 const EXPECTED_TOOLS = [
-  // Canonical catalog operations (API Convergence Phase 2).
+  // Catalog-driven: name, description and schema come from the engine's
+  // operation catalog rather than being declared here, so this surface cannot
+  // drift from the CLI's. The legacy twin of a catalog tool (e.g.
+  // create_document) stays registered but is deprecated.
   "context_get",
   "context_query",
   "context_resolve",
@@ -39,34 +42,32 @@ const EXPECTED_TOOLS = [
   "context_delete",
   "context_versions",
   "context_reconstruct",
-  "context_overview",
   "context_verify",
   "context_init",
   "context_packs",
   "context_import",
+  "context_nests",
+  // Hand-written, still current.
+  "document_format",
+  "read_index",
+  "read_pack",
+  "list_checkpoints",
+  "stage_drift_suggestion",
+  "list_suggestions",
+  "approve_suggestion",
+  "reject_suggestion",
   // Legacy names — kept as deprecated aliases for the migration window.
   "vault_info",
   "resolve",
   "read_document",
   "list_documents",
-  "document_format",
-  "read_index",
-  "read_pack",
   "search",
   "verify_integrity",
-  "list_checkpoints",
   "read_version",
   "create_document",
   "update_document",
   "delete_document",
   "publish_document",
-  "stage_drift_suggestion",
-  "list_suggestions",
-  "approve_suggestion",
-  "reject_suggestion",
-  // Catalog-driven: name, description and schema come from the engine's
-  // operation catalog rather than being declared here.
-  "context_import",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -175,6 +176,32 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
       expect((t.description ?? "").length).toBeGreaterThan(0);
       expect(t.inputSchema).toBeDefined();
     }
+  });
+
+  // A catalog tool is registered from `op.input.shape`, which is undefined on
+  // any descriptor whose input is a ZodEffects (i.e. one carrying a `.refine`).
+  // The SDK accepts that and publishes a tool advertising NO parameters at all,
+  // so a client cannot tell what to send — and asserting only that inputSchema
+  // "is defined" above sails straight past it.
+  it.each([
+    ["context_create", ["title", "content"]],
+    ["context_update", ["id", "content", "status"]],
+    ["context_list", ["type", "tag", "status", "limit"]],
+    ["context_versions", ["id", "title", "include_diff"]],
+    ["context_get", ["uri", "id", "title", "include_raw", "allow_rejected"]],
+    ["context_init", ["include_nodes", "limit"]],
+    ["context_search", ["query", "limit"]],
+    ["context_query", ["query", "hops", "full", "include_drafts"]],
+    ["context_resolve", ["selector", "max_tokens", "hops"]],
+    ["context_import", ["documents", "ids"]],
+  ])("%s advertises its declared inputs", async (name, expected) => {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === name);
+    expect(tool).toBeDefined();
+    const props = Object.keys(
+      (tool!.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
+    );
+    expect(props).toEqual(expect.arrayContaining(expected));
   });
 
   it("vault_info returns identity and the configured servers", async () => {

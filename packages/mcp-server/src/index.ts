@@ -162,7 +162,7 @@ function deprecated(canonical: string, description: string): string {
 
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
-server.tool("vault_info", deprecated("context_overview", "Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
+server.tool("vault_info", deprecated("context_init", "It returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
   const contextMd = await storage.readContextMd();
   const config = await storage.readConfig();
 
@@ -196,7 +196,10 @@ server.tool("vault_info", deprecated("context_overview", "Get vault identity (CO
 
 server.tool(
   "resolve",
-  deprecated("context_query", "Execute a selector query to find matching documents using graph traversal"),
+  deprecated(
+    "context_query",
+    "This has always been a graph-traversal selector query. (context_resolve is a different operation — it returns full bodies within a token budget.) Execute a selector query to find matching documents using graph traversal",
+  ),
   {
     // Superset of the catalog shape: the legacy param was `selector`, the
     // canonical one is `query`. Both are accepted for the migration window;
@@ -230,9 +233,11 @@ server.tool(
     if (id) input.id = id;
     else if (uri) {
       // The legacy param accepted a plain path in `uri`; the catalog op treats
-      // `uri` strictly, so route non-URIs through `id`.
+      // `uri` strictly, so route non-URIs through `id`. normalizeDocumentId
+      // keeps the legacy re-rooting of a bare slug into nodes/ — context_get
+      // deliberately does not re-root, but this alias always has.
       if (uri.startsWith("contextnest://")) input.uri = uri;
-      else input.id = uri;
+      else input.id = normalizeDocumentId(uri);
     }
     if (title) input.title = title;
     if (include_raw !== undefined) input.include_raw = include_raw;
@@ -620,7 +625,10 @@ server.tool(
 
 server.tool(
   "create_document",
-  deprecated("context_create", "Create a new document in the vault with frontmatter and optional body content"),
+  deprecated(
+    "context_create",
+    "Create a new document in the vault with frontmatter and optional body content Kept for existing clients: it wraps the body in a heading and fills skill defaults, which context_create does not.",
+  ),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().describe("Document title"),
@@ -732,7 +740,10 @@ server.tool(
 
 server.tool(
   "update_document",
-  deprecated("context_update", "Update an existing document's frontmatter fields and/or body content"),
+  deprecated(
+    "context_update",
+    "Update an existing document's frontmatter fields and/or body content Kept for existing clients: it accepts status aliases and wraps the body, which context_update does not.",
+  ),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().optional().describe("New title"),
@@ -912,7 +923,10 @@ server.tool(
 
 server.tool(
   "publish_document",
-  deprecated("context_publish", "Publish a document: bump version, compute checksum, create version entry and checkpoint"),
+  deprecated(
+    "context_publish",
+    "Publish a document: bump version, compute checksum, create version entry and checkpoint",
+  ),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),
@@ -1138,35 +1152,6 @@ server.tool(
     };
   },
 );
-
-// ─── Tool: context_import ──────────────────────────────────────────────────────
-
-// First catalog-driven tool in this server: the schema, description and
-// implementation all come from the engine's operation catalog, so this surface
-// cannot drift from the CLI/Community ones. The SDK wants a ZodRawShape, so we
-// hand it the descriptor's own `.shape` rather than restating the schema here.
-const importOp = engineApi.getOperation("context_import");
-if (importOp) {
-  server.tool(
-    importOp.name,
-    importOp.description,
-    (importOp.input as z.ZodObject<z.ZodRawShape>).shape,
-    async (input) => {
-      // No onProgress — MCP has no progress channel; the operation is identical
-      // without one.
-      const result = await engineApi.run(importOp.name, input, {
-        storage,
-        query: new GraphQueryEngine(storage),
-        versions: new VersionManager(storage),
-        rbac: permissiveRbac,
-        actor: "mcp@contextnest.local",
-      });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    },
-  );
-}
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import { NestStorage } from "../storage.js";
@@ -11,10 +12,12 @@ import { UnauthorizedActionError } from "../errors.js";
 import type { ContextNode } from "../types.js";
 import {
   createEngineApi,
+  OPERATIONS,
   type OperationContext,
   type EngineExtension,
   type OperationDescriptor,
 } from "../api/index.js";
+import { addVault, setDefaultVault } from "../registry.js";
 
 async function makeContext(): Promise<{ ctx: OperationContext; dir: string }> {
   const dir = await mkdtemp(join(tmpdir(), "contextnest-api-runtime-"));
@@ -88,17 +91,64 @@ describe("createEngineApi — executable core operations", () => {
     expect(listed.documents.some((d) => d.id === created.id)).toBe(true);
   });
 
-  it("update by title (not id) resolves the real doc (regression: C2)", async () => {
+  it("title selects the real doc, and on update it renames instead (regression: C2)", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "My Cool Title", content: "orig" }, ctx);
-    const updated = await api.run<{ id: string; version: number }>(
+    // Selecting by title still resolves the real doc rather than a slug guess —
+    // the C2 guard, now carried by the selector ops that kept that input.
+    const got = await api.run<{ id: string }>("context_get", { title: "My Cool Title" }, ctx);
+    expect(got.id).toBe("nodes/my-cool-title");
+    // On context_update `title` is the NEW title: it renames, leaving the id be.
+    const updated = await api.run<{ id: string }>(
       "context_update",
-      { title: "My Cool Title", append: "more" },
+      { id: got.id, title: "Renamed", append: "more" },
       ctx,
     );
     expect(updated.id).toBe("nodes/my-cool-title");
-    const got = await api.run<{ body: string }>("context_get", { title: "My Cool Title" }, ctx);
-    expect(got.body).toContain("more");
+    const after = await api.run<{ frontmatter: { title: string }; body: string }>(
+      "context_get",
+      { id: got.id },
+      ctx,
+    );
+    expect(after.frontmatter.title).toBe("Renamed");
+    expect(after.body).toContain("more");
+  });
+
+  it("rejects a title with nothing slug-able on create AND on rename", async () => {
+    const api = createEngineApi();
+    await expect(
+      api.run("context_create", { title: "###", content: "body" }, ctx),
+    ).rejects.toThrow(/no slug-able/);
+
+    const doc = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Real Title", content: "body" },
+      ctx,
+    );
+    // A rename keeps the id, but an unusable title is still unusable — title→id
+    // resolution, search and wiki links all read it back.
+    await expect(
+      api.run("context_update", { id: doc.id, title: "..." }, ctx),
+    ).rejects.toThrow(/no letter or number/);
+  });
+
+  it("keeps a non-Latin title renameable when the id was supplied explicitly", async () => {
+    const api = createEngineApi();
+    // Slugifies to nothing, so create only accepts it alongside an explicit id —
+    // and update must then apply the same rule, or the document is stuck with a
+    // title it can never re-save.
+    const doc = await api.run<{ id: string }>(
+      "context_create",
+      { title: "日本語のみ", content: "body", id: "nodes/system/jp" },
+      ctx,
+    );
+    await api.run("context_update", { id: doc.id, title: "日本語のみ", content: "more" }, ctx);
+    const after = await api.run<{ frontmatter: { title: string } }>(
+      "context_get",
+      { id: doc.id },
+      ctx,
+    );
+    expect(after.frontmatter.title).toBe("日本語のみ");
   });
 
   it("published doc is visible to graph-mode query after create (regression: S3 index regen)", async () => {
@@ -232,21 +282,46 @@ describe("createEngineApi — executable core operations", () => {
     expect(full.versions.filter((v) => v.keyframe).every((v) => !v.diff)).toBe(true);
   });
 
-  it("context_overview reports counts, tags, and the node list", async () => {
+  it("context_init opens the vault in one call: instructions, config and counts", async () => {
     const api = createEngineApi();
     await api.run("context_create", { title: "Alpha", content: "b", tags: ["#x"] }, ctx);
     await api.run("context_create", { title: "Beta", content: "b", type: "glossary" }, ctx);
-    const out = await api.run<{
+    type Init = {
+      context_md: string | null;
+      vault_path: string;
+      config: { name: string } | null;
       total: number;
       by_type: Record<string, number>;
       tags: string[];
-      nodes: Array<{ id: string }>;
-    }>("context_overview", {}, ctx);
+      nodes?: Array<{ id: string }>;
+    };
+    const out = await api.run<Init>("context_init", {}, ctx);
     expect(out.total).toBeGreaterThanOrEqual(2);
     expect(out.by_type.document).toBeGreaterThanOrEqual(1);
     expect(out.by_type.glossary).toBeGreaterThanOrEqual(1);
     expect(out.tags).toContain("#x");
-    expect(out.nodes.some((n) => n.id === "nodes/alpha")).toBe(true);
+    expect(out.vault_path).toBe(dir);
+    // The node list is the expensive part, so it is opt-in.
+    expect(out.nodes).toBeUndefined();
+
+    const withNodes = await api.run<Init>("context_init", { include_nodes: true }, ctx);
+    expect(withNodes.nodes?.some((n) => n.id === "nodes/alpha")).toBe(true);
+    expect((await api.run<Init>("context_init", { include_nodes: true, limit: 1 }, ctx)).nodes)
+      .toHaveLength(1);
+  });
+
+  it("context_init counts retired nodes, which discovery drops by default", async () => {
+    const api = createEngineApi();
+    await api.run("context_create", { title: "Live One", content: "b" }, ctx);
+    await api.run("context_create", { title: "Dead One", content: "b" }, ctx);
+    await api.run("context_update", { id: "nodes/dead-one", status: "rejected" }, ctx);
+    const out = await api.run<{ by_status: Record<string, number>; total: number }>(
+      "context_init",
+      {},
+      ctx,
+    );
+    expect(out.by_status.rejected).toBe(1);
+    expect(out.total).toBe(2);
   });
 
   it("context_reconstruct returns a past version's content", async () => {
@@ -317,6 +392,63 @@ describe("createEngineApi — executable core operations", () => {
     const api = createEngineApi();
     const out = await api.run<{ packs: unknown[] }>("context_packs", {}, ctx);
     expect(Array.isArray(out.packs)).toBe(true);
+  });
+
+  it("context_create with publish:false leaves the node a draft", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ id: string; version: number; status: string }>(
+      "context_create",
+      { title: "Needs Review", content: "body", publish: false },
+      ctx,
+    );
+    expect(out.status).toBe("draft");
+    const got = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: out.id },
+      ctx,
+    );
+    expect(got.frontmatter.status).toBe("draft");
+  });
+
+  it("context_create honours an explicit id over the title slug", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ id: string; status: string }>(
+      "context_create",
+      { title: "Human Title", content: "body", id: "nodes/system/deterministic-id" },
+      ctx,
+    );
+    expect(out.id).toBe("nodes/system/deterministic-id");
+    expect(out.status).toBe("published");
+  });
+
+  it("context_create rejects an explicit id that escapes the vault", async () => {
+    const api = createEngineApi();
+    await expect(
+      api.run("context_create", { title: "Escape", content: "b", id: "../../outside" }, ctx),
+    ).rejects.toThrow(/path traversal/);
+  });
+
+  it("context_create builds a valid skill node from the skill fields", async () => {
+    const api = createEngineApi();
+    const out = await api.run<{ id: string }>(
+      "context_create",
+      {
+        title: "Deploy Skill",
+        content: "steps",
+        type: "skill",
+        trigger: "when asked to deploy",
+        tools_required: ["bash"],
+        output_format: "markdown",
+      },
+      ctx,
+    );
+    const got = await api.run<{ frontmatter: any }>("context_get", { id: out.id }, ctx);
+    // A `skill` block, not loose top-level keys — validation requires it.
+    expect(got.frontmatter.skill).toMatchObject({
+      trigger: "when asked to deploy",
+      tools_required: ["bash"],
+      output_format: "markdown",
+    });
   });
 
   it("context_import bulk-creates many nodes under ONE checkpoint", async () => {
@@ -600,15 +732,507 @@ describe("core executors — review-fix regressions", () => {
     ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
   });
 
-  it("context_update de-duplicates merged tags", async () => {
+  it("context_update replaces tags and de-duplicates them", async () => {
     const api = createEngineApi();
-    await api.run("context_create", { title: "Dedupe", content: "b", tags: ["#api"] }, ctx);
+    await api.run(
+      "context_create",
+      { title: "Dedupe", content: "b", tags: ["#api", "#legacy"] },
+      ctx,
+    );
     await api.run("context_update", { id: "nodes/dedupe", tags: ["api", "#api", "ml"] }, ctx);
     const got = await api.run<{ frontmatter: { tags?: string[] } }>(
       "context_get",
       { id: "nodes/dedupe" },
       ctx,
     );
+    // #legacy is gone: the list replaces rather than merges, matching the CLI,
+    // mcp-server and context_create.
     expect(got.frontmatter.tags).toEqual(["#api", "#ml"]);
+  });
+});
+
+// ─── context_update — publish resolution ─────────────────────────────────────
+//
+// The CLI and mcp-server each hand-rolled "a lifecycle status change is
+// metadata, not a release". The op owns that rule now, so it is pinned here.
+
+describe("context_update — when it publishes", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+  const historyLength = async (id: string) =>
+    (await ctx.storage.readHistory(id))?.versions.length ?? 0;
+
+  it("publishes a content edit", async () => {
+    await api.run("context_create", { title: "Live", content: "one" }, ctx);
+    const before = await historyLength("nodes/live");
+    const res = await api.run<{ status: string; checkpoint: number | null }>(
+      "context_update",
+      { id: "nodes/live", content: "two" },
+      ctx,
+    );
+    expect(res.status).toBe("published");
+    expect(res.checkpoint).not.toBeNull();
+    expect(await historyLength("nodes/live")).toBe(before + 1);
+  });
+
+  it.each(["draft", "pending_review", "approved", "rejected"])(
+    "treats a %s transition as metadata — no version cut",
+    async (status) => {
+      await api.run("context_create", { title: "Cycle", content: "one" }, ctx);
+      const before = await historyLength("nodes/cycle");
+      const res = await api.run<{ status: string; checkpoint: number | null }>(
+        "context_update",
+        { id: "nodes/cycle", status },
+        ctx,
+      );
+      expect(res.status).toBe(status);
+      expect(res.checkpoint).toBeNull();
+      expect(await historyLength("nodes/cycle")).toBe(before);
+    },
+  );
+
+  it("honours an explicit publish:false over the derived default", async () => {
+    await api.run("context_create", { title: "Held", content: "one" }, ctx);
+    const before = await historyLength("nodes/held");
+    const res = await api.run<{ version: number; checkpoint: number | null }>(
+      "context_update",
+      { id: "nodes/held", content: "two", publish: false, version: 7 },
+      ctx,
+    );
+    // A governed caller assigns its own version for a revision awaiting review.
+    expect(res.version).toBe(7);
+    expect(res.checkpoint).toBeNull();
+    expect(await historyLength("nodes/held")).toBe(before);
+    const got = await api.run<{ frontmatter: { checksum?: string }; body: string }>(
+      "context_get",
+      { id: "nodes/held" },
+      ctx,
+    );
+    expect(got.body).toContain("two");
+    // Stale published-state checksum dropped, or the next verified read reports
+    // this write as external drift.
+    expect(got.frontmatter.checksum).toBeUndefined();
+  });
+
+  it("revives a rejected doc when the caller names a new status", async () => {
+    await api.run("context_create", { title: "Retired", content: "one" }, ctx);
+    await api.run("context_update", { id: "nodes/retired", status: "rejected" }, ctx);
+    // Content-only edit stays refused …
+    await expect(
+      api.run("context_update", { id: "nodes/retired", content: "sneaky" }, ctx),
+    ).rejects.toMatchObject({ code: "REJECTED_DOCUMENT" });
+    // … but declaring a status revives it.
+    const res = await api.run<{ status: string }>(
+      "context_update",
+      { id: "nodes/retired", status: "draft", content: "revived" },
+      ctx,
+    );
+    expect(res.status).toBe("draft");
+    const got = await api.run<{ body: string }>("context_get", { id: "nodes/retired" }, ctx);
+    expect(got.body).toContain("revived");
+  });
+});
+
+// ─── context_list — filters ──────────────────────────────────────────────────
+//
+// The CLI, mcp-server and Community each grew a private copy of this filter and
+// each got a different subset of the rules right. These pin the shared one.
+
+describe("context_list — filters", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+  const ids = (r: { documents: Array<{ id: string }> }) => r.documents.map((d) => d.id).sort();
+  const list = (input: object = {}) =>
+    api.run<{ documents: Array<{ id: string }> }>("context_list", input, ctx);
+
+  /** A document with NO `type:` field — the common case, and the one a literal
+   *  type comparison used to skip. */
+  const writeUntyped = async (id: string, status: string, tags = "") =>
+    ctx.storage.writeDocument(
+      id,
+      `---\ntitle: ${id}\nstatus: ${status}\n${tags}---\n\nbody\n`,
+    );
+
+  it("matches untyped documents against type:document", async () => {
+    await writeUntyped("nodes/plain", "published");
+    await api.run("context_create", { title: "A Skill", content: "b", type: "skill", trigger: "when asked" }, ctx);
+    expect(await list({ type: "document" }).then(ids)).toEqual(["nodes/plain"]);
+  });
+
+  it("accepts several types at once", async () => {
+    await writeUntyped("nodes/plain", "published");
+    await api.run("context_create", { title: "A Skill", content: "b", type: "skill", trigger: "when asked" }, ctx);
+    await api.run("context_create", { title: "An Agent", content: "b", type: "agent" }, ctx);
+    expect(await list({ type: ["skill", "agent"] }).then(ids)).toEqual([
+      "nodes/a-skill",
+      "nodes/an-agent",
+    ]);
+  });
+
+  it("finds retired documents on status:rejected, and hides them otherwise", async () => {
+    await writeUntyped("nodes/live", "published");
+    await writeUntyped("nodes/dead", "rejected");
+    // Discovery drops retired docs, so this filter used to match nothing at all.
+    expect(await list({ status: "rejected" }).then(ids)).toEqual(["nodes/dead"]);
+    expect(await list().then(ids)).toEqual(["nodes/live"]);
+  });
+
+  it("normalizes status aliases", async () => {
+    await writeUntyped("nodes/live", "published");
+    expect(await list({ status: "active" }).then(ids)).toEqual(["nodes/live"]);
+  });
+
+  it("matches a tag with or without its # and regardless of case", async () => {
+    await writeUntyped("nodes/tagged", "published", "tags:\n  - '#API'\n");
+    await writeUntyped("nodes/untagged", "published");
+    for (const tag of ["#API", "API", "api", "#api"]) {
+      expect(await list({ tag }).then(ids)).toEqual(["nodes/tagged"]);
+    }
+  });
+
+  it("applies limit last", async () => {
+    await writeUntyped("nodes/a", "published");
+    await writeUntyped("nodes/b", "published");
+    await writeUntyped("nodes/c", "rejected");
+    // Retired doc is excluded before the limit counts, not after.
+    expect((await list({ limit: 2 })).documents).toHaveLength(2);
+  });
+
+  it("include_retired keeps retired nodes with no status filter", async () => {
+    await writeUntyped("nodes/live", "published");
+    await writeUntyped("nodes/dead", "rejected");
+    // Governed surfaces list a rejected node as one its stewards still act on.
+    expect(await list({ include_retired: true }).then(ids)).toEqual([
+      "nodes/dead",
+      "nodes/live",
+    ]);
+  });
+
+  it("full returns frontmatter and body so callers need not re-read the files", async () => {
+    await ctx.storage.writeDocument(
+      "nodes/rich",
+      `---\ntitle: Rich\nstatus: published\nversion: 4\nauthor: someone@example.com\ncreated_at: '2024-01-01T00:00:00.000Z'\n---\n\nthe body\n`,
+    );
+    const summary = (await list()).documents[0] as Record<string, unknown>;
+    expect(summary.frontmatter).toBeUndefined();
+    expect(summary.body).toBeUndefined();
+
+    const full = (await list({ full: true })).documents[0] as unknown as {
+      body: string;
+      frontmatter: { version?: number; author?: string; created_at?: string };
+    };
+    expect(full.body).toContain("the body");
+    // The fields a summary drops are exactly why `full` exists.
+    expect(full.frontmatter.version).toBe(4);
+    expect(full.frontmatter.author).toBe("someone@example.com");
+    expect(full.frontmatter.created_at).toBeTruthy();
+  });
+});
+
+// ─── context_get — what each surface needs beyond {id, frontmatter, body} ────
+
+describe("context_get — raw, rejected, selector", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("include_raw returns the exact stored bytes, frontmatter block and all", async () => {
+    await api.run("context_create", { title: "Raw Doc", content: "the body" }, ctx);
+    const plain = await api.run<{ raw?: string }>("context_get", { id: "nodes/raw-doc" }, ctx);
+    expect(plain.raw).toBeUndefined();
+
+    const withRaw = await api.run<{ raw: string; body: string }>(
+      "context_get",
+      { id: "nodes/raw-doc", include_raw: true },
+      ctx,
+    );
+    // `body` is the parsed body; `raw` still carries the frontmatter block, so
+    // a caller can re-serve the file verbatim.
+    expect(withRaw.raw).toContain("---");
+    expect(withRaw.raw).toContain("title: Raw Doc");
+    expect(withRaw.raw).toContain("the body");
+    expect(withRaw.body).not.toContain("title: Raw Doc");
+  });
+
+  it("refuses a rejected node, unless the caller allows it", async () => {
+    await api.run("context_create", { title: "Retired Doc", content: "body" }, ctx);
+    await api.run("context_update", { id: "nodes/retired-doc", status: "rejected" }, ctx);
+
+    await expect(api.run("context_get", { id: "nodes/retired-doc" }, ctx)).rejects.toMatchObject({
+      code: "REJECTED_DOCUMENT",
+    });
+    // Reading one is not republishing it — governed surfaces show retired docs.
+    const allowed = await api.run<{ frontmatter: { status?: string } }>(
+      "context_get",
+      { id: "nodes/retired-doc", allow_rejected: true },
+      ctx,
+    );
+    expect(allowed.frontmatter.status).toBe("rejected");
+  });
+
+  it("still demands a selector now that the schema no longer refines one", async () => {
+    // The `.refine` came off so MCP can register these ops at all; the same
+    // error has to survive as a runtime check.
+    await expect(api.run("context_get", {}, ctx)).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
+    await expect(api.run("context_versions", {}, ctx)).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
+  });
+});
+describe("context_nests — registry-scoped operation", () => {
+  let tmp: string;
+  let savedConfigDir: string | undefined;
+
+  /** A directory that looks like a vault, optionally with its own name/description. */
+  function makeVault(dir: string, name?: string, description?: string): string {
+    mkdirSync(join(dir, ".context"), { recursive: true });
+    writeFileSync(
+      join(dir, ".context", "config.yaml"),
+      `version: 1\n${name ? `name: "${name}"\n` : ""}${description ? `description: "${description}"\n` : ""}`,
+    );
+    return dir;
+  }
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "cn-api-nests-"));
+    savedConfigDir = process.env.CONTEXTNEST_CONFIG_DIR;
+    process.env.CONTEXTNEST_CONFIG_DIR = join(tmp, "cfg");
+  });
+  afterEach(() => {
+    if (savedConfigDir === undefined) delete process.env.CONTEXTNEST_CONFIG_DIR;
+    else process.env.CONTEXTNEST_CONFIG_DIR = savedConfigDir;
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("lists every registered nest and resolves description precedence", async () => {
+    // Registry description wins; config `description` beats config `name`;
+    // neither present → undefined.
+    addVault("labelled", makeVault(join(tmp, "a"), "A", "config desc"), {
+      description: "registry desc",
+    });
+    addVault("described", makeVault(join(tmp, "b"), "B", "config desc"));
+    addVault("bare", makeVault(join(tmp, "c"), "C"), {});
+    addVault("unlabelled", makeVault(join(tmp, "d")), {});
+    // Registered, then deleted from disk — the only way to reach `exists: false`,
+    // since addVault rejects a path that is not already a vault.
+    addVault("gone", makeVault(join(tmp, "e"), "E"), {});
+    rmSync(join(tmp, "e"), { recursive: true, force: true });
+    setDefaultVault("described");
+
+    // Registry-scoped: the executor ignores ctx, so an empty one is enough.
+    const result = await createEngineApi().run(
+      "context_nests",
+      {},
+      {} as unknown as OperationContext,
+    );
+
+    // The op's own output schema is the contract — validate against it.
+    const parsed = OPERATIONS.context_nests.output.parse(result) as {
+      nests: { alias: string; description?: string; isDefault: boolean; exists: boolean }[];
+    };
+    const byAlias = Object.fromEntries(parsed.nests.map((n) => [n.alias, n]));
+
+    expect(Object.keys(byAlias).sort()).toEqual([
+      "bare",
+      "described",
+      "gone",
+      "labelled",
+      "unlabelled",
+    ]);
+    expect(byAlias.labelled.description).toBe("registry desc");
+    expect(byAlias.described.description).toBe("config desc");
+    expect(byAlias.bare.description).toBe("C"); // falls back to config `name`
+    expect(byAlias.unlabelled.description).toBeUndefined();
+    expect(byAlias.described.isDefault).toBe(true);
+    expect(byAlias.labelled.isDefault).toBe(false);
+    expect(byAlias.bare.exists).toBe(true);
+    expect(byAlias.gone.exists).toBe(false);
+  });
+});
+
+describe("context_reconstruct — asking for a version that isn't there", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("refuses a version the history does not contain", async () => {
+    await api.run("context_create", { title: "Only V1", content: "first" }, ctx);
+    // Reconstruction starts at the nearest keyframe at or before the target and
+    // replays diffs forward, so v99 used to land on v1's keyframe, find nothing
+    // to replay, and return v1's content AS v99.
+    await expect(
+      api.run("context_reconstruct", { id: "nodes/only-v1", version: 99 }, ctx),
+    ).rejects.toMatchObject({ code: "VERSION_NOT_FOUND" });
+  });
+
+  it("still reconstructs a version that does exist", async () => {
+    await api.run("context_create", { title: "Two Versions", content: "first" }, ctx);
+    await api.run("context_update", { id: "nodes/two-versions", content: "second" }, ctx);
+    const v2 = await api.run<{ content: string }>(
+      "context_reconstruct",
+      { id: "nodes/two-versions", version: 2 },
+      ctx,
+    );
+    expect(v2.content).toContain("second");
+    const v1 = await api.run<{ content: string }>(
+      "context_reconstruct",
+      { id: "nodes/two-versions", version: 1 },
+      ctx,
+    );
+    expect(v1.content).toContain("first");
+  });
+});
+
+// ─── Review follow-ups: rejected handling and id tolerance ───────────────────
+
+describe("a rejected status never publishes, and never strands a file", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("creates a rejected node as a draft instead of writing then crashing", async () => {
+    // Publish refuses a rejected doc. This used to write the file, throw from
+    // publish, and leave an orphan with no version — so the caller's retry hit
+    // DOCUMENT_ALREADY_EXISTS for a create it believed had failed.
+    const res = await api.run<{ id: string; status: string; checkpoint: number | null }>(
+      "context_create",
+      { title: "Born Rejected", content: "x", status: "rejected" },
+      ctx,
+    );
+    expect(res.status).toBe("rejected");
+    expect(res.checkpoint).toBeNull();
+    const got = await api.run<{ frontmatter: { version?: number } }>(
+      "context_get",
+      { id: res.id, allow_rejected: true },
+      ctx,
+    );
+    expect(got.frontmatter.version).toBe(1);
+  });
+
+  it("ignores an explicit publish:true when the edit lands on rejected", async () => {
+    await api.run("context_create", { title: "Going Away", content: "original" }, ctx);
+    const res = await api.run<{ checkpoint: number | null }>(
+      "context_update",
+      { id: "nodes/going-away", status: "rejected", publish: true },
+      ctx,
+    );
+    expect(res.checkpoint).toBeNull();
+  });
+
+  it("refuses an edit that re-asserts rejected, rather than rewriting the body", async () => {
+    await api.run("context_create", { title: "Stay Put", content: "original" }, ctx);
+    await api.run("context_update", { id: "nodes/stay-put", status: "rejected" }, ctx);
+    // A client echoing the current status back alongside an edit used to slip
+    // past the guard and mutate a document that stayed rejected.
+    await expect(
+      api.run(
+        "context_update",
+        { id: "nodes/stay-put", status: "rejected", content: "MUTATED" },
+        ctx,
+      ),
+    ).rejects.toMatchObject({ code: "REJECTED_DOCUMENT" });
+    const got = await api.run<{ body: string }>(
+      "context_get",
+      { id: "nodes/stay-put", allow_rejected: true },
+      ctx,
+    );
+    expect(got.body).toContain("original");
+    expect(got.body).not.toContain("MUTATED");
+  });
+});
+
+describe("id and title tolerance", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const api = createEngineApi();
+
+  it("accepts an id built from a file path (.md suffix, leading slash)", async () => {
+    await api.run("context_create", { title: "Path Doc", content: "body" }, ctx);
+    // Storage appends `.md` itself, so an un-stripped suffix resolved to
+    // `<id>.md.md` and 404'd. Callers build ids from file paths all the time.
+    for (const id of ["nodes/path-doc", "nodes/path-doc.md", "/nodes/path-doc"]) {
+      const got = await api.run<{ id: string }>("context_get", { id }, ctx);
+      expect(got.id).toBe("nodes/path-doc");
+    }
+  });
+
+  it("still does NOT re-root a bare id, which a flat-layout vault depends on", async () => {
+    // The contract is "exactly as stored". Re-rooting `flat-doc` to
+    // `nodes/flat-doc` is what broke every read in an imported vault.
+    await ctx.storage.writeDocument(
+      "flat-doc",
+      `---\ntitle: Flat Doc\nstatus: published\n---\n\nbody\n`,
+    );
+    const got = await api.run<{ id: string }>("context_get", { id: "flat-doc" }, ctx);
+    expect(got.id).toBe("flat-doc");
+  });
+
+  it("finds a retired document by title, not just by id", async () => {
+    // A custom id means the slug guess cannot rescue this: title lookup has to
+    // actually see the retired doc.
+    await api.run(
+      "context_create",
+      { id: "nodes/custom/slot-7", title: "Quarterly Plan", content: "body" },
+      ctx,
+    );
+    await api.run("context_update", { id: "nodes/custom/slot-7", status: "rejected" }, ctx);
+    const got = await api.run<{ id: string }>(
+      "context_get",
+      { title: "Quarterly Plan", allow_rejected: true },
+      ctx,
+    );
+    expect(got.id).toBe("nodes/custom/slot-7");
   });
 });

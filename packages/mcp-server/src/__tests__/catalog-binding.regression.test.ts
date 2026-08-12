@@ -249,12 +249,6 @@ describe("[regression] catalog binding — read operations return catalog shapes
     ).toBe(true);
   }
 
-  it("context_overview returns the catalog overview shape", async () => {
-    const json = await callJson(client, "context_overview");
-    expectOutputShape("context_overview", json);
-    expect(json.total).toBeGreaterThan(0);
-  });
-
   it("context_get returns a full document by id", async () => {
     const json = await callJson(client, "context_get", { id: "nodes/api-design" });
     expectOutputShape("context_get", json);
@@ -307,6 +301,8 @@ describe("[regression] catalog binding — read operations return catalog shapes
     const json = await callJson(client, "context_init");
     expectOutputShape("context_init", json);
     expect(json.context_md).toBeTruthy();
+    // context_overview is gone; its counts live here now.
+    expect(json.total).toBeGreaterThan(0);
   });
 
   it("context_packs lists the fixture pack", async () => {
@@ -380,7 +376,7 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
       ],
     });
     expect(getOperation("context_import")!.output.safeParse(json).success).toBe(true);
-    expect(json.created.length).toBe(2);
+    expect(json.published.length).toBe(2);
     expect(json.failed.length).toBe(0);
   });
 });

@@ -45,10 +45,12 @@ import {
   addRemote,
   removeVault,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   readRegistry,
   findLocalVault,
   getRegistryPath,
+  getRegistryDir,
   ALIAS_PATTERN,
   normalizeStatus,
   normalizeDocumentId,
@@ -91,6 +93,23 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
+import {
+  configureSafety,
+  openWriteScope,
+  closeWriteScope,
+  noteExternalWrite,
+  openRegistrySandbox,
+  registryPathForLog,
+  sandboxPath,
+  realRootPath,
+  isDryRun,
+  isForce,
+  confirmOrExit,
+  ensureOverwritable,
+  assertSafeEndpoint,
+  assertNotRedirected,
+  NO_REDIRECT,
+} from "./safety.js";
 
 const program = new Command();
 
@@ -101,7 +120,12 @@ program
   // Global selector: target a registered vault by alias from any directory.
   // When omitted, resolution falls back to env vars, the local vault, then the
   // registry default (see resolveVaultPath precedence in the engine).
-  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)");
+  .option("--vault <alias>", "Target a registered vault by alias (see `ctx vault list`)")
+  // File-safety rails — global so every write command answers to the same
+  // three flags. See safety.ts for the mechanics.
+  .option("--dry-run", "Preview a write command against a throwaway copy of the vault; touch nothing")
+  .option("-y, --yes", "Skip confirmation prompts (required for destructive commands in scripts/CI)")
+  .option("--force", "Overwrite existing files, and allow plaintext-HTTP pushes");
 
 // ---------------------------------------------------------------------------
 // Friendly top-level help
@@ -198,8 +222,18 @@ function renderRootHelp(): string {
   }
   lines.push(chalk.bold("GLOBAL OPTIONS"));
   lines.push(`${indent}${chalk.cyan("--vault <alias>".padEnd(col + 2))}target a registered vault by alias`);
+  lines.push(`${indent}${chalk.cyan("--dry-run".padEnd(col + 2))}preview a write command without touching the filesystem`);
+  lines.push(`${indent}${chalk.cyan("-y, --yes".padEnd(col + 2))}skip confirmation prompts`);
+  lines.push(`${indent}${chalk.cyan("--force".padEnd(col + 2))}allow overwriting existing files`);
   lines.push(`${indent}${chalk.cyan("-V, --version".padEnd(col + 2))}print the version number`);
   lines.push(`${indent}${chalk.cyan("-h, --help".padEnd(col + 2))}show this help`);
+  lines.push("");
+  lines.push(chalk.bold("FILE SAFETY"));
+  lines.push(`${indent}Every command that writes asks before it does, then prints the exact list of`);
+  lines.push(`${indent}files it created, modified or deleted. Nothing is overwritten silently.`);
+  lines.push(`${indent}${chalk.cyan("--dry-run")} runs the command against a temp copy of the vault and reports the`);
+  lines.push(`${indent}real file list without touching yours. In a non-interactive shell (agents, CI)`);
+  lines.push(`${indent}destructive commands refuse unless ${chalk.cyan("--yes")} or ${chalk.cyan("--force")} is passed.`);
   lines.push("");
   lines.push(chalk.dim(`Run ${chalk.reset("ctx <command> --help")}${chalk.dim(" for the options and details of any command.")}`));
   lines.push("");
@@ -221,14 +255,120 @@ program.configureHelp({
 // (`ctx --vault work list`) or after it (`ctx list --vault work`).
 let selectedVaultAlias: string | undefined;
 
-program.hook("preAction", (_thisCommand, actionCommand) => {
-  selectedVaultAlias = actionCommand.optsWithGlobals().vault as string | undefined;
+/**
+ * Commands that mutate the vault tree. Listed explicitly rather than audited
+ * unconditionally: the snapshot-diff behind the action log costs a full walk
+ * of the vault, and `ctx query` sits on the hot path for every agent turn.
+ *
+ * Commands that write OUTSIDE the vault (`vault *`, `push`, `read --out`)
+ * are absent on purpose — they report through `noteExternalWrite` or, for the
+ * registry, through `REGISTRY_WRITE_COMMANDS` below.
+ *
+ * MUST BE UPDATED when a write command is added or renamed. A command missing
+ * from both sets silently loses --dry-run redirection and its action log; the
+ * confirmation prompt is unaffected, since that lives at the call site. The
+ * `[regression] file safety — command coverage` suite catches a rename (every
+ * listed name has to resolve to a real command) but cannot catch a brand-new
+ * command nobody classified.
+ */
+const VAULT_WRITE_COMMANDS = new Set([
+  "init",
+  "add",
+  "update",
+  "delete",
+  "publish",
+  "index",
+  "welcome",
+  "checkpoint rebuild",
+  "drift stage",
+  "drift approve",
+  "drift reject",
+]);
+
+/**
+ * Commands whose write target is the global registry rather than a vault.
+ * They get the registry redirected into a throwaway copy under --dry-run, so
+ * the real engine calls still run and still refuse what they would refuse.
+ */
+const REGISTRY_WRITE_COMMANDS = new Set([
+  "vault add",
+  "vault describe",
+  "vault remove",
+  "vault default",
+]);
+
+/** Full space-separated path of a command, e.g. `drift approve`. */
+function commandPath(cmd: Command): string {
+  const parts: string[] = [];
+  for (let c: Command | null = cmd; c && c !== program; c = c.parent) parts.unshift(c.name());
+  return parts.join(" ");
+}
+
+program.hook("preAction", async (_thisCommand, actionCommand) => {
+  const opts = actionCommand.optsWithGlobals();
+  selectedVaultAlias = opts.vault as string | undefined;
+  configureSafety({ dryRun: opts.dryRun, yes: opts.yes, force: opts.force });
+
+  const name = commandPath(actionCommand);
+
+  if (REGISTRY_WRITE_COMMANDS.has(name)) {
+    // openRegistrySandbox redirects CONTEXTNEST_CONFIG_DIR under --dry-run and
+    // returns the real directory, so the log names the registry the user has
+    // rather than the throwaway copy the run wrote into.
+    const realRegistryDir = await openRegistrySandbox();
+    await openWriteScope(getRegistryDir(), {
+      sandbox: false,
+      absolutePaths: true,
+      displayRoot: realRegistryDir,
+    });
+    return;
+  }
+
+  if (!VAULT_WRITE_COMMANDS.has(name)) return;
+
+  if (name === "init") {
+    // A first-time init targets a directory that is not a vault yet — and is
+    // often an entire source tree — so there is nothing worth copying. But
+    // init is ALSO how a vault is re-initialized, and that rewrites
+    // config.yaml, agent configs and the index. Seeding the sandbox from an
+    // existing vault is what makes those log as modified rather than created.
+    const root = getInitRoot();
+    const alreadyAVault = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
+    // Registering the alias runs for real against a throwaway registry, so a
+    // dry-run init surfaces an alias collision instead of glossing over it.
+    await openRegistrySandbox();
+    await openWriteScope(root, { copy: alreadyAVault });
+    return;
+  }
+
+  // A remote nest writes nothing locally, so there is no sandbox to open and
+  // no local diff to log — and getVaultRoot() refuses a remote alias outright.
+  // remote.ts carries the confirm/dry-run guards for those writes instead.
+  if (remoteTarget(selectedVaultAlias)) return;
+
+  await openWriteScope(getVaultRoot());
 });
+
+program.hook("postAction", () => {
+  closeWriteScope();
+});
+
+// Resolution is memoized: the preAction hook resolves once to open the write
+// scope, and re-resolving in the command body would repeat any stale-env
+// warning to the user.
+let resolvedVaultRoot: string | undefined;
 
 // Helper: resolve vault root. Delegates to the engine resolver, which applies
 // precedence: --vault flag > CONTEXTNEST_VAULT (alias) > CONTEXTNEST_VAULT_PATH
 // (path) > local vault (walk up cwd) > registry default > cwd.
+//
+// Under --dry-run this returns the sandbox copy instead, which is the single
+// point that keeps every downstream engine write off the user's real vault.
 function getVaultRoot(): string {
+  const sandbox = sandboxPath();
+  if (sandbox) return sandbox;
+  if (resolvedVaultRoot !== undefined) return resolvedVaultRoot;
+
   const resolved = resolveVaultPath({
     vaultAlias: selectedVaultAlias,
     cwd: process.cwd(),
@@ -239,7 +379,8 @@ function getVaultRoot(): string {
   if (resolved.warning && resolved.source !== "local") {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
-  return resolved.path;
+  resolvedVaultRoot = resolved.path;
+  return resolvedVaultRoot;
 }
 
 // Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
@@ -249,7 +390,9 @@ function getVaultRoot(): string {
 // wrong directory (the "misresolved to home" bug). The explicit env override
 // still wins.
 function getInitRoot(): string {
-  return process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
+  // `||`, not `??`: an empty CONTEXTNEST_VAULT_PATH is how callers neutralize
+  // the override, and must fall through to cwd rather than mkdir("").
+  return sandboxPath() || process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
 }
 
 function getStorage(): NestStorage {
@@ -268,6 +411,22 @@ const permissiveRbac: RbacHook = {
   canIngest: () => true,
   isDocOwner: () => true,
 };
+
+/** Engine primitives an operation runs against, for one vault. */
+function opContext(
+  storage: NestStorage,
+  actor: string,
+  onProgress?: (done: number, total: number) => void,
+): OperationContext {
+  return {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    rbac: permissiveRbac,
+    actor,
+    onProgress,
+  };
+}
 
 // Interactively prompt the user to pick a starter recipe using an arrow-key
 // navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
@@ -724,7 +883,7 @@ program
   .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
   .option("--list-starters", "List available starter recipes")
   .option("--set-default", "Make the new vault the registry default")
-  .option("--description <text>", "Description/label for the registry entry")
+  .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -738,14 +897,25 @@ program
     }
 
     const root = getInitRoot();
-    const storage = new NestStorage(root);
-    await storage.init(opts.name, opts.layout as LayoutMode);
-    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${root}`));
+    // Under --dry-run `root` is a sandbox; every user-facing decision (does a
+    // vault already live here? what alias would it get?) has to be made about
+    // the directory the user actually pointed at.
+    const displayRoot = realRootPath() ?? root;
 
-    // Register the new vault in the central registry so it can be targeted from
-    // any directory via `ctx --vault <alias> ...`. The alias comes from an
-    // explicit --vault flag, an interactive prompt, or (non-interactively) a
-    // directory-derived default — so init always registers the vault.
+    if (fs.existsSync(pathMod.join(displayRoot, ".context", "config.yaml"))) {
+      await confirmOrExit(
+        `A Context Nest vault already exists at ${displayRoot} — re-initialize it? Existing documents are kept, but config.yaml and agent config files are rewritten.`,
+        { destructive: true },
+      );
+    } else {
+      await confirmOrExit(`Create a new Context Nest vault in ${displayRoot}?`);
+    }
+
+    // Resolve the registry alias and description BEFORE creating the vault: the
+    // description is written into .context/config.yaml by init(), so a prompted
+    // one has to be in hand first. The alias comes from an explicit --vault
+    // flag, an interactive prompt, or (non-interactively) a directory-derived
+    // default — so init always registers the vault.
     let registerAlias = selectedVaultAlias;
     let registerDescription = opts.description as string | undefined;
     const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -753,7 +923,7 @@ program
     // ownership check below (addVault re-reads internally for its write).
     const registrySnapshot = readRegistry();
     if (!registerAlias) {
-      const defaultAlias = defaultAliasFor(root, registrySnapshot);
+      const defaultAlias = defaultAliasFor(displayRoot, registrySnapshot);
       if (canPrompt) {
         console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
         registerAlias = await promptAlias(defaultAlias);
@@ -765,13 +935,22 @@ program
       }
     }
 
+    const storage = new NestStorage(root);
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription);
+    console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
+
     // Registration is performed AFTER the starter is applied (see registerVault
     // below) so an interruption mid-starter never leaves a registry alias
     // pointing at a half-populated vault.
     const registerVault = (): void => {
       if (!registerAlias) return;
-      const resolvedRoot = pathMod.resolve(root);
-      const existing = registrySnapshot.vaults[registerAlias];
+      const resolvedRoot = pathMod.resolve(displayRoot);
+      // Own-property check: a `--vault __proto__` would otherwise read back
+      // Object.prototype here and crash on `resolve(existing.path)` before
+      // addVault got the chance to reject the alias.
+      const existing = Object.hasOwn(registrySnapshot.vaults, registerAlias)
+        ? registrySnapshot.vaults[registerAlias]
+        : undefined;
       if (existing && pathMod.resolve(existing.path) !== resolvedRoot) {
         // The alias is already taken by a *different* vault. Don't silently
         // clobber it — the vault was still created; just skip registration.
@@ -790,7 +969,14 @@ program
       try {
         // force is safe here: the alias is either free or already points to
         // this same vault (idempotent re-init).
-        const reg = addVault(registerAlias, resolvedRoot, {
+        //
+        // Register the directory that was actually initialized: under
+        // --dry-run that is the sandbox, and addVault refuses a path with no
+        // .context/config.yaml — the real one has none yet. The registry it
+        // writes to is a throwaway copy in that case, so the alias rules,
+        // collision check and --force handling all still run for real.
+        noteExternalWrite(registryPathForLog());
+        const reg = addVault(registerAlias, pathMod.resolve(root), {
           description: registerDescription,
           setDefault: opts.setDefault,
           force: true,
@@ -798,7 +984,7 @@ program
         const isDefault = reg.default === registerAlias;
         console.log(
           chalk.green(
-            `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${root}`,
+            `  Registered vault "${chalk.bold(registerAlias)}"${isDefault ? " (default)" : ""} → ${resolvedRoot}`,
           ),
         );
       } catch (err) {
@@ -865,7 +1051,26 @@ program
     }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    // allow_rejected: `ctx read` has always shown a retired document — reading
+    // one is not republishing it, and refusing would hide it from the person
+    // deciding whether to revive it.
+    const got = await createEngineApi().run<{
+      id: string;
+      frontmatter: ContextNode["frontmatter"];
+      body: string;
+      raw?: string;
+    }>(
+      "context_get",
+      { id, include_raw: true, allow_rejected: true },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    const doc: ContextNode = {
+      id: got.id,
+      filePath: "",
+      rawContent: got.raw ?? "",
+      frontmatter: got.frontmatter,
+      body: got.body,
+    };
 
     if (opts.raw) {
       console.log(doc.rawContent);
@@ -877,16 +1082,28 @@ program
       const vaultName = config?.name || undefined;
       const html = renderDocumentHtml(doc, vaultName);
 
+      // `--out` is the one place the CLI writes to an arbitrary path the user
+      // named, so it gets the strictest guard: never clobber without consent.
+      const outPath = opts.out
+        ? pathMod.resolve(opts.out)
+        : pathMod.join(getVaultRoot(), ".context", `read-${id.replace(/\//g, "-")}.html`);
+
+      if (opts.out) await ensureOverwritable(outPath, "Output file");
+
+      // Record before writing, then let closeWriteScope render it — one
+      // implementation of the action log and the dry-run banner, so the two
+      // can't drift. It also picks created vs modified from what is on disk.
+      noteExternalWrite(outPath);
+      if (isDryRun()) return;
+
+      await mkdir(pathMod.dirname(outPath), { recursive: true });
+      await writeFile(outPath, html, "utf-8");
+
       if (opts.out) {
-        const outPath = pathMod.resolve(opts.out);
-        await writeFile(outPath, html, "utf-8");
         console.log(chalk.green(`Written to ${outPath}`));
       } else {
-        const tmpPath = pathMod.join(getVaultRoot(), ".context", `read-${id.replace(/\//g, "-")}.html`);
-        await mkdir(pathMod.dirname(tmpPath), { recursive: true });
-        await writeFile(tmpPath, html, "utf-8");
-        openInBrowser(tmpPath);
-        console.log(chalk.dim(`Opened in browser: ${tmpPath}`));
+        openInBrowser(outPath);
+        console.log(chalk.dim(`Opened in browser: ${outPath}`));
       }
       return;
     }
@@ -959,6 +1176,8 @@ program
       );
     }
 
+    await confirmOrExit(`Create ${id}.md in ${realRootPath() ?? storage.root} and publish v1?`);
+
     const title = opts.title || titleFromId(id);
 
     const tagList = opts.tags ? parseTagsOption(opts.tags) : undefined;
@@ -991,27 +1210,30 @@ program
       body = `\n# ${title}\n\n`;
     }
 
-    const node: ContextNode = {
-      id,
-      filePath: "",
-      frontmatter,
-      body,
-      rawContent: "",
-    };
+    // Scaffolding above stays a CLI concern (heading/steps templates are an
+    // authoring nicety, not vault semantics); the write + publish + index pass
+    // goes through the catalog so this matches every other surface.
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number | null;
+    }>(
+      "context_create",
+      {
+        id,
+        title,
+        content: body,
+        type: opts.type,
+        ...(tagList ? { tags: tagList } : {}),
+        ...(frontmatter.skill ?? {}),
+        note: "Created via CLI",
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
-    const content = serializeDocument(node);
-    await storage.writeDocument(id, content);
-
-    const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
-      note: "Created via CLI",
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Created and published ${id}.md`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
+    console.log(chalk.green(`Created and published ${result.id}.md`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
   });
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
@@ -1163,19 +1385,26 @@ program
       process.exit(1);
     }
 
-    const id = normalizeDocumentId(path);
+    await confirmOrExit(`Publish ${normalizeDocumentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
 
-    const result = await publishDocument(storage, id, {
-      editedBy: opts.author,
-      note: opts.message,
-    });
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number;
+      chain_hash: string;
+    }>(
+      "context_publish",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.message ? { note: opts.message } : {}),
+      },
+      opContext(storage, opts.author),
+    );
 
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Published ${id}`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
-    console.log(`  Chain hash: ${result.versionEntry.chain_hash}`);
+    console.log(chalk.green(`Published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
+    console.log(`  Chain hash: ${result.chain_hash}`);
   });
 
 /**
@@ -1194,21 +1423,17 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
     return;
   }
 
-  const ctx: OperationContext = {
-    storage,
-    query: new GraphQueryEngine(storage),
-    versions: new VersionManager(storage),
-    rbac: permissiveRbac,
-    actor: author,
-    onProgress: (done, total) => {
-      // Single rewritten line; fall back to plain lines when piped to a file.
-      if (process.stdout.isTTY) {
-        process.stdout.write(`\rPublishing ${done}/${total}…`);
-      } else if (done === total) {
-        console.log(`Publishing ${done}/${total}`);
-      }
-    },
-  };
+  for (const id of ids) console.error(chalk.dim(`  ${id}`));
+  await confirmOrExit(`Publish the ${ids.length} document(s) above?`);
+
+  const ctx = opContext(storage, author, (done, total) => {
+    // Single rewritten line; fall back to plain lines when piped to a file.
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\rPublishing ${done}/${total}…`);
+    } else if (done === total) {
+      console.log(`Publishing ${done}/${total}`);
+    }
+  });
 
   const result = await createEngineApi().run<{
     published: { id: string; version: number }[];
@@ -1232,6 +1457,7 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
 program
   .command("history <path>")
   .description("Show version history for a document")
+  .option("--diff", "Include each version's unified diff from the one before")
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -1241,25 +1467,38 @@ program
     }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const vm = new VersionManager(storage);
-    const history = await vm.getHistory(id);
+    const history = await createEngineApi().run<{
+      id: string;
+      keyframe_interval: number;
+      versions: Array<{
+        version: number;
+        keyframe: boolean;
+        edited_by: string;
+        edited_at: string;
+        published_at?: string;
+        note?: string;
+        chain_hash: string;
+        diff?: string;
+      }>;
+    }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
-    if (!history) {
+    if (history.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${id}`));
       return;
     }
 
     if (opts.json) {
       console.log(JSON.stringify(history, null, 2));
-    } else {
-      console.log(chalk.bold(`Version history for ${id}:\n`));
-      for (const entry of history.versions) {
-        const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
-        const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
-        console.log(`  v${entry.version}${keyframe}${published}`);
-        console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
-        if (entry.note) console.log(`    Note: ${entry.note}`);
-      }
+      return;
+    }
+    console.log(chalk.bold(`Version history for ${id}:\n`));
+    for (const entry of history.versions) {
+      const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
+      const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
+      console.log(`  v${entry.version}${keyframe}${published}`);
+      console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
+      if (entry.note) console.log(`    Note: ${entry.note}`);
+      if (entry.diff) console.log(entry.diff.replace(/^/gm, "    "));
     }
   });
 
@@ -1270,10 +1509,80 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-    const vm = new VersionManager(storage);
-    const content = await vm.reconstructVersion(id, parseInt(version, 10));
+    const { content } = await createEngineApi().run<{ content: string }>(
+      "context_reconstruct",
+      { id: normalizeDocumentId(path), version: parseInt(version, 10) },
+      opContext(storage, "cli@contextnest.local"),
+    );
     console.log(content);
+  });
+
+// ─── ctx info ─────────────────────────────────────────────────────────────────
+//
+// Named `info`, not `init`: `ctx init` CREATES a vault, while the operation
+// behind this one opens an existing vault (its instructions, config and what it
+// holds). Same word, opposite meaning — worth keeping apart on the CLI.
+
+program
+  .command("info")
+  .description("Show the vault's instructions, configuration and contents")
+  .option("--nodes", "Also list every node")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const out = await createEngineApi().run<{
+      context_md: string | null;
+      vault_path: string;
+      config: { name: string; description?: string; servers: string[] } | null;
+      total: number;
+      by_type: Record<string, number>;
+      by_status: Record<string, number>;
+      tags: string[];
+      nodes?: Array<{ id: string; title: string; type: string }>;
+    }>(
+      "context_init",
+      opts.nodes ? { include_nodes: true } : {},
+      opContext(storage, "cli@contextnest.local"),
+    );
+
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold(out.config?.name ?? "Vault"));
+    if (out.config?.description) console.log(chalk.dim(out.config.description));
+    console.log(chalk.dim(out.vault_path));
+    console.log();
+    console.log(`${chalk.bold(String(out.total))} node(s)`);
+    for (const [type, count] of Object.entries(out.by_type).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${chalk.cyan(type)}: ${count}`);
+    }
+    if (Object.keys(out.by_status).length) {
+      console.log(chalk.dim("status:"));
+      for (const [status, count] of Object.entries(out.by_status).sort((a, b) => b[1] - a[1])) {
+        console.log(`  ${status}: ${count}`);
+      }
+    }
+    if (out.tags.length) {
+      console.log(chalk.dim("tags:") + " " + out.tags.map((t) => chalk.cyan(t)).join(" "));
+    }
+    if (out.config?.servers.length) {
+      console.log(chalk.dim("servers:") + " " + out.config.servers.join(", "));
+    }
+    if (out.nodes) {
+      console.log();
+      for (const n of out.nodes) {
+        console.log(`  ${chalk.cyan(n.id)} [${n.type}]`);
+        console.log(`    ${n.title}`);
+      }
+    }
+    console.log();
+    console.log(
+      out.context_md
+        ? chalk.dim("CONTEXT.md:\n") + out.context_md
+        : chalk.yellow("No CONTEXT.md — run `ctx init` to scaffold one."),
+    );
   });
 
 // ─── ctx verify ────────────────────────────────────────────────────────────────
@@ -1396,6 +1705,10 @@ program
     // storage.regenerateIndex().
     const docs = await storage.discoverDocuments({ includeRetired: true });
 
+    await confirmOrExit(
+      `Regenerate context.yaml and INDEX.md in ${realRootPath() ?? storage.root}? Documents whose status is written in a legacy form are rewritten in place.`,
+    );
+
     // Status-canonicalization pass: rewrite any doc whose on-disk status
     // differs from its parsed (normalized) status. Only `ctx index` does
     // this — per-mutation calls to regenerateIndex stay cheap. After this
@@ -1458,11 +1771,14 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
 
   const [, org, packName] = match;
   const apiUrl = process.env.PROMPTOWL_API_URL || "https://api.promptowl.ai";
+  // The override carries the user's cloud token — same plaintext rule as push.
+  assertSafeEndpoint(apiUrl, "PROMPTOWL_API_URL");
   const token = await loadCloudToken();
 
   console.log(chalk.dim(`  ☁ Fetching from PromptOwl cloud...`));
 
   const res = await fetch(`${apiUrl}/v1/packs/${org}/${packName}/inject`, {
+    ...NO_REDIRECT,
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1470,6 +1786,7 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
     },
     body: JSON.stringify({ selector: `pack:${packName}`, format: "markdown" }),
   });
+  assertNotRedirected(res, "The cloud endpoint");
 
   if (res.status === 429) {
     const body = await res.json() as { message?: string; upgrade_url?: string };
@@ -1539,12 +1856,22 @@ program
 
     // Local query — graph-aware traversal
     const storage = getStorage();
-    const engine = new GraphQueryEngine(storage);
-    const result = await engine.query(selector, {
-      hops: opts.hops ?? 2,
-      full: opts.full ?? false,
-      includeDrafts: opts.includeDrafts ?? false,
-    });
+    type Doc = { id: string; title: string; body?: string; source?: unknown };
+    const result = await createEngineApi().run<{
+      documents: Doc[];
+      source_nodes?: Doc[];
+      trace_count?: number;
+      traversal?: { mode: string; hops_used: number; nodes_traversed: number };
+    }>(
+      "context_query",
+      {
+        query: selector,
+        ...(opts.hops !== undefined ? { hops: opts.hops } : {}),
+        ...(opts.full ? { full: true } : {}),
+        ...(opts.includeDrafts ? { include_drafts: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
       // Field selection shared with the remote branch (doc-views.ts).
@@ -1553,19 +1880,19 @@ program
           queryJsonPayload({
             documents: result.documents.map((d) => ({
               id: d.id,
-              title: d.frontmatter.title,
+              title: d.title,
               body: d.body,
             })),
-            sourceNodes: result.sourceNodes.map((d) => ({
+            sourceNodes: (result.source_nodes ?? []).map((d) => ({
               id: d.id,
-              title: d.frontmatter.title,
-              source: d.frontmatter.source,
+              title: d.title,
+              source: d.source,
               body: d.body,
             })),
-            traceCount: result.traces.length,
-            mode: result.mode,
-            hopsUsed: result.hopsUsed,
-            nodesTraversed: result.nodesTraversed,
+            traceCount: result.trace_count ?? 0,
+            mode: result.traversal?.mode,
+            hopsUsed: result.traversal?.hops_used,
+            nodesTraversed: result.traversal?.nodes_traversed,
           }),
           null,
           2,
@@ -1574,16 +1901,21 @@ program
     } else {
       console.log(chalk.bold("Documents:"));
       for (const doc of result.documents) {
-        console.log(`  ${chalk.cyan(doc.id)}: ${doc.frontmatter.title}`);
+        console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
       }
-      if (result.sourceNodes.length > 0) {
+      const sources = result.source_nodes ?? [];
+      if (sources.length > 0) {
         console.log(chalk.bold("\nSource Nodes (hydration order):"));
-        for (const doc of result.sourceNodes) {
-          console.log(`  ${chalk.magenta(doc.id)}: ${doc.frontmatter.title}`);
-          console.log(`    Transport: ${doc.frontmatter.source?.transport}, Server: ${doc.frontmatter.source?.server || "n/a"}`);
+        for (const doc of sources) {
+          const src = doc.source as { transport?: string; server?: string } | undefined;
+          console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+          console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
         }
       }
-      console.log(chalk.dim(`\n${result.mode} mode | ${result.hopsUsed} hops | ${result.nodesTraversed} nodes | ${result.traces.length} traces`));
+      const t = result.traversal;
+      console.log(
+        chalk.dim(`\n${t?.mode} mode | ${t?.hops_used} hops | ${t?.nodes_traversed} nodes`),
+      );
     }
   });
 
@@ -1595,6 +1927,7 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
+  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -1603,42 +1936,46 @@ program
       return;
     }
     const storage = getStorage();
-    // Include retired so users can list them with `--status rejected`; the
-    // shared filter re-hides them when no status is requested.
-    const discovered = await storage.discoverDocuments({ includeRetired: true });
-    // Filter semantics + field selection are shared with the remote branch
-    // (doc-views.ts) so the two can never drift apart on defaults.
-    const docs = filterDocList(
-      discovered.map((d) => ({
-        id: d.id,
-        title: d.frontmatter.title,
-        type: d.frontmatter.type,
-        status: d.frontmatter.status,
-        tags: d.frontmatter.tags,
-      })),
-      opts,
+    // Aliases collapse here; the operation owns the rest of the filtering,
+    // including hiding retired documents when no status was asked for.
+    const { documents } = await createEngineApi().run<{
+      documents: Array<{
+        id: string;
+        title: string;
+        type: string;
+        status: string;
+        tags?: string[];
+      }>;
+    }>(
+      "context_list",
+      {
+        ...(opts.type ? { type: opts.type } : {}),
+        ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
+        ...(opts.tag ? { tag: opts.tag } : {}),
+        ...(opts.limit ? { limit: opts.limit } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
     );
 
     if (opts.json) {
-      console.log(JSON.stringify(docs.map(listJsonEntry), null, 2));
-    } else {
-      if (docs.length === 0) {
-        console.log(chalk.yellow("No documents found."));
-      } else {
-        console.log(chalk.bold(`${docs.length} document(s):\n`));
-        for (const doc of docs) {
-          const type = doc.type || "document";
-          const status = doc.status || "draft";
-          const statusColor =
-            status === "published" ? chalk.green
-            : status === "approved" ? chalk.cyan
-            : status === "pending_review" ? chalk.magenta
-            : status === "rejected" ? chalk.red
-            : chalk.yellow;
-          console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
-          console.log(`    ${doc.title}`);
-        }
-      }
+      // Field selection shared with the remote branch (doc-views.ts).
+      console.log(JSON.stringify(documents.map(listJsonEntry), null, 2));
+      return;
+    }
+    if (documents.length === 0) {
+      console.log(chalk.yellow("No documents found."));
+      return;
+    }
+    console.log(chalk.bold(`${documents.length} document(s):\n`));
+    for (const doc of documents) {
+      const statusColor =
+        doc.status === "published" ? chalk.green
+        : doc.status === "approved" ? chalk.cyan
+        : doc.status === "pending_review" ? chalk.magenta
+        : doc.status === "rejected" ? chalk.red
+        : chalk.yellow;
+      console.log(`  ${chalk.cyan(doc.id)} [${doc.type}] ${statusColor(doc.status)}`);
+      console.log(`    ${doc.title}`);
     }
   });
 
@@ -1658,67 +1995,51 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+    // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
+    // takes canonical statuses only. It decides from that status whether this
+    // is a content release or a lifecycle transition, so the CLI no longer
+    // carries its own copy of that rule.
+    const status = opts.status !== undefined ? normalizeStatus(opts.status) : undefined;
 
-    if (opts.title !== undefined) doc.frontmatter.title = opts.title;
-    if (opts.status !== undefined) {
-      doc.frontmatter.status = normalizeStatus(opts.status);
-    }
-    if (opts.tags !== undefined) {
-      doc.frontmatter.tags = parseTagsOption(opts.tags);
-    }
-    doc.frontmatter.updated_at = new Date().toISOString();
+    await confirmOrExit(
+      `Rewrite ${normalizeDocumentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
+    );
 
-    if (opts.body !== undefined) {
-      doc.body = `\n${opts.body}\n`;
-    }
+    const result = await createEngineApi().run<{
+      id: string;
+      version: number;
+      status: string;
+      checkpoint: number | null;
+    }>(
+      "context_update",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.title !== undefined ? { title: opts.title } : {}),
+        ...(status !== undefined ? { status } : {}),
+        ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
+        ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
+        note: "Updated via CLI",
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
-    const validation = validateDocument(doc);
-    if (!validation.valid) {
-      console.log(chalk.red("Validation failed:"));
-      for (const err of validation.errors) {
-        console.log(`  Rule ${err.rule}: ${err.message}${err.field ? ` (${err.field})` : ""}`);
-      }
-      process.exit(1);
-    }
-
-    const content = serializeDocument(doc);
-    await storage.writeDocument(id, content);
-
-    // Non-published lifecycle paths skip auto-publish — those are metadata
-    // changes, not content releases. Mirrors MCP `update_document`.
-    if (
-      opts.status !== undefined &&
-      (doc.frontmatter.status === "rejected" ||
-        doc.frontmatter.status === "approved" ||
-        doc.frontmatter.status === "pending_review" ||
-        doc.frontmatter.status === "draft")
-    ) {
-      await regenerateIndex(storage);
+    if (result.checkpoint === null) {
       const label =
-        doc.frontmatter.status === "rejected"
+        result.status === "rejected"
           ? "retired"
-          : doc.frontmatter.status === "pending_review"
+          : result.status === "pending_review"
             ? "submitted for review"
-            : doc.frontmatter.status === "approved"
+            : result.status === "approved"
               ? "marked approved"
               : "reverted to draft";
-      console.log(chalk.green(`Updated and ${label}: ${id}`));
+      console.log(chalk.green(`Updated and ${label}: ${result.id}`));
       console.log(chalk.dim("  No new version cut. Run `ctx publish` to release."));
       return;
     }
 
-    const result = await publishDocument(storage, id, {
-      editedBy: "cli@contextnest.local",
-      note: "Updated via CLI",
-    });
-
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Updated and published ${id}`));
-    console.log(`  Version: ${result.node.frontmatter.version}`);
-    console.log(`  Checkpoint: ${result.checkpointNumber}`);
+    console.log(chalk.green(`Updated and published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────
@@ -1733,13 +2054,16 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
-
-    const doc = await storage.readDocument(id);
-    await storage.deleteDocument(id);
-    await regenerateIndex(storage);
-
-    console.log(chalk.green(`Deleted ${id} (${doc.frontmatter.title})`));
+    await confirmOrExit(
+      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.`,
+      { destructive: true },
+    );
+    const result = await createEngineApi().run<{ id: string; title: string }>(
+      "context_delete",
+      { id: normalizeDocumentId(path) },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
   });
 
 // ─── ctx search ───────────────────────────────────────────────────────────────
@@ -1748,6 +2072,7 @@ program
   .command("search <query>")
   .description("Full-text search across vault documents")
   .option("--json", "Output as JSON")
+  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -1755,37 +2080,32 @@ program
       return;
     }
     const storage = getStorage();
-    const docs = await storage.discoverDocuments();
-    const resolver = new Resolver({ documents: docs });
-
-    const uri = parseUri(`contextnest://search/${query.replace(/\s+/g, "+")}`);
-    const results = await resolver.resolve(uri);
+    const { results } = await createEngineApi().run<{
+      results: Array<{ id: string; title: string; description?: string; type: string }>;
+    }>(
+      "context_search",
+      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
       // Field selection shared with the remote branch (doc-views.ts).
       console.log(
         JSON.stringify(
-          results.map((d) =>
-            searchJsonEntry({
-              id: d.id,
-              title: d.frontmatter.title,
-              description: d.frontmatter.description,
-              type: d.frontmatter.type,
-            }),
-          ),
+          results.map(searchJsonEntry),
           null,
           2,
         ),
       );
-    } else {
-      if (results.length === 0) {
-        console.log(chalk.yellow("No results found."));
-      } else {
-        console.log(chalk.bold(`${results.length} result(s):\n`));
-        for (const doc of results) {
-          console.log(`  ${chalk.cyan(doc.id)}: ${doc.frontmatter.title}`);
-        }
-      }
+      return;
+    }
+    if (results.length === 0) {
+      console.log(chalk.yellow("No results found."));
+      return;
+    }
+    console.log(chalk.bold(`${results.length} result(s):\n`));
+    for (const doc of results) {
+      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
     }
   });
 
@@ -1799,19 +2119,21 @@ packCmd
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const packs = await storage.readPacks();
+    const { packs } = await createEngineApi().run<{
+      packs: Array<{ id: string; label: string; description?: string }>;
+    }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
 
     if (opts.json) {
       console.log(JSON.stringify(packs, null, 2));
-    } else {
-      if (packs.length === 0) {
-        console.log(chalk.yellow("No packs found."));
-      } else {
-        for (const pack of packs) {
-          console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
-          if (pack.description) console.log(`    ${pack.description}`);
-        }
-      }
+      return;
+    }
+    if (packs.length === 0) {
+      console.log(chalk.yellow("No packs found."));
+      return;
+    }
+    for (const pack of packs) {
+      console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
+      if (pack.description) console.log(`    ${pack.description}`);
     }
   });
 
@@ -1878,6 +2200,10 @@ cpCmd
   .description("Rebuild checkpoint history from per-document histories")
   .action(async () => {
     const storage = getStorage();
+    await confirmOrExit(
+      `Rebuild checkpoint history in ${realRootPath() ?? storage.root}? The existing .versions/context_history.yaml is replaced.`,
+      { destructive: true },
+    );
     const cm = new CheckpointManager(storage);
     const history = await cm.rebuildCheckpointHistory();
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
@@ -1893,6 +2219,8 @@ program
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
     const config = await storage.readConfig();
+
+    await confirmOrExit(`Rewrite .context/welcome.html in ${realRootPath() ?? getVaultRoot()}?`);
 
     const welcomePath = await generateWelcomeHtml({
       vaultPath: getVaultRoot(),
@@ -1912,7 +2240,8 @@ program
     console.log(chalk.green(`Generated welcome page: .context/welcome.html`));
     console.log(`  ${docs.length} documents across ${new Set(docs.map((d) => d.id.split("/")[0])).size} folders`);
 
-    if (opts.open !== false) {
+    // Don't open the sandbox copy — it is deleted the moment the run ends.
+    if (opts.open !== false && !isDryRun()) {
       openInBrowser(welcomePath);
       console.log(`  ${chalk.dim("Opened in browser")}`);
     }
@@ -1923,11 +2252,21 @@ program
 program
   .command("push")
   .description("Push the local vault to a hosted ContextNest server")
-  .requiredOption("--server <url>", "Hosted engine URL (e.g. http://localhost:3737)")
+  .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
   .requiredOption("--nest <id>", "Target nest ID")
-  .requiredOption("--key <apiKey>", "API key (cnst_...)")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .action(async (opts) => {
+    // A key on the command line is readable by anyone who can list processes,
+    // and lands in shell history. Accept it, but let the env var take over.
+    const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
+    if (!apiKey) {
+      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+      process.exit(1);
+    }
+    // Refuse to put documents and a bearer token on the wire in the clear.
+    assertSafeEndpoint(opts.server, "--server");
+
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
 
@@ -1954,6 +2293,21 @@ program
     const serverUrl = opts.server.replace(/\/$/, "");
     const url = `${serverUrl}/nests/${opts.nest}/publish`;
 
+    // Egress is the one action here that can't be undone by deleting a file,
+    // so show what leaves the machine before it leaves.
+    // stderr, like the action log: this is disclosure about the run, not the
+    // command's result, and stdout has to stay clean for redirection.
+    for (const doc of filtered) console.error(chalk.dim(`  ${doc.id}`));
+    await confirmOrExit(
+      `Send the ${documents.length} document(s) above${contextMd ? " and CONTEXT.md" : ""} to ${serverUrl}?`,
+      { destructive: true },
+    );
+
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan("Dry run — nothing was sent."));
+      return;
+    }
+
     console.log(chalk.dim(`Pushing ${documents.length} documents to ${serverUrl}...`));
 
     const body: Record<string, unknown> = { documents };
@@ -1961,13 +2315,17 @@ program
 
     try {
       const res = await fetch(url, {
+        ...NO_REDIRECT,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${opts.key}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
       });
+      // A validated https:// server that answers 3xx would otherwise resend
+      // every document body to an unvalidated destination.
+      assertNotRedirected(res, "--server");
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -2052,6 +2410,8 @@ drift
     const zone = node.frontmatter.zone;
     const docTier: GovernanceTier = node.frontmatter.governance ?? "standard";
 
+    await confirmOrExit(`Stage the drifted bytes of ${id} as a suggestion under _suggestions/?`);
+
     const result = await stageSuggestion({
       storage,
       documentId: id,
@@ -2125,6 +2485,11 @@ drift
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
 
+    await confirmOrExit(
+      `Approve ${suggestionId}? This rewrites the canonical bytes of ${id}, bumps its version and extends the hash chain.`,
+      { destructive: true },
+    );
+
     const result = await approveSuggestion({
       storage,
       rbac: permissiveRbac,
@@ -2160,6 +2525,8 @@ drift
     const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
+
+    await confirmOrExit(`Reject ${suggestionId} for ${id}? The suggestion is archived without merging.`);
 
     const result = await rejectSuggestion({
       storage,
@@ -2207,7 +2574,7 @@ vaultCmd
       console.log(
         chalk.dim(`No vaults registered. Add one with: ${chalk.yellow("ctx vault add <alias> [path]")}`),
       );
-      console.log(chalk.dim(`Registry: ${getRegistryPath()}`));
+      console.log(chalk.dim(`Registry: ${registryPathForLog()}`));
       return;
     }
     console.log(chalk.bold("\nRegistered vaults:\n"));
@@ -2225,7 +2592,7 @@ vaultCmd
       if (v.description) console.log(`     ${chalk.dim(v.description)}`);
       console.log(`     ${chalk.dim(v.path)}`);
     }
-    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + getRegistryPath())}\n`);
+    console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
   });
 
 vaultCmd
@@ -2233,7 +2600,7 @@ vaultCmd
   .description("Register a vault path — or a remote nest via --url / --mcp-command — under an alias")
   .option("--description <text>", "Short label for this alias")
   .option("--set-default", "Make this the default vault")
-  .option("--force", "Overwrite an existing alias")
+  // No local --force: the global one (see the root command) covers it.
   .option("--url <url>", "Register a REMOTE nest at this MCP endpoint (streamable HTTP)")
   .option("--bearer-env <var>", "Env var holding the bearer token for --url (stored as a reference, never the value)")
   .option("--mcp-command <cmd>", "Register a REMOTE nest served by this stdio MCP command")
@@ -2243,7 +2610,7 @@ vaultCmd
     (value: string, previous: string[]) => [...previous, value],
     [] as string[],
   )
-  .action((alias: string, path: string | undefined, opts) => {
+  .action(async (alias: string, path: string | undefined, opts) => {
     try {
       // Remote registration: --url (HTTP) or --mcp-command (stdio).
       if (opts.url || opts.mcpCommand) {
@@ -2268,9 +2635,12 @@ vaultCmd
               ...(opts.mcpArg.length ? { args: opts.mcpArg } : {}),
               ...(opts.description ? { description: opts.description } : {}),
             };
+        await confirmOrExit(
+          `Register remote "${alias}" → ${describeRemoteEndpoint(spec)} in ${registryPathForLog()}?`,
+        );
         const reg = addRemote(alias, spec, {
           setDefault: opts.setDefault,
-          force: opts.force,
+          force: isForce(),
         });
         const isDefault = reg.default === alias;
         console.log(
@@ -2297,10 +2667,14 @@ vaultCmd
         }
         target = pathMod.resolve(local);
       }
+      // Under --dry-run the registry directory is a throwaway copy, so addVault
+      // runs for real: an alias collision or a path that isn't a vault fails
+      // here exactly as it would without the flag.
+      await confirmOrExit(`Register "${alias}" → ${target} in ${registryPathForLog()}?`);
       const reg = addVault(alias, target, {
         description: opts.description,
         setDefault: opts.setDefault,
-        force: opts.force,
+        force: isForce(),
       });
       const isDefault = reg.default === alias;
       console.log(
@@ -2313,11 +2687,33 @@ vaultCmd
   });
 
 vaultCmd
+  .command("describe <alias> [description]")
+  .description("Set the description for a registered alias (omit the text to clear it)")
+  .action(async (alias: string, description: string | undefined) => {
+    try {
+      await confirmOrExit(`Update the description of "${alias}" in ${registryPathForLog()}?`);
+      setVaultDescription(alias, description);
+      console.log(
+        description
+          ? chalk.green(`Described "${chalk.bold(alias)}": ${description}`)
+          : chalk.yellow(`Cleared the description for "${alias}"`),
+      );
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
   .command("remove <alias>")
   .alias("rm")
   .description("Unregister a vault alias")
-  .action((alias: string) => {
+  .action(async (alias: string) => {
     try {
+      await confirmOrExit(
+        `Unregister "${alias}" from ${registryPathForLog()}? The vault's files are left alone.`,
+        { destructive: true },
+      );
       // removeVault reports wasDefault from its single read — no pre-read needed.
       const { wasDefault } = removeVault(alias);
       console.log(chalk.yellow(`Removed vault alias "${alias}"`));
@@ -2340,8 +2736,9 @@ vaultCmd
 vaultCmd
   .command("default <alias>")
   .description("Set the default vault")
-  .action((alias: string) => {
+  .action(async (alias: string) => {
     try {
+      await confirmOrExit(`Make "${alias}" the default vault in ${registryPathForLog()}?`);
       setDefaultVault(alias);
       console.log(chalk.green(`Default vault is now "${chalk.bold(alias)}"`));
     } catch (err) {

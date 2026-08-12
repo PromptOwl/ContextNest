@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
-import { execFileSync, execFile } from "node:child_process";
+import { execFileSync, execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import {
   mkdtempSync,
@@ -79,21 +79,18 @@ function runCtxResult(
   cwd: string,
   args: string[],
 ): { status: number; stdout: string; stderr: string } {
-  try {
-    const stdout = execFileSync("node", [distPath, ...args], {
-      cwd,
-      env: ENV,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { status: 0, stdout, stderr: "" };
-  } catch (err: any) {
-    return {
-      status: typeof err.status === "number" ? err.status : 1,
-      stdout: err.stdout?.toString() ?? "",
-      stderr: err.stderr?.toString() ?? "",
-    };
-  }
+  // spawnSync, not execFileSync: stderr has to come back on the SUCCESS path
+  // too, since that is where the file-safety action log is written.
+  const res = spawnSync("node", [distPath, ...args], {
+    cwd,
+    env: ENV,
+    encoding: "utf-8",
+  });
+  return {
+    status: typeof res.status === "number" ? res.status : 1,
+    stdout: res.stdout ?? "",
+    stderr: res.stderr ?? "",
+  };
 }
 
 function initVault(cwd: string): void {
@@ -194,8 +191,11 @@ describe("[regression] ctx add", () => {
   it("creates and auto-publishes a document at checkpoint 1", () => {
     const out = runCtx(tmp, ["add", "nodes/alpha", "--title", "Alpha Doc"]);
     expect(out).toMatch(/Created and published nodes\/alpha\.md/);
-    // init seeds v1; the publish on add bumps to v2.
-    expect(out).toMatch(/Version: 2/);
+    // A brand-new document's first published version is 1. `add` used to
+    // pre-set version:1 in frontmatter and let publish bump it, so the doc's
+    // history started at v2 with no v1 keyframe at all. Publish owns version
+    // assignment (spec §6) — the shared create path enforces that.
+    expect(out).toMatch(/Version: 1/);
     expect(out).toMatch(/Checkpoint: 1/);
 
     const onDisk = readFileSync(join(tmp, "nodes", "alpha.md"), "utf-8");
@@ -420,8 +420,8 @@ describe("[regression] ctx update", () => {
   it("a content edit auto-publishes and bumps the version", () => {
     const out = runCtx(tmp, ["update", "nodes/mutable", "--body", "Revised body"]);
     expect(out).toMatch(/Updated and published nodes\/mutable/);
-    // add landed at v2; a content update cuts v3.
-    expect(out).toMatch(/Version: 3/);
+    // add landed at v1; a content update cuts v2.
+    expect(out).toMatch(/Version: 2/);
 
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
     expect(onDisk).toMatch(/Revised body/);
@@ -465,7 +465,7 @@ describe("[regression] ctx publish, history & reconstruct", () => {
   it("publish bumps the version, advances the checkpoint, and reports a chain hash", () => {
     const out = runCtx(tmp, ["publish", "nodes/release", "-m", "second cut"]);
     expect(out).toMatch(/Published nodes\/release/);
-    expect(out).toMatch(/Version: 3/);
+    expect(out).toMatch(/Version: 2/);
     expect(out).toMatch(/Chain hash: sha256:/);
   });
 
@@ -473,16 +473,22 @@ describe("[regression] ctx publish, history & reconstruct", () => {
     runCtx(tmp, ["publish", "nodes/release", "-m", "cut"]);
     const history = JSON.parse(runCtx(tmp, ["history", "nodes/release", "--json"]));
     const versions = history.versions.map((v: { version: number }) => v.version);
+    expect(versions).toContain(1);
     expect(versions).toContain(2);
-    expect(versions).toContain(3);
     for (const v of history.versions) {
       expect(v.chain_hash).toMatch(/^sha256:/);
     }
   });
 
   it("reconstruct returns the serialized content for a known version", () => {
+    // beforeEach leaves the doc at v1, so v2 has to be cut here. This asked for
+    // v2 without publishing and passed anyway: reconstruct fell back to the
+    // nearest keyframe and handed back v1, which carries the same title.
+    runCtx(tmp, ["publish", "nodes/release", "-m", "cut"]);
     const content = runCtx(tmp, ["reconstruct", "nodes/release", "2"]);
     expect(content).toMatch(/title:\s*Release Doc/);
+    // Assert the VERSION, not just the title — that is what tells v2 from v1.
+    expect(content).toMatch(/version:\s*2/);
   });
 
   /** Highest checkpoint number currently sealed in the vault. */
@@ -530,7 +536,7 @@ describe("[regression] ctx delete", () => {
   it("removes the document and its version history", () => {
     expect(existsSync(join(tmp, "nodes", "disposable.md"))).toBe(true);
 
-    const out = runCtx(tmp, ["delete", "nodes/disposable"]);
+    const out = runCtx(tmp, ["delete", "nodes/disposable", "--yes"]);
     expect(out).toMatch(/Deleted nodes\/disposable/);
 
     expect(existsSync(join(tmp, "nodes", "disposable.md"))).toBe(false);
@@ -554,7 +560,7 @@ describe("[regression] ctx verify", () => {
 
   it("detects a tampered keyframe and exits non-zero", () => {
     appendFileSync(
-      join(tmp, "nodes", ".versions", "sealed", "v2.md"),
+      join(tmp, "nodes", ".versions", "sealed", "v1.md"),
       "\ntampered content\n",
     );
     const res = runCtxResult(tmp, ["verify"]);
@@ -633,7 +639,7 @@ describe("[regression] ctx checkpoint", () => {
   });
 
   it("rebuild reconstructs checkpoint history from per-document histories", () => {
-    const out = runCtx(tmp, ["checkpoint", "rebuild"]);
+    const out = runCtx(tmp, ["checkpoint", "rebuild", "--yes"]);
     expect(out).toMatch(/Rebuilt \d+ checkpoints/);
   });
 
@@ -813,6 +819,29 @@ describe("[regression] ctx validate --json (valid)", () => {
 describe("[regression] ctx pack", () => {
   beforeEach(() => initStarter(tmp, "developer"));
 
+  // Every starter node shipped `type: context`, which is not in NODE_TYPES.
+  // `init --starter` writes and publishes without validating, so the vault
+  // looked fine until the user ran `ctx update` or `ctx validate` on a
+  // scaffolded document. Nothing scaffolded may be born spec-invalid.
+  it("init --starter produces a vault that validates clean", () => {
+    const res = runCtxResult(tmp, ["validate", "--json"]);
+    const report = JSON.parse(res.stdout);
+    expect(report.errors).toEqual([]);
+    expect(report.valid).toBe(true);
+    expect(res.status).toBe(0);
+  });
+
+  it("a scaffolded document can be updated without a validation error", () => {
+    const out = runCtx(tmp, [
+      "update",
+      "nodes/architecture/architecture-overview",
+      "--tags",
+      "architecture, overview",
+      "--yes",
+    ]);
+    expect(out).toMatch(/Updated and published/);
+  });
+
   it("init --starter scaffolds documents and at least one pack", () => {
     const docs = JSON.parse(runCtx(tmp, ["list", "--json"]));
     expect(docs.length).toBeGreaterThan(0);
@@ -882,6 +911,7 @@ describe("[regression] ctx push", () => {
         "--server", server.url,
         "--nest", "nest-1",
         "--key", "cnst_testkey",
+        "--yes",
       ]);
       expect(out).toMatch(/Pushed 1 document/);
 
@@ -929,28 +959,28 @@ describe("[regression] flows", () => {
   beforeEach(() => initVault(tmp));
 
   it("full document lifecycle: add → read → update → history → reconstruct → delete", () => {
-    // add (auto-publishes the seeded doc to v2)
+    // add (auto-publishes the new doc at v1)
     const added = runCtx(tmp, ["add", "nodes/lc", "--title", "Lifecycle", "--body", "first body"]);
-    expect(added).toMatch(/Version: 2/);
+    expect(added).toMatch(/Version: 1/);
 
     // read shows the current body
     expect(runCtx(tmp, ["read", "nodes/lc"])).toContain("first body");
 
     // a content edit auto-publishes a new version
     const updated = runCtx(tmp, ["update", "nodes/lc", "--body", "second body"]);
-    expect(updated).toMatch(/Version: 3/);
+    expect(updated).toMatch(/Version: 2/);
 
     // history records both published versions with chain hashes
     const history = JSON.parse(runCtx(tmp, ["history", "nodes/lc", "--json"]));
     const versions = history.versions.map((v: { version: number }) => v.version);
-    expect(versions).toEqual(expect.arrayContaining([2, 3]));
+    expect(versions).toEqual(expect.arrayContaining([1, 2]));
 
     // each version reconstructs to the body it was published with
-    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "2"])).toContain("first body");
-    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "3"])).toContain("second body");
+    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "1"])).toContain("first body");
+    expect(runCtx(tmp, ["reconstruct", "nodes/lc", "2"])).toContain("second body");
 
     // delete removes the doc and its version history; reads then fail
-    runCtx(tmp, ["delete", "nodes/lc"]);
+    runCtx(tmp, ["delete", "nodes/lc", "--yes"]);
     expect(existsSync(join(tmp, "nodes", "lc.md"))).toBe(false);
     expect(existsSync(join(tmp, "nodes", ".versions", "lc"))).toBe(false);
     expect(runCtxResult(tmp, ["read", "nodes/lc"]).status).not.toBe(0);
@@ -1000,8 +1030,8 @@ describe("[regression] flows", () => {
     expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy", "--json"])).count).toBe(1);
 
     // approving merges the edit and bumps the version
-    const approved = JSON.parse(runCtx(tmp, ["drift", "approve", "nodes/policy", sid, "--json"]));
-    expect(approved.versionEntry.version).toBe(3);
+    const approved = JSON.parse(runCtx(tmp, ["drift", "approve", "nodes/policy", sid, "--json", "--yes"]));
+    expect(approved.versionEntry.version).toBe(2);
 
     // the suggestion is archived and the vault is clean again
     expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy", "--json"])).count).toBe(0);
@@ -1076,8 +1106,19 @@ describe("[regression] add/update edge cases", () => {
     expect(res.stderr).not.toMatch(/^\s+at\s/m);
   });
 
-  it("reconstruct without version history fails with a friendly error, no stack trace", () => {
+  it("reconstruct names the missing document, not a missing version, no stack trace", () => {
+    // Asking for v1 of a document that does not exist is a missing DOCUMENT.
+    // Saying VERSION_NOT_FOUND sends the reader hunting through a history that
+    // was never going to be there either.
     const res = runCtxResult(tmp, ["reconstruct", "nodes/never-existed", "1"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/Error \[DOCUMENT_NOT_FOUND\]/);
+    expect(res.stderr).not.toMatch(/^\s+at\s/m);
+  });
+
+  it("reconstruct reports a missing VERSION of a document that does exist", () => {
+    runCtx(tmp, ["add", "nodes/only-v1", "--title", "Only V1"]);
+    const res = runCtxResult(tmp, ["reconstruct", "nodes/only-v1", "99"]);
     expect(res.status).not.toBe(0);
     expect(res.stderr).toMatch(/Error \[VERSION_NOT_FOUND\]/);
     expect(res.stderr).not.toMatch(/^\s+at\s/m);
@@ -1110,11 +1151,247 @@ describe("[regression] integrity — keyframe tamper", () => {
   it("ctx verify reports content_hash_mismatch when a version keyframe is tampered", () => {
     // Canonical .md and history.yaml are untouched — only a keyframe re-hash
     // can surface this corruption.
-    appendFileSync(join(tmp, "nodes", ".versions", "archived", "v2.md"), "\nrewritten history\n");
+    appendFileSync(join(tmp, "nodes", ".versions", "archived", "v1.md"), "\nrewritten history\n");
     const res = runCtxResult(tmp, ["verify", "--json"]);
     expect(res.status).toBe(1);
     const parsed = JSON.parse(res.stdout);
     expect(parsed.valid).toBe(false);
     expect(parsed.errors.map((e: { type: string }) => e.type)).toContain("content_hash_mismatch");
+  });
+});
+
+// ─── file safety ─────────────────────────────────────────────────────────────
+// Q2 hardening: no ctx subcommand may touch the working directory without the
+// user seeing it coming (confirmation or an explicit flag), being able to
+// preview it (--dry-run), and being told exactly what happened (action log).
+
+describe("[regression] file safety", () => {
+  beforeEach(() => {
+    initVault(tmp);
+  });
+
+  it("prints an action log naming every file a write command touched", () => {
+    const res = runCtxResult(tmp, ["add", "nodes/logged", "--title", "Logged"]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toMatch(/file\(s\) changed:/);
+    expect(res.stderr).toContain("nodes/logged.md");
+    expect(res.stderr).toContain("nodes/.versions/logged/v1.md");
+    expect(res.stderr).toContain("context.yaml");
+  });
+
+  it("keeps the action log off stdout so --json output stays parseable", () => {
+    runCtx(tmp, ["add", "nodes/machine", "--title", "Machine"]);
+    const stdout = runCtx(tmp, ["list", "--json"]);
+    expect(() => JSON.parse(stdout)).not.toThrow();
+  });
+
+  it("--dry-run reports the real file list and writes nothing", () => {
+    const res = runCtxResult(tmp, ["add", "nodes/ghost", "--title", "Ghost", "--dry-run"]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toContain("Dry run — no files were written.");
+    expect(res.stderr).toContain("+ nodes/ghost.md");
+    expect(existsSync(join(tmp, "nodes", "ghost.md"))).toBe(false);
+  });
+
+  it("--dry-run leaves an existing document byte-identical", () => {
+    runCtx(tmp, ["add", "nodes/keep", "--title", "Keep", "--body", "original"]);
+    const docPath = join(tmp, "nodes", "keep.md");
+    const before = readFileSync(docPath, "utf-8");
+
+    runCtx(tmp, ["update", "nodes/keep", "--body", "rewritten", "--dry-run"]);
+    expect(readFileSync(docPath, "utf-8")).toBe(before);
+  });
+
+  it("delete refuses non-interactively without --yes, and the document survives", () => {
+    runCtx(tmp, ["add", "nodes/doomed", "--title", "Doomed"]);
+    const res = runCtxResult(tmp, ["delete", "nodes/doomed"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Refusing without confirmation/);
+    expect(existsSync(join(tmp, "nodes", "doomed.md"))).toBe(true);
+
+    runCtx(tmp, ["delete", "nodes/doomed", "--yes"]);
+    expect(existsSync(join(tmp, "nodes", "doomed.md"))).toBe(false);
+  });
+
+  it("read --out will not clobber an existing file without --force", () => {
+    runCtx(tmp, ["add", "nodes/rendered", "--title", "Rendered"]);
+    const outFile = join(tmp, "render.html");
+    writeFileSync(outFile, "PRE-EXISTING");
+
+    const res = runCtxResult(tmp, ["read", "nodes/rendered", "--html", "--out", outFile]);
+    expect(res.status).toBe(1);
+    expect(readFileSync(outFile, "utf-8")).toBe("PRE-EXISTING");
+
+    runCtx(tmp, ["read", "nodes/rendered", "--html", "--out", outFile, "--force"]);
+    expect(readFileSync(outFile, "utf-8")).toContain("<html");
+  });
+
+  it("push refuses to send vault contents over plaintext HTTP to a remote host", () => {
+    const res = runCtxResult(tmp, [
+      "push",
+      "--server",
+      "http://vault-exfil.example.com",
+      "--nest",
+      "n1",
+      "--key",
+      "cnst_test",
+    ]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/plaintext HTTP/);
+  });
+});
+
+// ─── file safety — dry-run fidelity ──────────────────────────────────────────
+// The claim these guard is that --dry-run reports the REAL result. Four spots
+// originally bypassed the sandbox and printed a hand-written "would ..." line,
+// which could disagree with what the command actually does.
+
+describe("[regression] file safety — dry-run fidelity", () => {
+  it("vault add --dry-run fails on an alias collision, like the real command", () => {
+    initVault(tmp);
+    runCtx(tmp, ["vault", "add", "taken", tmp, "--yes"]);
+
+    // Registering a DIFFERENT path under a taken alias needs --force. The dry
+    // run must refuse it too, rather than promising a mapping that can't happen.
+    const other = mkdtempSync(join(tmpdir(), "cn-other-vault-"));
+    try {
+      initVault(other);
+      const dry = runCtxResult(tmp, ["vault", "add", "taken", other, "--dry-run"]);
+      expect(dry.status).not.toBe(0);
+      expect(dry.stdout + dry.stderr).toMatch(/already exists/);
+
+      // And the dry run left the real registry alone.
+      const list = JSON.parse(runCtx(tmp, ["vault", "list", "--json"]));
+      const taken = list.find((v: { alias: string }) => v.alias === "taken");
+      expect(taken.path).toBe(tmp);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("vault remove --dry-run fails for an alias that isn't registered", () => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, ["vault", "remove", "never-registered", "--dry-run"]);
+    expect(res.status).not.toBe(0);
+  });
+
+  it("vault add --dry-run does not write to the registry", () => {
+    initVault(tmp);
+    runCtx(tmp, ["vault", "add", "ghost-alias", tmp, "--dry-run"]);
+    const list = JSON.parse(runCtx(tmp, ["vault", "list", "--json"]));
+    expect(list.map((v: { alias: string }) => v.alias)).not.toContain("ghost-alias");
+  });
+
+  it("init --dry-run on an existing vault reports rewrites as modified, not created", () => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, ["init", "--name", "again", "--yes", "--dry-run"]);
+    expect(res.status).toBe(0);
+    // config.yaml already exists, so re-initializing modifies it. Reporting it
+    // as created would mean the sandbox never saw the existing vault.
+    expect(res.stderr).toMatch(/~ \.context\/config\.yaml/);
+    expect(res.stderr).not.toMatch(/\+ \.context\/config\.yaml/);
+  });
+
+  it("read --out --dry-run marks an existing target as modified, not created", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/previewed", "--title", "Previewed"]);
+    const outFile = join(tmp, "preview.html");
+    writeFileSync(outFile, "PRE-EXISTING");
+
+    const res = runCtxResult(tmp, [
+      "read", "nodes/previewed", "--html", "--out", outFile, "--force", "--dry-run",
+    ]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toContain(`~ ${outFile}`);
+    expect(readFileSync(outFile, "utf-8")).toBe("PRE-EXISTING");
+  });
+});
+
+// ─── file safety — consent gate coverage ─────────────────────────────────────
+
+describe("[regression] file safety — command coverage", () => {
+  // VAULT_WRITE_COMMANDS / REGISTRY_WRITE_COMMANDS in index.ts are
+  // hand-maintained. A rename that misses them costs those commands their
+  // --dry-run sandbox and action log with no other symptom, so assert every
+  // listed name still resolves to a real command.
+  const CLASSIFIED = [
+    "init", "add", "update", "delete", "publish", "index", "welcome",
+    "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
+    "vault add", "vault describe", "vault remove", "vault default",
+  ];
+
+  it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {
+    const res = runCtxResult(tmp, [...name.split(" "), "--help"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Usage:/);
+  });
+
+  // Every destructive command must refuse without a TTY unless consent was
+  // given up front. delete / vault remove are covered above; these are the
+  // rest of the set the PR description calls out.
+  it("checkpoint rebuild refuses without --yes", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/cp", "--title", "CP"]);
+    const res = runCtxResult(tmp, ["checkpoint", "rebuild"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Refusing without confirmation/);
+  });
+
+  it("push refuses without --yes", async () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/sendable", "--title", "Sendable"]);
+    const server = await startMockEngine(() => ({
+      published: 1,
+      context_md_updated: false,
+      node_ids: ["n0"],
+    }));
+    try {
+      const res = runCtxResult(tmp, [
+        "push", "--server", server.url, "--nest", "n1", "--key", "cnst_k",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toMatch(/Refusing without confirmation/);
+      // Nothing reached the server.
+      expect(server.lastBody()).toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("drift approve refuses without --yes", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/policy3", "--title", "Policy", "--body", "original"]);
+    appendFileSync(join(tmp, "nodes", "policy3.md"), "\n\nout-of-band edit\n");
+    const staged = JSON.parse(runCtx(tmp, ["drift", "stage", "nodes/policy3", "--json"]));
+
+    const res = runCtxResult(tmp, ["drift", "approve", "nodes/policy3", staged.suggestion_id]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Refusing without confirmation/);
+    // The canonical document was not rewritten.
+    expect(JSON.parse(runCtx(tmp, ["drift", "list", "nodes/policy3", "--json"])).count).toBe(1);
+  });
+});
+
+// ─── file safety — vault layout collisions ───────────────────────────────────
+
+describe("[regression] file safety — generic folder names in a vault", () => {
+  // The prune list keeps node_modules out of the snapshot and the dry-run copy.
+  // Matching those names at any depth would make real documents invisible: a
+  // vault is free-form, and "build" / "out" / "target" are ordinary words.
+  beforeEach(() => initVault(tmp));
+
+  it("logs writes to a document folder whose name collides with a build dir", () => {
+    const res = runCtxResult(tmp, ["add", "nodes/build/pipeline", "--title", "Pipeline"]);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toContain("+ nodes/build/pipeline.md");
+  });
+
+  it("previews such a document against a complete sandbox copy", () => {
+    runCtx(tmp, ["add", "nodes/out/formats", "--title", "Formats", "--body", "original"]);
+    const res = runCtxResult(tmp, ["update", "nodes/out/formats", "--body", "revised", "--dry-run"]);
+    expect(res.status).toBe(0);
+    // Modified, not created — the subtree made it into the sandbox copy.
+    expect(res.stderr).toContain("~ nodes/out/formats.md");
+    expect(readFileSync(join(tmp, "nodes", "out", "formats.md"), "utf-8")).toContain("original");
   });
 });

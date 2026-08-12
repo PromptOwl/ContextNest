@@ -21,6 +21,7 @@ import {
   resolveNest,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestConnection, RemoteNestSpec } from "@promptowl/contextnest-engine";
+import { confirmOrExit, isDryRun } from "./safety.js";
 import {
   filterDocList,
   listJsonEntry,
@@ -271,6 +272,26 @@ export async function remoteHistory(
 
 // ─── Write surface ──────────────────────────────────────────────────────────
 
+/**
+ * Confirm a write that lands on someone else's nest.
+ *
+ * --dry-run refuses outright: the sandbox only ever shadows a LOCAL vault, so
+ * there is nothing here to preview against — proceeding would write for real.
+ */
+async function confirmRemoteWrite(
+  target: RemoteTarget,
+  question: string,
+  opts?: { destructive?: boolean },
+): Promise<void> {
+  if (isDryRun()) {
+    throw new ContextNestError(
+      `--dry-run cannot preview a write to remote nest "${target.alias}" — the sandbox only shadows a local vault.`,
+      "NOT_IMPLEMENTED",
+    );
+  }
+  await confirmOrExit(question, opts);
+}
+
 export async function remoteAdd(
   target: RemoteTarget,
   path: string,
@@ -282,6 +303,7 @@ export async function remoteAdd(
       "NOT_IMPLEMENTED",
     );
   }
+  await confirmRemoteWrite(target, `Create ${normalizeDocumentId(path)} on remote nest "${target.alias}" and publish v1?`);
   await withRemote(target, async (conn) => {
     const id = normalizeDocumentId(path);
     // Title derivation + tag parsing shared with the local branch
@@ -321,6 +343,10 @@ export async function remoteUpdate(
   if (opts.body === undefined) {
     throw new ContextNestError("Nothing to update — pass --body.", "VALIDATION_FAILED");
   }
+  await confirmRemoteWrite(
+    target,
+    `Rewrite ${normalizeDocumentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
+  );
   await withRemote(target, async (conn) => {
     const updated = await conn.run<{ id: string; version: number }>("context_update", {
       id: normalizeDocumentId(path),
@@ -332,6 +358,7 @@ export async function remoteUpdate(
 }
 
 export async function remotePublish(target: RemoteTarget, path: string): Promise<void> {
+  await confirmRemoteWrite(target, `Publish ${normalizeDocumentId(path)} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ id: string; version: number; checkpoint: number }>(
       "context_publish",
@@ -344,6 +371,11 @@ export async function remotePublish(target: RemoteTarget, path: string): Promise
 }
 
 export async function remoteDelete(target: RemoteTarget, path: string): Promise<void> {
+  await confirmRemoteWrite(
+    target,
+    `Delete ${normalizeDocumentId(path)} and its version history from remote nest "${target.alias}"? This cannot be undone.`,
+    { destructive: true },
+  );
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ id: string; deleted: true }>("context_delete", {
       id: normalizeDocumentId(path),

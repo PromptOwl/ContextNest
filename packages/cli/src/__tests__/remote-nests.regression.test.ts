@@ -311,7 +311,8 @@ describe("[regression] remote nests — vault registry registration", () => {
   it("vault remove deletes a remote entry", () => {
     const added = run(cwd, ["vault", "add", "team", "--url", "https://nest.example.com/mcp"]);
     expect(added.status, added.stderr).toBe(0);
-    const removed = run(cwd, ["vault", "remove", "team"]);
+    // Destructive, so a non-interactive caller must say --yes (safety.ts).
+    const removed = run(cwd, ["vault", "remove", "team", "--yes"]);
     expect(removed.status, removed.stderr).toBe(0);
     const registry = readFileSync(join(configDir, "config.yaml"), "utf-8");
     expect(registry).not.toContain("nest.example.com");
@@ -808,7 +809,8 @@ describe("[regression] remote nests — write surface routed over stdio MCP", ()
   });
 
   it("ctx delete removes the document from the remote vault", () => {
-    const res = run(cwd, ["delete", "nodes/remote-note", "--vault", "farnest"]);
+    // Destructive, so a non-interactive caller must say --yes (safety.ts).
+    const res = run(cwd, ["delete", "nodes/remote-note", "--vault", "farnest", "--yes"]);
     expect(res.status, res.stderr).toBe(0);
     expect(existsSync(join(serverVault, "nodes", "remote-note.md"))).toBe(false);
   });
