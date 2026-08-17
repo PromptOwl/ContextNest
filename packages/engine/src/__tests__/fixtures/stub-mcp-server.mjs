@@ -44,6 +44,21 @@ server.tool("context_list", "stub list — malformed error", {}, async () => ({
   isError: true,
 }));
 
+// The MCP-native split: prose for chat clients in `content`, catalog JSON in
+// `structuredContent`. The text here is deliberately unparseable, so a client
+// that ignores structuredContent fails loudly instead of silently passing.
+server.tool("context_resolve", "stub resolve — structured payload", {}, async () => ({
+  content: [{ type: "text", text: "Resolved 2 documents for you." }],
+  structuredContent: { total: 2, channel: "structuredContent" },
+}));
+
+// Same split on the error path.
+server.tool("context_versions", "stub versions — structured error", {}, async () => ({
+  content: [{ type: "text", text: "Sorry, I could not find that document." }],
+  structuredContent: { code: "DOCUMENT_NOT_FOUND", message: "Document not found: nodes/gone" },
+  isError: true,
+}));
+
 // Echo the received arguments back, to pin input passthrough.
 server.tool(
   "context_search",

@@ -143,7 +143,11 @@ export async function connectRemoteNest(
   return {
     toolNames,
     async run<T>(operation: string, input: Record<string, unknown>): Promise<T> {
-      let result: { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+      let result: {
+        content?: Array<{ type: string; text?: string }>;
+        structuredContent?: unknown;
+        isError?: boolean;
+      };
       try {
         result = (await client.callTool(
           { name: operation, arguments: input },
@@ -158,11 +162,15 @@ export async function connectRemoteNest(
       const text = (result.content ?? [])
         .map((c) => (c.type === "text" ? (c.text ?? "") : ""))
         .join("");
+      // `structuredContent` is MCP's channel for the machine payload, so a
+      // server is free to put human prose in `content`. Absent it, fall back to
+      // parsing the text — servers that predate the split behave exactly as before.
+      const structured = result.structuredContent;
       if (result.isError) {
         // Catalog-bound servers return structured {code, message} JSON; map it
         // back to a typed engine error. Anything else becomes INTERNAL.
         try {
-          const parsed = JSON.parse(text) as { code?: string; message?: string };
+          const parsed = (structured ?? JSON.parse(text)) as { code?: string; message?: string };
           if (parsed && typeof parsed.message === "string") {
             throw new ContextNestError(parsed.message, parsed.code ?? "INTERNAL");
           }
@@ -171,6 +179,7 @@ export async function connectRemoteNest(
         }
         throw new ContextNestError(text || `Remote operation ${operation} failed`, "INTERNAL");
       }
+      if (structured != null) return structured as T;
       try {
         return JSON.parse(text) as T;
       } catch {

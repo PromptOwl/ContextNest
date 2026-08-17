@@ -178,6 +178,29 @@ describe("connectRemoteNest — against a live stub server", () => {
     expect(out.total).toBe(2);
   });
 
+  it("prefers structuredContent over the text content blocks", async () => {
+    // The tool's `content` is prose that would fail JSON.parse — reading it
+    // would throw, so a pass proves the structured channel won.
+    const out = await conn.run<{ total: number; channel: string }>("context_resolve", {});
+    expect(out).toEqual({ total: 2, channel: "structuredContent" });
+  });
+
+  it("maps a structuredContent {code, message} error to a typed ContextNestError", async () => {
+    const err = await conn.run("context_versions", {}).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("DOCUMENT_NOT_FOUND");
+    expect((err as Error).message).toBe("Document not found: nodes/gone");
+  });
+
+  it("falls back to the text payload when the result carries no structuredContent", async () => {
+    // Backward compatibility with servers that predate the split.
+    const out = await conn.run<{ total: number; by_type: Record<string, number> }>(
+      "context_overview",
+      {},
+    );
+    expect(out.total).toBe(2);
+    expect(out.by_type).toEqual({ document: 2 });
+  });
+
   it("passes the input arguments through to the tool verbatim", async () => {
     const out = await conn.run<{ received: { query: string; limit?: number } }>(
       "context_search",
