@@ -46,7 +46,9 @@ const CHANGE_LADDER = [
   "(3) one node, one sentence → make that one edit and nothing else.",
   "(4) several nodes carry the same stale fact → note the before-marker",
   "(`ctx checkpoint list --json -n 1`) and fix all of them in one pass; a",
-  "half-swept vault contradicts itself.",
+  "half-swept vault contradicts itself. Then say that the duplication is the",
+  "root cause, and offer to make one node canonical with the rest linking to it",
+  "— offer, don't do it.",
   "(5) structural (a concept renamed, a decision reversed, a node whose title or",
   "type no longer fits) → stop, show the change-set, and ask before writing.",
 ].join(" ");

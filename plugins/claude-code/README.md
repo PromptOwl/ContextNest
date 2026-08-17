@@ -90,6 +90,11 @@ only then, the smallest new node.
 several nodes, changed together with the before-marker recorded → structural,
 which stops and asks.
 
+When the same fact turns out to live in several nodes, fixing all of them is the
+patch, not the cure: it will need correcting in all of them again next time. The
+curator says so and offers to make one node canonical with the rest linking to
+it — offered, never done unasked, because collapsing nodes is structural.
+
 A change is "structural" when the vault would end up contradicting itself, when
 a node's title or type no longer fits its body, when the corrected term is a
 concept the vault is organised around (a rename, not an edit), or when a

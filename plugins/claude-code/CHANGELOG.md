@@ -21,7 +21,10 @@ write, and a correction lands everywhere rather than in the first node it finds.
   published-only, so it also lists drafts and reads candidates — then changes
   them together, or reports that the vault never asserted it. Structural changes
   (a concept renamed, a decision reversed, a node that should split or be
-  retyped) stop and ask instead of proceeding.
+  retyped) stop and ask instead of proceeding. When the same fact turns out to
+  live in several nodes, the curator names the duplication as the root cause and
+  offers to make one node canonical with the rest linking to it — offered, never
+  done unasked.
 - **The change ladder is injected up front** on correction-shaped prompts, not
   just at end of turn, so the sweep happens before the edit rather than after.
 - **Capture is gated by a ladder that defaults to no.** A candidate must be

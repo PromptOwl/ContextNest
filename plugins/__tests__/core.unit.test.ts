@@ -449,6 +449,9 @@ describe("retrieve", () => {
     expect(text).toMatch(/nodes\/alpha/); // normal retrieval still happens
     expect(text).toMatch(/find EVERY occurrence before editing/);
     expect(text).toMatch(/stop, show the change-set, and ask/);
+    // Duplication is the root cause, and surfacing it is not licence to fix it.
+    expect(text).toMatch(/offer to make one node canonical/);
+    expect(text).toMatch(/offer, don't do it/);
   });
 
   it("the change ladder is injected even when retrieval finds nothing", () => {
