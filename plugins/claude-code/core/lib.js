@@ -34,6 +34,19 @@ export const USER_SETTINGS_FILE = join(".contextnest", "plugin-settings.json");
  */
 export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
 
+/**
+ * The only accepted capture_mode values, in ascending order of autonomy:
+ *   off     — never gate the stop; the vault is only written via an explicit
+ *             `/contextnest:capture` or a direct instruction.
+ *   propose — gate on a real signal, but the agent stays read-only: it walks
+ *             the capture ladder and proposes in one line. Nothing is written
+ *             until the user says yes. The default.
+ *   auto    — write unattended, still behind the ladder and the cooldown.
+ * Same validation contract as VALID_RETRIEVAL_MODES: anything else is treated
+ * as if the key were absent, so a typo can never silently raise autonomy.
+ */
+export const VALID_CAPTURE_MODES = ["off", "propose", "auto"];
+
 /** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
 export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
 export const FALSY_VALUES = ["false", "0", "no", "off"];
@@ -132,6 +145,19 @@ export function getConfig(env = process.env, opts = {}) {
     },
   );
 
+  // capture_mode supersedes the auto_capture boolean. Resolved independently so
+  // an explicit mode set at ANY layer beats a legacy boolean at a HIGHER one:
+  // someone who has picked a mode has said more than someone who ticked a box,
+  // and the legacy key's only two states can't express "propose".
+  const rawCaptureMode = pick(
+    "capture_mode",
+    ["CLAUDE_PLUGIN_OPTION_CAPTURE_MODE", "CONTEXTNEST_CAPTURE_MODE"],
+    {
+      normalize: (s) => s.trim().toLowerCase(),
+      accept: (s) => VALID_CAPTURE_MODES.includes(s),
+    },
+  );
+
   // Accept the unpin sentinel "" or a shape-valid alias; a malformed alias
   // ("my vault", "a/b", "..") is skipped so it can't reach ctx as a bad
   // --vault arg. Registry membership is verified by the config command.
@@ -158,6 +184,17 @@ export function getConfig(env = process.env, opts = {}) {
       ) || "search",
     // Default ON. Only a recognized falsy value disables it.
     autoCapture: rawAuto === undefined ? true : TRUTHY_VALUES.includes(rawAuto),
+    // Effective capture behaviour. An explicit capture_mode wins; otherwise the
+    // legacy boolean maps onto the two modes it could express (true was never
+    // "write without asking" as a *choice*, it was just "on", so it lands on
+    // the safer of the two). Absent both → the propose default.
+    captureMode:
+      rawCaptureMode ??
+      (rawAuto === undefined
+        ? "propose"
+        : TRUTHY_VALUES.includes(rawAuto)
+          ? "propose"
+          : "off"),
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,

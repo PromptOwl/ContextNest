@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "contextnest",
   "displayName": "Context Nest",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
   "author": { "name": "PromptOwl" },
   "homepage": "https://github.com/promptowl/contextnest",
@@ -16,10 +16,16 @@
       "description": "How much context to auto-inject on each prompt: off | search (cheap full-text) | query (graph) | agent (full reasoning).",
       "default": "search"
     },
+    "capture_mode": {
+      "type": "string",
+      "title": "Capture behaviour",
+      "description": "What happens when the plugin spots something worth keeping: off (never, use /contextnest:capture) | propose (review and propose in one line, write only once you agree) | auto (write unattended). Supersedes auto_capture.",
+      "default": "propose"
+    },
     "auto_capture": {
       "type": "boolean",
-      "title": "Auto-capture knowledge",
-      "description": "At the end of a substantive turn, trigger the capture agent to persist new facts/decisions into the vault.",
+      "title": "Auto-capture knowledge (deprecated)",
+      "description": "Deprecated — use capture_mode. Kept so existing installs keep working: true maps to propose, false maps to off. capture_mode wins when both are set.",
       "default": true
     },
     "vault": {

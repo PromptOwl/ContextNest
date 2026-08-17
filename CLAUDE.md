@@ -77,13 +77,15 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### Plugins (`plugins/`)
 
-Makes coding agents vault-aware (auto-retrieve) and self-maintaining (auto-capture) by shelling out to `ctx`. Only the Claude Code plugin is built; Codex/Gemini are README-only.
+Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Only the Claude Code plugin is built; Codex/Gemini are README-only.
 
 **`plugins/shared/` is the single source of truth. Never edit `plugins/claude-code/core/` — it is a vendored byte-identical copy.** Installed Claude plugins can't read files outside their own directory, so `pnpm plugins:sync` copies `shared/core/*` into each agent plugin and fills the `<!-- BEGIN SHARED -->…<!-- END SHARED -->` regions of agent/skill markdown from `shared/prompts/*.md`. `pnpm plugins:check` fails CI on drift.
 
 Each `core/*.js` module exports a **pure** `run({ input, env, exec })` returning the hook-output object (or `null` to do nothing), plus a thin IO shell guarded by `isMain(import.meta.url)`. Tests call `run()` with a fake `exec` — no subprocess. Zero runtime deps, plain Node ESM.
 
-Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `AUTO_CAPTURE` (default true), `VAULT` (pinned alias), `CTX_COMMAND` (default `ctx`).
+Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `CAPTURE_MODE` (`off`/`propose`/`auto`, default `propose`), `VAULT` (pinned alias), `CTX_COMMAND` (default `ctx`). `AUTO_CAPTURE` is deprecated but still read (`true`→`propose`, `false`→`off`); an explicit `CAPTURE_MODE` wins at any layer.
+
+**Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
 
 Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retrieval, `Stop` → loop-safe capture gate.
 
