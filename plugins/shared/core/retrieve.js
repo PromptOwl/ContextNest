@@ -22,8 +22,34 @@ import {
   isMain,
   MAX_HITS,
 } from "./lib.js";
+import { correctionIntent } from "./signals.js";
 
 const HEADER = "Relevant Context Nest vault material (auto-retrieved):";
+
+/**
+ * Appended only when the prompt looks like a correction.
+ *
+ * The end-of-turn gate is too late to be the only place this lives: by then the
+ * model has already edited whatever it was going to edit, usually the single
+ * node it happened to find. Injecting the sweep rule up front is what makes a
+ * correction land in every node that carries the stale fact.
+ *
+ * Only correction-shaped prompts pay for it, so ordinary turns are unchanged.
+ */
+const CHANGE_LADDER = [
+  "This prompt looks like a correction. If it contradicts anything in the vault,",
+  "resolve it by ladder, stopping at the first rung that applies:",
+  "(1) does the vault actually assert the old value? If not, change nothing and say so.",
+  "(2) find EVERY occurrence before editing — `ctx search` is ranked and",
+  "published-only, so also check `ctx list --json` and `ctx list --status draft --json`,",
+  "then `ctx read <id> --raw` the candidates.",
+  "(3) one node, one sentence → make that one edit and nothing else.",
+  "(4) several nodes carry the same stale fact → note the before-marker",
+  "(`ctx checkpoint list --json -n 1`) and fix all of them in one pass; a",
+  "half-swept vault contradicts itself.",
+  "(5) structural (a concept renamed, a decision reversed, a node whose title or",
+  "type no longer fits) → stop, show the change-set, and ask before writing.",
+].join(" ");
 
 /** Pull the user's prompt text out of the hook payload (field name varies). */
 function promptText(input) {
@@ -138,17 +164,20 @@ export function run({ input, env, exec }) {
   const mode = config.retrievalMode;
   if (mode === "off") return null;
 
-  if (mode === "agent") {
-    return wrap(AGENT_DIRECTIVE);
-  }
-
   const query = promptText(input);
+  // A correction gets the sweep rule even when retrieval finds nothing: search
+  // is ranked and published-only, so "no hits" is not evidence the vault is
+  // silent on the subject. Only correction-shaped prompts reach this.
+  const ladder = correctionIntent(query) ? CHANGE_LADDER : null;
+  const join = (block) => [block, ladder].filter(Boolean).join("\n\n");
+
+  if (mode === "agent") return wrap(join(AGENT_DIRECTIVE));
   if (!query) return null;
 
   const hits = searchAll(exec, config, query);
   const context = mode === "query" ? formatQuery(exec, config, hits) : formatSearch(hits);
-  if (!context) return null;
-  return wrap(context);
+  if (!context && !ladder) return null;
+  return wrap(join(context));
 }
 
 function wrap(additionalContext) {

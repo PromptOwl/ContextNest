@@ -34,9 +34,17 @@ describe("plugin manifest", () => {
     expect(typeof manifest.description).toBe("string");
   });
 
-  it("declares the four userConfig options with valid types", () => {
+  it("declares the userConfig options with valid types", () => {
     const keys = Object.keys(manifest.userConfig);
-    expect(keys.sort()).toEqual(["auto_capture", "ctx_command", "retrieval_mode", "vault"]);
+    // auto_capture is deprecated but retained: dropping it would silently reset
+    // the enable-time answer of every existing install.
+    expect(keys.sort()).toEqual([
+      "auto_capture",
+      "capture_mode",
+      "ctx_command",
+      "retrieval_mode",
+      "vault",
+    ]);
     for (const k of keys) {
       expect(["string", "number", "boolean", "directory", "file"]).toContain(manifest.userConfig[k].type);
       expect(manifest.userConfig[k].title).toBeTruthy();
@@ -86,6 +94,7 @@ describe("agent + skill frontmatter", () => {
   const files = [
     "agents/contextnest-retriever.md",
     "agents/contextnest-capture.md",
+    "agents/contextnest-curator.md",
     "skills/recall/SKILL.md",
   ];
 
@@ -110,14 +119,25 @@ describe("config command (CU-wdqcpzw825: settings must be changeable after enabl
     expect(existsSync(commandPath)).toBe(true);
   });
 
-  it("command has description frontmatter and covers all four settings", () => {
+  it("command has description frontmatter and covers every setting", () => {
     const text = read(commandPath);
     const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
     expect(fm, "frontmatter present").toBeTruthy();
     expect(fm![1]).toMatch(/\bdescription:\s*\S+/);
-    for (const key of ["retrieval_mode", "auto_capture", "vault", "ctx_command"]) {
+    for (const key of ["retrieval_mode", "capture_mode", "auto_capture", "vault", "ctx_command"]) {
       expect(text).toContain(key);
     }
+  });
+});
+
+describe("capture command", () => {
+  it("ships a /contextnest:capture escape hatch with description frontmatter", () => {
+    const commandPath = join(plugin, "commands", "capture.md");
+    expect(existsSync(commandPath)).toBe(true);
+    const text = read(commandPath);
+    expect(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1]).toMatch(/\bdescription:\s*\S+/);
+    // The command exists precisely because capture_mode can be `off`.
+    expect(text).toContain("contextnest-capture");
   });
 });
 
@@ -131,7 +151,14 @@ describe("vendored core sync", () => {
   });
 
   it("vendored core files are byte-identical to the shared source", () => {
-    for (const name of ["lib.js", "retrieve.js", "session-start.js", "capture-gate.js"]) {
+    for (const name of [
+      "lib.js",
+      "retrieve.js",
+      "session-start.js",
+      "capture-gate.js",
+      "signals.js",
+      "ledger.js",
+    ]) {
       expect(read(join(plugin, "core", name))).toBe(
         read(join(repo, "plugins", "shared", "core", name)),
       );
