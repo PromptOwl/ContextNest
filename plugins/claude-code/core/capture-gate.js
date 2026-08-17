@@ -97,6 +97,11 @@ export function readTranscript(path, maxLines = 200) {
  * An unreadable transcript returns false: without evidence we stay quiet. The
  * old behaviour (favour capture) is exactly the bias being removed, and
  * explicit user intent is read from the payload path, not from here.
+ *
+ * ponytail: a raw substring test for `"tool_use"`, so an assistant message that
+ * merely quotes the string reads as substantive. That only ever promotes a turn
+ * to *eligible*; the cooldown still decides whether anything fires, so the
+ * blast radius is nil. Kept from the original implementation deliberately.
  */
 export function isSubstantive(lines) {
   if (!lines || lines.length === 0) return false;

@@ -48,6 +48,13 @@ Stop at the first rung that resolves.
 3. **Several nodes carry the same fact.** Record the boundary first, then update
    all of them in one pass. Do not leave a partial sweep behind — a half-swept
    vault is worse than an unswept one, because it now contradicts itself.
+
+   Then name the root cause. A fact restated in four nodes is four copies of
+   something that should have had one home, and it will need correcting four
+   times again next time. Say so, and offer the fix: make one node canonical and
+   have the others reference it with a `[[wikilink]]`, so the next correction is
+   a single edit. **Offer it — do not perform it.** Collapsing nodes is
+   structural, which is rung 4.
 4. **Structural** — see below. Stop and ask.
 
 ### Recording the boundary
@@ -78,6 +85,8 @@ the minimal edit:
 - A recorded decision has been reversed, so the stated reasoning is now wrong,
   not just the conclusion.
 - A node should be split, merged, or retyped for the correction to make sense.
+- The same fact lives in several nodes and should be collapsed to one canonical
+  node that the others link to (rung 3's root cause).
 
 In any of those cases: **stop and ask.** Present the change-set — the ids, what
 each would become, and which rung triggered the escalation — and wait. Do not
@@ -86,6 +95,7 @@ begin a rename or a restructure on your own authority.
 ## 5. Report
 
 One line per changed node (`updated: vault:id — <what changed>`), plus the
-checkpoint number when you cut one. If you changed nothing, say so in one line
-and stop. Never claim a sweep you did not run.
+before-marker so the set can be unwound. If the same fact turned out to live in
+more than one node, add one line offering to canonicalize it. If you changed
+nothing, say so in one line and stop. Never claim a sweep you did not run.
 <!-- END SHARED -->
