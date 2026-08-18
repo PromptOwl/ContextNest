@@ -72,7 +72,6 @@ import {
   remoteDelete,
 } from "./remote.js";
 import {
-  filterDocList,
   listJsonEntry,
   queryJsonPayload,
   searchJsonEntry,
@@ -1367,7 +1366,7 @@ program
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
-      await remotePublish(remote, path);
+      await remotePublish(remote, path, opts);
       return;
     }
     const storage = getStorage();

@@ -603,13 +603,24 @@ const packsOp: OperationDescriptor = {
 
 // ─── context_nests ───────────────────────────────────────────────────────────
 
-/** One registered nest as returned by `context_nests`. */
+/**
+ * One registered nest as returned by `context_nests`. A nest is either a local
+ * vault on disk or a remote MCP endpoint, so `kind` is what a caller branches
+ * on: `path`/`exists` are local-only, `transport`/`url`/`command` remote-only.
+ * Reachability of a remote is deliberately absent — knowing it means probing,
+ * which this op never does.
+ */
 const nestSummary = z.object({
   alias: z.string(),
-  path: z.string(),
+  kind: z.enum(["local", "remote"]),
+  path: z.string().optional(),
+  transport: z.enum(["stdio", "http"]).optional(),
+  url: z.string().optional(),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
   description: z.string().optional(),
   isDefault: z.boolean(),
-  exists: z.boolean(),
+  exists: z.boolean().optional(),
 });
 
 /**
@@ -621,7 +632,7 @@ const nestsOp: OperationDescriptor = {
   name: "context_nests",
   namespace: "core",
   description:
-    "List every nest registered in the central registry, with its alias, path, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
+    "List every nest registered in the central registry — local vaults and remote MCP endpoints alike — with its alias, kind, endpoint, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
   input: z.object({}),
   output: z.object({ nests: z.array(nestSummary) }),
   errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
