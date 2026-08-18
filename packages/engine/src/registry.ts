@@ -30,7 +30,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { ConfigError, UnknownAliasError } from "./errors.js";
-import type { VaultRegistry, VaultRegistryEntry } from "./types.js";
+import type { RemoteNestSpec, VaultRegistry, VaultRegistryEntry } from "./types.js";
 
 /**
  * Allowed characters for a vault alias. Restricted to letters, digits, hyphens
@@ -61,6 +61,13 @@ function lookupVault(registry: VaultRegistry, alias: string): VaultRegistryEntry
   return Object.hasOwn(registry.vaults, alias) ? registry.vaults[alias] : undefined;
 }
 
+/** Same own-property guard as lookupVault, for the `remotes:` map. */
+function lookupRemote(registry: VaultRegistry, alias: string): RemoteNestSpec | undefined {
+  return registry.remotes && Object.hasOwn(registry.remotes, alias)
+    ? registry.remotes[alias]
+    : undefined;
+}
+
 function assertSafeAlias(alias: string): void {
   if (!alias.trim()) {
     throw new ConfigError("Vault alias must not be empty");
@@ -77,14 +84,117 @@ const vaultRegistryEntrySchema = z.object({
   description: z.string().optional(),
 });
 
-const vaultRegistrySchema = z.object({
-  version: z.number().default(1),
-  default: z.string().optional(),
-  // Validate alias keys on read too, not just in addVault — a hand-edited entry
-  // like "my vault" would otherwise be silently usable via CONTEXTNEST_VAULT,
-  // bypassing the shell-safety invariant.
-  vaults: z.record(z.string().regex(ALIAS_PATTERN), vaultRegistryEntrySchema).default({}),
-});
+/**
+ * Auth for HTTP remotes. Only env-var *references* are storable; any other key
+ * (a raw `bearer:`/`token:` value) is rejected with a message that names the
+ * env-ref fields, so a hand-edited secret can never silently live in the
+ * registry file.
+ */
+const REMOTE_AUTH_KEYS = new Set(["bearer_env", "header_name", "header_env"]);
+const remoteAuthSchema = z
+  .object({
+    bearer_env: z.string().min(1).optional(),
+    header_name: z.string().min(1).optional(),
+    header_env: z.string().min(1).optional(),
+  })
+  .passthrough()
+  .superRefine((val, rc) => {
+    for (const key of Object.keys(val)) {
+      if (!REMOTE_AUTH_KEYS.has(key)) {
+        rc.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `unknown auth key "${key}" — store secrets as env-var references (bearer_env / header_env), never as raw values`,
+        });
+      }
+    }
+  });
+
+/** Hosts where cleartext http is acceptable (local development/testing). */
+function isLoopbackHost(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname === "[::1]" ||
+    hostname.startsWith("127.")
+  );
+}
+
+const remoteNestSpecSchema = z
+  .discriminatedUnion("transport", [
+    z.object({
+      transport: z.literal("stdio"),
+      command: z.string().min(1),
+      args: z.array(z.string()).optional(),
+      description: z.string().optional(),
+      timeout_ms: z.number().int().positive().optional(),
+    }),
+    z.object({
+      transport: z.literal("http"),
+      url: z.string().min(1),
+      auth: remoteAuthSchema.optional(),
+      description: z.string().optional(),
+      timeout_ms: z.number().int().positive().optional(),
+    }),
+  ])
+  // superRefine on the UNION, not its options — discriminatedUnion requires
+  // plain ZodObject options, so per-option effects would fail to construct.
+  .superRefine((spec, rc) => {
+    if (spec.transport !== "http") return;
+    let url: URL;
+    try {
+      url = new URL(spec.url);
+    } catch {
+      rc.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `url "${spec.url}" is not a valid URL`,
+      });
+      return;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      rc.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `url must use http(s), got "${url.protocol}//"`,
+      });
+      return;
+    }
+    // Credentials over cleartext http would put the bearer token/header value
+    // on the wire unencrypted. Refuse outright (not just a warning) unless the
+    // host is loopback — local development is the one legitimate cleartext case.
+    if (spec.auth && url.protocol === "http:" && !isLoopbackHost(url.hostname)) {
+      rc.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          `refusing to send credentials over cleartext ${url.protocol}// to "${url.hostname}" — ` +
+          `use https://, or a loopback address (localhost/127.x) for local testing`,
+      });
+    }
+  });
+
+const vaultRegistrySchema = z
+  .object({
+    version: z.number().default(1),
+    default: z.string().optional(),
+    // Validate alias keys on read too, not just in addVault — a hand-edited entry
+    // like "my vault" would otherwise be silently usable via CONTEXTNEST_VAULT,
+    // bypassing the shell-safety invariant.
+    vaults: z.record(z.string().regex(ALIAS_PATTERN), vaultRegistryEntrySchema).default({}),
+    // Remote nests live in their own top-level map so pre-remote CLIs (which
+    // strip unknown top-level keys) keep working against a registry that has
+    // them — extending `vaults` entries would fail their whole-registry parse.
+    remotes: z.record(z.string().regex(ALIAS_PATTERN), remoteNestSpecSchema).optional(),
+  })
+  .superRefine((reg, rc) => {
+    // One alias namespace across both maps: --vault/CONTEXTNEST_VAULT/default
+    // must never be ambiguous about which entry they name.
+    for (const alias of Object.keys(reg.remotes ?? {})) {
+      if (reg.vaults[alias]) {
+        rc.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `alias "${alias}" is registered as both a vault and a remote — aliases share one namespace`,
+        });
+      }
+    }
+  });
 
 /** A fresh empty registry. Constructed per call so the nested `vaults` object is never shared. */
 function emptyRegistry(): VaultRegistry {
@@ -209,6 +319,13 @@ export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions
     );
   }
   const registry = readRegistry();
+  // One alias namespace: a remote under this alias always blocks (a --force
+  // local overwrite of a remote would silently change the entry's kind).
+  if (registry.remotes?.[alias]) {
+    throw new ConfigError(
+      `Alias "${alias}" already exists as a remote nest. Remove it first with \`ctx vault remove ${alias}\`.`,
+    );
+  }
   const isNew = !registry.vaults[alias];
   if (!isNew && !opts.force) {
     throw new ConfigError(
@@ -227,19 +344,70 @@ export function addVault(alias: string, vaultPath: string, opts: AddVaultOptions
   return registry;
 }
 
+export interface AddRemoteOptions {
+  setDefault?: boolean;
+  /** Overwrite an existing REMOTE entry under this alias instead of throwing. */
+  force?: boolean;
+}
+
+/**
+ * Register a remote nest (MCP endpoint) under an alias, in the registry's
+ * top-level `remotes:` map. Shares one alias namespace with local vaults.
+ */
+export function addRemote(
+  alias: string,
+  spec: RemoteNestSpec,
+  opts: AddRemoteOptions = {},
+): VaultRegistry {
+  // Same guard as addVault: ALIAS_PATTERN alone matches "__proto__", and the
+  // reserved-alias check is what keeps it out of the registry maps.
+  assertSafeAlias(alias);
+  const parsed = remoteNestSpecSchema.safeParse(spec);
+  if (!parsed.success) {
+    const messages = parsed.error.issues.map((i) => i.message);
+    throw new ConfigError(`Invalid remote nest spec: ${messages.join("; ")}`);
+  }
+  const registry = readRegistry();
+  if (registry.vaults[alias]) {
+    throw new ConfigError(
+      `Vault alias "${alias}" already exists (-> ${registry.vaults[alias].path}). Choose another alias or remove it first.`,
+    );
+  }
+  const isNew = !registry.remotes?.[alias];
+  if (!isNew && !opts.force) {
+    throw new ConfigError(
+      `Remote alias "${alias}" already exists. Use --force to overwrite.`,
+    );
+  }
+  registry.remotes = { ...(registry.remotes ?? {}), [alias]: parsed.data };
+  // Same promotion rule as addVault, to the letter: a brand-new entry takes the
+  // default only when none is set. A --force update of an existing alias must
+  // not silently grab it.
+  if (opts.setDefault || (isNew && !registry.default)) {
+    registry.default = alias;
+  }
+  writeRegistry(registry);
+  return registry;
+}
+
 export interface RemoveVaultResult {
   registry: VaultRegistry;
   /** True if the removed alias was the default (its default slot is now empty). */
   wasDefault: boolean;
 }
 
+/** Unregister an alias — local vault or remote nest alike. */
 export function removeVault(alias: string): RemoveVaultResult {
   assertSafeAlias(alias);
   const registry = readRegistry();
-  if (!registry.vaults[alias]) {
+  if (registry.vaults[alias]) {
+    delete registry.vaults[alias];
+  } else if (registry.remotes?.[alias]) {
+    delete registry.remotes[alias];
+    if (Object.keys(registry.remotes).length === 0) delete registry.remotes;
+  } else {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
   }
-  delete registry.vaults[alias];
   const wasDefault = registry.default === alias;
   if (wasDefault) {
     delete registry.default;
@@ -248,10 +416,11 @@ export function removeVault(alias: string): RemoveVaultResult {
   return { registry, wasDefault };
 }
 
+/** Set the default alias. A remote nest may be the default. */
 export function setDefaultVault(alias: string): VaultRegistry {
   assertSafeAlias(alias);
   const registry = readRegistry();
-  if (!registry.vaults[alias]) {
+  if (!registry.vaults[alias] && !registry.remotes?.[alias]) {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
   }
   registry.default = alias;
@@ -267,7 +436,9 @@ export function setDefaultVault(alias: string): VaultRegistry {
 export function setVaultDescription(alias: string, description?: string): VaultRegistry {
   assertSafeAlias(alias);
   const registry = readRegistry();
-  const entry = registry.vaults[alias];
+  // Either kind: a remote's description is as editable as a local vault's.
+  const entry: { description?: string } | undefined =
+    registry.vaults[alias] ?? registry.remotes?.[alias];
   if (!entry) {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
   }
@@ -279,19 +450,32 @@ export function setVaultDescription(alias: string, description?: string): VaultR
 
 export interface VaultListEntry {
   alias: string;
-  path: string;
-  /** Registry description, else the vault config's own `description` or `name`. */
+  /** Local vault on disk, or a remote nest reached over MCP. */
+  kind: "local" | "remote";
+  /** Local entries only: absolute vault path. */
+  path?: string;
+  /** Remote entries only. */
+  transport?: RemoteNestSpec["transport"];
+  url?: string;
+  command?: string;
+  args?: string[];
+  /** Registry description, else (local only) the vault config's own `description` or `name`. */
   description?: string;
   isDefault: boolean;
-  /** Whether the path currently resolves to a real vault. */
-  exists: boolean;
+  /**
+   * Local entries: whether the path currently resolves to a real vault.
+   * Remote entries: omitted — reachability is only known by probing, which
+   * `vault list` deliberately never does implicitly.
+   */
+  exists?: boolean;
 }
 
-/** List registered vaults with resolved descriptions and existence checks. */
+/** List registered vaults and remote nests with descriptions and existence checks. */
 export function listVaults(): VaultListEntry[] {
   const registry = readRegistry();
-  return Object.entries(registry.vaults).map(([alias, entry]) => ({
+  const locals: VaultListEntry[] = Object.entries(registry.vaults).map(([alias, entry]) => ({
     alias,
+    kind: "local" as const,
     path: entry.path,
     // Blank is treated as unset (same rule readVaultLabel applies to the config),
     // so a hand-edited `description: ""` falls through instead of winning.
@@ -299,6 +483,19 @@ export function listVaults(): VaultListEntry[] {
     isDefault: registry.default === alias,
     exists: isVaultRoot(entry.path),
   }));
+  const remotes: VaultListEntry[] = Object.entries(registry.remotes ?? {}).map(
+    ([alias, spec]) => ({
+      alias,
+      kind: "remote" as const,
+      transport: spec.transport,
+      ...(spec.transport === "http"
+        ? { url: spec.url }
+        : { command: spec.command, args: spec.args }),
+      description: spec.description,
+      isDefault: registry.default === alias,
+    }),
+  );
+  return [...locals, ...remotes];
 }
 
 /**
@@ -376,15 +573,49 @@ export interface ResolvedVault {
 }
 
 /**
- * Resolve which vault to operate on, applying the documented precedence.
- * Synchronous so it can run at CLI/MCP startup.
+ * A resolved nest: either a local vault path or a registered remote nest.
+ * `resolveNest` is the remote-aware resolver; `resolveVaultPath` wraps it for
+ * the (many) callers whose operation is inherently local.
  */
-export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault {
+export type ResolvedNest =
+  | ({ kind: "local" } & ResolvedVault)
+  | {
+      kind: "remote";
+      alias: string;
+      remote: RemoteNestSpec;
+      source: VaultResolutionSource;
+      warning?: string;
+    };
+
+/** One-line human description of a remote's endpoint, for messages/UIs. */
+export function describeRemoteEndpoint(spec: RemoteNestSpec): string {
+  return spec.transport === "http"
+    ? spec.url
+    : [spec.command, ...(spec.args ?? [])].join(" ");
+}
+
+/**
+ * Resolve which nest to operate on — local vault or remote — applying the
+ * documented precedence. An alias naming a `remotes:` entry resolves at the
+ * same precedence steps a local alias would (flag, env alias, positional arg,
+ * registry default). Synchronous so it can run at CLI/MCP startup.
+ */
+export function resolveNest(opts: ResolveVaultOptions = {}): ResolvedNest {
   const cwd = opts.cwd ?? process.cwd();
 
   // 1. explicit --vault flag — per-command and explicit, so a bad alias throws.
   if (opts.vaultAlias) {
-    return { path: resolveAliasOrThrow(opts.vaultAlias), source: "flag", alias: opts.vaultAlias };
+    const reg = readRegistry();
+    const remote = lookupRemote(reg, opts.vaultAlias);
+    if (remote) {
+      return { kind: "remote", alias: opts.vaultAlias, remote, source: "flag" };
+    }
+    return {
+      kind: "local",
+      path: resolveAliasOrThrow(opts.vaultAlias, reg),
+      source: "flag",
+      alias: opts.vaultAlias,
+    };
   }
 
   // Lazily read the registry at most once, shared across the branches below.
@@ -402,9 +633,13 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   // of every command — use it when valid, otherwise warn and fall through.
   const envAlias = process.env.CONTEXTNEST_VAULT;
   if (envAlias) {
+    const envRemote = lookupRemote(getRegistry(), envAlias);
+    if (envRemote) {
+      return { kind: "remote", alias: envAlias, remote: envRemote, source: "env-alias" };
+    }
     const entry = lookupVault(getRegistry(), envAlias);
     if (entry && isVaultRoot(entry.path)) {
-      return { path: entry.path, source: "env-alias", alias: envAlias };
+      return { kind: "local", path: entry.path, source: "env-alias", alias: envAlias };
     }
     warning ??= entry
       ? `CONTEXTNEST_VAULT="${envAlias}" points to "${entry.path}", which is no longer a vault — ignoring it.`
@@ -417,7 +652,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   const envPath = process.env.CONTEXTNEST_VAULT_PATH;
   if (envPath) {
     if (isVaultRoot(envPath)) {
-      return { path: envPath, source: "env-path" };
+      return { kind: "local", path: envPath, source: "env-path" };
     }
     warning ??= `CONTEXTNEST_VAULT_PATH="${envPath}" is not a vault (no .context/config.yaml) — ignoring it.`;
   }
@@ -429,8 +664,17 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   // absolute path that isn't (yet) a vault.
   if (opts.argPath) {
     const arg = opts.argPath;
+    const argRemote = lookupRemote(getRegistry(), arg);
+    if (argRemote) {
+      return { kind: "remote", alias: arg, remote: argRemote, source: "arg" };
+    }
     if (lookupVault(getRegistry(), arg)) {
-      return { path: resolveAliasOrThrow(arg, getRegistry()), source: "arg", alias: arg };
+      return {
+        kind: "local",
+        path: resolveAliasOrThrow(arg, getRegistry()),
+        source: "arg",
+        alias: arg,
+      };
     }
     // Not an alias → treat as a path. A relative path is resolved against cwd
     // (backward compat: `contextnest-mcp ./vault` / `../vault` worked before the
@@ -442,7 +686,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
         `"${arg}" is not a registered vault alias and is not a vault directory (no .context/config.yaml).`,
       );
     }
-    return { path: resolvedArg, source: "arg" };
+    return { kind: "local", path: resolvedArg, source: "arg" };
   }
 
   // 5. local vault from cwd walk-up — backward compat. Carry any stale-env
@@ -450,17 +694,39 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
   // `ctx vault which`) can surface it even though a vault did resolve.
   const local = findLocalVault(cwd);
   if (local) {
-    return { path: local, source: "local", warning };
+    return { kind: "local", path: local, source: "local", warning };
   }
 
   // 6. registry default alias. Also an implicit fallback, so a stale default
   // (vault deleted/moved) must NOT throw — fall through to cwd instead.
   const reg = getRegistry();
+  const defaultRemote = reg.default ? lookupRemote(reg, reg.default) : undefined;
+  if (reg.default && defaultRemote) {
+    return { kind: "remote", alias: reg.default, remote: defaultRemote, source: "default", warning };
+  }
   const defaultEntry = reg.default ? reg.vaults[reg.default] : undefined;
   if (defaultEntry && isVaultRoot(defaultEntry.path)) {
-    return { path: defaultEntry.path, source: "default", alias: reg.default, warning };
+    return { kind: "local", path: defaultEntry.path, source: "default", alias: reg.default, warning };
   }
 
   // 7. cwd fallback.
-  return { path: cwd, source: "cwd", warning };
+  return { kind: "local", path: cwd, source: "cwd", warning };
+}
+
+/**
+ * Resolve which LOCAL vault to operate on. Wraps {@link resolveNest} and
+ * throws a clear ConfigError when resolution lands on a remote nest — callers
+ * of this function (init/index/checkpoint and every direct-filesystem path)
+ * cannot operate over MCP.
+ */
+export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault {
+  const nest = resolveNest(opts);
+  if (nest.kind === "remote") {
+    throw new ConfigError(
+      `Vault alias "${nest.alias}" is a remote nest (${describeRemoteEndpoint(nest.remote)}) — ` +
+        `this operation is local-only and cannot run against a remote.`,
+    );
+  }
+  const { kind: _kind, ...resolved } = nest;
+  return resolved;
 }

@@ -1,0 +1,175 @@
+/**
+ * Remote nest client — drives a registered `remotes:` entry over MCP.
+ *
+ * The wire contract is the canonical operation catalog (`api/`): the client
+ * calls `context_*` tools by name and expects the structured
+ * `{ code, message }` error payload the catalog-bound server emits. Any MCP
+ * endpoint exposing the catalog's `core` namespace is a valid remote nest.
+ *
+ * The MCP SDK is loaded lazily (dynamic import) so `ctx` invocations that
+ * never touch a remote pay zero startup cost for it.
+ */
+
+import { ContextNestError } from "./errors.js";
+import type { RemoteNestSpec } from "./types.js";
+
+/** Default per-call timeout when the registry entry sets no timeout_ms. */
+export const REMOTE_DEFAULT_TIMEOUT_MS = 10_000;
+
+/**
+ * Thrown when the remote endpoint cannot be reached (spawn failure, dead
+ * process, connection refused, protocol handshake failure). Carries its own
+ * stable code so surfaces can map it to a distinct exit path — the CLI exits 3
+ * on it, letting plugin hooks skip an offline remote silently.
+ */
+export class RemoteUnreachableError extends ContextNestError {
+  constructor(
+    public readonly alias: string,
+    detail: string,
+  ) {
+    super(`Remote nest "${alias}" is unreachable — ${detail}`, "REMOTE_UNREACHABLE");
+    this.name = "RemoteUnreachableError";
+  }
+}
+
+/** A connected remote nest: run catalog operations, then close. */
+export interface RemoteNestConnection {
+  /** Call a catalog operation (canonical `context_*` name) on the remote. */
+  run<T = unknown>(operation: string, input: Record<string, unknown>): Promise<T>;
+  close(): Promise<void>;
+}
+
+/** Build HTTP auth headers from env-var references. Missing vars throw early. */
+function buildAuthHeaders(
+  spec: Extract<RemoteNestSpec, { transport: "http" }>,
+  env: Record<string, string | undefined>,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const auth = spec.auth;
+  if (!auth) return headers;
+  if (auth.bearer_env) {
+    const token = env[auth.bearer_env];
+    if (!token) {
+      throw new ContextNestError(
+        `Remote auth env var ${auth.bearer_env} is not set — export it or update the registry entry.`,
+        "CONFIG_ERROR",
+      );
+    }
+    headers.Authorization = `Bearer ${token}`;
+  }
+  if (auth.header_name && auth.header_env) {
+    const value = env[auth.header_env];
+    if (!value) {
+      throw new ContextNestError(
+        `Remote auth env var ${auth.header_env} is not set — export it or update the registry entry.`,
+        "CONFIG_ERROR",
+      );
+    }
+    headers[auth.header_name] = value;
+  }
+  return headers;
+}
+
+/**
+ * Connect to a remote nest. Throws {@link RemoteUnreachableError} when the
+ * endpoint cannot be reached or the MCP handshake fails.
+ */
+export async function connectRemoteNest(
+  alias: string,
+  spec: RemoteNestSpec,
+  env: Record<string, string | undefined> = process.env,
+): Promise<RemoteNestConnection> {
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const client = new Client({ name: "contextnest-remote-client", version: "1.0.0" });
+  const timeout = spec.timeout_ms ?? REMOTE_DEFAULT_TIMEOUT_MS;
+
+  try {
+    if (spec.transport === "stdio") {
+      const { StdioClientTransport } = await import(
+        "@modelcontextprotocol/sdk/client/stdio.js"
+      );
+      // StdioClientTransport REPLACES the child env when `env` is set, so
+      // forward the caller's environment (the spawned server may need PATH,
+      // proxies, …). Undefined values are filtered to satisfy the
+      // Record<string, string> contract.
+      //
+      // EXCEPT the caller's ambient vault selectors: the child's target vault
+      // is fully determined by this spec's command/args. Leaking
+      // CONTEXTNEST_VAULT=<this remote's own alias> would make the spawned
+      // server resolve the alias, find a remote, and refuse to start
+      // ("local-only") — a self-referential deadlock.
+      const childEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(env)) {
+        if (k === "CONTEXTNEST_VAULT" || k === "CONTEXTNEST_VAULT_PATH") continue;
+        if (typeof v === "string") childEnv[k] = v;
+      }
+      const transport = new StdioClientTransport({
+        command: spec.command,
+        args: spec.args ?? [],
+        env: childEnv,
+      });
+      await client.connect(transport, { timeout });
+    } else {
+      const { StreamableHTTPClientTransport } = await import(
+        "@modelcontextprotocol/sdk/client/streamableHttp.js"
+      );
+      const transport = new StreamableHTTPClientTransport(new URL(spec.url), {
+        requestInit: { headers: buildAuthHeaders(spec, env) },
+      });
+      await client.connect(transport, { timeout });
+    }
+  } catch (err) {
+    // A ContextNestError raised before any I/O (e.g. missing auth env var) is
+    // a config problem, not connectivity — let it through untranslated.
+    if (err instanceof ContextNestError) throw err;
+    throw new RemoteUnreachableError(alias, (err as Error)?.message ?? String(err));
+  }
+
+  return {
+    async run<T>(operation: string, input: Record<string, unknown>): Promise<T> {
+      let result: { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+      try {
+        result = (await client.callTool(
+          { name: operation, arguments: input },
+          undefined,
+          { timeout },
+        )) as typeof result;
+      } catch (err) {
+        // A protocol-level failure mid-call (transport died, request timed
+        // out) is a connectivity problem, same as a failed connect.
+        throw new RemoteUnreachableError(alias, (err as Error)?.message ?? String(err));
+      }
+      const text = (result.content ?? [])
+        .map((c) => (c.type === "text" ? (c.text ?? "") : ""))
+        .join("");
+      if (result.isError) {
+        // Catalog-bound servers return structured {code, message} JSON; map it
+        // back to a typed engine error. Anything else becomes INTERNAL.
+        try {
+          const parsed = JSON.parse(text) as { code?: string; message?: string };
+          if (parsed && typeof parsed.message === "string") {
+            throw new ContextNestError(parsed.message, parsed.code ?? "INTERNAL");
+          }
+        } catch (err) {
+          if (err instanceof ContextNestError) throw err;
+        }
+        throw new ContextNestError(text || `Remote operation ${operation} failed`, "INTERNAL");
+      }
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw new ContextNestError(
+          `Remote operation ${operation} returned a non-JSON payload — is "${alias}" a ContextNest MCP endpoint?`,
+          "INTERNAL",
+        );
+      }
+    },
+    async close(): Promise<void> {
+      try {
+        await client.close();
+      } catch {
+        // best-effort — the process/connection may already be gone
+      }
+    },
+  };
+}

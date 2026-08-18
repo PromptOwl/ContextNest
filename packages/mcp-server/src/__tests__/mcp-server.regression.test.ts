@@ -27,44 +27,47 @@ const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.ur
 const FIXTURES = fileURLToPath(new URL("../../../../fixtures/minimal-vault", import.meta.url));
 
 const EXPECTED_TOOLS = [
+  // Catalog-driven: name, description and schema come from the engine's
+  // operation catalog rather than being declared here, so this surface cannot
+  // drift from the CLI's. The legacy twin of a catalog tool (e.g.
+  // create_document) stays registered but is deprecated.
+  "context_get",
+  "context_query",
+  "context_resolve",
+  "context_list",
+  "context_search",
+  "context_create",
+  "context_update",
+  "context_publish",
+  "context_delete",
+  "context_versions",
+  "context_reconstruct",
+  "context_verify",
+  "context_init",
+  "context_packs",
+  "context_import",
+  "context_nests",
+  // Hand-written, still current.
+  "document_format",
+  "read_index",
+  "read_pack",
+  "list_checkpoints",
+  "stage_drift_suggestion",
+  "list_suggestions",
+  "approve_suggestion",
+  "reject_suggestion",
+  // Legacy names — kept as deprecated aliases for the migration window.
   "vault_info",
   "resolve",
   "read_document",
   "list_documents",
-  "document_format",
-  "read_index",
-  "read_pack",
   "search",
   "verify_integrity",
-  "list_checkpoints",
   "read_version",
   "create_document",
   "update_document",
   "delete_document",
   "publish_document",
-  "stage_drift_suggestion",
-  "list_suggestions",
-  "approve_suggestion",
-  "reject_suggestion",
-  // Catalog-driven: name, description and schema come from the engine's
-  // operation catalog rather than being declared here. The legacy twin of a
-  // catalog tool (e.g. create_document) stays registered but is deprecated.
-  "context_import",
-  "context_create",
-  "context_update",
-  "context_list",
-  "context_versions",
-  "context_get",
-  "context_init",
-  "context_verify",
-  "context_packs",
-  "context_nests",
-  "context_search",
-  "context_query",
-  "context_resolve",
-  "context_publish",
-  "context_delete",
-  "context_reconstruct",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
