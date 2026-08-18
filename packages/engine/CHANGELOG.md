@@ -1,5 +1,112 @@
 # @promptowl/contextnest-engine
 
+## 2.1.0
+
+### Minor Changes
+
+- 6b6ffcb: Flatten the dependency tree and publish the dependency graph.
+
+  Installing the CLI now pulls **2 packages with no nesting** (1 with `--omit=optional`), down from 104 packages at depth 7. **The MCP server installs nothing at all**, down from 97 packages at depth 11.
+
+  The CLI and MCP server are binaries, not libraries, so their dependencies are now compiled into `dist/` and declared as devDependencies. Unused code is dropped in the process — the MCP server no longer ships the SDK's express, hono, ajv and jose transports, none of which a stdio server touches. Every bundled package is listed with its version and licence in `DEPENDENCIES.md`, so nothing is hidden by being bundled.
+
+  The engine is a library and keeps real dependencies — 7 packages at depth 2, down from 76. Four were removed outright without losing any behaviour:
+
+  - `unified` / `remark-parse` / `remark-gfm` (58 packages) — the markdown AST was used only to find `contextnest://` links and section headings, which a fence-aware line scanner does directly.
+  - `fast-glob` (18 packages) — replaced by a small `*` / `**` matcher over a `readdir` walk.
+  - `gray-matter` (11 packages) — frontmatter is split in-tree and parsed with the `js-yaml` the engine already depended on, instead of a second, older copy of it.
+  - `cli-table3` (7 packages) — declared but never imported.
+
+  Alongside that:
+
+  - **No install scripts.** The CLI's `postinstall` banner is gone; installing the package now executes none of our code. The same guidance is one `ctx` away in the top-level help.
+  - **Minimal install profile.** `chalk` moved to `optionalDependencies`, so `npm install -g @promptowl/contextnest-cli --omit=optional` installs a colour-free CLI — a single package — with every command, flag and output format unchanged.
+  - **Published dependency graph.** `DEPENDENCIES.md` records every installed and bundled package, why it is there, and its licence. CI regenerates it and fails on drift, verifies that every module a published bundle imports is a declared dependency, and uploads the machine-readable graph as a build artifact.
+
+- 0610438: Give `context_import` the whole folder-import flow, instead of half of it.
+
+  Importing an existing vault took two passes over every document before
+  publishing even started. The importer scanned the vault itself, rewrote each
+  file to stamp its own metadata (an `author` that is the importing user, a title
+  falling back to the filename), and only then handed the ids back to be
+  published — which rewrites each file again. On a network-backed mount that is
+  two extra round trips per document, and the scan is duplicated work the engine
+  had already done.
+
+  Three additions close that gap:
+
+  - `files[]` writes an existing vault's files in **verbatim**, at their own
+    relative paths. Nothing is synthesized, so the source's frontmatter survives
+    (`version`, `checksum`, custom keys a generated draft would drop), and files
+    that are not documents travel too — `.versions/<doc>/history.yaml` included,
+    which is what lets an imported version chain still reconstruct. Paths are
+    guarded: `..` and absolute paths are rejected per-file rather than aborting
+    the import.
+  - `publish: false` stages files without publishing them. An upload that arrives
+    in several batches can stage every batch and publish once at the end, so the
+    import seals ONE checkpoint rather than one per batch.
+  - `discover: true` makes the vault itself the input. The engine scans, decides
+    publish-vs-hold from each file's own frontmatter, publishes the batch under a
+    single checkpoint, and returns a record per document (`id`, `title`,
+    `version`, `status`, `tags`, `content`) — enough for a governance layer to
+    record the import without re-reading the vault. `exclude_ids` skips what an
+    earlier run already took, so a re-import is idempotent.
+
+  **Publishing is opt-in.** Only a document whose frontmatter explicitly says
+  `published` or `approved` gets published. Everything else is held as a draft,
+  including a document that states no status at all — saying nothing is not
+  consent. A vault of hand-authored notes carries no governance state, and
+  importing it should not decide on the author's behalf that every note is fit to
+  serve to an AI. Held is recoverable, since you can approve what belongs;
+  published-by-default is not, because the exposure has already happened by the
+  time anyone reviews it. A held document is stamped with an explicit
+  `status: draft` rather than left implied, so a file read outside the engine is
+  never ambiguous — except where the author already stated `pending_review` or
+  `rejected`, which is theirs to keep.
+
+  The metadata stamp now rides along with the publish write through a new
+  `frontmatter` hook on `publishDocuments`, so it costs no pass of its own.
+
+  Two supporting pieces:
+
+  - `parser.explicitStatus(node)` returns the status the author actually wrote, or
+    `null`. `parseDocument` defaults a missing `status` to `draft`, so
+    `frontmatter.status` cannot tell a deliberate draft from a status-less
+    hand-authored note. Import needs that distinction: a status-less file is fair
+    game to publish, an explicit `draft` or `pending_review` must stay
+    unpublished. Aliases are normalized first, so an import cannot slip a
+    not-yet-approved document past the hold by spelling its status differently.
+  - `storage.writeVaultFile(relPath, content)` writes a file into the vault
+    verbatim under a path-traversal guard, parsing nothing.
+
+### Patch Changes
+
+- 6147ce4: Read the whole-vault crawls in parallel batches instead of one file at a time.
+
+  `discoverDocuments`, `findAllHistories` and the per-folder `INDEX.md` writes in
+  `regenerateIndex` each walked their files with an `await` inside a loop. On a
+  local disk that is free; on a network-backed vault mount every read is a round
+  trip, so a crawl cost one latency per file — and a bulk publish runs three such
+  crawls, which is what made importing a few hundred documents take minutes.
+
+  Batching overlaps those round trips. Ordering and error handling are unchanged:
+  documents still come back sorted by id, and an unreadable history is still
+  skipped and reported through `onUnreadable` exactly once.
+
+  Bulk publish already batched its per-document work through its own sliding
+  window; both now share one helper, so there is a single implementation of
+  "bounded-parallel map, preserving order". Publish keeps its own (lower) default
+  and its caller-configurable `concurrency` option — its unit is a document, each
+  costing several file operations, so the two bounds describe different amounts of
+  in-flight I/O.
+
+- c18b730: Reject titles and ids that carry no usable characters
+
+  A title of `###`, `...`, `!!!` or spaces slugifies to nothing. `context_create` already refused it, but a server that derives the id itself and calls the storage primitives directly went straight through: the document was written to `nodes/.md`, a dotfile discovery never lists, no id can address, and the next symbols-only title collided with. The write reported success and left a document nobody could open or delete.
+
+  - `assertSafeDocumentId` — which `normalizeDocumentId`, `publishDocuments` and the update path all funnel through — now rejects any path segment with no letter or number, alongside the existing `..` traversal check. The rule is `\p{L}`/`\p{N}`, not the a-z0-9 slug rule, because existing ids are read back through the same guard and a vault may legitimately hold `nodes/日本語`.
+  - `context_update` now rejects a supplied `title` with no letter or number in any script. A rename leaves the id alone, so this is the `\p{L}`/`\p{N}` rule rather than create's a-z0-9 slug rule — a document created with an explicit id may legitimately be titled `日本語`, and it stays renameable.
+
 ## 2.0.0
 
 ### Major Changes

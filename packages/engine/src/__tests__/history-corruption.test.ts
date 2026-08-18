@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import fg from "fast-glob";
+import { globFiles } from "../glob.js";
 import { NestStorage } from "../storage.js";
 import { publishDocument } from "../publish.js";
 import { CheckpointManager } from "../checkpoint.js";
@@ -180,7 +180,7 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
 
   it("keeps every keyframe and diff reachable after a refused publish", async () => {
     await buildHistory(4);
-    const artifactsBefore = await fg("nodes/.versions/victim/v*", { cwd: root });
+    const artifactsBefore = await globFiles(root, "nodes/.versions/victim/v*");
     const hashesBefore = await Promise.all(
       artifactsBefore.sort().map((f) => readFile(join(root, f), "utf-8")),
     );
@@ -192,7 +192,7 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
     );
     await publishDocument(storage, ID, { editedBy: "tester" }).catch(() => {});
 
-    const artifactsAfter = await fg("nodes/.versions/victim/v*", { cwd: root });
+    const artifactsAfter = await globFiles(root, "nodes/.versions/victim/v*");
     const hashesAfter = await Promise.all(
       artifactsAfter.sort().map((f) => readFile(join(root, f), "utf-8")),
     );
@@ -361,7 +361,7 @@ describe("history writes are durable (no torn file to begin with)", () => {
     expect(content).not.toContain("\0");
 
     // Every temp must be renamed away, not left beside the real file.
-    const strays = await fg("**/*.tmp", { cwd: root, dot: true });
+    const strays = await globFiles(root, "**/*.tmp", [], true);
     expect(strays).toEqual([]);
   });
 
@@ -379,7 +379,7 @@ describe("history writes are durable (no torn file to begin with)", () => {
     );
 
     expect(await storage.readHistory("nodes/race")).toEqual(history);
-    expect(await fg("**/*.tmp", { cwd: root, dot: true })).toEqual([]);
+    expect(await globFiles(root, "**/*.tmp", [], true)).toEqual([]);
   });
 
   it("keeps a concurrent rebuild and publish from tearing context_history.yaml", async () => {
@@ -397,7 +397,7 @@ describe("history writes are durable (no torn file to begin with)", () => {
 
     // Whichever write landed last, the file must be intact and parseable.
     expect(await storage.readCheckpointHistory()).not.toBeNull();
-    expect(await fg("**/*.tmp", { cwd: root, dot: true })).toEqual([]);
+    expect(await globFiles(root, "**/*.tmp", [], true)).toEqual([]);
   });
 
   it("hides temp files from the history crawl even mid-write", async () => {

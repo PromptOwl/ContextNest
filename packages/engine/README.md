@@ -14,6 +14,11 @@ The core engine behind [Context Nest](https://github.com/PromptOwl/ContextNest).
 npm install @promptowl/contextnest-engine
 ```
 
+**7 packages at depth 2**, down from 76. The markdown AST, glob and frontmatter dependencies were
+removed outright rather than swapped, and no install script runs. Every package is listed with its
+version and licence in
+[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
+
 ## Quickstart
 
 ```typescript
@@ -154,6 +159,61 @@ wire; in-process callers supply it, wire transports leave it undefined.
 `context_nests` is the catalog's first **registry-scoped** operation — it reads
 `~/.contextnest/config.yaml` rather than one vault, so it ignores its
 `OperationContext`.
+
+## Importing an Existing Folder
+
+`context_import` bulk-publishes in one pass — one checkpoint and one index
+regeneration for the whole batch, with failures reported per-document rather
+than aborting the rest. It takes four kinds of input:
+
+| Input | What it does |
+|---|---|
+| `documents` | New nodes synthesized from `title` + `content` |
+| `ids` | Documents already written into the vault, published as-is |
+| `files` | An existing vault's files written **verbatim** at their own relative paths |
+| `discover` | The engine scans the vault itself and decides what to publish |
+
+`files` synthesizes nothing, so the source's own frontmatter survives (`version`,
+`checksum`, custom keys a generated draft would drop) and non-document files
+travel too — `.versions/<doc>/history.yaml` included, which is what lets an
+imported version chain still reconstruct. Paths are guarded: `..` and absolute
+paths are rejected per-file rather than aborting the import.
+
+`publish: false` stages `files` without publishing them, so an upload arriving in
+several batches can stage every batch and make one final `discover` call — the
+import seals **one** checkpoint rather than one per batch.
+
+```typescript
+// Stage each batch as it arrives…
+await api.run("context_import", { files: batch, publish: false }, ctx);
+
+// …then let the engine take responsibility for the whole vault, once.
+const result = await api.run(
+  "context_import",
+  { discover: true, author: "alice", exclude_ids: alreadyImported },
+  ctx,
+);
+
+// result.documents: { id, title, version, status, tags, content } per document —
+// enough to record the import without re-reading the vault.
+// result.checkpoint: the single checkpoint sealing the batch.
+```
+
+**Publishing is opt-in.** Only a document whose frontmatter explicitly says
+`published` or `approved` is published. Everything else is held as a draft —
+including a document that states no status at all, because saying nothing is not
+consent. A vault of hand-authored notes carries no governance state, and
+importing it should not decide on the author's behalf that every note is fit to
+serve to an AI. Held is recoverable; published-by-default is not, since the
+exposure has already happened by the time anyone reviews it. A held document is
+stamped with an explicit `status: draft` so a file read outside the engine is
+never ambiguous — except where the author already wrote `pending_review` or
+`rejected`, which is theirs to keep.
+
+`exclude_ids` skips what an earlier run already took, so a re-import is
+idempotent. `parser.explicitStatus(node)` exposes the same distinction the
+importer relies on: the status the author actually wrote, or `null` where
+`parseDocument` would have defaulted to `draft`.
 
 ## Upgrading to 2.0
 
