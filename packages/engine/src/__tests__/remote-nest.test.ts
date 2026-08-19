@@ -16,6 +16,8 @@ import { fileURLToPath } from "node:url";
 import {
   connectRemoteNest,
   RemoteUnreachableError,
+  RemoteTimeoutError,
+  RemoteAuthError,
   type RemoteNestConnection,
 } from "../remote-nest.js";
 import { ContextNestError } from "../errors.js";
@@ -207,6 +209,33 @@ describe("connectRemoteNest — against a live stub server", () => {
     expect((err as Error).message).toMatch(/non-JSON/i);
   });
 
+  it("quotes the offending payload so the error is diagnosable", async () => {
+    const err = await conn.run("context_query", { query: "#x" }).catch((e) => e);
+    expect((err as Error).message).toContain("this is not json");
+  });
+
+  it("prefers structuredContent over a prose text block (community shape)", async () => {
+    const out = await conn.run<{ documents: Array<{ id: string }> }>("context_import", {});
+    expect(out.documents[0].id).toBe("nodes/a");
+  });
+
+  it("reads the error code from structuredContent when the text is prose", async () => {
+    const err = await conn.run("context_reconstruct", {}).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("DOCUMENT_NOT_FOUND");
+    expect((err as Error).message).toContain("nodes/ghost");
+  });
+
+  it("accepts structuredContent when the server sends no text mirror", async () => {
+    const out = await conn.run<{ id: string }>("context_resolve", {});
+    expect(out.id).toBe("nodes/a");
+  });
+
+  it("reports an empty payload as empty, not as unparseable text", async () => {
+    const err = await conn.run("context_versions", {}).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("INTERNAL");
+    expect((err as Error).message).toContain("empty");
+  });
+
   it("an unknown tool surfaces as an error, not a hang", async () => {
     const err = await conn.run("context_never_registered", {}).catch((e) => e);
     expect(err).toBeInstanceOf(ContextNestError);
@@ -238,14 +267,77 @@ describe("connectRemoteNest — against a live stub server", () => {
   }, 30_000);
 });
 
+describe("connectRemoteNest — HTTP auth rejection", () => {
+  // 401/403 mean the server ANSWERED. Reporting that as "unreachable" sent
+  // people hunting for a network fault while the body already said why.
+  for (const status of [401, 403]) {
+    it(`an HTTP ${status} is an auth failure, not unreachability`, async () => {
+      const srv = createHttpServer((_req, res) => {
+        res.statusCode = status;
+        res.end(JSON.stringify({ error: "Missing or invalid credentials" }));
+      });
+      await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+      const port = (srv.address() as AddressInfo).port;
+      try {
+        const err = await connectRemoteNest(
+          "team",
+          {
+            transport: "http",
+            url: `http://127.0.0.1:${port}/mcp`,
+            auth: { bearer_env: "CN_TOK" },
+          },
+          { CN_TOK: "expired-token" },
+        ).catch((e) => e);
+
+        expect(err).toBeInstanceOf(RemoteAuthError);
+        expect(err).not.toBeInstanceOf(RemoteUnreachableError);
+        expect((err as ContextNestError).code).toBe("REMOTE_AUTH_FAILED");
+        // Names the env var to re-export, and keeps the server's own words.
+        expect((err as Error).message).toContain("CN_TOK");
+        expect((err as Error).message).toContain("Missing or invalid credentials");
+      } finally {
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+      }
+    }, 20_000);
+  }
+
+  it("a non-auth HTTP status stays unreachable (exit-3 contract unchanged)", async () => {
+    const srv = createHttpServer((_req, res) => {
+      res.statusCode = 503;
+      res.end();
+    });
+    await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = (srv.address() as AddressInfo).port;
+    try {
+      const err = await connectRemoteNest(
+        "team",
+        { transport: "http", url: `http://127.0.0.1:${port}/mcp` },
+        {},
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(RemoteUnreachableError);
+      expect((err as ContextNestError).code).toBe("REMOTE_UNREACHABLE");
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  }, 20_000);
+});
+
 describe("connectRemoteNest — per-call timeout", () => {
-  it("a call exceeding timeout_ms fails as RemoteUnreachableError", async () => {
+  it("a call exceeding timeout_ms is a timeout, NOT unreachability", async () => {
     // Generous connect budget (the same timeout guards connect), tiny enough
     // that the stub's 60s-sleeping tool trips it well within the test timeout.
     const conn = await connectRemoteNest("slow", stubSpec({ timeout_ms: 4000 }), process.env);
     try {
       const err = await conn.run("context_verify", {}).catch((e) => e);
-      expect(err).toBeInstanceOf(RemoteUnreachableError);
+      // The distinction the CLI's exit-code contract rides on: connect
+      // succeeded, so the request WAS delivered — a write may have landed.
+      // Calling this "unreachable" is what made a timed-out `ctx add` look
+      // like a no-op and collide with itself on retry.
+      expect(err).toBeInstanceOf(RemoteTimeoutError);
+      expect(err).not.toBeInstanceOf(RemoteUnreachableError);
+      expect((err as ContextNestError).code).toBe("REMOTE_TIMEOUT");
+      expect((err as Error).message).toMatch(/may already have been applied/i);
+      expect((err as Error).message).toContain("context_verify");
     } finally {
       await conn.close();
     }

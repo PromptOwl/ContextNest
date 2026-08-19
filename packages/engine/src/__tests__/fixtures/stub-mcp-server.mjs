@@ -44,6 +44,31 @@ server.tool("context_list", "stub list — malformed error", {}, async () => ({
   isError: true,
 }));
 
+// Structured output in structuredContent only, with no text mirror.
+server.tool("context_resolve", "stub resolve — structuredContent only", {}, async () => ({
+  content: [],
+  structuredContent: { id: "nodes/a", title: "A" },
+}));
+
+// Nothing at all — no text, no structuredContent.
+server.tool("context_versions", "stub versions — empty payload", {}, async () => ({
+  content: [],
+}));
+
+// The contextnest-community shape: human-readable PROSE in the text block,
+// catalog payload in structuredContent. Parsing text first fails here.
+server.tool("context_import", "stub import — prose text + structuredContent", {}, async () => ({
+  content: [{ type: "text", text: "1 node(s):\n\n1. **A** [document]" }],
+  structuredContent: { documents: [{ id: "nodes/a", title: "A" }] },
+}));
+
+// Same shape on the error path: prose sentence + structured {code, message}.
+server.tool("context_reconstruct", "stub reconstruct — prose error + structured code", {}, async () => ({
+  content: [{ type: "text", text: "Node not found: nodes/ghost" }],
+  structuredContent: { code: "DOCUMENT_NOT_FOUND", message: "Node not found: nodes/ghost" },
+  isError: true,
+}));
+
 // Echo the received arguments back, to pin input passthrough.
 server.tool(
   "context_search",
