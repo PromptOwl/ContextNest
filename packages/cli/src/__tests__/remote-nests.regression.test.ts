@@ -602,6 +602,16 @@ describe("[regression] remote nests — unsupported options fail loudly", () => 
     expect(existsSync(join(serverVault, "nodes", "some-skill.md"))).toBe(false);
   });
 
+  it("ctx publish --all on a remote errors clearly instead of crashing", () => {
+    // --all leaves the path argument undefined; without a guard this reached
+    // normalizeDocumentId(undefined) and surfaced a raw TypeError.
+    const res = run(cwd, ["publish", "--all", "--vault", "farnest"]);
+    expect(res.status).toBe(1);
+    const output = res.stderr + res.stdout;
+    expect(output).toMatch(/not supported/i);
+    expect(output).not.toMatch(/Cannot read properties/i);
+  });
+
   it("a remote-side failure (missing doc) exits 1 with the typed code — never 3", () => {
     const res = run(cwd, ["read", "nodes/does-not-exist", "--raw", "--vault", "farnest"]);
     expect(res.status).toBe(1);
@@ -673,6 +683,56 @@ describe("[regression] remote nests — filter parity and ambient routing", () =
     const local = run(cwd, ["list", "--json", "--status", "active", "--vault", "local"]);
     const remote = run(cwd, ["list", "--json", "--status", "active", "--vault", "farnest"]);
     expect(remote.status, remote.stderr).toBe(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  // The flags below all change WHAT comes back rather than how it is rendered.
+  // Each one was silently dropped on the remote branch at one point, which the
+  // shape-only parity assertions above could not catch — a truncated list and a
+  // full one have the same shape.
+  it("ctx list --limit is honoured against a remote, not just locally", () => {
+    const local = run(cwd, ["list", "--json", "--limit", "1", "--vault", "local"]);
+    const remote = run(cwd, ["list", "--json", "--limit", "1", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(JSON.parse(remote.stdout)).toHaveLength(1);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("ctx list --status rejected finds retired documents on a remote", () => {
+    // Filtering client-side could never satisfy this: an unfiltered
+    // context_list already hides retired documents, so the rejected ones are
+    // gone before a local filter would see them.
+    const local = run(cwd, ["list", "--json", "--status", "rejected", "--vault", "local"]);
+    const remote = run(cwd, ["list", "--json", "--status", "rejected", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(JSON.parse(remote.stdout).length).toBeGreaterThan(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("ctx list --tag matches case-insensitively on a remote, as it does locally", () => {
+    const local = run(cwd, ["list", "--json", "--tag", "API", "--vault", "local"]);
+    const remote = run(cwd, ["list", "--json", "--tag", "API", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(JSON.parse(remote.stdout).length).toBeGreaterThan(0);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("ctx search --limit is honoured against a remote", () => {
+    const local = run(cwd, ["search", "api", "--json", "--limit", "1", "--vault", "local"]);
+    const remote = run(cwd, ["search", "api", "--json", "--limit", "1", "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(JSON.parse(remote.stdout)).toHaveLength(1);
+    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+  });
+
+  it("ctx query --include-drafts reaches the remote", () => {
+    const args = ["query", "#onboarding", "--json", "--include-drafts"];
+    const local = run(cwd, [...args, "--vault", "local"]);
+    const remote = run(cwd, [...args, "--vault", "farnest"]);
+    expect(remote.status, remote.stderr).toBe(0);
+    // nodes/onboarding-guide is a fixture DRAFT: without the flag reaching the
+    // nest it would be filtered out and both sides would differ.
+    expect(remote.stdout).toContain("nodes/onboarding-guide");
     expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
   });
 

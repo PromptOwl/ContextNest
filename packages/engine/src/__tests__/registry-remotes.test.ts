@@ -18,6 +18,7 @@ import {
   removeVault,
   setDefaultVault,
   listVaults,
+  setVaultDescription,
   readRegistry,
   getRegistryPath,
   resolveNest,
@@ -401,6 +402,45 @@ describe("registry remotes", () => {
     const v = makeVault(join(tmp, "v"));
     addVault("localone", v);
     expect(resolveVaultPath({ vaultAlias: "localone", cwd: tmp }).path).toBe(v);
+  });
+
+  // ── alias guards and default promotion, matched to addVault ───────────────
+
+  it.each(["__proto__", "constructor", "prototype"])(
+    "addRemote rejects the reserved alias %s, exactly as addVault does",
+    (alias) => {
+      expect(() => addRemote(alias, HTTP_SPEC)).toThrow(ConfigError);
+      expect(readRegistry().remotes?.[alias]).toBeUndefined();
+    },
+  );
+
+  it("addRemote promotes a new remote to default whenever no default is set", () => {
+    // Matches addVault's rule: "first entry with no default wins". An earlier
+    // stricter condition (vaults empty AND exactly one remote) made this
+    // diverge once a second remote existed.
+    // Land on a registry with one remote already present and NO default — the
+    // state left behind when a promoted alias is later removed. (addRemote
+    // first, so the registry directory exists.)
+    addRemote("first", HTTP_SPEC);
+    writeFileSync(
+      getRegistryPath(),
+      `version: 1\nremotes:\n  first:\n    transport: http\n    url: "${HTTP_SPEC.url}"\n`,
+      "utf-8",
+    );
+    expect(readRegistry().default).toBeUndefined();
+
+    addRemote("second", STDIO_SPEC);
+    expect(readRegistry().default).toBe("second");
+  });
+
+  it("setVaultDescription edits a remote's description too", () => {
+    addRemote("team", HTTP_SPEC);
+    setVaultDescription("team", "Shared team nest");
+    expect(readRegistry().remotes?.team?.description).toBe("Shared team nest");
+    expect(listVaults().find((v) => v.alias === "team")?.description).toBe("Shared team nest");
+
+    setVaultDescription("team");
+    expect(readRegistry().remotes?.team?.description).toBeUndefined();
   });
 
   // ── describeRemoteEndpoint ────────────────────────────────────────────────

@@ -163,6 +163,22 @@ export interface ContextNode {
   /** Full raw file content */
   rawContent: string;
   /**
+   * The `status` the author actually wrote, before normalization, or `null`
+   * when the frontmatter carried no `status:` key at all.
+   *
+   * `frontmatter.status` cannot answer that question: a missing status is
+   * normalized to `draft`, so an author's deliberate draft is indistinguishable
+   * from a status-less hand-authored note once parsed. Folder import needs the
+   * distinction — a status-less file is fair game to publish, an explicit
+   * `draft`/`pending_review` must be held back. Read it through
+   * `explicitStatus()`, which canonicalizes aliases.
+   *
+   * Taken from the same YAML load that produces `frontmatter`, so it sees
+   * whatever the author wrote, however they wrote it. Only `parseDocument` sets
+   * it; nodes built in memory leave it undefined.
+   */
+  authoredStatus?: string | null;
+  /**
    * Set when live file bytes differ from the last-approved canonical content
    * (bridge-function-spec Story 3.1, hootie-inbox-spec §4.2). When present,
    * `frontmatter` and `body` reflect the approved state, NOT live bytes.

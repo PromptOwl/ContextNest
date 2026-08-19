@@ -18,12 +18,12 @@ import {
   ContextNestError,
   connectRemoteNest,
   normalizeDocumentId,
+  normalizeStatus,
   resolveNest,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestConnection, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
 import {
-  filterDocList,
   listJsonEntry,
   queryJsonPayload,
   searchJsonEntry,
@@ -76,13 +76,21 @@ interface NodeSummary {
 
 export async function remoteList(
   target: RemoteTarget,
-  opts: { type?: string; status?: string; tag?: string; json?: boolean },
+  opts: { type?: string; status?: string; tag?: string; limit?: number; json?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {});
-    // Filter semantics + field selection come from doc-views.ts — the same
-    // code the local branch runs, so the two cannot drift apart on defaults.
-    const docs = filterDocList(out.documents, opts);
+    // Filters go to the NEST, exactly as they do locally. Re-deciding them here
+    // would be a second implementation of filters.ts (they drifted on tag case
+    // once already), and it cannot recover documents the nest already withheld
+    // — an unfiltered context_list hides retired docs, so a client-side
+    // `--status rejected` could only ever return nothing.
+    const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {
+      ...(opts.type ? { type: opts.type } : {}),
+      ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
+      ...(opts.tag ? { tag: opts.tag } : {}),
+      ...(opts.limit ? { limit: opts.limit } : {}),
+    });
+    const docs = out.documents;
 
     if (opts.json) {
       console.log(JSON.stringify(docs.map(listJsonEntry), null, 2));
@@ -103,9 +111,11 @@ export async function remoteList(
 export async function remoteQuery(
   target: RemoteTarget,
   selector: string,
-  opts: { json?: boolean; hops?: number; full?: boolean },
+  opts: { json?: boolean; hops?: number; full?: boolean; includeDrafts?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
+    // Same input the local branch builds: omit what wasn't asked for so the
+    // nest applies its own defaults rather than ours.
     const out = await conn.run<{
       documents: NodeSummary[];
       source_nodes?: NodeSummary[];
@@ -113,8 +123,9 @@ export async function remoteQuery(
       trace_count?: number;
     }>("context_query", {
       query: selector,
-      hops: opts.hops ?? 2,
-      full: opts.full ?? false,
+      ...(opts.hops !== undefined ? { hops: opts.hops } : {}),
+      ...(opts.full ? { full: true } : {}),
+      ...(opts.includeDrafts ? { include_drafts: true } : {}),
     });
 
     const sourceNodes = out.source_nodes ?? [];
@@ -157,10 +168,13 @@ export async function remoteQuery(
 export async function remoteSearch(
   target: RemoteTarget,
   query: string,
-  opts: { json?: boolean },
+  opts: { json?: boolean; limit?: number },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ results: NodeSummary[] }>("context_search", { query });
+    const out = await conn.run<{ results: NodeSummary[] }>("context_search", {
+      query,
+      ...(opts.limit ? { limit: opts.limit } : {}),
+    });
     if (opts.json) {
       // Field selection shared with the local branch (doc-views.ts).
       console.log(JSON.stringify(out.results.map(searchJsonEntry), null, 2));
@@ -242,14 +256,17 @@ export async function remoteVerify(
 export async function remoteHistory(
   target: RemoteTarget,
   path: string,
-  opts: { json?: boolean },
+  opts: { json?: boolean; diff?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     const out = await conn.run<{
       id: string;
       keyframe_interval: number;
       versions: Array<Record<string, unknown>>;
-    }>("context_versions", { id: normalizeDocumentId(path) });
+    }>("context_versions", {
+      id: normalizeDocumentId(path),
+      ...(opts.diff ? { include_diff: true } : {}),
+    });
 
     if (out.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${out.id}`));
@@ -357,7 +374,28 @@ export async function remoteUpdate(
   });
 }
 
-export async function remotePublish(target: RemoteTarget, path: string): Promise<void> {
+export async function remotePublish(
+  target: RemoteTarget,
+  path: string | undefined,
+  opts: { all?: boolean; message?: string } = {},
+): Promise<void> {
+  // Refuse loudly rather than crash: --all leaves `path` undefined, and the
+  // catalog's publish op takes neither a batch nor a version note.
+  if (opts.all) {
+    throw new ContextNestError(
+      `Publishing the whole nest at once is not supported against a remote nest — publish documents individually, or run against a local vault.`,
+      "NOT_IMPLEMENTED",
+    );
+  }
+  if (!path) {
+    throw new ContextNestError("Nothing to publish — pass a document path.", "VALIDATION_FAILED");
+  }
+  if (opts.message !== undefined) {
+    throw new ContextNestError(
+      "--message is not supported against a remote nest yet (the catalog's publish operation takes no version note).",
+      "NOT_IMPLEMENTED",
+    );
+  }
   await confirmRemoteWrite(target, `Publish ${normalizeDocumentId(path)} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ id: string; version: number; checkpoint: number }>(

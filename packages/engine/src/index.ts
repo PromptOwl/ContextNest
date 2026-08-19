@@ -162,6 +162,7 @@ export {
   stripTagPrefix,
   getChecksumContent,
   normalizeStatus,
+  explicitStatus,
   isDraft,
   isPendingReview,
   isApproved,

@@ -10,6 +10,8 @@
 
 MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **35 tools** over stdio transport.
 
+> **New in 2.1** — the server now installs **zero dependencies**, down from 97 packages at depth 11. `context_import` also gained the whole folder-import flow, so an existing folder of markdown can be imported in one call.
+>
 > **New in 2.0** — sixteen canonical `context_*` tools are generated straight from the engine's operation catalog, so this server, the `ctx` CLI and the PromptOwl cloud now advertise the same names, schemas and error codes. The older tools still work and are marked deprecated. See [Upgrading to 2.0](#upgrading-to-20).
 
 ## Install
@@ -25,6 +27,12 @@ Or install globally:
 ```bash
 npm install -g @promptowl/contextnest-mcp-server
 ```
+
+**Zero dependencies, no install scripts.** Everything the server needs is compiled into the
+published bundle, so the install pulls one package and executes none of our code. A stdio server
+never touches the SDK's express, hono, ajv or jose transports, and they are no longer shipped. Every
+bundled package is listed with its version and licence in
+[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
 
 ## Usage
 

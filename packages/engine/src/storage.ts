@@ -4,9 +4,9 @@
  */
 
 import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
-import { join, dirname, basename } from "node:path";
-import fg from "fast-glob";
+import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
+import { globFiles } from "./glob.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
@@ -43,7 +43,6 @@ import {
 
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
-
 
 /**
  * Normalize a user-supplied document path/slug into a canonical document id.
@@ -234,25 +233,19 @@ export class NestStorage {
       patterns = ["**/*.md"];
     }
 
-    const files = await fg(patterns, {
-      cwd: this.root,
-      ignore: [
-        "**/node_modules/**",
-        "**/.versions/**",
-        "**/.context/**",
-        "**/INDEX.md",
-        "CONTEXT.md",
-        "context.yaml",
-        // Agent-config / scaffold files are not knowledge nodes.
-        "**/CLAUDE.md",
-        "**/GEMINI.md",
-        "**/AGENTS.md",
-        "**/README.md",
-      ],
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const files = await globFiles(this.root, patterns, [
+      "**/node_modules/**",
+      "**/.versions/**",
+      "**/.context/**",
+      "**/INDEX.md",
+      "CONTEXT.md",
+      "context.yaml",
+      // Agent-config / scaffold files are not knowledge nodes.
+      "**/CLAUDE.md",
+      "**/GEMINI.md",
+      "**/AGENTS.md",
+      "**/README.md",
+    ]);
 
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
@@ -564,6 +557,39 @@ export class NestStorage {
       }
       throw err;
     }
+  }
+
+  /**
+   * Write a file into the vault VERBATIM at a caller-given relative path.
+   *
+   * For ingesting an existing vault — a folder or archive a user is importing.
+   * Those bytes must land exactly as they arrived: the frontmatter is the
+   * source's own (`version`, `checksum`, custom keys a synthesized draft would
+   * drop), and not every file is a document — `.versions/<doc>/history.yaml`
+   * is what makes an imported version chain reconstruct at all. So this writes
+   * what it is given and parses nothing.
+   *
+   * Path safety is the whole risk surface here, since the path comes from
+   * outside: `..` and absolute paths are rejected so an import cannot write
+   * outside the vault root.
+   */
+  async writeVaultFile(relPath: string, content: string): Promise<void> {
+    const segments = String(relPath ?? "")
+      .split(/[/\\]/)
+      .filter(Boolean);
+    if (
+      segments.length === 0 ||
+      isAbsolute(relPath) ||
+      segments.some((seg) => seg === "..")
+    ) {
+      throw new ContextNestError(
+        `Invalid vault file path "${relPath}": must be a relative path inside the vault.`,
+        "INVALID_DOCUMENT_ID",
+      );
+    }
+    const filePath = join(this.root, ...segments);
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, content, "utf-8");
   }
 
   /**
@@ -1079,9 +1105,8 @@ export class NestStorage {
   /** List all suggestion IDs staged for a document, sorted by file name. */
   async listSuggestionIds(docId: string): Promise<string[]> {
     const dir = this.suggestionDir(docId);
-    const files = await fg("*.meta.yaml", { cwd: dir, dot: false }).catch(
-      () => [] as string[],
-    );
+    // A missing suggestions directory yields no matches rather than throwing.
+    const files = await globFiles(dir, "*.meta.yaml");
     return files
       .map((f) => f.replace(/\.meta\.yaml$/, ""))
       .sort();
@@ -1190,12 +1215,7 @@ export class NestStorage {
    * Read all packs from packs/ directory (§3).
    */
   async readPacks(): Promise<Pack[]> {
-    const packFiles = await fg("packs/**/*.yml", {
-      cwd: this.root,
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const packFiles = await globFiles(this.root, "packs/**/*.yml");
     const packs: Pack[] = [];
     for (const file of packFiles.sort()) {
       const content = await readFile(join(this.root, file), "utf-8");
@@ -1250,13 +1270,10 @@ export class NestStorage {
   async findAllHistories(
     onUnreadable?: (docId: string, reason: string) => void,
   ): Promise<Map<string, DocumentHistory>> {
-    const historyFiles = await fg("**/.versions/*/history.yaml", {
-      cwd: this.root,
-      dot: true,
-      // Skip unreadable directories instead of crashing checkpoint rebuild
-      // on a single permission-denied dir under the vault root.
-      suppressErrors: true,
-    });
+    const historyFiles = await globFiles(
+      this.root,
+      "**/.versions/*/history.yaml",
+    );
 
     // Read in batches, then fold in input order so the map's iteration order
     // (and the order `onUnreadable` fires) stays what a serial crawl produced.
