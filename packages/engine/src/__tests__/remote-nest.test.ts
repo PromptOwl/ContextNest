@@ -224,10 +224,19 @@ describe("connectRemoteNest — against a live stub server", () => {
     expect((err as Error).message).toContain("plain text failure");
   });
 
-  it("rejects a non-JSON SUCCESS payload as INTERNAL (not a ContextNest endpoint)", async () => {
+  it("rejects a non-JSON SUCCESS payload as INTERNAL, naming the tools the remote does expose", async () => {
     const err = await conn.run("context_query", { query: "#x" }).catch((e) => e);
     expect((err as ContextNestError).code).toBe("INTERNAL");
-    expect((err as Error).message).toMatch(/non-JSON/i);
+    // Blames the CONTRACT, not the endpoint's identity: the server answered,
+    // it just speaks prose. The diagnostic names what it advertises instead.
+    const message = (err as Error).message;
+    expect(message).toMatch(/prose, not the JSON operation catalog/i);
+    expect(message).toMatch(/advertises \d+ tools: /);
+    expect(message).toContain("context_overview");
+    // Lazy + memoized: one listTools round trip, cached — same Set instance.
+    const names = await conn.toolNames();
+    expect(names.has("context_verify")).toBe(true);
+    expect(await conn.toolNames()).toBe(names);
   });
 
   it("an unknown tool surfaces as an error, not a hang", async () => {
