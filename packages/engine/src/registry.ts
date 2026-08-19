@@ -359,14 +359,9 @@ export function addRemote(
   spec: RemoteNestSpec,
   opts: AddRemoteOptions = {},
 ): VaultRegistry {
-  if (!alias.trim()) {
-    throw new ConfigError("Vault alias must not be empty");
-  }
-  if (!ALIAS_PATTERN.test(alias)) {
-    throw new ConfigError(
-      `Vault alias "${alias}" is invalid — use only letters, digits, hyphens, or underscores.`,
-    );
-  }
+  // Same guard as addVault: ALIAS_PATTERN alone matches "__proto__", and the
+  // reserved-alias check is what keeps it out of the registry maps.
+  assertSafeAlias(alias);
   const parsed = remoteNestSpecSchema.safeParse(spec);
   if (!parsed.success) {
     const messages = parsed.error.issues.map((i) => i.message);
@@ -385,15 +380,10 @@ export function addRemote(
     );
   }
   registry.remotes = { ...(registry.remotes ?? {}), [alias]: parsed.data };
-  // Same promotion rule as addVault: a brand-new entry becomes the default only
-  // when nothing else is registered yet, or when explicitly requested.
-  if (
-    opts.setDefault ||
-    (isNew &&
-      !registry.default &&
-      Object.keys(registry.vaults).length === 0 &&
-      Object.keys(registry.remotes).length === 1)
-  ) {
+  // Same promotion rule as addVault, to the letter: a brand-new entry takes the
+  // default only when none is set. A --force update of an existing alias must
+  // not silently grab it.
+  if (opts.setDefault || (isNew && !registry.default)) {
     registry.default = alias;
   }
   writeRegistry(registry);
@@ -446,7 +436,9 @@ export function setDefaultVault(alias: string): VaultRegistry {
 export function setVaultDescription(alias: string, description?: string): VaultRegistry {
   assertSafeAlias(alias);
   const registry = readRegistry();
-  const entry = registry.vaults[alias];
+  // Either kind: a remote's description is as editable as a local vault's.
+  const entry: { description?: string } | undefined =
+    registry.vaults[alias] ?? registry.remotes?.[alias];
   if (!entry) {
     throw new ConfigError(`No vault registered under alias "${alias}".`);
   }

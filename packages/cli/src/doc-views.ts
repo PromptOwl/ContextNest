@@ -4,15 +4,13 @@
  *
  * The local branches (index.ts) work on engine `ContextNode`s and the remote
  * branches (remote.ts) on catalog summaries — each maps its native objects
- * into these views, then filtering, field selection, and `--json` shapes are
- * SINGLE-SOURCED here. The local/remote parity regression suite verifies the
- * mapping; this module is what makes the shared semantics impossible to
- * change in one branch without the other.
+ * into these views, and the field selection behind every `--json` shape is
+ * SINGLE-SOURCED here. Filtering is not: both branches hand their filters to
+ * the nest that owns the documents. The local/remote parity regression suite
+ * verifies both halves.
  */
 
-import { normalizeStatus } from "@promptowl/contextnest-engine";
-
-/** The fields `ctx list` filtering and output need, regardless of source. */
+/** The fields `ctx list` output needs, regardless of source. */
 export interface DocListView {
   id: string;
   title: string;
@@ -22,28 +20,12 @@ export interface DocListView {
 }
 
 /**
- * `ctx list` filter semantics: type filter (default "document"), status
- * filter with alias normalization, tag filter with # auto-prefix, and the
- * default rejected-hidden rule when no status is requested.
+ * NOTE: filtering deliberately does NOT live here. Both branches send their
+ * filters to the nest that owns the documents (locally the engine's
+ * filters.ts, remotely the same code behind context_list), because a
+ * client-side copy of those rules drifts — and cannot recover documents the
+ * nest already withheld. Only field selection is shared here.
  */
-export function filterDocList<T extends DocListView>(
-  docs: T[],
-  opts: { type?: string; status?: string; tag?: string },
-): T[] {
-  let out = docs;
-  if (opts.type) out = out.filter((d) => (d.type || "document") === opts.type);
-  if (opts.status) {
-    const wanted = normalizeStatus(opts.status);
-    out = out.filter((d) => (d.status || "draft") === wanted);
-  } else {
-    out = out.filter((d) => d.status !== "rejected");
-  }
-  if (opts.tag) {
-    const normalizedTag = opts.tag.startsWith("#") ? opts.tag : `#${opts.tag}`;
-    out = out.filter((d) => d.tags?.includes(normalizedTag));
-  }
-  return out;
-}
 
 /** One entry of `ctx list --json`. */
 export function listJsonEntry(d: DocListView) {

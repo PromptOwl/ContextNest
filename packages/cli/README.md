@@ -12,6 +12,8 @@
 
 Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) — turn scattered knowledge into a structured, queryable brain your AI agents can use. Same instinct as the Obsidian-brain pattern, but with typed graph structure, ~100× cheaper queries (~500 tokens vs 50k), a sharing path, and governed change history when you need it.
 
+> **New in 2.1** — no command writes to your working directory without saying so: `--dry-run` on every write command, an action log of what changed, and confirmation prompts on the destructive ones. See [File safety](#file-safety). The install also drops from 104 packages to 2.
+>
 > **New in 2.0** — `ctx` now runs on the engine's shared operation catalog, so the CLI, the MCP server and the PromptOwl cloud all execute the same code for the same action. New: `ctx info`, `ctx publish --all`, `ctx vault describe`, `ctx history --diff`, `--limit` on `list` and `search`. See [Upgrading to 2.0](#upgrading-to-20).
 
 ## Install
@@ -19,6 +21,18 @@ Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) �
 ```bash
 npm install -g @promptowl/contextnest-cli
 ```
+
+**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install.
+For a lean install without terminal colour:
+
+```bash
+npm install -g @promptowl/contextnest-cli --omit=optional
+```
+
+That leaves exactly one package, with every command, flag and output format unchanged. The rest of
+the code is compiled into the published bundle rather than resolved from npm, so the install is
+deterministic — and every bundled package is listed with its version and licence in
+[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
 
 ## Quick Start
 
