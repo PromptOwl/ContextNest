@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 7 | 2 | 7 |
+| `@promptowl/contextnest-engine` | 96 | 11 | 96 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,18 +48,107 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 8 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@promptowl/contextnest-engine` | 2.1.0 | AGPL-3.0 |
+| `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
 | `diff` | 9.0.0 | BSD-3-Clause |
 | `js-yaml` | 4.2.0 | MIT |
 | `minisearch` | 7.2.0 | MIT |
 | `toposort` | 2.0.2 | MIT |
 | `zod` | 3.25.76 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
+| `@hono/node-server` | 1.19.14 | MIT |
+| `ajv` | 8.18.0 | MIT |
+| `ajv-formats` | 3.0.1 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
+| `content-type` | 1.0.5 | MIT |
+| `cors` | 2.8.6 | MIT |
+| `cross-spawn` | 7.0.6 | MIT |
+| `eventsource` | 3.0.7 | MIT |
+| `eventsource-parser` | 3.0.6 | MIT |
+| `express` | 5.2.1 | MIT |
+| `express-rate-limit` | 8.4.1 | MIT |
+| `hono` | 4.12.16 | MIT |
+| `jose` | 6.1.3 | MIT |
+| `json-schema-typed` | 8.0.2 | BSD-2-Clause |
+| `pkce-challenge` | 5.0.1 | MIT |
+| `raw-body` | 3.0.2 | MIT |
+| `accepts` | 2.0.0 | MIT |
+| `body-parser` | 2.2.2 | MIT |
+| `content-disposition` | 1.0.1 | MIT |
+| `cookie` | 0.7.2 | MIT |
+| `cookie-signature` | 1.2.2 | MIT |
+| `debug` | 4.4.3 | MIT |
+| `depd` | 2.0.0 | MIT |
+| `encodeurl` | 2.0.0 | MIT |
+| `escape-html` | 1.0.3 | MIT |
+| `etag` | 1.8.1 | MIT |
+| `fast-deep-equal` | 3.1.3 | MIT |
+| `fast-uri` | 3.1.0 | BSD-3-Clause |
+| `finalhandler` | 2.1.1 | MIT |
+| `fresh` | 2.0.0 | MIT |
+| `http-errors` | 2.0.1 | MIT |
+| `ip-address` | 10.1.0 | MIT |
+| `json-schema-traverse` | 1.0.0 | MIT |
+| `merge-descriptors` | 2.0.0 | MIT |
+| `mime-types` | 3.0.2 | MIT |
+| `object-assign` | 4.1.1 | MIT |
+| `on-finished` | 2.4.1 | MIT |
+| `once` | 1.4.0 | ISC |
+| `parseurl` | 1.3.3 | MIT |
+| `path-key` | 3.1.1 | MIT |
+| `proxy-addr` | 2.0.7 | MIT |
+| `qs` | 6.15.0 | BSD-3-Clause |
+| `range-parser` | 1.2.1 | MIT |
+| `require-from-string` | 2.0.2 | MIT |
+| `router` | 2.2.0 | MIT |
+| `send` | 1.2.1 | MIT |
+| `serve-static` | 2.2.1 | MIT |
+| `shebang-command` | 2.0.0 | MIT |
+| `statuses` | 2.0.2 | MIT |
+| `type-is` | 2.0.1 | MIT |
+| `vary` | 1.1.2 | MIT |
+| `which` | 2.0.2 | ISC |
+| `bytes` | 3.1.2 | MIT |
+| `forwarded` | 0.2.0 | MIT |
+| `iconv-lite` | 0.7.2 | MIT |
+| `ipaddr.js` | 1.9.1 | MIT |
+| `is-promise` | 4.0.0 | MIT |
+| `isexe` | 2.0.0 | ISC |
+| `ms` | 2.1.3 | MIT |
+| `negotiator` | 1.0.0 | MIT |
+| `path-to-regexp` | 8.4.2 | MIT |
+| `shebang-regex` | 3.0.0 | MIT |
+| `wrappy` | 1.0.2 | ISC |
+| `ee-first` | 1.1.1 | MIT |
+| `inherits` | 2.0.4 | ISC |
+| `media-typer` | 1.1.0 | MIT |
+| `mime-db` | 1.54.0 | MIT |
+| `safer-buffer` | 2.1.2 | MIT |
+| `setprototypeof` | 1.2.0 | ISC |
+| `side-channel` | 1.1.0 | MIT |
+| `toidentifier` | 1.0.1 | MIT |
+| `unpipe` | 1.0.0 | MIT |
+| `es-errors` | 1.3.0 | MIT |
+| `object-inspect` | 1.13.4 | MIT |
+| `side-channel-list` | 1.0.0 | MIT |
+| `side-channel-map` | 1.0.1 | MIT |
+| `side-channel-weakmap` | 1.0.2 | MIT |
+| `call-bound` | 1.0.4 | MIT |
+| `get-intrinsic` | 1.3.0 | MIT |
+| `call-bind-apply-helpers` | 1.0.2 | MIT |
+| `es-define-property` | 1.0.1 | MIT |
+| `es-object-atoms` | 1.1.1 | MIT |
+| `function-bind` | 1.1.2 | MIT |
+| `get-proto` | 1.0.1 | MIT |
+| `gopd` | 1.2.0 | MIT |
+| `has-symbols` | 1.1.0 | MIT |
+| `hasown` | 2.0.2 | MIT |
+| `math-intrinsics` | 1.1.0 | MIT |
+| `dunder-proto` | 1.0.1 | MIT |
 
 ## `@promptowl/contextnest-engine`
 
@@ -67,6 +156,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 
 | Package | Version | Licence | Required | Why |
 | --- | --- | --- | --- | --- |
+| `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
 | `js-yaml` | 4.2.0 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
@@ -78,7 +168,95 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 
 | Package | Version | Licence | Depth | Pulled in by |
 | --- | --- | --- | --- | --- |
+| `@hono/node-server` | 1.19.14 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `ajv` | 8.18.0 | MIT | 2 | `@modelcontextprotocol/sdk`, `ajv-formats` |
+| `ajv-formats` | 3.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `argparse` | 2.0.1 | Python-2.0 | 2 | `js-yaml` |
+| `content-type` | 1.0.5 | MIT | 2 | `@modelcontextprotocol/sdk`, `body-parser`, `express`, `type-is` |
+| `cors` | 2.8.6 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `cross-spawn` | 7.0.6 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `eventsource` | 3.0.7 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `eventsource-parser` | 3.0.6 | MIT | 2 | `@modelcontextprotocol/sdk`, `eventsource` |
+| `express` | 5.2.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `express-rate-limit` | 8.4.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `hono` | 4.12.16 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `jose` | 6.1.3 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `json-schema-typed` | 8.0.2 | BSD-2-Clause | 2 | `@modelcontextprotocol/sdk` |
+| `pkce-challenge` | 5.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `raw-body` | 3.0.2 | MIT | 2 | `@modelcontextprotocol/sdk`, `body-parser` |
+| `accepts` | 2.0.0 | MIT | 3 | `express` |
+| `body-parser` | 2.2.2 | MIT | 3 | `express` |
+| `content-disposition` | 1.0.1 | MIT | 3 | `express` |
+| `cookie` | 0.7.2 | MIT | 3 | `express` |
+| `cookie-signature` | 1.2.2 | MIT | 3 | `express` |
+| `debug` | 4.4.3 | MIT | 3 | `body-parser`, `express`, `finalhandler`, `router`, `send` |
+| `depd` | 2.0.0 | MIT | 3 | `express`, `http-errors`, `router` |
+| `encodeurl` | 2.0.0 | MIT | 3 | `express`, `finalhandler`, `send`, `serve-static` |
+| `escape-html` | 1.0.3 | MIT | 3 | `express`, `finalhandler`, `send`, `serve-static` |
+| `etag` | 1.8.1 | MIT | 3 | `express`, `send` |
+| `fast-deep-equal` | 3.1.3 | MIT | 3 | `ajv` |
+| `fast-uri` | 3.1.0 | BSD-3-Clause | 3 | `ajv` |
+| `finalhandler` | 2.1.1 | MIT | 3 | `express` |
+| `fresh` | 2.0.0 | MIT | 3 | `express`, `send` |
+| `http-errors` | 2.0.1 | MIT | 3 | `body-parser`, `express`, `raw-body`, `send` |
+| `ip-address` | 10.1.0 | MIT | 3 | `express-rate-limit` |
+| `json-schema-traverse` | 1.0.0 | MIT | 3 | `ajv` |
+| `merge-descriptors` | 2.0.0 | MIT | 3 | `express` |
+| `mime-types` | 3.0.2 | MIT | 3 | `accepts`, `express`, `send`, `type-is` |
+| `object-assign` | 4.1.1 | MIT | 3 | `cors` |
+| `on-finished` | 2.4.1 | MIT | 3 | `body-parser`, `express`, `finalhandler`, `send` |
+| `once` | 1.4.0 | ISC | 3 | `express` |
+| `parseurl` | 1.3.3 | MIT | 3 | `express`, `finalhandler`, `router`, `serve-static` |
+| `path-key` | 3.1.1 | MIT | 3 | `cross-spawn` |
+| `proxy-addr` | 2.0.7 | MIT | 3 | `express` |
+| `qs` | 6.15.0 | BSD-3-Clause | 3 | `body-parser`, `express` |
+| `range-parser` | 1.2.1 | MIT | 3 | `express`, `send` |
+| `require-from-string` | 2.0.2 | MIT | 3 | `ajv` |
+| `router` | 2.2.0 | MIT | 3 | `express` |
+| `send` | 1.2.1 | MIT | 3 | `express`, `serve-static` |
+| `serve-static` | 2.2.1 | MIT | 3 | `express` |
+| `shebang-command` | 2.0.0 | MIT | 3 | `cross-spawn` |
+| `statuses` | 2.0.2 | MIT | 3 | `express`, `finalhandler`, `http-errors`, `send` |
+| `type-is` | 2.0.1 | MIT | 3 | `body-parser`, `express` |
+| `vary` | 1.1.2 | MIT | 3 | `cors`, `express` |
+| `which` | 2.0.2 | ISC | 3 | `cross-spawn` |
+| `bytes` | 3.1.2 | MIT | 4 | `body-parser`, `raw-body` |
+| `forwarded` | 0.2.0 | MIT | 4 | `proxy-addr` |
+| `iconv-lite` | 0.7.2 | MIT | 4 | `body-parser`, `raw-body` |
+| `ipaddr.js` | 1.9.1 | MIT | 4 | `proxy-addr` |
+| `is-promise` | 4.0.0 | MIT | 4 | `router` |
+| `isexe` | 2.0.0 | ISC | 4 | `which` |
+| `ms` | 2.1.3 | MIT | 4 | `debug`, `send` |
+| `negotiator` | 1.0.0 | MIT | 4 | `accepts` |
+| `path-to-regexp` | 8.4.2 | MIT | 4 | `router` |
+| `shebang-regex` | 3.0.0 | MIT | 4 | `shebang-command` |
+| `wrappy` | 1.0.2 | ISC | 4 | `once` |
+| `ee-first` | 1.1.1 | MIT | 5 | `on-finished` |
+| `inherits` | 2.0.4 | ISC | 5 | `http-errors` |
+| `media-typer` | 1.1.0 | MIT | 5 | `type-is` |
+| `mime-db` | 1.54.0 | MIT | 5 | `mime-types` |
+| `safer-buffer` | 2.1.2 | MIT | 5 | `iconv-lite` |
+| `setprototypeof` | 1.2.0 | ISC | 5 | `http-errors` |
+| `side-channel` | 1.1.0 | MIT | 5 | `qs` |
+| `toidentifier` | 1.0.1 | MIT | 5 | `http-errors` |
+| `unpipe` | 1.0.0 | MIT | 5 | `raw-body` |
+| `es-errors` | 1.3.0 | MIT | 6 | `call-bind-apply-helpers`, `dunder-proto`, `es-object-atoms`, `get-intrinsic`, `side-channel`, `side-channel-list`, `side-channel-map`, `side-channel-weakmap` |
+| `object-inspect` | 1.13.4 | MIT | 6 | `side-channel`, `side-channel-list`, `side-channel-map`, `side-channel-weakmap` |
+| `side-channel-list` | 1.0.0 | MIT | 6 | `side-channel` |
+| `side-channel-map` | 1.0.1 | MIT | 6 | `side-channel`, `side-channel-weakmap` |
+| `side-channel-weakmap` | 1.0.2 | MIT | 6 | `side-channel` |
+| `call-bound` | 1.0.4 | MIT | 7 | `side-channel-map`, `side-channel-weakmap` |
+| `get-intrinsic` | 1.3.0 | MIT | 7 | `call-bound`, `side-channel-map`, `side-channel-weakmap` |
+| `call-bind-apply-helpers` | 1.0.2 | MIT | 8 | `call-bound`, `dunder-proto`, `get-intrinsic` |
+| `es-define-property` | 1.0.1 | MIT | 9 | `get-intrinsic` |
+| `es-object-atoms` | 1.1.1 | MIT | 9 | `get-intrinsic`, `get-proto` |
+| `function-bind` | 1.1.2 | MIT | 9 | `call-bind-apply-helpers`, `get-intrinsic`, `hasown` |
+| `get-proto` | 1.0.1 | MIT | 9 | `get-intrinsic` |
+| `gopd` | 1.2.0 | MIT | 9 | `dunder-proto`, `get-intrinsic` |
+| `has-symbols` | 1.1.0 | MIT | 9 | `get-intrinsic` |
+| `hasown` | 2.0.2 | MIT | 9 | `get-intrinsic` |
+| `math-intrinsics` | 1.1.0 | MIT | 9 | `get-intrinsic` |
+| `dunder-proto` | 1.0.1 | MIT | 10 | `get-proto` |
 
 ### Bundled into `dist/` at build time
 
@@ -123,7 +301,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
 | `toposort` | 2.0.2 | MIT |
-| `zod-to-json-schema` | 3.25.1 | ISC |
+| `zod-to-json-schema` | 3.25.2 | ISC |
 | `accepts` | 2.0.0 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
 | `body-parser` | 2.2.2 | MIT |
