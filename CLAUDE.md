@@ -87,7 +87,9 @@ Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (
 
 **Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
 
-Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retrieval, `Stop` → loop-safe capture gate.
+Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retrieval **and dispatch of any parked job**, `Stop` → capture gate.
+
+**The Stop hook never blocks.** It used to return `decision: "block"`, which held the turn open while a subagent ran. It now parks `{kind, reason, turn}` in the session ledger and returns only a `systemMessage`; the next `UserPromptSubmit` drains the queue and hands the directive over as `additionalContext` (the field the model acts on — Stop's own `additionalContext` is transcript metadata it does not act on). `contextnest-capture` and `contextnest-curator` are `background: true` so the dispatched work overlaps the user's next request. Note `saveLedger` writes an explicit key projection: a new ledger field must be added to the `EMPTY` sentinel, the `loadLedger` projection **and** the `saveLedger` stringify, or it is dropped silently.
 
 ## Key Concepts
 

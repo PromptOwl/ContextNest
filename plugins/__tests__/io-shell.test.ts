@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,23 +91,71 @@ describe("capture-gate.js IO shell", () => {
     });
   });
 
-  it("explicit capture intent → Stop block naming the capture agent", () => {
-    withTranscript([userLine("remember that we use pnpm")], (tpath) => {
-      const r = runScript(core("capture-gate.js"), { transcript_path: tpath });
+  /** Read a session ledger written by the real shell under a temp HOME. */
+  function readLedger(home: string, session: string) {
+    return JSON.parse(
+      readFileSync(join(home, ".contextnest", "plugin-state", `${session}.json`), "utf-8"),
+    );
+  }
+
+  it("explicit capture intent → parks for the capture agent, never blocks", () => {
+    withTranscript([userLine("remember that we use pnpm")], (tpath, home) => {
+      const started = Date.now();
+      const r = runScript(
+        core("capture-gate.js"),
+        { transcript_path: tpath, session_id: "sess2" },
+        { HOME: home, USERPROFILE: home },
+      );
       expect(r.status).toBe(0);
       const out = JSON.parse(r.stdout);
-      expect(out.decision).toBe("block");
-      expect(out.reason).toMatch(/contextnest-capture/);
+
+      // The regression this guards: any return of `decision`/`continue` puts the
+      // user back behind a subagent at the end of every gated turn.
+      expect(out).not.toHaveProperty("decision");
+      expect(out).not.toHaveProperty("continue");
+      expect(out.systemMessage).toMatch(/queued a capture pass/);
+
+      const pending = readLedger(home, "sess2").pending;
+      expect(pending.kind).toBe("capture");
+      expect(pending.reason).toMatch(/contextnest-capture/);
+
+      // The hook only reads a transcript and writes a small JSON file. A future
+      // change that does the vault work here instead would blow past this.
+      expect(Date.now() - started).toBeLessThan(5000);
     });
   });
 
-  it("a correction → Stop block naming the curator instead", () => {
-    withTranscript([userLine("actually it's 30 seconds not 60")], (tpath) => {
-      const r = runScript(core("capture-gate.js"), { transcript_path: tpath });
+  it("a correction → parks for the curator instead", () => {
+    withTranscript([userLine("actually it's 30 seconds not 60")], (tpath, home) => {
+      const r = runScript(
+        core("capture-gate.js"),
+        { transcript_path: tpath, session_id: "sess3" },
+        { HOME: home, USERPROFILE: home },
+      );
       expect(r.status).toBe(0);
       const out = JSON.parse(r.stdout);
-      expect(out.decision).toBe("block");
-      expect(out.reason).toMatch(/contextnest-curator/);
+      expect(out).not.toHaveProperty("decision");
+      expect(out.systemMessage).toMatch(/queued a correction sweep/);
+      expect(readLedger(home, "sess3").pending.kind).toBe("change");
+    });
+  });
+
+  it("retrieve.js drains the parked job on the next prompt", () => {
+    withTranscript([userLine("actually it's 30 seconds not 60")], (tpath, home) => {
+      const env = { HOME: home, USERPROFILE: home };
+      runScript(core("capture-gate.js"), { transcript_path: tpath, session_id: "sess4" }, env);
+
+      const r = runScript(
+        core("retrieve.js"),
+        { prompt: "carry on", session_id: "sess4" },
+        // `off` skips retrieval entirely — the queue must still drain.
+        { ...env, CONTEXTNEST_RETRIEVAL_MODE: "off" },
+      );
+      expect(r.status).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
+      expect(out.hookSpecificOutput.additionalContext).toMatch(/contextnest-curator/);
+      expect(readLedger(home, "sess4").pending).toBeNull();
     });
   });
 

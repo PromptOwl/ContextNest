@@ -8,8 +8,14 @@
  *            those tags (1 hop); inject distilled documents + source nodes.
  *   agent  → inject a directive telling the model to invoke the retriever agent.
  *
- * Pure core: run({input, env, exec}) returns the hook output object (or null for
- * "inject nothing"). The IO shell at the bottom does stdin/stdout.
+ * It also drains the work queue. The Stop hook parks capture/correction jobs in
+ * the session ledger rather than blocking the turn, and this is the single place
+ * they are handed to the model — as `additionalContext`, the one field the model
+ * actually acts on. That dispatch happens before every early return, so a queued
+ * job survives `retrieval_mode: off` and an empty prompt.
+ *
+ * Pure core: run({input, env, exec, ledgerIo}) returns the hook output object
+ * (or null for "inject nothing"). The IO shell at the bottom does stdin/stdout.
  */
 
 import {
@@ -23,6 +29,7 @@ import {
   MAX_HITS,
 } from "./lib.js";
 import { correctionIntent } from "./signals.js";
+import { clearPending, loadLedger } from "./ledger.js";
 
 const HEADER = "Relevant Context Nest vault material (auto-retrieved):";
 
@@ -158,27 +165,37 @@ const AGENT_DIRECTIVE = [
 ].join(" ");
 
 /**
- * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function}} ctx
+ * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function, ledgerIo?:object}} ctx
  * @returns {object|null} hook output, or null to inject nothing.
  */
-export function run({ input, env, exec }) {
+export function run({ input, env, exec, ledgerIo = {} }) {
   const config = getConfig(env);
   const mode = config.retrievalMode;
-  if (mode === "off") return null;
+
+  // Drain the queue FIRST — before any early return. The Stop hook parks work
+  // instead of blocking the turn, and this is the only place it gets handed to
+  // the model, so a job must survive `retrieval_mode: off` and an empty prompt.
+  // Draining is unconditional: handed over once, never re-offered.
+  const sessionId = input?.session_id;
+  const ledger = loadLedger(sessionId, ledgerIo);
+  const queued = ledger.pending?.reason || null;
+  if (queued) clearPending(sessionId, ledger, ledgerIo);
+
+  if (mode === "off") return queued ? wrap(queued) : null;
 
   const query = promptText(input);
   // A correction gets the sweep rule even when retrieval finds nothing: search
   // is ranked and published-only, so "no hits" is not evidence the vault is
   // silent on the subject. Only correction-shaped prompts reach this.
   const ladder = correctionIntent(query) ? CHANGE_LADDER : null;
-  const join = (block) => [block, ladder].filter(Boolean).join("\n\n");
+  const join = (block) => [queued, block, ladder].filter(Boolean).join("\n\n");
 
   if (mode === "agent") return wrap(join(AGENT_DIRECTIVE));
-  if (!query) return null;
+  if (!query) return queued ? wrap(queued) : null;
 
   const hits = searchAll(exec, config, query);
   const context = mode === "query" ? formatQuery(exec, config, hits) : formatSearch(hits);
-  if (!context && !ladder) return null;
+  if (!context && !ladder && !queued) return null;
   return wrap(join(context));
 }
 

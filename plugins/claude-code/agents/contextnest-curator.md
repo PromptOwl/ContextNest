@@ -1,8 +1,9 @@
 ---
 name: contextnest-curator
-description: Makes a user's correction land consistently across the whole Context Nest vault. Sweeps for every node carrying the stale fact, applies the minimum edit set behind a checkpoint, and stops to ask when the change is structural. Invoked by the Stop hook when the user corrects something.
+description: Makes a user's correction land consistently across the whole Context Nest vault. Sweeps for every node carrying the stale fact, applies the minimum edit set, and stops to ask when the change is structural. Queued by the Stop hook and dispatched on the next prompt; runs in the background so the user never waits on it.
 tools: Bash, Read
 model: sonnet
+background: true
 ---
 
 <!-- BEGIN SHARED -->

@@ -12,6 +12,7 @@ import { run as sessionStart } from "../shared/core/session-start.js";
 import {
   run as captureGate,
   captureSignal,
+  CHANGE_REASON,
   isSubstantive,
 } from "../shared/core/capture-gate.js";
 import {
@@ -21,8 +22,10 @@ import {
   lastUserMessage,
 } from "../shared/core/signals.js";
 import {
+  clearPending,
   inCooldown,
   loadLedger,
+  parkJob,
   saveLedger,
   sessionFileName,
 } from "../shared/core/ledger.js";
@@ -620,33 +623,59 @@ describe("ledger", () => {
   it("round-trips through save → load", () => {
     const io = fakeLedgerIo();
     expect(saveLedger("sess1", { lastGatedTurn: 7, captured: ["a"] }, io)).toBe(true);
-    expect(loadLedger("sess1", io)).toEqual({ lastGatedTurn: 7, captured: ["a"] });
+    expect(loadLedger("sess1", io)).toEqual({ lastGatedTurn: 7, captured: ["a"], pending: null });
+  });
+
+  it("parks and clears a pending job without losing the rest of the ledger", () => {
+    const io = fakeLedgerIo();
+    saveLedger("s", { lastGatedTurn: 3, captured: ["keep me"] }, io);
+    const job = { kind: "change", reason: "sweep it", turn: 4 };
+
+    parkJob("s", loadLedger("s", io), job, io);
+    const parked = loadLedger("s", io);
+    expect(parked.pending).toEqual(job);
+    // saveLedger writes an explicit projection, so this is the regression guard
+    // against a new field silently dropping the existing ones.
+    expect(parked.lastGatedTurn).toBe(3);
+    expect(parked.captured).toEqual(["keep me"]);
+
+    clearPending("s", parked, io);
+    expect(loadLedger("s", io).pending).toBeNull();
+    expect(loadLedger("s", io).lastGatedTurn).toBe(3);
+  });
+
+  it("a malformed pending job reads back as no job, not as a throw", () => {
+    const io = fakeLedgerIo();
+    for (const bad of [{ kind: "nonsense", reason: "x", turn: 1 }, { kind: "capture" }, "str", 7]) {
+      saveLedger("s", { lastGatedTurn: 1, pending: bad }, io);
+      expect(loadLedger("s", io).pending, JSON.stringify(bad)).toBeNull();
+    }
   });
 
   it("an unusable session id persists nothing and loads empty", () => {
     const io = fakeLedgerIo();
     expect(saveLedger("../evil", { lastGatedTurn: 1 }, io)).toBe(false);
     expect(Object.keys(io.files)).toHaveLength(0);
-    expect(loadLedger("../evil", io)).toEqual({ lastGatedTurn: null, captured: [] });
+    expect(loadLedger("../evil", io)).toEqual({ lastGatedTurn: null, captured: [], pending: null });
   });
 
   it("a missing or malformed file degrades to empty rather than throwing", () => {
     const io = fakeLedgerIo({ "/fake-home/.contextnest/plugin-state/bad.json": "{oops" });
-    expect(loadLedger("bad", io)).toEqual({ lastGatedTurn: null, captured: [] });
-    expect(loadLedger("absent", io)).toEqual({ lastGatedTurn: null, captured: [] });
+    expect(loadLedger("bad", io)).toEqual({ lastGatedTurn: null, captured: [], pending: null });
+    expect(loadLedger("absent", io)).toEqual({ lastGatedTurn: null, captured: [], pending: null });
   });
 
   it("inCooldown: the clock starts at session start, not at the first gate", () => {
     // Never gated, but only two turns in — a short session earns no ambient pass.
-    expect(inCooldown({ lastGatedTurn: null, captured: [] }, 2, 5)).toBe(true);
-    expect(inCooldown({ lastGatedTurn: null, captured: [] }, 10, 5)).toBe(false);
-    expect(inCooldown({ lastGatedTurn: 8, captured: [] }, 10, 5)).toBe(true);
-    expect(inCooldown({ lastGatedTurn: 4, captured: [] }, 10, 5)).toBe(false);
+    expect(inCooldown({ lastGatedTurn: null, captured: [], pending: null }, 2, 5)).toBe(true);
+    expect(inCooldown({ lastGatedTurn: null, captured: [], pending: null }, 10, 5)).toBe(false);
+    expect(inCooldown({ lastGatedTurn: 8, captured: [], pending: null }, 10, 5)).toBe(true);
+    expect(inCooldown({ lastGatedTurn: 4, captured: [], pending: null }, 10, 5)).toBe(false);
   });
 });
 
 describe("capture-gate", () => {
-  const noLedger = { lastGatedTurn: null, captured: [] };
+  const noLedger = { lastGatedTurn: null, captured: [], pending: null };
 
   it("allows when capture is off, via capture_mode or the legacy boolean", () => {
     for (const env of [{ CONTEXTNEST_CAPTURE_MODE: "off" }, { CONTEXTNEST_AUTO_CAPTURE: "false" }]) {
@@ -690,27 +719,61 @@ describe("capture-gate", () => {
     }
   });
 
-  it("gates on explicit capture intent and names the capture agent", () => {
+  it("never blocks the turn — it parks the job and notes it", () => {
+    const io = fakeLedgerIo();
     const out = captureGate({
       input: { transcript_path: "t", session_id: "s1" },
       env: {},
       readTranscript: tx([userLine("remember that we use pnpm")]),
-      ledgerIo: fakeLedgerIo(),
+      ledgerIo: io,
     });
-    expect(out?.decision).toBe("block");
-    expect(out?.reason).toMatch(/contextnest-capture/);
+    // The whole point: no `decision`, no `continue` — the turn ends now.
+    expect(out).not.toHaveProperty("decision");
+    expect(out).not.toHaveProperty("continue");
+    expect(out?.systemMessage).toMatch(/queued a capture pass/);
+
+    const parked = loadLedger("s1", io).pending;
+    expect(parked?.kind).toBe("capture");
+    expect(parked?.reason).toMatch(/contextnest-capture/);
   });
 
-  it("gates on a correction and routes to the curator, not the capture agent", () => {
+  it("parks a correction for the curator, not the capture agent", () => {
+    const io = fakeLedgerIo();
     const out = captureGate({
       input: { transcript_path: "t", session_id: "s1" },
       env: {},
       readTranscript: tx([userLine("actually it's 30 seconds not 60")]),
-      ledgerIo: fakeLedgerIo(),
+      ledgerIo: io,
     });
-    expect(out?.decision).toBe("block");
-    expect(out?.reason).toMatch(/contextnest-curator/);
-    expect(out?.reason).toMatch(/EVERY node/);
+    expect(out).not.toHaveProperty("decision");
+    expect(out?.systemMessage).toMatch(/queued a correction sweep/);
+
+    const parked = loadLedger("s1", io).pending;
+    expect(parked?.kind).toBe("change");
+    expect(parked?.reason).toMatch(/contextnest-curator/);
+    expect(parked?.reason).toMatch(/EVERY node/);
+  });
+
+  it("both dispatch directives ask for background execution", () => {
+    const t = { lines: [userLine("remember this")], userTurns: 1 };
+    for (const mode of ["propose", "auto"]) {
+      expect(
+        captureSignal({ transcript: t, ledger: noLedger, env: {}, captureMode: mode }).reason,
+      ).toMatch(/background/);
+    }
+    expect(CHANGE_REASON).toMatch(/background/);
+  });
+
+  it("does not re-park a job already queued for the same turn", () => {
+    // Stop fires again when a background agent reports back; the user must not
+    // get the same directive on two consecutive prompts.
+    const io = fakeLedgerIo();
+    const input = { transcript_path: "t", session_id: "s1" };
+    const read = tx([userLine("remember that we use pnpm")], 3);
+
+    expect(captureGate({ input, env: {}, readTranscript: read, ledgerIo: io })?.systemMessage)
+      .toBeTruthy();
+    expect(captureGate({ input, env: {}, readTranscript: read, ledgerIo: io })).toBeNull();
   });
 
   it("a correction outranks a capture phrase in the same message", () => {
@@ -745,7 +808,7 @@ describe("capture-gate", () => {
       readTranscript: tx(lines, 20),
       ledgerIo: io,
     });
-    expect(first?.decision).toBe("block");
+    expect(first?.systemMessage).toBeTruthy();
     expect(loadLedger("s1", io).lastGatedTurn).toBe(20);
 
     // One turn later: still inside the window, so nothing fires.
@@ -768,7 +831,7 @@ describe("capture-gate", () => {
       readTranscript: tx([userLine("remember that")], 21),
       ledgerIo: io,
     });
-    expect(out?.decision).toBe("block");
+    expect(out?.systemMessage).toBeTruthy();
     // Asking twice in a row must both land, so an explicit pass leaves the
     // window where it was rather than opening a new one.
     expect(loadLedger("s1", io).lastGatedTurn).toBe(20);
@@ -783,7 +846,78 @@ describe("capture-gate", () => {
       readTranscript: tx([userLine("hi")], 21),
       ledgerIo: io,
     });
-    expect(out?.decision).toBe("block");
+    expect(out?.systemMessage).toBeTruthy();
+  });
+
+  it("park → drain: the job reaches the model on the NEXT prompt, once", () => {
+    // The end-to-end contract of the non-blocking design. Stop parks; the next
+    // UserPromptSubmit hands it over as additionalContext and the queue empties.
+    const io = fakeLedgerIo();
+    const input = { transcript_path: "t", session_id: "s1" };
+
+    const stop = captureGate({
+      input,
+      env: {},
+      readTranscript: tx([userLine("actually it's Postgres not Redis")]),
+      ledgerIo: io,
+    });
+    expect(stop).not.toHaveProperty("decision");
+
+    const first = retrieve({
+      input: { prompt: "what next", session_id: "s1" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+      ledgerIo: io,
+    });
+    expect(additional(first)).toMatch(/contextnest-curator/);
+    expect(additional(first)).toMatch(/background/);
+
+    // Handed over exactly once — a dispatch the model ignores is not nagged.
+    expect(loadLedger("s1", io).pending).toBeNull();
+    const second = retrieve({
+      input: { prompt: "and again", session_id: "s1" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+      ledgerIo: io,
+    });
+    expect(additional(second) ?? "").not.toMatch(/contextnest-curator/);
+  });
+
+  it("a parked job surfaces even with retrieval_mode off", () => {
+    // The early-return trap: `off` bails before retrieval, but the queue is the
+    // only path the work has, so it must drain first.
+    const io = fakeLedgerIo();
+    captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("remember that we use pnpm")]),
+      ledgerIo: io,
+    });
+    const out = retrieve({
+      input: { prompt: "hello", session_id: "s1" },
+      env: { CONTEXTNEST_RETRIEVAL_MODE: "off" },
+      exec: fakeExec([], []),
+      ledgerIo: io,
+    });
+    expect(additional(out)).toMatch(/contextnest-capture/);
+    expect(loadLedger("s1", io).pending).toBeNull();
+  });
+
+  it("a parked job surfaces even when the prompt is empty", () => {
+    const io = fakeLedgerIo();
+    captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("remember that we use pnpm")]),
+      ledgerIo: io,
+    });
+    const out = retrieve({
+      input: { prompt: "", session_id: "s1" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+      ledgerIo: io,
+    });
+    expect(additional(out)).toMatch(/contextnest-capture/);
   });
 
   it("isSubstantive: tool use → true; an unreadable tail is no longer a reason to capture", () => {

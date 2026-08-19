@@ -1,20 +1,32 @@
 /**
  * Stop handler — gate that decides whether the vault should be touched at all.
  *
- * Returning `{decision:"block", reason}` is the documented, loop-safe way to make
- * the model do one more thing before the turn ends. What it is asked to do
- * depends on the signal:
+ * It decides, but it does NOT act. Returning `{decision:"block"}` would hold the
+ * turn open while a subagent reads the vault, and the user would sit through it
+ * every time the gate fired. Instead the job is parked in the session ledger and
+ * the turn ends immediately; the next UserPromptSubmit drains the queue and
+ * dispatches a *background* subagent, so the vault work overlaps the user's next
+ * request rather than delaying the end of their last one.
  *
- *   change  → the user corrected something. Invoke the curator, which sweeps
+ * The only thing this hook returns is a `systemMessage`, which renders in the
+ * transcript without blocking, so the user can see that something was queued.
+ * Note that Stop's own `additionalContext` is metadata appended after the
+ * model's message — the model does not act on it — so it is deliberately unused
+ * here. UserPromptSubmit's `additionalContext` is the field that dispatches.
+ *
+ * What gets queued depends on the signal:
+ *
+ *   change  → the user corrected something. Queue the curator, which sweeps
  *             the whole vault so the correction lands in *every* node that
  *             carries the stale fact, not just the first search hit.
- *   capture → something may be worth keeping. Invoke the capture agent, which
+ *   capture → something may be worth keeping. Queue the capture agent, which
  *             walks the capture ladder and (in the default `propose` mode)
  *             proposes rather than writes.
  *
- * Loop safety: when the model stops *again* afterwards, Claude Code sets
- * `stop_hook_active: true` on the Stop payload, which we always allow — so this
- * can never recurse.
+ * Loop safety: nothing blocks any more, so there is no recursion to guard
+ * against. The `stop_hook_active` check is kept because it stays correct and
+ * costs a line — it also means a fallback to blocking would not reintroduce a
+ * loop.
  *
  * Noise control, in the order the signals are tested:
  *   1. Explicit user intent ("remember this", "actually it's Y") always gates,
@@ -25,7 +37,7 @@
  * Set CONTEXTNEST_CAPTURE_ALWAYS=1 to bypass 2 (kept for debugging).
  *
  * Pure core: run({input, env, readTranscript, ledgerIo}) returns the Stop output
- * object (or null to allow the stop). The readers are injected for testability.
+ * object (or null to say nothing). The readers are injected for testability.
  */
 
 import { getConfig, isMain, readStdin, safeJson } from "./lib.js";
@@ -35,7 +47,7 @@ import {
   explicitCaptureIntent,
   lastUserMessage,
 } from "./signals.js";
-import { DEFAULT_MIN_TURNS, inCooldown, loadLedger, saveLedger } from "./ledger.js";
+import { DEFAULT_MIN_TURNS, inCooldown, loadLedger, parkJob } from "./ledger.js";
 import { readFileSync } from "node:fs";
 
 const LADDER = [
@@ -48,28 +60,49 @@ const LADDER = [
   "(6) only then, the smallest possible new node.",
 ].join(" ");
 
-/** What the model is told to do when the turn produced possible new knowledge. */
+/**
+ * These read as next-turn directives, not end-of-turn ones: they are parked by
+ * the Stop hook and handed to the model by the following UserPromptSubmit. Both
+ * ask for background dispatch — the whole point is that the user's current
+ * request is answered first and the vault work runs alongside it.
+ */
+const BACKGROUND = [
+  "Run it in the background (the agent is declared `background: true`) and answer",
+  "the user's current request first — they must not wait on the vault.",
+].join(" ");
+
+/** What the model is told to do when the previous turn produced possible new knowledge. */
 export function captureReason(mode) {
-  const agent = "invoke the `contextnest-capture` agent";
   const posture =
     mode === "auto"
-      ? `${agent} to persist anything genuinely worth keeping from this turn.`
-      : `${agent} to review this turn for anything worth keeping. It must NOT write: ` +
-        "it proposes in one line and waits for the user to say yes.";
+      ? "to persist anything genuinely worth keeping from that turn."
+      : "to review that turn for anything worth keeping. It must NOT write: it " +
+        "proposes in one line and waits for the user to say yes.";
   return [
-    `Before ending: ${posture}`,
+    "A Context Nest capture pass was queued at the end of your previous turn.",
+    `Invoke the \`contextnest-capture\` agent ${posture}`,
+    BACKGROUND,
     LADDER,
-    "If nothing clears the ladder, say nothing at all and finish.",
+    "If nothing clears the ladder, it says nothing at all.",
   ].join(" ");
 }
 
-/** What the model is told to do when the user corrected something. */
+/** What the model is told to do when the user corrected something last turn. */
 export const CHANGE_REASON = [
-  "Before ending: the user corrected something that the Context Nest vault may",
-  "record. Invoke the `contextnest-curator` agent. It must find EVERY node",
-  "carrying the stale fact — not just the first search hit — and change them",
-  "together, or report that the vault never asserted it. Then finish.",
+  "A Context Nest correction sweep was queued at the end of your previous turn:",
+  "the user corrected something the vault may record. Invoke the",
+  "`contextnest-curator` agent. It must find EVERY node carrying the stale fact —",
+  "not just the first search hit — and change them together, or report that the",
+  "vault never asserted it.",
+  BACKGROUND,
 ].join(" ");
+
+/** The one-line, non-blocking note the user sees in the transcript. */
+export function queuedMessage(kind) {
+  return kind === "change"
+    ? "Context Nest: queued a correction sweep — it runs with your next message."
+    : "Context Nest: queued a capture pass — it runs with your next message.";
+}
 
 /**
  * Default transcript reader. Returns the tail for signal analysis plus the
@@ -163,11 +196,16 @@ export function captureSignal({ transcript, ledger, env, captureMode }) {
 export function run({ input, env, readTranscript: readT = readTranscript, ledgerIo = {} }) {
   const config = getConfig(env);
   if (config.captureMode === "off") return null; // capture disabled
-  if (input?.stop_hook_active === true) return null; // loop guard — the pass already ran
+  if (input?.stop_hook_active === true) return null; // vestigial: nothing blocks
 
   const transcript = readT(input?.transcript_path);
   const sessionId = input?.session_id;
   const ledger = loadLedger(sessionId, ledgerIo);
+
+  // Stop fires at every turn end, including the one where a background agent
+  // reported back. A job already queued for this turn must not be queued twice,
+  // or the user gets the same directive on two consecutive prompts.
+  if (ledger.pending && ledger.pending.turn === transcript.userTurns) return null;
 
   const signal = captureSignal({
     transcript,
@@ -179,11 +217,20 @@ export function run({ input, env, readTranscript: readT = readTranscript, ledger
 
   // Stamp the cooldown only for ambient passes. Explicit intent must not start
   // a window, or asking twice in a row would silently ignore the second ask.
-  if (!signal.explicit) {
-    saveLedger(sessionId, { ...ledger, lastGatedTurn: transcript.userTurns }, ledgerIo);
-  }
+  const stamped = signal.explicit
+    ? ledger
+    : { ...ledger, lastGatedTurn: transcript.userTurns };
 
-  return { decision: "block", reason: signal.reason };
+  parkJob(
+    sessionId,
+    stamped,
+    { kind: signal.kind, reason: signal.reason, turn: transcript.userTurns },
+    ledgerIo,
+  );
+
+  // No `decision` and no `continue: false`: the turn ends now. The only output
+  // is the transcript note, so the user knows work is queued rather than lost.
+  return { systemMessage: queuedMessage(signal.kind) };
 }
 
 if (isMain(import.meta.url)) {
