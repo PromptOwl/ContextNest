@@ -18,12 +18,12 @@ import {
   ContextNestError,
   connectRemoteNest,
   normalizeDocumentId,
+  normalizeStatus,
   resolveNest,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestConnection, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
 import {
-  filterDocList,
   listJsonEntry,
   queryJsonPayload,
   searchJsonEntry,
@@ -76,13 +76,21 @@ interface NodeSummary {
 
 export async function remoteList(
   target: RemoteTarget,
-  opts: { type?: string; status?: string; tag?: string; json?: boolean },
+  opts: { type?: string; status?: string; tag?: string; limit?: number; json?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {});
-    // Filter semantics + field selection come from doc-views.ts — the same
-    // code the local branch runs, so the two cannot drift apart on defaults.
-    const docs = filterDocList(out.documents, opts);
+    // Filters go to the NEST, exactly as they do locally. Re-deciding them here
+    // would be a second implementation of filters.ts (they drifted on tag case
+    // once already), and it cannot recover documents the nest already withheld
+    // — an unfiltered context_list hides retired docs, so a client-side
+    // `--status rejected` could only ever return nothing.
+    const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {
+      ...(opts.type ? { type: opts.type } : {}),
+      ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
+      ...(opts.tag ? { tag: opts.tag } : {}),
+      ...(opts.limit ? { limit: opts.limit } : {}),
+    });
+    const docs = out.documents;
 
     if (opts.json) {
       console.log(JSON.stringify(docs.map(listJsonEntry), null, 2));
@@ -103,9 +111,11 @@ export async function remoteList(
 export async function remoteQuery(
   target: RemoteTarget,
   selector: string,
-  opts: { json?: boolean; hops?: number; full?: boolean },
+  opts: { json?: boolean; hops?: number; full?: boolean; includeDrafts?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
+    // Same input the local branch builds: omit what wasn't asked for so the
+    // nest applies its own defaults rather than ours.
     const out = await conn.run<{
       documents: NodeSummary[];
       source_nodes?: NodeSummary[];
@@ -113,8 +123,9 @@ export async function remoteQuery(
       trace_count?: number;
     }>("context_query", {
       query: selector,
-      hops: opts.hops ?? 2,
-      full: opts.full ?? false,
+      ...(opts.hops !== undefined ? { hops: opts.hops } : {}),
+      ...(opts.full ? { full: true } : {}),
+      ...(opts.includeDrafts ? { include_drafts: true } : {}),
     });
 
     const sourceNodes = out.source_nodes ?? [];
@@ -157,10 +168,13 @@ export async function remoteQuery(
 export async function remoteSearch(
   target: RemoteTarget,
   query: string,
-  opts: { json?: boolean },
+  opts: { json?: boolean; limit?: number },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ results: NodeSummary[] }>("context_search", { query });
+    const out = await conn.run<{ results: NodeSummary[] }>("context_search", {
+      query,
+      ...(opts.limit ? { limit: opts.limit } : {}),
+    });
     if (opts.json) {
       // Field selection shared with the local branch (doc-views.ts).
       console.log(JSON.stringify(out.results.map(searchJsonEntry), null, 2));
@@ -224,16 +238,6 @@ export async function remoteVerify(
   // process.exit inside the callback would skip the finally that closes the
   // connection (and with it, the spawned stdio server).
   const valid = await withRemote(target, async (conn) => {
-    // A nest that enforces integrity server-side publishes no hash chain for a
-    // client to walk, so there is no check to run from here. Refuse: emitting
-    // {valid: true} would report a pass for a verification that never happened.
-    if (!(await conn.toolNames()).has("context_verify")) {
-      throw new ContextNestError(
-        `Remote nest "${target.alias}" does not expose context_verify — this nest enforces integrity ` +
-          `server-side, so there is no hash chain for the client to walk. Nothing was verified.`,
-        "NOT_IMPLEMENTED",
-      );
-    }
     const report = await conn.run<{ valid: boolean; errors: unknown[] }>("context_verify", {});
     if (opts.json) {
       console.log(JSON.stringify(report, null, 2));
@@ -252,14 +256,17 @@ export async function remoteVerify(
 export async function remoteHistory(
   target: RemoteTarget,
   path: string,
-  opts: { json?: boolean },
+  opts: { json?: boolean; diff?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     const out = await conn.run<{
       id: string;
       keyframe_interval: number;
       versions: Array<Record<string, unknown>>;
-    }>("context_versions", { id: normalizeDocumentId(path) });
+    }>("context_versions", {
+      id: normalizeDocumentId(path),
+      ...(opts.diff ? { include_diff: true } : {}),
+    });
 
     if (out.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${out.id}`));
@@ -367,48 +374,33 @@ export async function remoteUpdate(
   });
 }
 
-export async function remotePublish(target: RemoteTarget, path: string): Promise<void> {
-  const id = normalizeDocumentId(path);
-  // Probe capabilities on a connection of its own: confirmRemoteWrite exits the
-  // process on a decline, which would skip the close() in withRemote's finally.
-  const tools = await withRemote(target, (conn) => conn.toolNames());
-
-  if (!tools.has("context_publish")) {
-    // A governed nest has no direct publish — that would bypass its review
-    // plane. A node goes context_submit_review → a steward's context_approve,
-    // so route there instead of failing, and never let the output read as live.
-    if (!tools.has("context_submit_review")) {
-      throw new ContextNestError(
-        `Remote nest "${target.alias}" exposes neither context_publish nor context_submit_review — ` +
-          `it offers no publish path this client can drive. Nothing was published.`,
-        "NOT_IMPLEMENTED",
-      );
-    }
-    await confirmRemoteWrite(
-      target,
-      `Submit ${id} for steward review on remote nest "${target.alias}"? ` +
-        `This nest publishes through review, so this will NOT make the node live.`,
+export async function remotePublish(
+  target: RemoteTarget,
+  path: string | undefined,
+  opts: { all?: boolean; message?: string } = {},
+): Promise<void> {
+  // Refuse loudly rather than crash: --all leaves `path` undefined, and the
+  // catalog's publish op takes neither a batch nor a version note.
+  if (opts.all) {
+    throw new ContextNestError(
+      `Publishing the whole nest at once is not supported against a remote nest — publish documents individually, or run against a local vault.`,
+      "NOT_IMPLEMENTED",
     );
-    await withRemote(target, async (conn) => {
-      // context_submit_review keys on title, not id — resolve it rather than
-      // guess, using the same context_get call remoteRead already makes.
-      const doc = await conn.run<{ frontmatter: { title: string } }>("context_get", { id });
-      await conn.run("context_submit_review", { title: doc.frontmatter.title });
-      console.log(chalk.green(`Submitted ${id} for steward review (remote: ${target.alias})`));
-      console.log(
-        chalk.yellow(
-          "  NOT published — this nest publishes through review. The node is not live until a steward approves it.",
-        ),
-      );
-    });
-    return;
   }
-
-  await confirmRemoteWrite(target, `Publish ${id} on remote nest "${target.alias}"?`);
+  if (!path) {
+    throw new ContextNestError("Nothing to publish — pass a document path.", "VALIDATION_FAILED");
+  }
+  if (opts.message !== undefined) {
+    throw new ContextNestError(
+      "--message is not supported against a remote nest yet (the catalog's publish operation takes no version note).",
+      "NOT_IMPLEMENTED",
+    );
+  }
+  await confirmRemoteWrite(target, `Publish ${normalizeDocumentId(path)} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ id: string; version: number; checkpoint: number }>(
       "context_publish",
-      { id },
+      { id: normalizeDocumentId(path) },
     );
     console.log(chalk.green(`Published ${out.id} (remote: ${target.alias})`));
     console.log(`  Version: ${out.version}`);

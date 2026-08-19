@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 import { Command, Help } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
-import chalk from "chalk";
+import chalk from "./color.js";
 import {
   NestStorage,
   validateDocument,
@@ -72,7 +72,6 @@ import {
   remoteDelete,
 } from "./remote.js";
 import {
-  filterDocList,
   listJsonEntry,
   queryJsonPayload,
   searchJsonEntry,
@@ -1367,7 +1366,7 @@ program
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
-      await remotePublish(remote, path);
+      await remotePublish(remote, path, opts);
       return;
     }
     const storage = getStorage();

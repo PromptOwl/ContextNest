@@ -1,5 +1,88 @@
 # @promptowl/contextnest-cli
 
+## 2.1.0
+
+### Minor Changes
+
+- 6b6ffcb: Flatten the dependency tree and publish the dependency graph.
+
+  Installing the CLI now pulls **2 packages with no nesting** (1 with `--omit=optional`), down from 104 packages at depth 7. **The MCP server installs nothing at all**, down from 97 packages at depth 11.
+
+  The CLI and MCP server are binaries, not libraries, so their dependencies are now compiled into `dist/` and declared as devDependencies. Unused code is dropped in the process — the MCP server no longer ships the SDK's express, hono, ajv and jose transports, none of which a stdio server touches. Every bundled package is listed with its version and licence in `DEPENDENCIES.md`, so nothing is hidden by being bundled.
+
+  The engine is a library and keeps real dependencies — 7 packages at depth 2, down from 76. Four were removed outright without losing any behaviour:
+
+  - `unified` / `remark-parse` / `remark-gfm` (58 packages) — the markdown AST was used only to find `contextnest://` links and section headings, which a fence-aware line scanner does directly.
+  - `fast-glob` (18 packages) — replaced by a small `*` / `**` matcher over a `readdir` walk.
+  - `gray-matter` (11 packages) — frontmatter is split in-tree and parsed with the `js-yaml` the engine already depended on, instead of a second, older copy of it.
+  - `cli-table3` (7 packages) — declared but never imported.
+
+  Alongside that:
+
+  - **No install scripts.** The CLI's `postinstall` banner is gone; installing the package now executes none of our code. The same guidance is one `ctx` away in the top-level help.
+  - **Minimal install profile.** `chalk` moved to `optionalDependencies`, so `npm install -g @promptowl/contextnest-cli --omit=optional` installs a colour-free CLI — a single package — with every command, flag and output format unchanged.
+  - **Published dependency graph.** `DEPENDENCIES.md` records every installed and bundled package, why it is there, and its licence. CI regenerates it and fails on drift, verifies that every module a published bundle imports is a declared dependency, and uploads the machine-readable graph as a build artifact.
+
+- 98fa7f3: CLI file-safety hardening: confirmation prompts, `--dry-run`, and an action log
+
+  No `ctx` command now writes to your working directory without saying so.
+
+  - **`--dry-run`** on every write command. It runs the real operation against a
+    throwaway copy of the vault, reports the exact files that would change, and
+    leaves your vault untouched — so the preview never drifts from what the
+    command actually does.
+  - **Action log.** Write commands end with the list of files created (`+`),
+    modified (`~`) or deleted (`-`), computed by diffing the vault before and
+    after. Written to stderr so `--json` output and redirected stdout stay clean.
+  - **Confirmation prompts.** Interactive runs ask first; destructive commands
+    (`delete`, `checkpoint rebuild`, `drift approve`, `vault remove`, re-running
+    `init` over an existing vault, overwriting a `read --out` target, `push`)
+    default to "no". Non-interactive callers are never blocked on stdin —
+    additive commands proceed, destructive ones refuse unless `--yes`/`--force`
+    is passed.
+  - **No silent overwrites.** `ctx read --html --out <file>` refuses to clobber an
+    existing file without `--force`.
+  - **Safer egress.** `ctx push` lists the documents leaving the machine before
+    sending them, refuses plaintext HTTP to a non-loopback host (which would
+    expose documents and the API key on the wire), and accepts the API key from
+    `CONTEXTNEST_API_KEY` so it need not appear in argv or shell history. The
+    same protocol check covers a `PROMPTOWL_API_URL` override.
+
+  Behavior change for scripts: `ctx delete`, `ctx checkpoint rebuild`,
+  `ctx drift approve`, `ctx vault remove` and `ctx push` now require `--yes` (or
+  `--force`) when there is no TTY.
+
+### Patch Changes
+
+- 98fa7f3: Fix: starter recipes scaffolded documents with an invalid node type
+
+  Every node in all five populated starter recipes (`developer`, `executive`,
+  `analyst`, `team`, `sales`) shipped `type: context` — a value that has never
+  been part of `NODE_TYPES`. `ctx init --starter` writes and publishes without
+  validating, so the vault looked healthy until the first `ctx update` or
+  `ctx validate` on a scaffolded document, which failed with:
+
+  ```
+  Rule 6: Invalid enum value. Expected 'document' | … | 'table', received 'context'
+  ```
+
+  All 15 nodes now declare `type: document`.
+
+  Two tests lock it down: a unit test runs the real parser and validator over
+  every node of every registered recipe (so any invalid frontmatter value fails
+  fast, not just this field), and a regression test asserts that a freshly
+  initialized starter vault passes `ctx validate` and that a scaffolded document
+  can be updated.
+
+  **Existing vaults are not migrated.** A vault created by an earlier release
+  still holds `type: context` on disk and will keep failing validation. Fix it in
+  place, e.g.:
+
+  ```bash
+  grep -rl '^type: context$' nodes/ | xargs sed -i 's/^type: context$/type: document/'
+  ctx index
+  ```
+
 ## 2.0.0
 
 ### Major Changes
