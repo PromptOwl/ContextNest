@@ -46,6 +46,16 @@
           ]
         },
         {
+          "name": "@modelcontextprotocol/sdk",
+          "version": "1.29.0",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "diff",
           "version": "9.0.0",
           "license": "BSD-3-Clause",
@@ -92,6 +102,7 @@
           "depth": 2,
           "optional": false,
           "via": [
+            "@modelcontextprotocol/sdk",
             "@promptowl/contextnest-engine"
           ]
         },
@@ -102,7 +113,39 @@
           "depth": 2,
           "optional": false,
           "via": [
+            "@modelcontextprotocol/sdk",
             "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "@hono/node-server",
+          "version": "1.19.14",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "ajv",
+          "version": "8.18.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "ajv-formats"
+          ]
+        },
+        {
+          "name": "ajv-formats",
+          "version": "3.0.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
           ]
         },
         {
@@ -114,6 +157,918 @@
           "via": [
             "js-yaml"
           ]
+        },
+        {
+          "name": "content-type",
+          "version": "1.0.5",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "body-parser",
+            "express",
+            "type-is"
+          ]
+        },
+        {
+          "name": "cors",
+          "version": "2.8.6",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "cross-spawn",
+          "version": "7.0.6",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "eventsource",
+          "version": "3.0.7",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "eventsource-parser",
+          "version": "3.0.6",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "eventsource"
+          ]
+        },
+        {
+          "name": "express",
+          "version": "5.2.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "express-rate-limit",
+          "version": "8.4.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "hono",
+          "version": "4.12.16",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "jose",
+          "version": "6.1.3",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "json-schema-typed",
+          "version": "8.0.2",
+          "license": "BSD-2-Clause",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "pkce-challenge",
+          "version": "5.0.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "raw-body",
+          "version": "3.0.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "body-parser"
+          ]
+        },
+        {
+          "name": "accepts",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "body-parser",
+          "version": "2.2.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "content-disposition",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "cookie",
+          "version": "0.7.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "cookie-signature",
+          "version": "1.2.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "debug",
+          "version": "4.4.3",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express",
+            "finalhandler",
+            "router",
+            "send"
+          ]
+        },
+        {
+          "name": "depd",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "http-errors",
+            "router"
+          ]
+        },
+        {
+          "name": "encodeurl",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "send",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "escape-html",
+          "version": "1.0.3",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "send",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "etag",
+          "version": "1.8.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "send"
+          ]
+        },
+        {
+          "name": "fast-deep-equal",
+          "version": "3.1.3",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "fast-uri",
+          "version": "3.1.0",
+          "license": "BSD-3-Clause",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "finalhandler",
+          "version": "2.1.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "fresh",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "send"
+          ]
+        },
+        {
+          "name": "http-errors",
+          "version": "2.0.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express",
+            "raw-body",
+            "send"
+          ]
+        },
+        {
+          "name": "ip-address",
+          "version": "10.1.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express-rate-limit"
+          ]
+        },
+        {
+          "name": "json-schema-traverse",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "merge-descriptors",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "mime-types",
+          "version": "3.0.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "accepts",
+            "express",
+            "send",
+            "type-is"
+          ]
+        },
+        {
+          "name": "object-assign",
+          "version": "4.1.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "cors"
+          ]
+        },
+        {
+          "name": "on-finished",
+          "version": "2.4.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express",
+            "finalhandler",
+            "send"
+          ]
+        },
+        {
+          "name": "once",
+          "version": "1.4.0",
+          "license": "ISC",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "parseurl",
+          "version": "1.3.3",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "router",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "path-key",
+          "version": "3.1.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "cross-spawn"
+          ]
+        },
+        {
+          "name": "proxy-addr",
+          "version": "2.0.7",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "qs",
+          "version": "6.15.0",
+          "license": "BSD-3-Clause",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express"
+          ]
+        },
+        {
+          "name": "range-parser",
+          "version": "1.2.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "send"
+          ]
+        },
+        {
+          "name": "require-from-string",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "router",
+          "version": "2.2.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "send",
+          "version": "1.2.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "serve-static",
+          "version": "2.2.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "shebang-command",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "cross-spawn"
+          ]
+        },
+        {
+          "name": "statuses",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "http-errors",
+            "send"
+          ]
+        },
+        {
+          "name": "type-is",
+          "version": "2.0.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express"
+          ]
+        },
+        {
+          "name": "vary",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "cors",
+            "express"
+          ]
+        },
+        {
+          "name": "which",
+          "version": "2.0.2",
+          "license": "ISC",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "cross-spawn"
+          ]
+        },
+        {
+          "name": "bytes",
+          "version": "3.1.2",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "raw-body"
+          ]
+        },
+        {
+          "name": "forwarded",
+          "version": "0.2.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "proxy-addr"
+          ]
+        },
+        {
+          "name": "iconv-lite",
+          "version": "0.7.2",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "raw-body"
+          ]
+        },
+        {
+          "name": "ipaddr.js",
+          "version": "1.9.1",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "proxy-addr"
+          ]
+        },
+        {
+          "name": "is-promise",
+          "version": "4.0.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "router"
+          ]
+        },
+        {
+          "name": "isexe",
+          "version": "2.0.0",
+          "license": "ISC",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "which"
+          ]
+        },
+        {
+          "name": "ms",
+          "version": "2.1.3",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "debug",
+            "send"
+          ]
+        },
+        {
+          "name": "negotiator",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "accepts"
+          ]
+        },
+        {
+          "name": "path-to-regexp",
+          "version": "8.4.2",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "router"
+          ]
+        },
+        {
+          "name": "shebang-regex",
+          "version": "3.0.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "shebang-command"
+          ]
+        },
+        {
+          "name": "wrappy",
+          "version": "1.0.2",
+          "license": "ISC",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "once"
+          ]
+        },
+        {
+          "name": "ee-first",
+          "version": "1.1.1",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "on-finished"
+          ]
+        },
+        {
+          "name": "inherits",
+          "version": "2.0.4",
+          "license": "ISC",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "http-errors"
+          ]
+        },
+        {
+          "name": "media-typer",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "type-is"
+          ]
+        },
+        {
+          "name": "mime-db",
+          "version": "1.54.0",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "mime-types"
+          ]
+        },
+        {
+          "name": "safer-buffer",
+          "version": "2.1.2",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "iconv-lite"
+          ]
+        },
+        {
+          "name": "setprototypeof",
+          "version": "1.2.0",
+          "license": "ISC",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "http-errors"
+          ]
+        },
+        {
+          "name": "side-channel",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "qs"
+          ]
+        },
+        {
+          "name": "toidentifier",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "http-errors"
+          ]
+        },
+        {
+          "name": "unpipe",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "raw-body"
+          ]
+        },
+        {
+          "name": "es-errors",
+          "version": "1.3.0",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "call-bind-apply-helpers",
+            "dunder-proto",
+            "es-object-atoms",
+            "get-intrinsic",
+            "side-channel",
+            "side-channel-list",
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "object-inspect",
+          "version": "1.13.4",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "side-channel",
+            "side-channel-list",
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "side-channel-list",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "side-channel"
+          ]
+        },
+        {
+          "name": "side-channel-map",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "side-channel",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "side-channel-weakmap",
+          "version": "1.0.2",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "side-channel"
+          ]
+        },
+        {
+          "name": "call-bound",
+          "version": "1.0.4",
+          "license": "MIT",
+          "depth": 8,
+          "optional": false,
+          "via": [
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "get-intrinsic",
+          "version": "1.3.0",
+          "license": "MIT",
+          "depth": 8,
+          "optional": false,
+          "via": [
+            "call-bound",
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "call-bind-apply-helpers",
+          "version": "1.0.2",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "call-bound",
+            "dunder-proto",
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "es-define-property",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "es-object-atoms",
+          "version": "1.1.1",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-intrinsic",
+            "get-proto"
+          ]
+        },
+        {
+          "name": "function-bind",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "call-bind-apply-helpers",
+            "get-intrinsic",
+            "hasown"
+          ]
+        },
+        {
+          "name": "get-proto",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "gopd",
+          "version": "1.2.0",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "dunder-proto",
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "has-symbols",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "hasown",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "math-intrinsics",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "dunder-proto",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 11,
+          "optional": false,
+          "via": [
+            "get-proto"
+          ]
         }
       ]
     },
@@ -121,6 +1076,7 @@
       "name": "@promptowl/contextnest-engine",
       "version": "2.1.0",
       "required": [
+        "@modelcontextprotocol/sdk",
         "diff",
         "js-yaml",
         "minisearch",
@@ -129,10 +1085,20 @@
         "zod-to-json-schema"
       ],
       "optional": [],
-      "maxDepth": 2,
-      "total": 7,
-      "minimalTotal": 7,
+      "maxDepth": 11,
+      "total": 96,
+      "minimalTotal": 96,
       "packages": [
+        {
+          "name": "@modelcontextprotocol/sdk",
+          "version": "1.29.0",
+          "license": "MIT",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
         {
           "name": "diff",
           "version": "9.0.0",
@@ -180,6 +1146,7 @@
           "depth": 1,
           "optional": false,
           "via": [
+            "@modelcontextprotocol/sdk",
             "@promptowl/contextnest-engine"
           ]
         },
@@ -190,7 +1157,39 @@
           "depth": 1,
           "optional": false,
           "via": [
+            "@modelcontextprotocol/sdk",
             "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "@hono/node-server",
+          "version": "1.19.14",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "ajv",
+          "version": "8.18.0",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "ajv-formats"
+          ]
+        },
+        {
+          "name": "ajv-formats",
+          "version": "3.0.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
           ]
         },
         {
@@ -201,6 +1200,918 @@
           "optional": false,
           "via": [
             "js-yaml"
+          ]
+        },
+        {
+          "name": "content-type",
+          "version": "1.0.5",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "body-parser",
+            "express",
+            "type-is"
+          ]
+        },
+        {
+          "name": "cors",
+          "version": "2.8.6",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "cross-spawn",
+          "version": "7.0.6",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "eventsource",
+          "version": "3.0.7",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "eventsource-parser",
+          "version": "3.0.6",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "eventsource"
+          ]
+        },
+        {
+          "name": "express",
+          "version": "5.2.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "express-rate-limit",
+          "version": "8.4.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "hono",
+          "version": "4.12.16",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "jose",
+          "version": "6.1.3",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "json-schema-typed",
+          "version": "8.0.2",
+          "license": "BSD-2-Clause",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "pkce-challenge",
+          "version": "5.0.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "raw-body",
+          "version": "3.0.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@modelcontextprotocol/sdk",
+            "body-parser"
+          ]
+        },
+        {
+          "name": "accepts",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "body-parser",
+          "version": "2.2.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "content-disposition",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "cookie",
+          "version": "0.7.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "cookie-signature",
+          "version": "1.2.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "debug",
+          "version": "4.4.3",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express",
+            "finalhandler",
+            "router",
+            "send"
+          ]
+        },
+        {
+          "name": "depd",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "http-errors",
+            "router"
+          ]
+        },
+        {
+          "name": "encodeurl",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "send",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "escape-html",
+          "version": "1.0.3",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "send",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "etag",
+          "version": "1.8.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "send"
+          ]
+        },
+        {
+          "name": "fast-deep-equal",
+          "version": "3.1.3",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "fast-uri",
+          "version": "3.1.0",
+          "license": "BSD-3-Clause",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "finalhandler",
+          "version": "2.1.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "fresh",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "send"
+          ]
+        },
+        {
+          "name": "http-errors",
+          "version": "2.0.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express",
+            "raw-body",
+            "send"
+          ]
+        },
+        {
+          "name": "ip-address",
+          "version": "10.1.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express-rate-limit"
+          ]
+        },
+        {
+          "name": "json-schema-traverse",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "merge-descriptors",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "mime-types",
+          "version": "3.0.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "accepts",
+            "express",
+            "send",
+            "type-is"
+          ]
+        },
+        {
+          "name": "object-assign",
+          "version": "4.1.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "cors"
+          ]
+        },
+        {
+          "name": "on-finished",
+          "version": "2.4.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express",
+            "finalhandler",
+            "send"
+          ]
+        },
+        {
+          "name": "once",
+          "version": "1.4.0",
+          "license": "ISC",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "parseurl",
+          "version": "1.3.3",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "router",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "path-key",
+          "version": "3.1.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "cross-spawn"
+          ]
+        },
+        {
+          "name": "proxy-addr",
+          "version": "2.0.7",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "qs",
+          "version": "6.15.0",
+          "license": "BSD-3-Clause",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express"
+          ]
+        },
+        {
+          "name": "range-parser",
+          "version": "1.2.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "send"
+          ]
+        },
+        {
+          "name": "require-from-string",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "ajv"
+          ]
+        },
+        {
+          "name": "router",
+          "version": "2.2.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "send",
+          "version": "1.2.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "serve-static"
+          ]
+        },
+        {
+          "name": "serve-static",
+          "version": "2.2.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express"
+          ]
+        },
+        {
+          "name": "shebang-command",
+          "version": "2.0.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "cross-spawn"
+          ]
+        },
+        {
+          "name": "statuses",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "express",
+            "finalhandler",
+            "http-errors",
+            "send"
+          ]
+        },
+        {
+          "name": "type-is",
+          "version": "2.0.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "express"
+          ]
+        },
+        {
+          "name": "vary",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "cors",
+            "express"
+          ]
+        },
+        {
+          "name": "which",
+          "version": "2.0.2",
+          "license": "ISC",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "cross-spawn"
+          ]
+        },
+        {
+          "name": "bytes",
+          "version": "3.1.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "raw-body"
+          ]
+        },
+        {
+          "name": "forwarded",
+          "version": "0.2.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "proxy-addr"
+          ]
+        },
+        {
+          "name": "iconv-lite",
+          "version": "0.7.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "body-parser",
+            "raw-body"
+          ]
+        },
+        {
+          "name": "ipaddr.js",
+          "version": "1.9.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "proxy-addr"
+          ]
+        },
+        {
+          "name": "is-promise",
+          "version": "4.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "router"
+          ]
+        },
+        {
+          "name": "isexe",
+          "version": "2.0.0",
+          "license": "ISC",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "which"
+          ]
+        },
+        {
+          "name": "ms",
+          "version": "2.1.3",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "debug",
+            "send"
+          ]
+        },
+        {
+          "name": "negotiator",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "accepts"
+          ]
+        },
+        {
+          "name": "path-to-regexp",
+          "version": "8.4.2",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "router"
+          ]
+        },
+        {
+          "name": "shebang-regex",
+          "version": "3.0.0",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "shebang-command"
+          ]
+        },
+        {
+          "name": "wrappy",
+          "version": "1.0.2",
+          "license": "ISC",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "once"
+          ]
+        },
+        {
+          "name": "ee-first",
+          "version": "1.1.1",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "on-finished"
+          ]
+        },
+        {
+          "name": "inherits",
+          "version": "2.0.4",
+          "license": "ISC",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "http-errors"
+          ]
+        },
+        {
+          "name": "media-typer",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "type-is"
+          ]
+        },
+        {
+          "name": "mime-db",
+          "version": "1.54.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "mime-types"
+          ]
+        },
+        {
+          "name": "safer-buffer",
+          "version": "2.1.2",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "iconv-lite"
+          ]
+        },
+        {
+          "name": "setprototypeof",
+          "version": "1.2.0",
+          "license": "ISC",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "http-errors"
+          ]
+        },
+        {
+          "name": "side-channel",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "qs"
+          ]
+        },
+        {
+          "name": "toidentifier",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "http-errors"
+          ]
+        },
+        {
+          "name": "unpipe",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "raw-body"
+          ]
+        },
+        {
+          "name": "es-errors",
+          "version": "1.3.0",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "call-bind-apply-helpers",
+            "dunder-proto",
+            "es-object-atoms",
+            "get-intrinsic",
+            "side-channel",
+            "side-channel-list",
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "object-inspect",
+          "version": "1.13.4",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "side-channel",
+            "side-channel-list",
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "side-channel-list",
+          "version": "1.0.0",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "side-channel"
+          ]
+        },
+        {
+          "name": "side-channel-map",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "side-channel",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "side-channel-weakmap",
+          "version": "1.0.2",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "side-channel"
+          ]
+        },
+        {
+          "name": "call-bound",
+          "version": "1.0.4",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "get-intrinsic",
+          "version": "1.3.0",
+          "license": "MIT",
+          "depth": 7,
+          "optional": false,
+          "via": [
+            "call-bound",
+            "side-channel-map",
+            "side-channel-weakmap"
+          ]
+        },
+        {
+          "name": "call-bind-apply-helpers",
+          "version": "1.0.2",
+          "license": "MIT",
+          "depth": 8,
+          "optional": false,
+          "via": [
+            "call-bound",
+            "dunder-proto",
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "es-define-property",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "es-object-atoms",
+          "version": "1.1.1",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "get-intrinsic",
+            "get-proto"
+          ]
+        },
+        {
+          "name": "function-bind",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "call-bind-apply-helpers",
+            "get-intrinsic",
+            "hasown"
+          ]
+        },
+        {
+          "name": "get-proto",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "gopd",
+          "version": "1.2.0",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "dunder-proto",
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "has-symbols",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "hasown",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "math-intrinsics",
+          "version": "1.1.0",
+          "license": "MIT",
+          "depth": 9,
+          "optional": false,
+          "via": [
+            "get-intrinsic"
+          ]
+        },
+        {
+          "name": "dunder-proto",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 10,
+          "optional": false,
+          "via": [
+            "get-proto"
           ]
         }
       ],
@@ -223,6 +2134,7 @@
           "depth": 1,
           "optional": false,
           "via": [
+            "@promptowl/contextnest-engine",
             "@promptowl/contextnest-mcp-server"
           ]
         },
@@ -446,7 +2358,7 @@
         },
         {
           "name": "zod-to-json-schema",
-          "version": "3.25.1",
+          "version": "3.25.2",
           "license": "ISC",
           "depth": 2,
           "optional": false,

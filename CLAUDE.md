@@ -71,7 +71,7 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 35 tools over stdio, in three groups:
 
-- **Catalog-driven** (16, registered by `registerCatalogTool` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift): `context_init`, `context_nests`, `context_get`, `context_list`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`. **Add new tools here, not by hand.**
+- **Catalog-driven** (16, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`. **Add new tools here, not by hand.**
 - **Hand-written, still current** (8): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`.
 - **Deprecated** (11, kept byte-identical for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`.
 

@@ -405,6 +405,47 @@ export interface VaultRegistryEntry {
 }
 
 /**
+ * Auth for an HTTP remote nest. Secrets are stored as environment-variable
+ * REFERENCES only (the *_env fields name the variable to read at connect
+ * time); the registry schema rejects raw secret values outright.
+ */
+export interface RemoteNestAuth {
+  /** Env var holding a bearer token, sent as `Authorization: Bearer <value>`. */
+  bearer_env?: string;
+  /** Custom header name, paired with header_env for its value. */
+  header_name?: string;
+  /** Env var holding the value for header_name. */
+  header_env?: string;
+}
+
+/**
+ * A registered remote nest — an MCP endpoint speaking the canonical operation
+ * catalog (`context_*` tools; legacy tool names accepted as aliases). Lives in
+ * the registry's top-level `remotes:` map, NEVER inside `vaults:`, so older
+ * CLIs (which strip unknown top-level keys) skip remotes instead of failing to
+ * parse the whole registry.
+ */
+export type RemoteNestSpec =
+  | {
+      transport: "stdio";
+      /** Executable to spawn (argv[0]); args are passed as an array, never a shell string. */
+      command: string;
+      args?: string[];
+      description?: string;
+      /** Per-call timeout in milliseconds (default 10000). */
+      timeout_ms?: number;
+    }
+  | {
+      transport: "http";
+      /** Streamable-HTTP MCP endpoint URL. */
+      url: string;
+      auth?: RemoteNestAuth;
+      description?: string;
+      /** Per-call timeout in milliseconds (default 10000). */
+      timeout_ms?: number;
+    };
+
+/**
  * Central vault registry. Maps short aliases to vault paths so the CLI and MCP
  * server can target any vault from any working directory (analogous to AWS
  * named profiles). Stored at ~/.contextnest/config.yaml.
@@ -415,6 +456,8 @@ export interface VaultRegistry {
   default?: string;
   /** Registered vaults, keyed by alias. */
   vaults: Record<string, VaultRegistryEntry>;
+  /** Registered remote nests, keyed by alias. Shares one alias namespace with `vaults`. */
+  remotes?: Record<string, RemoteNestSpec>;
 }
 
 /** Trace entry for document access (§9.2) */
