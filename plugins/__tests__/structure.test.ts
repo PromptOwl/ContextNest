@@ -130,6 +130,26 @@ describe("config command (CU-wdqcpzw825: settings must be changeable after enabl
   });
 });
 
+describe("dispatched agents run in the background", () => {
+  // The Stop hook parks work instead of blocking the turn, and the next prompt
+  // dispatches it. If these lose `background: true`, the dispatch runs inline
+  // and delays the user's next request instead of overlapping it.
+  it.each(["agents/contextnest-capture.md", "agents/contextnest-curator.md"])(
+    "%s declares background: true",
+    (rel) => {
+      const fm = read(join(plugin, rel)).match(/^---\r?\n([\s\S]*?)\r?\n---/)![1];
+      expect(fm).toMatch(/^background:\s*true\s*$/m);
+    },
+  );
+
+  it("the read-only retriever is NOT backgrounded — its answer is needed inline", () => {
+    const fm = read(join(plugin, "agents/contextnest-retriever.md")).match(
+      /^---\r?\n([\s\S]*?)\r?\n---/,
+    )![1];
+    expect(fm).not.toMatch(/background:/);
+  });
+});
+
 describe("capture command", () => {
   it("ships a /contextnest:capture escape hatch with description frontmatter", () => {
     const commandPath = join(plugin, "commands", "capture.md");

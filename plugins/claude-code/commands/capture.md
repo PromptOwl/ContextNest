@@ -14,7 +14,8 @@ Requested: `$ARGUMENTS`
 
 ## What to do
 
-1. Invoke the `contextnest-capture` agent.
+1. Invoke the `contextnest-capture` agent. It is declared `background: true`, so
+   it runs alongside whatever the user does next — don't hold them while it works.
 2. Tell it that this is an **explicit, user-initiated capture**, so it should
    write rather than propose — the user has already given consent by running
    this command.
@@ -30,4 +31,8 @@ Requested: `$ARGUMENTS`
 If the user is correcting something that is already in the vault rather than
 adding something new, use the `contextnest-curator` agent instead — it sweeps
 for every node carrying the stale fact rather than writing a second version of
-it alongside the first.
+it alongside the first. It is likewise a background agent.
+
+Note the plugin also queues these agents on its own: the `Stop` hook parks a job
+instead of blocking the end of a turn, and the next prompt dispatches it. This
+command is for when the user wants it now and wants it written.

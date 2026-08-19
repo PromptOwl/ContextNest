@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0
+
+The end-of-turn vault work no longer blocks you.
+
+- **The `Stop` hook stopped blocking.** It used to return `decision: "block"` —
+  the documented way to force one more action before a turn can end — so every
+  time the gate fired you waited while a subagent read the vault. It now parks
+  the job in the session ledger and returns only a `systemMessage`
+  (`Context Nest: queued a correction sweep`), so the turn ends immediately.
+- **The next prompt dispatches it.** `UserPromptSubmit` drains the queue and
+  hands the directive to the model as `additionalContext`. That drain runs before
+  every early return, so a queued job survives `retrieval_mode: off` and an empty
+  prompt. A job is handed over exactly once and never re-offered.
+- **`contextnest-capture` and `contextnest-curator` are now `background: true`**,
+  so the dispatched work runs alongside your next request rather than ahead of
+  it. The read-only `contextnest-retriever` stays in the foreground — its answer
+  is needed inline.
+- The tradeoff: parked work runs when you send your next message, so if you walk
+  away mid-session the capture does not happen. `/contextnest:capture` still
+  captures on demand.
+
 ## 0.3.0
 
 The plugin now decides *whether* to touch the vault before deciding *what* to

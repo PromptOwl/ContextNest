@@ -4,10 +4,13 @@ Makes any Claude Code session **vault-aware** and **self-maintaining**:
 
 - **Auto-retrieval** — a `UserPromptSubmit` hook pulls relevant vault material into
   each prompt (effort-toggled), so Claude answers from your governed knowledge base.
-- **Deliberate capture** — a `Stop` hook triggers a capture agent, but only on a real
+- **Deliberate capture** — a `Stop` hook queues a capture agent, but only on a real
   signal (you asked, or you corrected something, or the session has run on past a
   cooldown). By default that agent *proposes* in one line and writes nothing until
   you agree.
+- **Never in your way** — the `Stop` hook never blocks the end of a turn. It parks
+  the job and notes it in the transcript; your next message dispatches it to a
+  background agent that works alongside whatever you asked for next.
 - **Consistent corrections** — when you correct something the vault records, a curator
   agent sweeps for every node carrying the stale fact and changes them together,
   rather than fixing the first hit and leaving the rest contradicting it.
@@ -73,6 +76,18 @@ A key present in an override file always beats the enable-time answer; an
 explicit `"vault": ""` unpins a pinned vault. Remove a key to fall back to the
 enable-time value (then the default).
 
+## How the work is scheduled
+
+Nothing the plugin does holds up the end of a turn. The `Stop` hook decides
+whether the vault should be touched, writes that decision to
+`~/.contextnest/plugin-state/<session>.json`, and prints a one-line note. Your
+next prompt picks the job up and hands it to a `background: true` subagent, which
+runs concurrently with your new request.
+
+The cost of that: a parked job runs when you send your next message. Walk away
+mid-session and the capture does not happen — use `/contextnest:capture` when you
+want something saved right now.
+
 ## How it decides to touch the vault
 
 A knowledge base earns its keep by being small enough to trust, so both write
@@ -110,8 +125,8 @@ security vault are judged on their own terms.
 | Type | Name | Role |
 | --- | --- | --- |
 | Hook | `SessionStart` | Inject vault overview (or a warning if `ctx` is missing) |
-| Hook | `UserPromptSubmit` | Effort-toggled retrieval injection |
-| Hook | `Stop` | Loop-safe gate; fires on explicit intent, a correction, or past the cooldown |
+| Hook | `UserPromptSubmit` | Effort-toggled retrieval injection, and dispatches any parked job |
+| Hook | `Stop` | Decides and parks; never blocks. Fires on explicit intent, a correction, or past the cooldown |
 | Agent | `contextnest-retriever` | Selects vault(s), builds a selector, runs `ctx query`, returns a cited digest |
 | Agent | `contextnest-capture` | Walks the capture ladder; proposes (or, in `auto`, writes) the minimum |
 | Agent | `contextnest-curator` | Sweeps the vault so a correction lands in every node that carries it |

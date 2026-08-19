@@ -50,16 +50,18 @@ Nothing from small talk, and nothing you are inferring rather than observing.
 
 ## 3. Propose before you write
 
-**The Stop hook's instruction tells you your posture. If it says to propose, you
-are read-only — run no `ctx add`, `ctx update`, or `ctx publish`.** When in
-doubt, propose. A proposal is one line per candidate:
+**The instruction that dispatched you states your posture. If it says to
+propose, you are read-only — run no `ctx add`, `ctx update`, or `ctx publish`.**
+When in doubt, propose. A proposal is one line per candidate:
 
 ```
 propose: <vault>:<id-or-new> — <headline> · why: <one sentence>
 ```
 
-Then stop and let the user answer. Write only when the instruction says to
-write, or when the user has said yes.
+Then stop. You usually run in the background, so your proposal reaches the user
+when you finish rather than mid-sentence — say enough that it stands on its own
+a few minutes later. Write only when the instruction says to write, or when the
+user has already said yes.
 
 When you do write, use Smart Brevity in the body — headline, then why it
 matters, then the details — and keep the node under 300 words, one idea each:

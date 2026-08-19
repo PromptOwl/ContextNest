@@ -10,11 +10,11 @@ into each agent plugin.
 | Path | What it is |
 | --- | --- |
 | `core/lib.js` | Config from env, the `ctx` runner (with `npx` fallback), vault selection, JSON helpers, the hook IO shell. |
-| `core/retrieve.js` | `UserPromptSubmit` handler — effort-toggled retrieval (`off` / `search` / `query` / `agent`). |
+| `core/retrieve.js` | `UserPromptSubmit` handler — effort-toggled retrieval, and the single place a parked job is dispatched. |
 | `core/session-start.js` | `SessionStart` handler — injects a compact vault overview, or a warning if `ctx` is missing. |
-| `core/capture-gate.js` | `Stop` handler — loop-safe gate deciding whether to touch the vault, and as a capture or a correction. |
+| `core/capture-gate.js` | `Stop` handler — decides whether to touch the vault and parks the job; never blocks the turn. |
 | `core/signals.js` | Pure transcript classifiers: the last real user message, explicit capture intent, correction intent. |
-| `core/ledger.js` | Per-session capture state under `~/.contextnest/plugin-state/` — the cooldown that keeps ambient captures rare. |
+| `core/ledger.js` | Per-session state under `~/.contextnest/plugin-state/` — the ambient-capture cooldown and the parked job queue. |
 | `prompts/retriever.md` | Body of the retriever agent. |
 | `prompts/capture.md` | Body of the capture agent (the capture ladder). |
 | `prompts/curate.md` | Body of the curator agent (the change and escalation ladders). |
