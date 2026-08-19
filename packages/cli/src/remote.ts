@@ -230,6 +230,13 @@ export async function remoteRead(
   });
 }
 
+/**
+ * NOT AVAILABLE against a Community-hosted nest (contextnest-community):
+ * that server registers no `context_verify` tool and has no equivalent to
+ * route to, so this fails with "Tool context_verify not found". Works against
+ * a catalog-bound OSS server (@promptowl/contextnest-mcp-server), which does
+ * expose the op.
+ */
 export async function remoteVerify(
   target: RemoteTarget,
   opts: { json?: boolean },
@@ -289,7 +296,13 @@ export async function remoteHistory(
     console.log(chalk.bold(`Version history for ${out.id}:\n`));
     for (const entry of out.versions) {
       const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
-      const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
+      // published_at is our own server's field; contextnest-community reports
+      // the same fact as `status`. Without the fallback every version of a
+      // Community-hosted node renders "draft".
+      const published =
+        entry.published_at || entry.status === "published"
+          ? chalk.green(" published")
+          : chalk.yellow(" draft");
       console.log(`  v${entry.version}${keyframe}${published}`);
       console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
       if (entry.note) console.log(`    Note: ${entry.note}`);
@@ -384,6 +397,13 @@ export async function remoteUpdate(
   });
 }
 
+/**
+ * NOT AVAILABLE against a Community-hosted nest (contextnest-community):
+ * that server registers no `context_publish` tool — it publishes through
+ * steward review (`context_submit_review` → `context_approve`, which calls the
+ * engine's publish op server-side), so this fails with "Tool context_publish
+ * not found". Works against a catalog-bound OSS server, which exposes the op.
+ */
 export async function remotePublish(
   target: RemoteTarget,
   path: string | undefined,
