@@ -116,6 +116,12 @@ function authEnvVar(spec: RemoteNestSpec): string | undefined {
 export interface RemoteNestConnection {
   /** Call a catalog operation (canonical `context_*` name) on the remote. */
   run<T = unknown>(operation: string, input: Record<string, unknown>): Promise<T>;
+  /**
+   * Tool names the remote advertises. Lazy and memoized — the `listTools`
+   * round trip only fires the first time someone asks, so the hot path
+   * (connect → one `run` → close, as plugin hooks do) never pays for it.
+   */
+  toolNames(): Promise<ReadonlySet<string>>;
   close(): Promise<void>;
 }
 
@@ -211,7 +217,17 @@ export async function connectRemoteNest(
     throw new RemoteUnreachableError(alias, (err as Error)?.message ?? String(err));
   }
 
+  // Memoize the promise, not the value: concurrent callers share one round
+  // trip. A failure is cached too — a remote that can't list its tools once
+  // won't list them a moment later, and callers here treat that as "unknown".
+  let toolNamesPromise: Promise<ReadonlySet<string>> | undefined;
+  const toolNames = (): Promise<ReadonlySet<string>> =>
+    (toolNamesPromise ??= client
+      .listTools(undefined, { timeout })
+      .then(({ tools }) => new Set((tools ?? []).map((t) => t.name)) as ReadonlySet<string>));
+
   return {
+    toolNames,
     async run<T>(operation: string, input: Record<string, unknown>): Promise<T> {
       let result: {
         content?: Array<{ type: string; text?: string }>;
@@ -271,9 +287,25 @@ export async function connectRemoteNest(
       }
 
       if (payload !== undefined) return payload as T;
+
       // Quote what actually came back — without it this error is a dead end:
       // prose, an HTML error page and an empty payload all look identical.
       const got = text.trim() ? `got: ${text.trim().slice(0, 200)}` : "the payload was empty";
+      // The endpoint answered, so it is reachable and it IS an MCP server — the
+      // payload just isn't the catalog's JSON. Name what it does expose so the
+      // reader concludes "different contract", not "wrong URL". If listTools
+      // itself fails, fall back rather than mask the original.
+      const names = await toolNames().catch(() => undefined);
+      if (names?.size) {
+        const shown = [...names].slice(0, 5).join(", ");
+        const rest = names.size > 5 ? `, +${names.size - 5} more` : "";
+        throw new ContextNestError(
+          `Remote operation ${operation} returned prose, not the JSON operation catalog — ` +
+            `"${alias}" is a live MCP endpoint speaking a different contract. ` +
+            `It advertises ${names.size} tool${names.size === 1 ? "" : "s"}: ${shown}${rest} (${got}).`,
+          "INTERNAL",
+        );
+      }
       throw new ContextNestError(
         `Remote operation ${operation} returned a non-JSON payload — is "${alias}" a ContextNest MCP endpoint? (${got})`,
         "INTERNAL",

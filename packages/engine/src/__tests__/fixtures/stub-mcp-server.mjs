@@ -44,17 +44,20 @@ server.tool("context_list", "stub list — malformed error", {}, async () => ({
   isError: true,
 }));
 
-// Structured output in structuredContent only, with no text mirror.
-server.tool("context_resolve", "stub resolve — structuredContent only", {}, async () => ({
-  content: [],
-  structuredContent: { id: "nodes/a", title: "A" },
+// The MCP-native split: prose for chat clients in `content`, catalog JSON in
+// `structuredContent`. The text here is deliberately unparseable, so a client
+// that ignores structuredContent fails loudly instead of silently passing.
+server.tool("context_resolve", "stub resolve — structured payload", {}, async () => ({
+  content: [{ type: "text", text: "Resolved 2 documents for you." }],
+  structuredContent: { total: 2, channel: "structuredContent" },
 }));
 
-// Nothing at all — no text, no structuredContent.
-server.tool("context_versions", "stub versions — empty payload", {}, async () => ({
-  content: [],
+// Same split on the error path.
+server.tool("context_versions", "stub versions — structured error", {}, async () => ({
+  content: [{ type: "text", text: "Sorry, I could not find that document." }],
+  structuredContent: { code: "DOCUMENT_NOT_FOUND", message: "Document not found: nodes/gone" },
+  isError: true,
 }));
-
 // The contextnest-community shape: human-readable PROSE in the text block,
 // catalog payload in structuredContent. Parsing text first fails here.
 server.tool("context_import", "stub import — prose text + structuredContent", {}, async () => ({
@@ -67,6 +70,17 @@ server.tool("context_reconstruct", "stub reconstruct — prose error + structure
   content: [{ type: "text", text: "Node not found: nodes/ghost" }],
   structuredContent: { code: "DOCUMENT_NOT_FOUND", message: "Node not found: nodes/ghost" },
   isError: true,
+}));
+
+// Structured output in structuredContent only, with no text mirror.
+server.tool("context_nests", "stub nests — structuredContent only", {}, async () => ({
+  content: [],
+  structuredContent: { id: "nodes/a", title: "A" },
+}));
+
+// Nothing at all — no text, no structuredContent.
+server.tool("context_publish", "stub publish — empty payload", {}, async () => ({
+  content: [],
 }));
 
 // Echo the received arguments back, to pin input passthrough.
