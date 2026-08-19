@@ -238,6 +238,16 @@ export async function remoteVerify(
   // process.exit inside the callback would skip the finally that closes the
   // connection (and with it, the spawned stdio server).
   const valid = await withRemote(target, async (conn) => {
+    // A nest that enforces integrity server-side publishes no hash chain for a
+    // client to walk, so there is no check to run from here. Refuse: emitting
+    // {valid: true} would report a pass for a verification that never happened.
+    if (!(await conn.toolNames()).has("context_verify")) {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" does not expose context_verify — this nest enforces integrity ` +
+          `server-side, so there is no hash chain for the client to walk. Nothing was verified.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
     const report = await conn.run<{ valid: boolean; errors: unknown[] }>("context_verify", {});
     if (opts.json) {
       console.log(JSON.stringify(report, null, 2));
@@ -396,11 +406,47 @@ export async function remotePublish(
       "NOT_IMPLEMENTED",
     );
   }
-  await confirmRemoteWrite(target, `Publish ${normalizeDocumentId(path)} on remote nest "${target.alias}"?`);
+  const id = normalizeDocumentId(path);
+  // Probe capabilities on a connection of its own: confirmRemoteWrite exits the
+  // process on a decline, which would skip the close() in withRemote's finally.
+  const tools = await withRemote(target, (conn) => conn.toolNames());
+
+  if (!tools.has("context_publish")) {
+    // A governed nest has no direct publish — that would bypass its review
+    // plane. A node goes context_submit_review → a steward's context_approve,
+    // so route there instead of failing, and never let the output read as live.
+    if (!tools.has("context_submit_review")) {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" exposes neither context_publish nor context_submit_review — ` +
+          `it offers no publish path this client can drive. Nothing was published.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
+    await confirmRemoteWrite(
+      target,
+      `Submit ${id} for steward review on remote nest "${target.alias}"? ` +
+        `This nest publishes through review, so this will NOT make the node live.`,
+    );
+    await withRemote(target, async (conn) => {
+      // context_submit_review keys on title, not id — resolve it rather than
+      // guess, using the same context_get call remoteRead already makes.
+      const doc = await conn.run<{ frontmatter: { title: string } }>("context_get", { id });
+      await conn.run("context_submit_review", { title: doc.frontmatter.title });
+      console.log(chalk.green(`Submitted ${id} for steward review (remote: ${target.alias})`));
+      console.log(
+        chalk.yellow(
+          "  NOT published — this nest publishes through review. The node is not live until a steward approves it.",
+        ),
+      );
+    });
+    return;
+  }
+
+  await confirmRemoteWrite(target, `Publish ${id} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
     const out = await conn.run<{ id: string; version: number; checkpoint: number }>(
       "context_publish",
-      { id: normalizeDocumentId(path) },
+      { id },
     );
     console.log(chalk.green(`Published ${out.id} (remote: ${target.alias})`));
     console.log(`  Version: ${out.version}`);
