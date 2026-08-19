@@ -36,6 +36,12 @@ export class RemoteUnreachableError extends ContextNestError {
 export interface RemoteNestConnection {
   /** Call a catalog operation (canonical `context_*` name) on the remote. */
   run<T = unknown>(operation: string, input: Record<string, unknown>): Promise<T>;
+  /**
+   * Tool names the remote advertises. Lazy and memoized — the `listTools`
+   * round trip only fires the first time someone asks, so the hot path
+   * (connect → one `run` → close, as plugin hooks do) never pays for it.
+   */
+  toolNames(): Promise<ReadonlySet<string>>;
   close(): Promise<void>;
 }
 
@@ -125,9 +131,23 @@ export async function connectRemoteNest(
     throw new RemoteUnreachableError(alias, (err as Error)?.message ?? String(err));
   }
 
+  // Memoize the promise, not the value: concurrent callers share one round
+  // trip. A failure is cached too — a remote that can't list its tools once
+  // won't list them a moment later, and callers here treat that as "unknown".
+  let toolNamesPromise: Promise<ReadonlySet<string>> | undefined;
+  const toolNames = (): Promise<ReadonlySet<string>> =>
+    (toolNamesPromise ??= client
+      .listTools(undefined, { timeout })
+      .then(({ tools }) => new Set((tools ?? []).map((t) => t.name)) as ReadonlySet<string>));
+
   return {
+    toolNames,
     async run<T>(operation: string, input: Record<string, unknown>): Promise<T> {
-      let result: { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+      let result: {
+        content?: Array<{ type: string; text?: string }>;
+        structuredContent?: unknown;
+        isError?: boolean;
+      };
       try {
         result = (await client.callTool(
           { name: operation, arguments: input },
@@ -142,11 +162,15 @@ export async function connectRemoteNest(
       const text = (result.content ?? [])
         .map((c) => (c.type === "text" ? (c.text ?? "") : ""))
         .join("");
+      // `structuredContent` is MCP's channel for the machine payload, so a
+      // server is free to put human prose in `content`. Absent it, fall back to
+      // parsing the text — servers that predate the split behave exactly as before.
+      const structured = result.structuredContent;
       if (result.isError) {
         // Catalog-bound servers return structured {code, message} JSON; map it
         // back to a typed engine error. Anything else becomes INTERNAL.
         try {
-          const parsed = JSON.parse(text) as { code?: string; message?: string };
+          const parsed = (structured ?? JSON.parse(text)) as { code?: string; message?: string };
           if (parsed && typeof parsed.message === "string") {
             throw new ContextNestError(parsed.message, parsed.code ?? "INTERNAL");
           }
@@ -155,9 +179,25 @@ export async function connectRemoteNest(
         }
         throw new ContextNestError(text || `Remote operation ${operation} failed`, "INTERNAL");
       }
+      if (structured != null) return structured as T;
       try {
         return JSON.parse(text) as T;
       } catch {
+        // The endpoint answered, so it is reachable and it IS an MCP server —
+        // the payload just isn't the catalog's JSON. Name what it does expose
+        // so the reader concludes "different contract", not "wrong URL".
+        // If listTools itself fails, fall back rather than mask the original.
+        const names = await toolNames().catch(() => undefined);
+        if (names?.size) {
+          const shown = [...names].slice(0, 5).join(", ");
+          const rest = names.size > 5 ? `, +${names.size - 5} more` : "";
+          throw new ContextNestError(
+            `Remote operation ${operation} returned prose, not the JSON operation catalog — ` +
+              `"${alias}" is a live MCP endpoint speaking a different contract. ` +
+              `It advertises ${names.size} tool${names.size === 1 ? "" : "s"}: ${shown}${rest}.`,
+            "INTERNAL",
+          );
+        }
         throw new ContextNestError(
           `Remote operation ${operation} returned a non-JSON payload — is "${alias}" a ContextNest MCP endpoint?`,
           "INTERNAL",
