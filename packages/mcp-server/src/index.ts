@@ -1153,60 +1153,6 @@ server.tool(
   },
 );
 
-// ─── Catalog-driven tools (canonical `context_*` names) ───────────────────────
-
-/**
- * Register an engine catalog operation as an MCP tool. Name, description and
- * schema all come from the descriptor, so this surface cannot drift from the
- * CLI and Community ones. The SDK wants a ZodRawShape, hence the `.shape`.
- *
- * These are the canonical names. The legacy tools above (`create_document`,
- * `read_document`, …) stay registered and behave exactly as before; they are
- * deprecated in favour of these and will be removed in a future major.
- */
-function registerCatalogTool(name: string): void {
-  const op = engineApi.getOperation(name);
-  if (!op) return;
-  server.tool(
-    op.name,
-    op.description,
-    (op.input as z.ZodObject<z.ZodRawShape>).shape,
-    async (input) => {
-      // No onProgress — MCP has no progress channel; operations are identical
-      // without one.
-      const result = await engineApi.run(op.name, input, {
-        storage,
-        query: new GraphQueryEngine(storage),
-        versions: new VersionManager(storage),
-        rbac: permissiveRbac,
-        actor: "mcp@contextnest.local",
-      });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    },
-  );
-}
-
-registerCatalogTool("context_import");
-registerCatalogTool("context_create");
-registerCatalogTool("context_update");
-registerCatalogTool("context_list");
-registerCatalogTool("context_get");
-registerCatalogTool("context_init");
-registerCatalogTool("context_verify");
-registerCatalogTool("context_packs");
-registerCatalogTool("context_search");
-registerCatalogTool("context_query");
-registerCatalogTool("context_resolve");
-registerCatalogTool("context_publish");
-registerCatalogTool("context_delete");
-registerCatalogTool("context_reconstruct");
-// No legacy twin: nothing here listed version history before — read_version
-// fetches one version's content, which is a different question.
-registerCatalogTool("context_versions");
-registerCatalogTool("context_nests");
-
 // ─── Start server ──────────────────────────────────────────────────────────────
 
 async function main() {
