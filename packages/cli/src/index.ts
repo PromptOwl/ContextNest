@@ -39,7 +39,10 @@ import {
   approveSuggestion,
   rejectSuggestion,
   resolveVaultPath,
+  resolveNest,
+  describeRemoteEndpoint,
   addVault,
+  addRemote,
   removeVault,
   setDefaultVault,
   setVaultDescription,
@@ -54,6 +57,27 @@ import {
   isPublished,
   isRejected,
 } from "@promptowl/contextnest-engine";
+import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
+import {
+  remoteTarget,
+  remoteList,
+  remoteQuery,
+  remoteSearch,
+  remoteRead,
+  remoteVerify,
+  remoteHistory,
+  remoteAdd,
+  remoteUpdate,
+  remotePublish,
+  remoteDelete,
+} from "./remote.js";
+import {
+  listJsonEntry,
+  queryJsonPayload,
+  searchJsonEntry,
+  titleFromId,
+  parseTagsOption,
+} from "./doc-views.js";
 import { createEngineApi } from "@promptowl/contextnest-engine/api";
 import type { OperationContext } from "@promptowl/contextnest-engine/api";
 import type {
@@ -315,6 +339,11 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
     await openWriteScope(root, { copy: alreadyAVault });
     return;
   }
+
+  // A remote nest writes nothing locally, so there is no sandbox to open and
+  // no local diff to log — and getVaultRoot() refuses a remote alias outright.
+  // remote.ts carries the confirm/dry-run guards for those writes instead.
+  if (remoteTarget(selectedVaultAlias)) return;
 
   await openWriteScope(getVaultRoot());
 });
@@ -1014,6 +1043,11 @@ program
   .option("--out <file>", "Save HTML to file instead of opening in browser (requires --html)")
   .option("--raw", "Output raw file content (frontmatter + body)")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteRead(remote, path, opts);
+      return;
+    }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
     // allow_rejected: `ctx read` has always shown a retired document — reading
@@ -1121,6 +1155,11 @@ program
   .option("--body <body>", "Markdown body content")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteAdd(remote, path, opts);
+      return;
+    }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
 
@@ -1138,11 +1177,9 @@ program
 
     await confirmOrExit(`Create ${id}.md in ${realRootPath() ?? storage.root} and publish v1?`);
 
-    const title = opts.title || id.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+    const title = opts.title || titleFromId(id);
 
-    const tagList = opts.tags
-      ? opts.tags.split(/[,\s]+/).filter((t: string) => t.length > 0).map((t: string) => (t.startsWith("#") ? t : `#${t}`))
-      : undefined;
+    const tagList = opts.tags ? parseTagsOption(opts.tags) : undefined;
     const frontmatter: Frontmatter = {
       title,
       type: opts.type,
@@ -1327,6 +1364,11 @@ program
   .option("-m, --message <note>", "Version note")
   .option("--all", "Publish every unpublished document in the vault, in one batch")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remotePublish(remote, path, opts);
+      return;
+    }
     const storage = getStorage();
 
     if (opts.all) {
@@ -1417,6 +1459,11 @@ program
   .option("--diff", "Include each version's unified diff from the one before")
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteHistory(remote, path, opts);
+      return;
+    }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
     const history = await createEngineApi().run<{
@@ -1544,6 +1591,11 @@ program
   .description("Verify integrity of all hash chains")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteVerify(remote, opts);
+      return;
+    }
     const storage = getStorage();
 
     let totalErrors = 0;
@@ -1795,12 +1847,19 @@ program
       return;
     }
 
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteQuery(remote, selector, opts);
+      return;
+    }
+
     // Local query — graph-aware traversal
     const storage = getStorage();
     type Doc = { id: string; title: string; body?: string; source?: unknown };
     const result = await createEngineApi().run<{
       documents: Doc[];
       source_nodes?: Doc[];
+      trace_count?: number;
       traversal?: { mode: string; hops_used: number; nodes_traversed: number };
     }>(
       "context_query",
@@ -1814,9 +1873,10 @@ program
     );
 
     if (opts.json) {
+      // Field selection shared with the remote branch (doc-views.ts).
       console.log(
         JSON.stringify(
-          {
+          queryJsonPayload({
             documents: result.documents.map((d) => ({
               id: d.id,
               title: d.title,
@@ -1828,10 +1888,11 @@ program
               source: d.source,
               body: d.body,
             })),
+            traceCount: result.trace_count ?? 0,
             mode: result.traversal?.mode,
             hopsUsed: result.traversal?.hops_used,
             nodesTraversed: result.traversal?.nodes_traversed,
-          },
+          }),
           null,
           2,
         ),
@@ -1868,6 +1929,11 @@ program
   .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
   .option("--json", "Output as JSON")
   .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteList(remote, opts);
+      return;
+    }
     const storage = getStorage();
     // Aliases collapse here; the operation owns the rest of the filtering,
     // including hiding retired documents when no status was asked for.
@@ -1891,7 +1957,8 @@ program
     );
 
     if (opts.json) {
-      console.log(JSON.stringify(documents, null, 2));
+      // Field selection shared with the remote branch (doc-views.ts).
+      console.log(JSON.stringify(documents.map(listJsonEntry), null, 2));
       return;
     }
     if (documents.length === 0) {
@@ -1921,6 +1988,11 @@ program
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteUpdate(remote, path, opts);
+      return;
+    }
     const storage = getStorage();
     // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
     // takes canonical statuses only. It decides from that status whether this
@@ -1943,14 +2015,7 @@ program
         id: normalizeDocumentId(path),
         ...(opts.title !== undefined ? { title: opts.title } : {}),
         ...(status !== undefined ? { status } : {}),
-        ...(opts.tags !== undefined
-          ? {
-              tags: opts.tags
-                .split(/[,\s]+/)
-                .filter((t: string) => t.length > 0)
-                .map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
-            }
-          : {}),
+        ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
         ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
         note: "Updated via CLI",
       },
@@ -1982,6 +2047,11 @@ program
   .command("delete <path>")
   .description("Delete a document and its version history")
   .action(async (path) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteDelete(remote, path);
+      return;
+    }
     const storage = getStorage();
     await confirmOrExit(
       `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.`,
@@ -2003,6 +2073,11 @@ program
   .option("--json", "Output as JSON")
   .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
   .action(async (query, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteSearch(remote, query, opts);
+      return;
+    }
     const storage = getStorage();
     const { results } = await createEngineApi().run<{
       results: Array<{ id: string; title: string; description?: string; type: string }>;
@@ -2013,14 +2088,10 @@ program
     );
 
     if (opts.json) {
+      // Field selection shared with the remote branch (doc-views.ts).
       console.log(
         JSON.stringify(
-          results.map((d) => ({
-            id: d.id,
-            title: d.title,
-            description: d.description,
-            type: d.type,
-          })),
+          results.map(searchJsonEntry),
           null,
           2,
         ),
@@ -2508,6 +2579,13 @@ vaultCmd
     console.log(chalk.bold("\nRegistered vaults:\n"));
     for (const v of vaults) {
       const marker = v.isDefault ? chalk.green(" *") : "  ";
+      if (v.kind === "remote") {
+        const endpoint = v.url ?? [v.command, ...(v.args ?? [])].join(" ");
+        console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[remote:${v.transport}]`)}`);
+        if (v.description) console.log(`     ${chalk.dim(v.description)}`);
+        console.log(`     ${chalk.dim(endpoint)}`);
+        continue;
+      }
       const missing = v.exists ? "" : chalk.red("  [missing]");
       console.log(`${marker} ${chalk.cyan(v.alias)}${missing}`);
       if (v.description) console.log(`     ${chalk.dim(v.description)}`);
@@ -2518,12 +2596,60 @@ vaultCmd
 
 vaultCmd
   .command("add <alias> [path]")
-  .description("Register a vault path under an alias (path defaults to the vault in the current directory)")
+  .description("Register a vault path — or a remote nest via --url / --mcp-command — under an alias")
   .option("--description <text>", "Short label for this alias")
   .option("--set-default", "Make this the default vault")
   // No local --force: the global one (see the root command) covers it.
+  .option("--url <url>", "Register a REMOTE nest at this MCP endpoint (streamable HTTP)")
+  .option("--bearer-env <var>", "Env var holding the bearer token for --url (stored as a reference, never the value)")
+  .option("--mcp-command <cmd>", "Register a REMOTE nest served by this stdio MCP command")
+  .option(
+    "--mcp-arg <arg>",
+    "Argument for --mcp-command (repeatable)",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[],
+  )
   .action(async (alias: string, path: string | undefined, opts) => {
     try {
+      // Remote registration: --url (HTTP) or --mcp-command (stdio).
+      if (opts.url || opts.mcpCommand) {
+        if (opts.url && opts.mcpCommand) {
+          console.log(chalk.red("Pass either --url or --mcp-command, not both."));
+          process.exit(1);
+        }
+        if (path) {
+          console.log(chalk.red("A remote nest takes no path argument."));
+          process.exit(1);
+        }
+        const spec: RemoteNestSpec = opts.url
+          ? {
+              transport: "http",
+              url: opts.url,
+              ...(opts.bearerEnv ? { auth: { bearer_env: opts.bearerEnv } } : {}),
+              ...(opts.description ? { description: opts.description } : {}),
+            }
+          : {
+              transport: "stdio",
+              command: opts.mcpCommand,
+              ...(opts.mcpArg.length ? { args: opts.mcpArg } : {}),
+              ...(opts.description ? { description: opts.description } : {}),
+            };
+        await confirmOrExit(
+          `Register remote "${alias}" → ${describeRemoteEndpoint(spec)} in ${registryPathForLog()}?`,
+        );
+        const reg = addRemote(alias, spec, {
+          setDefault: opts.setDefault,
+          force: isForce(),
+        });
+        const isDefault = reg.default === alias;
+        console.log(
+          chalk.green(
+            `Registered remote "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${describeRemoteEndpoint(spec)}`,
+          ),
+        );
+        return;
+      }
+
       // With no explicit path, "register the vault I'm in" — resolve strictly
       // from the cwd walk-up, NOT getVaultRoot() (which honors CONTEXTNEST_VAULT
       // and could register the wrong vault under this alias).
@@ -2625,7 +2751,7 @@ vaultCmd
   .description("Show which vault the CLI would use right now, and why (respects --vault)")
   .action(() => {
     try {
-      const resolved = resolveVaultPath({
+      const resolved = resolveNest({
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
@@ -2634,6 +2760,12 @@ vaultCmd
       // a local resolution).
       if (resolved.warning) {
         console.error(chalk.yellow(resolved.warning));
+      }
+      if (resolved.kind === "remote") {
+        console.log(`${resolved.alias} ${chalk.magenta(`(remote, ${resolved.remote.transport})`)}`);
+        console.log(describeRemoteEndpoint(resolved.remote));
+        console.log(chalk.dim(`source: ${resolved.source} (alias: ${resolved.alias})`));
+        return;
       }
       console.log(resolved.path);
       console.log(
@@ -2655,6 +2787,12 @@ program.parseAsync().catch((err: unknown) => {
   console.error(chalk.red(`${label}: ${(err as Error)?.message ?? String(err)}`));
   if (!(err instanceof ContextNestError)) {
     console.error(chalk.dim("Re-run with CONTEXTNEST_DEBUG=1 for the full stack trace."));
+  }
+  // Distinct exit code for "the remote exists but could not be reached", so
+  // scripted callers (plugin hooks) can skip an offline remote silently
+  // instead of treating it like a bad query.
+  if (err instanceof ContextNestError && err.code === "REMOTE_UNREACHABLE") {
+    process.exit(3);
   }
   process.exit(1);
 });

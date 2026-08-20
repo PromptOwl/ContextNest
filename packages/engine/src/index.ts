@@ -46,6 +46,8 @@ export type {
   GraphQueryResult,
   VaultRegistry,
   VaultRegistryEntry,
+  RemoteNestSpec,
+  RemoteNestAuth,
 } from "./types.js";
 
 // Errors
@@ -188,20 +190,36 @@ export {
   isVaultRoot,
   findLocalVault,
   addVault,
+  addRemote,
   removeVault,
   setDefaultVault,
   setVaultDescription,
   listVaults,
   resolveVaultPath,
+  resolveNest,
+  describeRemoteEndpoint,
 } from "./registry.js";
 export type {
   AddVaultOptions,
+  AddRemoteOptions,
   RemoveVaultResult,
   VaultListEntry,
   VaultResolutionSource,
   ResolveVaultOptions,
   ResolvedVault,
+  ResolvedNest,
 } from "./registry.js";
+
+// Remote nest client (MCP over stdio/http; lazy-loads the MCP SDK).
+export {
+  connectRemoteNest,
+  RemoteUnreachableError,
+  RemoteTimeoutError,
+  RemoteAuthError,
+  REMOTE_DEFAULT_TIMEOUT_MS,
+  REMOTE_HTTP_DEFAULT_TIMEOUT_MS,
+} from "./remote-nest.js";
+export type { RemoteNestConnection } from "./remote-nest.js";
 
 // Storage
 export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";

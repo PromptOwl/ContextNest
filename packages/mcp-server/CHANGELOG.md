@@ -1,5 +1,22 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.2.0
+
+### Minor Changes
+
+- Remote nests: point `ctx` at a nest served over MCP and use it like a local vault.
+
+  The vault registry grows a top-level `remotes:` map — stdio or HTTP specs, env-ref-only auth, sharing one alias namespace with local `vaults:`. Older CLIs strip the unknown key and keep working. `resolveNest()` resolves an alias to either a local path or a remote spec at the documented precedence; `resolveVaultPath()` wraps it and fails with a clear local-only error when an alias points at a remote.
+
+  `--vault <remote-alias>` then routes read and write commands through an MCP client (`connectRemoteNest()`, SDK loaded lazily) instead of the local engine, with JSON output shape-identical to the local path. Local-only commands fail fast on a remote alias rather than pretending to work, and an unreachable remote exits 3 naming the alias.
+
+  The wire contract is the engine's canonical operation catalog, so the MCP server now binds every core op under its canonical `context_*` name with catalog-sourced schemas, keeps the legacy tool names as deprecated aliases, and returns catalog output shapes and structured `{code, message}` errors. That closes the drift between engine, CLI and MCP server on the remote path.
+
+  Capability-aware behaviour on top of it:
+
+  - `ctx publish` against a remote that has no `context_publish` routes through the remote's review flow instead of failing — Community publishes via steward review.
+  - `ctx verify` refuses to report a verification the remote cannot perform, rather than fabricating a pass.
+
 ## 2.1.0
 
 ### Minor Changes

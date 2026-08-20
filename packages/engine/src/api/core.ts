@@ -27,10 +27,10 @@ const tag = z.string().regex(TAG_PATTERN);
 const nodeSummary = z.object({
   id: z.string(),
   title: z.string(),
+  description: z.string().optional(),
   type: z.enum(NODE_TYPES).default("document"),
   status: z.enum(STATUSES).default("draft"),
   tags: z.array(tag).optional(),
-  description: z.string().optional(),
   body: z.string().optional(),
   // Whole frontmatter, on request. Summaries carry the fields a browser needs;
   // a caller that renders or gates the document needs the rest (version,
@@ -135,6 +135,8 @@ const queryOp: OperationDescriptor = {
     documents: z.array(nodeSummary),
     source_nodes: z.array(nodeSummary).optional(),
     traversal: traversal.optional(),
+    /** Number of §9 access traces recorded by the query (consumed by `ctx query`). */
+    trace_count: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED", "INVALID_SELECTOR", "INVALID_URI"],
   // "resolve" is the legacy OSS mcp-server tool name for THIS graph query — not
@@ -601,13 +603,24 @@ const packsOp: OperationDescriptor = {
 
 // ─── context_nests ───────────────────────────────────────────────────────────
 
-/** One registered nest as returned by `context_nests`. */
+/**
+ * One registered nest as returned by `context_nests`. A nest is either a local
+ * vault on disk or a remote MCP endpoint, so `kind` is what a caller branches
+ * on: `path`/`exists` are local-only, `transport`/`url`/`command` remote-only.
+ * Reachability of a remote is deliberately absent — knowing it means probing,
+ * which this op never does.
+ */
 const nestSummary = z.object({
   alias: z.string(),
-  path: z.string(),
+  kind: z.enum(["local", "remote"]),
+  path: z.string().optional(),
+  transport: z.enum(["stdio", "http"]).optional(),
+  url: z.string().optional(),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
   description: z.string().optional(),
   isDefault: z.boolean(),
-  exists: z.boolean(),
+  exists: z.boolean().optional(),
 });
 
 /**
@@ -619,7 +632,7 @@ const nestsOp: OperationDescriptor = {
   name: "context_nests",
   namespace: "core",
   description:
-    "List every nest registered in the central registry, with its alias, path, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
+    "List every nest registered in the central registry — local vaults and remote MCP endpoints alike — with its alias, kind, endpoint, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
   input: z.object({}),
   output: z.object({ nests: z.array(nestSummary) }),
   errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],

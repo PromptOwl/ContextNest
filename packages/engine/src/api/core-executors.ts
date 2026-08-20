@@ -38,6 +38,9 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
   return {
     id: node.id,
     title: node.frontmatter.title,
+    ...(node.frontmatter.description !== undefined
+      ? { description: node.frontmatter.description }
+      : {}),
     type: node.frontmatter.type ?? "document",
     status: node.frontmatter.status ?? "draft",
     tags: node.frontmatter.tags,
@@ -192,6 +195,7 @@ const query: OperationExecutor = async (ctx, input: any) => {
       hops_used: result.hopsUsed,
       nodes_traversed: result.nodesTraversed,
     },
+    trace_count: result.traces.length,
   };
 };
 
@@ -273,13 +277,13 @@ const list: OperationExecutor = async (ctx, input: any) => {
  * the bulk `import` executor so their node shape stays identical.
  */
 function buildDraftNode(input: {
+  id?: string;
   title: string;
   content: string;
   type?: string;
   tags?: unknown[];
   folder?: string;
   metadata?: Record<string, unknown>;
-  id?: string;
   status?: Frontmatter["status"];
   trigger?: string;
   tools_required?: string[];

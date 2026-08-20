@@ -54,6 +54,8 @@ export const ERROR_CODES = [
   // operation-runtime codes
   "UNKNOWN_OPERATION",
   "NOT_IMPLEMENTED",
+  // catch-all for uncoded failures surfaced across a binding boundary
+  "INTERNAL",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
