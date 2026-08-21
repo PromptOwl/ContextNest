@@ -297,6 +297,48 @@ export const packSchema = z.object({
   audiences: z.array(z.string()).optional(),
 });
 
+// ─── Client (caller) metadata (§9.4) ─────────────────────────────────────────
+
+/** Reserved keys of {@link clientMetadataSchema}; everything else is custom. */
+export const CLIENT_METADATA_RESERVED_KEYS = ["agent", "session_id"] as const;
+/** How many CUSTOM keys a caller may attach beyond the reserved two. */
+export const CLIENT_METADATA_MAX_CUSTOM_KEYS = 16;
+/** Longest string value accepted for any key. */
+export const CLIENT_METADATA_MAX_VALUE_LENGTH = 512;
+
+/**
+ * Caller metadata attached to an API call — the calling agent's name, its
+ * session id, and any custom keys it wants recorded alongside the action.
+ *
+ * Bounds are not decoration. This object is written into the append-only
+ * version history and into access traces, so an unbounded one lets any caller
+ * grow a vault's audit trail without limit. Values are scalars for the same
+ * reason: a nested payload has no natural size, and YAML-round-tripping one
+ * through history.yaml would make the entry unreadable.
+ */
+export const clientMetadataSchema = z
+  .object({
+    agent: z.string().min(1).max(CLIENT_METADATA_MAX_VALUE_LENGTH).optional(),
+    session_id: z.string().min(1).max(CLIENT_METADATA_MAX_VALUE_LENGTH).optional(),
+  })
+  .catchall(
+    z.union([
+      z.string().max(CLIENT_METADATA_MAX_VALUE_LENGTH),
+      z.number(),
+      z.boolean(),
+    ]),
+  )
+  .superRefine((value, ctx) => {
+    const reserved = new Set<string>(CLIENT_METADATA_RESERVED_KEYS);
+    const custom = Object.keys(value).filter((key) => !reserved.has(key));
+    if (custom.length > CLIENT_METADATA_MAX_CUSTOM_KEYS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `client metadata accepts at most ${CLIENT_METADATA_MAX_CUSTOM_KEYS} custom keys, got ${custom.length}`,
+      });
+    }
+  });
+
 export const versionEntrySchema = z.object({
   version: z.number().int().min(1),
   keyframe: z.boolean().optional(),
@@ -307,6 +349,8 @@ export const versionEntrySchema = z.object({
   note: z.string().optional(),
   content_hash: z.string().regex(CHECKSUM_PATTERN),
   chain_hash: z.string().regex(CHECKSUM_PATTERN),
+  // Annotation, not chained evidence — see VersionEntry.client in types.ts.
+  client: clientMetadataSchema.optional(),
 });
 
 export const documentHistorySchema = z.object({

@@ -1147,8 +1147,14 @@ Each version entry in `history.yaml` records:
 - `note` — reason for change (optional)
 - `content_hash` — SHA-256 of the entry's content (see §8)
 - `chain_hash` — SHA-256 linking this entry to all previous entries (see §8)
+- `client` — caller metadata supplied with the write (see §9.4); omitted when the caller supplied none
 
 `published_at` is the authoritative record used to reconstruct checkpoint history (see §7.3).
+
+`client` is an annotation, NOT chained evidence: it MUST NOT be an input to
+`chain_hash` (§8.2). A history recorded before any caller sent one therefore
+keeps verifying unchanged, and a `client` block proves only what the caller
+asserted about itself — `edited_by` remains the authoritative authoring record.
 
 ```yaml
 # .versions/api-design/history.yaml
@@ -1162,6 +1168,9 @@ versions:
     note: "Initial draft"
     content_hash: sha256:3a7bd3e2360a3d29aa625ddc5b74dac9f9b5b393f7d1e6b5a0c4f2e8d1a3c5b7
     chain_hash:   sha256:f4c2b3a1d9e8f7c6b5a4d3e2f1c0b9a8d7e6f5c4b3a2d1e0f9c8b7a6d5e4f3c2
+    client:
+      agent: claude-code
+      session_id: sess-9f2c41
   - version: 2
     diff: |
       --- v1
@@ -1458,6 +1467,47 @@ The trace records `result_hash`, not `result_content`. The trace proves *what wa
 This extends the provenance chain from knowledge through to action: "The agent resolved `pack:sprint.standup` → read 3 static docs at checkpoint 12 → hydrated `sources/current-sprint-tickets` via Jira MCP (cache miss, result hash `sha256:9f1b...`) → hydrated `sources/recent-pr-activity` via GitHub MCP (cache hit, 4m old) → generated summary."
 
 Note: Audit logging format, storage, and analytics are implementation-defined. This section defines the fields that SHOULD be captured, not the storage format.
+
+### 9.4 Client Metadata
+
+§9.2 answers *what* was read and §6.2 answers *what* was written. Neither says
+*who was calling*. A vault serving several agents, or one agent across many
+sessions, cannot attribute either from the record alone: `edited_by` names a
+person or a service account, and a read leaves no author at all.
+
+Every read and every write operation SHOULD therefore accept an optional
+`client` object describing the CALL:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent` | string | Name of the calling agent, e.g. `claude-code` |
+| `session_id` | string | Identifier of the calling session, opaque to the implementation |
+| *(other keys)* | string \| number \| boolean | Custom metadata, recorded verbatim |
+
+Where it is recorded:
+
+- A write that publishes SHOULD record it on the version entry it seals as
+  `client` (§6.2), so history answers "which agent wrote v7, in which session".
+- A read SHOULD stamp it on the access traces it emits (§9.2), so provenance
+  names the reader as well as the document.
+- An operation that records neither SHOULD still make it available to whatever
+  audit or authorization layer the implementation wraps around the call.
+
+Three constraints are normative:
+
+1. `client` is a **label, not an identity claim.** Implementations MUST NOT
+   authorize from it and MUST NOT treat it as authenticated. Any caller that
+   can set it can set it to anything; authorization belongs to the
+   implementation's identity layer, not to this field.
+2. It MUST NOT be an input to any hash (§8). It annotates a record; it does not
+   seal one.
+3. It MUST be bounded — key count and value size — because it is written to an
+   append-only audit trail by an untrusted caller. Values are scalars.
+   Implementations SHOULD reject an oversized or non-scalar payload rather than
+   truncating it silently.
+
+`client` is distinct from a node's `metadata` frontmatter (§1.5): `metadata`
+describes the document, `client` describes the call that touched it.
 
 ---
 

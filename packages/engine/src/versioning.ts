@@ -4,7 +4,12 @@
  */
 
 import { createPatch, applyPatch } from "diff";
-import type { ContextNode, DocumentHistory, VersionEntry } from "./types.js";
+import type {
+  ClientMetadata,
+  ContextNode,
+  DocumentHistory,
+  VersionEntry,
+} from "./types.js";
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
 import { NestStorage } from "./storage.js";
@@ -46,6 +51,9 @@ export class VersionManager {
     options: {
       note?: string;
       publishedAt?: string;
+      /** Caller metadata recorded on the entry (§9.4). Never hashed — see
+       *  `VersionEntry.client`. */
+      client?: ClientMetadata;
     } = {},
   ): Promise<VersionEntry> {
     const history = (await this.storage.readHistory(node.id)) || {
@@ -128,6 +136,12 @@ export class VersionManager {
       ...(options.note ? { note: options.note } : {}),
       content_hash: contentHash,
       chain_hash: chainHash,
+      // AFTER the hashes: `client` is an annotation on the entry, deliberately
+      // outside `computeChainHash`'s inputs so every history recorded before
+      // this field existed still verifies byte-for-byte.
+      ...(options.client && Object.keys(options.client).length > 0
+        ? { client: options.client }
+        : {}),
     };
 
     // APPEND, never rewrite. The entries already on disk are not reopened for

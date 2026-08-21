@@ -379,6 +379,44 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
     expect(json.published.length).toBe(2);
     expect(json.failed.length).toBe(0);
   });
+
+  it("carries `client` metadata over the wire onto the version entry", async () => {
+    // The whole point of the field is cross-process attribution: an agent on
+    // the far side of stdio says who it is, and the vault's audit trail keeps
+    // it. Asserting it in-process would not prove the MCP tool schema accepts
+    // it — an unadvertised property is dropped before the executor sees it.
+    const meta = { agent: "regression-agent", session_id: "sess-catalog-1", attempt: 1 };
+    const created = await callJson(client, "context_create", {
+      title: "Attributed Write",
+      content: "body",
+      client: meta,
+    });
+    const versions = await callJson(client, "context_versions", {
+      id: created.id,
+      client: meta,
+    });
+    expect(getOperation("context_versions")!.output.safeParse(versions).success).toBe(true);
+    expect(versions.versions.at(-1)!.client).toEqual(meta);
+  });
+
+  it("refuses malformed `client` metadata rather than writing an unvalidated one", async () => {
+    // The SDK validates tool arguments against the published schema before the
+    // handler runs, so this is rejected at the protocol layer rather than
+    // reaching the engine's own VALIDATION_FAILED. Either way the contract that
+    // matters holds: a non-scalar never lands in the audit trail.
+    const { text, isError } = await callText(client, "context_create", {
+      title: "Bad Attribution",
+      content: "body",
+      client: { agent: { nested: "not a scalar" } },
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/client/);
+
+    const listed = await callJson(client, "context_list", {});
+    expect(listed.documents.some((d: { title: string }) => d.title === "Bad Attribution")).toBe(
+      false,
+    );
+  });
 });
 
 // ─── Alias adapter edge cases ───────────────────────────────────────────────

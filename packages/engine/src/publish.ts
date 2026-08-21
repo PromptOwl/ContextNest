@@ -3,7 +3,12 @@
  * Ties together versioning, integrity, checkpoints, and index regeneration.
  */
 
-import type { ContextNode, Frontmatter, VersionEntry } from "./types.js";
+import type {
+  ClientMetadata,
+  ContextNode,
+  Frontmatter,
+  VersionEntry,
+} from "./types.js";
 import { NestStorage, assertSafeDocumentId } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
@@ -15,6 +20,11 @@ import { mapInBatches } from "./concurrency.js";
 export interface PublishOptions {
   editedBy: string;
   note?: string;
+  /**
+   * Caller metadata recorded on the version entry this publish seals (§9.4) —
+   * which agent, in which session. Not hashed; see `VersionEntry.client`.
+   */
+  client?: ClientMetadata;
 }
 
 export interface PublishResult {
@@ -90,6 +100,7 @@ export async function publishDocument(
   const versionEntry = await versionManager.createVersion(node, options.editedBy, {
     note: options.note,
     publishedAt,
+    client: options.client,
   });
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
@@ -223,6 +234,7 @@ export async function publishDocuments(
       const versionEntry = await versionManager.createVersion(node, options.editedBy, {
         note: options.note,
         publishedAt: new Date().toISOString(),
+        client: options.client,
       });
       published.push({
         id: docId,

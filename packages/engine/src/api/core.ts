@@ -19,6 +19,7 @@ import {
   TAG_PATTERN,
   frontmatterSchema,
 } from "../schemas.js";
+import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
 const tag = z.string().regex(TAG_PATTERN);
@@ -79,7 +80,7 @@ const nodeSelectorShape = {
  * what to send. `resolveId` raises the same VALIDATION_FAILED at execution
  * time, which every transport surfaces identically.
  */
-const nodeSelector = z.object(nodeSelectorShape);
+const nodeSelector = z.object({ ...nodeSelectorShape, ...clientField });
 
 // ─── context_search ──────────────────────────────────────────────────────────
 
@@ -91,6 +92,7 @@ const searchOp: OperationDescriptor = {
   input: z.object({
     query: z.string().min(1).describe("Search terms"),
     limit: z.number().int().positive().optional().describe("Max results"),
+    ...clientField,
   }),
   output: z.object({
     results: z.array(nodeSummary.extend({ score: z.number().optional() })),
@@ -130,6 +132,7 @@ const queryOp: OperationDescriptor = {
       .describe(
         "Include unpublished documents (default: published only). For authoring surfaces, where the point is to find the draft you are working on.",
       ),
+    ...clientField,
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -166,6 +169,7 @@ const resolveOp: OperationDescriptor = {
       .min(0)
       .optional()
       .describe("Graph traversal depth (default: 2)"),
+    ...clientField,
   }),
   output: z.object({
     documents: z.array(documentPayload),
@@ -203,6 +207,7 @@ const getOp: OperationDescriptor = {
       .describe(
         "Return a rejected node instead of refusing. Reading one is not the same as republishing it — surfaces that let a steward see and revive retired documents set this.",
       ),
+    ...clientField,
   }),
   output: documentPayload,
   errors: [
@@ -248,6 +253,7 @@ const listOp: OperationDescriptor = {
       .describe(
         "Return each node's full frontmatter and body instead of a summary. For callers that go on to render or gate the documents themselves and would otherwise have to read them all again.",
       ),
+    ...clientField,
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -310,6 +316,7 @@ const createOp: OperationDescriptor = {
     // skill block has exactly one authoritative schema.
     inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
     guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -374,6 +381,7 @@ const updateOp: OperationDescriptor = {
       .describe(
         "Explicit version to stamp, for governed callers that assign version numbers themselves (a draft revision awaiting review). Ignored when publishing, which assigns the version.",
       ),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -407,6 +415,7 @@ const publishOp: OperationDescriptor = {
       .string()
       .optional()
       .describe("Version-history note recorded against the publish (audit trail)."),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -454,6 +463,12 @@ const versionEntryOut = z.object({
   /** Only present when the caller passes `include_diff`. Absent for a keyframe
    *  (a full snapshot has no patch) and for v1. */
   diff: z.string().optional().describe("Unified diff from the previous version"),
+  /** Caller metadata recorded with the write that sealed this version (§9.4). */
+  client: clientMetadataSchema
+    .optional()
+    .describe(
+      "Caller metadata the write carried — agent, session_id, custom keys. Absent for versions written before the caller sent any.",
+    ),
 });
 
 const versionsOp: OperationDescriptor = {
@@ -470,6 +485,7 @@ const versionsOp: OperationDescriptor = {
       .boolean()
       .optional()
       .describe("Attach each version's change log (unified diff from the previous version)"),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -494,6 +510,7 @@ const reconstructOp: OperationDescriptor = {
   input: z.object({
     ...nodeSelectorShape,
     version: z.number().int().positive().describe("Version number to reconstruct"),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -533,7 +550,7 @@ const verifyOp: OperationDescriptor = {
   name: "context_verify",
   namespace: "core",
   description: "Verify every document and checkpoint hash chain in the vault.",
-  input: z.object({}),
+  input: z.object({ ...clientField }),
   output: z.object({ valid: z.boolean(), errors: z.array(verifyError) }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["verify_integrity"],
@@ -554,6 +571,7 @@ const initOp: OperationDescriptor = {
         "Also list every node. Off by default: the counts and tags below answer most opening questions, and a large vault's node list dwarfs them.",
       ),
     limit: z.number().int().positive().optional().describe("Max nodes to list, with include_nodes"),
+    ...clientField,
   }),
   output: z.object({
     context_md: z.string().nullable().describe("The vault's operating instructions, if it has any"),
@@ -596,7 +614,7 @@ const packsOp: OperationDescriptor = {
   name: "context_packs",
   namespace: "core",
   description: "List the context packs defined in the vault.",
-  input: z.object({}),
+  input: z.object({ ...clientField }),
   output: z.object({ packs: z.array(packSummary) }),
   errors: ["VALIDATION_FAILED"],
 };
@@ -633,7 +651,7 @@ const nestsOp: OperationDescriptor = {
   namespace: "core",
   description:
     "List every nest registered in the central registry — local vaults and remote MCP endpoints alike — with its alias, kind, endpoint, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
-  input: z.object({}),
+  input: z.object({ ...clientField }),
   output: z.object({ nests: z.array(nestSummary) }),
   errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
 };
@@ -707,6 +725,7 @@ const importOp: OperationDescriptor = {
       .describe(
         "With `discover`: stamped as `author` on every imported document. The importing user, not the vault's own `author:` — which names someone who need not exist on this host.",
       ),
+    ...clientField,
   }),
   output: z.object({
     published: z.array(z.object({ id: z.string(), version: z.number().int().min(1) })),

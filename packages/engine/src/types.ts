@@ -324,6 +324,16 @@ export interface VersionEntry {
   note?: string;
   content_hash: string;
   chain_hash: string;
+  /**
+   * Caller metadata supplied with the write that produced this version (§9.4)
+   * — which agent, in which session, plus any custom keys.
+   *
+   * Deliberately NOT an input to `chain_hash` (§8.2): the chain covers the
+   * content and the authoring facts the spec names, and every history written
+   * before this field existed must keep verifying byte-for-byte. Treat it as an
+   * annotation on the entry, not as sealed evidence.
+   */
+  client?: ClientMetadata;
 }
 
 /** Document history file (§6.2) */
@@ -460,6 +470,31 @@ export interface VaultRegistry {
   remotes?: Record<string, RemoteNestSpec>;
 }
 
+/**
+ * Caller-supplied metadata attached to an API call (§9.4).
+ *
+ * `agent` and `session_id` are the two fields every caller is expected to send
+ * — they answer "which agent, in which session" for a read or a write. Any
+ * other key is custom, and travels verbatim.
+ *
+ * This is NOT identity: the engine never authenticates it, and never makes a
+ * decision from it. It is a label recorded alongside the action so an audit
+ * trail can attribute it. Authorization stays with the `RbacHook` and the
+ * `actor` on an operation context.
+ *
+ * Bounded by `clientMetadataSchema` (schemas.ts) — this is written into the
+ * append-only version history, so an unbounded payload would be a way to bloat
+ * a vault's audit trail.
+ */
+export interface ClientMetadata {
+  /** Name of the calling agent, e.g. "claude-code". */
+  agent?: string;
+  /** Identifier of the calling session, opaque to the engine. */
+  session_id?: string;
+  /** Custom keys, recorded verbatim. */
+  [key: string]: string | number | boolean | undefined;
+}
+
 /** Trace entry for document access (§9.2) */
 export interface AccessTrace {
   trace_type: "access";
@@ -469,6 +504,8 @@ export interface AccessTrace {
   author?: string;
   edited_at?: string;
   accessed_at: string;
+  /** Caller metadata supplied with the read that produced this trace (§9.4). */
+  client?: ClientMetadata;
 }
 
 /** Trace entry for source hydration (§9.3) */

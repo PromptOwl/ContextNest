@@ -63,6 +63,42 @@ filesystem topology across vaults — the registry file is written `0600` for
 exactly that reason. Local stdio MCP and the CLI already have filesystem
 access, so both include it.
 
+### `client` — caller metadata on every read and write
+
+Every `core` operation takes an optional `client` object naming the calling
+agent and its session, plus any custom scalar keys (spec §9.4):
+
+```jsonc
+// write
+{ "title": "API Design", "content": "…",
+  "client": { "agent": "claude-code", "session_id": "s-9f2", "workspace": "acme" } }
+
+// read
+{ "query": "#api", "client": { "agent": "claude-code", "session_id": "s-9f2" } }
+```
+
+| Operation kind | Where it lands |
+|---|---|
+| Writes that publish (`context_create`, `context_update`, `context_publish`, `context_import`) | The version-history entry the publish seals — `context_versions` returns it as `client` on each entry |
+| Graph reads (`context_query`, `context_resolve`, `context_search`) | The §9.2 access traces the query emits |
+| Everything else | Extension `authorize` / `onResult` hooks, which receive the validated input |
+
+Three things it is not:
+
+- **Not identity.** The engine never authenticates `agent` and no executor
+  branches on it. Authorization stays with the `RbacHook` and the context's
+  `actor`.
+- **Not hashed.** `VersionEntry.client` is deliberately outside
+  `computeChainHash`'s inputs, so a history recorded before the field existed
+  still verifies byte-for-byte.
+- **Not `metadata`.** `metadata` on create/update/import is *frontmatter* — it
+  lands in the document. `client` describes the call that touched it. The two
+  mean opposite things, which is why they cannot share a name.
+
+Bounded on purpose (`clientMetadataSchema` in `schemas.ts`): values are scalars
+of at most 512 chars, and at most 16 custom keys beyond the reserved two.
+It is written into an append-only audit trail by a caller we do not trust.
+
 ## Public API
 
 ```ts
@@ -74,6 +110,9 @@ import {
   inputJsonSchema,   // draft-07 JSON Schema for an op's input
   outputJsonSchema,  // draft-07 JSON Schema for an op's output
   createEngineApi,   // executable runtime: .run(name, input, ctx)
+  clientField,       // { client } — spread into an extension op's input object
+  clientMetadataSchema,
+  type ClientMetadata,
 } from "@promptowl/contextnest-engine/api";
 ```
 

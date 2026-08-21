@@ -118,6 +118,27 @@ them over the legacy tools below.
 | `context_delete` | Delete a node and its version history; returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish. Takes `documents` (title + content) and/or `ids` (files already in the vault, published as-is) — a mixed batch seals **one** checkpoint and regenerates the index **once** |
 
+#### `client` — attributing a call
+
+Every tool above takes an optional `client` object naming the calling agent and
+its session, plus any custom scalar keys:
+
+```jsonc
+context_create({
+  title: "API Design",
+  content: "…",
+  client: { agent: "claude-code", session_id: "s-9f2" }
+})
+```
+
+A write that publishes records it on the version-history entry it seals, so
+`context_versions` can answer *which agent wrote v7, in which session*; a graph
+read stamps it on the access traces it emits. It is a label, never an identity
+claim — the server does not authenticate it and never authorizes from it — and
+it is not an input to any hash chain. Note that `client` describes the CALL;
+`metadata` on `context_create` / `context_update` is frontmatter and describes
+the DOCUMENT. See spec §9.4.
+
 ### Vault tools
 
 | Tool | Description |

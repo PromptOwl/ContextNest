@@ -9,6 +9,7 @@
  */
 
 import type {
+  ClientMetadata,
   ContextNode,
   ContextYaml,
   GraphQueryResult,
@@ -33,6 +34,12 @@ export interface GraphQueryOptions {
   full?: boolean;
   /** Include draft documents (default: false) */
   includeDrafts?: boolean;
+  /**
+   * Caller metadata (§9.4) — agent name, session id, custom keys — stamped on
+   * every access trace this query emits, so a §9.2 provenance record says which
+   * agent read the document, not just which document was read.
+   */
+  client?: ClientMetadata;
 }
 
 export class GraphQueryEngine {
@@ -143,6 +150,7 @@ export class GraphQueryEngine {
         checkpoint: currentCheckpoint,
         author: doc.frontmatter.author,
         editedAt: doc.frontmatter.updated_at,
+        client: options.client,
       });
     }
 
@@ -196,6 +204,7 @@ export class GraphQueryEngine {
       resolver,
       packLoader,
       currentCheckpoint,
+      client: options.client,
     });
 
     const result = await injector.inject(selector);

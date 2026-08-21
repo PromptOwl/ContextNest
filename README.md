@@ -599,6 +599,13 @@ cloud:
 | `context_delete` | Delete a node and its history; returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
 
+Every tool above also takes an optional `client` object — `{ agent, session_id, …custom }` —
+naming the agent and session behind the call. A write that publishes records it on the
+version-history entry it seals (so `context_versions` shows which agent wrote which version);
+a graph read stamps it on the access traces it emits. It is a label, not an identity claim:
+it is never authenticated, never used to authorize, and never an input to a hash chain. See
+spec §9.4.
+
 **Vault tools:**
 
 | Tool | Description |

@@ -11,7 +11,12 @@
  * existing surfaces (published-only search, index regeneration after publish,
  * status/tag normalization, document validation before write).
  */
-import type { ContextNode, Frontmatter, SkillMeta } from "../types.js";
+import type {
+  ClientMetadata,
+  ContextNode,
+  Frontmatter,
+  SkillMeta,
+} from "../types.js";
 import {
   serializeDocument,
   validateDocument,
@@ -169,10 +174,12 @@ async function publishAndIndex(
   ctx: OperationContext,
   id: string,
   note?: string,
+  client?: ClientMetadata,
 ): Promise<{ version: number; checkpoint: number }> {
   const res = await publishDocument(ctx.storage, id, {
     editedBy: ctx.actor ?? "engine",
     ...(note ? { note } : {}),
+    ...(client ? { client } : {}),
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
@@ -186,6 +193,9 @@ const query: OperationExecutor = async (ctx, input: any) => {
     hops: clampHops(input.hops),
     full: input.full ?? false,
     includeDrafts: input.include_drafts ?? false,
+    // Every access trace this query emits is stamped with the caller (§9.4),
+    // so provenance records which agent read the node, not just which node.
+    client: input.client,
   });
   return {
     documents: result.documents.map((d) => toSummary(d, true)),
@@ -205,6 +215,7 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
   const result = await ctx.query.query(input.selector, {
     hops: clampHops(input.hops),
     full: false,
+    client: input.client,
   });
   const budget = input.max_tokens ?? 8000;
   const documents: Array<{ id: string; frontmatter: Frontmatter; body: string }> = [];
@@ -236,7 +247,10 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // keeps recall while guaranteeing a single well-formed URI token.
   const q = slugify(String(input.query));
   if (!q) return { results: [] };
-  const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
+  const result = await ctx.query.query(`contextnest://search/${q}`, {
+    full: true,
+    client: input.client,
+  });
   const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
   return { results: docs.map((d) => toSummary(d)) };
 };
@@ -359,7 +373,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
       checkpoint: null,
     };
   }
-  const result = await publishAndIndex(ctx, node.id, input.note);
+  const result = await publishAndIndex(ctx, node.id, input.note, input.client);
   return {
     id: node.id,
     version: result.version,
@@ -455,7 +469,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
       checkpoint: null,
     };
   }
-  const result = await publishAndIndex(ctx, id, input.note);
+  const result = await publishAndIndex(ctx, id, input.note, input.client);
   return { id, version: result.version, status: "published", checkpoint: result.checkpoint };
 };
 
@@ -466,6 +480,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
   const result = await publishDocument(ctx.storage, id, {
     editedBy: ctx.actor ?? "engine",
     ...(input.note ? { note: input.note } : {}),
+    ...(input.client ? { client: input.client } : {}),
   });
   await ctx.storage.regenerateIndex();
   return {
@@ -513,6 +528,7 @@ const versions: OperationExecutor = async (ctx, input: any) => {
         note: v.note,
         content_hash: v.content_hash,
         chain_hash: v.chain_hash,
+        ...(v.client ? { client: v.client } : {}),
         ...(versionManager
           ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
           : {}),
@@ -701,6 +717,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       onProgress: ctx.onProgress,
+      ...(input.client ? { client: input.client } : {}),
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
