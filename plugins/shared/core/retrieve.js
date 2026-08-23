@@ -29,7 +29,7 @@ import {
   MAX_HITS,
 } from "./lib.js";
 import { correctionIntent } from "./signals.js";
-import { clearPending, loadLedger } from "./ledger.js";
+import { clearPending, loadLedger, saveLedger } from "./ledger.js";
 
 const HEADER = "Relevant Context Nest vault material (auto-retrieved):";
 
@@ -47,15 +47,18 @@ const CHANGE_LADDER = [
   "This prompt looks like a correction. If it contradicts anything in the vault,",
   "resolve it by ladder, stopping at the first rung that applies:",
   "(1) does the vault actually assert the old value? If not, change nothing and say so.",
-  "(2) find EVERY occurrence before editing — `ctx search` is ranked and",
+  "(2) find EVERY occurrence before editing, in EVERY nest that could carry it",
+  "(`ctx vault list --json`, then per candidate nest) — `ctx search` is ranked and",
   "published-only, so also check `ctx list --json` and `ctx list --status draft --json`,",
   "then `ctx read <id> --raw` the candidates.",
   "(3) one node, one sentence → make that one edit and nothing else.",
   "(4) several nodes carry the same stale fact → note the before-marker",
-  "(`ctx checkpoint list --json -n 1`) and fix all of them in one pass; a",
-  "half-swept vault contradicts itself. Then say that the duplication is the",
-  "root cause, and offer to make one node canonical with the rest linking to it",
-  "— offer, don't do it.",
+  "(`ctx checkpoint list --json -n 1` per nest) and fix all of them; when the",
+  "set spans nests or is large, fan out `contextnest-curator` agents in a single",
+  "message — one per nest at least, each owning a disjoint slice — a half-swept",
+  "vault contradicts itself. Then say that the duplication is the root cause,",
+  "and offer to make one node canonical with the rest linking to it — offer,",
+  "don't do it.",
   "(5) structural (a concept renamed, a decision reversed, a node whose title or",
   "type no longer fits) → stop, show the change-set, and ask before writing.",
 ].join(" ");
@@ -177,9 +180,9 @@ export function run({ input, env, exec, ledgerIo = {} }) {
   // the model, so a job must survive `retrieval_mode: off` and an empty prompt.
   // Draining is unconditional: handed over once, never re-offered.
   const sessionId = input?.session_id;
-  const ledger = loadLedger(sessionId, ledgerIo);
-  const queued = ledger.pending?.reason || null;
-  if (queued) clearPending(sessionId, ledger, ledgerIo);
+  let ledger = loadLedger(sessionId, ledgerIo);
+  const queued = formatQueued(ledger.pending);
+  if (queued) ledger = clearPending(sessionId, ledger, ledgerIo);
 
   if (mode === "off") return queued ? wrap(queued) : null;
 
@@ -194,9 +197,29 @@ export function run({ input, env, exec, ledgerIo = {} }) {
   if (!query) return queued ? wrap(queued) : null;
 
   const hits = searchAll(exec, config, query);
+
+  // Stash this turn's hit refs as warm seeds. If the end of this turn parks a
+  // change job, the scout starts from the nodes retrieval ALREADY matched on
+  // the very prompt where the user stated the fact — instead of cold.
+  saveLedger(
+    sessionId,
+    { ...ledger, lastHits: hits.map((h) => (h.vault ? `${h.vault}:${h.id}` : h.id)) },
+    ledgerIo,
+  );
+
   const context = mode === "query" ? formatQuery(exec, config, hits) : formatSearch(hits);
   if (!context && !ladder && !queued) return null;
   return wrap(join(context));
+}
+
+/** Render a parked job as the dispatch block, appending its warm seeds. */
+function formatQueued(pending) {
+  if (!pending?.reason) return null;
+  if (!pending.seeds?.length) return pending.reason;
+  return [
+    pending.reason,
+    `Warm seeds — nodes retrieval matched when the user stated this (start the scout here, but do not stop here): ${pending.seeds.join(", ")}.`,
+  ].join(" ");
 }
 
 function wrap(additionalContext) {

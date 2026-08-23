@@ -58,7 +58,12 @@ describe("hooks.json", () => {
 
   it("registers only known events", () => {
     for (const event of Object.keys(hooks)) expect(KNOWN_EVENTS.has(event)).toBe(true);
-    expect(Object.keys(hooks).sort()).toEqual(["SessionStart", "Stop", "UserPromptSubmit"]);
+    expect(Object.keys(hooks).sort()).toEqual([
+      "PostToolUse",
+      "SessionStart",
+      "Stop",
+      "UserPromptSubmit",
+    ]);
   });
 
   it("every command references an existing core script via CLAUDE_PLUGIN_ROOT", () => {
@@ -130,6 +135,24 @@ describe("config command (CU-wdqcpzw825: settings must be changeable after enabl
   });
 });
 
+describe("sweep-check hook registration", () => {
+  const hooks = readJson(join(plugin, "hooks", "hooks.json")).hooks;
+
+  it("PostToolUse is scoped to Bash and carries an explicit timeout", () => {
+    const groups = hooks.PostToolUse;
+    expect(groups).toHaveLength(1);
+    // Matcher keeps the hook off Read/Edit/etc — it only ever inspects shell
+    // commands, so firing anywhere else is pure overhead.
+    expect(groups[0].matcher).toBe("Bash");
+    const h = groups[0].hooks[0];
+    expect(h.command).toContain("core/sweep-check.js");
+    // It shells out to ctx several times; an explicit ceiling keeps a slow
+    // vault from stalling the loop on every Bash call.
+    expect(typeof h.timeout).toBe("number");
+    expect(h.timeout).toBeGreaterThan(0);
+  });
+});
+
 describe("dispatched agents run in the background", () => {
   // The Stop hook parks work instead of blocking the turn, and the next prompt
   // dispatches it. If these lose `background: true`, the dispatch runs inline
@@ -178,6 +201,7 @@ describe("vendored core sync", () => {
       "capture-gate.js",
       "signals.js",
       "ledger.js",
+      "sweep-check.js",
     ]) {
       expect(read(join(plugin, "core", name))).toBe(
         read(join(repo, "plugins", "shared", "core", name)),

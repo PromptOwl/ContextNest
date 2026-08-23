@@ -43,7 +43,21 @@ export const PENDING_KINDS = ["capture", "change"];
  * the vault work overlaps the user's next request instead of delaying the end
  * of their last one.
  */
-const EMPTY = { lastGatedTurn: null, captured: [], pending: null };
+const EMPTY = { lastGatedTurn: null, captured: [], pending: null, lastHits: [] };
+
+/** Cap on stashed retrieval hits — seeds for the scout, not an archive. */
+const MAX_LAST_HITS = 12;
+
+/**
+ * Validate the stashed retrieval hit set. Each entry is a vault-qualified ref
+ * ("alias:nodes/x" or "nodes/x"). These are the warm seeds the change scout
+ * starts from: the hits retrieval computed on the very turn the user stated
+ * the fact, which beats starting the occurrence search cold.
+ */
+function readLastHits(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((h) => typeof h === "string" && h.length > 0).slice(0, MAX_LAST_HITS);
+}
 
 /**
  * Validate a parked job read back off disk. Anything malformed becomes `null`
@@ -55,7 +69,7 @@ function readPending(raw) {
   if (!PENDING_KINDS.includes(raw.kind)) return null;
   if (typeof raw.reason !== "string" || raw.reason.length === 0) return null;
   const turn = typeof raw.turn === "number" && Number.isFinite(raw.turn) ? raw.turn : null;
-  return { kind: raw.kind, reason: raw.reason, turn };
+  return { kind: raw.kind, reason: raw.reason, turn, seeds: readLastHits(raw.seeds) };
 }
 
 /**
@@ -101,6 +115,7 @@ export function loadLedger(sessionId, io = {}) {
         ? parsed.captured.filter((h) => typeof h === "string")
         : [],
       pending: readPending(parsed.pending),
+      lastHits: readLastHits(parsed.lastHits),
     };
   } catch {
     return { ...EMPTY };
@@ -135,6 +150,7 @@ export function saveLedger(sessionId, state, io = {}) {
         lastGatedTurn: state.lastGatedTurn ?? null,
         captured: (state.captured || []).slice(-50),
         pending: readPending(state.pending),
+        lastHits: readLastHits(state.lastHits),
       }),
     );
     return true;

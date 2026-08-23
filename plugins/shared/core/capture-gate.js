@@ -62,13 +62,13 @@ const LADDER = [
 
 /**
  * These read as next-turn directives, not end-of-turn ones: they are parked by
- * the Stop hook and handed to the model by the following UserPromptSubmit. Both
- * ask for background dispatch — the whole point is that the user's current
- * request is answered first and the vault work runs alongside it.
+ * the Stop hook and handed to the model by the following UserPromptSubmit. The
+ * writes they dispatch run in the background — the user's current request is
+ * answered first, and the vault work overlaps it.
  */
 const BACKGROUND = [
-  "Run it in the background (the agent is declared `background: true`) and answer",
-  "the user's current request first — they must not wait on the vault.",
+  "The write agents are declared `background: true` — dispatch them and answer",
+  "the user's current request; they must not wait on the vault.",
 ].join(" ");
 
 /** What the model is told to do when the previous turn produced possible new knowledge. */
@@ -81,19 +81,41 @@ export function captureReason(mode) {
   return [
     "A Context Nest capture pass was queued at the end of your previous turn.",
     `Invoke the \`contextnest-capture\` agent ${posture}`,
+    "If the material genuinely belongs in more than one nest, it writes one node",
+    "per nest and links the rest to the first (`[[wikilink]]`/vault:id) — never a",
+    "duplicated body.",
     BACKGROUND,
     LADDER,
     "If nothing clears the ladder, it says nothing at all.",
   ].join(" ");
 }
 
-/** What the model is told to do when the user corrected something last turn. */
+/**
+ * What the model is told to do when the user corrected something last turn.
+ *
+ * Not "invoke the curator": a single curator inherits single-nest tunnel
+ * vision. The dispatch is route → scout → fan out, with the scout being the
+ * same retriever agent retrieval already uses — the read side and the write
+ * side share one setup for deciding what a fact touches.
+ */
 export const CHANGE_REASON = [
   "A Context Nest correction sweep was queued at the end of your previous turn:",
-  "the user corrected something the vault may record. Invoke the",
-  "`contextnest-curator` agent. It must find EVERY node carrying the stale fact —",
-  "not just the first search hit — and change them together, or report that the",
-  "vault never asserted it.",
+  "the user stated something that contradicts what the vault(s) may record.",
+  "Run it as route → scout → fan out:",
+  "(1) ROUTE — `ctx vault list --json`; candidates are the pinned nest plus any",
+  "whose description plausibly covers the fact. Pinned-first, never pinned-only.",
+  "(2) SCOUT — invoke the `contextnest-retriever` agent in scout mode",
+  "(foreground; it is read-only and fast): give it the old value, the new value,",
+  "and the entity names, plus the candidate nests. It returns an occurrence map —",
+  "`alias:id` with a one-line quote per node, drafts included.",
+  "(3) FAN OUT — partition the map and invoke `contextnest-curator` once per",
+  "unit of work IN A SINGLE MESSAGE so they run in parallel: at least one per",
+  "affected nest, and split a large nest across several curators, each owning a",
+  "disjoint slice of node ids. Tell each curator its `--vault <alias>` and its",
+  "exact scope. Concurrent writes are safe — the vault serializes them — but a",
+  "node belongs to exactly one curator.",
+  "If the scout finds nothing anywhere, say so in one line; the vault never",
+  "asserted it.",
   BACKGROUND,
 ].join(" ");
 
@@ -224,7 +246,14 @@ export function run({ input, env, readTranscript: readT = readTranscript, ledger
   parkJob(
     sessionId,
     stamped,
-    { kind: signal.kind, reason: signal.reason, turn: transcript.userTurns },
+    {
+      kind: signal.kind,
+      reason: signal.reason,
+      turn: transcript.userTurns,
+      // Warm seeds: the refs retrieval matched on this very turn (stashed by
+      // retrieve.js). The scout starts from them instead of cold.
+      seeds: ledger.lastHits,
+    },
     ledgerIo,
   );
 

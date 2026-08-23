@@ -110,8 +110,9 @@ const CORRECTION_PATTERNS = [
   /\b(actually|correction)\b/i,
   /\bto\s+correct\b/i,
   /\bthat'?s\s+(wrong|incorrect|not\s+right|outdated|stale)\b/i,
-  /\bno,?\s+it'?s\b/i,
-  /\bnot\s+\w+[\s,]+(it'?s|but)\b/i,
+  /\bno,?\s+it\s+is\b|\bno,?\s+it'?s\b/i,
+  /\bnot\s+[\w.-]+\s*,\s*[\w.-]+/i, // bare "not X, Y"
+  /\bnot\s+\w+[\s,]+(it'?s|it\s+is|but)\b/i,
   /\bchange\b[^.?!]*\bto\b/i,
   /\brename[ds]?\b/i,
   /\breplace\b[^.?!]*\bwith\b/i,

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0
+
+An update now lands in every node that carries the fact, across every nest that
+carries it — however you phrased it, with the work fanned out in parallel.
+
+- **A `PostToolUse` sweep-check catches incomplete updates at the write.** The
+  old guard was a regex over your phrasing, which missed almost every
+  declarative update ("we moved to Postgres") — so the model fixed one node and
+  stopped. The new hook is mechanical: after any successful `ctx update` it
+  diffs the node against its previous version, finds which terms the edit
+  removed, searches **every registered nest** for them, reads each candidate to
+  confirm, and hands the model the list of nodes still asserting the old value
+  — mid-turn, so it finishes the sweep immediately. Tunables:
+  `CONTEXTNEST_SWEEP_MAX_CANDIDATES` (default 24), `CONTEXTNEST_SWEEP_CHECK=off`.
+- **Correction dispatch is now route → scout → fan out.** The retriever agent
+  gained a scout mode (the same setup retrieval uses) that returns an occurrence
+  map across candidate nests; the dispatcher partitions the map and launches
+  curators **in parallel — as many as the work needs**, at least one per nest,
+  more for a large nest, each owning a disjoint slice. Retrieval hits from the
+  turn where you stated the fact are stashed as warm seeds for the scout.
+- **Concurrent writes are now safe (engine).** Parallel writers used to corrupt
+  the vault's hash chain silently — measured: 6 concurrent updates lost seals
+  and broke `ctx verify`. A per-vault write lock in the engine's mutating
+  operations serializes the checkpoint seal across processes, which also covers
+  remote nests: the MCP server runs the same operations on its own disk.
+- The capture agent may now propose into more than one nest when a fact
+  genuinely belongs in both — one node per nest, the secondary referencing the
+  primary, never duplicated prose.
+- Curators are scoped by contract: given a nest (and optionally a node list),
+  they stay inside it and report anything beyond it instead of chasing.
+- Two correction-pattern repairs: unabbreviated "no, it is" and bare
+  "not X, Y" are now recognized.
+
 ## 0.4.0
 
 The end-of-turn vault work no longer blocks you.
