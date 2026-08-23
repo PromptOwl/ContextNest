@@ -11,9 +11,14 @@ Makes any Claude Code session **vault-aware** and **self-maintaining**:
 - **Never in your way** — the `Stop` hook never blocks the end of a turn. It parks
   the job and notes it in the transcript; your next message dispatches it to a
   background agent that works alongside whatever you asked for next.
-- **Consistent corrections** — when you correct something the vault records, a curator
-  agent sweeps for every node carrying the stale fact and changes them together,
-  rather than fixing the first hit and leaving the rest contradicting it.
+- **Consistent corrections** — when you change something the nests record, the
+  retriever scouts an occurrence map across every candidate nest and curator
+  agents fan out in parallel over it — as many as the work needs — so the change
+  lands everywhere, not in the first search hit. A `PostToolUse` sweep-check
+  backstops it mechanically: after any `ctx update` it diffs the node against
+  its previous version and reports every node, in every nest, still carrying the
+  removed value. That check keys on the *write*, so it works no matter how the
+  request was phrased.
 - **Session overview** — a `SessionStart` hook injects a compact list of your vaults.
 
 Everything runs through the existing [`ctx`](../../packages/cli) CLI internally — no
@@ -127,9 +132,10 @@ security vault are judged on their own terms.
 | Hook | `SessionStart` | Inject vault overview (or a warning if `ctx` is missing) |
 | Hook | `UserPromptSubmit` | Effort-toggled retrieval injection, and dispatches any parked job |
 | Hook | `Stop` | Decides and parks; never blocks. Fires on explicit intent, a correction, or past the cooldown |
-| Agent | `contextnest-retriever` | Selects vault(s), builds a selector, runs `ctx query`, returns a cited digest |
+| Hook | `PostToolUse` (Bash) | After a `ctx update`: diffs against the prior version and names every node, in every nest, still carrying the removed value |
+| Agent | `contextnest-retriever` | Digest mode for questions; scout mode returns an occurrence map for writes |
 | Agent | `contextnest-capture` | Walks the capture ladder; proposes (or, in `auto`, writes) the minimum |
-| Agent | `contextnest-curator` | Sweeps the vault so a correction lands in every node that carries it |
+| Agent | `contextnest-curator` | Fixes its assigned scope (nest, or node slice) exhaustively; fanned out in parallel |
 | Skill | `/contextnest:recall <topic>` | Manual deep retrieval |
 | Command | `/contextnest:config` | View/change plugin settings after enable |
 | Command | `/contextnest:capture` | Capture on purpose, even when `capture_mode` is `off` |

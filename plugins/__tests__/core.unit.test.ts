@@ -22,6 +22,13 @@ import {
   lastUserMessage,
 } from "../shared/core/signals.js";
 import {
+  run as sweepCheck,
+  bodyOf,
+  droppedTerms,
+  findStragglers,
+  parseUpdate,
+} from "../shared/core/sweep-check.js";
+import {
   clearPending,
   inCooldown,
   loadLedger,
@@ -64,16 +71,22 @@ function fakeLedgerIo(seed: Record<string, string> = {}) {
   };
 }
 
-/** Build a fake exec from a list of [substringMatch, jsonValue]. */
+/**
+ * Build a fake exec from a list of [substringMatch, value]. Non-string values
+ * are emitted as JSON (what `--json` commands print); string values pass
+ * through raw, matching commands like `read --raw`/`reconstruct` whose stdout
+ * is a document, not JSON.
+ */
 function fakeExec(routes: [string, unknown][], fallback: unknown = []) {
+  const render = (val: unknown) => (typeof val === "string" ? val : JSON.stringify(val));
   return (args: string[]) => {
     const key = args.join(" ");
     for (const [match, val] of routes) {
       if (key.includes(match)) {
-        return { status: 0, stdout: JSON.stringify(val), stderr: "" };
+        return { status: 0, stdout: render(val), stderr: "" };
       }
     }
-    return { status: 0, stdout: JSON.stringify(fallback), stderr: "" };
+    return { status: 0, stdout: render(fallback), stderr: "" };
   };
 }
 
@@ -623,13 +636,18 @@ describe("ledger", () => {
   it("round-trips through save → load", () => {
     const io = fakeLedgerIo();
     expect(saveLedger("sess1", { lastGatedTurn: 7, captured: ["a"] }, io)).toBe(true);
-    expect(loadLedger("sess1", io)).toEqual({ lastGatedTurn: 7, captured: ["a"], pending: null });
+    expect(loadLedger("sess1", io)).toEqual({
+      lastGatedTurn: 7,
+      captured: ["a"],
+      pending: null,
+      lastHits: [],
+    });
   });
 
   it("parks and clears a pending job without losing the rest of the ledger", () => {
     const io = fakeLedgerIo();
     saveLedger("s", { lastGatedTurn: 3, captured: ["keep me"] }, io);
-    const job = { kind: "change", reason: "sweep it", turn: 4 };
+    const job = { kind: "change", reason: "sweep it", turn: 4, seeds: ["eng:nodes/x"] };
 
     parkJob("s", loadLedger("s", io), job, io);
     const parked = loadLedger("s", io);
@@ -656,13 +674,19 @@ describe("ledger", () => {
     const io = fakeLedgerIo();
     expect(saveLedger("../evil", { lastGatedTurn: 1 }, io)).toBe(false);
     expect(Object.keys(io.files)).toHaveLength(0);
-    expect(loadLedger("../evil", io)).toEqual({ lastGatedTurn: null, captured: [], pending: null });
+    expect(loadLedger("../evil", io)).toEqual({
+      lastGatedTurn: null,
+      captured: [],
+      pending: null,
+      lastHits: [],
+    });
   });
 
   it("a missing or malformed file degrades to empty rather than throwing", () => {
     const io = fakeLedgerIo({ "/fake-home/.contextnest/plugin-state/bad.json": "{oops" });
-    expect(loadLedger("bad", io)).toEqual({ lastGatedTurn: null, captured: [], pending: null });
-    expect(loadLedger("absent", io)).toEqual({ lastGatedTurn: null, captured: [], pending: null });
+    const empty = { lastGatedTurn: null, captured: [], pending: null, lastHits: [] };
+    expect(loadLedger("bad", io)).toEqual(empty);
+    expect(loadLedger("absent", io)).toEqual(empty);
   });
 
   it("inCooldown: the clock starts at session start, not at the first gate", () => {
@@ -671,6 +695,119 @@ describe("ledger", () => {
     expect(inCooldown({ lastGatedTurn: null, captured: [], pending: null }, 10, 5)).toBe(false);
     expect(inCooldown({ lastGatedTurn: 8, captured: [], pending: null }, 10, 5)).toBe(true);
     expect(inCooldown({ lastGatedTurn: 4, captured: [], pending: null }, 10, 5)).toBe(false);
+  });
+});
+
+describe("sweep-check", () => {
+  it("parseUpdate: accepts ctx update with/without --vault, rejects everything else", () => {
+    expect(parseUpdate("ctx update nodes/a --body x --yes")).toEqual({ id: "nodes/a", vault: null });
+    expect(parseUpdate('npx ctx update "nodes/my doc" --vault work --body x')).toEqual({
+      id: "nodes/my doc",
+      vault: "work",
+    });
+    for (const cmd of ["ls -la", "ctx add nodes/a --body x", "ctx read nodes/a", "git update-index", ""]) {
+      expect(parseUpdate(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("bodyOf strips frontmatter and tolerates non-strings", () => {
+    expect(bodyOf("---\ntitle: X\n---\nThe body.")).toBe("The body.");
+    expect(bodyOf("no frontmatter")).toBe("no frontmatter");
+    expect(bodyOf(undefined)).toBe("");
+  });
+
+  it("droppedTerms: finds removed values, skips stopwords, empty for pure additions", () => {
+    expect(droppedTerms("Sessions live in Redis.", "Sessions live in Postgres.")).toEqual(["redis"]);
+    // "the"/"now" are stopwords; short tokens are skipped.
+    expect(droppedTerms("the x is 5s now", "the x is 9s")).toEqual([]);
+    expect(droppedTerms("value is X", "value is X and more detail")).toEqual([]);
+  });
+
+  it("findStragglers: confirms by read, spans nests, excludes only the written node in its own nest", () => {
+    const exec = fakeExec([
+      // eng: sibling still asserts redis; the written node does not any more.
+      ["search redis --json --vault eng", [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
+      ["read nodes/sibling --raw --vault eng", "---\nt: x\n---\nCounters kept in Redis."],
+      // mkt: fuzzy hit whose body does NOT contain the term → must be dropped.
+      ["search redis --json --vault mkt", [{ id: "nodes/fuzzy" }]],
+      ["read nodes/fuzzy --raw --vault mkt", "---\nt: x\n---\nNothing relevant here."],
+    ]);
+    const { found, truncated } = findStragglers(exec, ["redis"], "nodes/written", "eng", ["eng", "mkt"]);
+    expect(found).toEqual([{ ref: "eng:nodes/sibling", term: "redis" }]);
+    expect(truncated).toBe(false);
+  });
+
+  it("findStragglers: honours the candidate budget and reports truncation", () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({ id: `nodes/n${i}` }));
+    const exec = fakeExec([
+      ["search", many],
+      ["read", "---\nt: x\n---\nstill says redis"],
+    ]);
+    const { found, truncated } = findStragglers(exec, ["redis"], "nodes/x", null, [null], 5);
+    expect(truncated).toBe(true);
+    expect(found.length).toBeLessThanOrEqual(5);
+  });
+
+  it("run: a non-ctx Bash command returns null without a single exec call", () => {
+    let calls = 0;
+    const exec = () => {
+      calls++;
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    expect(sweepCheck({ input: { tool_input: { command: "npm test" } }, env: {}, exec })).toBeNull();
+    expect(calls).toBe(0);
+  });
+
+  it("run: reports cross-nest stragglers with vault-qualified refs after a real update", () => {
+    const history = { versions: [{ version: 1 }, { version: 2 }] };
+    const exec = fakeExec([
+      ["vault list", [{ alias: "eng", exists: true }, { alias: "mkt", exists: true }]],
+      ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+      ["history nodes/a --json --vault eng", history],
+      ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+      ["search redis --json --vault eng", [{ id: "nodes/a" }]],
+      ["search redis --json --vault mkt", [{ id: "nodes/pitch" }]],
+      ["read nodes/pitch --raw --vault mkt", "---\nt: x\n---\nWe brag about Redis speed."],
+    ]);
+    const out = sweepCheck({
+      input: { tool_input: { command: "ctx update nodes/a --vault eng --body whatever" } },
+      env: {},
+      exec,
+    });
+    const text = out?.hookSpecificOutput?.additionalContext ?? "";
+    expect(out?.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
+    expect(text).toContain("eng:nodes/a is incomplete");
+    expect(text).toContain('mkt:nodes/pitch still contains "redis"');
+    expect(text).toMatch(/contextnest-curator/);
+  });
+
+  it("run: silent when nothing was dropped or no straggler survives the read check", () => {
+    const history = { versions: [{ version: 1 }, { version: 2 }] };
+    const exec = fakeExec([
+      ["vault list", []],
+      ["read nodes/a --raw", "---\nt: x\n---\nBody with extra detail added."],
+      ["history nodes/a --json", history],
+      ["reconstruct nodes/a 1", "---\nt: x\n---\nBody with"],
+    ]);
+    expect(
+      sweepCheck({ input: { tool_input: { command: "ctx update nodes/a --body x" } }, env: {}, exec }),
+    ).toBeNull();
+  });
+
+  it("run: CONTEXTNEST_SWEEP_CHECK=off disables it", () => {
+    let calls = 0;
+    const exec = () => {
+      calls++;
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    expect(
+      sweepCheck({
+        input: { tool_input: { command: "ctx update nodes/a --body x" } },
+        env: { CONTEXTNEST_SWEEP_CHECK: "off" },
+        exec,
+      }),
+    ).toBeNull();
+    expect(calls).toBe(0);
   });
 });
 
@@ -750,8 +887,13 @@ describe("capture-gate", () => {
 
     const parked = loadLedger("s1", io).pending;
     expect(parked?.kind).toBe("change");
+    // The dispatch is route → scout → fan out: the retriever scouts the
+    // occurrence map, then curators are fanned out over disjoint slices.
+    expect(parked?.reason).toMatch(/contextnest-retriever/);
     expect(parked?.reason).toMatch(/contextnest-curator/);
-    expect(parked?.reason).toMatch(/EVERY node/);
+    expect(parked?.reason).toMatch(/parallel/);
+    expect(parked?.reason).toMatch(/disjoint/);
+    expect(parked?.reason).toMatch(/Pinned-first, never pinned-only/);
   });
 
   it("both dispatch directives ask for background execution", () => {

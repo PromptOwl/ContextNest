@@ -15,7 +15,8 @@ into each agent plugin.
 | `core/capture-gate.js` | `Stop` handler — decides whether to touch the vault and parks the job; never blocks the turn. |
 | `core/signals.js` | Pure transcript classifiers: the last real user message, explicit capture intent, correction intent. |
 | `core/ledger.js` | Per-session state under `~/.contextnest/plugin-state/` — the ambient-capture cooldown and the parked job queue. |
-| `prompts/retriever.md` | Body of the retriever agent. |
+| `core/sweep-check.js` | `PostToolUse` handler — after a `ctx update`, finds nodes in any nest still carrying the removed value. |
+| `prompts/retriever.md` | Body of the retriever agent (digest mode + scout mode for writes). |
 | `prompts/capture.md` | Body of the capture agent (the capture ladder). |
 | `prompts/curate.md` | Body of the curator agent (the change and escalation ladders). |
 | `prompts/recall.md` | Body of the manual recall skill. |

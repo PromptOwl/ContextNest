@@ -7,11 +7,22 @@ Bash tool.
 The failure this exists to prevent: fixing one node, leaving three others
 asserting the old value, and reporting success.
 
-## 1. Pick the vault
+## 1. Know your scope
 
-Run `ctx vault list --json`. Use the pinned alias if it is registered; if the
-pin is stale (not in the list), ignore it and choose by `description`. Pass
-`--vault <alias>` to every subsequent command.
+You are usually dispatched with an explicit scope: a `--vault <alias>`, and
+often a list of node ids you own (other curators may be running in parallel on
+their own slices — concurrent writes are safe, the vault serializes them, but a
+node belongs to exactly one curator).
+
+- **Given a scope: stay inside it.** Pass `--vault <alias>` to every command.
+  If you were given node ids, touch only those nodes; your sweep confirms and
+  fixes them, it does not expand the set.
+- **Evidence outside your scope** — the fact in another nest, or in nodes not
+  on your list — goes in your report as one line. You do not chase it; the
+  dispatcher owns the partition.
+- **No scope given?** Run `ctx vault list --json`, use the pinned alias if
+  registered (stale pin → choose by `description`), and sweep that one nest
+  fully as below.
 
 ## 2. Sweep before you touch anything
 

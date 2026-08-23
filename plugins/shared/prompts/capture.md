@@ -22,6 +22,11 @@ Run `ctx vault list --json` first.
   described as "positioning and messaging" have different notions of a durable
   fact. Draw titles and tags from the vocabulary the description implies, and
   from the tags already in use (`ctx list --json`).
+- A fact may genuinely belong in **more than one nest** (an engineering decision
+  with positioning consequences). Then write one node per nest, each in that
+  nest's own vocabulary — and make the secondary node **reference** the primary
+  (`[[wikilink]]` or `vault:id`) rather than restating its body. Duplicated
+  prose is the thing the curator later has to sweep; a reference is not.
 
 ## 2. The capture ladder
 
