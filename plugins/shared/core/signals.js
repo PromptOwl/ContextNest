@@ -50,7 +50,7 @@ export function lastUserMessage(lines) {
  * monotonic counter whose *deltas* are what the ledger compares, so being a
  * turn or two off in absolute terms is harmless.
  *
- * ponytail: substring matching, not JSON.parse. It miscounts a line that quotes
+ * Tradeoff: substring matching, not JSON.parse. It miscounts a line that quotes
  * `"tool_result"` inside prose, which costs at most one turn of cooldown. If
  * the cooldown ever needs to be exact, parse only the lines that match the
  * cheap test rather than parsing the whole transcript.
@@ -84,7 +84,7 @@ function textOf(content) {
  * Deliberately narrow: a false positive costs a write proposal the user did
  * not ask for, which is the exact noise this change exists to remove.
  *
- * ponytail: regexes over English, so they miss paraphrases and other
+ * Tradeoff: regexes over English, so they miss paraphrases and other
  * languages. A miss is cheap — the ambient path still catches a long session,
  * and the user can say it again or run `/contextnest:capture`. If recall here
  * ever matters more than the zero dependencies do, this is the seam to replace
