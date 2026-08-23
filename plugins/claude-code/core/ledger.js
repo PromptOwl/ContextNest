@@ -14,7 +14,7 @@
  * malformed JSON blob, or a read-only home all degrade to "no ledger", never to
  * a throw. A hook must not break a session over bookkeeping.
  *
- * ponytail: one small JSON file per session, never cleaned up. At a few dozen
+ * Tradeoff: one small JSON file per session, never cleaned up. At a few dozen
  * bytes each that is cheaper than any reaping scheme would be to run or to get
  * wrong. If the directory ever needs bounding, delete by mtime on load — do not
  * add a daemon.
