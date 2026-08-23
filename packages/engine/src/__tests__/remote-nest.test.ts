@@ -207,6 +207,25 @@ describe("connectRemoteNest — against a live stub server", () => {
     expect((err as Error).message).toMatch(/non-JSON/i);
   });
 
+  it("prefers structuredContent over prose in content[]", async () => {
+    const out = await conn.run<{ documents: Array<{ id: string }> }>("context_resolve", {});
+    expect(out.documents.map((d) => d.id)).toEqual(["nodes/alpha", "nodes/beta"]);
+  });
+
+  it("recovers the typed error code from a structuredContent error payload", async () => {
+    const err = await conn.run("context_reconstruct", {}).catch((e) => e);
+    expect(err).toBeInstanceOf(ContextNestError);
+    // Not INTERNAL: the prose alone is unparseable, the structured half is not.
+    expect((err as ContextNestError).code).toBe("DOCUMENT_NOT_FOUND");
+    expect((err as Error).message).toContain("nodes/ghost");
+  });
+
+  it("listTools() reports the tool names the stub advertises", async () => {
+    const tools = await conn.listTools();
+    expect(tools.has("context_overview")).toBe(true);
+    expect(tools.has("context_never_registered")).toBe(false);
+  });
+
   it("an unknown tool surfaces as an error, not a hang", async () => {
     const err = await conn.run("context_never_registered", {}).catch((e) => e);
     expect(err).toBeInstanceOf(ContextNestError);

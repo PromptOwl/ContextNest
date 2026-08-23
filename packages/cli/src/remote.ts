@@ -238,6 +238,12 @@ export async function remoteVerify(
   // process.exit inside the callback would skip the finally that closes the
   // connection (and with it, the spawned stdio server).
   const valid = await withRemote(target, async (conn) => {
+    if (!(await conn.listTools()).has("context_verify")) {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" does not expose context_verify — its integrity is enforced server-side, so there is no client-verifiable hash chain to check.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
     const report = await conn.run<{ valid: boolean; errors: unknown[] }>("context_verify", {});
     if (opts.json) {
       console.log(JSON.stringify(report, null, 2));
@@ -261,7 +267,8 @@ export async function remoteHistory(
   await withRemote(target, async (conn) => {
     const out = await conn.run<{
       id: string;
-      keyframe_interval: number;
+      keyframe_interval?: number;
+      approved_version?: number | null;
       versions: Array<Record<string, unknown>>;
     }>("context_versions", {
       id: normalizeDocumentId(path),
@@ -279,8 +286,18 @@ export async function remoteHistory(
     console.log(chalk.bold(`Version history for ${out.id}:\n`));
     for (const entry of out.versions) {
       const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
-      const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
-      console.log(`  v${entry.version}${keyframe}${published}`);
+      // A nest that approves rather than publishes reports a per-version
+      // `status` and names its serving version in `approved_version`; reading
+      // only `published_at` labelled every one of those versions "draft".
+      const state =
+        typeof entry.status === "string"
+          ? (entry.version === out.approved_version
+              ? chalk.green(` ${entry.status} (AI-active)`)
+              : chalk.yellow(` ${entry.status}`))
+          : entry.published_at
+            ? chalk.green(" published")
+            : chalk.yellow(" draft");
+      console.log(`  v${entry.version}${keyframe}${state}`);
       console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
       if (entry.note) console.log(`    Note: ${entry.note}`);
     }
@@ -390,17 +407,55 @@ export async function remotePublish(
   if (!path) {
     throw new ContextNestError("Nothing to publish — pass a document path.", "VALIDATION_FAILED");
   }
-  if (opts.message !== undefined) {
-    throw new ContextNestError(
-      "--message is not supported against a remote nest yet (the catalog's publish operation takes no version note).",
-      "NOT_IMPLEMENTED",
-    );
-  }
-  await confirmRemoteWrite(target, `Publish ${normalizeDocumentId(path)} on remote nest "${target.alias}"?`);
+  const id = normalizeDocumentId(path);
+
   await withRemote(target, async (conn) => {
+    const tools = await conn.listTools();
+
+    // A nest that governs its own boundary publishes through steward review
+    // rather than exposing context_publish: nothing reaches an agent until a
+    // steward approves it. `ctx publish` lands on context_submit_review there,
+    // and says so — announcing "Published" for a node still sitting in a
+    // review queue would be a plain lie about what the write did.
+    if (!tools.has("context_publish") && tools.has("context_submit_review")) {
+      // context_submit_review matches on title, not id, so read the node first.
+      const doc = await conn.run<{ frontmatter: { title?: string } }>("context_get", { id });
+      const title = doc.frontmatter?.title;
+      if (!title) {
+        throw new ContextNestError(
+          `Cannot submit ${id} for review — the remote returned no title to submit it by.`,
+          "INTERNAL",
+        );
+      }
+      await confirmRemoteWrite(
+        target,
+        `Submit ${id} for steward review on remote nest "${target.alias}"? It stays unreadable to agents until a steward approves it.`,
+      );
+      const out = await conn.run<{
+        id: string;
+        review?: { id?: string; version?: number; status?: string; priority?: string };
+      }>("context_submit_review", { title, ...(opts.message ? { note: opts.message } : {}) });
+      const review = out.review ?? {};
+      console.log(
+        chalk.green(`Submitted ${out.id} for review (remote: ${target.alias}) — not yet published.`),
+      );
+      if (review.version !== undefined) console.log(`  Version: ${review.version}`);
+      if (review.status) console.log(`  Review: ${review.status}${review.priority ? ` (${review.priority} priority)` : ""}`);
+      if (review.id) console.log(`  Request: ${review.id}`);
+      return;
+    }
+
+    // The catalog's publish op takes no version note.
+    if (opts.message !== undefined) {
+      throw new ContextNestError(
+        "--message is not supported against a remote nest yet (the catalog's publish operation takes no version note).",
+        "NOT_IMPLEMENTED",
+      );
+    }
+    await confirmRemoteWrite(target, `Publish ${id} on remote nest "${target.alias}"?`);
     const out = await conn.run<{ id: string; version: number; checkpoint: number }>(
       "context_publish",
-      { id: normalizeDocumentId(path) },
+      { id },
     );
     console.log(chalk.green(`Published ${out.id} (remote: ${target.alias})`));
     console.log(`  Version: ${out.version}`);

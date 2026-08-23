@@ -61,6 +61,21 @@ server.tool("context_packs", "stub packs — env probe", {}, async () =>
   }),
 );
 
+// Prose in content[] + payload in structuredContent — what a nest that also
+// serves chat clients emits (the community nest does exactly this).
+server.tool("context_resolve", "stub resolve — structuredContent payload", {}, async () => ({
+  content: [{ type: "text", text: "2 node(s):\n\n1. **Alpha**\n2. **Beta**" }],
+  structuredContent: { documents: [{ id: "nodes/alpha" }, { id: "nodes/beta" }] },
+}));
+
+// The same split on the ERROR path: prose for humans, {code, message} in
+// structuredContent so the client can recover the typed code.
+server.tool("context_reconstruct", "stub reconstruct — structuredContent error", {}, async () => ({
+  content: [{ type: "text", text: "Node not found: nodes/ghost" }],
+  structuredContent: { code: "DOCUMENT_NOT_FOUND", message: "Node not found: nodes/ghost" },
+  isError: true,
+}));
+
 // Slow tool for per-call timeout coverage.
 server.tool("context_verify", "stub verify — never finishes in time", {}, async () => {
   await new Promise((resolve) => setTimeout(resolve, 60_000));

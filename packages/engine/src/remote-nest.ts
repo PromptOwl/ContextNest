@@ -36,7 +36,28 @@ export class RemoteUnreachableError extends ContextNestError {
 export interface RemoteNestConnection {
   /** Call a catalog operation (canonical `context_*` name) on the remote. */
   run<T = unknown>(operation: string, input: Record<string, unknown>): Promise<T>;
+  /**
+   * Tool names the remote advertises, memoized (the set cannot change within
+   * one connection).
+   *
+   * A nest exposes only the operations its governance model allows — one that
+   * publishes through steward review ships no `context_publish` at all, and
+   * one whose integrity is enforced server-side ships no `context_verify`.
+   * Capability-namespace advertisement on `initialize` is specified but not
+   * implemented server-side yet, so `tools/list` is the only signal a caller
+   * has for what it may attempt.
+   */
+  listTools(): Promise<Set<string>>;
   close(): Promise<void>;
+}
+
+/** JSON.parse that yields undefined instead of throwing. */
+function tryParseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Build HTTP auth headers from env-var references. Missing vars throw early. */
@@ -125,9 +146,15 @@ export async function connectRemoteNest(
     throw new RemoteUnreachableError(alias, (err as Error)?.message ?? String(err));
   }
 
+  let toolNames: Set<string> | undefined;
+
   return {
     async run<T>(operation: string, input: Record<string, unknown>): Promise<T> {
-      let result: { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+      let result: {
+        content?: Array<{ type: string; text?: string }>;
+        structuredContent?: unknown;
+        isError?: boolean;
+      };
       try {
         result = (await client.callTool(
           { name: operation, arguments: input },
@@ -142,27 +169,44 @@ export async function connectRemoteNest(
       const text = (result.content ?? [])
         .map((c) => (c.type === "text" ? (c.text ?? "") : ""))
         .join("");
+      // The catalog payload arrives one of two ways. A nest that also serves
+      // chat clients puts human-readable prose in `content` and the payload
+      // alongside it in `structuredContent`; a machine-only server puts the
+      // payload straight into `content` as JSON. Resolve it once here so the
+      // error and success paths below agree on what the server said — reading
+      // only the text missed the structured half entirely, which is what made
+      // every operation against such a nest fail as "non-JSON payload".
+      const payload =
+        result.structuredContent !== undefined
+          ? result.structuredContent
+          : tryParseJson(text);
+
       if (result.isError) {
-        // Catalog-bound servers return structured {code, message} JSON; map it
+        // Catalog-bound servers return a structured {code, message}; map it
         // back to a typed engine error. Anything else becomes INTERNAL.
-        try {
-          const parsed = JSON.parse(text) as { code?: string; message?: string };
-          if (parsed && typeof parsed.message === "string") {
-            throw new ContextNestError(parsed.message, parsed.code ?? "INTERNAL");
-          }
-        } catch (err) {
-          if (err instanceof ContextNestError) throw err;
+        const failure = payload as { code?: string; message?: string } | undefined;
+        if (failure && typeof failure.message === "string") {
+          throw new ContextNestError(failure.message, failure.code ?? "INTERNAL");
         }
         throw new ContextNestError(text || `Remote operation ${operation} failed`, "INTERNAL");
       }
-      try {
-        return JSON.parse(text) as T;
-      } catch {
+      if (payload === undefined) {
         throw new ContextNestError(
           `Remote operation ${operation} returned a non-JSON payload — is "${alias}" a ContextNest MCP endpoint?`,
           "INTERNAL",
         );
       }
+      return payload as T;
+    },
+    async listTools(): Promise<Set<string>> {
+      if (toolNames) return toolNames;
+      try {
+        const { tools } = await client.listTools(undefined, { timeout });
+        toolNames = new Set(tools.map((t) => t.name));
+      } catch (err) {
+        throw new RemoteUnreachableError(alias, (err as Error)?.message ?? String(err));
+      }
+      return toolNames;
     },
     async close(): Promise<void> {
       try {

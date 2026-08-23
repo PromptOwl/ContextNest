@@ -51,11 +51,13 @@
     "chalk": "^5.4.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@promptowl/contextnest-engine": "workspace:^",
     "@types/node": "^22.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.9",
+    "zod": "^3.24.0"
   },
   "files": [
     "dist",
