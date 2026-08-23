@@ -18,7 +18,9 @@ Makes any Claude Code session **vault-aware** and **self-maintaining**:
   backstops it mechanically: after any `ctx update` it diffs the node against
   its previous version and reports every node, in every nest, still carrying the
   removed value. That check keys on the *write*, so it works no matter how the
-  request was phrased.
+  request was phrased. Nodes carry **entity tags** for the concrete values they
+  assert, so the sweep also does exact tag-index lookups — catching nodes that
+  paraphrase a fact, which no text search can.
 - **Session overview** — a `SessionStart` hook injects a compact list of your vaults.
 
 Everything runs through the existing [`ctx`](../../packages/cli) CLI internally — no

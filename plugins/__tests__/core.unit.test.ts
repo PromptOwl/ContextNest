@@ -27,6 +27,7 @@ import {
   droppedTerms,
   findStragglers,
   parseUpdate,
+  sweepMessage,
 } from "../shared/core/sweep-check.js";
 import {
   clearPending,
@@ -733,8 +734,45 @@ describe("sweep-check", () => {
       ["read nodes/fuzzy --raw --vault mkt", "---\nt: x\n---\nNothing relevant here."],
     ]);
     const { found, truncated } = findStragglers(exec, ["redis"], "nodes/written", "eng", ["eng", "mkt"]);
-    expect(found).toEqual([{ ref: "eng:nodes/sibling", term: "redis" }]);
+    expect(found).toEqual([{ ref: "eng:nodes/sibling", term: "redis", stale: false }]);
     expect(truncated).toBe(false);
+  });
+
+  it("findStragglers: the tag channel catches a paraphrased node search cannot see", () => {
+    const exec = fakeExec([
+      // Tagged with the entity, body words the fact without the literal term.
+      ["list --tag redis --json --vault mkt", [{ id: "nodes/brand" }]],
+      ["read nodes/brand --raw --vault mkt", "---\nt: x\n---\nOur flagship in-memory engine."],
+      ["search redis --json --vault mkt", []],
+    ]);
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", "eng", ["mkt"]);
+    // Reported as stale: the node either asserts the fact in other words (needs
+    // the change) or carries an outdated tag (needs retagging).
+    expect(found).toEqual([{ ref: "mkt:nodes/brand", term: "redis", stale: true }]);
+  });
+
+  it("findStragglers: a node hit by both channels is reported once, as a straggler", () => {
+    const exec = fakeExec([
+      ["list --tag redis --json", [{ id: "nodes/both" }]],
+      ["search redis --json", [{ id: "nodes/both" }]],
+      ["read nodes/both --raw", "---\nt: x\n---\nStill uses Redis."],
+    ]);
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", null, [null]);
+    expect(found).toEqual([{ ref: "nodes/both", term: "redis", stale: false }]);
+  });
+
+  it("sweepMessage words the stale-tag case as check-and-retag", () => {
+    const text = sweepMessage(
+      "eng:nodes/x",
+      [
+        { ref: "eng:nodes/a", term: "redis", stale: false },
+        { ref: "mkt:nodes/b", term: "redis", stale: true },
+      ],
+      false,
+    );
+    expect(text).toContain('eng:nodes/a still contains "redis"');
+    expect(text).toContain("mkt:nodes/b is tagged #redis but words it differently");
+    expect(text).toContain("retag it if the tag is outdated");
   });
 
   it("findStragglers: honours the candidate budget and reports truncation", () => {

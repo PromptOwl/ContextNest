@@ -70,6 +70,9 @@ beforeAll(() => {
   ctl(eng, ["add", "nodes/stack", "--title", "Stack", "--tags", "infra", "--body", `The queue engine is ${OLD}.`]);
   ctl(eng, ["add", "nodes/runbook", "--title", "Runbook", "--tags", "infra", "--body", `Restart ${OLD} before the API.`]);
   ctl(mkt, ["add", "nodes/pitch", "--title", "Pitch", "--tags", "messaging", "--body", `We highlight ${OLD} in demos.`]);
+  // Tagged with the entity, but the body PARAPHRASES the fact — full-text
+  // search provably cannot find this one; only the tag channel can.
+  ctl(mkt, ["add", "nodes/brand", "--title", "Brand", "--tags", `messaging,${OLD.toLowerCase()}`, "--body", "Our brand voice centers the flagship engine."]);
 });
 
 afterAll(() => {
@@ -93,12 +96,16 @@ describe("[regression] sweep-check spans nests and converges", () => {
     // Same-nest sibling AND the other nest's node — the multi-nest guarantee.
     expect(text).toContain(`eng:nodes/runbook still contains "${OLD.toLowerCase()}"`);
     expect(text).toContain(`mkt:nodes/pitch still contains "${OLD.toLowerCase()}"`);
+    // The tag channel: found by index despite the body never using the term.
+    expect(text).toContain(`mkt:nodes/brand is tagged #${OLD.toLowerCase()}`);
     // The written node itself is not reported.
     expect(text).not.toContain("eng:nodes/stack still contains");
 
     // Fix the survivors — the convergence half of the contract.
     ctl(eng, ["update", "nodes/runbook", "--vault", "eng", "--body", `Restart ${NEW} before the API.`, "--yes"]);
     ctl(join(workspace, "mkt"), ["update", "nodes/pitch", "--vault", "mkt", "--body", `We highlight ${NEW} in demos.`, "--yes"]);
+    // The stale-tag repair the message asks for: retag, carrying topics forward.
+    ctl(join(workspace, "mkt"), ["update", "nodes/brand", "--vault", "mkt", "--tags", `messaging,${NEW.toLowerCase()}`, "--yes"]);
 
     const second = sweepCheck({ input, env: {}, exec });
     // The written node's before/after diff still drops the old term, but no
