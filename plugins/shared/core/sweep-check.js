@@ -133,14 +133,28 @@ export function previousBody(exec, id, alias) {
 
 /**
  * Nodes across ALL given vault targets — not just the one that was written —
- * that still contain one of `terms`. The written node itself is excluded in its
+ * that still carry one of `terms`. The written node itself is excluded in its
  * own vault.
  *
- * Search is ranked and fuzzy, so every candidate is read and checked for the
- * literal term before being reported: sending the model to "fix" a node that
- * never mentions the value would be worse than silence.
+ * Two channels per term, complementary by construction:
  *
- * @returns {{found: {ref: string, term: string}[], truncated: boolean}}
+ *  - **Tags** (`ctx list --tag <term>`): exact, index-backed, and it sees
+ *    drafts. An entity tag is a *stored claim* that the node asserts this
+ *    value — the capture/curator prompts maintain them for exactly this lookup
+ *    — so a tagged node whose body words the fact differently is still found,
+ *    which full-text search provably cannot do. (`filterDocuments` compares
+ *    tags bare and case-insensitively, so the bare term matches `#term`.)
+ *  - **Search** (`ctx search <term>`): catches untagged prose. Ranked and
+ *    fuzzy, so hits only count once the literal term is confirmed in the body.
+ *
+ * Every candidate from either channel is read. Classification:
+ *  - body contains the term            → a straggler (`stale: false`);
+ *  - tagged, body words it differently → reported with `stale: true` — either
+ *    the node asserts the fact in other words (needs the change) or its tag is
+ *    outdated (needs retagging). Both are real work, neither is a false alarm.
+ *  - search-only hit without the term  → dropped, as before.
+ *
+ * @returns {{found: {ref: string, term: string, stale: boolean}[], truncated: boolean}}
  */
 export function findStragglers(exec, terms, excludeId, writtenAlias, targets, budget = MAX_CANDIDATES) {
   const checked = new Set();
@@ -154,9 +168,15 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
     if ((alias || null) === (writtenAlias || null)) checked.add(ref(excludeId));
 
     for (const term of terms) {
-      const hits = ctxJson(exec, withVault(["search", term, "--json"], alias), []);
-      if (!Array.isArray(hits)) continue;
-      for (const hit of hits) {
+      const tagged = ctxJson(exec, withVault(["list", "--tag", term, "--json"], alias), []);
+      const searched = ctxJson(exec, withVault(["search", term, "--json"], alias), []);
+      const tagHits = Array.isArray(tagged) ? tagged : [];
+      const taggedIds = new Set(tagHits.map((d) => d?.id).filter(Boolean));
+      // Tag hits first: when the budget bites, the stored claims outrank the
+      // fuzzy guesses.
+      const candidates = [...tagHits, ...(Array.isArray(searched) ? searched : [])];
+
+      for (const hit of candidates) {
         if (!hit?.id || checked.has(ref(hit.id))) continue;
         if (checked.size >= budget) {
           truncated = true;
@@ -164,8 +184,12 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
         }
         checked.add(ref(hit.id));
         const raw = ctxText(exec, withVault(["read", hit.id, "--raw"], alias));
-        if (!raw || !bodyOf(raw).toLowerCase().includes(term)) continue;
-        found.push({ ref: ref(hit.id), term });
+        if (!raw) continue;
+        if (bodyOf(raw).toLowerCase().includes(term)) {
+          found.push({ ref: ref(hit.id), term, stale: false });
+        } else if (taggedIds.has(hit.id)) {
+          found.push({ ref: ref(hit.id), term, stale: true });
+        }
       }
     }
   }
@@ -174,7 +198,11 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
 
 /** The context handed back to the model. */
 export function sweepMessage(writtenRef, stragglers, truncated) {
-  const lines = stragglers.map((s) => `- ${s.ref} still contains "${s.term}"`);
+  const lines = stragglers.map((s) =>
+    s.stale
+      ? `- ${s.ref} is tagged #${s.term} but words it differently — apply the change if it asserts this fact, or retag it if the tag is outdated`
+      : `- ${s.ref} still contains "${s.term}"`,
+  );
   return [
     `Context Nest: the change to ${writtenRef} is incomplete.`,
     "",
