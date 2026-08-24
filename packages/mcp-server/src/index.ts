@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
+  withVaultLock,
   NestStorage,
   Resolver,
   PackLoader,
@@ -621,6 +622,16 @@ server.tool(
   },
 );
 
+/**
+ * The deprecated write tools below predate the operation catalog and call
+ * storage/publish directly, bypassing the catalog executors' vault lock. Any
+ * legacy client could therefore race a locked `context_update` and corrupt
+ * the checkpoint chain. Wrapping here keeps their wire output byte-identical
+ * while closing the gap; new tools go through the catalog and need nothing.
+ */
+const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
+  withVaultLock(storage.root, fn);
+
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
 server.tool(
@@ -643,7 +654,8 @@ server.tool(
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
   },
-  async ({ path, title, type, tags, body, trigger, tools_required, output_format }) => {
+  async ({ path, title, type, tags, body, trigger, tools_required, output_format }) =>
+    lockedHandler(async () => {
     // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
     // lands in the same place as one created via `ctx add` (single source of
     // truth — normalizeDocumentId in the engine).
@@ -733,7 +745,7 @@ server.tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: update_document ─────────────────────────────────────────────────
@@ -756,7 +768,8 @@ server.tool(
       ),
     body: z.string().optional().describe("New markdown body content"),
   },
-  async ({ path, title, tags, status, body }) => {
+  async ({ path, title, tags, status, body }) =>
+    lockedHandler(async () => {
     const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
@@ -884,7 +897,7 @@ server.tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: delete_document ─────────────────────────────────────────────────
@@ -895,7 +908,8 @@ server.tool(
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
   },
-  async ({ path }) => {
+  async ({ path }) =>
+    lockedHandler(async () => {
     const id = normalizeDocumentId(path);
 
     // Verify the document exists before deleting
@@ -916,7 +930,7 @@ server.tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: publish_document ────────────────────────────────────────────────
@@ -932,7 +946,8 @@ server.tool(
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),
     note: z.string().optional().describe("Version note"),
   },
-  async ({ path, author, note }) => {
+  async ({ path, author, note }) =>
+    lockedHandler(async () => {
     const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
@@ -960,7 +975,7 @@ server.tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: stage_drift_suggestion ──────────────────────────────────────────

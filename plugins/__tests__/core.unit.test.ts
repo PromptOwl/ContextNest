@@ -27,7 +27,9 @@ import {
   droppedTerms,
   findStragglers,
   parseUpdate,
+  parseUpdates,
   sweepMessage,
+  sweepTargets,
 } from "../shared/core/sweep-check.js";
 import {
   clearPending,
@@ -830,6 +832,87 @@ describe("sweep-check", () => {
     expect(
       sweepCheck({ input: { tool_input: { command: "ctx update nodes/a --body x" } }, env: {}, exec }),
     ).toBeNull();
+  });
+
+  it("parseUpdates: a chained command yields every updated node, prose yields none", () => {
+    expect(parseUpdates("ctx update nodes/a --vault w && ctx update nodes/b --vault w")).toEqual([
+      { id: "nodes/a", vault: "w" },
+      { id: "nodes/b", vault: "w" },
+    ]);
+    // The reviewer's false-positive shapes: prose containing "update", a path
+    // that merely ends in /ctx, and non-ctx binaries.
+    for (const cmd of [
+      'echo "remember to update later" && ctx read foo --raw',
+      'ctx add nodes/a --body "we should update nodes/legacy soon"',
+      "docs/ctx update notes",
+      "git update-index --add file",
+    ]) {
+      expect(parseUpdates(cmd), cmd).toEqual([]);
+    }
+    // Explicit binary paths and the npx package form are invocations.
+    expect(parseUpdates("/usr/local/bin/ctx update nodes/e --yes")).toHaveLength(1);
+    expect(parseUpdates("npx -y @promptowl/contextnest-cli update nodes/b")).toHaveLength(1);
+  });
+
+  it("run: sweeps every node of a chained update, not just the first", () => {
+    const history = { versions: [{ version: 1 }, { version: 2 }] };
+    const exec = fakeExec([
+      ["vault list", []],
+      ["read nodes/a --raw", "---\nt: x\n---\nNow says Postgres."],
+      ["history nodes/a --json", history],
+      ["reconstruct nodes/a 1", "---\nt: x\n---\nSays Redis."],
+      ["read nodes/b --raw", "---\nt: x\n---\nNow says Vercel."],
+      ["history nodes/b --json", history],
+      ["reconstruct nodes/b 1", "---\nt: x\n---\nSays Heroku."],
+      ["search redis", [{ id: "nodes/lag1" }]],
+      ["read nodes/lag1 --raw", "---\nt: x\n---\nStill on Redis."],
+      ["search heroku", [{ id: "nodes/lag2" }]],
+      ["read nodes/lag2 --raw", "---\nt: x\n---\nStill on Heroku."],
+    ]);
+    const out = sweepCheck({
+      input: { tool_input: { command: "ctx update nodes/a --body x && ctx update nodes/b --body y" } },
+      env: {},
+      exec,
+    });
+    const text = out?.hookSpecificOutput?.additionalContext ?? "";
+    // Both updates' dropped terms produce findings in ONE merged message.
+    expect(text).toContain('nodes/lag1 still contains "redis"');
+    expect(text).toContain('nodes/lag2 still contains "heroku"');
+  });
+
+  it("run: capture_mode off silences the sweep too, with zero exec calls", () => {
+    let calls = 0;
+    const exec = () => {
+      calls++;
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    expect(
+      sweepCheck({
+        input: { tool_input: { command: "ctx update nodes/a --body x" } },
+        env: { CONTEXTNEST_CAPTURE_MODE: "off" },
+        exec,
+      }),
+    ).toBeNull();
+    expect(calls).toBe(0);
+  });
+
+  it("sweepTargets: a pinned vault does NOT narrow the sweep", () => {
+    // vaultTargets() deliberately short-circuits to the pin for retrieval; the
+    // sweep's guarantee is per-registry, so it must not inherit that shortcut.
+    const exec = fakeExec([
+      ["vault list", [{ alias: "eng", exists: true }, { alias: "mkt", exists: true }]],
+    ]);
+    const { targets, capped } = sweepTargets(exec, "eng", {});
+    expect(targets.sort()).toEqual(["eng", "mkt"]);
+    expect(capped).toBe(false);
+  });
+
+  it("sweepTargets: signals when the registry exceeds the nest cap", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ alias: `v${i}`, exists: true }));
+    const exec = fakeExec([["vault list", many]]);
+    const { targets, capped } = sweepTargets(exec, "v0", {});
+    expect(capped).toBe(true);
+    expect(targets.length).toBeLessThanOrEqual(9); // cap + written alias
   });
 
   it("run: CONTEXTNEST_SWEEP_CHECK=off disables it", () => {

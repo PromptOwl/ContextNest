@@ -24,7 +24,7 @@
  * SINGLE SOURCE OF TRUTH: plugins/shared/core/. Edit here, then `pnpm plugins:sync`.
  */
 
-import { ctxJson, getConfig, isMain, runAsHook, vaultTargets, withVault } from "./lib.js";
+import { ctxJson, envInt, getConfig, isMain, listVaults, runAsHook, withVault } from "./lib.js";
 
 /** Terms examined per edit. More than a few is noise, not signal. */
 export const MAX_TERMS = 3;
@@ -100,15 +100,46 @@ export function droppedTerms(oldBody, newBody, limit = MAX_TERMS) {
  * read back from the vault, which is authoritative in a way the command string
  * is not.
  */
-export function parseUpdate(command) {
+/**
+ * Binary forms: bare `ctx`/`contextnest`, an EXPLICIT path to one (must start
+ * with `/`, `./`, `../` or `~/` — `docs/ctx` in prose is not an invocation),
+ * or the npx package (`npx -y @promptowl/contextnest-cli …`).
+ */
+const BINARY =
+  /(?:npx\s+(?:-y\s+)?)?(?:(?:\.{1,2}|~)?\/[\w.@~\/-]*\/)?(?:@[\w-]+\/)?(?:ctx|contextnest(?:-cli)?)/;
+const UPDATE_RE = new RegExp(
+  "(?:^|\\s)" + BINARY.source + "\\s+(?:--?[\\w-]+(?:[= ]\\S+)?\\s+)*update\\s+(?!-)(\"[^\"]+\"|'[^']+'|\\S+)",
+);
+
+/** All Context Nest updates in a shell command, in order, deduped. */
+export function parseUpdates(command) {
   const text = String(command || "");
-  if (!/(^|[\s;&|(])(ctx|contextnest)\b/.test(text)) return null;
-  const m = text.match(/\bupdate\s+(?!-)("[^"]+"|'[^']+'|\S+)/);
-  if (!m) return null;
-  const id = m[1].replace(/^["']|["']$/g, "");
-  if (!id || id.startsWith("-")) return null;
-  const vault = text.match(/--vault[= ]\s*["']?([A-Za-z0-9_-]+)/);
-  return { id, vault: vault ? vault[1] : null };
+  const out = [];
+  const seen = new Set();
+  // Per shell segment (a && b; c | d), so prose in one command can't combine
+  // with a ctx invocation in another: "echo update later && ctx read x" must
+  // not read as an update of `later`. Within a segment, `update` must sit in
+  // the SUBCOMMAND position — the first non-flag token after the binary,
+  // never a word from --title/--body text. A chained command can update
+  // SEVERAL nodes (`ctx update a && ctx update b`); every one is returned, or
+  // the sweep itself would have the partial-coverage bug it exists to catch.
+  for (const segment of text.split(/&&|\|\||[;|]/)) {
+    const m = segment.match(UPDATE_RE);
+    if (!m) continue;
+    const id = m[1].replace(/^["']|["']$/g, "");
+    if (!id || id.startsWith("-")) continue;
+    const vault = segment.match(/--vault[= ]\s*["']?([A-Za-z0-9_-]+)/);
+    const key = `${vault ? vault[1] : ""}::${id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ id, vault: vault ? vault[1] : null });
+  }
+  return out;
+}
+
+/** First update in the command, or null — kept for callers that need one. */
+export function parseUpdate(command) {
+  return parseUpdates(command)[0] ?? null;
 }
 
 /** Raw text of a ctx subcommand, or null when it failed. */
@@ -208,7 +239,7 @@ export function sweepMessage(writtenRef, stragglers, truncated) {
     "",
     ...lines,
     ...(truncated
-      ? ["", "(candidate budget reached — this list may be incomplete; sweep the nests to be sure)"]
+      ? ["", "(a candidate or nest budget was reached — this list may be incomplete; sweep the nests to be sure)"]
       : []),
     "",
     "A change that lands in one node and not its siblings leaves the nest(s)",
@@ -223,8 +254,34 @@ export function sweepMessage(writtenRef, stragglers, truncated) {
 
 /** Candidate budget, env-tunable. */
 function candidateBudget(env) {
-  const raw = parseInt(env.CONTEXTNEST_SWEEP_MAX_CANDIDATES || "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : MAX_CANDIDATES;
+  return envInt(env, "CONTEXTNEST_SWEEP_MAX_CANDIDATES", MAX_CANDIDATES) || MAX_CANDIDATES;
+}
+
+/** Nests examined per sweep. Spans the registry; env-tunable. */
+export const MAX_SWEEP_VAULTS = 8;
+
+/**
+ * Which nests the sweep examines: EVERY registered nest, capped.
+ *
+ * Deliberately NOT `vaultTargets()` — that helper serves the cheap retrieval
+ * fast path and short-circuits to just the pinned vault when one is set. A pin
+ * narrows where retrieval looks, but the sweep's whole guarantee is "no nest
+ * still asserts the old value", and a pinned user is exactly as exposed to a
+ * sibling nest carrying the fact as an unpinned one.
+ *
+ * @returns {{targets: (string|null)[], capped: boolean}}
+ */
+export function sweepTargets(exec, writtenAlias, env) {
+  const registered = listVaults(exec)
+    .filter((v) => v.exists !== false)
+    .map((v) => v.alias);
+  const cap = envInt(env, "CONTEXTNEST_SWEEP_MAX_VAULTS", MAX_SWEEP_VAULTS) || MAX_SWEEP_VAULTS;
+  const capped = registered.length > cap;
+  const targets = new Set(registered.slice(0, cap));
+  // The written vault is always examined (it may be an unregistered local
+  // vault, in which case writtenAlias is null and ctx resolves it).
+  targets.add(writtenAlias);
+  return { targets: [...targets], capped };
 }
 
 /**
@@ -234,45 +291,78 @@ function candidateBudget(env) {
 export function run({ input, env, exec }) {
   // Fires after every Bash call: the cheap reject comes first, and everything
   // below runs only for an actual vault update.
-  const target = parseUpdate(input?.tool_input?.command);
-  if (!target) return null;
+  const updates = parseUpdates(input?.tool_input?.command);
+  if (updates.length === 0) return null;
   if (/^(0|false|no|off)$/i.test(env.CONTEXTNEST_SWEEP_CHECK || "")) return null;
 
   const config = getConfig(env);
-  const writtenAlias = target.vault || config.vault || null;
+  // capture_mode: off means "nothing automatic touches or nags about the
+  // vault" — least surprise wins over the sweep being conceptually a
+  // correction aid rather than a capture. CONTEXTNEST_SWEEP_CHECK stays as
+  // the independent switch for users who want capture without the sweep.
+  if (config.captureMode === "off") return null;
 
-  // Success is read from the vault, not from the tool result: if the node
-  // cannot be read back, there is nothing to check.
-  const current = ctxText(exec, withVault(["read", target.id, "--raw"], writtenAlias));
-  if (!current) return null;
+  // A chained command may have updated several nodes; every one gets its own
+  // diff and sweep, or this hook has the partial-coverage bug it exists to
+  // catch. Findings merge into one message, deduped by ref+term.
+  const budget = candidateBudget(env);
+  const allFound = [];
+  const seenFinding = new Set();
+  const writtenRefs = [];
+  let anyTruncated = false;
 
-  const before = previousBody(exec, target.id, writtenAlias);
-  if (!before) return null;
+  for (const target of updates) {
+    const writtenAlias = target.vault || config.vault || null;
 
-  const dropped = droppedTerms(before, bodyOf(current));
-  if (dropped.length === 0) return null;
+    // Success is read from the vault, not from the tool result: if the node
+    // cannot be read back, there is nothing to check.
+    const current = ctxText(exec, withVault(["read", target.id, "--raw"], writtenAlias));
+    if (!current) continue;
 
-  // Every registered nest, not just the written one: a fact that lives in two
-  // nests must be corrected in two nests. vaultTargets already applies the
-  // pinned/registered/local resolution rules and the fan-out cap.
-  const targets = new Set(vaultTargets(config, exec));
-  targets.add(writtenAlias);
+    const before = previousBody(exec, target.id, writtenAlias);
+    if (!before) continue;
 
-  const { found, truncated } = findStragglers(
-    exec,
-    dropped,
-    target.id,
-    writtenAlias,
-    [...targets],
-    candidateBudget(env),
-  );
-  if (found.length === 0) return null;
+    const dropped = droppedTerms(before, bodyOf(current));
+    if (dropped.length === 0) continue;
 
-  const writtenRef = writtenAlias ? `${writtenAlias}:${target.id}` : target.id;
+    // Every registered nest, not just the written one: a fact that lives in
+    // two nests must be corrected in two nests — pinned or not (a pin narrows
+    // retrieval, never the consistency guarantee).
+    const { targets, capped } = sweepTargets(exec, writtenAlias, env);
+
+    const { found, truncated } = findStragglers(
+      exec,
+      dropped,
+      target.id,
+      writtenAlias,
+      targets,
+      budget,
+    );
+    anyTruncated = anyTruncated || truncated || capped;
+
+    // A node this same command just updated is not a straggler of a sibling
+    // update — its own diff pass judges it.
+    const updatedRefs = new Set(
+      updates.map((u) => {
+        const a = u.vault || config.vault || null;
+        return a ? `${a}:${u.id}` : u.id;
+      }),
+    );
+    for (const f of found) {
+      const key = `${f.ref}::${f.term}`;
+      if (updatedRefs.has(f.ref) || seenFinding.has(key)) continue;
+      seenFinding.add(key);
+      allFound.push(f);
+    }
+    writtenRefs.push(writtenAlias ? `${writtenAlias}:${target.id}` : target.id);
+  }
+
+  if (allFound.length === 0) return null;
+
   return {
     hookSpecificOutput: {
       hookEventName: "PostToolUse",
-      additionalContext: sweepMessage(writtenRef, found, truncated),
+      additionalContext: sweepMessage(writtenRefs.join(", "), allFound, anyTruncated),
     },
   };
 }

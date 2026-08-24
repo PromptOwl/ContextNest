@@ -254,6 +254,12 @@ export function makeExec(config, opts = {}) {
   };
 }
 
+/** Positive-integer env override, or `fallback` when unset/invalid. */
+export function envInt(env, name, fallback) {
+  const raw = parseInt(env?.[name] || "", 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
 /** Parse JSON without throwing. Returns `fallback` on any failure. */
 export function safeJson(str, fallback = null) {
   try {

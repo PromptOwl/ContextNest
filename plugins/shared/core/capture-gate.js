@@ -40,7 +40,7 @@
  * object (or null to say nothing). The readers are injected for testability.
  */
 
-import { getConfig, isMain, readStdin, safeJson } from "./lib.js";
+import { envInt, getConfig, isMain, readStdin, safeJson } from "./lib.js";
 import {
   correctionIntent,
   countUserTurns,
@@ -179,8 +179,7 @@ export function isSubstantive(lines) {
 
 /** Read the cooldown length, so a user who wants a chattier plugin can say so. */
 function minTurns(env) {
-  const raw = parseInt(env.CONTEXTNEST_CAPTURE_MIN_TURNS || "", 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_MIN_TURNS;
+  return envInt(env, "CONTEXTNEST_CAPTURE_MIN_TURNS", DEFAULT_MIN_TURNS);
 }
 
 /**
