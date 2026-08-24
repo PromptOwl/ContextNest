@@ -916,7 +916,7 @@ describe("[regression] remote nests — governed nest without publish/verify", (
     expect(res.status, res.stderr).toBe(0);
     // Must NOT claim the node was published — it is sitting in a review queue.
     expect(res.stdout).toMatch(/submitted/i);
-    expect(res.stdout).toMatch(/not yet published/i);
+    expect(res.stdout).toMatch(/NOT published/);
     expect(res.stdout).toMatch(/pending/i);
   });
 

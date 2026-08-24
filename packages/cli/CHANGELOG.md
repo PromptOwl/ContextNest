@@ -1,5 +1,36 @@
 # @promptowl/contextnest-cli
 
+## 2.2.0
+
+### Minor Changes
+
+- Remote nests: point `ctx` at a nest served over MCP and use it like a local vault.
+
+  The vault registry grows a top-level `remotes:` map — stdio or HTTP specs, env-ref-only auth, sharing one alias namespace with local `vaults:`. Older CLIs strip the unknown key and keep working. `resolveNest()` resolves an alias to either a local path or a remote spec at the documented precedence; `resolveVaultPath()` wraps it and fails with a clear local-only error when an alias points at a remote.
+
+  `--vault <remote-alias>` then routes read and write commands through an MCP client (`connectRemoteNest()`, SDK loaded lazily) instead of the local engine, with JSON output shape-identical to the local path. Local-only commands fail fast on a remote alias rather than pretending to work, and an unreachable remote exits 3 naming the alias.
+
+  The wire contract is the engine's canonical operation catalog, so the MCP server now binds every core op under its canonical `context_*` name with catalog-sourced schemas, keeps the legacy tool names as deprecated aliases, and returns catalog output shapes and structured `{code, message}` errors. That closes the drift between engine, CLI and MCP server on the remote path.
+
+  Capability-aware behaviour on top of it:
+
+  - `ctx publish` against a remote that has no `context_publish` routes through the remote's review flow instead of failing — Community publishes via steward review.
+  - `ctx verify` refuses to report a verification the remote cannot perform, rather than fabricating a pass.
+
+### Patch Changes
+
+- Tell remote timeouts and auth failures apart from an unreachable remote, and read the payload from the right field.
+
+  `connectRemoteNest()` collapsed three distinct failure modes into `RemoteUnreachableError`:
+
+  - `RemoteTimeoutError` (`REMOTE_TIMEOUT`) — a call that times out after a successful handshake was delivered and may have executed. Reporting it as "unreachable" told users nothing had happened when a node had in fact been created, and the retry then collided with it.
+  - `RemoteAuthError` (`REMOTE_AUTH_FAILED`) — HTTP 401/403 at connect or mid-call. The server answered on purpose, so the body already says why. This also keeps a dead credential off the CLI's exit-3 path, where a plugin hook would otherwise have stopped syncing silently.
+  - `REMOTE_HTTP_DEFAULT_TIMEOUT_MS` is 30s for HTTP; a scale-to-zero host cold-starts past the 10s stdio default with the write already landed.
+
+  Tool results are now read from `structuredContent` when present, on both the success and error paths. The catalog payload lives there (MCP 2025-06-18) and the text block is prose for chat clients that need not mirror it, so parsing text first failed on every op against a `contextnest-community` nest. A non-JSON payload is quoted in the error, which prose, an HTML error page and an empty response were previously indistinguishable in.
+
+  CLI: `remoteHistory` falls back to `entry.status === "published"`, which is how Community reports it — otherwise every version rendered as `draft`.
+
 ## 2.1.0
 
 ### Minor Changes

@@ -230,6 +230,13 @@ export async function remoteRead(
   });
 }
 
+/**
+ * NOT AVAILABLE against a Community-hosted nest (contextnest-community):
+ * that server registers no `context_verify` tool and has no equivalent to
+ * route to, so this fails with "Tool context_verify not found". Works against
+ * a catalog-bound OSS server (@promptowl/contextnest-mcp-server), which does
+ * expose the op.
+ */
 export async function remoteVerify(
   target: RemoteTarget,
   opts: { json?: boolean },
@@ -238,9 +245,13 @@ export async function remoteVerify(
   // process.exit inside the callback would skip the finally that closes the
   // connection (and with it, the spawned stdio server).
   const valid = await withRemote(target, async (conn) => {
-    if (!(await conn.listTools()).has("context_verify")) {
+    // A nest that enforces integrity server-side publishes no hash chain for a
+    // client to walk, so there is no check to run from here. Refuse: emitting
+    // {valid: true} would report a pass for a verification that never happened.
+    if (!(await conn.toolNames()).has("context_verify")) {
       throw new ContextNestError(
-        `Remote nest "${target.alias}" does not expose context_verify — its integrity is enforced server-side, so there is no client-verifiable hash chain to check.`,
+        `Remote nest "${target.alias}" does not expose context_verify — this nest enforces integrity ` +
+          `server-side, so there is no hash chain for the client to walk. Nothing was verified.`,
         "NOT_IMPLEMENTED",
       );
     }
@@ -391,6 +402,13 @@ export async function remoteUpdate(
   });
 }
 
+/**
+ * NOT AVAILABLE against a Community-hosted nest (contextnest-community):
+ * that server registers no `context_publish` tool — it publishes through
+ * steward review (`context_submit_review` → `context_approve`, which calls the
+ * engine's publish op server-side), so this fails with "Tool context_publish
+ * not found". Works against a catalog-bound OSS server, which exposes the op.
+ */
 export async function remotePublish(
   target: RemoteTarget,
   path: string | undefined,
@@ -408,17 +426,29 @@ export async function remotePublish(
     throw new ContextNestError("Nothing to publish — pass a document path.", "VALIDATION_FAILED");
   }
   const id = normalizeDocumentId(path);
+  // Probe capabilities on a connection of its own: confirmRemoteWrite exits the
+  // process on a decline, which would skip the close() in withRemote's finally.
+  const tools = await withRemote(target, (conn) => conn.toolNames());
 
-  await withRemote(target, async (conn) => {
-    const tools = await conn.listTools();
-
-    // A nest that governs its own boundary publishes through steward review
-    // rather than exposing context_publish: nothing reaches an agent until a
-    // steward approves it. `ctx publish` lands on context_submit_review there,
-    // and says so — announcing "Published" for a node still sitting in a
-    // review queue would be a plain lie about what the write did.
-    if (!tools.has("context_publish") && tools.has("context_submit_review")) {
-      // context_submit_review matches on title, not id, so read the node first.
+  if (!tools.has("context_publish")) {
+    // A governed nest has no direct publish — that would bypass its review
+    // plane. A node goes context_submit_review -> a steward's context_approve,
+    // so route there instead of failing, and never let the output read as live.
+    if (!tools.has("context_submit_review")) {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" exposes neither context_publish nor context_submit_review — ` +
+          `it offers no publish path this client can drive. Nothing was published.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
+    await confirmRemoteWrite(
+      target,
+      `Submit ${id} for steward review on remote nest "${target.alias}"? ` +
+        `This nest publishes through review, so this will NOT make the node live.`,
+    );
+    await withRemote(target, async (conn) => {
+      // context_submit_review keys on title, not id — resolve it rather than
+      // guess, using the same context_get call remoteRead already makes.
       const doc = await conn.run<{ frontmatter: { title?: string } }>("context_get", { id });
       const title = doc.frontmatter?.title;
       if (!title) {
@@ -427,32 +457,36 @@ export async function remotePublish(
           "INTERNAL",
         );
       }
-      await confirmRemoteWrite(
-        target,
-        `Submit ${id} for steward review on remote nest "${target.alias}"? It stays unreadable to agents until a steward approves it.`,
-      );
+      // Unlike context_publish, this op DOES carry a note — map --message onto it.
       const out = await conn.run<{
         id: string;
         review?: { id?: string; version?: number; status?: string; priority?: string };
       }>("context_submit_review", { title, ...(opts.message ? { note: opts.message } : {}) });
       const review = out.review ?? {};
-      console.log(
-        chalk.green(`Submitted ${out.id} for review (remote: ${target.alias}) — not yet published.`),
-      );
+      console.log(chalk.green(`Submitted ${out.id ?? id} for steward review (remote: ${target.alias})`));
       if (review.version !== undefined) console.log(`  Version: ${review.version}`);
-      if (review.status) console.log(`  Review: ${review.status}${review.priority ? ` (${review.priority} priority)` : ""}`);
+      if (review.status) {
+        console.log(`  Review: ${review.status}${review.priority ? ` (${review.priority} priority)` : ""}`);
+      }
       if (review.id) console.log(`  Request: ${review.id}`);
-      return;
-    }
-
-    // The catalog's publish op takes no version note.
-    if (opts.message !== undefined) {
-      throw new ContextNestError(
-        "--message is not supported against a remote nest yet (the catalog's publish operation takes no version note).",
-        "NOT_IMPLEMENTED",
+      console.log(
+        chalk.yellow(
+          "  NOT published — this nest publishes through review. The node is not live until a steward approves it.",
+        ),
       );
-    }
-    await confirmRemoteWrite(target, `Publish ${id} on remote nest "${target.alias}"?`);
+    });
+    return;
+  }
+
+  // The catalog's publish op takes no version note (context_submit_review, above, does).
+  if (opts.message !== undefined) {
+    throw new ContextNestError(
+      "--message is not supported against a remote nest yet (the catalog's publish operation takes no version note).",
+      "NOT_IMPLEMENTED",
+    );
+  }
+  await confirmRemoteWrite(target, `Publish ${id} on remote nest "${target.alias}"?`);
+  await withRemote(target, async (conn) => {
     const out = await conn.run<{ id: string; version: number; checkpoint: number }>(
       "context_publish",
       { id },

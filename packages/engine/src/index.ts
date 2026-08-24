@@ -214,7 +214,10 @@ export type {
 export {
   connectRemoteNest,
   RemoteUnreachableError,
+  RemoteTimeoutError,
+  RemoteAuthError,
   REMOTE_DEFAULT_TIMEOUT_MS,
+  REMOTE_HTTP_DEFAULT_TIMEOUT_MS,
 } from "./remote-nest.js";
 export type { RemoteNestConnection } from "./remote-nest.js";
 
