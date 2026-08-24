@@ -337,6 +337,24 @@ export const clientMetadataSchema = z
         message: `client metadata accepts at most ${CLIENT_METADATA_MAX_CUSTOM_KEYS} custom keys, got ${custom.length}`,
       });
     }
+    // Refuse a near-miss on a reserved key. `sessionId` is valid as a custom
+    // key and would be recorded — but NOT in the slot `context_versions` reads,
+    // so the write ends up silently un-attributed. That is the one failure an
+    // open catchall cannot catch on its own, and the caller cannot see it
+    // happen. Naming the intended key is cheaper than auditing the miss later.
+    for (const key of custom) {
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const collision = CLIENT_METADATA_RESERVED_KEYS.find(
+        (r) => r.replace(/[^a-z0-9]/g, "") === normalized,
+      );
+      if (collision) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `client metadata key "${key}" looks like the reserved key "${collision}" — use "${collision}" exactly, or rename it`,
+        });
+      }
+    }
   });
 
 export const versionEntrySchema = z.object({

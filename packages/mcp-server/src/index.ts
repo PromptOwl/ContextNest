@@ -4,6 +4,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -106,6 +107,59 @@ function opCtx(): OperationContext {
   };
 }
 
+// ─── Caller attribution defaults (spec §9.4) ─────────────────────────────────
+//
+// A tool call carries a `client` block naming the calling agent and session.
+// Most callers will not populate it — an agent has no reason to know the field
+// exists — and an audit trail that is empty by default is not much of one. So
+// the server fills what it can from what the transport already knows.
+
+/**
+ * This server process's session id.
+ *
+ * Over stdio, one process IS one session: the client spawns us, talks, and we
+ * exit with it. MCP has no session identifier of its own to borrow, so minting
+ * one per process is the closest true statement we can make — every call
+ * carrying this id really did come from one uninterrupted client connection.
+ */
+const MCP_SESSION_ID = `mcp-${randomUUID()}`;
+
+/**
+ * Attribution derived from the MCP `initialize` handshake, for calls that
+ * supply none of their own. `clientInfo.name` is the client's self-report, the
+ * same trust level as a caller-supplied `agent` — which is why neither is ever
+ * used to authorize.
+ *
+ * Read per call rather than cached: the handshake completes after this module
+ * is evaluated, so a value captured at load time would always be undefined.
+ */
+function defaultClient(): Record<string, string> {
+  const info = server.server.getClientVersion();
+  return {
+    ...(info?.name ? { agent: info.name } : {}),
+    session_id: MCP_SESSION_ID,
+  };
+}
+
+/**
+ * Merge server defaults under whatever the caller sent. Per KEY, not per
+ * object: a caller that names its agent but no session still gets the session
+ * filled in, rather than losing it to an all-or-nothing choice.
+ */
+function withClientDefaults(input: Record<string, unknown>): Record<string, unknown> {
+  const supplied = input.client;
+  // A non-object `client` is the caller's error to hear about. Passing it
+  // through unchanged lets the catalog raise VALIDATION_FAILED, where spreading
+  // it into an object here would silently repair invalid input.
+  if (supplied !== undefined && (typeof supplied !== "object" || supplied === null || Array.isArray(supplied))) {
+    return input;
+  }
+  return {
+    ...input,
+    client: { ...defaultClient(), ...(supplied as Record<string, unknown> | undefined) },
+  };
+}
+
 function toolResult(payload: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
@@ -130,7 +184,7 @@ function toolError(err: unknown) {
 /** Run a catalog operation and package the outcome as a tool result. */
 async function runOp(name: string, input: Record<string, unknown>) {
   try {
-    return toolResult(await api.run(name, input, opCtx()));
+    return toolResult(await api.run(name, withClientDefaults(input), opCtx()));
   } catch (err) {
     return toolError(err);
   }

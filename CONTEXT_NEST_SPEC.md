@@ -1509,6 +1509,40 @@ Three constraints are normative:
 `client` is distinct from a node's `metadata` frontmatter (§1.5): `metadata`
 describes the document, `client` describes the call that touched it.
 
+#### 9.4.1 Reserved and custom keys
+
+`agent` and `session_id` are RESERVED. An implementation accepting custom keys
+alongside them MUST NOT silently accept a near-miss on a reserved key
+(`sessionId`, `session-id`, `Agent`) as a custom key: the write is then recorded
+but not in the slot readers look in, so it is silently unattributed while
+appearing to succeed. Reject it and name the intended key.
+
+Custom keys and reserved keys share one namespace and travel together in the
+same object. An implementation SHOULD bound the number of custom keys and the
+length of every value, and SHOULD restrict values to scalars.
+
+#### 9.4.2 Binding conventions
+
+A caller will often not populate `client` — an agent has no reason to know the
+field exists — so a binding SHOULD supply what its transport already knows, and
+MUST merge those defaults per KEY, under anything the caller sent. A caller that
+names its agent but no session keeps its agent and still gains a session id.
+
+| Binding | `agent` | `session_id` |
+|---|---|---|
+| MCP | The `clientInfo.name` from the `initialize` handshake | An identifier for the connection. Over stdio one process is one session, so a value minted per process is an accurate statement |
+| CLI | An explicit flag, falling back to an environment variable so a wrapping agent sets it once per session rather than per invocation | Same |
+| REST / other | Whatever the transport authenticates or correlates by | The transport's own session or request-correlation id |
+
+A binding MUST NOT invent a value it cannot stand behind. Where the transport
+knows nothing — a REST call with no session concept — the field is better absent
+than filled with a placeholder, because a reader cannot tell a synthesized value
+from a real one.
+
+Defaults do not change the trust level of anything in §9.4: `clientInfo.name` is
+a client's self-report, exactly like a caller-supplied `agent`, and neither is
+authenticated.
+
 ---
 
 ## 10. INDEX.md Format

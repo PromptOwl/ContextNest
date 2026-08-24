@@ -87,6 +87,7 @@ import type {
   GovernanceTier,
   RbacHook,
   VaultRegistry,
+  ClientMetadata,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
@@ -110,6 +111,11 @@ import {
   NO_REDIRECT,
 } from "./safety.js";
 
+/** Commander collector for repeatable `--client key=value` flags. */
+function collectClientPair(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 const program = new Command();
 
 program
@@ -124,7 +130,24 @@ program
   // three flags. See safety.ts for the mechanics.
   .option("--dry-run", "Preview a write command against a throwaway copy of the vault; touch nothing")
   .option("-y, --yes", "Skip confirmation prompts (required for destructive commands in scripts/CI)")
-  .option("--force", "Overwrite existing files, and allow plaintext-HTTP pushes");
+  .option("--force", "Overwrite existing files, and allow plaintext-HTTP pushes")
+  // Caller attribution (spec §9.4). Global so a write and a read attribute the
+  // same way, and env-backed so a coding-agent plugin that shells out to `ctx`
+  // can set them once for a whole session instead of on every invocation.
+  .option(
+    "--agent <name>",
+    "Name of the calling agent, recorded with reads and writes (env: CONTEXTNEST_AGENT)",
+  )
+  .option(
+    "--session <id>",
+    "Calling session id, recorded with reads and writes (env: CONTEXTNEST_SESSION_ID)",
+  )
+  .option(
+    "--client <key=value>",
+    "Extra caller metadata, repeatable (e.g. --client workspace=acme)",
+    collectClientPair,
+    [] as string[],
+  );
 
 // ---------------------------------------------------------------------------
 // Friendly top-level help
@@ -224,8 +247,16 @@ function renderRootHelp(): string {
   lines.push(`${indent}${chalk.cyan("--dry-run".padEnd(col + 2))}preview a write command without touching the filesystem`);
   lines.push(`${indent}${chalk.cyan("-y, --yes".padEnd(col + 2))}skip confirmation prompts`);
   lines.push(`${indent}${chalk.cyan("--force".padEnd(col + 2))}allow overwriting existing files`);
+  lines.push(`${indent}${chalk.cyan("--agent <name>".padEnd(col + 2))}name of the calling agent, recorded with reads and writes`);
+  lines.push(`${indent}${chalk.cyan("--session <id>".padEnd(col + 2))}calling session id, recorded with reads and writes`);
+  lines.push(`${indent}${chalk.cyan("--client <k=v>".padEnd(col + 2))}extra caller metadata, repeatable`);
   lines.push(`${indent}${chalk.cyan("-V, --version".padEnd(col + 2))}print the version number`);
   lines.push(`${indent}${chalk.cyan("-h, --help".padEnd(col + 2))}show this help`);
+  lines.push("");
+  lines.push(chalk.bold("CALLER ATTRIBUTION"));
+  lines.push(`${indent}${chalk.cyan("--agent")} and ${chalk.cyan("--session")} record WHO is calling on every read and write.`);
+  lines.push(`${indent}A write stores them in version history, where ${chalk.cyan("ctx history")} shows them. Set`);
+  lines.push(`${indent}${chalk.cyan("CONTEXTNEST_AGENT")}/${chalk.cyan("CONTEXTNEST_SESSION_ID")} to attribute a whole session at once.`);
   lines.push("");
   lines.push(chalk.bold("FILE SAFETY"));
   lines.push(`${indent}Every command that writes asks before it does, then prints the exact list of`);
@@ -253,6 +284,89 @@ program.configureHelp({
 // preAction hook so it works whether the flag is given before the subcommand
 // (`ctx --vault work list`) or after it (`ctx list --vault work`).
 let selectedVaultAlias: string | undefined;
+
+/**
+ * Caller attribution for the currently-running command (spec §9.4) — the
+ * `client` block every catalog call carries. Captured by the same preAction
+ * hook as the vault alias, for the same reason: the flags work before or after
+ * the subcommand.
+ */
+let callClient: ClientMetadata | undefined;
+
+/**
+ * Build the `client` block from flags and env.
+ *
+ * Env is the fallback, not an override: a coding-agent plugin exports
+ * CONTEXTNEST_AGENT/CONTEXTNEST_SESSION_ID once for a whole session, and a
+ * one-off `ctx --agent …` on top of that still wins.
+ *
+ * Returns undefined when nothing was supplied, so an unattributed run writes no
+ * empty `client:` key into history.
+ */
+function buildCallClient(opts: {
+  agent?: string;
+  session?: string;
+  client?: string[];
+}): ClientMetadata | undefined {
+  const client: ClientMetadata = {};
+  const agent = opts.agent ?? process.env.CONTEXTNEST_AGENT;
+  const session = opts.session ?? process.env.CONTEXTNEST_SESSION_ID;
+  if (agent) client.agent = agent;
+  if (session) client.session_id = session;
+
+  for (const pair of opts.client ?? []) {
+    // Split on the FIRST `=` only — a value may legitimately contain one
+    // (a URL, a base64 fragment), and splitting on every one would truncate it.
+    const eq = pair.indexOf("=");
+    if (eq <= 0) {
+      console.error(chalk.red(`Invalid --client "${pair}" — expected key=value`));
+      process.exit(1);
+    }
+    const key = pair.slice(0, eq).trim();
+    // Recorded as a STRING, always. Coercing digits to numbers would silently
+    // rewrite `version=1.0` as 1 and `build=007` as 7 — a shell argument is
+    // text, and an audit record that quietly loses characters is worse than one
+    // that stores a number as "2". Callers needing real scalars use the API.
+    client[key] = pair.slice(eq + 1);
+  }
+
+  return Object.keys(client).length > 0 ? client : undefined;
+}
+
+/** One-line rendering of a recorded `client` block: `agent (session), k=v`. */
+function formatClient(client: ClientMetadata): string {
+  const { agent, session_id, ...custom } = client;
+  const head = agent ?? "(unnamed agent)";
+  const session = session_id ? ` (session ${session_id})` : "";
+  const extras = Object.entries(custom)
+    .map(([k, v]) => `${k}=${String(v)}`)
+    .join(", ");
+  return `${head}${session}${extras ? `, ${extras}` : ""}`;
+}
+
+/**
+ * The engine API with this run's caller attribution folded in.
+ *
+ * Every CLI call goes through here rather than `createEngineApi()` directly, so
+ * a new command cannot silently ship unattributed: there is one place the
+ * `client` block is attached, not thirteen. An input that names its own
+ * `client` wins, which is what lets a command attribute a call more precisely
+ * than the global flags do.
+ */
+function cliApi() {
+  const api = createEngineApi();
+  return {
+    run<T = unknown>(
+      name: string,
+      input: Record<string, unknown>,
+      ctx: OperationContext,
+    ): Promise<T> {
+      const merged =
+        callClient && input.client === undefined ? { ...input, client: callClient } : input;
+      return api.run<T>(name, merged, ctx);
+    },
+  };
+}
 
 /**
  * Commands that mutate the vault tree. Listed explicitly rather than audited
@@ -306,6 +420,7 @@ function commandPath(cmd: Command): string {
 program.hook("preAction", async (_thisCommand, actionCommand) => {
   const opts = actionCommand.optsWithGlobals();
   selectedVaultAlias = opts.vault as string | undefined;
+  callClient = buildCallClient(opts as { agent?: string; session?: string; client?: string[] });
   configureSafety({ dryRun: opts.dryRun, yes: opts.yes, force: opts.force });
 
   const name = commandPath(actionCommand);
@@ -1053,7 +1168,7 @@ program
     // allow_rejected: `ctx read` has always shown a retired document — reading
     // one is not republishing it, and refusing would hide it from the person
     // deciding whether to revive it.
-    const got = await createEngineApi().run<{
+    const got = await cliApi().run<{
       id: string;
       frontmatter: ContextNode["frontmatter"];
       body: string;
@@ -1212,7 +1327,7 @@ program
     // Scaffolding above stays a CLI concern (heading/steps templates are an
     // authoring nicety, not vault semantics); the write + publish + index pass
     // goes through the catalog so this matches every other surface.
-    const result = await createEngineApi().run<{
+    const result = await cliApi().run<{
       id: string;
       version: number;
       checkpoint: number | null;
@@ -1386,7 +1501,7 @@ program
 
     await confirmOrExit(`Publish ${normalizeDocumentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
 
-    const result = await createEngineApi().run<{
+    const result = await cliApi().run<{
       id: string;
       version: number;
       checkpoint: number;
@@ -1434,7 +1549,7 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
     }
   });
 
-  const result = await createEngineApi().run<{
+  const result = await cliApi().run<{
     published: { id: string; version: number }[];
     failed: { id?: string; title?: string; error: string }[];
     checkpoint: number | null;
@@ -1466,7 +1581,7 @@ program
     }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
-    const history = await createEngineApi().run<{
+    const history = await cliApi().run<{
       id: string;
       keyframe_interval: number;
       versions: Array<{
@@ -1478,6 +1593,7 @@ program
         note?: string;
         chain_hash: string;
         diff?: string;
+        client?: ClientMetadata;
       }>;
     }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
@@ -1497,6 +1613,9 @@ program
       console.log(`  v${entry.version}${keyframe}${published}`);
       console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
       if (entry.note) console.log(`    Note: ${entry.note}`);
+      // Who was CALLING, as distinct from `By:` above, which is the authoring
+      // identity. Rendered only when the write carried attribution.
+      if (entry.client) console.log(`    Client: ${formatClient(entry.client)}`);
       if (entry.diff) console.log(entry.diff.replace(/^/gm, "    "));
     }
   });
@@ -1508,7 +1627,7 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const { content } = await createEngineApi().run<{ content: string }>(
+    const { content } = await cliApi().run<{ content: string }>(
       "context_reconstruct",
       { id: normalizeDocumentId(path), version: parseInt(version, 10) },
       opContext(storage, "cli@contextnest.local"),
@@ -1529,7 +1648,7 @@ program
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const out = await createEngineApi().run<{
+    const out = await cliApi().run<{
       context_md: string | null;
       vault_path: string;
       config: { name: string; description?: string; servers: string[] } | null;
@@ -1856,7 +1975,7 @@ program
     // Local query — graph-aware traversal
     const storage = getStorage();
     type Doc = { id: string; title: string; body?: string; source?: unknown };
-    const result = await createEngineApi().run<{
+    const result = await cliApi().run<{
       documents: Doc[];
       source_nodes?: Doc[];
       trace_count?: number;
@@ -1937,7 +2056,7 @@ program
     const storage = getStorage();
     // Aliases collapse here; the operation owns the rest of the filtering,
     // including hiding retired documents when no status was asked for.
-    const { documents } = await createEngineApi().run<{
+    const { documents } = await cliApi().run<{
       documents: Array<{
         id: string;
         title: string;
@@ -2004,7 +2123,7 @@ program
       `Rewrite ${normalizeDocumentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
     );
 
-    const result = await createEngineApi().run<{
+    const result = await cliApi().run<{
       id: string;
       version: number;
       status: string;
@@ -2057,7 +2176,7 @@ program
       `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.`,
       { destructive: true },
     );
-    const result = await createEngineApi().run<{ id: string; title: string }>(
+    const result = await cliApi().run<{ id: string; title: string }>(
       "context_delete",
       { id: normalizeDocumentId(path) },
       opContext(storage, "cli@contextnest.local"),
@@ -2079,7 +2198,7 @@ program
       return;
     }
     const storage = getStorage();
-    const { results } = await createEngineApi().run<{
+    const { results } = await cliApi().run<{
       results: Array<{ id: string; title: string; description?: string; type: string }>;
     }>(
       "context_search",
@@ -2118,7 +2237,7 @@ packCmd
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
-    const { packs } = await createEngineApi().run<{
+    const { packs } = await cliApi().run<{
       packs: Array<{ id: string; label: string; description?: string }>;
     }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
 

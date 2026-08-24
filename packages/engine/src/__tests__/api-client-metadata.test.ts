@@ -91,6 +91,22 @@ describe("client metadata — validation bounds", () => {
     expect(clientMetadataSchema.safeParse({ agent: "x".repeat(513) }).success).toBe(false);
   });
 
+  it("rejects a near-miss on a reserved key rather than filing it as custom", () => {
+    // The one failure an open catchall cannot catch on its own: `sessionId` is
+    // a valid custom key, so without this guard the write is recorded but NOT
+    // in the slot context_versions reads — silently un-attributed.
+    for (const typo of ["sessionId", "session-id", "SESSION_ID", "Agent"]) {
+      const result = clientMetadataSchema.safeParse({ [typo]: "value" });
+      expect(result.success, `${typo} should be rejected`).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toMatch(/reserved key/);
+      }
+    }
+    // A key that merely mentions a reserved word is still fine.
+    expect(clientMetadataSchema.safeParse({ agent_version: "1.2.0" }).success).toBe(true);
+    expect(clientMetadataSchema.safeParse({ parent_session_id: "s-1" }).success).toBe(true);
+  });
+
   it(`rejects more than ${CLIENT_METADATA_MAX_CUSTOM_KEYS} custom keys`, () => {
     const tooMany: Record<string, string> = { ...CLIENT };
     for (let i = 0; i <= CLIENT_METADATA_MAX_CUSTOM_KEYS; i++) tooMany[`k${i}`] = "v";

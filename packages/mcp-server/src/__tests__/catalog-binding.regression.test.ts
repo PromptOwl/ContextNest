@@ -399,6 +399,44 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
     expect(versions.versions.at(-1)!.client).toEqual(meta);
   });
 
+  it("fills agent + session_id from the MCP handshake when the caller sends none", async () => {
+    // Most agents will not know the field exists, and an audit trail that is
+    // empty by default is not much of one. The server knows the client's name
+    // from `initialize` and owns the stdio connection, so it can say both.
+    const created = await callJson(client, "context_create", {
+      title: "Server Attributed",
+      content: "body",
+    });
+    const versions = await callJson(client, "context_versions", { id: created.id });
+    const recorded = versions.versions.at(-1)!.client;
+    expect(recorded.agent).toBe("catalog-regression-test");
+    expect(recorded.session_id).toMatch(/^mcp-[0-9a-f-]{36}$/);
+  });
+
+  it("lets a caller override the defaults per key, not all-or-nothing", async () => {
+    const created = await callJson(client, "context_create", {
+      title: "Partial Override",
+      content: "body",
+      client: { agent: "downstream-agent" },
+    });
+    const versions = await callJson(client, "context_versions", { id: created.id });
+    const recorded = versions.versions.at(-1)!.client;
+    // The caller's agent wins…
+    expect(recorded.agent).toBe("downstream-agent");
+    // …and the session it did not supply is still filled in, rather than lost.
+    expect(recorded.session_id).toMatch(/^mcp-/);
+  });
+
+  it("keeps one session id across every call on a connection", async () => {
+    const a = await callJson(client, "context_create", { title: "Same Session A", content: "x" });
+    const b = await callJson(client, "context_create", { title: "Same Session B", content: "y" });
+    const [va, vb] = await Promise.all([
+      callJson(client, "context_versions", { id: a.id }),
+      callJson(client, "context_versions", { id: b.id }),
+    ]);
+    expect(va.versions.at(-1)!.client.session_id).toBe(vb.versions.at(-1)!.client.session_id);
+  });
+
   it("refuses malformed `client` metadata rather than writing an unvalidated one", async () => {
     // The SDK validates tool arguments against the published schema before the
     // handler runs, so this is rejected at the protocol layer rather than

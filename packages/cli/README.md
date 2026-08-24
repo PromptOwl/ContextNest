@@ -155,6 +155,40 @@ it would put both the documents and your API key on the wire in the clear.
 Prefer `CONTEXTNEST_API_KEY` over `--key`: command-line arguments are visible
 to other processes and land in shell history.
 
+### Caller attribution
+
+Three global flags record *who is calling* on every read and write
+(spec §9.4):
+
+| Flag | Effect |
+|------|--------|
+| `--agent <name>` | Name of the calling agent (env: `CONTEXTNEST_AGENT`) |
+| `--session <id>` | Calling session id (env: `CONTEXTNEST_SESSION_ID`) |
+| `--client <key=value>` | Extra caller metadata, repeatable |
+
+```bash
+ctx add nodes/spec --title "Spec" --agent claude-code --session s-9f2
+ctx history nodes/spec
+#   v1 [keyframe] published
+#     By: you@example.com at 2026-08-22T15:54:47.356Z
+#     Client: claude-code (session s-9f2)
+```
+
+A write that publishes records the block on its version-history entry, so
+`ctx history` shows which agent produced each version — distinct from `By:`,
+which is the authoring identity. Reads carry it too; nothing is persisted for
+them locally, but a governed backend receives it.
+
+The env vars are the reason this is practical for agents: a plugin that shells
+out to `ctx` exports them once for a session instead of threading flags through
+every call. A flag beats the env var per key, so `--agent` on one command
+overrides the ambient agent while keeping the ambient session.
+
+Values from `--client` are recorded as **strings** — a shell argument is text,
+and coercing `version=1.0` to `1` would quietly lose characters from an audit
+record. Attribution is a label, never an identity claim: nothing authenticates
+it, and it is never used to authorize.
+
 ### Errors
 
 Every failure prints as a single line — `Error [CODE]: message` for engine
@@ -173,6 +207,7 @@ CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 
 ### Index & Agent Configs
 - `ctx index` — Regenerate context.yaml, INDEX.md, and agent config files (CLAUDE.md, GEMINI.md, .cursorrules, .windsurfrules, .github/copilot-instructions.md)
+
 
 ## Upgrading to 2.0
 

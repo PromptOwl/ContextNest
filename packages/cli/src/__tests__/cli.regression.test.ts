@@ -11,7 +11,7 @@
  * `vitest run -t regression`.
  */
 
-import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
 import { execFileSync, execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -1393,5 +1393,114 @@ describe("[regression] file safety — generic folder names in a vault", () => {
     // Modified, not created — the subtree made it into the sandbox copy.
     expect(res.stderr).toContain("~ nodes/out/formats.md");
     expect(readFileSync(join(tmp, "nodes", "out", "formats.md"), "utf-8")).toContain("original");
+  });
+});
+
+// ─── Caller attribution (spec §9.4) ─────────────────────────────────────────
+
+describe("[regression] caller attribution — --agent / --session / --client", () => {
+  let dir: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "cn-cli-reg-client-"));
+    initVault(dir);
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("records the flags on the version entry and shows them in `ctx history`", () => {
+    runCtx(dir, [
+      "add",
+      "nodes/attributed-note",
+      "--title",
+      "Attributed Note",
+      "--body",
+      "body",
+      "--agent",
+      "claude-code",
+      "--session",
+      "sess-cli-1",
+      "--client",
+      "workspace=acme",
+    ]);
+
+    const history = runCtx(dir, ["history", "nodes/attributed-note", "--json"]);
+    const parsed = JSON.parse(history) as {
+      versions: Array<{ client?: Record<string, string> }>;
+    };
+    expect(parsed.versions.at(-1)!.client).toEqual({
+      agent: "claude-code",
+      session_id: "sess-cli-1",
+      workspace: "acme",
+    });
+
+    // …and the human rendering surfaces it, distinct from the `By:` line, which
+    // is the authoring identity rather than the caller.
+    const rendered = runCtx(dir, ["history", "nodes/attributed-note"]);
+    expect(rendered).toMatch(/Client: claude-code \(session sess-cli-1\), workspace=acme/);
+  });
+
+  it("falls back to env, and an explicit flag still wins", () => {
+    const envRun = { ...ENV, CONTEXTNEST_AGENT: "env-agent", CONTEXTNEST_SESSION_ID: "sess-env" };
+    execFileSync(
+      "node",
+      [distPath, "add", "nodes/from-env", "--title", "From Env", "--body", "body"],
+      { cwd: dir, env: envRun, encoding: "utf-8" },
+    );
+    execFileSync(
+      "node",
+      [distPath, "add", "nodes/flag-wins", "--title", "Flag Wins", "--body", "body",
+       "--agent", "flag-agent"],
+      { cwd: dir, env: envRun, encoding: "utf-8" },
+    );
+
+    const fromEnv = JSON.parse(runCtx(dir, ["history", "nodes/from-env", "--json"]));
+    expect(fromEnv.versions.at(-1).client).toEqual({
+      agent: "env-agent",
+      session_id: "sess-env",
+    });
+
+    const flagWins = JSON.parse(runCtx(dir, ["history", "nodes/flag-wins", "--json"]));
+    // The flag overrides the agent; the session still comes from env, because
+    // the fallback is per-key rather than all-or-nothing.
+    expect(flagWins.versions.at(-1).client).toEqual({
+      agent: "flag-agent",
+      session_id: "sess-env",
+    });
+  });
+
+  it("writes no client block at all when nothing is supplied", () => {
+    runCtx(dir, ["add", "nodes/unattributed", "--title", "Unattributed", "--body", "body"]);
+    const parsed = JSON.parse(runCtx(dir, ["history", "nodes/unattributed", "--json"]));
+    expect(parsed.versions.at(-1)).not.toHaveProperty("client");
+  });
+
+  it("rejects a malformed --client pair instead of recording a broken key", () => {
+    const res = runCtxResult(dir, [
+      "add",
+      "nodes/bad-pair",
+      "--title",
+      "Bad Pair",
+      "--body",
+      "body",
+      "--client",
+      "no-equals-sign",
+    ]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/expected key=value/);
+  });
+
+  it("attributes reads too, not only writes", () => {
+    // The flags are global, so a query carries them the same way a write does.
+    // Nothing is persisted for a read, so this asserts the call is accepted
+    // rather than rejected as an unknown option.
+    const out = runCtx(dir, [
+      "query",
+      "#none",
+      "--agent",
+      "claude-code",
+      "--session",
+      "sess-cli-1",
+    ]);
+    expect(out).toBeDefined();
   });
 });
