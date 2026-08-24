@@ -14,6 +14,14 @@ carries it — however you phrased it, with the work fanned out in parallel.
   confirm, and hands the model the list of nodes still asserting the old value
   — mid-turn, so it finishes the sweep immediately. Tunables:
   `CONTEXTNEST_SWEEP_MAX_CANDIDATES` (default 24), `CONTEXTNEST_SWEEP_CHECK=off`.
+- **Entity tags make that sweep deterministic.** The capture and curator agents
+  now tag nodes with the concrete entities they assert (`#infra, #redis` for
+  "Sessions live in Redis") and retag when an edit changes what a node claims.
+  The sweep-check consults the tag index (`ctx list --tag`) alongside full-text
+  search — exact, and it sees drafts — so a node that *paraphrases* a changed
+  fact is still found, and a tag whose body no longer backs it is reported for
+  repair instead of silently rotting. No new storage: tags and `context.yaml`
+  already exist, are versioned, and are visible to selectors.
 - **Correction dispatch is now route → scout → fan out.** The retriever agent
   gained a scout mode (the same setup retrieval uses) that returns an occurrence
   map across candidate nests; the dispatcher partitions the map and launches

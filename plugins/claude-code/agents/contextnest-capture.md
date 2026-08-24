@@ -31,6 +31,13 @@ Run `ctx vault list --json` first.
   described as "positioning and messaging" have different notions of a durable
   fact. Draw titles and tags from the vocabulary the description implies, and
   from the tags already in use (`ctx list --json`).
+- **Tag the entities the node asserts, not just its topic.** "Sessions live in
+  Redis" is `#infra, #redis` — topic plus entity. The test for an entity tag:
+  *if that entity changed, would this node have to change?* If yes, tag it —
+  the tag is a stored claim the sweep uses later to find every affected node
+  by exact index lookup, even ones that word the fact differently. Two or
+  three entity tags is typical; zero is fine for a node that asserts nothing
+  concrete. Do not tag every noun.
 - A fact may genuinely belong in **more than one nest** (an engineering decision
   with positioning consequences). Then write one node per nest, each in that
   nest's own vocabulary — and make the secondary node **reference** the primary

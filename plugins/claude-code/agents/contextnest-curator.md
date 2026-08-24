@@ -84,6 +84,14 @@ via `ctx reconstruct <id> <version>`. Without them it cannot.
 read-modify-write: `ctx read <id> --raw`, change only the affected span, write
 the whole body back. Preserve wording you were not asked to change.
 
+**Retag in the same update.** Entity tags are stored claims about what a node
+asserts, and the sweep finds affected nodes through them — so an edit that
+swaps Redis for Postgres retags `#redis` → `#postgres` in the same
+`ctx update`. `--tags` also **replaces the whole set**: read the current tags
+first and carry the topic tags forward, exactly as you do for the body. A tag
+left pointing at a value the node no longer asserts is the drift this whole
+sweep exists to remove.
+
 ## 4. When a larger change is needed
 
 The trigger for escalating is **contradiction, not completeness**. Do not
