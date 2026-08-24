@@ -49,6 +49,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Thrown when the lock cannot be acquired within ACQUIRE_TIMEOUT_MS. */
 export class VaultLockTimeoutError extends Error {
+  /**
+   * Stable discriminator for consumers matching across package boundaries
+   * (dual CJS/ESM builds break `instanceof`). Mirrored in the api module's
+   * ERROR_CODES so bindings can surface it as a typed, retryable error.
+   */
+  readonly code = "VAULT_LOCK_TIMEOUT";
+
   constructor(root: string) {
     super(
       `Could not acquire the write lock for vault at ${root} within ${ACQUIRE_TIMEOUT_MS}ms — ` +
