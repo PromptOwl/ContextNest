@@ -100,4 +100,10 @@ describe("withVaultLock", () => {
     // message names the remedy — the full 20s wait is not worth a test's time.
     expect(new VaultLockTimeoutError("/x").message).toMatch(/stale/i);
   });
+
+  it("carries a stable code for cross-package matching", () => {
+    // Consumers on the other side of a dual CJS/ESM build can't rely on
+    // instanceof; `code` (mirrored in api ERROR_CODES) is the contract.
+    expect(new VaultLockTimeoutError("/x").code).toBe("VAULT_LOCK_TIMEOUT");
+  });
 });
