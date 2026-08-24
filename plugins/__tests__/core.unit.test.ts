@@ -873,9 +873,7 @@ describe("capture-gate", () => {
       readTranscript: tx([userLine("run the tests"), '{"role":"assistant","content":[{"tool_use":1}]}']),
       ledgerIo: fakeLedgerIo(),
     });
-    expect(out?.decision).toBe("block");
-    expect(out?.reason).toMatch(/contextnest-curator/);
-    expect(out?.reason).toMatch(/EVERY node/);
+    expect(out).toBeNull();
   });
 
   it("a whole short session of tool-using turns stays silent", () => {
