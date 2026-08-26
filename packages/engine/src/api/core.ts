@@ -303,8 +303,9 @@ const foldersOp: OperationDescriptor = {
       }),
     ),
   }),
+  // No alias: aliases are a migration path off tool names that already
+  // existed in the wild, and nothing ever called this one.
   errors: ["VALIDATION_FAILED"],
-  aliases: ["list_folders"],
 };
 
 // ─── context_create ──────────────────────────────────────────────────────────

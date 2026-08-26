@@ -89,6 +89,19 @@ describe("folder-scoped discovery", () => {
     expect(normalizeFolder("/nodes/gtm/")).toBe("nodes/gtm");
     expect(normalizeFolder("nodes\\gtm")).toBe("nodes/gtm");
     expect(normalizeFolder("")).toBe("");
+    // Empty segments collapse — an interior "//" would otherwise survive into
+    // the glob prefix and match nothing.
+    expect(normalizeFolder("nodes//gtm")).toBe("nodes/gtm");
+    expect(normalizeFolder("///")).toBe("");
+  });
+
+  it("normalizes a hostile run of separators in linear time", () => {
+    // Trimming with an anchored `\/+` retried at every position of the run,
+    // which is quadratic — a path like this is the cheap way to notice.
+    const hostile = "/".repeat(200_000) + "x";
+    const started = performance.now();
+    expect(normalizeFolder(hostile)).toBe("x");
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   it("lists folders without opening a single document", async () => {

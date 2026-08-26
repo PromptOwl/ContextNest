@@ -133,22 +133,26 @@ export function assertSafeDocumentId(raw: string): void {
 }
 
 /**
- * Normalize a folder path used to scope discovery: strips surrounding slashes,
+ * Normalize a folder path used to scope discovery: drops empty segments,
  * accepts either separator, and rejects `..` — the path is joined against the
  * vault root to start the crawl, so a traversal sequence would read outside it.
  *
  * `""` is the vault root, which is why this cannot reuse `assertSafeDocumentId`
  * (that requires every segment to name something).
+ *
+ * Splitting on the separator rather than trimming with an anchored `\/+` also
+ * keeps this linear: that pattern retries at every position of a long run of
+ * slashes, which is quadratic on a hostile path (CodeQL js/polynomial-redos).
  */
 export function normalizeFolder(raw: string): string {
-  const trimmed = raw.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  if (trimmed.split("/").some((seg) => seg === "..")) {
+  const segments = raw.split(/[/\\]/).filter(Boolean);
+  if (segments.includes("..")) {
     throw new ContextNestError(
       `Invalid folder "${raw}": path traversal ("..") is not allowed.`,
       "INVALID_DOCUMENT_ID",
     );
   }
-  return trimmed;
+  return segments.join("/");
 }
 
 /**
