@@ -292,8 +292,8 @@ export class CheckpointManager {
   }
 
   /**
-   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it re-reads
-   * context_history.yaml, appends one checkpoint, and writes it back.
+   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it reads the
+   * chain's head, links one checkpoint onto it, and appends.
    */
   private async sealCheckpoint(
     triggeredBy: string,
@@ -303,11 +303,10 @@ export class CheckpointManager {
     {
       // Re-read inside the lock so the checkpoint number and previous-hash
       // linkage are based on the latest committed write, not a stale snapshot.
-      const history = (await this.storage.readCheckpointHistory()) || {
-        checkpoints: [],
-      };
-
-      const previousCheckpoint = getLatestCheckpoint(history);
+      // Head only, not the whole chain: this runs on every publish, and the
+      // chain grows by one entry per published document per checkpoint, so
+      // loading it here made each publish cost O(chain size).
+      const previousCheckpoint = await this.storage.readLatestCheckpoint();
 
       const checkpointNumber = previousCheckpoint
         ? previousCheckpoint.checkpoint + 1
@@ -365,8 +364,11 @@ export class CheckpointManager {
         checkpoint_hash: checkpointHash,
       };
 
-      history.checkpoints.push(checkpoint);
-      await this.storage.writeCheckpointHistory(history);
+      // Extend the chain in place when there is one to extend. Only a vault
+      // with no readable head starts a new file — and that path preserves
+      // whatever was there rather than overwriting it.
+      if (previousCheckpoint) await this.storage.appendCheckpoint(checkpoint);
+      else await this.storage.startCheckpointHistory(checkpoint);
 
       return checkpoint;
     }
