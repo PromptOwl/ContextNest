@@ -8,17 +8,65 @@ import type { ContextNode, DocumentHistory, VersionEntry } from "./types.js";
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
 import { NestStorage } from "./storage.js";
-import { ContextNestError } from "./errors.js";
+import { ContextNestError, CorruptHistoryError } from "./errors.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
+
+/** What {@link VersionManager.historyOrRepair} found, and what it had to do. */
+export interface ResilientHistory {
+  /** The parsed history, or null when there is none to read. */
+  history: DocumentHistory | null;
+  /**
+   * Where an unreadable history.yaml was preserved, when one was moved aside.
+   * Null on the normal path — including for a document that simply has no
+   * history yet, which is not a break.
+   */
+  quarantinedAs: string | null;
+}
 
 export class VersionManager {
   constructor(private storage: NestStorage) {}
 
   /**
-   * Next version number for a document — ahead of BOTH the caller's hint
-   * (frontmatter version, a DB row count) and everything already recorded in
-   * history.yaml.
+   * Read a document's history, healing an unreadable one instead of failing the
+   * caller's write.
+   *
+   * A torn history.yaml (an interrupted write leaving null bytes, a hand edit,
+   * a schema-invalid file) used to throw `CorruptHistoryError` straight out of
+   * every publish and every edit of that document — permanently, with no way
+   * for the author to get past it from any surface. The document itself is
+   * fine; only its ledger is unreadable. So: move the unreadable file aside
+   * (never delete it — it is the sole record of the old chain) and report the
+   * document as having no history, which lets {@link createVersion} restart the
+   * chain from a fresh keyframe on this very write.
+   *
+   * Two invariants keep that safe rather than lossy:
+   *   - the quarantined bytes stay on disk under `.corrupt-<ts>.yaml`;
+   *   - numbering continues past every artifact already sealed on disk (see
+   *     {@link nextVersion}), so no `v{N}.md` / `v{N}.diff` is ever reused —
+   *     `writeVersionArtifact`'s exclusive create remains the backstop.
+   *
+   * The break is still visible: `verify` reports the gap, the restart entry
+   * carries a note saying what happened, and the quarantined file names it.
+   */
+  async historyOrRepair(docId: string): Promise<ResilientHistory> {
+    try {
+      return { history: await this.storage.readHistory(docId), quarantinedAs: null };
+    } catch (err) {
+      if (!(err instanceof CorruptHistoryError)) throw err;
+      const quarantinedAs = await this.storage.quarantineHistory(docId);
+      console.warn(
+        `[versioning] ${docId}: history.yaml is unreadable (${err.message}); ` +
+          `preserved as ${quarantinedAs} and restarting the chain from this version`,
+      );
+      return { history: null, quarantinedAs };
+    }
+  }
+
+  /**
+   * Next version number for a document — ahead of the caller's hint
+   * (frontmatter version, a DB row count), everything recorded in history.yaml,
+   * and every version artifact on disk.
    *
    * history.yaml is append-only, so the next entry MUST outrank every entry in
    * it. Numbering from frontmatter alone lets a document whose frontmatter lags
@@ -26,14 +74,34 @@ export class VersionManager {
    * frontmatter was reset — graft a SECOND chain onto the first: duplicate
    * v{N} entries, keyframe files overwritten at the same number, and
    * reconstructVersion() failing on the first diff after the graft.
+   *
+   * The on-disk artifacts are consulted too, because a quarantined history
+   * (see {@link historyOrRepair}) leaves nothing to read but the `v{N}` files
+   * it sealed — and restarting at 1 there would collide with every one of them.
    */
   async nextVersion(docId: string, hint = 0): Promise<number> {
-    const history = await this.storage.readHistory(docId);
+    const { history } = await this.historyOrRepair(docId);
     const recorded = (history?.versions ?? []).reduce(
       (max, entry) => Math.max(max, entry.version),
       0,
     );
-    return Math.max(hint, recorded) + 1;
+    const sealed = await this.storage.maxRecordedVersion(docId);
+    return Math.max(hint, recorded, sealed) + 1;
+  }
+
+  /**
+   * Note for an entry that begins a replacement chain, or null for an ordinary
+   * one. Only consulted when there is no readable history, so the directory
+   * listing never touches the normal path.
+   */
+  private async restartNoteFor(
+    docId: string,
+    history: DocumentHistory | null,
+  ): Promise<string | null> {
+    if (history) return null;
+    const sealed = await this.storage.maxRecordedVersion(docId);
+    if (sealed === 0) return null; // genuinely new document, not a restart
+    return `Chain restarted — no readable history.yaml, and versions up to v${sealed} were already sealed`;
   }
 
   /**
@@ -48,7 +116,11 @@ export class VersionManager {
       publishedAt?: string;
     } = {},
   ): Promise<VersionEntry> {
-    const history = (await this.storage.readHistory(node.id)) || {
+    // Resilient read: an unreadable history is moved aside and treated as
+    // absent, so this write restarts the chain rather than failing. See
+    // historyOrRepair for why that is safe.
+    const { history: readHistory } = await this.historyOrRepair(node.id);
+    const history = readHistory || {
       keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
       versions: [],
     };
@@ -119,13 +191,25 @@ export class VersionManager {
       editedAt,
     );
 
+    // A restart is not a silent event: say so on the entry that begins the new
+    // chain, so `ctx history` and the version list show the break where it
+    // happened. Detected from what is on disk rather than from the quarantine
+    // above, because the two do not always happen in the same call — the
+    // publish path repairs first and records the version later, by which point
+    // history.yaml is legitimately absent. "No readable ledger, but sealed
+    // artifacts above it" is a restart however the ledger came to be missing.
+    const note =
+      [options.note, await this.restartNoteFor(node.id, readHistory)]
+        .filter(Boolean)
+        .join(" — ") || undefined;
+
     const entry: VersionEntry = {
       version: currentVersion,
       ...(isKeyframe ? { keyframe: true } : {}),
       edited_by: editedBy,
       edited_at: editedAt,
       ...(options.publishedAt ? { published_at: options.publishedAt } : {}),
-      ...(options.note ? { note: options.note } : {}),
+      ...(note ? { note } : {}),
       content_hash: contentHash,
       chain_hash: chainHash,
     };
