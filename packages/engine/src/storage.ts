@@ -57,6 +57,25 @@ import {
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
 
 /**
+ * What a read of `.versions/context_history.yaml` found.
+ *
+ * Deliberately four cases, not a nullable checkpoint. The publish seal
+ * quarantines a chain it cannot read, so "unreadable" has to be separable from
+ * "absent" and from "valid but holds nothing" — and a transient I/O failure has
+ * to be neither, which is why {@link NestStorage.readCheckpointChainState}
+ * throws rather than reporting one.
+ */
+export type CheckpointChainState =
+  /** No chain file yet. */
+  | { kind: "absent" }
+  /** Valid, with no checkpoints — what a rebuild writes over an empty vault. */
+  | { kind: "empty" }
+  /** The newest checkpoint, to link the next one onto. */
+  | { kind: "head"; checkpoint: Checkpoint }
+  /** Present and genuinely unparseable. The only state that licenses a quarantine. */
+  | { kind: "unreadable"; reason: string };
+
+/**
  * Normalize a user-supplied document path/slug into a canonical document id.
  *
  * Single source of truth shared by every client (CLI, MCP) so a bare slug
@@ -1242,49 +1261,104 @@ export class NestStorage {
   }
 
   /**
-   * The most recent checkpoint, without loading the chain behind it.
+   * The state of the checkpoint chain, read without loading it.
    *
-   * Both hot callers — regenerateIndex (every write) and sealCheckpoint (every
-   * publish) — need exactly this one entry, and reading it by parsing the whole
-   * file made each write cost O(chain size). Three sources, cheapest first:
+   * Four outcomes, because collapsing them is a data-loss bug: the seal
+   * quarantines a chain it cannot read, so "unreadable" MUST be distinguishable
+   * from "absent", from "readable but holds nothing", and above all from a
+   * transient I/O failure — on the network-backed mounts this whole change
+   * exists for, one flaky read would otherwise rename a healthy multi-megabyte
+   * chain aside and restart numbering at 1.
    *
-   *   1. the pointer file, accepted only when the chain file is still the size
-   *      it was when the pointer was written (so a hand edit, a restored
-   *      backup or a rebuild invalidates it rather than silently mislinking);
-   *   2. a bounded tail read of context_history.yaml, which is exact because
-   *      every writer here emits one list item per checkpoint with `lineWidth:
-   *      -1` — no wrapped scalars, so the last `- checkpoint:` item parses
-   *      standalone;
-   *   3. a full read, for a file small enough to have no usable tail.
+   * Mirrors how {@link readHistory} discriminates for a single document: only a
+   * file that is present and genuinely unparseable is corrupt. Any other error
+   * propagates, so the write fails loudly and is retried rather than silently
+   * discarding the chain.
    *
-   * Never throws: an unreadable chain returns null, and the callers treat that
-   * as "no checkpoint yet" rather than failing the user's write.
+   * The head itself comes from three sources, cheapest first: the pointer file,
+   * a bounded tail read, then a full read for a file too small to have a usable
+   * tail. None of the three grows with the chain.
    */
-  async readLatestCheckpoint(): Promise<Checkpoint | null> {
-    let historyBytes: number;
+  async readCheckpointChainState(): Promise<CheckpointChainState> {
+    let info: { size: number; mtimeMs: number };
     try {
-      historyBytes = (await stat(this.checkpointHistoryPath())).size;
-    } catch {
-      return null; // no chain file at all
+      const s = await stat(this.checkpointHistoryPath());
+      info = { size: s.size, mtimeMs: s.mtimeMs };
+    } catch (err) {
+      // Absent is the only benign case; a permission or I/O failure here must
+      // not read as "no chain", which is what would license a quarantine.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      throw err;
     }
 
-    const pointed = await this.readLatestCheckpointPointer(historyBytes);
-    if (pointed) return pointed;
+    const pointed = await this.readLatestCheckpointPointer(info);
+    if (pointed) return { kind: "head", checkpoint: pointed };
 
-    const tailed = await this.readLatestCheckpointFromTail(historyBytes);
-    if (tailed) return tailed;
+    const tailed = await this.readLatestCheckpointFromTail(info.size);
+    if (tailed) return { kind: "head", checkpoint: tailed };
 
-    return (await this.readCheckpointHistory())?.checkpoints.at(-1) ?? null;
+    // Neither shortcut resolved a head, so the file has to be read properly —
+    // and this read is the one that decides corrupt vs merely empty.
+    let content: string;
+    try {
+      content = await readFile(this.checkpointHistoryPath(), "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      throw err;
+    }
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      return { kind: "unreadable", reason: err instanceof Error ? err.message : String(err) };
+    }
+    const result = checkpointHistorySchema.safeParse(raw);
+    if (!result.success) {
+      return {
+        kind: "unreadable",
+        reason: `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
+      };
+    }
+    const head = (result.data as CheckpointHistory).checkpoints.at(-1);
+    // Valid YAML with no checkpoints — what rebuildCheckpointHistory writes for
+    // a vault with nothing published. Empty is not broken.
+    return head ? { kind: "head", checkpoint: head } : { kind: "empty" };
   }
 
-  /** Pointer-file half of {@link readLatestCheckpoint}. */
+  /**
+   * The most recent checkpoint, or null when there is none to link onto.
+   *
+   * Convenience over {@link readCheckpointChainState} for callers that only
+   * want to stamp the head somewhere (regenerateIndex). An unreadable chain
+   * reads as "no checkpoint yet" here rather than failing the caller's write;
+   * a transient I/O failure still propagates.
+   */
+  async readLatestCheckpoint(): Promise<Checkpoint | null> {
+    const state = await this.readCheckpointChainState();
+    return state.kind === "head" ? state.checkpoint : null;
+  }
+
+  /**
+   * Pointer-file half of {@link readCheckpointChainState}.
+   *
+   * Validated against the chain file's size AND mtime. That is a cheap staleness
+   * check, not a proof of identity: an external rewrite that lands on the same
+   * byte count within the same mtime tick would still validate. It closes the
+   * realistic cases — a rebuild, a restored backup, an append from another
+   * process — and the chain's own hash linkage remains what `verify` checks.
+   */
   private async readLatestCheckpointPointer(
-    historyBytes: number,
+    info: { size: number; mtimeMs: number },
   ): Promise<Checkpoint | null> {
     try {
       const raw = yaml.load(await readFile(this.latestCheckpointPath(), "utf-8"));
-      const pointer = raw as { history_bytes?: unknown; checkpoint?: unknown };
-      if (pointer?.history_bytes !== historyBytes) return null;
+      const pointer = raw as {
+        history_bytes?: unknown;
+        history_mtime_ms?: unknown;
+        checkpoint?: unknown;
+      };
+      if (pointer?.history_bytes !== info.size) return null;
+      if (pointer?.history_mtime_ms !== info.mtimeMs) return null;
       const parsed = checkpointSchema.safeParse(pointer.checkpoint);
       return parsed.success ? (parsed.data as Checkpoint) : null;
     } catch {
@@ -1292,7 +1366,19 @@ export class NestStorage {
     }
   }
 
-  /** Tail-read half of {@link readLatestCheckpoint}. */
+  /**
+   * Tail-read half of {@link readCheckpointChainState}.
+   *
+   * Finds the last list item by scanning for a two-space-indented
+   * `- checkpoint:` line. That is exact for files this class writes, and only
+   * for those: every writer dumps with `lineWidth: -1` so no scalar wraps, and
+   * a `Checkpoint`'s own values cannot contain a newline — `triggered_by` is a
+   * document id or a generated label, and the map keys are document ids, which
+   * `assertSafeDocumentId` constrains. Storing free text on a Checkpoint would
+   * break that assumption, so this must be revisited if the shape gains one.
+   * A wrong slice is not silent corruption: it fails to parse or fails the
+   * schema, and the caller falls back to a full read.
+   */
   private async readLatestCheckpointFromTail(
     historyBytes: number,
   ): Promise<Checkpoint | null> {
@@ -1303,8 +1389,11 @@ export class NestStorage {
       const handle = await open(this.checkpointHistoryPath(), "r");
       try {
         const buf = Buffer.alloc(historyBytes - start);
-        await handle.read(buf, 0, buf.length, start);
-        text = buf.toString("utf-8");
+        // A short read is normal on network-backed mounts. Decoding the
+        // untouched remainder would splice NUL bytes onto the text and send an
+        // otherwise-fine chain down the slow path.
+        const { bytesRead } = await handle.read(buf, 0, buf.length, start);
+        text = buf.subarray(0, bytesRead).toString("utf-8");
       } finally {
         await handle.close();
       }
@@ -1339,26 +1428,31 @@ export class NestStorage {
     }
   }
 
-  /** Refresh the pointer to match `checkpoint` at the chain file's current size. */
+  /** Re-point the cache at `checkpoint`, stamped with the chain file's identity. */
   private async writeLatestCheckpointPointer(
     checkpoint: Checkpoint,
   ): Promise<void> {
-    let historyBytes: number;
+    let info: { size: number; mtimeMs: number };
     try {
-      historyBytes = (await stat(this.checkpointHistoryPath())).size;
+      const s = await stat(this.checkpointHistoryPath());
+      info = { size: s.size, mtimeMs: s.mtimeMs };
     } catch {
-      return; // nothing to point at; readLatestCheckpoint falls back cleanly
+      return; // nothing to point at; the read path falls back cleanly
     }
-    // Not writeFileDurable: this file is a cache. A torn one fails its size
+    // Not writeFileDurable: this file is a cache. A torn one fails its staleness
     // check and costs one tail read, so paying an fsync per write to protect it
-    // would trade the thing being fixed for nothing.
+    // would trade away the thing being fixed for nothing.
     await writeFile(
       this.latestCheckpointPath(),
       "# Auto-generated cache of the newest checkpoint. Safe to delete.\n" +
-        yaml.dump({ history_bytes: historyBytes, checkpoint }, {
-          lineWidth: -1,
-          noRefs: true,
-        }),
+        yaml.dump(
+          {
+            history_bytes: info.size,
+            history_mtime_ms: info.mtimeMs,
+            checkpoint,
+          },
+          { lineWidth: -1, noRefs: true },
+        ),
       "utf-8",
     );
   }
@@ -1398,29 +1492,33 @@ export class NestStorage {
   /**
    * Begin a fresh chain with `checkpoint` as its first entry.
    *
-   * For the two states {@link appendCheckpoint} cannot extend: no chain file at
-   * all, and a chain file that yields no readable checkpoint (`checkpoints: []`
-   * from a rebuild over an empty vault, a truncated write, a hand edit). The
-   * second case is QUARANTINED rather than overwritten — the chain is an
-   * integrity anchor, so a caller that cannot read it must not be the one to
-   * destroy it, and a write must not fail just because it is unreadable.
+   * For the states {@link appendCheckpoint} cannot extend: no chain file, or one
+   * holding no checkpoint to link onto.
+   *
+   * `quarantineExisting` is the CALLER's finding, never inferred here. Deciding
+   * from the file's size would conflate "unreadable" with "valid and empty" and
+   * — far worse — with a transient read failure, so a flaky mount could rename a
+   * healthy chain aside and restart numbering at 1. Only
+   * {@link readCheckpointChainState} can tell those apart, so only it decides.
    */
-  async startCheckpointHistory(checkpoint: Checkpoint): Promise<void> {
+  async startCheckpointHistory(
+    checkpoint: Checkpoint,
+    options: { quarantineExisting?: string } = {},
+  ): Promise<void> {
     const path = this.checkpointHistoryPath();
     await mkdir(dirname(path), { recursive: true });
-    let existingBytes = 0;
-    try {
-      existingBytes = (await stat(path)).size;
-    } catch {
-      /* absent — nothing to preserve */
-    }
-    if (existingBytes > 0) {
-      const quarantined = await quarantine(path);
-      console.warn(
-        `[checkpoint] ${path} held no readable checkpoint; preserved as ${basename(
-          quarantined,
-        )} and starting a new chain`,
-      );
+    if (options.quarantineExisting !== undefined) {
+      try {
+        const quarantined = await quarantine(path);
+        console.warn(
+          `[checkpoint] ${path} is unreadable (${options.quarantineExisting}); ` +
+            `preserved as ${basename(quarantined)} and starting a new chain`,
+        );
+      } catch (err) {
+        // Another process moved it first. Losing that race is fine — the file
+        // is preserved either way, and failing the publish over it is not.
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
     }
     await this.writeCheckpointHistory({ checkpoints: [checkpoint] });
   }

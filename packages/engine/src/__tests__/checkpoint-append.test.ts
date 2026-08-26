@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, writeFile, readdir, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, writeFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import yaml from "js-yaml";
@@ -186,6 +186,82 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
 
     const chain = await storage.readCheckpointHistory();
     expect(chain?.checkpoints).toHaveLength(1);
+  });
+
+  it("does not call a valid-but-empty chain corrupt", async () => {
+    // `checkpoints: []` is what a rebuild writes over a vault with nothing
+    // published — valid YAML, zero entries. Quarantining it would litter the
+    // vault with `.corrupt-*` files and cry a break that never happened.
+    await writeFile(historyPath, HEADER + "checkpoints: []\n", "utf-8");
+    expect(await storage.readCheckpointChainState()).toEqual({ kind: "empty" });
+
+    await storage.writeDocument("nodes/next", draft("next"));
+    await publishDocument(storage, "nodes/next", { editedBy: "tester" });
+
+    expect(
+      (await readdir(join(root, ".versions"))).filter((f) =>
+        /corrupt/.test(f),
+      ),
+    ).toEqual([]);
+  });
+
+  it("tells the four chain states apart", async () => {
+    // The whole point of the discriminated read: the seal quarantines on
+    // exactly one of these, so collapsing any two of them into null is how a
+    // healthy chain gets renamed aside.
+    expect((await storage.readCheckpointChainState()).kind).toBe("head");
+
+    await rm(historyPath, { force: true });
+    expect(await storage.readCheckpointChainState()).toEqual({ kind: "absent" });
+
+    await writeFile(historyPath, HEADER + "checkpoints: []\n", "utf-8");
+    expect(await storage.readCheckpointChainState()).toEqual({ kind: "empty" });
+
+    await writeFile(historyPath, "checkpoints:\n  - checkpoint: 1\0\0\0\n", "utf-8");
+    expect((await storage.readCheckpointChainState()).kind).toBe("unreadable");
+  });
+
+  it("propagates a read error rather than reporting an absent chain", async () => {
+    // A non-ENOENT failure is neither "no chain" nor "corrupt". Reported as
+    // either one, it licenses a quarantine of a chain nobody has actually read.
+    // A directory where the file belongs is the portable way to force one.
+    await rm(historyPath, { force: true });
+    await mkdir(historyPath, { recursive: true });
+
+    await expect(storage.readCheckpointChainState()).rejects.toThrow();
+  });
+
+  it("fails loudly on a transient read error instead of discarding the chain", async () => {
+    // The regression that matters most: readLatestCheckpoint used to swallow
+    // every error, so one flaky read on a network-backed mount looked exactly
+    // like "no chain yet" — and the seal would then quarantine a healthy
+    // multi-megabyte chain and restart numbering at 1.
+    await storage.writeDocument("nodes/two", draft("two"));
+    await publishDocument(storage, "nodes/two", { editedBy: "tester" });
+    const intact = await readFile(historyPath, "utf-8");
+
+    const realStat = storage.readCheckpointChainState.bind(storage);
+    let failNext = true;
+    storage.readCheckpointChainState = async () => {
+      if (failNext) {
+        failNext = false;
+        const err: NodeJS.ErrnoException = new Error("EIO: i/o error");
+        err.code = "EIO";
+        throw err;
+      }
+      return realStat();
+    };
+
+    await storage.writeDocument("nodes/three", draft("three"));
+    await expect(
+      publishDocument(storage, "nodes/three", { editedBy: "tester" }),
+    ).rejects.toThrow(/EIO/);
+
+    // The chain is untouched and nothing was quarantined.
+    expect(await readFile(historyPath, "utf-8")).toBe(intact);
+    expect(
+      (await readdir(join(root, ".versions"))).filter((f) => /corrupt/.test(f)),
+    ).toEqual([]);
   });
 
   it("ignores a pointer that no longer matches the chain on disk", async () => {

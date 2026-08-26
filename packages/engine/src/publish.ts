@@ -50,7 +50,6 @@ export async function publishDocument(
   // its pre-publish body becomes permanently unreachable via read_version
   // once we bump to the next number.
   //
-  //
   // Resilient read: an unreadable history.yaml no longer refuses the publish.
   // It is preserved under `.corrupt-<ts>.yaml` and the chain restarts here —
   // numbering still clears every artifact on disk, so nothing is overwritten.

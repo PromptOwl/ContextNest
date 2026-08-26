@@ -306,7 +306,13 @@ export class CheckpointManager {
       // Head only, not the whole chain: this runs on every publish, and the
       // chain grows by one entry per published document per checkpoint, so
       // loading it here made each publish cost O(chain size).
-      const previousCheckpoint = await this.storage.readLatestCheckpoint();
+      //
+      // The full state, not just the head: whether the existing file gets
+      // quarantined below turns on WHY there is no head, and a transient read
+      // failure throws out of here rather than being mistaken for one.
+      const chainState = await this.storage.readCheckpointChainState();
+      const previousCheckpoint =
+        chainState.kind === "head" ? chainState.checkpoint : null;
 
       const checkpointNumber = previousCheckpoint
         ? previousCheckpoint.checkpoint + 1
@@ -364,11 +370,21 @@ export class CheckpointManager {
         checkpoint_hash: checkpointHash,
       };
 
-      // Extend the chain in place when there is one to extend. Only a vault
-      // with no readable head starts a new file — and that path preserves
-      // whatever was there rather than overwriting it.
-      if (previousCheckpoint) await this.storage.appendCheckpoint(checkpoint);
-      else await this.storage.startCheckpointHistory(checkpoint);
+      // Extend the chain in place when there is one to extend. Otherwise start
+      // a new file — preserving the old one ONLY when it was genuinely
+      // unreadable. An absent or validly-empty chain has nothing to preserve,
+      // and calling either of those corrupt would litter the vault with
+      // `.corrupt-*` files and cry a break that never happened.
+      if (chainState.kind === "head") {
+        await this.storage.appendCheckpoint(checkpoint);
+      } else {
+        await this.storage.startCheckpointHistory(
+          checkpoint,
+          chainState.kind === "unreadable"
+            ? { quarantineExisting: chainState.reason }
+            : {},
+        );
+      }
 
       return checkpoint;
     }
