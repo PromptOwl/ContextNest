@@ -35,6 +35,7 @@ const EXPECTED_TOOLS = [
   "context_query",
   "context_resolve",
   "context_list",
+  "context_folders",
   "context_search",
   "context_create",
   "context_update",
