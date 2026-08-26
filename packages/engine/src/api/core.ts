@@ -267,7 +267,10 @@ const listOp: OperationDescriptor = {
   output: z.object({
     documents: z.array(nodeSummary),
   }),
-  errors: ["VALIDATION_FAILED"],
+  // `folder` is a free-form string to zod, so a `..` in it clears validation
+  // and is rejected by the folder normalizer instead — a consumer generating
+  // handling from this list has to know that code can arrive.
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
   aliases: ["list_documents"],
 };
 
@@ -305,7 +308,8 @@ const foldersOp: OperationDescriptor = {
   }),
   // No alias: aliases are a migration path off tool names that already
   // existed in the wild, and nothing ever called this one.
-  errors: ["VALIDATION_FAILED"],
+  // INVALID_DOCUMENT_ID for the same reason as context_list — see there.
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
 };
 
 // ─── context_create ──────────────────────────────────────────────────────────

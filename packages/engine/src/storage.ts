@@ -432,8 +432,12 @@ export class NestStorage {
         }
       }
       if (rel !== base) found.push({ path: rel, count });
+      // Sibling directories are independent reads, and on a network mount each
+      // one is a round trip — the very cost this function exists to avoid.
+      // Batched rather than unbounded so a wide vault can't exhaust file
+      // handles. Push order stops being deterministic; the caller sorts.
       if (depth > 0) {
-        for (const child of children) await scan(child, depth - 1);
+        await mapInBatches(children, (child) => scan(child, depth - 1));
       }
     };
 

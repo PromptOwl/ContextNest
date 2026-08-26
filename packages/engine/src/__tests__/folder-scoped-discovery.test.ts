@@ -158,6 +158,23 @@ describe("folder-scoped discovery", () => {
     expect(folders.find((f) => f.path === "nodes/gtm")!.count).toBe(1);
   });
 
+  it("declares the error code a rejected folder actually raises", async () => {
+    const api = createEngineApi();
+    // `folder` is a plain string to zod, so a traversal clears validation and
+    // is thrown by the normalizer instead. A consumer generating handling from
+    // `op.errors` only learns that if the descriptor says so.
+    for (const name of ["context_list", "context_folders"]) {
+      const raised = await api
+        .run(name, { folder: "../../etc" }, { storage } as any)
+        .then(() => null, (e: any) => e.code);
+      expect(raised, `${name} should reject a traversal`).toBe("INVALID_DOCUMENT_ID");
+      expect(
+        api.getOperation(name)!.errors,
+        `${name} does not declare the code it raises`,
+      ).toContain(raised);
+    }
+  });
+
   it("exposes folder listing through context_folders", async () => {
     const api = createEngineApi();
     const res = await api.run<{ folders: { path: string; count: number }[] }>(
