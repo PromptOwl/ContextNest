@@ -3,7 +3,17 @@
  * Supports both structured and Obsidian-compatible layouts (§1.1).
  */
 
-import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
+import {
+  readFile,
+  readdir,
+  writeFile,
+  mkdir,
+  open,
+  stat,
+  unlink,
+  rm,
+  rename,
+} from "node:fs/promises";
 import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
@@ -99,6 +109,59 @@ export function assertSafeDocumentId(raw: string): void {
       "INVALID_DOCUMENT_ID",
     );
   }
+}
+
+/**
+ * Normalize a folder path used to scope discovery: strips surrounding slashes,
+ * accepts either separator, and rejects `..` — the path is joined against the
+ * vault root to start the crawl, so a traversal sequence would read outside it.
+ *
+ * `""` is the vault root, which is why this cannot reuse `assertSafeDocumentId`
+ * (that requires every segment to name something).
+ */
+export function normalizeFolder(raw: string): string {
+  const trimmed = raw.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (trimmed.split("/").some((seg) => seg === "..")) {
+    throw new ContextNestError(
+      `Invalid folder "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * Markdown that lives in the vault but is not a knowledge node: version
+ * artifacts, generated indexes, agent-config scaffold. Shared by document
+ * discovery and folder listing so the two can never disagree about which files
+ * count — a folder holding only these is not a folder of documents.
+ */
+const NON_DOCUMENT_BASENAMES = new Set([
+  "INDEX.md",
+  // Agent-config / scaffold files are not knowledge nodes.
+  "CLAUDE.md",
+  "GEMINI.md",
+  "AGENTS.md",
+  "README.md",
+]);
+
+const NON_DOCUMENT_FILES = [
+  "**/node_modules/**",
+  "**/.versions/**",
+  "**/.context/**",
+  // Root-only, unlike the basenames below: a CONTEXT.md nested in a folder is
+  // an authored document, the one at the vault root is the vault's preamble.
+  "CONTEXT.md",
+  "context.yaml",
+  ...[...NON_DOCUMENT_BASENAMES].map((name) => `**/${name}`),
+];
+
+/** A folder of documents, and how many sit directly in it. */
+export interface FolderEntry {
+  /** Path relative to the vault root — the id prefix, e.g. `nodes/gtm`. */
+  path: string;
+  /** Documents directly in this folder, not counting its subfolders. */
+  count: number;
 }
 
 /** Options for `NestStorage.readDocument`. */
@@ -217,14 +280,33 @@ export class NestStorage {
    *
    * Back-compat: `includeSuperseded` is accepted as a deprecated alias for
    * `includeRetired`. Either flag opens the filter.
+   *
+   * `folder` scopes the crawl to one directory (a path relative to the vault
+   * root, i.e. the id prefix — `nodes/gtm`, not `gtm`). This narrows the READ,
+   * not just the result: a caller browsing one folder of a large vault never
+   * opens the rest of it. With `recursive: false` only that folder's own
+   * documents are read, so its subfolders cost nothing either.
    */
   async discoverDocuments(
-    options: { includeRetired?: boolean; includeSuperseded?: boolean } = {},
+    options: {
+      includeRetired?: boolean;
+      includeSuperseded?: boolean;
+      folder?: string;
+      recursive?: boolean;
+    } = {},
   ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
     let patterns: string[];
 
-    if (layout === "structured") {
+    const folder = options.folder === undefined ? undefined : normalizeFolder(options.folder);
+    if (folder !== undefined) {
+      // One directory. An empty folder means the vault root itself, whose
+      // own *.md files are the root-level nodes.
+      const prefix = folder ? `${folder}/` : "";
+      patterns = options.recursive === false
+        ? [`${prefix}*.md`]
+        : [`${prefix}**/*.md`];
+    } else if (layout === "structured") {
       // Include root-level *.md so a node is discoverable wherever it lives,
       // not only under nodes/ or sources/. Agent-config and scaffold files at
       // the root are excluded via the ignore list below.
@@ -233,19 +315,7 @@ export class NestStorage {
       patterns = ["**/*.md"];
     }
 
-    const files = await globFiles(this.root, patterns, [
-      "**/node_modules/**",
-      "**/.versions/**",
-      "**/.context/**",
-      "**/INDEX.md",
-      "CONTEXT.md",
-      "context.yaml",
-      // Agent-config / scaffold files are not knowledge nodes.
-      "**/CLAUDE.md",
-      "**/GEMINI.md",
-      "**/AGENTS.md",
-      "**/README.md",
-    ]);
+    const files = await globFiles(this.root, patterns, NON_DOCUMENT_FILES);
 
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
@@ -273,6 +343,59 @@ export class NestStorage {
     const includeRetired = options.includeRetired || options.includeSuperseded;
     if (includeRetired) return nodes;
     return nodes.filter((n) => n.frontmatter.status !== "rejected");
+  }
+
+  /**
+   * The vault's folders, WITHOUT reading a single document.
+   *
+   * Discovery's cost is not the directory walk, it is opening and parsing every
+   * markdown file it finds. A caller that only needs the shape of the vault — a
+   * navigable tree, a folder picker, per-folder counts — pays none of that here:
+   * the walk yields paths, and paths alone answer the question.
+   *
+   * Counts are of files, so they include retired documents; a status is only
+   * knowable by reading the file, which is the thing this avoids. Ancestors are
+   * included even when they hold no document of their own, so a tree built from
+   * this is fully navigable. `folder` and `recursive` scope it exactly as they
+   * scope `discoverDocuments`.
+   */
+  async listFolders(
+    options: { folder?: string; recursive?: boolean } = {},
+  ): Promise<FolderEntry[]> {
+    const base = options.folder === undefined ? "" : normalizeFolder(options.folder);
+    const found: FolderEntry[] = [];
+
+    // Directories are read, not inferred from the documents inside them: a
+    // folder holding nothing but subfolders is still a folder, and inferring
+    // from files would silently drop it.
+    const scan = async (rel: string, depth: number): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(join(this.root, rel), { withFileTypes: true });
+      } catch {
+        return; // unreadable subtree — same tolerance as the vault crawl
+      }
+      let count = 0;
+      const children: string[] = [];
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          // Dot-directories (.versions, .context, .git, .obsidian), package
+          // installs, and staged-suggestion stores hold no knowledge nodes.
+          if (entry.name.startsWith(".")) continue;
+          if (entry.name === "node_modules" || entry.name === "_suggestions") continue;
+          children.push(rel ? `${rel}/${entry.name}` : entry.name);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (!NON_DOCUMENT_BASENAMES.has(entry.name)) count++;
+        }
+      }
+      if (rel !== base) found.push({ path: rel, count });
+      if (depth > 0) {
+        for (const child of children) await scan(child, depth - 1);
+      }
+    };
+
+    await scan(base, options.recursive === false ? 1 : Infinity);
+    return found.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**

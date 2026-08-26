@@ -222,8 +222,13 @@ export {
 export type { RemoteNestConnection } from "./remote-nest.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";
-export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
+export {
+  NestStorage,
+  UNSTAGED_DRIFT_SENTINEL,
+  normalizeDocumentId,
+  normalizeFolder,
+} from "./storage.js";
+export type { LayoutMode, ReadDocumentOptions, FolderEntry } from "./storage.js";
 
 // Document filtering — shared by context_list and by surfaces that filter a
 // document list they already hold.
