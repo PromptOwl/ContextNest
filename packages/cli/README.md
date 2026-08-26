@@ -258,7 +258,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **35 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
+For direct AI agent access via the Model Context Protocol — **36 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -277,7 +277,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 35 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 36 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 

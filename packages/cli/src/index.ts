@@ -1730,8 +1730,10 @@ program
     }
 
     const config = await storage.readConfig();
-    const checkpointHistory = await storage.readCheckpointHistory();
-    const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
+    // Head only — same reason storage.regenerateIndex() takes it this way: the
+    // chain grows by one entry per published doc per checkpoint, and only its
+    // newest entry reaches context.yaml.
+    const latestCheckpoint = await storage.readLatestCheckpoint();
     const published = docs.filter((d) => d.frontmatter.status === "published");
 
     // Generate context.yaml

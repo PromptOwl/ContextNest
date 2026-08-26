@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { globFiles } from "../glob.js";
 import { NestStorage } from "../storage.js";
 import { publishDocument } from "../publish.js";
@@ -143,26 +143,82 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("refuses to publish rather than replacing a corrupt history with a fresh one", async () => {
+  it("publishes over a corrupt history by quarantining it, never by overwriting it", async () => {
     await buildHistory(4);
     const before = (await storage.readHistory(ID))!;
-    const historyPath = join(root, "nodes", ".versions", "victim", "history.yaml");
+    const dir = join(root, "nodes", ".versions", "victim");
+    const historyPath = join(dir, "history.yaml");
     await writeFile(historyPath, "versions:\n  - version: 1\0\0\0\n", "utf-8");
 
+    // The author is not blocked: the write goes through.
     await expect(
       publishDocument(storage, ID, { editedBy: "tester" }),
-    ).rejects.toThrow(CorruptHistoryError);
+    ).resolves.toBeTruthy();
 
-    // The corrupt file must still be there — overwriting it is the data loss.
-    const raw = await readFile(historyPath, "utf-8");
-    expect(raw).toContain("\0");
+    // The corrupt bytes still exist — moved aside, not destroyed.
+    const quarantined = (await readdir(dir)).filter((f) =>
+      /^history\.corrupt-.*\.yaml$/.test(f),
+    );
+    expect(quarantined).toHaveLength(1);
+    expect(await readFile(join(dir, quarantined[0]), "utf-8")).toContain("\0");
 
-    // And once it is restored, every recorded version is reachable again.
+    // The fresh chain is readable and starts ABOVE everything the old one
+    // sealed, so no artifact was reused.
+    const after = (await storage.readHistory(ID))!;
+    expect(after.versions).toHaveLength(1);
+    expect(after.versions[0].version).toBeGreaterThan(
+      Math.max(...before.versions.map((v) => v.version)),
+    );
+    expect(after.versions[0].note).toMatch(/Chain restarted/);
+
+    // And restoring the quarantined history makes every old version reachable.
     await storage.writeHistory(ID, before);
     const vm = new VersionManager(storage);
     for (const entry of before.versions) {
       await expect(vm.reconstructVersion(ID, entry.version)).resolves.toContain("---");
     }
+  });
+
+  it("records a draft revision over a corrupt history instead of refusing", async () => {
+    // The Community edit path never publishes — it numbers a version and
+    // records it. A corrupt history used to fail it the same way, leaving the
+    // author unable to save the document from any surface.
+    await buildHistory(3);
+    await writeFile(
+      join(root, "nodes", ".versions", "victim", "history.yaml"),
+      "versions:\n  - version: 1\0\0\0\n",
+      "utf-8",
+    );
+
+    const vm = new VersionManager(storage);
+    const next = await vm.nextVersion(ID, 0);
+    expect(next).toBeGreaterThan(3); // clears every sealed artifact
+
+    const node = await storage.readDocument(ID);
+    node.frontmatter.version = next;
+    await expect(vm.createVersion(node, "author")).resolves.toMatchObject({
+      version: next,
+      keyframe: true,
+    });
+  });
+
+  it("still publishes when the doc's current version is itself a sealed keyframe", async () => {
+    // Regression: the pre-publish seed writes v{current}.md, and at a keyframe
+    // boundary that file already exists — an exclusive create that threw and
+    // put the author straight back behind the corrupt history.
+    await buildHistory(11);
+    expect(
+      await globFiles(root, "nodes/.versions/victim/v11.md"),
+    ).toHaveLength(1);
+    await writeFile(
+      join(root, "nodes", ".versions", "victim", "history.yaml"),
+      "versions:\n  - version: 1\0\0\0\n",
+      "utf-8",
+    );
+
+    await expect(
+      publishDocument(storage, ID, { editedBy: "tester" }),
+    ).resolves.toBeTruthy();
   });
 
   it("distinguishes a corrupt history from a document that has none", async () => {
@@ -178,7 +234,7 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
     await expect(storage.readHistory(ID)).rejects.toThrow(CorruptHistoryError);
   });
 
-  it("keeps every keyframe and diff reachable after a refused publish", async () => {
+  it("keeps every keyframe and diff byte-identical when the chain restarts", async () => {
     await buildHistory(4);
     const artifactsBefore = await globFiles(root, "nodes/.versions/victim/v*");
     const hashesBefore = await Promise.all(
@@ -190,14 +246,61 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
       "versions:\n  - version: 1\0\0\0\n",
       "utf-8",
     );
-    await publishDocument(storage, ID, { editedBy: "tester" }).catch(() => {});
+    await publishDocument(storage, ID, { editedBy: "tester" });
 
+    // The restart may ADD artifacts above the old high-water mark, but every
+    // one that was already sealed must survive untouched.
     const artifactsAfter = await globFiles(root, "nodes/.versions/victim/v*");
-    const hashesAfter = await Promise.all(
-      artifactsAfter.sort().map((f) => readFile(join(root, f), "utf-8")),
+    expect(artifactsAfter.sort()).toEqual(
+      expect.arrayContaining(artifactsBefore.sort()),
     );
-    expect(artifactsAfter.sort()).toEqual(artifactsBefore.sort());
+    const hashesAfter = await Promise.all(
+      artifactsBefore.sort().map((f) => readFile(join(root, f), "utf-8")),
+    );
     expect(hashesAfter).toEqual(hashesBefore);
+  });
+
+  // A document's history lives beside it — `<dir>/.versions/<name>/` — so both
+  // the quarantine and the on-disk high-water mark are derived from the id, not
+  // from a fixed root. Nesting and root-level ids are the two ways that
+  // derivation can go wrong, and getting it wrong restarts numbering at 1 and
+  // collides with artifacts already sealed.
+  it.each([
+    ["a nested subfolder", "nodes/accounts/georgia/gta", "nodes/accounts/georgia"],
+    ["a root-level document", "readme", "."],
+  ])("restarts the chain correctly for %s", async (_label, id, dir) => {
+    await storage.writeDocument(id, draft(id));
+    for (let i = 0; i < 3; i++) {
+      const node = await storage.readDocument(id);
+      node.body = `\n# ${id}\n\nrevision ${i}\n`;
+      await storage.writeDocument(id, serializeDocument(node));
+      await publishDocument(storage, id, { editedBy: "tester" });
+    }
+
+    const versionsDir = join(root, dir, ".versions", basename(id));
+    expect(await storage.maxRecordedVersion(id)).toBe(3);
+
+    await writeFile(
+      join(versionsDir, "history.yaml"),
+      "versions:\n  - version: 1\0\0\0\n",
+      "utf-8",
+    );
+
+    await expect(
+      publishDocument(storage, id, { editedBy: "tester" }),
+    ).resolves.toBeTruthy();
+
+    // Quarantined next to the document it belongs to, not at the vault root.
+    expect(
+      (await readdir(versionsDir)).filter((f) =>
+        /^history\.corrupt-.*\.yaml$/.test(f),
+      ),
+    ).toHaveLength(1);
+
+    // Numbering cleared every sealed artifact, so none was reused.
+    const restarted = (await storage.readHistory(id))!;
+    expect(restarted.versions[0].version).toBeGreaterThan(3);
+    expect(restarted.versions[0].note).toMatch(/Chain restarted/);
   });
 
   it("refuses to overwrite a sealed version artifact", async () => {

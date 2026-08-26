@@ -8,8 +8,13 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **35 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **36 tools** over stdio transport.
 
+> **New in 2.2.1** — `context_folders` lists the vault's folders and their
+> document counts without opening a document, and `context_list` takes a
+> `folder` to read one folder instead of crawling the whole vault. Writes on a
+> large vault no longer slow down as its checkpoint chain grows.
+>
 > **New in 2.1** — the server now installs **zero dependencies**, down from 97 packages at depth 11. `context_import` also gained the whole folder-import flow, so an existing folder of markdown can be imported in one call.
 >
 > **New in 2.0** — sixteen canonical `context_*` tools are generated straight from the engine's operation catalog, so this server, the `ctx` CLI and the PromptOwl cloud now advertise the same names, schemas and error codes. The older tools still work and are marked deprecated. See [Upgrading to 2.0](#upgrading-to-20).
@@ -104,7 +109,8 @@ them over the legacy tools below.
 | `context_init` | Open a vault: its `CONTEXT.md` instructions, configuration, path, and what it holds (totals, counts by type and status, tag set). `include_nodes` to also list nodes |
 | `context_nests` | List every nest in the central registry — alias, path, description, which is default, whether it exists |
 | `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
-| `context_list` | List nodes with type / status / tag filters. Takes an array of types, `include_retired`, `full`, `limit` |
+| `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
+| `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |
 | `context_search` | Full-text search with graph traversal |
 | `context_query` | Selector query with graph traversal. `include_drafts` for authoring surfaces |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |
