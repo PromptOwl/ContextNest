@@ -292,8 +292,8 @@ export class CheckpointManager {
   }
 
   /**
-   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it re-reads
-   * context_history.yaml, appends one checkpoint, and writes it back.
+   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it reads the
+   * chain's head, links one checkpoint onto it, and appends.
    */
   private async sealCheckpoint(
     triggeredBy: string,
@@ -303,11 +303,16 @@ export class CheckpointManager {
     {
       // Re-read inside the lock so the checkpoint number and previous-hash
       // linkage are based on the latest committed write, not a stale snapshot.
-      const history = (await this.storage.readCheckpointHistory()) || {
-        checkpoints: [],
-      };
-
-      const previousCheckpoint = getLatestCheckpoint(history);
+      // Head only, not the whole chain: this runs on every publish, and the
+      // chain grows by one entry per published document per checkpoint, so
+      // loading it here made each publish cost O(chain size).
+      //
+      // The full state, not just the head: whether the existing file gets
+      // quarantined below turns on WHY there is no head, and a transient read
+      // failure throws out of here rather than being mistaken for one.
+      const chainState = await this.storage.readCheckpointChainState();
+      const previousCheckpoint =
+        chainState.kind === "head" ? chainState.checkpoint : null;
 
       const checkpointNumber = previousCheckpoint
         ? previousCheckpoint.checkpoint + 1
@@ -365,8 +370,21 @@ export class CheckpointManager {
         checkpoint_hash: checkpointHash,
       };
 
-      history.checkpoints.push(checkpoint);
-      await this.storage.writeCheckpointHistory(history);
+      // Extend the chain in place when there is one to extend. Otherwise start
+      // a new file — preserving the old one ONLY when it was genuinely
+      // unreadable. An absent or validly-empty chain has nothing to preserve,
+      // and calling either of those corrupt would litter the vault with
+      // `.corrupt-*` files and cry a break that never happened.
+      if (chainState.kind === "head") {
+        await this.storage.appendCheckpoint(checkpoint);
+      } else {
+        await this.storage.startCheckpointHistory(
+          checkpoint,
+          chainState.kind === "unreadable"
+            ? { quarantineExisting: chainState.reason }
+            : {},
+        );
+      }
 
       return checkpoint;
     }
