@@ -91,6 +91,25 @@ describe("checkpoint chain — sealing appends instead of rewriting", () => {
     expect(after.startsWith(before)).toBe(true);
   });
 
+  it("seals documents from nested folders and the vault root alike", async () => {
+    // A document's history lives beside it, so the seal has to find
+    // `<dir>/.versions/<name>/history.yaml` at any depth. A miss is silent —
+    // the checkpoint just omits the document's chain hash, leaving it with no
+    // integrity anchor while the publish still reports success.
+    const ids = ["nodes/accounts/georgia/gta", "nodes/flat", "readme"];
+    for (const id of ids) {
+      await storage.writeDocument(id, draft(id));
+      await publishDocument(storage, id, { editedBy: "tester" });
+    }
+
+    const head = (await storage.readLatestCheckpoint())!;
+
+    for (const id of ids) {
+      expect(head.document_versions).toHaveProperty([id]);
+      expect(head.document_chain_hashes[id]).toMatch(/^sha256:/);
+    }
+  });
+
   it("publishes without parsing the whole chain", async () => {
     await sealCheckpoints(3);
 

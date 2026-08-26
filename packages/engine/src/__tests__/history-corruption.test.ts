@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, rm, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { globFiles } from "../glob.js";
 import { NestStorage } from "../storage.js";
 import { publishDocument } from "../publish.js";
@@ -258,6 +258,49 @@ describe("corrupt history.yaml — no version is lost or orphaned", () => {
       artifactsBefore.sort().map((f) => readFile(join(root, f), "utf-8")),
     );
     expect(hashesAfter).toEqual(hashesBefore);
+  });
+
+  // A document's history lives beside it — `<dir>/.versions/<name>/` — so both
+  // the quarantine and the on-disk high-water mark are derived from the id, not
+  // from a fixed root. Nesting and root-level ids are the two ways that
+  // derivation can go wrong, and getting it wrong restarts numbering at 1 and
+  // collides with artifacts already sealed.
+  it.each([
+    ["a nested subfolder", "nodes/accounts/georgia/gta", "nodes/accounts/georgia"],
+    ["a root-level document", "readme", "."],
+  ])("restarts the chain correctly for %s", async (_label, id, dir) => {
+    await storage.writeDocument(id, draft(id));
+    for (let i = 0; i < 3; i++) {
+      const node = await storage.readDocument(id);
+      node.body = `\n# ${id}\n\nrevision ${i}\n`;
+      await storage.writeDocument(id, serializeDocument(node));
+      await publishDocument(storage, id, { editedBy: "tester" });
+    }
+
+    const versionsDir = join(root, dir, ".versions", basename(id));
+    expect(await storage.maxRecordedVersion(id)).toBe(3);
+
+    await writeFile(
+      join(versionsDir, "history.yaml"),
+      "versions:\n  - version: 1\0\0\0\n",
+      "utf-8",
+    );
+
+    await expect(
+      publishDocument(storage, id, { editedBy: "tester" }),
+    ).resolves.toBeTruthy();
+
+    // Quarantined next to the document it belongs to, not at the vault root.
+    expect(
+      (await readdir(versionsDir)).filter((f) =>
+        /^history\.corrupt-.*\.yaml$/.test(f),
+      ),
+    ).toHaveLength(1);
+
+    // Numbering cleared every sealed artifact, so none was reused.
+    const restarted = (await storage.readHistory(id))!;
+    expect(restarted.versions[0].version).toBeGreaterThan(3);
+    expect(restarted.versions[0].note).toMatch(/Chain restarted/);
   });
 
   it("refuses to overwrite a sealed version artifact", async () => {
