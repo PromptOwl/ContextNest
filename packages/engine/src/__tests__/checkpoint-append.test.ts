@@ -6,6 +6,7 @@ import yaml from "js-yaml";
 import { NestStorage } from "../storage.js";
 import { publishDocument } from "../publish.js";
 import { CheckpointManager } from "../checkpoint.js";
+import { GraphQueryEngine } from "../graph-query-engine.js";
 import { serializeDocument } from "../parser.js";
 import type { CheckpointHistory } from "../types.js";
 
@@ -89,6 +90,35 @@ describe("checkpoint chain — sealing appends instead of rewriting", () => {
     const after = await readFile(historyPath, "utf-8");
 
     expect(after.startsWith(before)).toBe(true);
+  });
+
+  it("queries without parsing the whole chain", async () => {
+    // context_query is the hottest read path and stamps the checkpoint number
+    // onto every trace it logs. Loading the chain for that one number made
+    // retrieval pay the same O(chain size) cost the write path was freed from.
+    await sealCheckpoints(3);
+    storage.readCheckpointHistory = async () => {
+      throw new Error("a query must not parse the whole checkpoint chain");
+    };
+
+    const engine = new GraphQueryEngine(storage);
+
+    await expect(engine.query("#doc")).resolves.toBeTruthy();
+  });
+
+  it("still answers a query when the chain cannot be read at all", async () => {
+    // Degrading the trace stamp beats failing someone's retrieval. The write
+    // path takes the throwing read instead, where a transient failure has to
+    // surface rather than be mistaken for "no chain".
+    await sealCheckpoints(2);
+    await rm(join(root, ".versions", "context_latest.yaml"), { force: true });
+    await rm(historyPath, { force: true });
+    await mkdir(historyPath, { recursive: true }); // forces a non-ENOENT error
+
+    expect(await storage.readLatestCheckpointNumber()).toBe(0);
+
+    const engine = new GraphQueryEngine(storage);
+    await expect(engine.query("#doc")).resolves.toBeTruthy();
   });
 
   it("seals documents from nested folders and the vault root alike", async () => {

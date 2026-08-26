@@ -1339,6 +1339,26 @@ export class NestStorage {
   }
 
   /**
+   * The newest checkpoint's number, or 0 when there is none.
+   *
+   * For READ paths, which want the number only to stamp it onto an audit
+   * record. Never throws: a retrieval query must not fail because the chain
+   * file hiccuped, and a trace entry recording checkpoint 0 is a far smaller
+   * harm than a query that errors.
+   *
+   * Write paths take {@link readCheckpointChainState} instead, where a
+   * transient failure MUST surface rather than be mistaken for "no chain" —
+   * that mistake is what licenses a quarantine.
+   */
+  async readLatestCheckpointNumber(): Promise<number> {
+    try {
+      return (await this.readLatestCheckpoint())?.checkpoint ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Pointer-file half of {@link readCheckpointChainState}.
    *
    * Validated against the chain file's size AND mtime. That is a cheap staleness
