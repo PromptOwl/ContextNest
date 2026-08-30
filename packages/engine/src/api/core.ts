@@ -320,7 +320,18 @@ const createOp: OperationDescriptor = {
   description: "Create a new knowledge node in the vault.",
   input: z.object({
     title: z.string().min(1).max(200).describe("Descriptive title"),
-    content: z.string().describe("Markdown content body"),
+    content: z.string().optional().describe("Markdown content body"),
+    // Alias, not a second field. `body` is what the legacy create_document
+    // tool and the frontmatter itself call this, so agents reach for it
+    // constantly; before the runtime refused unknown keys it was dropped in
+    // silence and the node was written empty.
+    body: z.string().optional().describe("Alias for `content` — pass one or the other, not both"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
+      ),
     type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
@@ -398,6 +409,13 @@ const updateOp: OperationDescriptor = {
       ),
     title: z.string().optional().describe("New title"),
     content: z.string().optional().describe("New content (replaces body)"),
+    body: z.string().optional().describe("Alias for `content` — pass one or the other, not both"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "New one-line summary for frontmatter. An empty string removes it. Indexed for retrieval alongside title and tags.",
+      ),
     append: z.string().optional().describe("Content to append"),
     tags: z.array(tag).optional().describe("New tags (replaces existing)"),
     metadata: z

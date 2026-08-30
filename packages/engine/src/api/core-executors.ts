@@ -287,6 +287,28 @@ const folders: OperationExecutor = async (ctx, input: any) => {
 };
 
 /**
+ * Collapse the `content` / `body` pair to one value.
+ *
+ * They name the same field: `content` is the op's parameter, `body` is what
+ * the frontmatter, the legacy create_document/update_document tools, and
+ * therefore most agents call it. Accepting both is what stops a caller's text
+ * from going nowhere; disagreeing values are refused rather than silently
+ * picking one, because either choice discards work the caller sent.
+ */
+function resolveContentAlias(input: { content?: unknown; body?: unknown }): string | undefined {
+  const { content, body } = input;
+  if (typeof content === "string" && typeof body === "string" && content !== body) {
+    throw new ContextNestError(
+      "`content` and `body` are aliases for the same field but were given different text — pass only one.",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (typeof content === "string") return content;
+  if (typeof body === "string") return body;
+  return undefined;
+}
+
+/**
  * Build a fresh draft node from create/import input. Slugifies each folder
  * segment and always roots under nodes/ so the doc is discoverable
  * (normalizeDocumentId only prepends nodes/ when there is no slash — a raw
@@ -302,6 +324,7 @@ function buildDraftNode(input: {
   folder?: string;
   metadata?: Record<string, unknown>;
   status?: Frontmatter["status"];
+  description?: string;
   trigger?: string;
   tools_required?: string[];
   output_format?: SkillMeta["output_format"];
@@ -321,6 +344,7 @@ function buildDraftNode(input: {
   const frontmatter: Frontmatter = {
     title: input.title,
     type: (input.type as Frontmatter["type"]) ?? "document",
+    ...(input.description !== undefined ? { description: input.description } : {}),
     ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
     // Skill nodes carry a `skill` block — `trigger` is required there for
@@ -347,7 +371,14 @@ function buildDraftNode(input: {
 }
 
 const create: OperationExecutor = async (ctx, input: any) => {
-  const node = buildDraftNode(input);
+  const content = resolveContentAlias(input);
+  if (content === undefined) {
+    throw new ContextNestError(
+      "A node needs a body: pass `content` (or its alias `body`).",
+      "VALIDATION_FAILED",
+    );
+  }
+  const node = buildDraftNode({ ...input, content });
   // A rejected node cannot be published — publish refuses one by design. Left
   // to fall through, the write below lands and publish then throws, stranding a
   // file on disk with no version and no history, and making the caller's retry
@@ -420,6 +451,13 @@ const update: OperationExecutor = async (ctx, input: any) => {
     frontmatter.title = input.title;
   }
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  // An empty string CLEARS the description, the same convention `metadata`
+  // uses for null: over a JSON wire an absent key cannot be told apart from
+  // "leave this alone", so without it a caller has no way to remove one.
+  if (typeof input.description === "string") {
+    if (input.description === "") delete frontmatter.description;
+    else frontmatter.description = input.description;
+  }
   if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
   if (input.metadata) {
     const merged: Record<string, unknown> = {
@@ -436,14 +474,15 @@ const update: OperationExecutor = async (ctx, input: any) => {
     frontmatter.metadata = merged;
   }
   frontmatter.updated_at = new Date().toISOString();
+  const newContent = resolveContentAlias(input);
   let body = existing.body;
-  if (typeof input.content === "string") body = input.content;
+  if (newContent !== undefined) body = newContent;
   if (typeof input.append === "string") body = `${body}\n${input.append}`;
   // The checksum describes the PUBLISHED body, so any body change invalidates
   // it — including one whose publish then fails, which would otherwise leave a
   // stale checksum on disk and make the next verified read cry external drift.
   // Frontmatter-only edits keep it: the checksum covers the body alone.
-  if (typeof input.content === "string" || typeof input.append === "string") {
+  if (newContent !== undefined || typeof input.append === "string") {
     delete frontmatter.checksum;
   }
 
