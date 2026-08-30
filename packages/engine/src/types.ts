@@ -375,6 +375,17 @@ export interface NestConfig {
     auto_index?: boolean;
   };
   /**
+   * Vault-hosted skills (see `skills.ts`).
+   *
+   * `bootstrap` names the `type: skill` node an agent should install first —
+   * the entry point that teaches it how to use this particular vault. It is a
+   * pointer, not content: the node stays the source of truth, so the vault can
+   * change what onboarding means without anyone reinstalling anything.
+   */
+  skills?: {
+    bootstrap?: string;
+  };
+  /**
    * Agent maintenance directive — emitted into the managed section of
    * CLAUDE.md / GEMINI.md / .cursorrules / .windsurfrules /
    * .github/copilot-instructions.md by `ctx index`. Tells the agent

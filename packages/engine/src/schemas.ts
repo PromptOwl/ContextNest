@@ -277,6 +277,11 @@ export const nestConfigSchema = z.object({
       auto_index: z.boolean().optional(),
     })
     .optional(),
+  skills: z
+    .object({
+      bootstrap: z.string().optional(),
+    })
+    .optional(),
   agent_maintenance_directive: z.string().optional(),
   agent_tools: z.array(z.string()).optional(),
 });
