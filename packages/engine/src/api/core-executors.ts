@@ -11,7 +11,7 @@
  * existing surfaces (published-only search, index regeneration after publish,
  * status/tag normalization, document validation before write).
  */
-import type { ContextNode, Frontmatter, SkillMeta } from "../types.js";
+import type { ContextNode, Frontmatter, SkillMeta, SourceMeta } from "../types.js";
 import {
   serializeDocument,
   validateDocument,
@@ -27,6 +27,7 @@ import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
@@ -330,6 +331,7 @@ function buildDraftNode(input: {
   output_format?: SkillMeta["output_format"];
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
+  source?: SourceMeta;
 }): ContextNode {
   const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
@@ -341,32 +343,31 @@ function buildDraftNode(input: {
   const id = input.id
     ? normalizeDocumentId(input.id)
     : normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  const type = (input.type as Frontmatter["type"]) ?? "document";
   const frontmatter: Frontmatter = {
     title: input.title,
-    type: (input.type as Frontmatter["type"]) ?? "document",
+    type,
     ...(input.description !== undefined ? { description: input.description } : {}),
     ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
-    // Skill nodes carry a `skill` block — `trigger` is required there for
-    // type:"skill" and the block must be ABSENT on every other type, so these
-    // cannot ride along inside `metadata`.
-    ...(input.trigger
-      ? {
-          skill: {
-            trigger: input.trigger,
-            ...(input.inputs ? { inputs: input.inputs } : {}),
-            ...(input.tools_required ? { tools_required: input.tools_required } : {}),
-            ...(input.output_format ? { output_format: input.output_format } : {}),
-            ...(input.guard_rails ? { guard_rails: input.guard_rails } : {}),
-          },
-        }
-      : {}),
     status: (input.status as Frontmatter["status"]) ?? "draft",
     created_at: now,
     // A node is "updated" at birth; without this a draft carries no
     // updated_at until its first edit, and every surface renders it blank.
     updated_at: now,
   };
+  // `source` and `skill` are required by one type and forbidden on the others,
+  // so they cannot ride along inside `metadata` and cannot be added afterwards
+  // — a source node written without its block fails every later update.
+  applyTypedBlocks(frontmatter, {
+    type,
+    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
+    ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
+    ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
+    ...(input.inputs !== undefined ? { inputs: input.inputs } : {}),
+    ...(input.guard_rails !== undefined ? { guard_rails: input.guard_rails } : {}),
+  });
   return { id, filePath: "", rawContent: "", frontmatter, body: input.content };
 }
 
@@ -473,6 +474,21 @@ const update: OperationExecutor = async (ctx, input: any) => {
     }
     frontmatter.metadata = merged;
   }
+  // The typed blocks are settled against the node's POST-write type — the one
+  // passed in this call, or the one it already carries. Without this an
+  // existing type:source node has no way to gain the block rule 9 demands, and
+  // every update it is ever given fails validation.
+  const nextType = (input.type as Frontmatter["type"]) ?? frontmatter.type ?? "document";
+  if (input.type !== undefined) frontmatter.type = nextType;
+  applyTypedBlocks(frontmatter, {
+    type: nextType,
+    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
+    ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
+    ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
+    ...(input.inputs !== undefined ? { inputs: input.inputs } : {}),
+    ...(input.guard_rails !== undefined ? { guard_rails: input.guard_rails } : {}),
+  });
   frontmatter.updated_at = new Date().toISOString();
   const newContent = resolveContentAlias(input);
   let body = existing.body;

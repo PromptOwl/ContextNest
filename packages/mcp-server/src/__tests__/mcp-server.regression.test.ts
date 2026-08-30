@@ -428,6 +428,52 @@ describe("[regression] MCP server e2e — mutation tools", () => {
     expect(json.frontmatter.skill.trigger).toBe("when asked to do the thing");
   });
 
+  it("create_document round-trips a source node's block, and refuses one without it", async () => {
+    const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
+    const { json } = await callJson(client, "create_document", {
+      path: "nodes/my-source",
+      title: "My Source",
+      type: "source",
+      source,
+    });
+    expect(json.frontmatter.type).toBe("source");
+    expect(json.frontmatter.source).toEqual(source);
+
+    // Rule 9: without a block the create fails outright and leaves nothing behind.
+    const bare = await callText(client, "create_document", {
+      path: "nodes/no-block",
+      title: "No Block",
+      type: "source",
+    });
+    expect(bare.isError).toBe(true);
+    expect(bare.text).toContain("rule 9");
+    expect(await exists(join(vault, "nodes", "no-block.md"))).toBe(false);
+  });
+
+  it("update_document can edit a source block and re-type a node", async () => {
+    const replacement = { transport: "rest", server: "bigearnie", tools: ["get_estimate"] };
+    const edited = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      source: replacement,
+    });
+    expect(edited.json.frontmatter.source).toEqual(replacement);
+
+    // Rule 17 both ways: the block goes when the type does, and comes back with it.
+    const plain = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      type: "document",
+    });
+    expect(plain.json.frontmatter.type).toBe("document");
+    expect(plain.json.frontmatter.source).toBeUndefined();
+
+    const back = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      type: "source",
+      source: replacement,
+    });
+    expect(back.json.frontmatter.source).toEqual(replacement);
+  });
+
   it("create_document rejects a duplicate path", async () => {
     const dup = await callText(client, "create_document", { path: "nodes/created", title: "Dup" });
     expect(dup.isError).toBe(true);

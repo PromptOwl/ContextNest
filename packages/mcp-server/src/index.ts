@@ -34,6 +34,9 @@ import {
   STATUS_ALIASES,
   normalizeDocumentId,
   ContextNestError,
+  applyTypedBlocks,
+  sourceMetaSchema,
+  NODE_TYPES,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -182,15 +185,18 @@ function resolveBodyAlias(
   }
   return { ok: true, body: body ?? content };
 }
-
-/** Tool result for a rejected body/content pair. */
-function aliasConflict(message: string) {
+/** Uniform error payload for a caller mistake (VALIDATION_FAILED). */
+function validationError(message: string) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ error: message, code: "VALIDATION_FAILED" }, null, 2) }],
     isError: true,
   };
 }
 
+/** Uniform error payload for an alias conflict (VALIDATION_FAILED). */
+function aliasConflict(message: string) {
+  return validationError(message);
+}
 /** Run a catalog operation and package the outcome as a tool result. */
 async function runOp(name: string, input: Record<string, unknown>) {
   try {
@@ -709,11 +715,7 @@ tool(
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().describe("Document title"),
-    type: z
-      .enum(["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill"])
-      .optional()
-      .default("document")
-      .describe("Node type"),
+    type: z.enum(NODE_TYPES).optional().default("document").describe("Node type"),
     description: z
       .string()
       .optional()
@@ -729,8 +731,25 @@ tool(
     trigger: z.string().optional().describe("Skill trigger description (required when type is 'skill')"),
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
+    source: sourceMetaSchema
+      .optional()
+      .describe(
+        "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
+      ),
   },
-  async ({ path, title, description, type, tags, body, content: bodyAlias, trigger, tools_required, output_format }) => {
+  async ({
+    path,
+    title,
+    description,
+    type,
+    tags,
+    body,
+    content: bodyAlias,
+    trigger,
+    tools_required,
+    output_format,
+    source,
+  }) => {
     const resolvedBody = resolveBodyAlias(body, bodyAlias);
     if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
 
@@ -763,14 +782,31 @@ tool(
       ...(tagList ? { tags: tagList } : {}),
     };
 
-    // Add skill block for skill nodes
-    if (type === "skill") {
+    // Settle the typed blocks BEFORE anything is written. `source` and `skill`
+    // are required by one type and forbidden on the others, and until now this
+    // tool built a skill block but had no source equivalent — so a type:source
+    // node was written with no block, published fine, and then failed every
+    // update it was ever given, with no parameter able to supply the field.
+    try {
+      applyTypedBlocks(frontmatter, {
+        type,
+        ...(source !== undefined ? { source } : {}),
+        ...(trigger !== undefined ? { trigger } : {}),
+        ...(tools_required !== undefined ? { tools_required } : {}),
+        ...(output_format !== undefined ? { output_format } : {}),
+        defaultTrigger: `when asked to ${title.toLowerCase()}`,
+      });
+    } catch (err) {
+      return validationError(err instanceof Error ? err.message : String(err));
+    }
+    // Skill defaults this tool has always filled in and context_create does not.
+    if (frontmatter.skill) {
       frontmatter.skill = {
-        trigger: trigger || `when asked to ${title.toLowerCase()}`,
         inputs: [],
-        tools_required: tools_required || [],
-        output_format: output_format || "markdown",
+        tools_required: [],
+        output_format: "markdown",
         guard_rails: [],
+        ...frontmatter.skill,
       };
     }
 
@@ -781,6 +817,22 @@ tool(
       body: resolvedBody.body ? `\n${resolvedBody.body}\n` : `\n# ${title}\n\n`,
       rawContent: "",
     };
+
+    // Validate BEFORE the write, not after. Create used to skip validation
+    // entirely, which is what let an invalid node reach disk in the first
+    // place; checking here means a bad create leaves nothing to clean up.
+    const validation = validateDocument(node);
+    if (!validation.valid) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ error: "Validation failed", errors: validation.errors }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     const content = serializeDocument(node);
     await storage.writeDocument(id, content);
@@ -856,8 +908,41 @@ tool(
       .string()
       .optional()
       .describe("Alias for `body` — pass one or the other, not both"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+      ),
+    source: sourceMetaSchema
+      .optional()
+      .describe(
+        "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    trigger: z
+      .string()
+      .optional()
+      .describe("New skill trigger, for a node that is (or is becoming) type:skill"),
+    tools_required: z.array(z.string()).optional().describe("New tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("New skill output format"),
   },
-  async ({ path, title, description, tags, status, body, content: bodyAlias }) => {
+  async ({
+    path,
+    title,
+    description,
+    tags,
+    status,
+    body,
+    content: bodyAlias,
+    type,
+    source,
+    trigger,
+    tools_required,
+    output_format,
+  }) => {
     const resolvedBody = resolveBodyAlias(body, bodyAlias);
     if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
     const id = normalizeDocumentId(path);
@@ -904,6 +989,23 @@ tool(
     if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
     if (tags !== undefined) {
       doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
+    }
+    // Settle the typed blocks against the node's POST-write type — the one
+    // passed in this call, or the one it already carries. Without this an
+    // existing type:source node has no way to gain the block rule 9 demands,
+    // and every update it is ever given fails validation.
+    const nextType = type ?? doc.frontmatter.type ?? "document";
+    if (type !== undefined) doc.frontmatter.type = nextType;
+    try {
+      applyTypedBlocks(doc.frontmatter, {
+        type: nextType,
+        ...(source !== undefined ? { source } : {}),
+        ...(trigger !== undefined ? { trigger } : {}),
+        ...(tools_required !== undefined ? { tools_required } : {}),
+        ...(output_format !== undefined ? { output_format } : {}),
+      });
+    } catch (err) {
+      return validationError(err instanceof Error ? err.message : String(err));
     }
     doc.frontmatter.updated_at = new Date().toISOString();
 
