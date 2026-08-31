@@ -36,7 +36,7 @@ RUN pnpm build
 # on how the client invokes the container.
 ENV CONTEXTNEST_VAULT_PATH=/vault
 
-# ponytail: demo vault baked into the image so the Glama inspector has documents
+# Note: demo vault baked into the image so the Glama inspector has documents
 # to read. Seeded here rather than in the runtime stage so the CLI (and its
 # deps) never ship in the final image.
 ARG SEED_DEMO_VAULT=true

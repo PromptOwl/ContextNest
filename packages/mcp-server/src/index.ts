@@ -10,6 +10,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
+  withVaultLock,
   NestStorage,
   Resolver,
   PackLoader,
@@ -704,6 +705,16 @@ tool(
   },
 );
 
+/**
+ * The deprecated write tools below predate the operation catalog and call
+ * storage/publish directly, bypassing the catalog executors' vault lock. Any
+ * legacy client could therefore race a locked `context_update` and corrupt
+ * the checkpoint chain. Wrapping here keeps their wire output byte-identical
+ * while closing the gap; new tools go through the catalog and need nothing.
+ */
+const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
+  withVaultLock(storage.root, fn);
+
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
 tool(
@@ -750,6 +761,7 @@ tool(
     output_format,
     source,
   }) => {
+  lockedHandler(async () => {
     const resolvedBody = resolveBodyAlias(body, bodyAlias);
     if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
 
@@ -876,7 +888,7 @@ tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: update_document ─────────────────────────────────────────────────
@@ -943,6 +955,7 @@ tool(
     tools_required,
     output_format,
   }) => {
+  lockedHandler(async () => {
     const resolvedBody = resolveBodyAlias(body, bodyAlias);
     if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
     const id = normalizeDocumentId(path);
@@ -1096,7 +1109,7 @@ tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: delete_document ─────────────────────────────────────────────────
@@ -1107,7 +1120,8 @@ tool(
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
   },
-  async ({ path }) => {
+  async ({ path }) =>
+    lockedHandler(async () => {
     const id = normalizeDocumentId(path);
 
     // Verify the document exists before deleting
@@ -1128,7 +1142,7 @@ tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: publish_document ────────────────────────────────────────────────
@@ -1144,7 +1158,8 @@ tool(
     author: z.string().optional().default("mcp@contextnest.local").describe("Author email"),
     note: z.string().optional().describe("Version note"),
   },
-  async ({ path, author, note }) => {
+  async ({ path, author, note }) =>
+    lockedHandler(async () => {
     const id = normalizeDocumentId(path);
 
     const result = await publishDocument(storage, id, {
@@ -1172,7 +1187,7 @@ tool(
         },
       ],
     };
-  },
+  }),
 );
 
 // ─── Tool: stage_drift_suggestion ──────────────────────────────────────────

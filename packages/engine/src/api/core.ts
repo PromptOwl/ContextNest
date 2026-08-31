@@ -397,7 +397,12 @@ const createOp: OperationDescriptor = {
       .nullable()
       .describe("Checkpoint sealing the publish, or null when created as a draft"),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["create_document"],
 };
 
@@ -499,6 +504,7 @@ const updateOp: OperationDescriptor = {
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
 };
@@ -529,6 +535,7 @@ const publishOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["publish_document"],
 };
@@ -545,21 +552,38 @@ const deleteOp: OperationDescriptor = {
     title: z.string().describe("Title of the deleted node, read before removal"),
     deleted: z.literal(true),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["delete_document"],
 };
 
 // ─── context_versions ────────────────────────────────────────────────────────
 
+// Optional where a server may legitimately have nothing to report, not
+// because the field is decorative. `keyframe`/`content_hash`/`chain_hash`
+// describe the keyframe+diff storage model and its per-version hash chain; a
+// nest that stores content whole and enforces integrity server-side has no
+// equivalent and omits them rather than faking a value. Same reason
+// `published_at` and `status` are both optional: a nest either publishes
+// versions or approves them, never both.
 const versionEntryOut = z.object({
   version: z.number().int(),
-  keyframe: z.boolean(),
+  keyframe: z.boolean().optional(),
   edited_by: z.string(),
   edited_at: z.string(),
   published_at: z.string().optional(),
+  status: z
+    .string()
+    .optional()
+    .describe("Lifecycle status of this version on a nest that approves rather than publishes"),
   note: z.string().optional(),
-  content_hash: z.string(),
-  chain_hash: z.string(),
+  content_hash: z.string().optional(),
+  chain_hash: z.string().optional(),
   /** Only present when the caller passes `include_diff`. Absent for a keyframe
    *  (a full snapshot has no patch) and for v1. */
   diff: z.string().optional().describe("Unified diff from the previous version"),
@@ -582,7 +606,16 @@ const versionsOp: OperationDescriptor = {
   }),
   output: z.object({
     id: z.string(),
-    keyframe_interval: z.number().int(),
+    // Absent from a server with no keyframe+diff model — see versionEntryOut.
+    keyframe_interval: z.number().int().optional(),
+    approved_version: z
+      .number()
+      .int()
+      .nullable()
+      .optional()
+      .describe(
+        "The version a governed nest currently serves to agents; null when none is approved yet. Absent from a nest that publishes rather than approves.",
+      ),
     versions: z.array(versionEntryOut),
   }),
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
@@ -850,7 +883,7 @@ const importOp: OperationDescriptor = {
       )
       .optional(),
   }),
-  errors: ["VALIDATION_FAILED"],
+  errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
 };
 
 /** All `core` namespace operations, in catalog order. */
