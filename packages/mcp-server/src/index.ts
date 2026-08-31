@@ -186,6 +186,7 @@ function resolveBodyAlias(
   }
   return { ok: true, body: body ?? content };
 }
+
 /** Uniform error payload for a caller mistake (VALIDATION_FAILED). */
 function validationError(message: string) {
   return {
@@ -194,10 +195,6 @@ function validationError(message: string) {
   };
 }
 
-/** Uniform error payload for an alias conflict (VALIDATION_FAILED). */
-function aliasConflict(message: string) {
-  return validationError(message);
-}
 /** Run a catalog operation and package the outcome as a tool result. */
 async function runOp(name: string, input: Record<string, unknown>) {
   try {
@@ -247,12 +244,12 @@ tool("vault_info", deprecated("context_init", "It returns this plus what the vau
             context_md: contextMd || "(no CONTEXT.md found)",
             config: config
               ? {
-                  name: config.name,
-                  description: config.description,
-                  servers: config.servers
-                    ? Object.keys(config.servers)
-                    : [],
-                }
+                name: config.name,
+                description: config.description,
+                servers: config.servers
+                  ? Object.keys(config.servers)
+                  : [],
+              }
               : null,
           },
           null,
@@ -742,7 +739,12 @@ tool(
     trigger: z.string().optional().describe("Skill trigger description (required when type is 'skill')"),
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
+    // `.strict()` here, not on the export: the tool() helper's strictness stops
+    // at the top level, so an unknown key INSIDE the block is still stripped —
+    // a typo'd `server` would write a source block missing the field rule 12
+    // wants, silently. The base schema stays lenient for on-disk frontmatter.
     source: sourceMetaSchema
+      .strict()
       .optional()
       .describe(
         "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
@@ -760,135 +762,135 @@ tool(
     tools_required,
     output_format,
     source,
-  }) => {
-  lockedHandler(async () => {
-    const resolvedBody = resolveBodyAlias(body, bodyAlias);
-    if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
+  }) =>
+    lockedHandler(async () => {
+      const resolvedBody = resolveBodyAlias(body, bodyAlias);
+      if (!resolvedBody.ok) return validationError(resolvedBody.error);
 
-    // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
-    // lands in the same place as one created via `ctx add` (single source of
-    // truth — normalizeDocumentId in the engine).
-    const id = normalizeDocumentId(path);
+      // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
+      // lands in the same place as one created via `ctx add` (single source of
+      // truth — normalizeDocumentId in the engine).
+      const id = normalizeDocumentId(path);
 
-    // Check if document already exists
-    try {
-      await storage.readDocument(id);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ error: `Document "${id}" already exists` }) }],
-        isError: true,
-      };
-    } catch {
-      // Document doesn't exist, good to proceed
-    }
+      // Check if document already exists
+      try {
+        await storage.readDocument(id);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: `Document "${id}" already exists` }) }],
+          isError: true,
+        };
+      } catch {
+        // Document doesn't exist, good to proceed
+      }
 
-    const tagList = tags ? tags.map((t) => (t.startsWith("#") ? t : `#${t}`)) : undefined;
-    // version omitted — publishDocument owns version assignment (spec §6:
-    // "version managed automatically by publish"). Pre-setting it caused
-    // create-with-publish to land on v=2 instead of v=1.
-    const frontmatter: Frontmatter = {
-      title,
-      type,
-      ...(description !== undefined ? { description } : {}),
-      status: "draft",
-      created_at: new Date().toISOString(),
-      ...(tagList ? { tags: tagList } : {}),
-    };
-
-    // Settle the typed blocks BEFORE anything is written. `source` and `skill`
-    // are required by one type and forbidden on the others, and until now this
-    // tool built a skill block but had no source equivalent — so a type:source
-    // node was written with no block, published fine, and then failed every
-    // update it was ever given, with no parameter able to supply the field.
-    try {
-      applyTypedBlocks(frontmatter, {
+      const tagList = tags ? tags.map((t) => (t.startsWith("#") ? t : `#${t}`)) : undefined;
+      // version omitted — publishDocument owns version assignment (spec §6:
+      // "version managed automatically by publish"). Pre-setting it caused
+      // create-with-publish to land on v=2 instead of v=1.
+      const frontmatter: Frontmatter = {
+        title,
         type,
-        ...(source !== undefined ? { source } : {}),
-        ...(trigger !== undefined ? { trigger } : {}),
-        ...(tools_required !== undefined ? { tools_required } : {}),
-        ...(output_format !== undefined ? { output_format } : {}),
-        defaultTrigger: `when asked to ${title.toLowerCase()}`,
-      });
-    } catch (err) {
-      return validationError(err instanceof Error ? err.message : String(err));
-    }
-    // Skill defaults this tool has always filled in and context_create does not.
-    if (frontmatter.skill) {
-      frontmatter.skill = {
-        inputs: [],
-        tools_required: [],
-        output_format: "markdown",
-        guard_rails: [],
-        ...frontmatter.skill,
+        ...(description !== undefined ? { description } : {}),
+        status: "draft",
+        created_at: new Date().toISOString(),
+        ...(tagList ? { tags: tagList } : {}),
       };
-    }
 
-    const node: ContextNode = {
-      id,
-      filePath: "",
-      frontmatter,
-      body: resolvedBody.body ? `\n${resolvedBody.body}\n` : `\n# ${title}\n\n`,
-      rawContent: "",
-    };
+      // Settle the typed blocks BEFORE anything is written. `source` and `skill`
+      // are required by one type and forbidden on the others, and until now this
+      // tool built a skill block but had no source equivalent — so a type:source
+      // node was written with no block, published fine, and then failed every
+      // update it was ever given, with no parameter able to supply the field.
+      try {
+        applyTypedBlocks(frontmatter, {
+          type,
+          ...(source !== undefined ? { source } : {}),
+          ...(trigger !== undefined ? { trigger } : {}),
+          ...(tools_required !== undefined ? { tools_required } : {}),
+          ...(output_format !== undefined ? { output_format } : {}),
+          defaultTrigger: `when asked to ${title.toLowerCase()}`,
+        });
+      } catch (err) {
+        return validationError(err instanceof Error ? err.message : String(err));
+      }
+      // Skill defaults this tool has always filled in and context_create does not.
+      if (frontmatter.skill) {
+        frontmatter.skill = {
+          inputs: [],
+          tools_required: [],
+          output_format: "markdown",
+          guard_rails: [],
+          ...frontmatter.skill,
+        };
+      }
 
-    // Validate BEFORE the write, not after. Create used to skip validation
-    // entirely, which is what let an invalid node reach disk in the first
-    // place; checking here means a bad create leaves nothing to clean up.
-    const validation = validateDocument(node);
-    if (!validation.valid) {
+      const node: ContextNode = {
+        id,
+        filePath: "",
+        frontmatter,
+        body: resolvedBody.body ? `\n${resolvedBody.body}\n` : `\n# ${title}\n\n`,
+        rawContent: "",
+      };
+
+      // Validate BEFORE the write, not after. Create used to skip validation
+      // entirely, which is what let an invalid node reach disk in the first
+      // place; checking here means a bad create leaves nothing to clean up.
+      const validation = validateDocument(node);
+      if (!validation.valid) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ error: "Validation failed", errors: validation.errors }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const content = serializeDocument(node);
+      await storage.writeDocument(id, content);
+
+      // Auto-publish: bump version, create version entry & checkpoint.
+      // If publish fails after writeDocument succeeded, roll back the file
+      // so the next create attempt isn't blocked by orphan state.
+      let result;
+      try {
+        result = await publishDocument(storage, id, {
+          editedBy: "mcp@contextnest.local",
+          note: "Created via MCP server",
+        });
+      } catch (err) {
+        try {
+          await storage.deleteDocument(id);
+        } catch {
+          // best-effort cleanup; surface original publish error regardless
+        }
+        throw err;
+      }
+
+      await regenerateIndex();
+
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ error: "Validation failed", errors: validation.errors }, null, 2),
+            text: JSON.stringify(
+              {
+                id: result.node.id,
+                frontmatter: result.node.frontmatter,
+                version: result.node.frontmatter.version,
+                checkpoint: result.checkpointNumber,
+                chain_hash: result.versionEntry.chain_hash,
+                message: "Document created and published successfully",
+              },
+              null,
+              2,
+            ),
           },
         ],
-        isError: true,
       };
-    }
-
-    const content = serializeDocument(node);
-    await storage.writeDocument(id, content);
-
-    // Auto-publish: bump version, create version entry & checkpoint.
-    // If publish fails after writeDocument succeeded, roll back the file
-    // so the next create attempt isn't blocked by orphan state.
-    let result;
-    try {
-      result = await publishDocument(storage, id, {
-        editedBy: "mcp@contextnest.local",
-        note: "Created via MCP server",
-      });
-    } catch (err) {
-      try {
-        await storage.deleteDocument(id);
-      } catch {
-        // best-effort cleanup; surface original publish error regardless
-      }
-      throw err;
-    }
-
-    await regenerateIndex();
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            {
-              id: result.node.id,
-              frontmatter: result.node.frontmatter,
-              version: result.node.frontmatter.version,
-              checkpoint: result.checkpointNumber,
-              chain_hash: result.versionEntry.chain_hash,
-              message: "Document created and published successfully",
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
-  }),
+    }),
 );
 
 // ─── Tool: update_document ─────────────────────────────────────────────────
@@ -927,6 +929,7 @@ tool(
         "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
       ),
     source: sourceMetaSchema
+      .strict()
       .optional()
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
@@ -954,162 +957,162 @@ tool(
     trigger,
     tools_required,
     output_format,
-  }) => {
-  lockedHandler(async () => {
-    const resolvedBody = resolveBodyAlias(body, bodyAlias);
-    if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
-    const id = normalizeDocumentId(path);
-    const doc = await storage.readDocument(id);
+  }) =>
+    lockedHandler(async () => {
+      const resolvedBody = resolveBodyAlias(body, bodyAlias);
+      if (!resolvedBody.ok) return validationError(resolvedBody.error);
+      const id = normalizeDocumentId(path);
+      const doc = await storage.readDocument(id);
 
-    // Normalize caller-supplied status to canonical before any guard or
-    // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
-    // collapse here so the disk store and downstream tools only ever see
-    // canonical values.
-    const normalizedStatus = status !== undefined ? normalizeStatus(status) : undefined;
+      // Normalize caller-supplied status to canonical before any guard or
+      // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
+      // collapse here so the disk store and downstream tools only ever see
+      // canonical values.
+      const normalizedStatus = status !== undefined ? normalizeStatus(status) : undefined;
 
-    // Refuse content edits on rejected docs unless the caller explicitly
-    // names a new status (revive to draft/pending_review/approved/published,
-    // or no-op re-rejection). Mirrors the engine guard in publish.ts and
-    // forces callers to declare intent before content changes land.
-    if (isRejected(doc) && normalizedStatus === undefined) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                error: `Document "${id}" is rejected — set status (draft|pending_review|approved|published|rejected) before further updates`,
-                code: "REJECTED_DOCUMENT",
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // Update frontmatter fields
-    if (title !== undefined) doc.frontmatter.title = title;
-    // An empty string CLEARS the description: over a JSON wire an absent key
-    // cannot be told apart from "leave this alone", so without the convention
-    // a caller has no way to remove one.
-    if (description !== undefined) {
-      if (description === "") delete doc.frontmatter.description;
-      else doc.frontmatter.description = description;
-    }
-    if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
-    if (tags !== undefined) {
-      doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
-    }
-    // Settle the typed blocks against the node's POST-write type — the one
-    // passed in this call, or the one it already carries. Without this an
-    // existing type:source node has no way to gain the block rule 9 demands,
-    // and every update it is ever given fails validation.
-    const nextType = type ?? doc.frontmatter.type ?? "document";
-    if (type !== undefined) doc.frontmatter.type = nextType;
-    try {
-      applyTypedBlocks(doc.frontmatter, {
-        type: nextType,
-        ...(source !== undefined ? { source } : {}),
-        ...(trigger !== undefined ? { trigger } : {}),
-        ...(tools_required !== undefined ? { tools_required } : {}),
-        ...(output_format !== undefined ? { output_format } : {}),
-      });
-    } catch (err) {
-      return validationError(err instanceof Error ? err.message : String(err));
-    }
-    doc.frontmatter.updated_at = new Date().toISOString();
-
-    // Update body if provided
-    if (resolvedBody.body !== undefined) {
-      doc.body = `\n${resolvedBody.body}\n`;
-    }
-
-    // Validate before writing
-    const validation = validateDocument(doc);
-    if (!validation.valid) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ error: "Validation failed", errors: validation.errors }, null, 2),
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    const content = serializeDocument(doc);
-    await storage.writeDocument(id, content);
-
-    // Metadata-only paths — any non-published status set is treated as
-    // a lifecycle transition, not a content release. Skip publishDocument
-    // entirely (rejected would throw REJECTED_DOCUMENT) and don't cut a
-    // new version. Only an explicit `published` or no-status update falls
-    // through to the publish flow below.
-    if (
-      normalizedStatus === "rejected" ||
-      normalizedStatus === "approved" ||
-      normalizedStatus === "pending_review" ||
-      normalizedStatus === "draft"
-    ) {
-      await regenerateIndex();
-      const message =
-        normalizedStatus === "rejected"
-          ? "Document retired (status: rejected). No new version cut."
-          : normalizedStatus === "pending_review"
-            ? "Document submitted for review (status: pending_review). No new version cut."
-            : normalizedStatus === "approved"
-              ? "Document marked approved. No new version cut — call publish_document to release."
-              : "Document reverted to draft. No new version cut.";
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                id,
-                frontmatter: doc.frontmatter,
-                message,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    }
-
-    // Auto-publish: bump version, create version entry & checkpoint
-    const result = await publishDocument(storage, id, {
-      editedBy: "mcp@contextnest.local",
-      note: "Updated via MCP server",
-    });
-
-    await regenerateIndex();
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
+      // Refuse content edits on rejected docs unless the caller explicitly
+      // names a new status (revive to draft/pending_review/approved/published,
+      // or no-op re-rejection). Mirrors the engine guard in publish.ts and
+      // forces callers to declare intent before content changes land.
+      if (isRejected(doc) && normalizedStatus === undefined) {
+        return {
+          content: [
             {
-              id: result.node.id,
-              frontmatter: result.node.frontmatter,
-              version: result.node.frontmatter.version,
-              checkpoint: result.checkpointNumber,
-              chain_hash: result.versionEntry.chain_hash,
-              message: "Document updated and published successfully",
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  error: `Document "${id}" is rejected — set status (draft|pending_review|approved|published|rejected) before further updates`,
+                  code: "REJECTED_DOCUMENT",
+                },
+                null,
+                2,
+              ),
             },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
-  }),
+          ],
+          isError: true,
+        };
+      }
+
+      // Update frontmatter fields
+      if (title !== undefined) doc.frontmatter.title = title;
+      // An empty string CLEARS the description: over a JSON wire an absent key
+      // cannot be told apart from "leave this alone", so without the convention
+      // a caller has no way to remove one.
+      if (description !== undefined) {
+        if (description === "") delete doc.frontmatter.description;
+        else doc.frontmatter.description = description;
+      }
+      if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
+      if (tags !== undefined) {
+        doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
+      }
+      // Settle the typed blocks against the node's POST-write type — the one
+      // passed in this call, or the one it already carries. Without this an
+      // existing type:source node has no way to gain the block rule 9 demands,
+      // and every update it is ever given fails validation.
+      const nextType = type ?? doc.frontmatter.type ?? "document";
+      if (type !== undefined) doc.frontmatter.type = nextType;
+      try {
+        applyTypedBlocks(doc.frontmatter, {
+          type: nextType,
+          ...(source !== undefined ? { source } : {}),
+          ...(trigger !== undefined ? { trigger } : {}),
+          ...(tools_required !== undefined ? { tools_required } : {}),
+          ...(output_format !== undefined ? { output_format } : {}),
+        });
+      } catch (err) {
+        return validationError(err instanceof Error ? err.message : String(err));
+      }
+      doc.frontmatter.updated_at = new Date().toISOString();
+
+      // Update body if provided
+      if (resolvedBody.body !== undefined) {
+        doc.body = `\n${resolvedBody.body}\n`;
+      }
+
+      // Validate before writing
+      const validation = validateDocument(doc);
+      if (!validation.valid) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ error: "Validation failed", errors: validation.errors }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const content = serializeDocument(doc);
+      await storage.writeDocument(id, content);
+
+      // Metadata-only paths — any non-published status set is treated as
+      // a lifecycle transition, not a content release. Skip publishDocument
+      // entirely (rejected would throw REJECTED_DOCUMENT) and don't cut a
+      // new version. Only an explicit `published` or no-status update falls
+      // through to the publish flow below.
+      if (
+        normalizedStatus === "rejected" ||
+        normalizedStatus === "approved" ||
+        normalizedStatus === "pending_review" ||
+        normalizedStatus === "draft"
+      ) {
+        await regenerateIndex();
+        const message =
+          normalizedStatus === "rejected"
+            ? "Document retired (status: rejected). No new version cut."
+            : normalizedStatus === "pending_review"
+              ? "Document submitted for review (status: pending_review). No new version cut."
+              : normalizedStatus === "approved"
+                ? "Document marked approved. No new version cut — call publish_document to release."
+                : "Document reverted to draft. No new version cut.";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  id,
+                  frontmatter: doc.frontmatter,
+                  message,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      // Auto-publish: bump version, create version entry & checkpoint
+      const result = await publishDocument(storage, id, {
+        editedBy: "mcp@contextnest.local",
+        note: "Updated via MCP server",
+      });
+
+      await regenerateIndex();
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id: result.node.id,
+                frontmatter: result.node.frontmatter,
+                version: result.node.frontmatter.version,
+                checkpoint: result.checkpointNumber,
+                chain_hash: result.versionEntry.chain_hash,
+                message: "Document updated and published successfully",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }),
 );
 
 // ─── Tool: delete_document ─────────────────────────────────────────────────
@@ -1122,27 +1125,27 @@ tool(
   },
   async ({ path }) =>
     lockedHandler(async () => {
-    const id = normalizeDocumentId(path);
+      const id = normalizeDocumentId(path);
 
-    // Verify the document exists before deleting
-    const doc = await storage.readDocument(id);
+      // Verify the document exists before deleting
+      const doc = await storage.readDocument(id);
 
-    await storage.deleteDocument(id);
-    await regenerateIndex();
+      await storage.deleteDocument(id);
+      await regenerateIndex();
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            { id, title: doc.frontmatter.title, message: "Document deleted successfully" },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
-  }),
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { id, title: doc.frontmatter.title, message: "Document deleted successfully" },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }),
 );
 
 // ─── Tool: publish_document ────────────────────────────────────────────────
@@ -1160,34 +1163,34 @@ tool(
   },
   async ({ path, author, note }) =>
     lockedHandler(async () => {
-    const id = normalizeDocumentId(path);
+      const id = normalizeDocumentId(path);
 
-    const result = await publishDocument(storage, id, {
-      editedBy: author,
-      note,
-    });
+      const result = await publishDocument(storage, id, {
+        editedBy: author,
+        note,
+      });
 
-    await regenerateIndex();
+      await regenerateIndex();
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            {
-              id,
-              version: result.node.frontmatter.version,
-              checkpoint: result.checkpointNumber,
-              chain_hash: result.versionEntry.chain_hash,
-              message: "Document published successfully",
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
-  }),
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id,
+                version: result.node.frontmatter.version,
+                checkpoint: result.checkpointNumber,
+                chain_hash: result.versionEntry.chain_hash,
+                message: "Document published successfully",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }),
 );
 
 // ─── Tool: stage_drift_suggestion ──────────────────────────────────────────

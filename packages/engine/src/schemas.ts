@@ -183,6 +183,13 @@ const skillMetaSchema = z.object({
  * frontmatter validator enforces — a second, hand-restated schema is how the
  * two drift apart, and a block the caller cannot see the fields of is a block
  * the caller cannot supply.
+ *
+ * Deliberately NOT strict. This shape parses documents already on disk, where
+ * an unrecognized key is a file to keep reading, not a caller to refuse. The
+ * write operations call `.strict()` on it themselves, because there the same
+ * key is a typo that would otherwise be dropped in silence and sealed into the
+ * chain. Making the base strict to settle that asymmetry would start failing
+ * existing vault files.
  */
 export const sourceMetaSchema = z.object({
   transport: z.enum(TRANSPORTS),          // Rule 10

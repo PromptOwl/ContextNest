@@ -977,4 +977,37 @@ describe("[regression] MCP server e2e — misnamed parameters cannot silently dr
       expect(doc.status).toBe("published");
     }
   });
+
+  it("refuses a misnamed key INSIDE a source block, on create and on update", async () => {
+    // The tool() helper's strictness stops at the top level, so this holds only
+    // because the nested source schema is strict too. A dropped `server` would
+    // write a block missing the field rule 12 wants, and seal it into the chain.
+    const typo = { transport: "mcp", servers: "TYPO", tools: ["list_projects"] };
+    const badCreate = await callText(client, "create_document", {
+      path: "nodes/typo-source",
+      title: "Typo Source",
+      type: "source",
+      source: typo,
+    });
+    expect(badCreate.isError).toBe(true);
+    expect(badCreate.text).toMatch(/servers/);
+    expect(await exists(join(vault, "nodes", "typo-source.md"))).toBe(false);
+
+    const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
+    await callJson(client, "create_document", {
+      path: "nodes/good-source",
+      title: "Good Source",
+      type: "source",
+      source,
+    });
+    const badUpdate = await callText(client, "update_document", {
+      path: "nodes/good-source",
+      source: typo,
+    });
+    expect(badUpdate.isError).toBe(true);
+    expect(badUpdate.text).toMatch(/servers/);
+
+    const { json } = await callJson(client, "read_document", { uri: "nodes/good-source" });
+    expect(json.frontmatter.source).toEqual(source);
+  });
 });

@@ -382,6 +382,7 @@ const createOp: OperationDescriptor = {
     // and forbidden on every other type, so it cannot ride inside `metadata`
     // either. Without it a source node simply could not be created.
     source: sourceMetaSchema
+      .strict()
       .optional()
       .describe(
         'Source block (required for type:source): how an agent fetches the live data this node stands for.',
@@ -473,6 +474,7 @@ const updateOp: OperationDescriptor = {
         "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
       ),
     source: sourceMetaSchema
+      .strict()
       .optional()
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
@@ -782,24 +784,66 @@ const nestsOp: OperationDescriptor = {
 
 // ─── context_import ──────────────────────────────────────────────────────────
 
-/** One node to create in a bulk import — same shape as context_create input. */
-const importDoc = z.object({
-  title: z.string().min(1).max(200).describe("Descriptive title"),
-  content: z.string().describe("Markdown content body"),
-  type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
-  tags: z.array(tag).optional().describe("Tags"),
-  folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
-  metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
-});
+/**
+ * One node to create in a bulk import — the fields `context_create` takes.
+ *
+ * `.strict()` for the same reason `EngineApi.run()` refuses unknown top-level
+ * keys: that check reads the OUTER shape only, so without this a caller who
+ * writes `body` here has it stripped in silence and the node is published with
+ * the wrong text. `metadata` stays permissive — arbitrary keys are its purpose.
+ *
+ * The typed-block fields are what make a `type: source` or `type: skill` node
+ * importable at all: `buildDraftNode` settles them through `applyTypedBlocks`,
+ * which requires the block of the type being entered, and nothing else here
+ * can supply it.
+ */
+const importDoc = z
+  .object({
+    title: z.string().min(1).max(200).describe("Descriptive title"),
+    content: z.string().describe("Markdown content body"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
+      ),
+    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    tags: z.array(tag).optional().describe("Tags"),
+    folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
+    metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Source block (required for type:source): how an agent fetches the live data this node stands for.",
+      ),
+    trigger: z.string().optional().describe("Skill trigger (required for type:skill)"),
+    tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("Skill output format"),
+    inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
+  })
+  .strict();
 
-/** One file from an existing vault, written in exactly as given. */
-const importFile = z.object({
-  path: z
-    .string()
-    .min(1)
-    .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
-  content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
-});
+/**
+ * One file from an existing vault, written in exactly as given.
+ *
+ * `.strict()` because a misnamed `content` is not an inert typo here: the
+ * executor writes `f.content ?? ""`, so a stripped key lands an EMPTY file and
+ * still counts itself in `written`.
+ */
+const importFile = z
+  .object({
+    path: z
+      .string()
+      .min(1)
+      .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
+    content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
+  })
+  .strict();
 
 const importOp: OperationDescriptor = {
   name: "context_import",
