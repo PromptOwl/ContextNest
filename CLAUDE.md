@@ -69,9 +69,9 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-36 tools over stdio, in three groups:
+38 tools over stdio, in three groups:
 
-- **Catalog-driven** (17, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`. **Add new tools here, not by hand.**
+- **Catalog-driven** (19, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_skill`, `context_skill_install`. **Add new tools here, not by hand.**
 - **Hand-written, still current** (8): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`.
 - **Deprecated** (11, backward-compatible for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`. Additive parity fixes are allowed here — `list_documents` takes `path` (the `folder` filter of `context_list`), `create_document`/`update_document` take `description` and accept `content` as an alias for `body` — but nothing already accepted may change meaning.
 

@@ -6,6 +6,7 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
+import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { Command, Help } from "commander";
 
@@ -56,6 +57,7 @@ import {
   normalizeDocumentId,
   isPublished,
   isRejected,
+  HARNESSES,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -1142,6 +1144,103 @@ program
 
     console.log(chalk.dim("─".repeat(60)));
     console.log(doc.body.trim());
+  });
+
+// ─── ctx skill ─────────────────────────────────────────────────────────────────
+
+const HARNESS_CHOICES = HARNESSES.join(" | ");
+
+/** Resolve a manifest entry's `base` to a real directory on this machine. */
+function resolveInstallBase(base: "project_root" | "home"): string {
+  return base === "home" ? homedir() : process.cwd();
+}
+
+async function runSkillOp<T>(op: string, input: Record<string, unknown>): Promise<T> {
+  const storage = getStorage();
+  return createEngineApi().run<T>(op, input, opContext(storage, "cli@contextnest.local"));
+}
+
+const skillCmd = program
+  .command("skill")
+  .description("Render and install vault-hosted skills (type: skill nodes)");
+
+skillCmd
+  .command("show <path>", { isDefault: true })
+  .description("Render a skill node for an agent harness and print it")
+  .option(`--harness <name>`, `Target harness (${HARNESS_CHOICES})`, "claude-code")
+  .option("--server-alias <name>", "What your MCP client calls this server (default: vault name)")
+  .option("--scope <scope>", "user | project — decides the install path only", "user")
+  .action(async (path, opts) => {
+    const rendered = await runSkillOp<{
+      name: string;
+      description: string;
+      content: string;
+      relative_path: string;
+      base: "project_root" | "home";
+    }>("context_skill", {
+      id: normalizeDocumentId(path),
+      harness: opts.harness,
+      scope: opts.scope,
+      ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
+    });
+
+    console.log(chalk.dim(`# ${pathMod.join(resolveInstallBase(rendered.base), rendered.relative_path)}`));
+    console.log(rendered.content);
+  });
+
+skillCmd
+  .command("install <path>")
+  .description("Build (and optionally write) the files that install a vault skill locally")
+  .option(`--harness <name>`, `Target harness (${HARNESS_CHOICES})`, "claude-code")
+  .option("--server-alias <name>", "What your MCP client calls this server (default: vault name)")
+  .option("--scope <scope>", "user (home directory) | project (cwd)", "user")
+  .option(
+    "--mode <mode>",
+    "loader — fetch the procedure at runtime, cannot drift; full — offline snapshot that will",
+    "loader",
+  )
+  .option("--write", "Actually write the files (otherwise they are only printed)")
+  .action(async (path, opts) => {
+    const manifest = await runSkillOp<{
+      files: { relative_path: string; base: "project_root" | "home"; content: string }[];
+      post_install: string;
+      notes: string;
+      skill: { name: string; source_path: string; version: number | null };
+    }>("context_skill_install", {
+      id: normalizeDocumentId(path),
+      harness: opts.harness,
+      scope: opts.scope,
+      mode: opts.mode,
+      ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
+    });
+
+    for (const file of manifest.files) {
+      const target = pathMod.join(resolveInstallBase(file.base), file.relative_path);
+
+      if (!opts.write) {
+        console.log(chalk.dim(`# ${target}`));
+        console.log(file.content);
+        continue;
+      }
+
+      // These land outside the vault, in the user's project or home directory,
+      // so they get the same never-clobber-without-consent guard as `read --out`.
+      await ensureOverwritable(target, "Skill file");
+      noteExternalWrite(target);
+      if (isDryRun()) continue;
+
+      await mkdir(pathMod.dirname(target), { recursive: true });
+      await writeFile(target, file.content, "utf-8");
+      console.log(chalk.green(`Written to ${target}`));
+    }
+
+    if (!opts.write) {
+      console.log();
+      console.log(chalk.dim("Re-run with --write to install these files."));
+    }
+    console.log();
+    console.log(chalk.dim(manifest.notes));
+    if (opts.write && !isDryRun()) console.log(chalk.yellow(manifest.post_install));
   });
 
 // ─── ctx add ───────────────────────────────────────────────────────────────────

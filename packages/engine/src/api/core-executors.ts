@@ -27,6 +27,14 @@ import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import {
+  buildInstallManifest,
+  renderSkill,
+  NotASkillNodeError,
+  type Harness,
+  type InstallMode,
+  type InstallScope,
+} from "../skills.js";
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
@@ -648,6 +656,7 @@ const init: OperationExecutor = async (ctx, input: any) => {
           name: config.name,
           ...(config.description ? { description: config.description } : {}),
           servers: config.servers ? Object.keys(config.servers) : [],
+          ...(config.skills?.bootstrap ? { skill_bootstrap: config.skills.bootstrap } : {}),
         }
       : null,
     total: docs.length,
@@ -658,6 +667,71 @@ const init: OperationExecutor = async (ctx, input: any) => {
     // dwarfs them, so it is opt-in.
     ...(input?.include_nodes ? { nodes: listed.map((d) => toSummary(d)) } : {}),
   };
+};
+
+/**
+ * Shared preamble for the two skill operations: load the node, and settle the
+ * caller-supplied names. `server_alias` falls back to the vault's own name
+ * because a caller that omits it usually configured the server under that name;
+ * a wrong-but-plausible prefix is at least recognizable, where an empty one
+ * renders `mcp____context_skill`.
+ */
+async function loadSkillNode(ctx: OperationContext, input: any) {
+  const id = normalizeDocumentId(String(input.id ?? ""));
+  assertSafeDocumentId(id);
+  const [node, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
+  const vaultName = config?.name;
+  return {
+    doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    vaultName,
+    serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
+    harness: (input.harness ?? "claude-code") as Harness,
+    scope: (input.scope ?? "user") as InstallScope,
+    mode: (input.mode ?? "loader") as InstallMode,
+  };
+}
+
+/** NotASkillNodeError carries a caller-actionable message; keep it, drop the class. */
+function asValidationError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof NotASkillNodeError) {
+      throw new ContextNestError(err.message, "VALIDATION_FAILED");
+    }
+    throw err;
+  }
+}
+
+const skill: OperationExecutor = async (ctx, input: any) => {
+  const { doc, vaultName, serverAlias, harness, scope } = await loadSkillNode(ctx, input);
+  const rendered = asValidationError(() =>
+    renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
+  );
+  return {
+    name: rendered.name,
+    description: rendered.description,
+    content: rendered.content,
+    relative_path: rendered.relativePath,
+    base: rendered.base,
+    harness,
+    source_path: doc.id,
+    version: doc.frontmatter.version ?? null,
+  };
+};
+
+const skillInstall: OperationExecutor = async (ctx, input: any) => {
+  const { doc, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(ctx, input);
+  return asValidationError(() =>
+    buildInstallManifest(doc, {
+      harness,
+      serverAlias,
+      vaultName,
+      vaultId: vaultName ?? serverAlias,
+      scope,
+      mode,
+    }),
+  );
 };
 
 const packs: OperationExecutor = async (ctx) => {
@@ -899,4 +973,6 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_packs: packs,
   context_nests: nests,
   context_import: locked(importDocs),
+  context_skill: skill,
+  context_skill_install: skillInstall,
 });

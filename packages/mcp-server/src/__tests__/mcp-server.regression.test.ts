@@ -48,6 +48,8 @@ const EXPECTED_TOOLS = [
   "context_packs",
   "context_import",
   "context_nests",
+  "context_skill",
+  "context_skill_install",
   // Hand-written, still current.
   "document_format",
   "read_index",

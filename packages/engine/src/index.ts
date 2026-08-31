@@ -370,4 +370,27 @@ export { TraceLogger } from "./tracing.js";
 
 // Chain event log (persistent governance audit trail)
 export { ChainEventLog } from "./chain-log.js";
+
+// Vault-hosted skills
+export {
+  HARNESSES,
+  INSTALL_SCOPES,
+  INSTALL_MODES,
+  NotASkillNodeError,
+  assertSkillNode,
+  skillNameFromPath,
+  substitutePlaceholders,
+  renderSkill,
+  buildInstallManifest,
+} from "./skills.js";
+export type {
+  Harness,
+  InstallScope,
+  InstallMode,
+  SkillSource,
+  RenderOptions,
+  RenderedSkill,
+  ManifestFile,
+  InstallManifest,
+} from "./skills.js";
 export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";
