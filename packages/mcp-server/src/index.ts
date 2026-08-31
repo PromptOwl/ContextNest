@@ -5,6 +5,8 @@
 
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
@@ -33,6 +35,9 @@ import {
   STATUS_ALIASES,
   normalizeDocumentId,
   ContextNestError,
+  applyTypedBlocks,
+  sourceMetaSchema,
+  NODE_TYPES,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -73,6 +78,37 @@ const server = new McpServer({
   name: "contextnest",
   version,
 });
+
+/** Second argument every tool callback receives (request id, signal, auth, …). */
+type ToolCtx = Parameters<ToolCallback<z.ZodRawShape>>[1];
+
+/**
+ * Register a tool whose input schema REFUSES keys it does not declare.
+ *
+ * `server.tool(name, description, rawShape, cb)` wraps the shape in a plain
+ * `z.object()`, which STRIPS unknown keys — while the JSON Schema it publishes
+ * to clients says `additionalProperties: false`. An agent that misnames a
+ * parameter (`content` where the tool takes `body`) therefore gets a success
+ * response for a write that dropped its text, detectable only by reading the
+ * document back and comparing. `registerTool` takes a real ZodObject and
+ * carries `.strict()` through both validation and tools/list, so the mistake
+ * comes back as an input-validation error instead of silent data loss.
+ */
+function tool<Shape extends z.ZodRawShape>(
+  name: string,
+  description: string,
+  shape: Shape,
+  handler: (
+    args: z.output<z.ZodObject<Shape>>,
+    ctx: ToolCtx,
+  ) => CallToolResult | Promise<CallToolResult>,
+): void {
+  server.registerTool(
+    name,
+    { description, inputSchema: z.object(shape).strict() },
+    handler as ToolCallback<z.ZodObject<Shape, "strict">>,
+  );
+}
 
 const regenerateIndex = () => storage.regenerateIndex();
 
@@ -128,6 +164,40 @@ function toolError(err: unknown) {
   };
 }
 
+/**
+ * Collapse the `body` / `content` pair to one value.
+ *
+ * They name the same field: `body` is this tool's parameter, `content` is what
+ * `context_create`/`context_update` call it, so agents that have seen either
+ * surface reach for the other's name. Disagreeing values are refused rather
+ * than resolved by preference, because either choice discards text the caller
+ * sent.
+ */
+function resolveBodyAlias(
+  body: string | undefined,
+  content: string | undefined,
+): { ok: true; body: string | undefined } | { ok: false; error: string } {
+  if (body !== undefined && content !== undefined && body !== content) {
+    return {
+      ok: false,
+      error:
+        "`body` and `content` are aliases for the same field but were given different text — pass only one.",
+    };
+  }
+  return { ok: true, body: body ?? content };
+}
+/** Uniform error payload for a caller mistake (VALIDATION_FAILED). */
+function validationError(message: string) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ error: message, code: "VALIDATION_FAILED" }, null, 2) }],
+    isError: true,
+  };
+}
+
+/** Uniform error payload for an alias conflict (VALIDATION_FAILED). */
+function aliasConflict(message: string) {
+  return validationError(message);
+}
 /** Run a catalog operation and package the outcome as a tool result. */
 async function runOp(name: string, input: Record<string, unknown>) {
   try {
@@ -151,7 +221,7 @@ function inputShape(op: OperationDescriptor): Record<string, z.ZodTypeAny> {
 }
 
 for (const op of listOperations("core")) {
-  server.tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
+  tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
     runOp(op.name, args),
   );
 }
@@ -163,7 +233,7 @@ function deprecated(canonical: string, description: string): string {
 
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
-server.tool("vault_info", deprecated("context_init", "It returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
+tool("vault_info", deprecated("context_init", "It returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
   const contextMd = await storage.readContextMd();
   const config = await storage.readConfig();
 
@@ -195,7 +265,7 @@ server.tool("vault_info", deprecated("context_init", "It returns this plus what 
 
 // ─── Tool: resolve ─────────────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "resolve",
   deprecated(
     "context_query",
@@ -220,7 +290,7 @@ server.tool(
 
 // ─── Tool: read_document (deprecated alias of context_get) ─────────────────────
 
-server.tool(
+tool(
   "read_document",
   deprecated("context_get", "Read a single document by its contextnest:// URI or path"),
   {
@@ -248,10 +318,16 @@ server.tool(
 
 // ─── Tool: list_documents ──────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "list_documents",
   deprecated("context_list", "List all documents with optional filters"),
   {
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'List only documents under this folder, as an id prefix ("nodes/history"). Matches the folder itself and everything beneath it.',
+      ),
     type: z.string().optional().describe("Filter by node type"),
     status: z
       .string()
@@ -261,12 +337,19 @@ server.tool(
       ),
     tag: z.string().optional().describe("Filter by tag"),
   },
-  async ({ type, status, tag }) => {
+  async ({ path, type, status, tag }) => {
     // includeRetired so callers can list rejected docs; default filter
     // (rejected hidden) still applies only when status filter is not set
     // to "rejected" — match below handles both cases.
     let docs = await storage.discoverDocuments({ includeRetired: true });
 
+    if (path) {
+      // Segment boundary, not a bare startsWith: "nodes/his" must not match
+      // "nodes/history". A trailing slash or .md from a caller pasting a file
+      // path is tolerated rather than silently matching nothing.
+      const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
+      docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
+    }
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);
     if (status) {
       const wanted = normalizeStatus(status);
@@ -303,7 +386,7 @@ server.tool(
 
 // ─── Tool: document_format ────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "document_format",
   "Returns the markdown document format, supported frontmatter fields, validation rules, node types, and URI scheme. Call this before creating or updating documents to ensure correct structure.",
   {},
@@ -439,7 +522,7 @@ server.tool(
 
 // ─── Tool: read_index ──────────────────────────────────────────────────────────
 
-server.tool("read_index", "Return the context.yaml index", {}, async () => {
+tool("read_index", "Return the context.yaml index", {}, async () => {
   const contextYaml = await storage.readContextYaml();
   return {
     content: [
@@ -455,7 +538,7 @@ server.tool("read_index", "Return the context.yaml index", {}, async () => {
 
 // ─── Tool: read_pack ───────────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "read_pack",
   "Resolve and return a context pack using graph traversal",
   {
@@ -511,7 +594,7 @@ server.tool(
 
 // ─── Tool: search ──────────────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "search",
   deprecated("context_search", "Full-text search across vault documents with graph traversal"),
   {
@@ -557,7 +640,7 @@ server.tool(
 
 // ─── Tool: verify_integrity ────────────────────────────────────────────────────
 
-server.tool("verify_integrity", deprecated("context_verify", "Verify integrity of all hash chains in the vault"), {}, async () => {
+tool("verify_integrity", deprecated("context_verify", "Verify integrity of all hash chains in the vault"), {}, async () => {
   const report = await storage.verifyVaultIntegrity();
   return {
     content: [
@@ -571,7 +654,7 @@ server.tool("verify_integrity", deprecated("context_verify", "Verify integrity o
 
 // ─── Tool: list_checkpoints ────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "list_checkpoints",
   "List recent checkpoints",
   { limit: z.number().optional().describe("Max checkpoints to return (default 10)") },
@@ -599,7 +682,7 @@ server.tool(
 
 // ─── Tool: read_version ────────────────────────────────────────────────────────
 
-server.tool(
+tool(
   "read_version",
   deprecated("context_reconstruct", "Read a specific version of a document"),
   {
@@ -634,7 +717,7 @@ const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
 
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
-server.tool(
+tool(
   "create_document",
   deprecated(
     "context_create",
@@ -643,19 +726,45 @@ server.tool(
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().describe("Document title"),
-    type: z
-      .enum(["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill"])
+    type: z.enum(NODE_TYPES).optional().default("document").describe("Node type"),
+    description: z
+      .string()
       .optional()
-      .default("document")
-      .describe("Node type"),
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a document without one is markedly harder to find.",
+      ),
     tags: z.array(z.string()).optional().describe("Tags for the document"),
-    body: z.string().optional().default("").describe("Markdown body content"),
+    body: z.string().optional().describe("Markdown body content"),
+    content: z
+      .string()
+      .optional()
+      .describe("Alias for `body` — pass one or the other, not both"),
     trigger: z.string().optional().describe("Skill trigger description (required when type is 'skill')"),
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
+    source: sourceMetaSchema
+      .optional()
+      .describe(
+        "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
+      ),
   },
-  async ({ path, title, type, tags, body, trigger, tools_required, output_format }) =>
-    lockedHandler(async () => {
+  async ({
+    path,
+    title,
+    description,
+    type,
+    tags,
+    body,
+    content: bodyAlias,
+    trigger,
+    tools_required,
+    output_format,
+    source,
+  }) => {
+  lockedHandler(async () => {
+    const resolvedBody = resolveBodyAlias(body, bodyAlias);
+    if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
+
     // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
     // lands in the same place as one created via `ctx add` (single source of
     // truth — normalizeDocumentId in the engine).
@@ -679,19 +788,37 @@ server.tool(
     const frontmatter: Frontmatter = {
       title,
       type,
+      ...(description !== undefined ? { description } : {}),
       status: "draft",
       created_at: new Date().toISOString(),
       ...(tagList ? { tags: tagList } : {}),
     };
 
-    // Add skill block for skill nodes
-    if (type === "skill") {
+    // Settle the typed blocks BEFORE anything is written. `source` and `skill`
+    // are required by one type and forbidden on the others, and until now this
+    // tool built a skill block but had no source equivalent — so a type:source
+    // node was written with no block, published fine, and then failed every
+    // update it was ever given, with no parameter able to supply the field.
+    try {
+      applyTypedBlocks(frontmatter, {
+        type,
+        ...(source !== undefined ? { source } : {}),
+        ...(trigger !== undefined ? { trigger } : {}),
+        ...(tools_required !== undefined ? { tools_required } : {}),
+        ...(output_format !== undefined ? { output_format } : {}),
+        defaultTrigger: `when asked to ${title.toLowerCase()}`,
+      });
+    } catch (err) {
+      return validationError(err instanceof Error ? err.message : String(err));
+    }
+    // Skill defaults this tool has always filled in and context_create does not.
+    if (frontmatter.skill) {
       frontmatter.skill = {
-        trigger: trigger || `when asked to ${title.toLowerCase()}`,
         inputs: [],
-        tools_required: tools_required || [],
-        output_format: output_format || "markdown",
+        tools_required: [],
+        output_format: "markdown",
         guard_rails: [],
+        ...frontmatter.skill,
       };
     }
 
@@ -699,9 +826,25 @@ server.tool(
       id,
       filePath: "",
       frontmatter,
-      body: body ? `\n${body}\n` : `\n# ${title}\n\n`,
+      body: resolvedBody.body ? `\n${resolvedBody.body}\n` : `\n# ${title}\n\n`,
       rawContent: "",
     };
+
+    // Validate BEFORE the write, not after. Create used to skip validation
+    // entirely, which is what let an invalid node reach disk in the first
+    // place; checking here means a bad create leaves nothing to clean up.
+    const validation = validateDocument(node);
+    if (!validation.valid) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ error: "Validation failed", errors: validation.errors }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     const content = serializeDocument(node);
     await storage.writeDocument(id, content);
@@ -750,7 +893,7 @@ server.tool(
 
 // ─── Tool: update_document ─────────────────────────────────────────────────
 
-server.tool(
+tool(
   "update_document",
   deprecated(
     "context_update",
@@ -759,6 +902,12 @@ server.tool(
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
     title: z.string().optional().describe("New title"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "New one-line summary for frontmatter. An empty string removes it. Indexed for retrieval alongside title and tags.",
+      ),
     tags: z.array(z.string()).optional().describe("New tags (replaces existing)"),
     status: z
       .string()
@@ -767,9 +916,48 @@ server.tool(
         "New status. Canonical: draft | pending_review | approved | published | rejected. Aliases like 'cancelled', 'superseded', 'active', 'archived', 'review', 'submitted', 'in_review' are accepted and normalized to canonical before storage. Unknown values fall back to 'draft'. 'rejected' retires the doc — no new published version is cut.",
       ),
     body: z.string().optional().describe("New markdown body content"),
+    content: z
+      .string()
+      .optional()
+      .describe("Alias for `body` — pass one or the other, not both"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+      ),
+    source: sourceMetaSchema
+      .optional()
+      .describe(
+        "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    trigger: z
+      .string()
+      .optional()
+      .describe("New skill trigger, for a node that is (or is becoming) type:skill"),
+    tools_required: z.array(z.string()).optional().describe("New tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("New skill output format"),
   },
-  async ({ path, title, tags, status, body }) =>
-    lockedHandler(async () => {
+  async ({
+    path,
+    title,
+    description,
+    tags,
+    status,
+    body,
+    content: bodyAlias,
+    type,
+    source,
+    trigger,
+    tools_required,
+    output_format,
+  }) => {
+  lockedHandler(async () => {
+    const resolvedBody = resolveBodyAlias(body, bodyAlias);
+    if (!resolvedBody.ok) return aliasConflict(resolvedBody.error);
     const id = normalizeDocumentId(path);
     const doc = await storage.readDocument(id);
 
@@ -804,15 +992,39 @@ server.tool(
 
     // Update frontmatter fields
     if (title !== undefined) doc.frontmatter.title = title;
+    // An empty string CLEARS the description: over a JSON wire an absent key
+    // cannot be told apart from "leave this alone", so without the convention
+    // a caller has no way to remove one.
+    if (description !== undefined) {
+      if (description === "") delete doc.frontmatter.description;
+      else doc.frontmatter.description = description;
+    }
     if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
     if (tags !== undefined) {
       doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
     }
+    // Settle the typed blocks against the node's POST-write type — the one
+    // passed in this call, or the one it already carries. Without this an
+    // existing type:source node has no way to gain the block rule 9 demands,
+    // and every update it is ever given fails validation.
+    const nextType = type ?? doc.frontmatter.type ?? "document";
+    if (type !== undefined) doc.frontmatter.type = nextType;
+    try {
+      applyTypedBlocks(doc.frontmatter, {
+        type: nextType,
+        ...(source !== undefined ? { source } : {}),
+        ...(trigger !== undefined ? { trigger } : {}),
+        ...(tools_required !== undefined ? { tools_required } : {}),
+        ...(output_format !== undefined ? { output_format } : {}),
+      });
+    } catch (err) {
+      return validationError(err instanceof Error ? err.message : String(err));
+    }
     doc.frontmatter.updated_at = new Date().toISOString();
 
     // Update body if provided
-    if (body !== undefined) {
-      doc.body = `\n${body}\n`;
+    if (resolvedBody.body !== undefined) {
+      doc.body = `\n${resolvedBody.body}\n`;
     }
 
     // Validate before writing
@@ -902,7 +1114,7 @@ server.tool(
 
 // ─── Tool: delete_document ─────────────────────────────────────────────────
 
-server.tool(
+tool(
   "delete_document",
   deprecated("context_delete", "Delete a document and its version history from the vault"),
   {
@@ -935,7 +1147,7 @@ server.tool(
 
 // ─── Tool: publish_document ────────────────────────────────────────────────
 
-server.tool(
+tool(
   "publish_document",
   deprecated(
     "context_publish",
@@ -980,7 +1192,7 @@ server.tool(
 
 // ─── Tool: stage_drift_suggestion ──────────────────────────────────────────
 
-server.tool(
+tool(
   "stage_drift_suggestion",
   "Capture an out-of-band edit (live file drifted from last-approved bytes) as a staged suggestion under _suggestions/. Does NOT modify the canonical document or hash chain. Pair with verify_integrity → approve_suggestion or reject_suggestion to resolve drift.",
   {
@@ -1049,7 +1261,7 @@ server.tool(
 
 // ─── Tool: list_suggestions ────────────────────────────────────────────────
 
-server.tool(
+tool(
   "list_suggestions",
   "List all staged suggestions for a document",
   { path: z.string().describe("Document path (e.g., 'nodes/api-design')") },
@@ -1073,7 +1285,7 @@ server.tool(
 
 // ─── Tool: approve_suggestion ──────────────────────────────────────────────
 
-server.tool(
+tool(
   "approve_suggestion",
   "Approve a staged suggestion: applies the patch, bumps version, writes new canonical bytes, archives the suggestion under _archive/approved/. Refuses if the chain head moved since staging (caller must re-stage).",
   {
@@ -1123,7 +1335,7 @@ server.tool(
 
 // ─── Tool: reject_suggestion ───────────────────────────────────────────────
 
-server.tool(
+tool(
   "reject_suggestion",
   "Reject a staged suggestion: archives the patch + meta under _archive/rejected/ and emits a chain event. Canonical document and hash chain head are untouched. Rejection reason is required for audit trail.",
   {

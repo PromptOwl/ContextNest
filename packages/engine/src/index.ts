@@ -145,6 +145,7 @@ export {
   STATUSES,
   STATUS_ALIASES,
   TRANSPORTS,
+  sourceMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
   HASH_CHAIN_EVENT_TYPES,
@@ -152,6 +153,10 @@ export {
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
 } from "./schemas.js";
+
+// Typed frontmatter blocks (source / skill) — see typed-blocks.ts
+export { applyTypedBlocks } from "./typed-blocks.js";
+export type { TypedBlockArgs } from "./typed-blocks.js";
 
 // Parser
 export {

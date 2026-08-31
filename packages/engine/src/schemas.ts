@@ -176,7 +176,15 @@ const skillMetaSchema = z.object({
   guard_rails: z.array(z.string()).optional(),
 });
 
-const sourceMetaSchema = z.object({
+/**
+ * The `source` block (§1.9.1).
+ *
+ * Exported so the write operations can accept one against the same shape the
+ * frontmatter validator enforces — a second, hand-restated schema is how the
+ * two drift apart, and a block the caller cannot see the fields of is a block
+ * the caller cannot supply.
+ */
+export const sourceMetaSchema = z.object({
   transport: z.enum(TRANSPORTS),          // Rule 10
   server: z.string().optional(),           // Rule 12
   tools: z.array(z.string()).min(1),       // Rule 11

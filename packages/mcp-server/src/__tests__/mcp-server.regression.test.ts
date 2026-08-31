@@ -85,10 +85,17 @@ async function connect(vaultPath: string): Promise<Client> {
   // StdioClientTransport replaces (not merges) the child env when `env` is set,
   // so forward the current environment plus the vault override. Filter out
   // undefined values to satisfy the Record<string, string> contract.
-  const env: Record<string, string> = { CONTEXTNEST_VAULT_PATH: vaultPath };
+  //
+  // The override is applied AFTER the copy: a developer who has
+  // CONTEXTNEST_VAULT_PATH or CTX_NEST_HOME exported for their own vault would
+  // otherwise have it copied over the throwaway one, and the suite would run —
+  // and write — against their real vault.
+  const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
+  delete env.CTX_NEST_HOME;
+  env.CONTEXTNEST_VAULT_PATH = vaultPath;
 
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -419,6 +426,52 @@ describe("[regression] MCP server e2e — mutation tools", () => {
     expect(json.frontmatter.type).toBe("skill");
     expect(json.frontmatter.skill).toBeDefined();
     expect(json.frontmatter.skill.trigger).toBe("when asked to do the thing");
+  });
+
+  it("create_document round-trips a source node's block, and refuses one without it", async () => {
+    const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
+    const { json } = await callJson(client, "create_document", {
+      path: "nodes/my-source",
+      title: "My Source",
+      type: "source",
+      source,
+    });
+    expect(json.frontmatter.type).toBe("source");
+    expect(json.frontmatter.source).toEqual(source);
+
+    // Rule 9: without a block the create fails outright and leaves nothing behind.
+    const bare = await callText(client, "create_document", {
+      path: "nodes/no-block",
+      title: "No Block",
+      type: "source",
+    });
+    expect(bare.isError).toBe(true);
+    expect(bare.text).toContain("rule 9");
+    expect(await exists(join(vault, "nodes", "no-block.md"))).toBe(false);
+  });
+
+  it("update_document can edit a source block and re-type a node", async () => {
+    const replacement = { transport: "rest", server: "bigearnie", tools: ["get_estimate"] };
+    const edited = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      source: replacement,
+    });
+    expect(edited.json.frontmatter.source).toEqual(replacement);
+
+    // Rule 17 both ways: the block goes when the type does, and comes back with it.
+    const plain = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      type: "document",
+    });
+    expect(plain.json.frontmatter.type).toBe("document");
+    expect(plain.json.frontmatter.source).toBeUndefined();
+
+    const back = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      type: "source",
+      source: replacement,
+    });
+    expect(back.json.frontmatter.source).toEqual(replacement);
   });
 
   it("create_document rejects a duplicate path", async () => {
@@ -807,5 +860,121 @@ describe("[regression] MCP server e2e — selector operators", () => {
     const ids = json.documents.map((d: any) => d.id);
     expect(ids).toContain("nodes/op-auth");
     expect(ids).not.toContain("nodes/op-billing");
+  });
+});
+
+describe("[regression] MCP server e2e — misnamed parameters cannot silently drop a write", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("advertises additionalProperties:false and actually enforces it", async () => {
+    const { tools } = await client.listTools();
+    const update = tools.find((t) => t.name === "update_document")!;
+    expect((update.inputSchema as any).additionalProperties).toBe(false);
+
+    await callJson(client, "create_document", {
+      path: "nodes/strict-doc",
+      title: "Strict Doc",
+      body: "the original body",
+    });
+
+    // `contents` is not a parameter. Previously zod stripped it, the tool
+    // answered "Document updated and published successfully", the version
+    // bumped, and the body on disk was untouched.
+    const rejected = await callText(client, "update_document", {
+      path: "nodes/strict-doc",
+      contents: "the rewrite",
+    });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toMatch(/contents/);
+
+    const { json } = await callJson(client, "read_document", { uri: "nodes/strict-doc" });
+    expect(json.body).toContain("the original body");
+    expect(json.body).not.toContain("the rewrite");
+  });
+
+  it("accepts `content` as an alias for `body` on create and update", async () => {
+    await callJson(client, "create_document", {
+      path: "nodes/alias-doc",
+      title: "Alias Doc",
+      content: "created through content",
+    });
+    let doc = await callJson(client, "read_document", { uri: "nodes/alias-doc" });
+    expect(doc.json.body).toContain("created through content");
+
+    await callJson(client, "update_document", {
+      path: "nodes/alias-doc",
+      content: "updated through content",
+    });
+    doc = await callJson(client, "read_document", { uri: "nodes/alias-doc" });
+    expect(doc.json.body).toContain("updated through content");
+  });
+
+  it("refuses `body` and `content` carrying different text rather than picking one", async () => {
+    const { isError, json } = await callJson(client, "create_document", {
+      path: "nodes/alias-conflict",
+      title: "Conflict",
+      body: "one",
+      content: "two",
+    });
+    expect(isError).toBe(true);
+    expect(json.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("sets and clears a description through create_document and update_document", async () => {
+    await callJson(client, "create_document", {
+      path: "nodes/described-doc",
+      title: "Described Doc",
+      description: "what this document is for",
+      body: "body",
+    });
+    let doc = await callJson(client, "read_document", { uri: "nodes/described-doc" });
+    expect(doc.json.frontmatter.description).toBe("what this document is for");
+
+    await callJson(client, "update_document", {
+      path: "nodes/described-doc",
+      description: "a sharper summary",
+    });
+    doc = await callJson(client, "read_document", { uri: "nodes/described-doc" });
+    expect(doc.json.frontmatter.description).toBe("a sharper summary");
+
+    await callJson(client, "update_document", { path: "nodes/described-doc", description: "" });
+    doc = await callJson(client, "read_document", { uri: "nodes/described-doc" });
+    expect(doc.json.frontmatter.description).toBeUndefined();
+  });
+
+  it("filters list_documents by path, on segment boundaries", async () => {
+    await callJson(client, "create_document", { path: "nodes/history/q1", title: "Q1" });
+    await callJson(client, "create_document", { path: "nodes/history/q2", title: "Q2" });
+    await callJson(client, "create_document", { path: "nodes/historic-note", title: "Historic" });
+
+    const { json } = await callJson(client, "list_documents", { path: "nodes/history" });
+    const ids = json.map((d: any) => d.id);
+    expect(ids).toContain("nodes/history/q1");
+    expect(ids).toContain("nodes/history/q2");
+    // "nodes/historic-note" shares the prefix but not the segment.
+    expect(ids).not.toContain("nodes/historic-note");
+  });
+
+  it("composes the path filter with the other list filters", async () => {
+    const { json } = await callJson(client, "list_documents", {
+      path: "nodes/history",
+      status: "published",
+    });
+    expect(json.length).toBeGreaterThan(0);
+    for (const doc of json) {
+      expect(doc.id.startsWith("nodes/history/")).toBe(true);
+      expect(doc.status).toBe("published");
+    }
   });
 });
