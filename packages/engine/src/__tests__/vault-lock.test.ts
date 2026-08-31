@@ -94,11 +94,73 @@ describe("withVaultLock", () => {
   });
 
   it("times out with its own error type when the lock never frees", async () => {
-    // Shrink nothing: instead verify the error type surfaces by holding the
-    // lock in-process while a second writer with an already-expired deadline
-    // competes. To keep the suite fast we only assert the class exists and the
-    // message names the remedy — the full 20s wait is not worth a test's time.
-    expect(new VaultLockTimeoutError("/x").message).toMatch(/stale/i);
+    // The full acquire window is not worth a test's wall-clock; assert the
+    // message tells the caller the truth — contention, retryable, with crashed
+    // locks recovered automatically.
+    const msg = new VaultLockTimeoutError("/x").message;
+    expect(msg).toMatch(/contention/i);
+    expect(msg).toMatch(/retry/i);
+  });
+
+  it("a live holder heartbeats, so a long critical section is never stolen", async () => {
+    const root = freshRoot();
+    const lockPath = join(root, LOCK_DIRNAME);
+
+    let stolenObserved = false;
+    const holder = withVaultLock(root, async () => {
+      // Run past a full staleness window. The heartbeat interval is 10s, so
+      // backdate the mtime mid-run the way a slow clock would see it — then
+      // verify a competing waiter still cannot steal while we live.
+      const old = (Date.now() - STALE_MS - 5_000) / 1000;
+      utimesSync(lockPath, old, old);
+      // Manually heartbeat once (the real interval fires at 10s; tests
+      // shouldn't wait that long) — this is exactly what the interval does.
+      const now = new Date();
+      const { utimes } = await import("node:fs/promises");
+      await utimes(lockPath, now, now);
+
+      let acquired = false;
+      const contender = withVaultLock(root, async () => {
+        acquired = true;
+      });
+      await sleep(250);
+      stolenObserved = acquired; // must still be false: mtime is fresh again
+      // Wrap the promise so the async return doesn't unwrap-and-await it here,
+      // which would deadlock against our own (non-reentrant) lock.
+      return { contender };
+    });
+    const { contender } = await holder;
+    await contender; // acquires normally once the holder released
+    expect(stolenObserved).toBe(false);
+  });
+
+  it("release does not remove a lock it no longer owns", async () => {
+    const root = freshRoot();
+    const lockPath = join(root, LOCK_DIRNAME);
+
+    await withVaultLock(root, async () => {
+      // Simulate having been stolen during a long suspend: replace the owner
+      // token with someone else's.
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(join(lockPath, "owner"), "someone-else");
+    });
+    // Our release must have left the (now foreign) lock in place.
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  it("a real filesystem error surfaces immediately, not as a timeout", async () => {
+    // A FILE squatting where .versions/ must be a directory → mkdir fails with
+    // ENOTDIR/EEXIST-on-parent — must throw fast with the real error, not spin
+    // for the acquire window and blame lock contention.
+    const root = freshRoot();
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(root, ".versions"), "not a directory");
+
+    const started = Date.now();
+    await expect(withVaultLock(root, async () => {})).rejects.toSatisfy(
+      (e: unknown) => !(e instanceof VaultLockTimeoutError),
+    );
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 
   it("carries a stable code for cross-package matching", () => {

@@ -29,7 +29,7 @@ import {
   MAX_HITS,
 } from "./lib.js";
 import { correctionIntent } from "./signals.js";
-import { clearPending, loadLedger, saveLedger } from "./ledger.js";
+import { loadLedger, saveLedger } from "./ledger.js";
 
 const HEADER = "Relevant Context Nest vault material (auto-retrieved):";
 
@@ -182,9 +182,17 @@ export function run({ input, env, exec, ledgerIo = {} }) {
   const sessionId = input?.session_id;
   let ledger = loadLedger(sessionId, ledgerIo);
   const queued = formatQueued(ledger.pending);
-  if (queued) ledger = clearPending(sessionId, ledger, ledgerIo);
+  // Drain in memory; every exit path below persists exactly once. Two writes
+  // per prompt (clear, then stash) was avoidable I/O on the hottest hook.
+  if (queued) ledger = { ...ledger, pending: null };
+  const persist = () => {
+    if (queued) saveLedger(sessionId, ledger, ledgerIo);
+  };
 
-  if (mode === "off") return queued ? wrap(queued) : null;
+  if (mode === "off") {
+    persist();
+    return queued ? wrap(queued) : null;
+  }
 
   const query = promptText(input);
   // A correction gets the sweep rule even when retrieval finds nothing: search
@@ -193,14 +201,21 @@ export function run({ input, env, exec, ledgerIo = {} }) {
   const ladder = correctionIntent(query) ? CHANGE_LADDER : null;
   const join = (block) => [queued, block, ladder].filter(Boolean).join("\n\n");
 
-  if (mode === "agent") return wrap(join(AGENT_DIRECTIVE));
-  if (!query) return queued ? wrap(queued) : null;
+  if (mode === "agent") {
+    persist();
+    return wrap(join(AGENT_DIRECTIVE));
+  }
+  if (!query) {
+    persist();
+    return queued ? wrap(queued) : null;
+  }
 
   const hits = searchAll(exec, config, query);
 
-  // Stash this turn's hit refs as warm seeds. If the end of this turn parks a
-  // change job, the scout starts from the nodes retrieval ALREADY matched on
-  // the very prompt where the user stated the fact — instead of cold.
+  // Stash this turn's hit refs as warm seeds (one write also carries the
+  // drain). If the end of this turn parks a change job, the scout starts from
+  // the nodes retrieval ALREADY matched on the very prompt where the user
+  // stated the fact — instead of cold.
   saveLedger(
     sessionId,
     { ...ledger, lastHits: hits.map((h) => (h.vault ? `${h.vault}:${h.id}` : h.id)) },
