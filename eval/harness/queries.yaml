@@ -1,0 +1,87 @@
+- id: q01
+  question: "What pre-flight steps are required before running a database migration?"
+  selector: "#runbook #database"
+  gold_doc: nodes/runbooks/database-migration
+  gold_facts:
+    - "snapshot the database to S3 before any DDL"
+    - "notify #eng-ops 30 minutes before the window"
+    - "migration must be reviewed and approved"
+
+- id: q02
+  question: "What rules govern API versioning at our company?"
+  selector: "#api #standards"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "endpoints are prefixed with /v1/, /v2/"
+    - "breaking changes require a new version"
+    - "90 day deprecation notice"
+
+- id: q03
+  question: "How do I roll back a bad production deploy?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "rerun the previous successful build"
+    - "confirm rollback by checking the version header on /healthz"
+
+- id: q04
+  question: "When is a security review required before launching a feature?"
+  selector: "#security #standards"
+  gold_doc: nodes/standards/security-review
+  gold_facts:
+    - "user-uploaded files"
+    - "authentication tokens"
+    - "third-party processor"
+    - "PII or payment data"
+
+- id: q05
+  question: "Why did we pick Postgres over MongoDB for the primary store?"
+  selector: "#adr #database"
+  gold_doc: nodes/adrs/0001-postgres-over-mongo
+  gold_facts:
+    - "strong consistency"
+    - "better tooling for migrations"
+    - "deeper operational expertise with Postgres"
+
+- id: q06
+  question: "Why are we using a monorepo and which tool runs the builds?"
+  selector: "#adr #build"
+  gold_doc: nodes/adrs/0002-monorepo-structure
+  gold_facts:
+    - "Turborepo"
+    - "atomic cross-package commits"
+    - "remote cache cuts CI time by about 60%"
+
+- id: q07
+  question: "What protocol do internal services use to talk to each other?"
+  selector: "#adr #api"
+  gold_doc: nodes/adrs/0003-grpc-internal-rest-external
+  gold_facts:
+    - "gRPC for internal service-to-service traffic"
+    - "REST for external-facing APIs"
+
+- id: q08
+  question: "What are our incident severity levels and how should each be handled?"
+  selector: "#runbook #incident"
+  gold_doc: nodes/runbooks/incident-response
+  gold_facts:
+    - "SEV1 is a customer-facing outage, page on-call immediately"
+    - "SEV2 is degraded service, page during business hours"
+    - "SEV3 is internal-only, file a ticket"
+
+- id: q09
+  question: "What pagination style do our APIs use and why?"
+  selector: "#api #standards"
+  gold_doc: nodes/standards/api-design
+  gold_facts:
+    - "cursor-based pagination only"
+    - "offset pagination is forbidden"
+
+- id: q10
+  question: "How is a production deploy rollback automatically triggered?"
+  selector: "#runbook #deploy"
+  gold_doc: nodes/runbooks/deploy-rollback
+  gold_facts:
+    - "error rate exceeds 1%"
+    - "P99 latency exceeds 800ms"
+    - "Datadog prod-deploy-health monitor"
