@@ -133,7 +133,10 @@ export function skillNameFromPath(nodePath: string): string {
   const slug = segment
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    // The line above collapses every run of non-alphanumerics to ONE dash, so a
+    // single-character trim is enough here. `^-+|-+$` would be equivalent but is
+    // quadratic on a long run of dashes (CodeQL js/polynomial-redos).
+    .replace(/^-|-$/g, "");
   return slug || "skill";
 }
 
