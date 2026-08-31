@@ -20,6 +20,7 @@ import {
   frontmatterSchema,
   sourceMetaSchema,
 } from "../schemas.js";
+import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import type { OperationDescriptor } from "./types.js";
 
 const tag = z.string().regex(TAG_PATTERN);
@@ -707,6 +708,12 @@ const initOp: OperationDescriptor = {
         name: z.string(),
         description: z.string().optional(),
         servers: z.array(z.string()).describe("Names of the MCP servers the vault declares"),
+        skill_bootstrap: z
+          .string()
+          .optional()
+          .describe(
+            "The vault's entry-point skill node (config `skills.bootstrap`), if it designates one. Render it with context_skill and install it with context_skill_install — it is how this vault teaches an agent to use it.",
+          ),
       })
       .nullable(),
     total: z.number().int(),
@@ -930,6 +937,106 @@ const importOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
 };
 
+
+// ─── context_skill / context_skill_install ───────────────────────────────────
+
+const skillOp: OperationDescriptor = {
+  name: "context_skill",
+  namespace: "core",
+  description:
+    "Render a `type: skill` node as a harness-ready skill file (Claude Code SKILL.md, a Cursor rule, and so on). The node's `skill.trigger` becomes the harness's matcher, and `{{server_alias}}` / `{{vault_id}}` / `{{node_path}}` placeholders in the node resolve to this caller's names. Returns the file content and where it belongs; it writes nothing.",
+  input: z.object({
+    id: z.string().describe("Node path of the skill, e.g. `nodes/skills/release-checklist`"),
+    harness: z
+      .enum(HARNESSES)
+      .optional()
+      .describe("Target agent harness. Default `claude-code`."),
+    server_alias: z
+      .string()
+      .optional()
+      .describe(
+        "What YOUR client calls this MCP server — the `mcp__<alias>__*` prefix baked into the rendered file. The prefix is client configuration, not a server fact, so pass your own. Defaults to the vault name.",
+      ),
+    scope: z
+      .enum(INSTALL_SCOPES)
+      .optional()
+      .describe("`user` (home directory, default) or `project` (repo root). Decides the path only."),
+  }),
+  output: z.object({
+    name: z.string().describe("Slugified skill / rule name"),
+    description: z.string().describe("The harness's local matcher text, from `skill.trigger`"),
+    content: z.string().describe("Complete file content, harness frontmatter included"),
+    relative_path: z.string().describe("Path relative to `base`"),
+    base: z.enum(["project_root", "home"]),
+    harness: z.enum(HARNESSES),
+    source_path: z.string(),
+    version: z.number().int().nullable(),
+    served_version: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Present only when the node is rejected: the approved version served in its place. The live file is NOT what you got.",
+      ),
+    notes: z.string().optional().describe("Only set when an approved version stood in for a rejected node"),
+  }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
+};
+
+const skillInstallOp: OperationDescriptor = {
+  name: "context_skill_install",
+  namespace: "core",
+  description:
+    "Build the file manifest that installs a vault skill into an agent harness. Defaults to `mode: \"loader\"` — a small file carrying the trigger and a fetch instruction back to the vault, so it CANNOT drift from the node. Use `mode: \"full\"` only when the agent must work offline; that copy will go stale silently. Returns files and paths; the caller writes them (`ctx skill install --write`, or your own file tools).",
+  input: z.object({
+    id: z.string().describe("Node path of the skill"),
+    harness: z.enum(HARNESSES).optional().describe("Target agent harness. Default `claude-code`."),
+    server_alias: z
+      .string()
+      .optional()
+      .describe("What YOUR client calls this MCP server. Defaults to the vault name."),
+    scope: z
+      .enum(INSTALL_SCOPES)
+      .optional()
+      .describe("`user` (home directory, default) or `project` (repo root)."),
+    mode: z
+      .enum(INSTALL_MODES)
+      .optional()
+      .describe(
+        "`loader` (default) fetches the procedure at runtime and never drifts. `full` embeds an offline snapshot that will.",
+      ),
+  }),
+  output: z.object({
+    files: z.array(
+      z.object({
+        relative_path: z.string(),
+        base: z.enum(["project_root", "home"]),
+        content: z.string(),
+      }),
+    ),
+    post_install: z.string().describe("What the user must do for the harness to pick it up"),
+    notes: z.string(),
+    served_version: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Present only when the node is rejected: the approved version served in its place. The live file is NOT what you got.",
+      ),
+
+    skill: z.object({
+      name: z.string(),
+      source_path: z.string(),
+      version: z.number().int().nullable(),
+      harness: z.enum(HARNESSES),
+      scope: z.enum(INSTALL_SCOPES),
+      mode: z.enum(INSTALL_MODES),
+      server_alias: z.string(),
+    }),
+  }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
+};
+
 /** All `core` namespace operations, in catalog order. */
 export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   getOp,
@@ -949,4 +1056,6 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   packsOp,
   nestsOp,
   importOp,
+  skillOp,
+  skillInstallOp,
 ];

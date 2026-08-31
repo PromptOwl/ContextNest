@@ -73,7 +73,7 @@ console.log(report.valid ? "Integrity OK" : `Tampering: ${report.errors}`);
 - **Graph Traversal** — Hop-based BFS over `context.yaml` as a lightweight graph index, with priority-weighted edges
 - **Skill Nodes** — First-class `type: skill` nodes with trigger, inputs, tools_required, output_format, and guard_rails
 - **Versioning** — Hash-chained version history with keyframe + diff reconstruction; each non-keyframe version's change log is a standalone `v{N}.diff` unified diff beside the keyframes
-- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of 17 operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own. As of 2.0 the `core` namespace is complete and every surface actually runs on it
+- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of 19 operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own. As of 2.0 the `core` namespace is complete and every surface actually runs on it
 - **Integrity** — SHA-256 content hashes, chain hashes, and checkpoint verification down to the byte
 - **URI Resolution** — Resolve `contextnest://` URIs to documents, tags, folders, or search results
 - **Storage** — Read/write documents, version histories, checkpoints, and config from the vault file system; discovery is folder-scoped, and `listFolders` returns the vault's shape from directory entries without parsing a document

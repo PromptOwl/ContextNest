@@ -19,6 +19,7 @@ import {
   normalizeStatus,
   isRejected,
   explicitStatus,
+  parseDocument,
 } from "../parser.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
@@ -27,6 +28,14 @@ import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import {
+  buildInstallManifest,
+  renderSkill,
+  NotASkillNodeError,
+  type Harness,
+  type InstallMode,
+  type InstallScope,
+} from "../skills.js";
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
@@ -648,6 +657,7 @@ const init: OperationExecutor = async (ctx, input: any) => {
           name: config.name,
           ...(config.description ? { description: config.description } : {}),
           servers: config.servers ? Object.keys(config.servers) : [],
+          ...(config.skills?.bootstrap ? { skill_bootstrap: config.skills.bootstrap } : {}),
         }
       : null,
     total: docs.length,
@@ -657,6 +667,108 @@ const init: OperationExecutor = async (ctx, input: any) => {
     // Counts and tags answer most opening questions; a large vault's node list
     // dwarfs them, so it is opt-in.
     ...(input?.include_nodes ? { nodes: listed.map((d) => toSummary(d)) } : {}),
+  };
+};
+
+/**
+ * Shared preamble for the two skill operations: load the node, and settle the
+ * caller-supplied names. `server_alias` falls back to the vault's own name
+ * because a caller that omits it usually configured the server under that name;
+ * a wrong-but-plausible prefix is at least recognizable, where an empty one
+ * renders `mcp____context_skill`.
+ */
+async function loadSkillNode(ctx: OperationContext, input: any) {
+  const id = normalizeDocumentId(String(input.id ?? ""));
+  assertSafeDocumentId(id);
+  const [live, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
+
+  // A rejected node does not dead-end: it falls back to the last APPROVED version,
+  // so an agent keeps working from the last steps a steward signed off on while the
+  // author fixes the live file (which update/publish still accept — being rejected
+  // is what you edit your way out of). Rendering the rejected text itself is what
+  // is refused: an installed skill is matched on and executed, not just displayed.
+  // Only a rejected node with nothing approved behind it has nothing safe to serve.
+  let node = live;
+  let servedVersion: number | null = null;
+  if (isRejected(live)) {
+    const history = await ctx.versions.getHistory(id);
+    // published_at is the local marker of an approved version — the approval
+    // publish path is the only writer. Highest wins; history is append-only.
+    const approved = [...(history?.versions ?? [])].reverse().find((v) => v.published_at);
+    if (!approved) throw new RejectedDocumentError(id);
+    node = parseDocument(id, await ctx.versions.reconstructVersion(id, approved.version), id);
+    servedVersion = approved.version;
+  }
+  const vaultName = config?.name;
+  return {
+    doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    servedVersion,
+    vaultName,
+    serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
+    harness: (input.harness ?? "claude-code") as Harness,
+    scope: (input.scope ?? "user") as InstallScope,
+    mode: (input.mode ?? "loader") as InstallMode,
+  };
+}
+
+/** NotASkillNodeError carries a caller-actionable message; keep it, drop the class. */
+function asValidationError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof NotASkillNodeError) {
+      throw new ContextNestError(err.message, "VALIDATION_FAILED");
+    }
+    throw err;
+  }
+}
+
+const skill: OperationExecutor = async (ctx, input: any) => {
+  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
+    ctx,
+    input,
+  );
+  const rendered = asValidationError(() =>
+    renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
+  );
+  return {
+    name: rendered.name,
+    description: rendered.description,
+    content: rendered.content,
+    relative_path: rendered.relativePath,
+    base: rendered.base,
+    harness,
+    source_path: doc.id,
+    version: doc.frontmatter.version ?? null,
+    ...(servedVersion === null ? {} : { served_version: servedVersion, notes: rejectedNote(doc.id, servedVersion) }),
+  };
+};
+
+/** Said out loud on both ops: what you got is not what is on disk right now. */
+function rejectedNote(id: string, version: number): string {
+  return `${id} is rejected; serving approved version ${version}.`;
+}
+
+const skillInstall: OperationExecutor = async (ctx, input: any) => {
+  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
+    ctx,
+    input,
+  );
+  const manifest = asValidationError(() =>
+    buildInstallManifest(doc, {
+      harness,
+      serverAlias,
+      vaultName,
+      vaultId: vaultName ?? serverAlias,
+      scope,
+      mode,
+    }),
+  );
+  if (servedVersion === null) return manifest;
+  return {
+    ...manifest,
+    served_version: servedVersion,
+    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
   };
 };
 
@@ -899,4 +1011,6 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_packs: packs,
   context_nests: nests,
   context_import: locked(importDocs),
+  context_skill: skill,
+  context_skill_install: skillInstall,
 });

@@ -32,6 +32,7 @@ Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
 `context_delete` · `context_import` (bulk create+publish, one checkpoint)
 History/audit: `context_versions` · `context_reconstruct` · `context_verify`
 Registry: `context_nests` (list every registered nest)
+Skills: `context_skill`, `context_skill_install` (render/install a vault-hosted skill)
 
 These cover the operations all three surfaces (OSS MCP, CLI, Community MCP)
 expose, so Phase 2 bindings import them instead of hand-rolling. `governance`,
