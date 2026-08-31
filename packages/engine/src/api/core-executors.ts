@@ -265,9 +265,26 @@ const list: OperationExecutor = async (ctx, input: any) => {
   // includeRetired, or `status: "rejected"` matches nothing: discovery drops
   // retired documents before the filter ever sees them. filterDocuments hides
   // them again whenever no status was asked for.
-  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
+  // `folder` goes to discovery, not to filterDocuments: it decides which files
+  // are read at all, so narrowing afterwards would save nothing.
+  const docs = await ctx.storage.discoverDocuments({
+    includeRetired: true,
+    ...(input.folder !== undefined ? { folder: input.folder } : {}),
+    ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
+  });
   const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
   return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
+};
+
+const folders: OperationExecutor = async (ctx, input: any) => {
+  // Reads directory entries only — the shape of the vault is answerable
+  // without opening a single document.
+  return {
+    folders: await ctx.storage.listFolders({
+      ...(input?.folder !== undefined ? { folder: input.folder } : {}),
+      ...(input?.recursive !== undefined ? { recursive: input.recursive } : {}),
+    }),
+  };
 };
 
 /**
@@ -815,6 +832,7 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_search: search,
   context_get: get,
   context_list: list,
+  context_folders: folders,  
   context_create: locked(create),
   context_update: locked(update),
   context_publish: locked(publish),

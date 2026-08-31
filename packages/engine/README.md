@@ -73,10 +73,10 @@ console.log(report.valid ? "Integrity OK" : `Tampering: ${report.errors}`);
 - **Graph Traversal** — Hop-based BFS over `context.yaml` as a lightweight graph index, with priority-weighted edges
 - **Skill Nodes** — First-class `type: skill` nodes with trigger, inputs, tools_required, output_format, and guard_rails
 - **Versioning** — Hash-chained version history with keyframe + diff reconstruction; each non-keyframe version's change log is a standalone `v{N}.diff` unified diff beside the keyframes
-- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of 16 operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own. As of 2.0 the `core` namespace is complete and every surface actually runs on it
+- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of 17 operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own. As of 2.0 the `core` namespace is complete and every surface actually runs on it
 - **Integrity** — SHA-256 content hashes, chain hashes, and checkpoint verification down to the byte
 - **URI Resolution** — Resolve `contextnest://` URIs to documents, tags, folders, or search results
-- **Storage** — Read/write documents, version histories, checkpoints, and config from the vault file system
+- **Storage** — Read/write documents, version histories, checkpoints, and config from the vault file system; discovery is folder-scoped, and `listFolders` returns the vault's shape from directory entries without parsing a document
 - **Parsing & Validation** — Markdown + YAML frontmatter, validated against the spec (skill and source node rules)
 - **Index Generation** — Generate `context.yaml` (document graph) and `INDEX.md`
 - **Agent Config Generation** — Auto-generate CLAUDE.md, GEMINI.md, .cursorrules, etc. so AI tools discover the vault
@@ -159,6 +159,37 @@ wire; in-process callers supply it, wire transports leave it undefined.
 `context_nests` is the catalog's first **registry-scoped** operation — it reads
 `~/.contextnest/config.yaml` rather than one vault, so it ignores its
 `OperationContext`.
+
+## Browsing Without Reading
+
+Discovery's cost is parsing every markdown file it finds, so a caller that only
+needs the vault's *shape* should not pay it. Two operations narrow the crawl
+rather than the result:
+
+- `context_folders` (and `NestStorage.listFolders`) returns each folder's path
+  and its document count, read from directory entries without opening a single
+  document. Folders are read rather than inferred from the documents inside
+  them, so a folder holding only subfolders still appears.
+- `context_list` and `NestStorage.discoverDocuments` take `folder` — a path
+  relative to the vault root, i.e. the id prefix (`"nodes/gtm"`, not `"gtm"`) —
+  and `recursive`. With `recursive: false` a folder's subfolders are never
+  opened, so a lazily-expanded document tree pays only for the level it shows.
+
+```typescript
+const { folders } = await api.run("context_folders", { recursive: false }, ctx);
+// → [{ path: "nodes", count: 0 }, …]
+
+const { documents } = await api.run(
+  "context_list",
+  { folder: "nodes/gtm", recursive: false },
+  ctx,
+);
+```
+
+Previously the only way to browse one folder was to read and parse every
+document in the vault and filter afterwards, which costs the same as not
+filtering — painful on a large vault, and worse on a network-backed mount where
+each document is a round trip.
 
 ## Importing an Existing Folder
 

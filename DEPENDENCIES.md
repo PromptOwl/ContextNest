@@ -52,7 +52,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 
 | Package | Version | Licence |
 | --- | --- | --- |
-| `@promptowl/contextnest-engine` | 2.2.0 | AGPL-3.0 |
+| `@promptowl/contextnest-engine` | 2.3.0 | AGPL-3.0 |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
 | `diff` | 9.0.0 | BSD-3-Clause |
 | `js-yaml` | 4.2.0 | MIT |
@@ -280,7 +280,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
-| `@promptowl/contextnest-engine` | 2.2.0 | AGPL-3.0 |
+| `@promptowl/contextnest-engine` | 2.3.0 | AGPL-3.0 |
 | `zod` | 3.25.76 | MIT |
 | `@hono/node-server` | 1.19.14 | MIT |
 | `ajv` | 8.18.0 | MIT |

@@ -3,7 +3,17 @@
  * Supports both structured and Obsidian-compatible layouts (§1.1).
  */
 
-import { readFile, writeFile, mkdir, open, stat, unlink, rm, rename } from "node:fs/promises";
+import {
+  readFile,
+  writeFile,
+  mkdir,
+  open,
+  stat,
+  unlink,
+  rm,
+  rename,
+  readdir,
+} from "node:fs/promises";
 import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
@@ -23,6 +33,7 @@ import type {
   NestConfig,
   DocumentHistory,
   VersionEntry,
+  Checkpoint,
   CheckpointHistory,
   Pack,
   ContextYaml,
@@ -38,11 +49,31 @@ import {
 import {
   packSchema,
   documentHistorySchema,
+  checkpointSchema,
   checkpointHistorySchema,
 } from "./schemas.js";
 
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
+
+/**
+ * What a read of `.versions/context_history.yaml` found.
+ *
+ * Deliberately four cases, not a nullable checkpoint. The publish seal
+ * quarantines a chain it cannot read, so "unreadable" has to be separable from
+ * "absent" and from "valid but holds nothing" — and a transient I/O failure has
+ * to be neither, which is why {@link NestStorage.readCheckpointChainState}
+ * throws rather than reporting one.
+ */
+export type CheckpointChainState =
+  /** No chain file yet. */
+  | { kind: "absent" }
+  /** Valid, with no checkpoints — what a rebuild writes over an empty vault. */
+  | { kind: "empty" }
+  /** The newest checkpoint, to link the next one onto. */
+  | { kind: "head"; checkpoint: Checkpoint }
+  /** Present and genuinely unparseable. The only state that licenses a quarantine. */
+  | { kind: "unreadable"; reason: string };
 
 /**
  * Normalize a user-supplied document path/slug into a canonical document id.
@@ -101,6 +132,63 @@ export function assertSafeDocumentId(raw: string): void {
   }
 }
 
+/**
+ * Normalize a folder path used to scope discovery: drops empty segments,
+ * accepts either separator, and rejects `..` — the path is joined against the
+ * vault root to start the crawl, so a traversal sequence would read outside it.
+ *
+ * `""` is the vault root, which is why this cannot reuse `assertSafeDocumentId`
+ * (that requires every segment to name something).
+ *
+ * Splitting on the separator rather than trimming with an anchored `\/+` also
+ * keeps this linear: that pattern retries at every position of a long run of
+ * slashes, which is quadratic on a hostile path (CodeQL js/polynomial-redos).
+ */
+export function normalizeFolder(raw: string): string {
+  const segments = raw.split(/[/\\]/).filter(Boolean);
+  if (segments.includes("..")) {
+    throw new ContextNestError(
+      `Invalid folder "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  return segments.join("/");
+}
+
+/**
+ * Markdown that lives in the vault but is not a knowledge node: version
+ * artifacts, generated indexes, agent-config scaffold. Shared by document
+ * discovery and folder listing so the two can never disagree about which files
+ * count — a folder holding only these is not a folder of documents.
+ */
+const NON_DOCUMENT_BASENAMES = new Set([
+  "INDEX.md",
+  // Agent-config / scaffold files are not knowledge nodes.
+  "CLAUDE.md",
+  "GEMINI.md",
+  "AGENTS.md",
+  "README.md",
+]);
+
+const NON_DOCUMENT_FILES = [
+  "**/node_modules/**",
+  "**/.versions/**",
+  "**/.context/**",
+  // Root-only, unlike the basenames below: a CONTEXT.md nested in a folder is
+  // an authored document, the one at the vault root is the vault's preamble.
+  "CONTEXT.md",
+  "context.yaml",
+  ...[...NON_DOCUMENT_BASENAMES].map((name) => `**/${name}`),
+];
+
+/** A folder of documents, and how many sit directly in it. */
+export interface FolderEntry {
+  /** Path relative to the vault root — the id prefix, e.g. `nodes/gtm`. */
+  path: string;
+  /** Documents directly in this folder, not counting its subfolders. */
+  count: number;
+}
+
 /** Options for `NestStorage.readDocument`. */
 export interface ReadDocumentOptions {
   /**
@@ -153,6 +241,24 @@ async function renameWithRetry(from: string, to: string): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, Math.min(2 ** attempt, 250)));
     }
   }
+}
+
+/**
+ * Move an unreadable integrity file aside and return where it went.
+ *
+ * The hash-chain files are the only record of what a document's history was, so
+ * a caller that cannot parse one must never be the caller that deletes it.
+ * Renaming keeps every byte for forensics and repair while freeing the canonical
+ * name, which is what lets a write proceed instead of failing on a file nobody
+ * can read. `.corrupt-<ts>` sits outside every glob the engine crawls
+ * (`history.yaml`, `**\/.versions/*\/history.yaml`), so a quarantined file is
+ * inert rather than re-read on the next pass.
+ */
+async function quarantine(path: string): Promise<string> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.replace(/\.yaml$/, "") + `.corrupt-${stamp}.yaml`;
+  await renameWithRetry(path, dest);
+  return dest;
 }
 
 export class NestStorage {
@@ -217,14 +323,33 @@ export class NestStorage {
    *
    * Back-compat: `includeSuperseded` is accepted as a deprecated alias for
    * `includeRetired`. Either flag opens the filter.
+   *
+   * `folder` scopes the crawl to one directory (a path relative to the vault
+   * root, i.e. the id prefix — `nodes/gtm`, not `gtm`). This narrows the READ,
+   * not just the result: a caller browsing one folder of a large vault never
+   * opens the rest of it. With `recursive: false` only that folder's own
+   * documents are read, so its subfolders cost nothing either.
    */
   async discoverDocuments(
-    options: { includeRetired?: boolean; includeSuperseded?: boolean } = {},
+    options: {
+      includeRetired?: boolean;
+      includeSuperseded?: boolean;
+      folder?: string;
+      recursive?: boolean;
+    } = {},
   ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
     let patterns: string[];
 
-    if (layout === "structured") {
+    const folder = options.folder === undefined ? undefined : normalizeFolder(options.folder);
+    if (folder !== undefined) {
+      // One directory. An empty folder means the vault root itself, whose
+      // own *.md files are the root-level nodes.
+      const prefix = folder ? `${folder}/` : "";
+      patterns = options.recursive === false
+        ? [`${prefix}*.md`]
+        : [`${prefix}**/*.md`];
+    } else if (layout === "structured") {
       // Include root-level *.md so a node is discoverable wherever it lives,
       // not only under nodes/ or sources/. Agent-config and scaffold files at
       // the root are excluded via the ignore list below.
@@ -233,19 +358,7 @@ export class NestStorage {
       patterns = ["**/*.md"];
     }
 
-    const files = await globFiles(this.root, patterns, [
-      "**/node_modules/**",
-      "**/.versions/**",
-      "**/.context/**",
-      "**/INDEX.md",
-      "CONTEXT.md",
-      "context.yaml",
-      // Agent-config / scaffold files are not knowledge nodes.
-      "**/CLAUDE.md",
-      "**/GEMINI.md",
-      "**/AGENTS.md",
-      "**/README.md",
-    ]);
+    const files = await globFiles(this.root, patterns, NON_DOCUMENT_FILES);
 
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
@@ -273,6 +386,63 @@ export class NestStorage {
     const includeRetired = options.includeRetired || options.includeSuperseded;
     if (includeRetired) return nodes;
     return nodes.filter((n) => n.frontmatter.status !== "rejected");
+  }
+
+  /**
+   * The vault's folders, WITHOUT reading a single document.
+   *
+   * Discovery's cost is not the directory walk, it is opening and parsing every
+   * markdown file it finds. A caller that only needs the shape of the vault — a
+   * navigable tree, a folder picker, per-folder counts — pays none of that here:
+   * the walk yields paths, and paths alone answer the question.
+   *
+   * Counts are of files, so they include retired documents; a status is only
+   * knowable by reading the file, which is the thing this avoids. Ancestors are
+   * included even when they hold no document of their own, so a tree built from
+   * this is fully navigable. `folder` and `recursive` scope it exactly as they
+   * scope `discoverDocuments`.
+   */
+  async listFolders(
+    options: { folder?: string; recursive?: boolean } = {},
+  ): Promise<FolderEntry[]> {
+    const base = options.folder === undefined ? "" : normalizeFolder(options.folder);
+    const found: FolderEntry[] = [];
+
+    // Directories are read, not inferred from the documents inside them: a
+    // folder holding nothing but subfolders is still a folder, and inferring
+    // from files would silently drop it.
+    const scan = async (rel: string, depth: number): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(join(this.root, rel), { withFileTypes: true });
+      } catch {
+        return; // unreadable subtree — same tolerance as the vault crawl
+      }
+      let count = 0;
+      const children: string[] = [];
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          // Dot-directories (.versions, .context, .git, .obsidian), package
+          // installs, and staged-suggestion stores hold no knowledge nodes.
+          if (entry.name.startsWith(".")) continue;
+          if (entry.name === "node_modules" || entry.name === "_suggestions") continue;
+          children.push(rel ? `${rel}/${entry.name}` : entry.name);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (!NON_DOCUMENT_BASENAMES.has(entry.name)) count++;
+        }
+      }
+      if (rel !== base) found.push({ path: rel, count });
+      // Sibling directories are independent reads, and on a network mount each
+      // one is a round trip — the very cost this function exists to avoid.
+      // Batched rather than unbounded so a wide vault can't exhaust file
+      // handles. Push order stops being deterministic; the caller sorts.
+      if (depth > 0) {
+        await mapInBatches(children, (child) => scan(child, depth - 1));
+      }
+    };
+
+    await scan(base, options.recursive === false ? 1 : Infinity);
+    return found.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**
@@ -375,8 +545,12 @@ export class NestStorage {
     // them; context.yaml gets filtered to published only below.
     const docs = await this.discoverDocuments({ includeRetired: true });
     const config = await this.readConfig();
-    const checkpointHistory = await this.readCheckpointHistory();
-    const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
+    // Only the LATEST checkpoint reaches context.yaml, so this must not load the
+    // whole chain: regenerateIndex runs after every single write, and
+    // context_history.yaml grows by one entry per published doc per checkpoint.
+    // Parsing it here is what made writes time out on a mature vault while reads
+    // — which never come through this path — stayed instant.
+    const latestCheckpoint = await this.readLatestCheckpoint();
     const published = docs.filter((d) => d.frontmatter.status === "published");
     const packs = await this.readPacks();
 
@@ -738,6 +912,42 @@ export class NestStorage {
       );
     }
     return result.data as DocumentHistory;
+  }
+
+  /**
+   * Move a document's unreadable history.yaml aside, returning its new name.
+   *
+   * Frees the canonical name so the next write can start a readable chain,
+   * without destroying the only record of the old one. Pair it with
+   * {@link maxRecordedVersion}: numbering must still clear whatever the
+   * quarantined chain sealed, or the fresh chain reuses version numbers and
+   * collides with the artifacts already on disk.
+   */
+  async quarantineHistory(docId: string): Promise<string> {
+    return quarantine(this.historyPath(docId));
+  }
+
+  /**
+   * Highest version this document has a sealed artifact for on disk.
+   *
+   * Read from the `v{N}.md` / `v{N}.diff` files rather than history.yaml, so it
+   * still answers when the history is missing or unparseable — which is exactly
+   * when it is needed. Returns 0 for a document with no artifacts.
+   */
+  async maxRecordedVersion(docId: string): Promise<number> {
+    const dir = join(this.root, dirname(docId), ".versions", basename(docId));
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return 0;
+    }
+    let max = 0;
+    for (const name of entries) {
+      const match = /^v(\d+)\.(md|diff)$/.exec(name);
+      if (match) max = Math.max(max, Number(match[1]));
+    }
+    return max;
   }
 
   /**
@@ -1136,15 +1346,33 @@ export class NestStorage {
     return destDir;
   }
 
+  /** Absolute path of the checkpoint chain file. */
+  private checkpointHistoryPath(): string {
+    return join(this.root, ".versions", "context_history.yaml");
+  }
+
+  /**
+   * Absolute path of the latest-checkpoint pointer.
+   *
+   * A cache, never an authority: it is validated against the size of
+   * context_history.yaml before use and can be deleted at any time without
+   * losing anything — see {@link readLatestCheckpoint}.
+   */
+  private latestCheckpointPath(): string {
+    return join(this.root, ".versions", "context_latest.yaml");
+  }
+
   /**
    * Read checkpoint history from .versions/context_history.yaml (§7.2).
+   *
+   * Loads and validates the WHOLE chain, which is O(checkpoints × published
+   * docs). Only the paths that genuinely need every checkpoint — verify, the
+   * §7.3 rebuild — should call it. To link a new checkpoint onto the chain, or
+   * to stamp the latest one into context.yaml, use {@link readLatestCheckpoint}.
    */
   async readCheckpointHistory(): Promise<CheckpointHistory | null> {
     try {
-      const content = await readFile(
-        join(this.root, ".versions", "context_history.yaml"),
-        "utf-8",
-      );
+      const content = await readFile(this.checkpointHistoryPath(), "utf-8");
       const raw = yaml.load(content);
       const result = checkpointHistorySchema.safeParse(raw);
       return result.success ? (result.data as CheckpointHistory) : null;
@@ -1154,7 +1382,293 @@ export class NestStorage {
   }
 
   /**
+   * The state of the checkpoint chain, read without loading it.
+   *
+   * Four outcomes, because collapsing them is a data-loss bug: the seal
+   * quarantines a chain it cannot read, so "unreadable" MUST be distinguishable
+   * from "absent", from "readable but holds nothing", and above all from a
+   * transient I/O failure — on the network-backed mounts this whole change
+   * exists for, one flaky read would otherwise rename a healthy multi-megabyte
+   * chain aside and restart numbering at 1.
+   *
+   * Mirrors how {@link readHistory} discriminates for a single document: only a
+   * file that is present and genuinely unparseable is corrupt. Any other error
+   * propagates, so the write fails loudly and is retried rather than silently
+   * discarding the chain.
+   *
+   * The head itself comes from three sources, cheapest first: the pointer file,
+   * a bounded tail read, then a full read for a file too small to have a usable
+   * tail. None of the three grows with the chain.
+   */
+  async readCheckpointChainState(): Promise<CheckpointChainState> {
+    let info: { size: number; mtimeMs: number };
+    try {
+      const s = await stat(this.checkpointHistoryPath());
+      info = { size: s.size, mtimeMs: s.mtimeMs };
+    } catch (err) {
+      // Absent is the only benign case; a permission or I/O failure here must
+      // not read as "no chain", which is what would license a quarantine.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      throw err;
+    }
+
+    const pointed = await this.readLatestCheckpointPointer(info);
+    if (pointed) return { kind: "head", checkpoint: pointed };
+
+    const tailed = await this.readLatestCheckpointFromTail(info.size);
+    if (tailed) return { kind: "head", checkpoint: tailed };
+
+    // Neither shortcut resolved a head, so the file has to be read properly —
+    // and this read is the one that decides corrupt vs merely empty.
+    let content: string;
+    try {
+      content = await readFile(this.checkpointHistoryPath(), "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      throw err;
+    }
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      return { kind: "unreadable", reason: err instanceof Error ? err.message : String(err) };
+    }
+    const result = checkpointHistorySchema.safeParse(raw);
+    if (!result.success) {
+      return {
+        kind: "unreadable",
+        reason: `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
+      };
+    }
+    const head = (result.data as CheckpointHistory).checkpoints.at(-1);
+    // Valid YAML with no checkpoints — what rebuildCheckpointHistory writes for
+    // a vault with nothing published. Empty is not broken.
+    return head ? { kind: "head", checkpoint: head } : { kind: "empty" };
+  }
+
+  /**
+   * The most recent checkpoint, or null when there is none to link onto.
+   *
+   * Convenience over {@link readCheckpointChainState} for callers that only
+   * want to stamp the head somewhere (regenerateIndex). An unreadable chain
+   * reads as "no checkpoint yet" here rather than failing the caller's write;
+   * a transient I/O failure still propagates.
+   */
+  async readLatestCheckpoint(): Promise<Checkpoint | null> {
+    const state = await this.readCheckpointChainState();
+    return state.kind === "head" ? state.checkpoint : null;
+  }
+
+  /**
+   * The newest checkpoint's number, or 0 when there is none.
+   *
+   * For READ paths, which want the number only to stamp it onto an audit
+   * record. Never throws: a retrieval query must not fail because the chain
+   * file hiccuped, and a trace entry recording checkpoint 0 is a far smaller
+   * harm than a query that errors.
+   *
+   * Write paths take {@link readCheckpointChainState} instead, where a
+   * transient failure MUST surface rather than be mistaken for "no chain" —
+   * that mistake is what licenses a quarantine.
+   */
+  async readLatestCheckpointNumber(): Promise<number> {
+    try {
+      return (await this.readLatestCheckpoint())?.checkpoint ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Pointer-file half of {@link readCheckpointChainState}.
+   *
+   * Validated against the chain file's size AND mtime. That is a cheap staleness
+   * check, not a proof of identity: an external rewrite that lands on the same
+   * byte count within the same mtime tick would still validate. It closes the
+   * realistic cases — a rebuild, a restored backup, an append from another
+   * process — and the chain's own hash linkage remains what `verify` checks.
+   */
+  private async readLatestCheckpointPointer(
+    info: { size: number; mtimeMs: number },
+  ): Promise<Checkpoint | null> {
+    try {
+      const raw = yaml.load(await readFile(this.latestCheckpointPath(), "utf-8"));
+      const pointer = raw as {
+        history_bytes?: unknown;
+        history_mtime_ms?: unknown;
+        checkpoint?: unknown;
+      };
+      if (pointer?.history_bytes !== info.size) return null;
+      if (pointer?.history_mtime_ms !== info.mtimeMs) return null;
+      const parsed = checkpointSchema.safeParse(pointer.checkpoint);
+      return parsed.success ? (parsed.data as Checkpoint) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Tail-read half of {@link readCheckpointChainState}.
+   *
+   * Finds the last list item by scanning for a two-space-indented
+   * `- checkpoint:` line. That is exact for files this class writes, and only
+   * for those: every writer dumps with `lineWidth: -1` so no scalar wraps, and
+   * a `Checkpoint`'s own values cannot contain a newline — `triggered_by` is a
+   * document id or a generated label, and the map keys are document ids, which
+   * `assertSafeDocumentId` constrains. Storing free text on a Checkpoint would
+   * break that assumption, so this must be revisited if the shape gains one.
+   * A wrong slice is not silent corruption: it fails to parse or fails the
+   * schema, and the caller falls back to a full read.
+   */
+  private async readLatestCheckpointFromTail(
+    historyBytes: number,
+  ): Promise<Checkpoint | null> {
+    const TAIL_BYTES = 64 * 1024;
+    const start = Math.max(0, historyBytes - TAIL_BYTES);
+    let text: string;
+    try {
+      const handle = await open(this.checkpointHistoryPath(), "r");
+      try {
+        const buf = Buffer.alloc(historyBytes - start);
+        // A short read is normal on network-backed mounts. Decoding the
+        // untouched remainder would splice NUL bytes onto the text and send an
+        // otherwise-fine chain down the slow path.
+        const { bytesRead } = await handle.read(buf, 0, buf.length, start);
+        text = buf.subarray(0, bytesRead).toString("utf-8");
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return null;
+    }
+    // A window that starts mid-file almost certainly starts mid-line; drop the
+    // partial one rather than feeding it to the parser.
+    if (start > 0) {
+      const firstBreak = text.indexOf("\n");
+      if (firstBreak === -1) return null;
+      text = text.slice(firstBreak + 1);
+    }
+    const marker = "\n  - checkpoint:";
+    const at = text.lastIndexOf(marker);
+    const item = at === -1
+      ? (text.startsWith("  - checkpoint:") ? text : null)
+      : text.slice(at + 1);
+    if (item === null) return null;
+    try {
+      const dedented = item
+        .split("\n")
+        .map((line) => (line.startsWith("  ") ? line.slice(2) : line))
+        .join("\n");
+      const raw = yaml.load(dedented);
+      const parsed = checkpointSchema.safeParse(
+        Array.isArray(raw) ? raw[0] : raw,
+      );
+      return parsed.success ? (parsed.data as Checkpoint) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Re-point the cache at `checkpoint`, stamped with the chain file's identity. */
+  private async writeLatestCheckpointPointer(
+    checkpoint: Checkpoint,
+  ): Promise<void> {
+    let info: { size: number; mtimeMs: number };
+    try {
+      const s = await stat(this.checkpointHistoryPath());
+      info = { size: s.size, mtimeMs: s.mtimeMs };
+    } catch {
+      return; // nothing to point at; the read path falls back cleanly
+    }
+    // Not writeFileDurable: this file is a cache. A torn one fails its staleness
+    // check and costs one tail read, so paying an fsync per write to protect it
+    // would trade away the thing being fixed for nothing.
+    await writeFile(
+      this.latestCheckpointPath(),
+      "# Auto-generated cache of the newest checkpoint. Safe to delete.\n" +
+        yaml.dump(
+          {
+            history_bytes: info.size,
+            history_mtime_ms: info.mtimeMs,
+            checkpoint,
+          },
+          { lineWidth: -1, noRefs: true },
+        ),
+      "utf-8",
+    );
+  }
+
+  /**
+   * Append one checkpoint to the chain (§7.2).
+   *
+   * APPEND, not read-modify-write. Sealing used to load the entire chain, push
+   * one entry and dump it back, so every publish cost O(chain size) in parse,
+   * serialize and fsync — on a network-backed mount, a full re-upload of a file
+   * that grows by one entry per published document per checkpoint. The bytes
+   * written are identical either way: `yaml.dump({checkpoints: [...]})` emits
+   * exactly `checkpoints:\n` followed by each item indented two spaces.
+   *
+   * Only valid when the file already ends in a non-empty `checkpoints:` list —
+   * i.e. when {@link readLatestCheckpoint} returned an entry. Callers with no
+   * previous checkpoint use {@link startCheckpointHistory}.
+   */
+  async appendCheckpoint(checkpoint: Checkpoint): Promise<void> {
+    const path = this.checkpointHistoryPath();
+    await mkdir(dirname(path), { recursive: true });
+    const block = yaml
+      .dump([checkpoint], { lineWidth: -1, noRefs: true })
+      .split("\n")
+      .map((line) => (line.length > 0 ? `  ${line}` : line))
+      .join("\n");
+    const handle = await open(path, "a");
+    try {
+      await handle.write(block);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await this.writeLatestCheckpointPointer(checkpoint);
+  }
+
+  /**
+   * Begin a fresh chain with `checkpoint` as its first entry.
+   *
+   * For the states {@link appendCheckpoint} cannot extend: no chain file, or one
+   * holding no checkpoint to link onto.
+   *
+   * `quarantineExisting` is the CALLER's finding, never inferred here. Deciding
+   * from the file's size would conflate "unreadable" with "valid and empty" and
+   * — far worse — with a transient read failure, so a flaky mount could rename a
+   * healthy chain aside and restart numbering at 1. Only
+   * {@link readCheckpointChainState} can tell those apart, so only it decides.
+   */
+  async startCheckpointHistory(
+    checkpoint: Checkpoint,
+    options: { quarantineExisting?: string } = {},
+  ): Promise<void> {
+    const path = this.checkpointHistoryPath();
+    await mkdir(dirname(path), { recursive: true });
+    if (options.quarantineExisting !== undefined) {
+      try {
+        const quarantined = await quarantine(path);
+        console.warn(
+          `[checkpoint] ${path} is unreadable (${options.quarantineExisting}); ` +
+            `preserved as ${basename(quarantined)} and starting a new chain`,
+        );
+      } catch (err) {
+        // Another process moved it first. Losing that race is fine — the file
+        // is preserved either way, and failing the publish over it is not.
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+    await this.writeCheckpointHistory({ checkpoints: [checkpoint] });
+  }
+
+  /**
    * Write checkpoint history.
+   *
+   * Rewrites the file whole — for the rebuild path (§7.3) and for starting a
+   * fresh chain. The publish path appends instead; see {@link appendCheckpoint}.
    */
   async writeCheckpointHistory(history: CheckpointHistory): Promise<void> {
     const dir = join(this.root, ".versions");
@@ -1162,7 +1676,13 @@ export class NestStorage {
     const content =
       "# Auto-generated. Do not edit manually.\n" +
       yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await this.writeFileDurable(join(dir, "context_history.yaml"), content);
+    await this.writeFileDurable(this.checkpointHistoryPath(), content);
+    // Keep the pointer in step with the file it caches. Without this a rebuild
+    // would leave it naming a checkpoint the rewritten chain no longer ends
+    // with; the size check would catch that, but re-pointing is exact and free.
+    const latest = history.checkpoints.at(-1);
+    if (latest) await this.writeLatestCheckpointPointer(latest);
+    else await unlink(this.latestCheckpointPath()).catch(() => {});
   }
 
   /**
