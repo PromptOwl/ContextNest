@@ -6,7 +6,8 @@
  * `run(name, input, ctx)`:
  *   1. resolve the operation (built-in `core` or extension-provided, by name
  *      or legacy alias),
- *   2. validate input against the operation's Zod schema,
+ *   2. validate input against the operation's Zod schema, refusing any key
+ *      the schema does not declare rather than silently dropping it,
  *   3. run every extension's `authorize` gate (throw to deny) — this is the
  *      commercial-governance seam,
  *   4. execute the single executor,
@@ -39,6 +40,21 @@ export interface EngineApi {
   getOperation(name: string): OperationDescriptor | undefined;
   /** Validate, authorize, execute, and observe a single operation. */
   run<T = unknown>(name: string, input: unknown, ctx: OperationContext): Promise<T>;
+}
+
+/**
+ * The declared field names of an operation's input schema, or null when the
+ * schema is not an object (nothing to compare a caller's keys against).
+ *
+ * Unwrapped with `_def.typeName` rather than `instanceof` so a duplicated zod
+ * copy in the dependency graph cannot silently defeat the check — the same
+ * reason the MCP server's `inputShape` unwraps this way.
+ */
+function declaredInputKeys(schema: OperationDescriptor["input"]): string[] | null {
+  let inner: any = schema;
+  while (inner?._def?.typeName === "ZodEffects") inner = inner._def.schema;
+  if (inner?._def?.typeName !== "ZodObject") return null;
+  return Object.keys(inner.shape as Record<string, unknown>);
 }
 
 /**
@@ -100,6 +116,26 @@ export function createEngineApi(options: CreateEngineApiOptions = {}): EngineApi
   ): Promise<T> {
     const op = getOperation(name);
     if (!op) throw new ContextNestError(`Unknown operation: ${name}`, "UNKNOWN_OPERATION");
+
+    // Unknown keys are REFUSED, not dropped. Zod's default object mode strips
+    // them, so a caller who misnames a parameter (`content` where the op takes
+    // `body`) reaches the executor with that field silently gone: the op
+    // reports success, the write lands without the text, and nothing surfaces
+    // the typo. Refusing the call is the only outcome that cannot lose work.
+    const declared = declaredInputKeys(op.input);
+    if (declared && input !== null && typeof input === "object" && !Array.isArray(input)) {
+      const unknown = Object.keys(input as Record<string, unknown>).filter(
+        (key) => !declared.includes(key),
+      );
+      if (unknown.length > 0) {
+        throw new ContextNestError(
+          `Invalid input for ${op.name}: unrecognized parameter(s) ${unknown
+            .map((k) => `\`${k}\``)
+            .join(", ")}. Accepted: ${declared.join(", ")}.`,
+          "VALIDATION_FAILED",
+        );
+      }
+    }
 
     const parsed = op.input.safeParse(input);
     if (!parsed.success) {
