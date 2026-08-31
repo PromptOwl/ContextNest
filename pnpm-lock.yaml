@@ -32,10 +32,6 @@ importers:
       commander:
         specifier: ^13.0.0
         version: 13.1.0
-    optionalDependencies:
-      chalk:
-        specifier: ^5.4.0
-        version: 5.6.2
     devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
@@ -58,6 +54,10 @@ importers:
       zod:
         specifier: ^3.24.0
         version: 3.25.76
+    optionalDependencies:
+      chalk:
+        specifier: ^5.4.0
+        version: 5.6.2
 
   packages/engine:
     dependencies:
