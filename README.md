@@ -226,6 +226,10 @@ folders:
     description: "Project documents"
   sources:
     description: "Live data sources"
+skills:
+  # The type: skill node that teaches an agent how to use this vault.
+  # A pointer, not content — the node stays the source of truth.
+  bootstrap: "nodes/skills/onboarding"
 servers:
   jira:
     url: "https://mcp.atlassian.com/sse"
@@ -352,6 +356,42 @@ skill:
 
 Skills are queryable like any other node: `ctx query "type:skill + #engineering"`
 
+#### Installing a skill into an agent harness
+
+A skill node is not just documentation — it can be **installed** into Claude Code,
+Cursor, or Codex, where the harness matches on it and runs it:
+
+```bash
+ctx skill nodes/review-pr                          # render it and look at it
+ctx skill install nodes/review-pr --write          # install for Claude Code, user scope
+ctx skill install nodes/review-pr --harness cursor --scope project --write
+```
+
+`skill.trigger` becomes the harness's local matcher (Claude Code's `description`
+frontmatter, a Cursor rule description). It is the one field that must exist
+locally, because matching happens before anything can be fetched — which is why a
+skill node without a trigger is refused rather than given a guessed one.
+
+The default install writes a **loader**: a small file carrying the trigger and an
+instruction to fetch the procedure from the vault at runtime. A loader cannot go
+stale, because it never holds a copy of the procedure. `--mode full` embeds an
+offline snapshot instead — useful when the agent cannot reach the vault, and a
+deliberate trade: that copy *will* drift as the node changes, silently, while the
+agent keeps working confidently from superseded rules.
+
+Node bodies should write `{{server_alias}}`, `{{vault_id}}`, and `{{node_path}}`
+rather than hardcoding a tool prefix: the same vault is `mcp__contextnest__*` on
+one machine and `mcp__team-ctx__*` on another, so the prefix is resolved per
+caller at render time.
+
+Point `skills.bootstrap` at the skill that teaches an agent to use *this* vault,
+and `context_init` will hand it to every agent that opens the vault:
+
+```yaml
+skills:
+  bootstrap: nodes/skills/onboarding
+```
+
 ### 7. Add context packs
 
 Packs are saved queries in `packs/` as YAML files:
@@ -461,6 +501,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx delete <path>` | Delete a document and its version history |
 | `ctx read <path>` | Read and display a document in the terminal |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
+| `ctx skill <path>` | Render a `type: skill` node for an agent harness and print it |
+| `ctx skill install <path>` | Install a vault skill into Claude Code / Cursor / Codex (`--write` to actually write) |
 | `ctx validate [path]` | Validate documents against the spec |
 | `ctx publish <path>` | Publish a document (creates version + checkpoint) |
 | `ctx publish --all` | Publish every unpublished document in one batch — one checkpoint, one index pass |
@@ -517,7 +559,7 @@ full stack trace back.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 36 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 38 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -584,6 +626,8 @@ cloud:
 |---|---|
 | `context_init` | Open a vault: instructions, configuration, path, and what it holds (`include_nodes` to also list nodes) |
 | `context_nests` | List every nest in the central registry |
+| `context_skill` | Render a `type: skill` node as a harness-ready skill file |
+| `context_skill_install` | Build the file manifest that installs a vault skill locally |
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
 | `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
 | `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |

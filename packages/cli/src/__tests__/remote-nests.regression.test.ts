@@ -875,3 +875,63 @@ describe("[regression] remote nests — write surface routed over stdio MCP", ()
     expect(existsSync(join(serverVault, "nodes", "remote-note.md"))).toBe(false);
   });
 });
+
+// ─── 6. Governed nests: no context_publish, no context_verify ───────────────
+
+describe("[regression] remote nests — governed nest without publish/verify", () => {
+  let configDir: string;
+  let cwd: string;
+  let run: ReturnType<typeof makeRunner>;
+
+  const stub = join(here, "fixtures", "governed-nest-stub.mjs");
+
+  beforeAll(() => {
+    configDir = mkdtempSync(join(tmpdir(), "cn-governed-cfg-"));
+    cwd = mkdtempSync(join(tmpdir(), "cn-governed-cwd-"));
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "config.yaml"),
+      [
+        "version: 1",
+        "remotes:",
+        "  governed:",
+        "    transport: stdio",
+        `    command: ${yq(process.execPath)}`,
+        "    args:",
+        `      - ${yq(stub)}`,
+        "    description: Governed nest stub",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+    run = makeRunner(configDir);
+  });
+
+  afterAll(() => {
+    for (const dir of [configDir, cwd]) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("ctx publish falls back to submit-for-review and says so", () => {
+    const res = run(cwd, ["publish", "nodes/remote-note", "--vault", "governed"]);
+    expect(res.status, res.stderr).toBe(0);
+    // Must NOT claim the node was published — it is sitting in a review queue.
+    expect(res.stdout).toMatch(/submitted/i);
+    expect(res.stdout).toMatch(/NOT published/);
+    expect(res.stdout).toMatch(/pending/i);
+  });
+
+  it("ctx verify refuses clearly instead of failing on an unknown tool", () => {
+    const res = run(cwd, ["verify", "--vault", "governed"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/does not expose context_verify/i);
+    // Not a protocol-level failure — the nest answered fine.
+    expect(res.status).not.toBe(REMOTE_UNREACHABLE_EXIT);
+  });
+
+  it("ctx history labels the approved version instead of calling everything a draft", () => {
+    const res = run(cwd, ["history", "nodes/remote-note", "--vault", "governed"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout).toMatch(/v2.*approved.*AI-active/is);
+    expect(res.stdout).not.toMatch(/draft/i);
+  });
+});

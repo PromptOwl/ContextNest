@@ -51,6 +51,9 @@ export const ERROR_CODES = [
   "REJECTED_DOCUMENT",
   "SUPERSEDED_DOCUMENT",
   "CONFIG_ERROR",
+  // vault write lock (vault-lock.ts) — retryable: a concurrent writer held
+  // the lock past the acquire timeout; the operation was not performed
+  "VAULT_LOCK_TIMEOUT",
   // operation-runtime codes
   "UNKNOWN_OPERATION",
   "NOT_IMPLEMENTED",

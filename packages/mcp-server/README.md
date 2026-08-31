@@ -8,7 +8,7 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **36 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **38 tools** over stdio transport.
 
 > **New in 2.2.1** — `context_folders` lists the vault's folders and their
 > document counts without opening a document, and `context_list` takes a
@@ -108,6 +108,8 @@ them over the legacy tools below.
 |------|-------------|
 | `context_init` | Open a vault: its `CONTEXT.md` instructions, configuration, path, and what it holds (totals, counts by type and status, tag set). `include_nodes` to also list nodes |
 | `context_nests` | List every nest in the central registry — alias, path, description, which is default, whether it exists |
+| `context_skill` | Render a `type: skill` node for an agent harness (Claude Code, Cursor, Codex, raw) — trigger becomes the harness matcher |
+| `context_skill_install` | Build the file manifest that installs a vault skill. Loader mode (default) fetches at runtime and cannot drift; `full` embeds an offline copy that will |
 | `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
 | `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
 | `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |

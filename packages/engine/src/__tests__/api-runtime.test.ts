@@ -1500,3 +1500,226 @@ describe("id and title tolerance", () => {
     expect(got.id).toBe("nodes/custom/slot-7");
   });
 });
+
+describe("createEngineApi — unknown input keys are refused, not dropped", () => {
+  let ctx: OperationContext;
+  let dir: string;
+  let api: ReturnType<typeof createEngineApi>;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+    api = createEngineApi();
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("rejects a misnamed parameter instead of silently writing without it", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Runbook", content: "original body" },
+      ctx,
+    );
+
+    // `text` is not a parameter of context_update. Before this guard zod
+    // stripped it, the op reported success, the version bumped, and the body
+    // on disk was still "original body".
+    await expect(
+      api.run("context_update", { id: created.id, text: "the rewrite" }, ctx),
+    ).rejects.toThrow(/unrecognized parameter\(s\) `text`/);
+
+    const got = await api.run<{ body: string; frontmatter: { version?: number } }>(
+      "context_get",
+      { id: created.id },
+      ctx,
+    );
+    expect(got.body).toContain("original body");
+    expect(got.frontmatter.version).toBe(1);
+  });
+
+  it("names every unknown key and lists what the operation accepts", async () => {
+    await expect(
+      api.run("context_list", { folder: "nodes", offset: 2, sort: "title" }, ctx),
+    ).rejects.toThrow(/`offset`, `sort`\. Accepted: .*folder/s);
+  });
+
+  it("still accepts every key the operation declares", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Declared Keys", content: "body", tags: ["#ok"], folder: "gtm" },
+      ctx,
+    );
+    expect(created.id).toContain("gtm/declared-keys");
+  });
+});
+
+describe("createEngineApi — body/content aliasing and description", () => {
+  let ctx: OperationContext;
+  let dir: string;
+  let api: ReturnType<typeof createEngineApi>;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+    api = createEngineApi();
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("accepts `body` as an alias for `content` on create", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Aliased Create", body: "written via body" },
+      ctx,
+    );
+    const got = await api.run<{ body: string }>("context_get", { id: created.id }, ctx);
+    expect(got.body).toContain("written via body");
+  });
+
+  it("accepts `body` as an alias for `content` on update", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Aliased Update", content: "first" },
+      ctx,
+    );
+    await api.run("context_update", { id: created.id, body: "second" }, ctx);
+    const got = await api.run<{ body: string }>("context_get", { id: created.id }, ctx);
+    expect(got.body).toContain("second");
+    expect(got.body).not.toContain("first");
+  });
+
+  it("refuses `content` and `body` carrying different text rather than picking one", async () => {
+    await expect(
+      api.run("context_create", { title: "Conflict", content: "a", body: "b" }, ctx),
+    ).rejects.toThrow(/aliases for the same field/);
+  });
+
+  it("requires a body on create, under either name", async () => {
+    await expect(api.run("context_create", { title: "Bodyless" }, ctx)).rejects.toThrow(
+      /needs a body/,
+    );
+  });
+
+  it("stores a description on create and replaces it on update", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Described", content: "body", description: "the first summary" },
+      ctx,
+    );
+    let got = await api.run<{ frontmatter: { description?: string } }>(
+      "context_get",
+      { id: created.id },
+      ctx,
+    );
+    expect(got.frontmatter.description).toBe("the first summary");
+
+    await api.run("context_update", { id: created.id, description: "the second summary" }, ctx);
+    got = await api.run("context_get", { id: created.id }, ctx);
+    expect(got.frontmatter.description).toBe("the second summary");
+  });
+
+  it("clears the description when update is given an empty string", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Clearable", content: "body", description: "remove me" },
+      ctx,
+    );
+    await api.run("context_update", { id: created.id, description: "" }, ctx);
+    const got = await api.run<{ frontmatter: { description?: string } }>(
+      "context_get",
+      { id: created.id },
+      ctx,
+    );
+    expect(got.frontmatter.description).toBeUndefined();
+  });
+});
+
+describe("createEngineApi — unknown keys are refused inside nested objects too", () => {
+  let ctx: OperationContext;
+  let dir: string;
+  let api: ReturnType<typeof createEngineApi>;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+    api = createEngineApi();
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // The runtime's own guard reads the OUTER shape only, so these hold solely
+  // because the nested schemas are strict. Same failure as a misnamed
+  // top-level key — a write that reports success and lands without the text.
+  it("refuses a misnamed key inside context_import's documents[]", async () => {
+    await expect(
+      api.run("context_import", { documents: [{ title: "T", content: "c", body: "DROPPED" }] }, ctx),
+    ).rejects.toThrow(/body/);
+
+    const { documents } = await api.run<{ documents: unknown[] }>("context_list", {}, ctx);
+    expect(documents).toHaveLength(0);
+  });
+
+  // Not an inert typo: the executor writes `f.content ?? ""`, so a stripped
+  // key lands an EMPTY file and still counts itself in `written`.
+  it("refuses a misnamed key inside context_import's files[]", async () => {
+    await expect(
+      api.run("context_import", { files: [{ path: "nodes/a.md", contents: "DROPPED" }] }, ctx),
+    ).rejects.toThrow(/contents/);
+    expect(existsSync(join(dir, "nodes", "a.md"))).toBe(false);
+  });
+
+  it("refuses a misnamed key inside a source block, on create and on update", async () => {
+    const typo = { transport: "mcp", servers: "TYPO", tools: ["list_projects"] };
+    await expect(
+      api.run("context_create", { title: "S", content: "c", type: "source", source: typo }, ctx),
+    ).rejects.toThrow(/servers/);
+
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      {
+        title: "Real Source",
+        content: "c",
+        type: "source",
+        source: { transport: "mcp", server: "harvest", tools: ["list_projects"] },
+      },
+      ctx,
+    );
+    await expect(
+      api.run("context_update", { id: created.id, source: typo }, ctx),
+    ).rejects.toThrow(/servers/);
+  });
+
+  it("imports a source node and a skill node, which it could not before", async () => {
+    const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
+    const result = await api.run<{ published: string[]; failed: unknown[] }>(
+      "context_import",
+      {
+        documents: [
+          { title: "Live Harvest", content: "c", type: "source", description: "d", source },
+          { title: "Do The Thing", content: "c", type: "skill", trigger: "when asked" },
+        ],
+      },
+      ctx,
+    );
+    expect(result.failed).toHaveLength(0);
+    expect(result.published).toHaveLength(2);
+
+    const node = await api.run<{ frontmatter: Record<string, any> }>(
+      "context_get",
+      { id: "nodes/live-harvest" },
+      ctx,
+    );
+    expect(node.frontmatter.source).toEqual(source);
+    expect(node.frontmatter.description).toBe("d");
+  });
+
+  // Strictness must not reach `metadata` — arbitrary keys are its purpose.
+  it("leaves metadata permissive", async () => {
+    const result = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { documents: [{ title: "Meta", content: "c", metadata: { anything: 1, nested: { x: 2 } } }] },
+      ctx,
+    );
+    expect(result.failed).toHaveLength(0);
+  });
+});
