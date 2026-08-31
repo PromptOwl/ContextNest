@@ -18,6 +18,7 @@ import {
   STATUSES,
   TAG_PATTERN,
   frontmatterSchema,
+  sourceMetaSchema,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import type { OperationDescriptor } from "./types.js";
@@ -321,7 +322,18 @@ const createOp: OperationDescriptor = {
   description: "Create a new knowledge node in the vault.",
   input: z.object({
     title: z.string().min(1).max(200).describe("Descriptive title"),
-    content: z.string().describe("Markdown content body"),
+    content: z.string().optional().describe("Markdown content body"),
+    // Alias, not a second field. `body` is what the legacy create_document
+    // tool and the frontmatter itself call this, so agents reach for it
+    // constantly; before the runtime refused unknown keys it was dropped in
+    // silence and the node was written empty.
+    body: z.string().optional().describe("Alias for `content` — pass one or the other, not both"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
+      ),
     type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
@@ -367,6 +379,15 @@ const createOp: OperationDescriptor = {
     // skill block has exactly one authoritative schema.
     inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
     guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
+    // The `source` block's counterpart to `trigger`: REQUIRED for type:"source"
+    // and forbidden on every other type, so it cannot ride inside `metadata`
+    // either. Without it a source node simply could not be created.
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        'Source block (required for type:source): how an agent fetches the live data this node stands for.',
+      ),
   }),
   output: z.object({
     id: z.string(),
@@ -378,7 +399,12 @@ const createOp: OperationDescriptor = {
       .nullable()
       .describe("Checkpoint sealing the publish, or null when created as a draft"),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["create_document"],
 };
 
@@ -399,6 +425,13 @@ const updateOp: OperationDescriptor = {
       ),
     title: z.string().optional().describe("New title"),
     content: z.string().optional().describe("New content (replaces body)"),
+    body: z.string().optional().describe("Alias for `content` — pass one or the other, not both"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "New one-line summary for frontmatter. An empty string removes it. Indexed for retrieval alongside title and tags.",
+      ),
     append: z.string().optional().describe("Content to append"),
     tags: z.array(tag).optional().describe("New tags (replaces existing)"),
     metadata: z
@@ -431,6 +464,33 @@ const updateOp: OperationDescriptor = {
       .describe(
         "Explicit version to stamp, for governed callers that assign version numbers themselves (a draft revision awaiting review). Ignored when publishing, which assigns the version.",
       ),
+    // Re-typing and the typed blocks travel together: source/skill blocks are
+    // required by one type and forbidden on the others, so a node can only be
+    // re-typed if its block is added or dropped in the SAME call. Freezing a
+    // block at creation is the trap `description` was in before this PR.
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+      ),
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    trigger: z
+      .string()
+      .optional()
+      .describe("New skill trigger, for a node that is (or is becoming) type:skill"),
+    tools_required: z.array(z.string()).optional().describe("New tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("New skill output format"),
+    inputs: z.array(z.record(z.unknown())).optional().describe("New skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("New skill execution constraints"),
   }),
   output: z.object({
     id: z.string(),
@@ -447,6 +507,7 @@ const updateOp: OperationDescriptor = {
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
 };
@@ -477,6 +538,7 @@ const publishOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["publish_document"],
 };
@@ -493,21 +555,38 @@ const deleteOp: OperationDescriptor = {
     title: z.string().describe("Title of the deleted node, read before removal"),
     deleted: z.literal(true),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["delete_document"],
 };
 
 // ─── context_versions ────────────────────────────────────────────────────────
 
+// Optional where a server may legitimately have nothing to report, not
+// because the field is decorative. `keyframe`/`content_hash`/`chain_hash`
+// describe the keyframe+diff storage model and its per-version hash chain; a
+// nest that stores content whole and enforces integrity server-side has no
+// equivalent and omits them rather than faking a value. Same reason
+// `published_at` and `status` are both optional: a nest either publishes
+// versions or approves them, never both.
 const versionEntryOut = z.object({
   version: z.number().int(),
-  keyframe: z.boolean(),
+  keyframe: z.boolean().optional(),
   edited_by: z.string(),
   edited_at: z.string(),
   published_at: z.string().optional(),
+  status: z
+    .string()
+    .optional()
+    .describe("Lifecycle status of this version on a nest that approves rather than publishes"),
   note: z.string().optional(),
-  content_hash: z.string(),
-  chain_hash: z.string(),
+  content_hash: z.string().optional(),
+  chain_hash: z.string().optional(),
   /** Only present when the caller passes `include_diff`. Absent for a keyframe
    *  (a full snapshot has no patch) and for v1. */
   diff: z.string().optional().describe("Unified diff from the previous version"),
@@ -530,7 +609,16 @@ const versionsOp: OperationDescriptor = {
   }),
   output: z.object({
     id: z.string(),
-    keyframe_interval: z.number().int(),
+    // Absent from a server with no keyframe+diff model — see versionEntryOut.
+    keyframe_interval: z.number().int().optional(),
+    approved_version: z
+      .number()
+      .int()
+      .nullable()
+      .optional()
+      .describe(
+        "The version a governed nest currently serves to agents; null when none is approved yet. Absent from a nest that publishes rather than approves.",
+      ),
     versions: z.array(versionEntryOut),
   }),
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
@@ -703,24 +791,66 @@ const nestsOp: OperationDescriptor = {
 
 // ─── context_import ──────────────────────────────────────────────────────────
 
-/** One node to create in a bulk import — same shape as context_create input. */
-const importDoc = z.object({
-  title: z.string().min(1).max(200).describe("Descriptive title"),
-  content: z.string().describe("Markdown content body"),
-  type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
-  tags: z.array(tag).optional().describe("Tags"),
-  folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
-  metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
-});
+/**
+ * One node to create in a bulk import — the fields `context_create` takes.
+ *
+ * `.strict()` for the same reason `EngineApi.run()` refuses unknown top-level
+ * keys: that check reads the OUTER shape only, so without this a caller who
+ * writes `body` here has it stripped in silence and the node is published with
+ * the wrong text. `metadata` stays permissive — arbitrary keys are its purpose.
+ *
+ * The typed-block fields are what make a `type: source` or `type: skill` node
+ * importable at all: `buildDraftNode` settles them through `applyTypedBlocks`,
+ * which requires the block of the type being entered, and nothing else here
+ * can supply it.
+ */
+const importDoc = z
+  .object({
+    title: z.string().min(1).max(200).describe("Descriptive title"),
+    content: z.string().describe("Markdown content body"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
+      ),
+    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    tags: z.array(tag).optional().describe("Tags"),
+    folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
+    metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Source block (required for type:source): how an agent fetches the live data this node stands for.",
+      ),
+    trigger: z.string().optional().describe("Skill trigger (required for type:skill)"),
+    tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("Skill output format"),
+    inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
+  })
+  .strict();
 
-/** One file from an existing vault, written in exactly as given. */
-const importFile = z.object({
-  path: z
-    .string()
-    .min(1)
-    .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
-  content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
-});
+/**
+ * One file from an existing vault, written in exactly as given.
+ *
+ * `.strict()` because a misnamed `content` is not an inert typo here: the
+ * executor writes `f.content ?? ""`, so a stripped key lands an EMPTY file and
+ * still counts itself in `written`.
+ */
+const importFile = z
+  .object({
+    path: z
+      .string()
+      .min(1)
+      .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
+    content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
+  })
+  .strict();
 
 const importOp: OperationDescriptor = {
   name: "context_import",
@@ -804,7 +934,7 @@ const importOp: OperationDescriptor = {
       )
       .optional(),
   }),
-  errors: ["VALIDATION_FAILED"],
+  errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
 };
 
 

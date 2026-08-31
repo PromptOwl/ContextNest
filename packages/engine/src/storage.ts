@@ -223,7 +223,7 @@ export type LayoutMode = "structured" | "obsidian";
  * EPERM/EACCES/EBUSY rather than waiting. The contention is transient, so retry
  * briefly before giving up.
  *
- * ponytail: fixed backoff schedule, ~500ms total across 10 attempts. If a real
+ * Tradeoff: fixed backoff schedule, ~500ms total across 10 attempts. If a real
  * workload starts losing writes here, the fix is a per-path write queue, not a
  * longer sleep.
  */
