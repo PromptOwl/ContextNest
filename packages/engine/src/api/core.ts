@@ -377,7 +377,12 @@ const createOp: OperationDescriptor = {
       .nullable()
       .describe("Checkpoint sealing the publish, or null when created as a draft"),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["create_document"],
 };
 
@@ -446,6 +451,7 @@ const updateOp: OperationDescriptor = {
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
 };
@@ -476,6 +482,7 @@ const publishOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["publish_document"],
 };
@@ -492,7 +499,13 @@ const deleteOp: OperationDescriptor = {
     title: z.string().describe("Title of the deleted node, read before removal"),
     deleted: z.literal(true),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["delete_document"],
 };
 
@@ -797,7 +810,7 @@ const importOp: OperationDescriptor = {
       )
       .optional(),
   }),
-  errors: ["VALIDATION_FAILED"],
+  errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
 };
 
 /** All `core` namespace operations, in catalog order. */

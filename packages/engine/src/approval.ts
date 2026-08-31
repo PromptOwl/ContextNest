@@ -31,6 +31,7 @@ import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { VersionManager } from "./versioning.js";
+import { withVaultLock } from "./vault-lock.js";
 import { readSuggestion } from "./suggestions.js";
 import {
   requireCzar,
@@ -81,7 +82,7 @@ export interface ApprovalResult {
  * Refuses if the suggestion's `target_hash` no longer equals the current
  * chain head (suggestion is stale; caller must re-stage).
  */
-export async function approveSuggestion(
+async function approveSuggestionImpl(
   input: ApproveSuggestionInput,
 ): Promise<ApprovalResult> {
   const sug = await readSuggestion(
@@ -168,7 +169,7 @@ export interface RejectionResult {
  * are MOVED (not deleted) into `_archive/rejected/` — per spec, governance
  * history is permanently retained.
  */
-export async function rejectSuggestion(
+async function rejectSuggestionImpl(
   input: RejectSuggestionInput,
 ): Promise<RejectionResult> {
   if (!input.reason.trim()) {
@@ -247,7 +248,7 @@ export interface RollbackResult {
  * prior content. Prior versions are not erased; the chain reads cleanly
  * forward to the rollback entry, then to whatever comes after.
  */
-export async function rollbackDocument(
+async function rollbackDocumentImpl(
   input: RollbackInput,
 ): Promise<RollbackResult> {
   await gateForTier(input.rbac, input.docTier, {
@@ -313,7 +314,7 @@ export interface CzarDirectEditResult {
  * No suggestion layer. Czar's signature is auto-recorded. Subscribers see
  * it as a direct publication (chain event = `primary.approved`).
  */
-export async function czarDirectEdit(
+async function czarDirectEditImpl(
   input: CzarDirectEditInput,
 ): Promise<CzarDirectEditResult> {
   await requireCzar(input.rbac, input.actor, input.zone, "czarDirectEdit");
@@ -463,4 +464,43 @@ function buildChainEvent(args: {
 function makeEventId(...parts: Array<string | number>): string {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   return `evt_${ts}_${parts.join("_")}`;
+}
+
+// ─── Locked entry points ─────────────────────────────────────────────────────
+//
+// Every function above commits a version and appends hash-chain events — the
+// same critical section the catalog's mutating executors serialize with the
+// per-vault write lock. These are called DIRECTLY (not through the catalog) by
+// the CLI's `drift approve/reject`, the OSS MCP server's suggestion tools, and
+// Community's governance layer, so they must take the same lock themselves:
+// a `drift approve` racing a parallel curator's `ctx update` would otherwise
+// interleave chain writes and corrupt the checkpoint history silently.
+//
+// None of the implementations call each other or a locked catalog executor,
+// so acquiring here cannot deadlock (the lock is deliberately non-reentrant).
+
+/** Approve a staged suggestion: bumps version, writes canonical bytes, archives. */
+export async function approveSuggestion(
+  input: ApproveSuggestionInput,
+): Promise<ApprovalResult> {
+  return withVaultLock(input.storage.root, () => approveSuggestionImpl(input));
+}
+
+/** Reject a staged suggestion: archives it without merging. */
+export async function rejectSuggestion(
+  input: RejectSuggestionInput,
+): Promise<RejectionResult> {
+  return withVaultLock(input.storage.root, () => rejectSuggestionImpl(input));
+}
+
+/** Roll a document back to a prior version as a new version. */
+export async function rollbackDocument(input: RollbackInput): Promise<RollbackResult> {
+  return withVaultLock(input.storage.root, () => rollbackDocumentImpl(input));
+}
+
+/** Czar-tier direct edit: commit new content without the suggestion workflow. */
+export async function czarDirectEdit(
+  input: CzarDirectEditInput,
+): Promise<CzarDirectEditResult> {
+  return withVaultLock(input.storage.root, () => czarDirectEditImpl(input));
 }

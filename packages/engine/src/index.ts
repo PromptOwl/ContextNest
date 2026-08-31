@@ -365,3 +365,4 @@ export { TraceLogger } from "./tracing.js";
 
 // Chain event log (persistent governance audit trail)
 export { ChainEventLog } from "./chain-log.js";
+export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";

@@ -17,7 +17,7 @@
  *      proceeds on the strength of its own argv, while a destructive one
  *      refuses unless `--yes` / `--force` was passed.
  *
- * ponytail: the snapshot hashes full file contents. Fine for markdown vaults;
+ * Tradeoff: the snapshot hashes full file contents. Fine for markdown vaults;
  * if someone starts storing large binaries here, switch to size+mtime and
  * accept the same-millisecond blind spot.
  */
@@ -197,7 +197,7 @@ export function realRootPath(): string | null {
  * The filter must prune on exactly the same rule as `snapshot()`, or a dry run
  * would preview against a tree the action log then reports differently.
  *
- * ponytail: a full byte copy, so a dry run costs the size of the vault rather
+ * Tradeoff: a full byte copy, so a dry run costs the size of the vault rather
  * than the size of the change. Fine for markdown (and MAX_SCAN_FILES bounds it
  * anyway). Hardlinks would be cheaper but are unsafe — not every engine write
  * goes through write-temp-then-rename, and an in-place truncate would reach

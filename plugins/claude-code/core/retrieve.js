@@ -8,8 +8,14 @@
  *            those tags (1 hop); inject distilled documents + source nodes.
  *   agent  → inject a directive telling the model to invoke the retriever agent.
  *
- * Pure core: run({input, env, exec}) returns the hook output object (or null for
- * "inject nothing"). The IO shell at the bottom does stdin/stdout.
+ * It also drains the work queue. The Stop hook parks capture/correction jobs in
+ * the session ledger rather than blocking the turn, and this is the single place
+ * they are handed to the model — as `additionalContext`, the one field the model
+ * actually acts on. That dispatch happens before every early return, so a queued
+ * job survives `retrieval_mode: off` and an empty prompt.
+ *
+ * Pure core: run({input, env, exec, ledgerIo}) returns the hook output object
+ * (or null for "inject nothing"). The IO shell at the bottom does stdin/stdout.
  */
 
 import {
@@ -22,8 +28,40 @@ import {
   isMain,
   MAX_HITS,
 } from "./lib.js";
+import { correctionIntent } from "./signals.js";
+import { loadLedger, saveLedger } from "./ledger.js";
 
 const HEADER = "Relevant Context Nest vault material (auto-retrieved):";
+
+/**
+ * Appended only when the prompt looks like a correction.
+ *
+ * The end-of-turn gate is too late to be the only place this lives: by then the
+ * model has already edited whatever it was going to edit, usually the single
+ * node it happened to find. Injecting the sweep rule up front is what makes a
+ * correction land in every node that carries the stale fact.
+ *
+ * Only correction-shaped prompts pay for it, so ordinary turns are unchanged.
+ */
+const CHANGE_LADDER = [
+  "This prompt looks like a correction. If it contradicts anything in the vault,",
+  "resolve it by ladder, stopping at the first rung that applies:",
+  "(1) does the vault actually assert the old value? If not, change nothing and say so.",
+  "(2) find EVERY occurrence before editing, in EVERY nest that could carry it",
+  "(`ctx vault list --json`, then per candidate nest) — `ctx search` is ranked and",
+  "published-only, so also check `ctx list --json` and `ctx list --status draft --json`,",
+  "then `ctx read <id> --raw` the candidates.",
+  "(3) one node, one sentence → make that one edit and nothing else.",
+  "(4) several nodes carry the same stale fact → note the before-marker",
+  "(`ctx checkpoint list --json -n 1` per nest) and fix all of them; when the",
+  "set spans nests or is large, fan out `contextnest-curator` agents in a single",
+  "message — one per nest at least, each owning a disjoint slice — a half-swept",
+  "vault contradicts itself. Then say that the duplication is the root cause,",
+  "and offer to make one node canonical with the rest linking to it — offer,",
+  "don't do it.",
+  "(5) structural (a concept renamed, a decision reversed, a node whose title or",
+  "type no longer fits) → stop, show the change-set, and ask before writing.",
+].join(" ");
 
 /** Pull the user's prompt text out of the hook payload (field name varies). */
 function promptText(input) {
@@ -130,25 +168,73 @@ const AGENT_DIRECTIVE = [
 ].join(" ");
 
 /**
- * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function}} ctx
+ * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function, ledgerIo?:object}} ctx
  * @returns {object|null} hook output, or null to inject nothing.
  */
-export function run({ input, env, exec }) {
+export function run({ input, env, exec, ledgerIo = {} }) {
   const config = getConfig(env);
   const mode = config.retrievalMode;
-  if (mode === "off") return null;
 
-  if (mode === "agent") {
-    return wrap(AGENT_DIRECTIVE);
+  // Drain the queue FIRST — before any early return. The Stop hook parks work
+  // instead of blocking the turn, and this is the only place it gets handed to
+  // the model, so a job must survive `retrieval_mode: off` and an empty prompt.
+  // Draining is unconditional: handed over once, never re-offered.
+  const sessionId = input?.session_id;
+  let ledger = loadLedger(sessionId, ledgerIo);
+  const queued = formatQueued(ledger.pending);
+  // Drain in memory; every exit path below persists exactly once. Two writes
+  // per prompt (clear, then stash) was avoidable I/O on the hottest hook.
+  if (queued) ledger = { ...ledger, pending: null };
+  const persist = () => {
+    if (queued) saveLedger(sessionId, ledger, ledgerIo);
+  };
+
+  if (mode === "off") {
+    persist();
+    return queued ? wrap(queued) : null;
   }
 
   const query = promptText(input);
-  if (!query) return null;
+  // A correction gets the sweep rule even when retrieval finds nothing: search
+  // is ranked and published-only, so "no hits" is not evidence the vault is
+  // silent on the subject. Only correction-shaped prompts reach this.
+  const ladder = correctionIntent(query) ? CHANGE_LADDER : null;
+  const join = (block) => [queued, block, ladder].filter(Boolean).join("\n\n");
+
+  if (mode === "agent") {
+    persist();
+    return wrap(join(AGENT_DIRECTIVE));
+  }
+  if (!query) {
+    persist();
+    return queued ? wrap(queued) : null;
+  }
 
   const hits = searchAll(exec, config, query);
+
+  // Stash this turn's hit refs as warm seeds (one write also carries the
+  // drain). If the end of this turn parks a change job, the scout starts from
+  // the nodes retrieval ALREADY matched on the very prompt where the user
+  // stated the fact — instead of cold.
+  saveLedger(
+    sessionId,
+    { ...ledger, lastHits: hits.map((h) => (h.vault ? `${h.vault}:${h.id}` : h.id)) },
+    ledgerIo,
+  );
+
   const context = mode === "query" ? formatQuery(exec, config, hits) : formatSearch(hits);
-  if (!context) return null;
-  return wrap(context);
+  if (!context && !ladder && !queued) return null;
+  return wrap(join(context));
+}
+
+/** Render a parked job as the dispatch block, appending its warm seeds. */
+function formatQueued(pending) {
+  if (!pending?.reason) return null;
+  if (!pending.seeds?.length) return pending.reason;
+  return [
+    pending.reason,
+    `Warm seeds — nodes retrieval matched when the user stated this (start the scout here, but do not stop here): ${pending.seeds.join(", ")}.`,
+  ].join(" ");
 }
 
 function wrap(additionalContext) {

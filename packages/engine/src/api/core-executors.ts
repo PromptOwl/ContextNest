@@ -28,6 +28,7 @@ import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
 import { mapInBatches } from "../concurrency.js";
+import { withVaultLock } from "../vault-lock.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -812,6 +813,18 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   };
 };
 
+/**
+ * Serialize a mutating executor on the vault's write lock. Every mutation
+ * read-modify-writes the nest-level checkpoint chain; without this, concurrent
+ * writers (parallel agents, two terminals, N remote clients on one server)
+ * silently lose seals and break `ctx verify`. Applied at the binding so each
+ * operation locks exactly once, at its outer edge.
+ */
+const locked =
+  (executor: OperationExecutor): OperationExecutor =>
+  (ctx, input) =>
+    withVaultLock(ctx.storage.root, () => Promise.resolve(executor(ctx, input)));
+
 /** name → executor for the built-in `core` namespace. */
 export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({
   context_query: query,
@@ -819,16 +832,16 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_search: search,
   context_get: get,
   context_list: list,
-  context_folders: folders,
-  context_create: create,
-  context_update: update,
-  context_publish: publish,
-  context_delete: del,
+  context_folders: folders,  
+  context_create: locked(create),
+  context_update: locked(update),
+  context_publish: locked(publish),
+  context_delete: locked(del),
   context_versions: versions,
   context_reconstruct: reconstruct,
   context_verify: verify,
   context_init: init,
   context_packs: packs,
   context_nests: nests,
-  context_import: importDocs,
+  context_import: locked(importDocs),
 });

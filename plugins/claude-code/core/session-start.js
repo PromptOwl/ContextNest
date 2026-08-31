@@ -38,7 +38,11 @@ export function run({ env, exec }) {
     return Array.isArray(v) ? v : [];
   })();
 
-  const lines = ["Context Nest is active for this session."];
+  // Naming the effective mode up front answers "did the plugin stop writing?"
+  // for anyone whose legacy auto_capture:true now maps to propose.
+  const lines = [
+    `Context Nest is active for this session (capture: ${config.captureMode}).`,
+  ];
 
   // A pin is only honoured if it still resolves to a registered vault; it may
   // have been removed or renamed since it was set. Warn loudly on a stale pin —
