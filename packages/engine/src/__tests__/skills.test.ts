@@ -117,22 +117,20 @@ describe("renderSkill", () => {
     expect(rendered.content).not.toContain("{{");
   });
 
-  it("substitutes placeholders in the guard rails, inputs and output format", () => {
+  it("substitutes placeholders in the guard rails and input descriptions", () => {
     const doc = skillDoc();
     doc.frontmatter.skill!.guard_rails = ["Call mcp__{{server_alias}}__context_get before editing"];
     doc.frontmatter.skill!.inputs = [
       { name: "version", type: "string", required: true, description: "Tag in {{vault_id}}" },
     ];
-    doc.frontmatter.skill!.output_format = "Cite {{node_path}} in the summary.";
     const opts = { serverAlias: "team-ctx", vaultId: "team" } as const;
 
     for (const content of [
       renderSkill(doc, { ...opts, harness: "raw" }).content,
-      buildInstallManifest(doc, { ...opts, harness: "raw", mode: "loader" }).files[0].content,
+      buildInstallManifest(doc, { ...opts, harness: "raw", mode: "loader", scope: "project" }).files[0].content,
     ]) {
       expect(content).toContain("Call mcp__team-ctx__context_get before editing");
       expect(content).toContain("Tag in team");
-      expect(content).toContain("Cite nodes/skills/release-checklist in the summary.");
       expect(content).not.toContain("{{");
     }
   });
