@@ -971,8 +971,16 @@ const skillOp: OperationDescriptor = {
     harness: z.enum(HARNESSES),
     source_path: z.string(),
     version: z.number().int().nullable(),
+    served_version: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Present only when the node is rejected: the approved version served in its place. The live file is NOT what you got.",
+      ),
+    notes: z.string().optional().describe("Only set when an approved version stood in for a rejected node"),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID"],
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
 };
 
 const skillInstallOp: OperationDescriptor = {
@@ -1008,6 +1016,14 @@ const skillInstallOp: OperationDescriptor = {
     ),
     post_install: z.string().describe("What the user must do for the harness to pick it up"),
     notes: z.string(),
+    served_version: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Present only when the node is rejected: the approved version served in its place. The live file is NOT what you got.",
+      ),
+
     skill: z.object({
       name: z.string(),
       source_path: z.string(),
@@ -1018,7 +1034,7 @@ const skillInstallOp: OperationDescriptor = {
       server_alias: z.string(),
     }),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID"],
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
 };
 
 /** All `core` namespace operations, in catalog order. */

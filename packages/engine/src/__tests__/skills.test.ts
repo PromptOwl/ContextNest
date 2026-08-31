@@ -15,6 +15,7 @@ import {
   type SkillSource,
 } from "../skills.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { parseDocument } from "../parser.js";
 
 function skillDoc(overrides: Partial<SkillSource> = {}): SkillSource {
   return {
@@ -267,6 +268,74 @@ describe("context_skill / context_skill_install", () => {
     await expect(
       createEngineApi().run("context_skill", { id: "nodes/notes" }, ctx),
     ).rejects.toThrow(/not "skill"/);
+  });
+
+  it("refuses a rejected skill node with nothing approved behind it", async () => {
+    await writeFile(
+      join(dir, "nodes", "skills", "retired.md"),
+      [
+        "---",
+        "title: Retired",
+        "type: skill",
+        "status: rejected",
+        "skill:",
+        '  trigger: "When deploying to production"',
+        "---",
+        "",
+        "Steps a steward turned down.",
+      ].join("\n"),
+      "utf-8",
+    );
+    const api = createEngineApi();
+    for (const op of ["context_skill", "context_skill_install"]) {
+      await expect(api.run(op, { id: "nodes/skills/retired" }, ctx)).rejects.toMatchObject({
+        code: "REJECTED_DOCUMENT",
+      });
+    }
+  });
+
+  it("serves the last approved version when the live node is rejected", async () => {
+    const id = "nodes/skills/deploy";
+    const file = join(dir, "nodes", "skills", "deploy.md");
+    const node = (status: string, step: string) =>
+      [
+        "---",
+        "title: Deploy",
+        "type: skill",
+        `status: ${status}`,
+        "skill:",
+        '  trigger: "When deploying"',
+        "---",
+        "",
+        step,
+      ].join("\n");
+
+    // v1 approved and published, then a rejected edit on top of it.
+    await writeFile(file, node("approved", "Approved step."), "utf-8");
+    await ctx.versions.createVersion(
+      parseDocument(file, node("approved", "Approved step."), id),
+      "steward@example.com",
+      { publishedAt: "1970-01-01T00:00:00.000Z" },
+    );
+    await writeFile(file, node("rejected", "Steps a steward turned down."), "utf-8");
+
+    const rendered = await createEngineApi().run<{
+      content: string;
+      served_version?: number;
+      notes?: string;
+    }>("context_skill", { id }, ctx);
+    expect(rendered.served_version).toBe(1);
+    expect(rendered.content).toContain("Approved step.");
+    expect(rendered.content).not.toContain("turned down");
+    expect(rendered.notes).toContain("serving approved version 1");
+
+    const manifest = await createEngineApi().run<{ served_version?: number; notes: string }>(
+      "context_skill_install",
+      { id, mode: "full" },
+      ctx,
+    );
+    expect(manifest.served_version).toBe(1);
+    expect(manifest.notes).toContain("serving approved version 1");
   });
 
   it("builds a loader manifest by default", async () => {

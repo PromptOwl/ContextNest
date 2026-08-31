@@ -19,6 +19,7 @@ import {
   normalizeStatus,
   isRejected,
   explicitStatus,
+  parseDocument,
 } from "../parser.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
@@ -679,10 +680,29 @@ const init: OperationExecutor = async (ctx, input: any) => {
 async function loadSkillNode(ctx: OperationContext, input: any) {
   const id = normalizeDocumentId(String(input.id ?? ""));
   assertSafeDocumentId(id);
-  const [node, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
+  const [live, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
+
+  // A rejected node does not dead-end: it falls back to the last APPROVED version,
+  // so an agent keeps working from the last steps a steward signed off on while the
+  // author fixes the live file (which update/publish still accept — being rejected
+  // is what you edit your way out of). Rendering the rejected text itself is what
+  // is refused: an installed skill is matched on and executed, not just displayed.
+  // Only a rejected node with nothing approved behind it has nothing safe to serve.
+  let node = live;
+  let servedVersion: number | null = null;
+  if (isRejected(live)) {
+    const history = await ctx.versions.getHistory(id);
+    // published_at is the local marker of an approved version — the approval
+    // publish path is the only writer. Highest wins; history is append-only.
+    const approved = [...(history?.versions ?? [])].reverse().find((v) => v.published_at);
+    if (!approved) throw new RejectedDocumentError(id);
+    node = parseDocument(id, await ctx.versions.reconstructVersion(id, approved.version), id);
+    servedVersion = approved.version;
+  }
   const vaultName = config?.name;
   return {
     doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    servedVersion,
     vaultName,
     serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
     harness: (input.harness ?? "claude-code") as Harness,
@@ -704,7 +724,10 @@ function asValidationError<T>(fn: () => T): T {
 }
 
 const skill: OperationExecutor = async (ctx, input: any) => {
-  const { doc, vaultName, serverAlias, harness, scope } = await loadSkillNode(ctx, input);
+  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
+    ctx,
+    input,
+  );
   const rendered = asValidationError(() =>
     renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
   );
@@ -717,12 +740,21 @@ const skill: OperationExecutor = async (ctx, input: any) => {
     harness,
     source_path: doc.id,
     version: doc.frontmatter.version ?? null,
+    ...(servedVersion === null ? {} : { served_version: servedVersion, notes: rejectedNote(doc.id, servedVersion) }),
   };
 };
 
+/** Said out loud on both ops: what you got is not what is on disk right now. */
+function rejectedNote(id: string, version: number): string {
+  return `${id} is rejected; serving approved version ${version}.`;
+}
+
 const skillInstall: OperationExecutor = async (ctx, input: any) => {
-  const { doc, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(ctx, input);
-  return asValidationError(() =>
+  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
+    ctx,
+    input,
+  );
+  const manifest = asValidationError(() =>
     buildInstallManifest(doc, {
       harness,
       serverAlias,
@@ -732,6 +764,12 @@ const skillInstall: OperationExecutor = async (ctx, input: any) => {
       mode,
     }),
   );
+  if (servedVersion === null) return manifest;
+  return {
+    ...manifest,
+    served_version: servedVersion,
+    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
+  };
 };
 
 const packs: OperationExecutor = async (ctx) => {
