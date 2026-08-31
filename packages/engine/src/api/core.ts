@@ -220,7 +220,8 @@ const getOp: OperationDescriptor = {
 const listOp: OperationDescriptor = {
   name: "context_list",
   namespace: "core",
-  description: "Browse vault contents with optional type, tag, status, or limit filters.",
+  description:
+    "Browse vault contents with optional folder, type, tag, status, or limit filters.",
   input: z.object({
     // An array as well as a single value: callers that browse a family of types
     // (every runnable type, say) would otherwise have to list, then re-filter.
@@ -236,6 +237,20 @@ const listOp: OperationDescriptor = {
       .optional()
       .describe("Filter by status (aliases normalized). Retired nodes are hidden unless asked for."),
     limit: z.number().int().positive().optional().describe("Max nodes to return"),
+    // Narrows the CRAWL, not just the result. Filtering a whole-vault listing
+    // down to one folder costs exactly as much as not filtering it.
+    folder: z
+      .string()
+      .optional()
+      .describe(
+        'Read only this folder, as a path relative to the vault root — the id prefix ("nodes/gtm", not "gtm"). Empty string means the vault root itself.',
+      ),
+    recursive: z
+      .boolean()
+      .optional()
+      .describe(
+        "With `folder`: include subfolders (default true). Pass false for one level only, so nested folders are never read.",
+      ),
     include_retired: z
       .boolean()
       .optional()
@@ -252,8 +267,49 @@ const listOp: OperationDescriptor = {
   output: z.object({
     documents: z.array(nodeSummary),
   }),
-  errors: ["VALIDATION_FAILED"],
+  // `folder` is a free-form string to zod, so a `..` in it clears validation
+  // and is rejected by the folder normalizer instead — a consumer generating
+  // handling from this list has to know that code can arrive.
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
   aliases: ["list_documents"],
+};
+
+// ─── context_folders ─────────────────────────────────────────────────────────
+
+const foldersOp: OperationDescriptor = {
+  name: "context_folders",
+  namespace: "core",
+  description:
+    "List the vault's folders and their document counts, without reading any document.",
+  input: z.object({
+    folder: z
+      .string()
+      .optional()
+      .describe(
+        'List folders under this one, as a path relative to the vault root — the id prefix ("nodes/gtm", not "gtm"). Omit for the whole vault.',
+      ),
+    recursive: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include nested folders (default true). Pass false for the immediate children only.",
+      ),
+  }),
+  output: z.object({
+    folders: z.array(
+      z.object({
+        path: z.string().describe("Path relative to the vault root"),
+        count: z
+          .number()
+          .int()
+          .describe("Documents directly in this folder, excluding its subfolders"),
+      }),
+    ),
+  }),
+  // No alias: aliases are a migration path off tool names that already
+  // existed in the wild, and nothing ever called this one.
+  // INVALID_DOCUMENT_ID for the same reason as context_list — see there.
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
 };
 
 // ─── context_create ──────────────────────────────────────────────────────────
@@ -763,6 +819,7 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   queryOp,
   resolveOp,
   listOp,
+  foldersOp,
   searchOp,
   createOp,
   updateOp,

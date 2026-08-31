@@ -517,7 +517,7 @@ full stack trace back.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 35 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 36 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -585,7 +585,8 @@ cloud:
 | `context_init` | Open a vault: instructions, configuration, path, and what it holds (`include_nodes` to also list nodes) |
 | `context_nests` | List every nest in the central registry |
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
-| `context_list` | List nodes with type / status / tag filters (`include_retired`, `full`, `limit`) |
+| `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
+| `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |
 | `context_search` | Full-text search with graph traversal |
 | `context_query` | Selector query with graph traversal (`include_drafts`) |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |
