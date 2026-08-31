@@ -181,10 +181,13 @@ function bulletList(items: string[] | undefined): string | null {
   return clean.map((i) => `- ${i}`).join("\n");
 }
 
-function contextBlocks(skill: SkillMeta, serverAlias: string): string {
+function contextBlocks(
+  skill: SkillMeta,
+  values: { serverAlias: string; vaultId: string; nodePath: string },
+): string {
   const parts: string[] = [];
 
-  const tools = bulletList((skill.tools_required ?? []).map((t) => qualifyTool(t, serverAlias)));
+  const tools = bulletList((skill.tools_required ?? []).map((t) => qualifyTool(t, values.serverAlias)));
   if (tools) parts.push(`## Tools required\n\n${tools}`);
 
   const inputs = bulletList(
@@ -201,7 +204,9 @@ function contextBlocks(skill: SkillMeta, serverAlias: string): string {
 
   if (skill.output_format) parts.push(`## Output format\n\n${skill.output_format}`);
 
-  return parts.join("\n\n");
+  // Guard rails, input descriptions and output_format are node-authored too, so they
+  // carry the same {{server_alias}} placeholders the trigger and body do.
+  return substitutePlaceholders(parts.join("\n\n"), values);
 }
 
 /**
@@ -239,7 +244,7 @@ function loaderBody(
     "",
     "2. Follow the returned body exactly. It supersedes anything in this file.",
     "",
-    contextBlocks(skill, alias),
+    contextBlocks(skill, { serverAlias: alias, vaultId: opts.vaultId, nodePath: doc.id }),
     "",
     "## If the vault is unreachable",
     "",
@@ -274,7 +279,7 @@ function fullBody(
     `> Refresh with \`mcp__${alias}__context_skill({ id: "${doc.id}" })\` whenever the vault`,
     "> is reachable, and prefer the fetched version over this one.",
     "",
-    contextBlocks(skill, alias),
+    contextBlocks(skill, { serverAlias: alias, vaultId: opts.vaultId, nodePath: doc.id }),
     "",
     "---",
     "",
