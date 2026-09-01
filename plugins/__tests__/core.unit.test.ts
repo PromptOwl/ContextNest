@@ -100,21 +100,23 @@ function additional(out: any): string | undefined {
 }
 
 // getConfig() reads real override files when the caller doesn't inject
-// cwd/homedir (sessionStart never does). Point HOME and the project dir at an
+// cwd/homedir (sessionStart never does). Point the home and project dirs at an
 // empty temp dir so a developer's own ~/.contextnest/plugin-settings.json can't
-// leak into these assertions. Node's os.homedir() honours $HOME on POSIX.
-const realHome = process.env.HOME;
-const realProjectDir = process.env.CLAUDE_PROJECT_DIR;
+// leak into these assertions. os.homedir() reads $HOME on POSIX and
+// %USERPROFILE% on Windows — setting only HOME leaves Windows unisolated, where
+// a real pinned vault turns eight of these into failures.
+const realEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR };
 beforeAll(() => {
   const empty = mkdtempSync(join(tmpdir(), "cn-no-settings-"));
   process.env.HOME = empty;
+  process.env.USERPROFILE = empty;
   process.env.CLAUDE_PROJECT_DIR = empty;
 });
 afterAll(() => {
-  if (realHome === undefined) delete process.env.HOME;
-  else process.env.HOME = realHome;
-  if (realProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
-  else process.env.CLAUDE_PROJECT_DIR = realProjectDir;
+  for (const [key, value] of Object.entries(realEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe("getConfig", () => {
