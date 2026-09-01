@@ -1221,9 +1221,13 @@ describe("makeExec", () => {
     expect(res.stdout.trim()).toBe(process.version);
   });
 
-  it("reports a failure instead of throwing when the command is missing", () => {
-    const exec = makeExec({ ctxCommand: "definitely-not-a-real-binary-xyz" });
-    const res = exec(["--version"]);
-    expect(res.status).not.toBe(0);
+  // Deliberately not "the command is missing": that path ENOENTs into the npx
+  // fallback, which resolves the real CLI off the network and legitimately
+  // succeeds. A command that runs and fails is the case worth pinning — hooks
+  // must never break a session, so a non-zero exit is reported, never thrown.
+  it("reports a failing command instead of throwing", () => {
+    const exec = makeExec({ ctxCommand: process.execPath });
+    const res = exec(["-e", "process.exit(3)"]);
+    expect(res.status).toBe(3);
   });
 });
