@@ -157,6 +157,14 @@ it would put both the documents and your API key on the wire in the clear.
 Prefer `CONTEXTNEST_API_KEY` over `--key`: command-line arguments are visible
 to other processes and land in shell history.
 
+**Confirmation gate.** A nest can require a human to confirm a push in the web
+UI before it is applied. When it does, `ctx push` prints a `Confirm in the UI:`
+link and waits for the decision, exiting `0` once the push is applied and
+non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
+submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
+defaults to the server's window, else 15 minutes). Ungated nests apply
+immediately, exactly as before.
+
 ### Errors
 
 Every failure prints as a single line — `Error [CODE]: message` for engine
