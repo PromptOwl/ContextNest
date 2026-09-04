@@ -14,6 +14,13 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const core = (name: string) => join(here, "..", "shared", "core", name);
 
+// These spawn the scripts for real, so the child reads whatever settings files
+// the inherited environment points at — including the developer's own pinned
+// vault. Default every run to an empty home; a test that needs its own passes
+// one and wins the spread below. os.homedir() reads $HOME on POSIX and
+// %USERPROFILE% on Windows, so both are set.
+const NO_SETTINGS = mkdtempSync(join(tmpdir(), "cn-io-nosettings-"));
+
 /** Run a core script with a JSON stdin payload + env; return {status, stdout}. */
 function runScript(
   script: string,
@@ -23,7 +30,13 @@ function runScript(
   try {
     const stdout = execFileSync("node", [script], {
       input: JSON.stringify(input),
-      env: { ...process.env, ...env },
+      env: {
+        ...process.env,
+        HOME: NO_SETTINGS,
+        USERPROFILE: NO_SETTINGS,
+        CLAUDE_PROJECT_DIR: NO_SETTINGS,
+        ...env,
+      },
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
     });

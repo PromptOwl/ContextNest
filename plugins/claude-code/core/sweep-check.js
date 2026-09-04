@@ -24,7 +24,16 @@
  * SINGLE SOURCE OF TRUTH: plugins/shared/core/. Edit here, then `pnpm plugins:sync`.
  */
 
-import { ctxJson, envInt, getConfig, isMain, listVaults, runAsHook, withVault } from "./lib.js";
+import {
+  ctxJson,
+  envInt,
+  getConfig,
+  isMain,
+  listVaults,
+  MAX_LIST_SCAN,
+  runAsHook,
+  withVault,
+} from "./lib.js";
 
 /** Terms examined per edit. More than a few is noise, not signal. */
 export const MAX_TERMS = 3;
@@ -199,7 +208,14 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
     if ((alias || null) === (writtenAlias || null)) checked.add(ref(excludeId));
 
     for (const term of terms) {
-      const tagged = ctxJson(exec, withVault(["list", "--tag", term, "--json"], alias), []);
+      const tagged = ctxJson(
+        exec,
+        withVault(
+          ["list", "--tag", term, "--json", "--limit", String(MAX_LIST_SCAN)],
+          alias,
+        ),
+        [],
+      );
       const searched = ctxJson(exec, withVault(["search", term, "--json"], alias), []);
       const tagHits = Array.isArray(tagged) ? tagged : [];
       const taggedIds = new Set(tagHits.map((d) => d?.id).filter(Boolean));

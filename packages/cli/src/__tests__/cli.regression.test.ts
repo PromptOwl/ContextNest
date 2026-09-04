@@ -147,6 +147,88 @@ function startMockEngine(
   });
 }
 
+/**
+ * Like runCtxAsync, but tolerates a non-zero exit — needed for the gated-push
+ * paths that exit non-zero (rejected/expired) while an in-process mock server
+ * must stay responsive (so spawnSync/runCtxResult, which blocks the event loop,
+ * would deadlock the poll). Returns status + captured streams.
+ */
+async function runCtxAsyncResult(
+  cwd: string,
+  args: string[],
+): Promise<{ status: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync("node", [distPath, ...args], {
+      cwd,
+      env: ENV,
+      encoding: "utf-8",
+    });
+    return { status: 0, stdout, stderr };
+  } catch (e: any) {
+    return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+  }
+}
+
+interface GatedServer {
+  url: string;
+  /** The most recently received publish (POST) body, parsed. */
+  lastBody: () => unknown;
+  /** How many times the pending-push poll endpoint was hit. */
+  pollCount: () => number;
+  close: () => Promise<void>;
+}
+
+/**
+ * A mock engine that gates the push: POST /nests/:id/publish answers 202 with a
+ * pending_confirmation envelope, and GET /nests/:id/pending-pushes/:pid returns
+ * the next body in `pollSequence` (repeating the last), so the CLI's confirm-gate
+ * polling can be driven end to end. The first terminal poll returns immediately,
+ * so tests never pay the real backoff.
+ */
+function startGatedEngine(pollSequence: Array<Record<string, unknown>>): Promise<GatedServer> {
+  const polls = [...pollSequence];
+  return new Promise((resolve) => {
+    let captured: unknown;
+    let gets = 0;
+    const server: Server = createServer((req, res) => {
+      if (req.method === "POST") {
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          captured = JSON.parse(raw);
+          const nest = (req.url ?? "").split("/")[2] ?? "nest-1";
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              status: "pending_confirmation",
+              pending_id: "pid1",
+              confirm_url: "https://ui.example/confirm/pid1",
+              poll_url: `/nests/${nest}/pending-pushes/pid1`,
+              message: "This nest requires confirmation before the push is applied.",
+              expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+            }),
+          );
+        });
+        return;
+      }
+      // GET poll
+      gets++;
+      const body = polls.length > 1 ? polls.shift()! : polls[0];
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    server.listen(0, () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        url: `http://localhost:${port}`,
+        lastBody: () => captured,
+        pollCount: () => gets,
+        close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
+}
+
 let tmp: string;
 
 beforeEach(() => {
@@ -946,6 +1028,68 @@ describe("[regression] ctx push", () => {
       expect(res.stdout).toMatch(/No documents to push/);
     } finally {
       rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  // ─── confirmation gate (202) ────────────────────────────────────────────────
+  // A gated nest parks the push for a human to confirm and answers 202 instead
+  // of applying. The CLI must recognize that, surface the confirm URL, and (by
+  // default) poll to the decision — never misreport the pending 202 as applied.
+
+  it("a gated push (202) polls to 'applied' and reports the confirmed count (exit 0)", async () => {
+    const server = await startGatedEngine([{ status: "applied", applied_node_count: 1, decided_by: "steward@ex" }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toMatch(/Pushed 1 document/);
+      expect(server.pollCount()).toBeGreaterThanOrEqual(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a gated push that is rejected exits non-zero and says nothing was applied", async () => {
+    const server = await startGatedEngine([{ status: "rejected", decided_by: "steward@ex" }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toMatch(/rejected/i);
+      expect(res.stdout).not.toMatch(/Pushed/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("--no-wait submits, prints the confirm URL, and exits 0 without polling", async () => {
+    const server = await startGatedEngine([{ status: "pending" }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+        "--no-wait",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).not.toMatch(/Pushed/);
+      expect(server.pollCount()).toBe(0);
+    } finally {
+      await server.close();
     }
   });
 });
