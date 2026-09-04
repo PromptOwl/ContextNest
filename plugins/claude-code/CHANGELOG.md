@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.1
+
+Retrieval worked on paper and returned nothing on Windows, and returned too
+little from any hosted nest. Both are fixed.
+
+- **The plugin can reach `ctx` on Windows.** Every hook shelled out with
+  `execFileSync("ctx", ...)` and no shell. npm installs `ctx` as a `.cmd` shim
+  there, and Node refuses to `execFile` one without a shell — it throws
+  `EINVAL`, which the `npx` fallback did not treat as "not found" either. The
+  result was silent: no error surfaced, hooks simply injected nothing, and the
+  SessionStart notice claimed the CLI was unavailable while `ctx` sat on PATH.
+  Windows now spawns through the shell, quoting each argument itself because
+  `cmd.exe` does not. macOS and Linux are untouched — `ctx` is a shebang symlink
+  there, so the branch never runs.
+- **A remote nest is no longer read 50 documents at a time.** The whole-vault
+  `ctx list` scans passed no `--limit`, and a hosted nest pages `list` at 50 by
+  default. A 166-document nest was seen as its first 50: the `query` tier built
+  its id→tag map from that slice and fell back to flat search whenever a seed
+  sat outside it, and the straggler sweep's tag channel missed anything past the
+  cut — the exact half-swept vault the sweep exists to prevent. Both scans now
+  ask for what they need. Local vaults were never affected.
+
 ## 0.5.0
 
 An update now lands in every node that carries the fact, across every nest that

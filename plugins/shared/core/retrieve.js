@@ -27,6 +27,7 @@ import {
   runAsHook,
   isMain,
   MAX_HITS,
+  MAX_LIST_SCAN,
 } from "./lib.js";
 import { correctionIntent } from "./signals.js";
 import { loadLedger, saveLedger } from "./ledger.js";
@@ -130,7 +131,11 @@ function formatQuery(exec, config, hits) {
   const blocks = [];
   for (const [vaultKey, ids] of byVault) {
     const alias = vaultKey || null;
-    const docs = ctxJson(exec, withVault(["list", "--json"], alias), []);
+    const docs = ctxJson(
+      exec,
+      withVault(["list", "--json", "--limit", String(MAX_LIST_SCAN)], alias),
+      [],
+    );
     const tagOf = new Map(
       (Array.isArray(docs) ? docs : []).map((d) => [d.id, d.tags || []]),
     );
