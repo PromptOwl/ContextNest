@@ -48,6 +48,8 @@ import {
   squish,
   VALID_CAPTURE_MODES,
   VALID_RETRIEVAL_MODES,
+  makeExec,
+  winQuote,
 } from "../shared/core/lib.js";
 
 /** Transcript stub in the shape the gate's reader returns. */
@@ -98,21 +100,23 @@ function additional(out: any): string | undefined {
 }
 
 // getConfig() reads real override files when the caller doesn't inject
-// cwd/homedir (sessionStart never does). Point HOME and the project dir at an
+// cwd/homedir (sessionStart never does). Point the home and project dirs at an
 // empty temp dir so a developer's own ~/.contextnest/plugin-settings.json can't
-// leak into these assertions. Node's os.homedir() honours $HOME on POSIX.
-const realHome = process.env.HOME;
-const realProjectDir = process.env.CLAUDE_PROJECT_DIR;
+// leak into these assertions. os.homedir() reads $HOME on POSIX and
+// %USERPROFILE% on Windows — setting only HOME leaves Windows unisolated, where
+// a real pinned vault turns eight of these into failures.
+const realEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR };
 beforeAll(() => {
   const empty = mkdtempSync(join(tmpdir(), "cn-no-settings-"));
   process.env.HOME = empty;
+  process.env.USERPROFILE = empty;
   process.env.CLAUDE_PROJECT_DIR = empty;
 });
 afterAll(() => {
-  if (realHome === undefined) delete process.env.HOME;
-  else process.env.HOME = realHome;
-  if (realProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
-  else process.env.CLAUDE_PROJECT_DIR = realProjectDir;
+  for (const [key, value] of Object.entries(realEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe("getConfig", () => {
@@ -743,7 +747,7 @@ describe("sweep-check", () => {
   it("findStragglers: the tag channel catches a paraphrased node search cannot see", () => {
     const exec = fakeExec([
       // Tagged with the entity, body words the fact without the literal term.
-      ["list --tag redis --json --vault mkt", [{ id: "nodes/brand" }]],
+      ["list --tag redis", [{ id: "nodes/brand" }]],
       ["read nodes/brand --raw --vault mkt", "---\nt: x\n---\nOur flagship in-memory engine."],
       ["search redis --json --vault mkt", []],
     ]);
@@ -755,7 +759,7 @@ describe("sweep-check", () => {
 
   it("findStragglers: a node hit by both channels is reported once, as a straggler", () => {
     const exec = fakeExec([
-      ["list --tag redis --json", [{ id: "nodes/both" }]],
+      ["list --tag redis", [{ id: "nodes/both" }]],
       ["search redis --json", [{ id: "nodes/both" }]],
       ["read nodes/both --raw", "---\nt: x\n---\nStill uses Redis."],
     ]);
@@ -1187,5 +1191,45 @@ describe("capture-gate", () => {
     expect(isSubstantive(['{"role":"assistant","tool_use":1}'])).toBe(true);
     expect(isSubstantive([])).toBe(false);
     expect(isSubstantive(['{"role":"user"}', '{"role":"assistant"} short'])).toBe(false);
+  });
+});
+
+describe("makeExec", () => {
+  // The Windows shim path is the whole reason this quoting exists: npm installs
+  // ctx as ctx.cmd there, Node refuses to execFile a .cmd without a shell, and
+  // cmd.exe does no quoting of its own. On mac/linux `ctx` is a shebang symlink
+  // that execve handles directly, so none of this is engaged.
+  it("winQuote leaves shell-safe argv entries untouched", () => {
+    expect(winQuote("search")).toBe("search");
+    expect(winQuote("--json")).toBe("--json");
+    expect(winQuote("nodes/backend/auth")).toBe("nodes/backend/auth");
+  });
+
+  it("winQuote wraps anything cmd.exe would split or interpret", () => {
+    expect(winQuote("public nest sharing")).toBe('"public nest sharing"');
+    expect(winQuote("#a | #b")).toBe('"#a | #b"');
+    expect(winQuote("")).toBe('""');
+  });
+
+  it("winQuote doubles backslash runs that would escape the closing quote", () => {
+    expect(winQuote("C:\\Program Files\\ctx\\")).toBe('"C:\\Program Files\\ctx\\\\"');
+    expect(winQuote('say "hi"')).toBe('"say \\"hi\\""');
+  });
+
+  it("runs a real command and returns its stdout on every platform", () => {
+    const exec = makeExec({ ctxCommand: process.execPath });
+    const res = exec(["--version"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe(process.version);
+  });
+
+  // Deliberately not "the command is missing": that path ENOENTs into the npx
+  // fallback, which resolves the real CLI off the network and legitimately
+  // succeeds. A command that runs and fails is the case worth pinning — hooks
+  // must never break a session, so a non-zero exit is reported, never thrown.
+  it("reports a failing command instead of throwing", () => {
+    const exec = makeExec({ ctxCommand: process.execPath });
+    const res = exec(["-e", "process.exit(3)"]);
+    expect(res.status).toBe(3);
   });
 });

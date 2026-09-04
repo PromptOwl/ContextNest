@@ -16,10 +16,31 @@ import { readFileSync } from "node:fs";
 import { homedir as osHomedir } from "node:os";
 import { join } from "node:path";
 
+/** Windows needs shell-based spawning for npm's .cmd shims — see makeExec. */
+const WIN32 = process.platform === "win32";
+
+/**
+ * Quote one argv entry for cmd.exe, which passes the command line through
+ * verbatim. Backslash runs before a quote (and before the closing quote) are
+ * doubled, per the Windows argv parsing rules.
+ * ponytail: `%VAR%` inside a quoted arg still expands; no cmd.exe escape for it.
+ */
+export function winQuote(s) {
+  const str = String(s);
+  if (str !== "" && !/[\s"^&|<>()%!]/.test(str)) return str;
+  return `"${str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+}
+
 /** Default cap on how many registered vaults the cheap tiers fan out across. */
 export const MAX_FANOUT_VAULTS = 5;
 /** Default cap on how many retrieval hits we inject. */
 export const MAX_HITS = 6;
+/**
+ * Explicit `--limit` for whole-vault `ctx list` scans. A remote nest pages
+ * `list` at 50 by default, which silently truncated the id→tag map the query
+ * tier builds and the straggler sweep; local vaults return everything anyway.
+ */
+export const MAX_LIST_SCAN = 1000;
 
 /** Project-level settings override, relative to the project root. */
 export const PROJECT_SETTINGS_FILE = join(".claude", "contextnest.local.json");
@@ -227,13 +248,22 @@ export function makeExec(config, opts = {}) {
 
   const attempt = (cmd, args) => {
     try {
-      const stdout = execFileSync(cmd, args, {
-        cwd,
-        env,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-        maxBuffer: 16 * 1024 * 1024,
-      });
+      const stdout = execFileSync(
+        WIN32 ? winQuote(cmd) : cmd,
+        WIN32 ? args.map(winQuote) : args,
+        {
+          cwd,
+          env,
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "pipe"],
+          maxBuffer: 16 * 1024 * 1024,
+          // npm installs ctx/npx as .cmd shims on Windows, and Node refuses to
+          // execFile those without a shell (CVE-2024-27980) — it throws EINVAL,
+          // not ENOENT, so the npx fallback never fires either. Run through the
+          // shell there; cmd.exe does no quoting of its own, hence winQuote.
+          shell: WIN32,
+        },
+      );
       return { status: 0, stdout, stderr: "" };
     } catch (err) {
       return {
@@ -247,7 +277,8 @@ export function makeExec(config, opts = {}) {
 
   return (args) => {
     const res = attempt(config.ctxCommand, args);
-    if (res.code === "ENOENT") {
+    // EINVAL: shell-less .cmd refusal on older Node. ENOENT: no global install.
+    if (res.code === "ENOENT" || res.code === "EINVAL") {
       return attempt("npx", ["-y", "@promptowl/contextnest-cli", ...args]);
     }
     return res;
