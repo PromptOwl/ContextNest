@@ -111,6 +111,13 @@ import {
   assertNotRedirected,
   NO_REDIRECT,
 } from "./safety.js";
+import {
+  asPendingConfirmation,
+  pollUntilDecided,
+  resolveTimeoutMs,
+  exitCodeFor,
+  type TerminalOutcome,
+} from "./push-confirm.js";
 
 const program = new Command();
 
@@ -2349,6 +2356,33 @@ program
 
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
+/** Print the terminal result of a gated push. Success stays on stdout. */
+function reportPushOutcome(outcome: TerminalOutcome): void {
+  switch (outcome.kind) {
+    case "applied": {
+      const n = outcome.result.applied_node_count ?? outcome.result.doc_count ?? 0;
+      console.log(chalk.green(`Pushed ${n} document${n !== 1 ? "s" : ""}`));
+      if (outcome.result.decided_by) console.log(chalk.dim(`  confirmed by ${outcome.result.decided_by}`));
+      return;
+    }
+    case "rejected":
+      console.error(
+        chalk.red(
+          `Push rejected${outcome.result.decided_by ? ` by ${outcome.result.decided_by}` : ""} — nothing was applied.`,
+        ),
+      );
+      return;
+    case "expired":
+      console.error(chalk.red("Push expired before it was confirmed — nothing was applied."));
+      return;
+    case "timeout":
+      console.error(
+        chalk.yellow("Timed out waiting for confirmation. The push is still pending — confirm it in the UI."),
+      );
+      return;
+  }
+}
+
 program
   .command("push")
   .description("Push the local vault to a hosted ContextNest server")
@@ -2356,6 +2390,22 @@ program
   .requiredOption("--nest <id>", "Target nest ID")
   .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
+  .option(
+    "--no-wait",
+    "For a nest that gates pushes: submit, print the confirmation URL, and exit without waiting for the decision",
+  )
+  .option(
+    "--timeout <sec>",
+    "Max seconds to wait for a gated push to be confirmed (default: the server's window, else 15m)",
+    (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error(chalk.red("--timeout must be a positive number of seconds."));
+        process.exit(1);
+      }
+      return n;
+    },
+  )
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
@@ -2427,13 +2477,55 @@ program
       // every document body to an unvalidated destination.
       assertNotRedirected(res, "--server");
 
-      if (!res.ok) {
+      if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
         process.exit(1);
       }
 
-      const data = (await res.json()) as { published: number; context_md_updated: boolean; node_ids: string[] };
+      const payload = await res.json().catch(() => null);
+
+      // A gated nest does not apply the push; it parks it for a human to
+      // confirm in the UI and answers 202. Treating that as success (any 2xx
+      // used to print "Pushed N") would misreport a push that never landed.
+      const pending = asPendingConfirmation(res.status, payload);
+      if (pending) {
+        console.log(chalk.yellow(pending.message || "This nest requires confirmation before the push is applied."));
+        console.log(chalk.cyan(`Confirm in the UI: ${pending.confirm_url}`));
+
+        // --no-wait → commander sets opts.wait = false.
+        if (opts.wait === false) {
+          console.error(chalk.dim("Submitted. Not waiting for the decision (--no-wait)."));
+          return; // exit 0: the submission itself succeeded
+        }
+
+        const timeoutMs = resolveTimeoutMs(opts.timeout as number | undefined, pending.expires_at);
+        console.error(chalk.dim("Waiting for confirmation… (Ctrl-C to stop; the push stays pending)"));
+
+        let printedProgress = false;
+        const outcome = await pollUntilDecided({
+          serverUrl,
+          pollUrl: pending.poll_url,
+          apiKey,
+          timeoutMs,
+          onPending: () => {
+            printedProgress = true;
+            process.stderr.write(chalk.dim("."));
+          },
+        });
+        if (printedProgress) process.stderr.write("\n");
+        reportPushOutcome(outcome);
+        process.exit(exitCodeFor(outcome));
+      }
+
+      if (res.status === 202) {
+        // 202, but not the pending-confirmation envelope we understand — do not
+        // claim success for a response whose meaning we can't read.
+        console.error(chalk.red("Push returned 202 with an unrecognized body — treating as not applied."));
+        process.exit(1);
+      }
+
+      const data = (payload ?? {}) as { published: number; context_md_updated: boolean; node_ids: string[] };
       console.log(chalk.green(`Pushed ${data.published} document${data.published !== 1 ? "s" : ""}`));
       if (data.context_md_updated) console.log(chalk.green("  CONTEXT.md updated"));
       for (const id of data.node_ids) {
