@@ -169,6 +169,35 @@ describe("selector grammar — bare node ids (nodes/<id>, sources/<id>)", () => 
     expect(parseSelector("nodes/a-b")).toEqual({ type: "uri", value: "contextnest://nodes/a-b" });
   });
 
+  it("a QUOTED bare id gets the scheme too (review on PR #100)", () => {
+    expect(parseSelector('"nodes/gtm/foo"')).toEqual({
+      type: "uri",
+      value: "contextnest://nodes/gtm/foo",
+    });
+    expect(parseSelector('"sources/feed"')).toEqual({
+      type: "uri",
+      value: "contextnest://sources/feed",
+    });
+    expect(parseSelector('"nodes/gtm/foo" | nodes/other')).toEqual({
+      type: "or",
+      left: { type: "uri", value: "contextnest://nodes/gtm/foo" },
+      right: { type: "uri", value: "contextnest://nodes/other" },
+    });
+  });
+
+  it("a mis-cased prefix (Nodes/foo) is hinted as nodes/foo, never nodes/Nodes/foo", () => {
+    let msg = "";
+    try {
+      parseSelector("Nodes/foo");
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).toContain('Unexpected token "Nodes/foo" at position 0');
+    expect(msg).toContain('did you mean "nodes/foo"');
+    expect(msg).not.toContain("nodes/Nodes");
+    expect(() => parseSelector("SOURCES/feed")).toThrow(/did you mean "sources\/feed"/);
+  });
+
   it("emits a URI token whose position is where the bare id started", () => {
     const tokens = tokenize("#x nodes/y");
     expect(tokens[1]).toEqual({ type: "URI", value: "contextnest://nodes/y", position: 3 });
@@ -283,6 +312,14 @@ describe("bare node ids through the query engine", () => {
     expect(and.documents.map((d) => d.id)).toEqual(["nodes/gtm/foo"]);
     const or = await gqe.query("nodes/gtm/foo | nodes/gtm/bar", { hops: 0 });
     expect(or.documents.map((d) => d.id).sort()).toEqual(["nodes/gtm/bar", "nodes/gtm/foo"]);
+  });
+
+  it("the quoted form resolves the same doc as the unquoted form", async () => {
+    const gqe = new GraphQueryEngine(storage);
+    const quoted = await gqe.query('"nodes/gtm/foo"', { hops: 0 });
+    const bare = await gqe.query("nodes/gtm/foo", { hops: 0 });
+    expect(quoted.documents.map((d) => d.id)).toEqual(bare.documents.map((d) => d.id));
+    expect(quoted.documents.map((d) => d.id)).toEqual(["nodes/gtm/foo"]);
   });
 
   it("context_resolve lists it", async () => {
