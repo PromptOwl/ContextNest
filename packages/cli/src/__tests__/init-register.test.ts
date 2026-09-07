@@ -13,6 +13,9 @@ const distPath = join(here, "..", "..", "dist", "index.js");
 // after the suite.
 const NON_TMP_ROOT = join(here, "..", "..", ".tmp-test");
 
+// Paths that round-trip through the CLI's cwd come back canonical (macOS:
+// /private/var for the /var tmpdir symlink; Windows: 8.3 names expanded), so
+// every comparison against a mkdtemp path goes through realpath on both sides.
 function realpath(p: string): string {
   try {
     return realpathSync.native(p);
@@ -57,6 +60,15 @@ describe("ctx init — registration under the OS temp dir", () => {
     return existsSync(p) ? readFileSync(p, "utf-8") : "";
   }
 
+  /** Registered local vault paths, canonicalised (see realpath above). */
+  function registeredPaths(): string[] {
+    const list = JSON.parse(run(["vault", "list", "--json"], tmp)) as Array<{
+      kind: string;
+      path?: string;
+    }>;
+    return list.filter((v) => v.kind === "local").map((v) => realpath(v.path ?? ""));
+  }
+
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), "cn-init-reg-"));
     cfgDir = join(tmp, "cfg");
@@ -94,7 +106,7 @@ describe("ctx init — registration under the OS temp dir", () => {
     expect(out).toContain("Registered vault");
     expect(out).not.toContain("Not registering");
     expect(registryText()).toContain("scratch");
-    expect(registryText()).toContain(dir);
+    expect(registeredPaths()).toContain(realpath(dir));
   });
 
   it("an explicit --vault <alias> is a registration request too", () => {
@@ -117,7 +129,7 @@ describe("ctx init — registration under the OS temp dir", () => {
       const out = run(["init", "--name", "Real"], dir);
       expect(out).toContain("Registered vault");
       expect(out).not.toContain("Not registering");
-      expect(registryText()).toContain(realpath(dir));
+      expect(registeredPaths()).toContain(realpath(dir));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

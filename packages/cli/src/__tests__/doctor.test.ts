@@ -1,6 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  chmodSync,
+  realpathSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +21,19 @@ const cliPkg = JSON.parse(readFileSync(join(here, "..", "..", "package.json"), "
 const enginePkg = JSON.parse(
   readFileSync(join(here, "..", "..", "..", "engine", "package.json"), "utf-8"),
 ) as { version: string };
+
+/**
+ * Paths that round-trip through a child process's cwd come back canonical:
+ * macOS reports /private/var for the /var tmpdir symlink, Windows may expand
+ * an 8.3 short name. Compare on the realpath of both sides.
+ */
+function real(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return p;
+  }
+}
 
 interface DoctorReport {
   cli: { version: string };
@@ -117,7 +138,7 @@ describe("ctx doctor", () => {
     expect(report.registry.default_missing).toBe(true);
 
     expect(report.cwd.in_vault).toBe(true);
-    expect(report.cwd.vault_path).toBe(a);
+    expect(real(report.cwd.vault_path ?? "")).toBe(real(a));
     expect(report.cwd.alias).toBe("a");
 
     // No plugin manifest under the sandboxed CLAUDE_CONFIG_DIR.
