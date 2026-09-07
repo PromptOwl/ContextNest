@@ -11,7 +11,7 @@
  *   2. Unresolvable targets produce no edge but are counted in stats.
  *   3. A doc linking the same target via `contextnest://` AND `[[..]]` yields
  *      exactly one edge (dedupe by from/to/type).
- *   4. `buildBacklinks` sees the same edges, so INDEX.md backlinks and
+ *   4. `buildBacklinks` sees the same edges, so the engine backlinks API and
  *      context.yaml never disagree.
  *   5. A graph query seeded on the linking doc reaches the target in 1 hop.
  */
@@ -112,11 +112,55 @@ describe("buildRelationships — [[wikilinks]]", () => {
     expect(stats).toEqual({ edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 });
   });
 
-  it("AC4: buildBacklinks sees wikilink edges (INDEX.md backlinks stay consistent)", () => {
+  it("AC4: buildBacklinks sees wikilink edges (engine backlinks API stays consistent)", () => {
     const a = doc("nodes/a", "A", "[[B Title]]");
     const b = doc("nodes/b", "B Title", "");
     const backlinks = buildBacklinks([a, b]);
     expect(backlinks.get("nodes/b")).toEqual(["nodes/a"]);
+  });
+
+  // PR #97 review: a `#` inside a TITLE (`C#`, `Fix #123`) is not an anchor.
+  // The whole target must be tried first; only a miss falls back to
+  // stripping `#anchor`.
+  it("resolves titles that contain '#' before treating '#' as an anchor", () => {
+    const a = doc("nodes/a", "A", "[[C#]] [[Fix #123]] [[C# Guide#setup]]");
+    const csharp = doc("nodes/csharp", "C#", "");
+    const c = doc("nodes/c", "C", "");
+    const fix = doc("nodes/fix-123", "Fix #123", "");
+    const fixPrefix = doc("nodes/fix", "Fix", "");
+    const guide = doc("nodes/csharp-guide", "C# Guide", "");
+    const { edges, stats } = buildRelationshipsWithStats([a, csharp, c, fix, fixPrefix, guide]);
+    expect(refEdges(edges, "nodes/a").sort()).toEqual([
+      "nodes/csharp",
+      "nodes/csharp-guide",
+      "nodes/fix-123",
+    ]);
+    expect(stats.unresolvedWikilinks).toBe(0);
+  });
+
+  // PR #97 review: `extractContextLinks` masks fenced blocks and inline code;
+  // wikilinks must too, or a doc that DOCUMENTS the syntax becomes a hub.
+  it("ignores wikilinks inside fenced code blocks and inline code", () => {
+    const body = [
+      "Link syntax looks like `[[B Title]]` inline, or in a block:",
+      "",
+      "```md",
+      "[[B Title]]",
+      "```",
+      "",
+      "~~~",
+      "[[C Title]]",
+      "~~~",
+    ].join("\n");
+    const a = doc("nodes/a", "A", body);
+    const b = doc("nodes/b", "B Title", "");
+    const c = doc("nodes/c", "C Title", "");
+    const { edges, stats } = buildRelationshipsWithStats([a, b, c]);
+    expect(edges).toEqual([]);
+    expect(stats).toEqual({ edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 });
+
+    const plain = doc("nodes/a", "A", body + "\n\nBut a real [[B Title]] link counts.");
+    expect(refEdges(buildRelationships([plain, b, c]), "nodes/a")).toEqual(["nodes/b"]);
   });
 });
 
