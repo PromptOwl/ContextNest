@@ -39,6 +39,7 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import { sanitizeImportedFrontmatter, slugifyImportPath } from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -790,9 +791,59 @@ const packs: OperationExecutor = async (ctx) => {
 // Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
 const nests: OperationExecutor = () => ({ nests: listVaults() });
 
+/**
+ * Land one imported file. The path is slugified segment by segment so the id
+ * every later surface addresses is a clean one (`nodes/Dr. Smith.md` →
+ * `nodes/dr-smith.md`), and a markdown document that would not validate as
+ * it arrived — no title, a type outside the spec, tags with spaces — is
+ * repaired on the way in, each repair reported as a warning. A file that is
+ * already valid, and every non-document file (version histories, indexes),
+ * is written byte for byte: the source's frontmatter is its own.
+ *
+ * The title falls back to the ORIGINAL filename, human casing intact: after
+ * the rename only the slug survives, and `dr-smith` is a worse title than
+ * `Dr. Smith`.
+ */
+async function writeImportedFile(
+  ctx: OperationContext,
+  f: { path: string; content?: string },
+  warnings: string[],
+): Promise<void> {
+  const raw = String(f.path ?? "");
+  const relPath = slugifyImportPath(raw);
+  if (relPath !== raw) warnings.push(`${raw}: written as ${relPath} (path slugified)`);
+
+  let content = f.content ?? "";
+  const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
+  if (/\.md$/i.test(lastSegment) && !lastSegment.startsWith(".")) {
+    const id = relPath.replace(/\.md$/i, "");
+    let node: ContextNode | undefined;
+    try {
+      node = parseDocument(`${id}.md`, content, id);
+    } catch {
+      // Unparseable frontmatter is the author's to fix; land it as it came so
+      // nothing is lost, and let validate report it.
+    }
+    if (node) {
+      const { patch, warnings: repairs } = sanitizeImportedFrontmatter(
+        node,
+        lastSegment.replace(/\.md$/i, ""),
+      );
+      warnings.push(...repairs);
+      if (Object.keys(patch).length > 0) {
+        content = serializeDocument({ ...node, frontmatter: { ...node.frontmatter, ...patch } });
+      }
+    }
+  }
+  await ctx.storage.writeVaultFile(relPath, content);
+}
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
+  // Every repair the import made to something it did not author — a renamed
+  // path, a coerced type, a dropped tag. Reported, never fatal.
+  const warnings: string[] = [];
 
   // Ids of documents already in the vault publish as-is — their paths ARE their
   // ids, and the caller owns their frontmatter. Nothing is rewritten here.
@@ -806,7 +857,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   if (incoming.length > 0) {
     await mapInBatches(incoming, async (f) => {
       try {
-        await ctx.storage.writeVaultFile(f.path, f.content ?? "");
+        await writeImportedFile(ctx, f, warnings);
         written++;
       } catch (err) {
         failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
@@ -830,7 +881,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // A staging call — files written, publishing deferred to the caller's final
   // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
   if (input.publish === false) {
-    return { published: [], failed, checkpoint: null, written };
+    return {
+      published: [],
+      failed,
+      checkpoint: null,
+      written,
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 2 (discover): the vault itself is the input. The scan, the metadata
@@ -839,6 +896,11 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // ids back — that pass cost a second full round trip per document.
   let held: ContextNode[] = [];
   let scanned: ContextNode[] = [];
+  // Frontmatter repairs for the documents the scan owns, by id. A caller that
+  // wrote the files itself and only asks the engine to discover them gets the
+  // same hygiene as one that sent them through `files`: without it a note
+  // with no title or a `type: note` is published as-is and fails validate.
+  const repairs = new Map<string, Partial<Frontmatter>>();
   if (input.discover) {
     const exclude = new Set<string>(input.exclude_ids ?? []);
     // Ids the caller supplied itself, via `ids` or staged from `documents`.
@@ -849,6 +911,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
       if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
+        doc,
+        doc.id.split("/").pop() ?? doc.id,
+      );
+      warnings.push(...repaired);
+      if (Object.keys(patch).length > 0) repairs.set(doc.id, patch);
       // Publishing is opt-in. Only a file that EXPLICITLY says it is published
       // or approved gets published; everything else is held as a draft for a
       // human to approve, including a file that states no status at all.
@@ -900,6 +968,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
             discovered.has(node.id)
               ? {
                   title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...repairs.get(node.id),
                   ...(input.author ? { author: input.author } : {}),
                 }
               : null
@@ -914,7 +983,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   }
 
   if (!input.discover) {
-    return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
+    return {
+      published,
+      failed,
+      checkpoint,
+      ...(incoming.length ? { written } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 3b: held documents never reach the publish write, so this is their
@@ -934,9 +1009,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // re-import of an already-stamped vault free.
   await mapInBatches(held, async (doc) => {
     const authored = explicitStatus(doc);
-    const stamp: Record<string, unknown> = {};
+    const stamp: Record<string, unknown> = { ...repairs.get(doc.id) };
 
-    const title = doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    const title = stamp.title ?? doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
     if (doc.frontmatter.title !== title) stamp.title = title;
     if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
     // Only when the author stated nothing — an explicit `pending_review` or
@@ -962,12 +1037,14 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const asRecord = (doc: ContextNode) => {
     const version = publishedVersion.get(doc.id);
     const own = Number(doc.frontmatter.version);
+    // Report what was written, repairs included, not what was found.
+    const frontmatter = { ...doc.frontmatter, ...repairs.get(doc.id) };
     return {
       id: doc.id,
-      title: doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      title: frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
       version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
       status: version !== undefined ? ("published" as const) : ("draft" as const),
-      tags: normalizeTags(doc.frontmatter.tags) ?? [],
+      tags: normalizeTags(frontmatter.tags) ?? [],
       content: doc.body ?? "",
     };
   };
@@ -976,6 +1053,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     failed,
     checkpoint,
     ...(incoming.length ? { written } : {}),
+    ...(warnings.length ? { warnings } : {}),
     documents: [...scanned, ...held].map(asRecord),
   };
 };

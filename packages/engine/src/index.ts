@@ -363,6 +363,11 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+export {
+  slugifyImportPath,
+  sanitizeImportedFrontmatter,
+  sanitizeImportedTags,
+} from "./import-hygiene.js";
 export type { AgentConfigInput, AgentConfigFile } from "./agent-configs.js";
 
 // Tracing

@@ -917,6 +917,13 @@ const importOp: OperationDescriptor = {
     /** `files` only: how many were written in. */
     written: z.number().int().optional(),
     /**
+     * Repairs the import made to files it did not author — a path slugified,
+     * a missing title derived, a `type` outside the spec coerced to
+     * `document`, a tag that fails the tag rule dropped. One line each;
+     * present only when something was repaired.
+     */
+    warnings: z.array(z.string()).optional(),
+    /**
      * `discover` only: every document the scan took responsibility for,
      * published or held back. Carries what a governance layer needs to record
      * the import without re-reading the vault itself.

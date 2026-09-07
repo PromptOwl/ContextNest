@@ -1,0 +1,249 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { join } from "node:path";
+import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { NestStorage } from "../storage.js";
+import { GraphQueryEngine } from "../graph-query-engine.js";
+import { VersionManager } from "../versioning.js";
+import { parseDocument, validateDocument } from "../parser.js";
+import { createEngineApi, type OperationContext } from "../api/index.js";
+import { slugifyImportPath, sanitizeImportedFrontmatter } from "../import-hygiene.js";
+
+// CU-wdqcq01c61: folder import left title-less nodes at ids like
+// `nodes/Untitled 1` and `nodes/?tab=t.vdb3f3osszzz`, `type: note`, and tags
+// with spaces — so `ctx validate` failed on the vault and `ctx list` printed
+// `undefined`. Import now derives titles, slugifies ids, coerces unknown types
+// and sanitizes tags, reporting each fix as a warning.
+
+async function makeContext(): Promise<{ ctx: OperationContext; dir: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "contextnest-import-hygiene-"));
+  const storage = new NestStorage(dir);
+  return {
+    dir,
+    ctx: {
+      storage,
+      query: new GraphQueryEngine(storage),
+      versions: new VersionManager(storage),
+      actor: "tester@example.com",
+    },
+  };
+}
+
+type ImportResult = {
+  published: Array<{ id: string; version: number }>;
+  failed: Array<{ id?: string; title?: string; error: string }>;
+  checkpoint: number | null;
+  written?: number;
+  warnings?: string[];
+  documents?: Array<{ id: string; title: string; status: string; tags: string[] }>;
+};
+
+describe("slugifyImportPath", () => {
+  it("slugifies each segment, keeps the extension and the nodes/ root", () => {
+    expect(slugifyImportPath("nodes/Dr. Smith.md")).toBe("nodes/dr-smith.md");
+    expect(slugifyImportPath("nodes/?tab=t.vdb3f3osszzz.md")).toBe("nodes/tab-t-vdb3f3osszzz.md");
+    expect(slugifyImportPath("nodes/Untitled 1.md")).toBe("nodes/untitled-1.md");
+    expect(slugifyImportPath('nodes/My "Quoted" & Odd=Name#1.md')).toBe(
+      "nodes/my-quoted-odd-name-1.md",
+    );
+    expect(slugifyImportPath("Meeting Notes/Q3 Plan.md")).toBe("meeting-notes/q3-plan.md");
+  });
+
+  it("leaves an already-clean path alone, dot-directories included", () => {
+    expect(slugifyImportPath("nodes/handbook.md")).toBe("nodes/handbook.md");
+    expect(slugifyImportPath("nodes/my_doc-v2.md")).toBe("nodes/my_doc-v2.md");
+    expect(slugifyImportPath("nodes/.versions/handbook/history.yaml")).toBe(
+      "nodes/.versions/handbook/history.yaml",
+    );
+    expect(slugifyImportPath("context.yaml")).toBe("context.yaml");
+  });
+
+  it("renames a version directory the same way as its document", () => {
+    expect(slugifyImportPath("nodes/.versions/Dr. Smith/history.yaml")).toBe(
+      "nodes/.versions/dr-smith/history.yaml",
+    );
+  });
+
+  it("falls back to `untitled` for a segment with nothing slug-able", () => {
+    expect(slugifyImportPath("nodes/???.md")).toBe("nodes/untitled.md");
+  });
+});
+
+describe("sanitizeImportedFrontmatter", () => {
+  const node = (content: string, id = "nodes/dr-smith") =>
+    parseDocument(`${id}.md`, content, id);
+
+  it("derives a missing title from the first # heading, else the filename", () => {
+    const fromHeading = sanitizeImportedFrontmatter(node("# My Heading\ntext\n"), "Untitled 1");
+    expect(fromHeading.patch.title).toBe("My Heading");
+    const fromName = sanitizeImportedFrontmatter(node("no heading here\n## sub only\n"), "Dr. Smith");
+    expect(fromName.patch.title).toBe("Dr. Smith");
+    // Only a bare `# ` heading counts — `##` is a section, not a title.
+    expect(fromName.warnings).toHaveLength(0);
+  });
+
+  it("coerces an unknown type to document with one warning", () => {
+    const out = sanitizeImportedFrontmatter(node("---\ntitle: X\ntype: note\n---\nbody\n"), "x");
+    expect(out.patch.type).toBe("document");
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings[0]).toMatch(/type "note"/);
+  });
+
+  it("splits hashtag lists, drops invalid tags with a warning, keeps valid ones", () => {
+    const out = sanitizeImportedFrontmatter(
+      node('---\ntitle: X\ntags: ["bad tag", "#ok", "gtm #contextnest #promptowl", "ok"]\n---\nbody\n'),
+      "x",
+    );
+    expect(out.patch.tags).toEqual(["#ok", "#gtm", "#contextnest", "#promptowl"]);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings[0]).toMatch(/bad tag/);
+  });
+
+  it("returns an empty patch for a file with valid frontmatter (regression)", () => {
+    const out = sanitizeImportedFrontmatter(
+      node("---\ntitle: Handbook\ntype: document\ntags: [\"#a\", \"b\"]\nversion: 3\n---\nbody\n"),
+      "handbook",
+    );
+    expect(out.patch).toEqual({});
+    expect(out.warnings).toEqual([]);
+  });
+});
+
+describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () => {
+  let ctx: OperationContext;
+  let dir: string;
+
+  beforeEach(async () => {
+    ({ ctx, dir } = await makeContext());
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("slugifies ids, derives titles, coerces types and sanitizes tags", async () => {
+    const api = createEngineApi();
+    const staged = await api.run<ImportResult>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/Untitled 1.md", content: "# My Heading\ntext\n" },
+          {
+            path: "nodes/Dr. Smith.md",
+            content: '---\ntype: note\ntags: ["bad tag", "#ok"]\n---\n\nabout the doctor\n',
+          },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(staged.written).toBe(2);
+    expect(staged.failed).toEqual([]);
+    // Files landed under their slugified names, not the raw ones.
+    expect(existsSync(join(dir, "nodes", "untitled-1.md"))).toBe(true);
+    expect(existsSync(join(dir, "nodes", "dr-smith.md"))).toBe(true);
+    expect(existsSync(join(dir, "nodes", "Untitled 1.md"))).toBe(false);
+    expect(existsSync(join(dir, "nodes", "Dr. Smith.md"))).toBe(false);
+
+    const warnings = staged.warnings ?? [];
+    expect(warnings.some((w) => /nodes\/dr-smith/.test(w) && /type "note"/.test(w))).toBe(true);
+    expect(warnings.some((w) => /nodes\/dr-smith/.test(w) && /bad tag/.test(w))).toBe(true);
+
+    const out = await api.run<ImportResult>("context_import", { discover: true }, ctx);
+    const byId = new Map((out.documents ?? []).map((d) => [d.id, d]));
+    expect([...byId.keys()].sort()).toEqual(["nodes/dr-smith", "nodes/untitled-1"]);
+    expect(byId.get("nodes/untitled-1")!.title).toBe("My Heading");
+    expect(byId.get("nodes/dr-smith")!.title).toBe("Dr. Smith");
+
+    const smith = await api.run<{ frontmatter: { title: string; type: string; tags?: string[] } }>(
+      "context_get",
+      { id: "nodes/dr-smith" },
+      ctx,
+    );
+    expect(smith.frontmatter.title).toBe("Dr. Smith");
+    expect(smith.frontmatter.type).toBe("document");
+    expect(smith.frontmatter.tags).toEqual(["#ok"]);
+    const untitled = await api.run<{ frontmatter: { title: string; type: string } }>(
+      "context_get",
+      { id: "nodes/untitled-1" },
+      ctx,
+    );
+    expect(untitled.frontmatter.title).toBe("My Heading");
+    expect(untitled.frontmatter.type).toBe("document");
+
+    // The resulting vault validates — the same check `ctx validate` runs.
+    const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
+    expect(docs).toHaveLength(2);
+    for (const doc of docs) {
+      const result = validateDocument(doc);
+      expect(result.errors, doc.id).toEqual([]);
+    }
+  });
+
+  it("writes a file with valid frontmatter verbatim under its own id (regression)", async () => {
+    const api = createEngineApi();
+    const doc =
+      '---\ntitle: Handbook\ntype: snippet\ntags: ["#a", "b"]\nversion: 3\ncustom_key: keep me\n---\n\nbody\n';
+    const staged = await api.run<ImportResult>(
+      "context_import",
+      { files: [{ path: "nodes/handbook.md", content: doc }], publish: false },
+      ctx,
+    );
+    expect(staged.warnings ?? []).toEqual([]);
+    expect(await readFile(join(dir, "nodes/handbook.md"), "utf-8")).toBe(doc);
+
+    await api.run<ImportResult>("context_import", { discover: true }, ctx);
+    const got = await api.run<{ id: string; frontmatter: { title: string; type: string; tags?: string[] } }>(
+      "context_get",
+      { id: "nodes/handbook" },
+      ctx,
+    );
+    expect(got.id).toBe("nodes/handbook");
+    expect(got.frontmatter.title).toBe("Handbook");
+    expect(got.frontmatter.type).toBe("snippet");
+    expect(got.frontmatter.tags).toEqual(["#a", "#b"]);
+  });
+
+  it("sanitizes documents the caller wrote into the vault itself before discover", async () => {
+    // A folder importer that writes files directly (no files[] call) and only
+    // asks the engine to discover: the frontmatter still gets cleaned, for
+    // published and held documents alike.
+    const api = createEngineApi();
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(
+      join(dir, "nodes", "live.md"),
+      '---\ntype: note\nstatus: published\ntags: ["gtm #contextnest", "bad tag"]\n---\n# Live Heading\n\nbody\n',
+    );
+    await writeFile(join(dir, "nodes", "held.md"), "---\ntype: memo\n---\nno heading\n");
+
+    const out = await api.run<ImportResult>("context_import", { discover: true }, ctx);
+    expect(out.published.map((p) => p.id)).toEqual(["nodes/live"]);
+    expect(out.failed).toEqual([]);
+    const warnings = out.warnings ?? [];
+    expect(warnings.filter((w) => /type "note"/.test(w))).toHaveLength(1);
+    expect(warnings.filter((w) => /type "memo"/.test(w))).toHaveLength(1);
+    expect(warnings.filter((w) => /bad tag/.test(w))).toHaveLength(1);
+
+    const live = await api.run<{ frontmatter: { title: string; type: string; tags?: string[] } }>(
+      "context_get",
+      { id: "nodes/live" },
+      ctx,
+    );
+    expect(live.frontmatter.title).toBe("Live Heading");
+    expect(live.frontmatter.type).toBe("document");
+    expect(live.frontmatter.tags).toEqual(["#gtm", "#contextnest"]);
+
+    const held = await api.run<{ frontmatter: { title: string; type: string; status: string } }>(
+      "context_get",
+      { id: "nodes/held" },
+      ctx,
+    );
+    expect(held.frontmatter.title).toBe("held");
+    expect(held.frontmatter.type).toBe("document");
+    expect(held.frontmatter.status).toBe("draft");
+
+    for (const doc of await ctx.storage.discoverDocuments({ includeRetired: true })) {
+      expect(validateDocument(doc).errors, doc.id).toEqual([]);
+    }
+  });
+});

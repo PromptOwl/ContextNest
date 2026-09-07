@@ -2082,7 +2082,9 @@ program
         : doc.status === "rejected" ? chalk.red
         : chalk.yellow;
       console.log(`  ${chalk.cyan(doc.id)} [${doc.type}] ${statusColor(doc.status)}`);
-      console.log(`    ${doc.title}`);
+      // A node imported or hand-written without a title still has to be named
+      // in a listing — `undefined` is not a name.
+      console.log(`    ${doc.title || "(untitled)"}`);
     }
   });
 
