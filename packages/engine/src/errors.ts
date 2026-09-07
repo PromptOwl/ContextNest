@@ -177,8 +177,9 @@ export class UnknownAliasError extends ConfigError {
 
 /**
  * Raised when vault resolution fell through to the bare working directory
- * and that directory is not a vault (no `.context/config.yaml` and no
- * `context.yaml`). Reading it would report every `.md` under an arbitrary
+ * and that directory is not a vault root (no `.context/config.yaml`; a bare
+ * `context.yaml` does not count — that is the residue the old auto-index bug
+ * left behind). Reading it would report every `.md` under an arbitrary
  * folder as a draft document, and the first query would auto-index it —
  * writing a `context.yaml` into a directory the user never asked us to touch.
  * Refuse instead, and say how to pick a real vault.

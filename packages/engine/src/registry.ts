@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
-import { ConfigError, UnknownAliasError } from "./errors.js";
+import { ConfigError, NoVaultError, UnknownAliasError } from "./errors.js";
 import type { RemoteNestSpec, VaultRegistry, VaultRegistryEntry } from "./types.js";
 
 /**
@@ -728,5 +728,24 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     );
   }
   const { kind: _kind, ...resolved } = nest;
+  return resolved;
+}
+
+/**
+ * Refuse a resolution that landed on the bare working directory when that
+ * directory is not a vault root. Every other resolution source is validated
+ * with {@link isVaultRoot} before it is returned; the cwd fallback is the one
+ * step that hands back an unvalidated path, and operating on it is how a
+ * folder of repos gets read as documents (and, before the engine guard,
+ * auto-indexed). Shared by the CLI and the MCP server so both refuse with the
+ * same `NO_VAULT` error, which names the registered aliases as a way out.
+ *
+ * Returns the resolution unchanged when it is acceptable, so callers can
+ * write `assertVaultRoot(resolveVaultPath(opts))`.
+ */
+export function assertVaultRoot(resolved: ResolvedVault): ResolvedVault {
+  if (resolved.source === "cwd" && !isVaultRoot(resolved.path)) {
+    throw new NoVaultError(resolved.path, Object.keys(readRegistry().vaults));
+  }
   return resolved;
 }

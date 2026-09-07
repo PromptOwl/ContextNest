@@ -25,8 +25,7 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
-  NoVaultError,
-  isVaultRoot,
+  assertVaultRoot,
   generateContextYaml,
   generateIndexMd,
   generateAgentConfigs,
@@ -390,24 +389,13 @@ function getVaultRoot(): string {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
   // The bare-cwd fallback is the only step that hands back an unvalidated
-  // directory. Every other source is a vault by construction. Refuse here,
-  // centrally, so no command reads a folder of repos as documents or
-  // auto-indexes a context.yaml into it. `init` (getInitRoot) and the
-  // `vault *` registry commands never come through this helper.
-  if (resolved.source === "cwd" && !isVaultLike(resolved.path)) {
-    throw new NoVaultError(resolved.path, Object.keys(readRegistry().vaults));
-  }
+  // directory. Refuse it here, centrally (NO_VAULT), so no command reads a
+  // folder of repos as documents or auto-indexes a context.yaml into it.
+  // `init` (getInitRoot) and the `vault *` registry commands never come
+  // through this helper. Same engine guard as the MCP server.
+  assertVaultRoot(resolved);
   resolvedVaultRoot = resolved.path;
   return resolvedVaultRoot;
-}
-
-/**
- * A directory we are willing to operate on as a vault: a real vault root
- * (`.context/config.yaml`) or a legacy/index-only vault that has a
- * `context.yaml`.
- */
-function isVaultLike(dir: string): boolean {
-  return isVaultRoot(dir) || fs.existsSync(pathMod.join(dir, "context.yaml"));
 }
 
 // Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init

@@ -12,9 +12,10 @@ import {
   getRegistryDir,
   getRegistryPath,
   resolveVaultPath,
+  assertVaultRoot,
 } from "../registry.js";
 import { NestStorage } from "../storage.js";
-import { ConfigError } from "../errors.js";
+import { ConfigError, NoVaultError } from "../errors.js";
 
 /** Create a directory that looks like a vault (has .context/config.yaml). */
 function makeVault(root: string, name = "Test Vault"): string {
@@ -326,6 +327,51 @@ describe("vault registry", () => {
       mkdirSync(outside, { recursive: true });
       const r = resolveVaultPath({ cwd: outside });
       expect(r).toMatchObject({ path: outside, source: "cwd" });
+    });
+
+    it("6b. assertVaultRoot refuses the bare-cwd fallback when the dir is not a vault", () => {
+      // Register two, remove the (auto-promoted) default: "registered, but no
+      // default" is the shape where the cwd fallback is reached with aliases
+      // worth naming in the error.
+      removeVault("alpha");
+      removeVault("beta");
+      addVault("gamma", alpha);
+      addVault("delta", beta);
+      removeVault("gamma");
+      const outside = join(tmp, "outside3");
+      mkdirSync(outside, { recursive: true });
+      const r = resolveVaultPath({ cwd: outside });
+      expect(r.source).toBe("cwd");
+      let caught: unknown;
+      try {
+        assertVaultRoot(r);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(NoVaultError);
+      expect((caught as NoVaultError).code).toBe("NO_VAULT");
+      expect((caught as Error).message).toContain(`${outside} is not a Context Nest vault`);
+      expect((caught as Error).message).toContain("registered: delta");
+      // A bare context.yaml is not a vault either — that is the residue the
+      // old auto-index bug left behind, and must not re-admit the folder.
+      writeFileSync(join(outside, "context.yaml"), "version: 1\n");
+      expect(() => assertVaultRoot(resolveVaultPath({ cwd: outside }))).toThrow(NoVaultError);
+    });
+
+    it("6c. assertVaultRoot passes every real resolution through unchanged", () => {
+      const local = resolveVaultPath({ cwd: alpha });
+      expect(assertVaultRoot(local)).toBe(local);
+      // Even a cwd-sourced result is fine when the directory IS a vault root.
+      const cwdVault = { path: alpha, source: "cwd" as const };
+      expect(assertVaultRoot(cwdVault)).toBe(cwdVault);
+      // Empty registry → no alias list, point at `ctx vault list` instead.
+      removeVault("alpha");
+      removeVault("beta");
+      const outside = join(tmp, "outside4");
+      mkdirSync(outside, { recursive: true });
+      expect(() => assertVaultRoot(resolveVaultPath({ cwd: outside }))).toThrow(
+        /see "ctx vault list"/,
+      );
     });
 
     it("throws on an unknown alias", () => {

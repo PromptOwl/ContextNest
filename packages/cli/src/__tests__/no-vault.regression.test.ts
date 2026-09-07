@@ -134,6 +134,19 @@ describe("[regression] NO_VAULT — read commands refuse a non-vault cwd", () =>
     expect(readdirSync(plain).sort()).toEqual(["readme.md"]);
   });
 
+  it("a dir containing only a stray context.yaml is still refused", () => {
+    // Exactly the residue the old bug left behind. A bare context.yaml is not
+    // a vault (no .context/config.yaml) and must not re-admit the folder.
+    const polluted = tmp("cn-novault-polluted-");
+    writeFileSync(join(polluted, "context.yaml"), "version: 1\ndocuments: []\n");
+
+    const res = runCtxResult(polluted, ["list"]);
+
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("NO_VAULT");
+    expect(readdirSync(polluted).sort()).toEqual(["context.yaml"]);
+  });
+
   it("ctx add in a non-vault cwd also refuses and writes nothing", () => {
     const res = runCtxResult(plain, ["add", "nodes/stray", "--title", "Stray"]);
 
