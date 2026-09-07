@@ -12,9 +12,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { homedir as osHomedir } from "node:os";
-import { join } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { homedir as osHomedir, tmpdir as osTmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 /** Windows needs shell-based spawning for npm's .cmd shims — see makeExec. */
 const WIN32 = process.platform === "win32";
@@ -345,6 +345,77 @@ export function isVaultRegistered(alias, vaults) {
   return vaults.some((v) => v.alias === alias && v.exists !== false);
 }
 
+/** Best-effort canonical form of a path: realpath when it exists, else resolved. */
+function canonical(p) {
+  const abs = resolve(String(p));
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/**
+ * True when two paths name the same directory. Compared in both their given
+ * and realpath'd forms, so a symlinked temp dir (macOS `/var` → `/private/var`)
+ * or a path that doesn't exist yet still matches its twin.
+ */
+export function samePath(a, b) {
+  if (!a || !b) return false;
+  const forms = (p) => new Set([resolve(String(p)), canonical(p)]);
+  const fa = forms(a);
+  for (const f of forms(b)) if (fa.has(f)) return true;
+  return false;
+}
+
+/**
+ * True when `path` is `root` or lives under it. `path.relative` is already
+ * case-insensitive on Windows; realpath'd forms are compared too (see samePath).
+ */
+function isUnder(path, root) {
+  const inside = (p, r) => {
+    const rel = relative(r, p);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+  for (const r of [resolve(String(root)), canonical(root)]) {
+    for (const p of [resolve(String(path)), canonical(path)]) {
+      if (inside(p, r)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a vault path lives under the OS temp directory. Agents create
+ * scratch vaults there (and `ctx init` registers them), and nobody wants a
+ * throwaway's nodes injected into every prompt of a real session.
+ * `tmp` is injectable for tests; defaults to os.tmpdir().
+ */
+export function isTmpVaultPath(path, tmp = osTmpdir()) {
+  if (!path || !tmp) return false;
+  return isUnder(path, tmp);
+}
+
+/**
+ * The vault ctx resolves from the working directory alone, via
+ * `ctx vault which --json` (exec already runs in the hook's cwd). Only a
+ * `source: "local"` resolution counts — i.e. a `.context/config.yaml` found by
+ * walking up from cwd. A registry default, an env override, or the bare-cwd
+ * fallback is NOT a cwd vault. Returns `{ path, alias }` where `alias` is the
+ * registered alias for that same path when there is one (else null), or null
+ * when the cwd is not inside a vault (or ctx is too old to know `--json`).
+ *
+ * @param {(args:string[]) => any} exec
+ * @param {{alias:string, path?:string, exists?:boolean}[]} vaults from listVaults()
+ */
+export function cwdVault(exec, vaults = []) {
+  const which = ctxJson(exec, ["vault", "which", "--json"], null);
+  if (!which || typeof which !== "object" || Array.isArray(which)) return null;
+  if (which.kind !== "local" || which.source !== "local" || !which.path) return null;
+  const match = vaults.find((v) => v.exists !== false && v.path && samePath(v.path, which.path));
+  return { path: which.path, alias: match ? match.alias : null };
+}
+
 /**
  * Decide which vault aliases the cheap (non-agent) tiers should search.
  *
@@ -352,19 +423,37 @@ export function isVaultRegistered(alias, vaults) {
  *  - Pinned alias, NOT registered (stale/removed pin) → ignore the pin and
  *    behave as unpinned, rather than passing ctx a bad --vault that resolves to
  *    nothing. session-start surfaces a warning so this isn't silent.
- *  - Unpinned + registry     → fan out across registered vaults (capped).
- *  - Unpinned + empty registry → a single null target, i.e. let ctx resolve the
- *                                 local/default vault with no --vault flag.
+ *  - Unpinned → the vault in the working directory FIRST, then registered
+ *    vaults in registry order, capped at MAX_FANOUT_VAULTS in total.
+ *      · The cwd vault is targeted as `null` (no --vault, ctx resolves it
+ *        locally) and its hits are cited without an alias prefix. When that
+ *        same directory is also registered it is targeted by its alias
+ *        instead — once, still first — so a hit keeps a citable `alias:id`
+ *        and is never listed twice.
+ *      · Registry entries whose path is missing (`exists: false`) or lives
+ *        under os.tmpdir() (scratch vaults agents create) are skipped. A cwd
+ *        vault or a pin is a deliberate choice and is never filtered.
+ *  - Unpinned + nothing eligible + no cwd vault → a single null target, i.e.
+ *    let ctx resolve the local/default vault with no --vault flag.
  *
  * @param {ReturnType<typeof getConfig>} config
  * @param {(args:string[]) => any} exec
  * @returns {(string|null)[]} list of alias targets (null = ctx default resolution)
  */
 export function vaultTargets(config, exec) {
-  const vaults = listVaults(exec).filter((v) => v.exists !== false);
-  if (isVaultRegistered(config.vault, vaults)) return [config.vault];
-  if (vaults.length === 0) return [null];
-  return vaults.slice(0, MAX_FANOUT_VAULTS).map((v) => v.alias);
+  const present = listVaults(exec).filter((v) => v.exists !== false);
+  if (isVaultRegistered(config.vault, present)) return [config.vault];
+
+  const local = cwdVault(exec, present);
+  const targets = [];
+  if (local) targets.push(local.alias);
+  for (const v of present) {
+    if (targets.length >= MAX_FANOUT_VAULTS) break;
+    if (local && v.alias === local.alias) continue;
+    if (isTmpVaultPath(v.path)) continue;
+    targets.push(v.alias);
+  }
+  return targets.length === 0 ? [null] : targets;
 }
 
 /** Collapse internal whitespace and trim, for compact single-line context. */
