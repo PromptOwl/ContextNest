@@ -337,6 +337,17 @@ async function confirmRemoteWrite(
   await confirmOrExit(question, opts);
 }
 
+/**
+ * Folder segment of a document id — everything between the `nodes/` root and
+ * the final slug. `nodes/repo/thing` -> `repo`; `nodes/thing` -> `""`.
+ */
+export function folderFromId(id: string): string {
+  const segments = id.split("/");
+  if (segments[0] === "nodes") segments.shift();
+  segments.pop();
+  return segments.join("/");
+}
+
 export async function remoteAdd(
   target: RemoteTarget,
   path: string,
@@ -362,6 +373,13 @@ export async function remoteAdd(
       title,
       content: opts.body ? `\n${opts.body}\n` : `\n# ${title}\n\n`,
     };
+    // Send the folder alongside the id. A nest whose `context_create` predates
+    // the catalog's `id` parameter drops that key and derives the id from the
+    // title alone, filing every remote `ctx add nodes/<folder>/<slug>` flat at
+    // the nest root; `folder` has been in the op the whole time. A catalog-
+    // conformant nest is unaffected — an explicit `id` overrides `folder`.
+    const folder = folderFromId(id);
+    if (folder) input.folder = folder;
     if (opts.type) input.type = opts.type;
     if (tags) input.tags = tags;
 
