@@ -8,7 +8,12 @@ import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { parseDocument, validateDocument } from "../parser.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
-import { slugifyImportPath, sanitizeImportedFrontmatter } from "../import-hygiene.js";
+import {
+  slugifyImportPath,
+  sanitizeImportedFrontmatter,
+  sanitizeImportedTags,
+  firstHeading,
+} from "../import-hygiene.js";
 
 // CU-wdqcq01c61: folder import left title-less nodes at ids like
 // `nodes/Untitled 1` and `nodes/?tab=t.vdb3f3osszzz`, `type: note`, and tags
@@ -67,6 +72,33 @@ describe("slugifyImportPath", () => {
 
   it("falls back to `untitled` for a segment with nothing slug-able", () => {
     expect(slugifyImportPath("nodes/???.md")).toBe("nodes/untitled.md");
+  });
+});
+
+describe("firstHeading / sanitizeImportedTags — pathological input (CodeQL js/polynomial-redos)", () => {
+  // Document input reaches both; a `#` followed by thousands of tabs must
+  // neither hang nor yield anything.
+  const hostile = "#" + "\t".repeat(5000);
+
+  it("firstHeading returns nothing, fast, for a hash followed by 5000 tabs", () => {
+    const started = performance.now();
+    expect(firstHeading(hostile)).toBeUndefined();
+    expect(firstHeading(hostile + "\n" + hostile + " ##")).toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(200);
+  });
+
+  it("firstHeading still reads ordinary headings", () => {
+    expect(firstHeading("intro\n# Real Title ##\n## Section\n")).toBe("Real Title");
+    expect(firstHeading("## Only a section\n")).toBeUndefined();
+    expect(firstHeading("#NoSpace\n")).toBeUndefined();
+    expect(firstHeading("# Windows Title\r\nbody")).toBe("Windows Title");
+  });
+
+  it("sanitizeImportedTags yields no tags, fast, for a hash followed by 5000 tabs", () => {
+    const started = performance.now();
+    const out = sanitizeImportedTags([hostile, "#" + "\t\t".repeat(2500) + "#"], "x");
+    expect(out.tags).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(200);
   });
 });
 

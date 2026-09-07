@@ -54,11 +54,29 @@ export function slugifyImportPath(relPath: string): string {
     .join("/");
 }
 
-/** The first top-level `# Heading` in a markdown body, if there is one. */
+/**
+ * The first top-level `# Heading` in a markdown body, if there is one.
+ *
+ * A character walk rather than a regex: the body is document input, and the
+ * natural pattern (`^#[ \t]+(.+?)[ \t]*#*[ \t]*$`) has overlapping
+ * quantifiers that backtrack polynomially on a line of `#` followed by
+ * thousands of tabs (CodeQL js/polynomial-redos).
+ */
 export function firstHeading(body: string): string | undefined {
-  const match = /^#[ \t]+(.+?)[ \t]*#*[ \t]*$/m.exec(body);
-  const text = match?.[1]?.trim();
-  return text ? text : undefined;
+  for (const rawLine of body.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    // Exactly one `#`, then at least one space or tab: `##` is a section.
+    if (line.charCodeAt(0) !== 0x23 /* # */) continue;
+    const second = line.charAt(1);
+    if (second !== " " && second !== "\t") continue;
+    // Trailing closing hashes (`# Title ##`) are decoration, not title.
+    let end = line.length;
+    while (end > 1 && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
+    while (end > 1 && line[end - 1] === "#") end--;
+    const text = line.slice(1, end).trim();
+    if (text) return text;
+  }
+  return undefined;
 }
 
 /**
@@ -72,7 +90,12 @@ export function firstHeading(body: string): string | undefined {
 function splitTagEntry(raw: string): string[] {
   const bare = raw.startsWith("#") ? raw.slice(1) : raw;
   if (!bare.includes("#")) return [bare];
-  return bare.split(/[\s#]+/).filter(Boolean);
+  // Whitespace first, then `#` inside each token — two single-character
+  // splits, so nothing here backtracks on a long run of tabs.
+  return bare
+    .split(/\s+/)
+    .flatMap((token) => token.split("#"))
+    .filter(Boolean);
 }
 
 /**
