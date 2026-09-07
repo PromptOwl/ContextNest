@@ -247,6 +247,10 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // discoverDocuments() drops rejected nodes and the resolver indexes only
   // published ones; the isPublished filter is belt-and-braces so this
   // surface can never leak unpublished content.
+  // Note for the selector route (`context_query`): the evaluator keeps the
+  // order of a search URI only when it is the LEFTMOST operand — set
+  // intersection/union walk the left side first, so
+  // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
   if (!query) return { results: [], total: 0 };
   const docs = await ctx.storage.discoverDocuments();

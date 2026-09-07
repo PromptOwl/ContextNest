@@ -97,11 +97,16 @@ export function searchJsonEntry(d: SearchHitView) {
 export const DEFAULT_SEARCH_LIMIT = 10;
 
 /**
- * Turn the raw `--limit` value into the `limit` sent to `context_search`:
- * absent (or unparsable) → the default; `0` → undefined, i.e. everything.
+ * Turn the parsed `--limit` value into the `limit` sent to `context_search`:
+ * absent → the default; `0` → undefined, i.e. everything; `n` → `n`.
+ * The option parser rejects anything else before it gets here; this guard
+ * only keeps a programmatic caller honest.
  */
 export function searchLimit(raw: number | undefined): number | undefined {
-  if (raw === undefined || Number.isNaN(raw)) return DEFAULT_SEARCH_LIMIT;
+  if (raw === undefined) return DEFAULT_SEARCH_LIMIT;
+  if (!Number.isInteger(raw) || raw < 0) {
+    throw new Error("--limit must be 0 or a positive integer.");
+  }
   return raw > 0 ? raw : undefined;
 }
 

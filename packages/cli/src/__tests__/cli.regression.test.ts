@@ -577,6 +577,17 @@ describe("[regression] ctx search ranking and --limit", () => {
       expect(out).toMatch(/22 more/);
     });
   });
+
+  it.each(["-5", "abc", "2.5"])(
+    "rejects --limit %s with a clear message and exit 1",
+    (bad) => {
+      // Commander hands "-5" over as the value, so without a guard a negative
+      // limit silently meant "everything".
+      const res = runCtxResult(tmp, ["search", "needle", "--limit", bad]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toMatch(/--limit must be 0 or a positive integer/);
+    },
+  );
 });
 
 // ─── update ──────────────────────────────────────────────────────────────────

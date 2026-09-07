@@ -2181,7 +2181,16 @@ program
   .command("search <query>")
   .description("Full-text search across vault documents, best match first")
   .option("--json", "Output as JSON (each hit carries its relevance score)")
-  .option("--limit <n>", "Max results (default 10; 0 = all)", (v) => parseInt(v, 10))
+  .option("--limit <n>", "Max results (default 10; 0 = all)", (v) => {
+    // Commander hands "-5" over as the value, so validate here — once, ahead
+    // of both the local and the remote branch — rather than let a negative
+    // or fractional limit slip through as "everything".
+    if (!/^\d+$/.test(v.trim())) {
+      console.error(chalk.red("--limit must be 0 or a positive integer."));
+      process.exit(1);
+    }
+    return parseInt(v, 10);
+  })
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
