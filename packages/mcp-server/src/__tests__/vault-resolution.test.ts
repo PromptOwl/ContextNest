@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NoVaultError } from "@promptowl/contextnest-engine";
@@ -106,7 +106,9 @@ describe("resolveMcpVaultPath", () => {
     const prev = process.cwd();
     process.chdir(v);
     try {
-      expect(resolveMcpVaultPath(undefined)).toBe(v);
+      // process.cwd() is canonical on macOS (/private/var/...) while mkdtemp
+      // hands back the symlinked /var/... form; compare realpaths.
+      expect(realpathSync(resolveMcpVaultPath(undefined))).toBe(realpathSync(v));
     } finally {
       process.chdir(prev);
     }
