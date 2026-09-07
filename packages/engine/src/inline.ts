@@ -4,6 +4,12 @@
  */
 
 import type { ContextNode, RelationshipEdge } from "./types.js";
+import {
+  buildWikiTitleIndex,
+  extractWikiLinks,
+  resolveWikiTarget,
+  type WikiTitleIndex,
+} from "./wiki-graph.js";
 
 /**
  * Mark which lines sit inside a fenced code block, so link and heading
@@ -105,13 +111,52 @@ export function countTasks(body: string): { total: number; completed: number } {
   return { total: incomplete + complete, completed: complete };
 }
 
+/** How the relationship edge list was built — surfaced by `ctx index`. */
+export interface RelationshipStats {
+  /** Total edges emitted (after dedupe). */
+  edges: number;
+  /** Edges that exist only because of a `[[wikilink]]`. */
+  fromWikilinks: number;
+  /** `[[wikilinks]]` whose target matched no published document. */
+  unresolvedWikilinks: number;
+}
+
 /**
  * Build a relationship edge list from all documents.
- * Extracts `reference` edges from contextnest:// links
- * and `depends_on` edges from source node frontmatter.
+ * Extracts `reference` edges from contextnest:// links AND `[[wikilinks]]`,
+ * and `depends_on` edges from source node frontmatter. Edges are de-duplicated
+ * by (from, to, type); self-links are dropped.
+ *
+ * Wikilinks live here rather than in the index generator so that
+ * `buildBacklinks` (INDEX.md) and `generateContextYaml` (context.yaml) can
+ * never disagree about which edges exist. `[[Title]]`, `[[title]]`,
+ * `[[Title|alias]]`, `[[Title#anchor]]` and `[[nodes/id]]` all resolve
+ * through the same `wiki-graph` helpers the query side uses. A target that
+ * matches nothing produces no edge and is counted in `unresolvedWikilinks`.
+ *
+ * @param titleIndex Optional pre-built title index (e.g. when the caller has
+ *   already built one over the same documents); built from `documents` when
+ *   omitted. Only documents in the index can be wikilink targets, so passing
+ *   an index over a wider set than `documents` is the caller's decision.
  */
-export function buildRelationships(documents: ContextNode[]): RelationshipEdge[] {
+export function buildRelationshipsWithStats(
+  documents: ContextNode[],
+  titleIndex?: WikiTitleIndex,
+): { edges: RelationshipEdge[]; stats: RelationshipStats } {
   const edges: RelationshipEdge[] = [];
+  const seen = new Set<string>();
+  const stats: RelationshipStats = { edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 };
+
+  /** Push unless an identical (from, to, type) edge is already present. */
+  const add = (edge: RelationshipEdge): boolean => {
+    const key = `${edge.type}\u0000${edge.from}\u0000${edge.to}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    edges.push(edge);
+    return true;
+  };
+
+  const index = titleIndex ?? buildWikiTitleIndex(documents);
 
   for (const doc of documents) {
     // Extract reference edges from inline links
@@ -133,19 +178,44 @@ export function buildRelationships(documents: ContextNode[]): RelationshipEdge[]
         ? link
         : target;
 
-      edges.push({ from: doc.id, to, type: "reference" });
+      add({ from: doc.id, to, type: "reference" });
+    }
+
+    // Extract reference edges from [[wikilinks]]
+    for (const target of extractWikiLinks(doc.body)) {
+      const to = resolveWikiTarget(target, index);
+      if (to === null) {
+        // `[[#section]]` is a self-anchor, not a dangling link.
+        if (target.trim().startsWith("#")) continue;
+        stats.unresolvedWikilinks++;
+        continue;
+      }
+      if (to === doc.id) continue;
+      if (add({ from: doc.id, to, type: "reference" })) stats.fromWikilinks++;
     }
 
     // Extract depends_on edges from source node frontmatter
     if (doc.frontmatter.source?.depends_on) {
       for (const dep of doc.frontmatter.source.depends_on) {
         const target = dep.replace("contextnest://", "");
-        edges.push({ from: doc.id, to: target, type: "depends_on" });
+        add({ from: doc.id, to: target, type: "depends_on" });
       }
     }
   }
 
-  return edges;
+  stats.edges = edges.length;
+  return { edges, stats };
+}
+
+/**
+ * Build a relationship edge list from all documents.
+ * See `buildRelationshipsWithStats` — this is the same list without the counts.
+ */
+export function buildRelationships(
+  documents: ContextNode[],
+  titleIndex?: WikiTitleIndex,
+): RelationshipEdge[] {
+  return buildRelationshipsWithStats(documents, titleIndex).edges;
 }
 
 /**

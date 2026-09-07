@@ -210,7 +210,7 @@ Your vault files are untouched — no migration to run. Behaviour that changes:
 
 ## Graph Traversal
 
-Queries use `context.yaml` as a lightweight graph index. Instead of loading all documents into memory, the engine evaluates selectors against metadata, traverses relationship edges for N hops via BFS, and only loads bodies for reached nodes.
+Queries use `context.yaml` as a lightweight graph index. Instead of loading all documents into memory, the engine evaluates selectors against metadata, traverses relationship edges for N hops via BFS, and only loads bodies for reached nodes. `[[wikilinks]]` in document bodies become `reference` edges when the vault is indexed (`ctx index` reports how many, and how many failed to resolve), so wiki-style vaults traverse the same as ones linked with `contextnest://` URIs.
 
 ```bash
 ctx query "#engineering"           # Default: 2 hops from matched docs

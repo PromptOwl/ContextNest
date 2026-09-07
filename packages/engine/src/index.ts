@@ -254,9 +254,11 @@ export {
   extractMentions,
   countTasks,
   buildRelationships,
+  buildRelationshipsWithStats,
   buildBacklinks,
   extractSection,
 } from "./inline.js";
+export type { RelationshipStats } from "./inline.js";
 
 // Selector grammar
 export { tokenize } from "./selector/lexer.js";
@@ -272,6 +274,7 @@ export {
   extractWikiLinks,
   buildWikiTitleIndex,
   resolveWikiSeeds,
+  resolveWikiTarget,
   traverseWikiGraph,
 } from "./wiki-graph.js";
 export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
@@ -347,7 +350,8 @@ export {
 } from "./source-graph.js";
 
 // Index generation
-export { generateContextYaml } from "./index-generator.js";
+export { generateContextYaml, generateContextYamlWithStats } from "./index-generator.js";
+export type { GenerateContextYamlOptions } from "./index-generator.js";
 export { generateIndexMd } from "./index-md-generator.js";
 
 // Injection

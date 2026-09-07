@@ -79,11 +79,21 @@ export function buildWikiTitleIndex(docs: WikiDocLike[]): WikiTitleIndex {
   return { byTitle, byTitleLower, ids };
 }
 
-/** Resolve one wiki target (id or title, optionally wrapped in `[[ ]]`) to a node id. */
-function resolveTarget(target: string, index: WikiTitleIndex): string | null {
+/**
+ * Resolve one wiki target (id or title, optionally wrapped in `[[ ]]`, with an
+ * optional `#anchor` suffix) to a node id, or null when nothing matches.
+ * Shared by seed resolution here and by index-time edge extraction in
+ * `inline.ts` so a `[[..]]` resolves identically in both places.
+ */
+export function resolveWikiTarget(target: string, index: WikiTitleIndex): string | null {
   let t = target.trim();
   const wrapped = t.match(/^\[\[([^[\]]+)\]\]$/);
   if (wrapped) t = wrapped[1].split("|")[0].trim();
+  // `[[Title#section]]` — the anchor addresses a section of the target doc;
+  // the edge is to the doc. A bare `[[#section]]` is a self-anchor: no target.
+  const hash = t.indexOf("#");
+  if (hash !== -1) t = t.slice(0, hash).trim();
+  if (!t) return null;
   // Precedence: id match wins over title match. A string that is BOTH a node id
   // and some other doc's title resolves to the id. Intentional — ids are exact
   // and unambiguous; titles are user-authored free text and can collide.
@@ -98,7 +108,7 @@ function resolveTarget(target: string, index: WikiTitleIndex): string | null {
 export function resolveWikiSeeds(seeds: string[], index: WikiTitleIndex): string[] {
   const out = new Set<string>();
   for (const seed of seeds) {
-    const id = resolveTarget(seed, index);
+    const id = resolveWikiTarget(seed, index);
     if (id) out.add(id);
   }
   return [...out];
@@ -144,7 +154,7 @@ export function traverseWikiGraph(
   };
   for (const doc of docs) {
     for (const target of extractWikiLinks(doc.body)) {
-      const to = resolveTarget(target, index);
+      const to = resolveWikiTarget(target, index);
       if (to) link(doc.id, to);
     }
   }

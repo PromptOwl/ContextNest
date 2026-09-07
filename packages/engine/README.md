@@ -83,7 +83,7 @@ console.log(report.valid ? "Integrity OK" : `Tampering: ${report.errors}`);
 
 ## Graph Traversal
 
-The engine evaluates selectors against document metadata (no bodies loaded), then traverses relationship edges via BFS for N hops, loading bodies only for reached nodes.
+The engine evaluates selectors against document metadata (no bodies loaded), then traverses relationship edges via BFS for N hops, loading bodies only for reached nodes. `[[wikilinks]]` in document bodies (`[[Title]]`, `[[Title|alias]]`, `[[nodes/id]]`) are resolved at index time into `reference` edges alongside `contextnest://` links, so a wiki-style vault traverses the same way.
 
 - `depends_on` edges and edges to hub nodes are free (always traversed)
 - `reference` edges cost 1 hop
