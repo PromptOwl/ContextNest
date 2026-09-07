@@ -111,6 +111,15 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx query @org/pack` — Query from a cloud-hosted pack
 - `ctx resolve <selector>` — Execute a selector query
 
+### Connect an agent
+- `ctx connect claude` — Emit the Claude MCP configuration for the nest this CLI resolves to, ready to paste or apply
+- `ctx connect claude --surface desktop` — `claude_desktop_config.json` snippet plus the restart reminder
+- `ctx connect claude --surface web` — The custom-connector URL for claude.ai, plus the public-DNS note
+- `ctx connect claude --write` — Merge the block into `./.mcp.json` (keeps the project's other servers)
+- `ctx connect claude --run` — Run the `claude mcp add` line instead of printing it
+
+See [Connecting Claude](#connecting-claude) for what each surface emits and where the API key comes from.
+
 ### Versioning & Integrity
 - `ctx history <path>` — Show version history
 - `ctx history <path> --diff` — Include each version's unified diff from the one before
@@ -164,6 +173,49 @@ non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
 submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
 defaults to the server's window, else 15 minutes). Ungated nests apply
 immediately, exactly as before.
+
+### Connecting Claude
+
+`ctx connect claude` turns the nest this CLI already resolves to (`--vault`,
+`CONTEXTNEST_VAULT`, the registry default, or the vault you are standing in)
+into the exact configuration the chosen Claude surface wants. One command,
+nothing hand-assembled:
+
+```bash
+ctx connect claude                          # claude mcp add … line for Claude Code
+ctx connect claude --format json            # the same server as a .mcp.json block
+ctx connect claude --write                  # merged into ./.mcp.json
+ctx connect claude --run                    # registered with Claude Code directly
+ctx connect claude --surface desktop        # claude_desktop_config.json snippet
+ctx connect claude --surface web            # custom-connector URL for claude.ai
+```
+
+A registered HTTP nest emits an HTTP server; a local vault emits the stdio MCP
+server over its path (`contextnest-mcp` when it is on your PATH, `npx` otherwise).
+The MCP server is named after the nest alias unless you pass `--name`.
+
+**The configuration goes to stdout, the commentary to stderr**, so both of these
+work:
+
+```bash
+ctx connect claude | sh
+ctx connect claude --format json > .mcp.json
+```
+
+**Where the key comes from.** The registry entry's `bearer_env` (or
+`header_name`/`header_env`) wins, since that is the credential the rest of the
+CLI already uses for that nest; an entry with no auth falls back to
+`CONTEXTNEST_API_KEY`. There is no `--key` flag on purpose — argv is readable by
+every process on the box.
+
+**The key is never in the output.** The `claude mcp add` line carries `$VAR`,
+which your *shell* expands when you run it, so the secret stays out of shell
+history. The `.mcp.json` and desktop blocks carry `${VAR}`, which *Claude*
+expands when it reads the file, so the secret never lands in a file you might
+commit. The variable is read only to check that it is set: rather than emit an
+empty `Authorization` header that fails later with an opaque 401, the command
+errors and names the variable to export. A genuinely open nest takes
+`--no-auth`.
 
 ### Errors
 

@@ -1539,3 +1539,220 @@ describe("[regression] file safety — generic folder names in a vault", () => {
     expect(readFileSync(join(tmp, "nodes", "out", "formats.md"), "utf-8")).toContain("original");
   });
 });
+
+describe("[regression] ctx connect claude", () => {
+  // Gate: `ctx connect claude` → a working Claude connection in one command.
+  // These spawn the real CLI so the emitted config comes out of the same
+  // resolution path a user hits (registry → nest → surface). The per-surface
+  // shapes themselves are asserted in connect-claude.test.ts.
+
+  const KEY = "cnst_regression_secret";
+  let aliasSeq = 0;
+
+  /** Run the CLI with extra env, tolerating failure. */
+  function runConnect(
+    cwd: string,
+    args: string[],
+    extraEnv: NodeJS.ProcessEnv = {},
+  ): { status: number; stdout: string; stderr: string } {
+    const res = spawnSync("node", [distPath, ...args], {
+      cwd,
+      env: { ...ENV, ...extraEnv },
+      encoding: "utf-8",
+    });
+    return {
+      status: typeof res.status === "number" ? res.status : 1,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+    };
+  }
+
+  /** Register a fresh HTTP remote in the sandboxed registry; returns its alias. */
+  function addRemote(cwd: string, extra: string[] = []): string {
+    const alias = `nest${aliasSeq++}`;
+    runCtx(cwd, [
+      "vault", "add", alias, "--url", "https://nest.example.com/mcp", "--yes", ...extra,
+    ]);
+    return alias;
+  }
+
+  it("emits a working `claude mcp add` line for a registered HTTP nest", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias], {
+      CONTEXTNEST_API_KEY: KEY,
+    });
+
+    expect(res.status).toBe(0);
+    // stdout carries ONLY the line, so `ctx connect claude | sh` works.
+    expect(res.stdout.trim()).toBe(
+      `claude mcp add --transport http ${alias} https://nest.example.com/mcp ` +
+        `--header "Authorization: Bearer $CONTEXTNEST_API_KEY"`,
+    );
+    // The key itself never reaches either stream.
+    expect(res.stdout).not.toContain(KEY);
+    expect(res.stderr).not.toContain(KEY);
+  });
+
+  it("emits a paste-ready desktop snippet with the restart reminder", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias, "--surface", "desktop"], {
+      CONTEXTNEST_API_KEY: KEY,
+    });
+
+    expect(res.status).toBe(0);
+    expect(JSON.parse(res.stdout)).toEqual({
+      mcpServers: {
+        [alias]: {
+          type: "http",
+          url: "https://nest.example.com/mcp",
+          headers: { Authorization: "Bearer ${CONTEXTNEST_API_KEY}" },
+        },
+      },
+    });
+    expect(res.stderr).toMatch(/QUIT and reopen Claude Desktop/);
+    expect(res.stdout).not.toContain(KEY);
+    expect(res.stderr).not.toContain(KEY);
+  });
+
+  it("prints the connector URL and the public-DNS note for the web surface", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias, "--surface", "web"], {
+      CONTEXTNEST_API_KEY: KEY,
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe("https://nest.example.com/mcp");
+    expect(res.stderr).toMatch(/public DNS/);
+    expect(res.stderr).toMatch(/reload the conversation/i);
+  });
+
+  it("errors with how to authenticate when no key is available", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias], {
+      CONTEXTNEST_API_KEY: "",
+    });
+
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("CONTEXTNEST_API_KEY");
+    expect(res.stderr).toContain("--no-auth");
+    // Nothing that could be pasted: no half-built config on stdout.
+    expect(res.stdout.trim()).toBe("");
+  });
+
+  it("emits no header at all for an open nest under --no-auth", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias, "--no-auth"], {
+      CONTEXTNEST_API_KEY: "",
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stdout).not.toContain("--header");
+    expect(res.stdout).not.toMatch(/Bearer/);
+  });
+
+  it("uses the registry's own bearer_env when the entry names one", () => {
+    const alias = addRemote(tmp, ["--bearer-env", "WORK_NEST_KEY"]);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias], {
+      WORK_NEST_KEY: KEY,
+      CONTEXTNEST_API_KEY: "",
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain('--header "Authorization: Bearer $WORK_NEST_KEY"');
+    expect(res.stdout).not.toContain(KEY);
+  });
+
+  it("connects a LOCAL vault over stdio", () => {
+    initVault(tmp);
+    const res = runConnect(tmp, ["connect", "claude"]);
+
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/^claude mcp add \S+ -- /);
+    expect(res.stdout).toContain(tmp);
+  });
+
+  it("refuses when the cwd is not a vault, rather than emitting a dead config", () => {
+    // Its own empty registry: with no default alias to fall back on, resolution
+    // lands on the bare cwd — the case this guard exists for.
+    const res = runConnect(tmp, ["connect", "claude"], {
+      CONTEXTNEST_CONFIG_DIR: mkdtempSync(join(tmpdir(), "cn-connect-empty-")),
+    });
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/is not a vault/);
+    expect(res.stdout.trim()).toBe("");
+  });
+
+  it("merges into an existing .mcp.json without losing the other servers", () => {
+    const alias = addRemote(tmp);
+    writeFileSync(
+      join(tmp, ".mcp.json"),
+      JSON.stringify({ mcpServers: { other: { command: "other-server" } } }, null, 2),
+    );
+
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias, "--write", "--yes"], {
+      CONTEXTNEST_API_KEY: KEY,
+    });
+
+    expect(res.status).toBe(0);
+    const written = JSON.parse(readFileSync(join(tmp, ".mcp.json"), "utf-8"));
+    expect(Object.keys(written.mcpServers).sort()).toEqual([alias, "other"].sort());
+    // The `${VAR}` reference is what lands on disk — never the key, since
+    // .mcp.json is routinely committed.
+    expect(written.mcpServers[alias].headers.Authorization).toBe("Bearer ${CONTEXTNEST_API_KEY}");
+    expect(readFileSync(join(tmp, ".mcp.json"), "utf-8")).not.toContain(KEY);
+    // External writes are reported through the standard action log.
+    expect(res.stderr).toContain(".mcp.json");
+  });
+
+  it("--dry-run previews the .mcp.json write without touching the file", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(
+      tmp,
+      ["connect", "claude", "--vault", alias, "--write", "--yes", "--dry-run"],
+      { CONTEXTNEST_API_KEY: KEY },
+    );
+
+    expect(res.status).toBe(0);
+    expect(res.stderr).toMatch(/Dry run/);
+    expect(existsSync(join(tmp, ".mcp.json"))).toBe(false);
+  });
+
+  it("refuses to replace an existing server entry without consent", () => {
+    const alias = addRemote(tmp);
+    writeFileSync(
+      join(tmp, ".mcp.json"),
+      JSON.stringify({ mcpServers: { [alias]: { command: "stale" } } }),
+    );
+
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias, "--write"], {
+      CONTEXTNEST_API_KEY: KEY,
+    });
+
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Refusing without confirmation/);
+    expect(JSON.parse(readFileSync(join(tmp, ".mcp.json"), "utf-8")).mcpServers[alias]).toEqual({
+      command: "stale",
+    });
+  });
+
+  it("rejects an unknown surface instead of defaulting to one", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(tmp, ["connect", "claude", "--vault", alias, "--surface", "vscode"], {
+      CONTEXTNEST_API_KEY: KEY,
+    });
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Unknown --surface "vscode"/);
+    expect(res.stderr).toContain("code, desktop, web");
+  });
+
+  it("rejects --write on a surface that has no .mcp.json", () => {
+    const alias = addRemote(tmp);
+    const res = runConnect(
+      tmp,
+      ["connect", "claude", "--vault", alias, "--surface", "desktop", "--write"],
+      { CONTEXTNEST_API_KEY: KEY },
+    );
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/--write applies to `--surface code` only/);
+  });
+});

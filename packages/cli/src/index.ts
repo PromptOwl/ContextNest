@@ -3,6 +3,7 @@
  */
 
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
@@ -118,6 +119,16 @@ import {
   exitCodeFor,
   type TerminalOutcome,
 } from "./push-confirm.js";
+import {
+  CLAUDE_SURFACES,
+  authEnvVar,
+  mergeMcpJson,
+  planClaudeConnection,
+  resolveAuth,
+  serverBlock,
+  type ClaudeSurface,
+  type ConnectNest,
+} from "./connect-claude.js";
 
 const program = new Command();
 
@@ -193,7 +204,10 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   },
   {
     title: "Share",
-    commands: [["push", "Push the vault to a hosted ContextNest server"]],
+    commands: [
+      ["connect", "Wire this nest into Claude (Code, Desktop or claude.ai)"],
+      ["push", "Push the vault to a hosted ContextNest server"],
+    ],
   },
 ];
 
@@ -2535,6 +2549,253 @@ program
       console.error(chalk.red(`Push failed: ${err.message}`));
       process.exit(1);
     }
+  });
+
+// ─── ctx connect ─────────────────────────────────────────────────────────────
+// One command between "I have a nest" and "Claude can query it". The config
+// itself is built by the pure planner in connect-claude.ts; everything here is
+// the IO around it — resolving the nest, choosing an stdio command for a local
+// vault, and the three ways to apply the result (print / write / run).
+
+/**
+ * Is `bin` an executable on PATH? Used to pick between the installed
+ * `contextnest-mcp` binary and an `npx` fallback: emitting a command that is
+ * not on the user's PATH produces a config Claude accepts and then fails to
+ * start, which is exactly the broken-connection outcome this command exists to
+ * prevent.
+ */
+function onPath(bin: string): boolean {
+  const exts =
+    process.platform === "win32"
+      ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";")
+      : [""];
+  for (const dir of (process.env.PATH ?? "").split(pathMod.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      try {
+        if (fs.statSync(pathMod.join(dir, bin + ext)).isFile()) return true;
+      } catch {
+        // not here — keep looking
+      }
+    }
+  }
+  return false;
+}
+
+/** The stdio MCP command that serves a LOCAL vault. */
+function localMcpCommand(vaultPath: string): { command: string; args: string[] } {
+  return onPath("contextnest-mcp")
+    ? { command: "contextnest-mcp", args: [vaultPath] }
+    : { command: "npx", args: ["-y", "@promptowl/contextnest-mcp-server", vaultPath] };
+}
+
+const connectCmd = program
+  .command("connect")
+  .description("Wire this nest into a coding agent in one command");
+
+connectCmd
+  .command("claude")
+  .description("Emit (or apply) the Claude MCP configuration for the nest this CLI resolves to")
+  .option("--surface <surface>", `Claude surface: ${CLAUDE_SURFACES.join(" | ")}`, "code")
+  .option("--name <name>", "MCP server name Claude will show (default: the nest alias)")
+  .option("--scope <scope>", "Pass through to `claude mcp add --scope` (local | project | user)")
+  .option("--format <format>", "Surface `code` output: `line` (claude mcp add) or `json` (.mcp.json block)", "line")
+  .option("--write [path]", "Merge the block into a .mcp.json file instead of printing it (default: ./.mcp.json)")
+  .option("--run", "Run the `claude mcp add` line instead of printing it")
+  // Commander maps --no-auth onto opts.auth === false.
+  .option("--no-auth", "Emit no credential — only for a nest that accepts unauthenticated calls")
+  .action(async (opts) => {
+    const surface = opts.surface as ClaudeSurface;
+    if (!CLAUDE_SURFACES.includes(surface)) {
+      throw new ContextNestError(
+        `Unknown --surface "${opts.surface}" — expected one of: ${CLAUDE_SURFACES.join(", ")}.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    const format = opts.format as string;
+    if (format !== "line" && format !== "json") {
+      throw new ContextNestError(
+        `Unknown --format "${format}" — expected "line" or "json".`,
+        "VALIDATION_FAILED",
+      );
+    }
+    // Refuse a combination rather than silently ignore the flag: a user who
+    // passed --run and got a printout would reasonably believe it had run.
+    for (const [flag, set] of [
+      ["--run", Boolean(opts.run)],
+      ["--write", opts.write !== undefined],
+      ["--scope", opts.scope !== undefined],
+    ] as const) {
+      if (set && surface !== "code") {
+        throw new ContextNestError(
+          `${flag} applies to \`--surface code\` only — ${surface === "desktop" ? "Claude Desktop is configured by editing claude_desktop_config.json" : "claude.ai connectors are added in the web UI"}.`,
+          "VALIDATION_FAILED",
+        );
+      }
+    }
+    if (opts.run && opts.write !== undefined) {
+      throw new ContextNestError("Pass either --run or --write, not both.", "VALIDATION_FAILED");
+    }
+
+    // Same resolution every other command uses, so `--vault`, CONTEXTNEST_VAULT
+    // and the registry default all select the nest that gets connected.
+    const resolved = resolveNest({ vaultAlias: selectedVaultAlias, cwd: process.cwd() });
+    if (resolved.warning) console.error(chalk.yellow(`Warning: ${resolved.warning}`));
+
+    let nest: ConnectNest;
+    let endpointLabel: string;
+    if (resolved.kind === "remote") {
+      const spec = resolved.remote;
+      endpointLabel = describeRemoteEndpoint(spec);
+      nest =
+        spec.transport === "http"
+          ? {
+              kind: "http",
+              alias: resolved.alias,
+              url: spec.url,
+              auth: resolveAuth(spec, process.env, {
+                alias: resolved.alias,
+                allowNone: opts.auth === false,
+              }),
+            }
+          : {
+              kind: "stdio",
+              alias: resolved.alias,
+              command: spec.command,
+              args: spec.args ?? [],
+            };
+    } else {
+      // A bare-cwd fallback is not a nest. Emitting a config for it would hand
+      // Claude a server that exits on startup — say so here instead.
+      if (!fs.existsSync(pathMod.join(resolved.path, ".context", "config.yaml"))) {
+        throw new ContextNestError(
+          `No nest resolved — "${resolved.path}" is not a vault. Run \`ctx init\` here, ` +
+            `or select one with \`--vault <alias>\` (see \`ctx vault list\`).`,
+          "CONFIG_ERROR",
+        );
+      }
+      endpointLabel = resolved.path;
+      const local = localMcpCommand(resolved.path);
+      nest = { kind: "stdio", alias: resolved.alias ?? "contextnest", ...local };
+    }
+
+    const plan = planClaudeConnection(nest, {
+      surface,
+      name: opts.name as string | undefined,
+      scope: opts.scope as string | undefined,
+    });
+
+    // Everything below splits by channel on purpose: the CONFIG goes to stdout
+    // so `ctx connect claude | sh` and `… --format json > .mcp.json` both work,
+    // while the commentary goes to stderr where it can't corrupt either.
+    const commentary = (line: string) => console.error(line);
+    commentary(
+      chalk.dim(`Nest "${nest.alias}" → ${endpointLabel}`) +
+        chalk.dim(`  (server name: ${plan.serverName})`),
+    );
+
+    /**
+     * `credentialNote` describes the EMITTED text ("your shell expands $VAR"),
+     * so the --run path suppresses it: --run expanded the variable itself, and
+     * repeating the printed-line explanation there would describe something
+     * that did not happen.
+     */
+    const printNotes = (opts?: { credential?: boolean }) => {
+      const notes = [
+        ...(opts?.credential === false || !plan.credentialNote ? [] : [plan.credentialNote]),
+        ...plan.notes,
+      ];
+      if (notes.length === 0) return;
+      commentary("");
+      for (const note of notes) {
+        commentary(note.startsWith("WARNING") ? chalk.yellow(note) : chalk.dim(note));
+      }
+    };
+
+    if (surface === "web") {
+      console.log(plan.connectorUrl);
+      printNotes();
+      return;
+    }
+
+    if (surface === "desktop") {
+      console.log(serverBlock(plan.serverName, plan.serverConfig!));
+      printNotes();
+      return;
+    }
+
+    // ── surface: code ────────────────────────────────────────────────────────
+
+    if (opts.run) {
+      const argv = plan.addArgv!;
+      // `claude mcp add --header` stores whatever string it is given, so the
+      // token has to be expanded before the spawn — which puts it in the child
+      // process's argv, where `ps` can see it. Copying the printed line instead
+      // keeps expansion inside the user's own shell, so say which trade is
+      // being made rather than making it quietly.
+      const envVar = nest.kind === "http" ? authEnvVar(nest.auth) : undefined;
+      const secret = envVar ? process.env[envVar] : undefined;
+      const expanded =
+        envVar && secret ? argv.map((a) => a.split(`$${envVar}`).join(secret)) : argv;
+      if (envVar && secret) {
+        commentary(
+          chalk.yellow(
+            `Note: --run passes the expanded $${envVar} to \`claude\` as an argument, briefly visible to \`ps\`. ` +
+              `Re-run without --run to copy a line that keeps the key in your shell instead.`,
+          ),
+        );
+      }
+
+      await confirmOrExit(`Run \`${plan.addLine}\` to register "${plan.serverName}" with Claude Code?`);
+      if (isDryRun()) {
+        console.error(chalk.bold.cyan("Dry run — nothing was registered."));
+        return;
+      }
+      const res = spawnSync(expanded[0], expanded.slice(1), { stdio: "inherit" });
+      if (res.error) {
+        throw new ContextNestError(
+          `Could not run \`claude\` (${res.error.message}). Install Claude Code, or re-run without --run and paste the line yourself.`,
+          "NOT_IMPLEMENTED",
+        );
+      }
+      if (res.status !== 0) process.exit(res.status ?? 1);
+      console.log(chalk.green(`Registered "${plan.serverName}" with Claude Code`));
+      printNotes({ credential: false });
+      return;
+    }
+
+    if (opts.write !== undefined) {
+      const target = pathMod.resolve(
+        typeof opts.write === "string" ? opts.write : pathMod.join(process.cwd(), ".mcp.json"),
+      );
+      // Merge rather than clobber: a .mcp.json usually already has the
+      // project's other servers in it.
+      const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf-8") : undefined;
+      const { text, replaced } = mergeMcpJson(existing, plan.serverName, plan.serverConfig!);
+      if (replaced) {
+        await confirmOrExit(
+          `${target} already defines an MCP server named "${plan.serverName}" — replace it?`,
+          { destructive: true },
+        );
+      } else {
+        await confirmOrExit(`Add MCP server "${plan.serverName}" to ${target}?`);
+      }
+      noteExternalWrite(target);
+      if (!isDryRun()) {
+        await mkdir(pathMod.dirname(target), { recursive: true });
+        await writeFile(target, text, "utf-8");
+        console.log(chalk.green(`${replaced ? "Updated" : "Added"} "${plan.serverName}" in ${target}`));
+      }
+      printNotes();
+      return;
+    }
+
+    if (format === "json") {
+      console.log(serverBlock(plan.serverName, plan.serverConfig!));
+    } else {
+      console.log(plan.addLine);
+    }
+    printNotes();
   });
 
 // ─── ctx drift ─────────────────────────────────────────────────────────────────

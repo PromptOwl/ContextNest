@@ -488,6 +488,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault remove <alias>` | Unregister an alias |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which` | Show the resolved vault and the reason |
+| `ctx connect claude` | Emit (or apply) the Claude MCP configuration for the resolved nest (`--surface code\|desktop\|web`) |
 
 ### Document Management
 
@@ -579,6 +580,30 @@ docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
 ```
 
 The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
+
+### Connecting Claude in one command
+
+`ctx connect claude` emits the configuration for the nest the CLI already
+resolves to, so nothing has to be hand-assembled:
+
+```bash
+ctx connect claude                     # the `claude mcp add …` line for Claude Code
+ctx connect claude --run               # …or register it directly
+ctx connect claude --write             # …or merge it into ./.mcp.json
+ctx connect claude --surface desktop   # claude_desktop_config.json snippet + restart note
+ctx connect claude --surface web       # custom-connector URL for claude.ai
+```
+
+A registered HTTP nest emits an HTTP server; a local vault emits the stdio MCP
+server over its path. The credential comes from the registry entry's
+`bearer_env`, else `CONTEXTNEST_API_KEY` — never from a command-line flag — and
+the emitted config references the variable (`$VAR` in the shell line, `${VAR}`
+in JSON) rather than the key itself. With no credential available the command
+errors and names the variable to export instead of emitting an empty
+`Authorization` header. See the [CLI README](packages/cli/README.md#connecting-claude)
+for the details.
+
+The manual equivalents follow.
 
 ### Configuring with Claude Code
 
