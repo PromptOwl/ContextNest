@@ -178,6 +178,9 @@ export {
   isSuperseded,
 } from "./parser.js";
 
+// Engine version (baked in at build time; see version.ts).
+export { ENGINE_VERSION } from "./version.js";
+
 // Config
 export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
@@ -197,6 +200,7 @@ export {
   addVault,
   addRemote,
   removeVault,
+  pruneVaults,
   setDefaultVault,
   setVaultDescription,
   listVaults,
@@ -208,6 +212,8 @@ export type {
   AddVaultOptions,
   AddRemoteOptions,
   RemoveVaultResult,
+  PrunedVault,
+  PruneVaultsResult,
   VaultListEntry,
   VaultResolutionSource,
   ResolveVaultOptions,

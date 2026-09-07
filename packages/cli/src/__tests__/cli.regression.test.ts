@@ -1461,7 +1461,7 @@ describe("[regression] file safety — command coverage", () => {
   const CLASSIFIED = [
     "init", "add", "update", "delete", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
-    "vault add", "vault describe", "vault remove", "vault default",
+    "vault add", "vault describe", "vault remove", "vault default", "vault prune",
   ];
 
   it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {

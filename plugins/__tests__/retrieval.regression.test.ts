@@ -61,9 +61,11 @@ beforeAll(() => {
   betaDir = join(workspace, "beta");
   mkdirSync(alphaDir, { recursive: true });
   mkdirSync(betaDir, { recursive: true });
-  // `ctx init` initializes in the cwd and auto-registers an alias = --name.
-  ctl(alphaDir, ["init", "--name", "alpha", "--description", "security and auth"]);
-  ctl(betaDir, ["init", "--name", "beta", "--description", "performance and caching"]);
+  // `ctx init` initializes in the cwd and registers an alias = --name. The
+  // sandbox lives under the OS temp dir, where init no longer auto-registers,
+  // so --register asks for it explicitly.
+  ctl(alphaDir, ["init", "--name", "alpha", "--description", "security and auth", "--register"]);
+  ctl(betaDir, ["init", "--name", "beta", "--description", "performance and caching", "--register"]);
 });
 
 afterAll(() => {
