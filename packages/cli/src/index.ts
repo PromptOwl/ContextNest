@@ -76,7 +76,9 @@ import {
 import {
   listJsonEntry,
   queryJsonPayload,
-  searchJsonEntry,
+  searchLimit,
+  printSearchResults,
+  type SearchHitView,
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
@@ -2177,9 +2179,9 @@ program
 
 program
   .command("search <query>")
-  .description("Full-text search across vault documents")
-  .option("--json", "Output as JSON")
-  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
+  .description("Full-text search across vault documents, best match first")
+  .option("--json", "Output as JSON (each hit carries its relevance score)")
+  .option("--limit <n>", "Max results (default 10; 0 = all)", (v) => parseInt(v, 10))
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -2187,33 +2189,14 @@ program
       return;
     }
     const storage = getStorage();
-    const { results } = await createEngineApi().run<{
-      results: Array<{ id: string; title: string; description?: string; type: string }>;
-    }>(
+    const limit = searchLimit(opts.limit);
+    const out = await createEngineApi().run<{ results: SearchHitView[]; total?: number }>(
       "context_search",
-      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      { query, ...(limit ? { limit } : {}) },
       opContext(storage, "cli@contextnest.local"),
     );
-
-    if (opts.json) {
-      // Field selection shared with the remote branch (doc-views.ts).
-      console.log(
-        JSON.stringify(
-          results.map(searchJsonEntry),
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    if (results.length === 0) {
-      console.log(chalk.yellow("No results found."));
-      return;
-    }
-    console.log(chalk.bold(`${results.length} result(s):\n`));
-    for (const doc of results) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
-    }
+    // Rendering shared with the remote branch (doc-views.ts).
+    printSearchResults(out, opts);
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────

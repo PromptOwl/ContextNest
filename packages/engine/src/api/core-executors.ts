@@ -18,9 +18,11 @@ import {
   normalizeTags,
   normalizeStatus,
   isRejected,
+  isPublished,
   explicitStatus,
   parseDocument,
 } from "../parser.js";
+import { Resolver } from "../resolver.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -234,22 +236,28 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
 };
 
 const search: OperationExecutor = async (ctx, input: any) => {
-  // Go through the engine's published-only, ranked full-text search (the
-  // `contextnest://search/…` resolver, which indexes title/description/body/tags
-  // and filters to published) instead of a hand-rolled substring scorer — never
-  // leaks unpublished content. `full: true` routes through the Resolver; graph
-  // mode would only match context.yaml metadata (no body).
-  // Slugify the query before embedding it in the URI. This string is re-lexed
-  // by the selector grammar, whose URI token terminates on whitespace/+/|/()
-  // (lexer.ts), and parseUri rejects '//'. Raw user text (spaces, a '/' from a
-  // pasted URL, '+') would truncate the token or throw INVALID_URI. Hyphens are
-  // lexer-safe URI path chars and MiniSearch tokenizes on them, so slugifying
-  // keeps recall while guaranteeing a single well-formed URI token.
-  const q = slugify(String(input.query));
-  if (!q) return { results: [] };
-  const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
-  const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
-  return { results: docs.map((d) => toSummary(d)) };
+  // Go straight to the engine's ranked, published-only full-text index
+  // (Resolver.search: title/description/body/tags, MiniSearch) rather than
+  // through `ctx.query.query("contextnest://search/…")`. The selector route
+  // had two problems: the query had to be slugified into a single lexer-safe
+  // URI token, and the selector evaluator collapsed the hits into a Set and
+  // re-filtered the discovery list, so the score — and the order — were gone
+  // by the time results reached a caller. Here the raw text goes to
+  // MiniSearch as-is and every hit carries its score.
+  // discoverDocuments() drops rejected nodes and the resolver indexes only
+  // published ones; the isPublished filter is belt-and-braces so this
+  // surface can never leak unpublished content.
+  const query = String(input.query).trim();
+  if (!query) return { results: [], total: 0 };
+  const docs = await ctx.storage.discoverDocuments();
+  const hits = new Resolver({ documents: docs })
+    .search(query)
+    .filter((h) => isPublished(h.document));
+  const kept = input.limit ? hits.slice(0, input.limit) : hits;
+  return {
+    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    total: hits.length,
+  };
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {

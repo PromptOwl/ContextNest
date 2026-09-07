@@ -101,7 +101,7 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx publish --all` — Publish every unpublished document in one batch, with a live counter. Seals one checkpoint and regenerates the index once, instead of once per document
 - `ctx validate [path]` — Validate against the spec
 - `ctx list` — List documents (filter by `--type`, `--status`, `--tag`; cap with `--limit`)
-- `ctx search <query>` — Full-text search (`--limit` to cap results)
+- `ctx search <query>` — Full-text search, best match first (documents matching every term, then partial matches, each by relevance score). Prints the top 10; `--limit <n>` to change, `--limit 0` for all; `--json` carries each hit's `score`
 
 ### Context Queries
 - `ctx query <selector>` — Query context with graph traversal (default: 2 hops)
