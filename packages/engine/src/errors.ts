@@ -176,6 +176,32 @@ export class UnknownAliasError extends ConfigError {
 }
 
 /**
+ * Raised when vault resolution fell through to the bare working directory
+ * and that directory is not a vault (no `.context/config.yaml` and no
+ * `context.yaml`). Reading it would report every `.md` under an arbitrary
+ * folder as a draft document, and the first query would auto-index it —
+ * writing a `context.yaml` into a directory the user never asked us to touch.
+ * Refuse instead, and say how to pick a real vault.
+ */
+export class NoVaultError extends ContextNestError {
+  constructor(
+    public readonly dir: string,
+    public readonly registered: readonly string[] = [],
+  ) {
+    const hint =
+      registered.length > 0
+        ? `(registered: ${registered.join(", ")})`
+        : `(see "ctx vault list")`;
+    super(
+      `${dir} is not a Context Nest vault. Run "ctx init" here, or pass --vault <alias> ${hint}.`,
+      "NO_VAULT",
+      "§11",
+    );
+    this.name = "NoVaultError";
+  }
+}
+
+/**
  * Raised when a document's frontmatter-declared zone contradicts its
  * folder-implied zone (zone-classification-rbac-spec §2.4). Per spec, the
  * document remains injectable; the Czar resolves via the Inbox.

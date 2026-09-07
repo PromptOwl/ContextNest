@@ -62,6 +62,7 @@ export {
   FederationNotSupportedError,
   ConfigError,
   UnknownAliasError,
+  NoVaultError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,

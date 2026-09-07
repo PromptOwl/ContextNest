@@ -418,7 +418,10 @@ agent_instructions: |
 
 ### File safety
 
-No `ctx` command writes to your working directory without saying so.
+No `ctx` command writes to your working directory without saying so. And no
+command reads or indexes a directory that is not a vault: when nothing resolves
+a vault (no `--vault`, no local vault, no registry default), `ctx` refuses with
+`Error [NO_VAULT]` instead of treating your current folder as one.
 
 | Flag | Effect |
 |---|---|

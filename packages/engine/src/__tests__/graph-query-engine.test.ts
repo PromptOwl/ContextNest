@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, unlink } from "node:fs/promises";
+import { mkdtemp, rm, unlink, writeFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -155,6 +155,26 @@ describe("GraphQueryEngine — auto-index", () => {
     expect(result.documents.map((d) => d.id)).toContain("nodes/api");
     // context.yaml should now exist
     expect(await storage.readContextYaml()).not.toBeNull();
+  });
+
+  it("does not write context.yaml when the root is not a vault (no .context/config.yaml)", async () => {
+    // A plain directory with a stray markdown file — NOT a vault. The engine
+    // must not auto-index it: doing so wrote a context.yaml into arbitrary
+    // folders and reported every .md beneath them as a document.
+    const plain = await mkdtemp(join(tmpdir(), "contextnest-gqe-plain-"));
+    try {
+      await writeFile(join(plain, "readme.md"), "# not a vault\n");
+      const plainStorage = new NestStorage(plain);
+      expect(await plainStorage.readContextYaml()).toBeNull();
+
+      const engine = new GraphQueryEngine(plainStorage);
+      await engine.query("#anything");
+
+      expect(await plainStorage.readContextYaml()).toBeNull();
+      expect((await readdir(plain)).sort()).toEqual(["readme.md"]);
+    } finally {
+      await rm(plain, { recursive: true, force: true });
+    }
   });
 });
 
