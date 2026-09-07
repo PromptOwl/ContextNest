@@ -1,6 +1,6 @@
 ---
 "@promptowl/contextnest-cli": minor
-"@promptowl/contextnest-engine": patch
+"@promptowl/contextnest-engine": minor
 ---
 
 Registry hygiene and `ctx doctor`.

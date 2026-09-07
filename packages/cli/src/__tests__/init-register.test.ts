@@ -24,9 +24,14 @@ function realpath(p: string): string {
   }
 }
 
+// Mirrors the production isUnderTempDir(): case-insensitive on Windows.
 function isUnderTmp(p: string): boolean {
-  const t = realpath(tmpdir());
-  const r = realpath(p);
+  let t = realpath(tmpdir());
+  let r = realpath(p);
+  if (process.platform === "win32") {
+    t = t.toLowerCase();
+    r = r.toLowerCase();
+  }
   return r === t || r.startsWith(t + sep);
 }
 

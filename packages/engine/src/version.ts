@@ -8,6 +8,9 @@
  * file would therefore silently report the *CLI's* version from inside the CLI.
  * The build injects the literal instead (`define` in tsup.config.ts); the
  * package.json fallback only serves source runs (vitest, ts-node).
+ *
+ * The baked value reaches the CLI through the engine's dist, so the engine
+ * must build before the CLI — `pnpm -r build` runs in topological order.
  */
 
 import { createRequire } from "node:module";

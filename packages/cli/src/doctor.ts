@@ -109,13 +109,28 @@ export function fetchLatestVersion(
     });
     const timer = setTimeout(() => {
       done(null);
-      // Drop our end of the pipe and stop waiting on the process, so a helper
-      // that outlives the kill cannot keep this CLI alive.
+      // On Windows the child is the cmd.exe shell running the npm.cmd shim;
+      // kill() only ends that shell and leaks the node.exe grandchild doing
+      // the actual work. taskkill /T takes the whole process tree down.
+      if (process.platform === "win32" && child.pid) {
+        try {
+          spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          })
+            .on("error", () => {})
+            .unref();
+        } catch {
+          /* taskkill missing or refused — fall through to kill() */
+        }
+      }
       try {
         child.kill("SIGKILL");
       } catch {
         /* already gone */
       }
+      // Drop our end of the pipe and stop waiting on the process, so a helper
+      // that outlives the kill cannot keep this CLI alive.
       child.stdout?.destroy();
       child.unref();
     }, timeoutMs);
