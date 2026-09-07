@@ -39,7 +39,7 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
-import { sanitizeImportedFrontmatter, slugifyImportPath } from "../import-hygiene.js";
+import { planImportPaths, sanitizeImportedFrontmatter } from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -792,13 +792,14 @@ const packs: OperationExecutor = async (ctx) => {
 const nests: OperationExecutor = () => ({ nests: listVaults() });
 
 /**
- * Land one imported file. The path is slugified segment by segment so the id
- * every later surface addresses is a clean one (`nodes/Dr. Smith.md` →
- * `nodes/dr-smith.md`), and a markdown document that would not validate as
- * it arrived — no title, a type outside the spec, tags with spaces — is
- * repaired on the way in, each repair reported as a warning. A file that is
- * already valid, and every non-document file (version histories, indexes),
- * is written byte for byte: the source's frontmatter is its own.
+ * Land one imported file at the path `planImportPaths` chose for it — the
+ * slugified id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), disambiguated
+ * against the rest of the batch and the vault. A markdown document that
+ * would not validate as it arrived — no title, a type outside the spec, tags
+ * with spaces — is repaired on the way in, each repair reported as a warning.
+ * A file that is already valid, and every non-document file (version
+ * histories, indexes), is written byte for byte: the source's frontmatter is
+ * its own.
  *
  * The title falls back to the ORIGINAL filename, human casing intact: after
  * the rename only the slug survives, and `dr-smith` is a worse title than
@@ -806,13 +807,10 @@ const nests: OperationExecutor = () => ({ nests: listVaults() });
  */
 async function writeImportedFile(
   ctx: OperationContext,
-  f: { path: string; content?: string },
+  f: { raw: string; path: string; content?: string },
   warnings: string[],
 ): Promise<void> {
-  const raw = String(f.path ?? "");
-  const relPath = slugifyImportPath(raw);
-  if (relPath !== raw) warnings.push(`${raw}: written as ${relPath} (path slugified)`);
-
+  const { raw, path: relPath } = f;
   let content = f.content ?? "";
   const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
   if (/\.md$/i.test(lastSegment) && !lastSegment.startsWith(".")) {
@@ -855,12 +853,30 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
   if (incoming.length > 0) {
-    await mapInBatches(incoming, async (f) => {
+    // Targets are settled BEFORE the parallel write, in input order: two
+    // files whose names slugify alike must not race for one path, and a file
+    // already in the vault is never overwritten. A path the guard refuses
+    // (`../`) is reported per file rather than sinking the batch.
+    const plan: Array<{ raw: string; path: string; content: string; warnings: string[] }> = [];
+    for (const f of incoming) {
+      const raw = String(f.path ?? "");
+      try {
+        const [planned] = await planImportPaths([raw], async (p) => {
+          const owner = plan.find((q) => q.path === p);
+          return owner !== undefined || (await ctx.storage.hasVaultFile(p));
+        });
+        plan.push({ ...planned, content: f.content ?? "" });
+      } catch (err) {
+        failed.push({ id: raw, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    for (const p of plan) warnings.push(...p.warnings);
+    await mapInBatches(plan, async (f) => {
       try {
         await writeImportedFile(ctx, f, warnings);
         written++;
       } catch (err) {
-        failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
+        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
       }
     });
   }

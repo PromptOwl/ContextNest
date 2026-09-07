@@ -4,6 +4,7 @@
  */
 
 import {
+  access,
   readFile,
   writeFile,
   mkdir,
@@ -748,6 +749,27 @@ export class NestStorage {
    * outside the vault root.
    */
   async writeVaultFile(relPath: string, content: string): Promise<void> {
+    const filePath = this.vaultFilePath(relPath);
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, content, "utf-8");
+  }
+
+  /**
+   * Whether a vault-relative path already holds a file. Same path guard as
+   * `writeVaultFile`, so an import can plan where a batch lands before it
+   * writes anything, and never overwrites what it did not write.
+   */
+  async hasVaultFile(relPath: string): Promise<boolean> {
+    try {
+      await access(this.vaultFilePath(relPath));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Resolve a caller-given vault-relative path, refusing anything that escapes. */
+  private vaultFilePath(relPath: string): string {
     const segments = String(relPath ?? "")
       .split(/[/\\]/)
       .filter(Boolean);
@@ -761,9 +783,7 @@ export class NestStorage {
         "INVALID_DOCUMENT_ID",
       );
     }
-    const filePath = join(this.root, ...segments);
-    await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, content, "utf-8");
+    return join(this.root, ...segments);
   }
 
   /**

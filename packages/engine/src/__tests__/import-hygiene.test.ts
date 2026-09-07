@@ -13,6 +13,7 @@ import {
   sanitizeImportedFrontmatter,
   sanitizeImportedTags,
   firstHeading,
+  planImportPaths,
 } from "../import-hygiene.js";
 
 // CU-wdqcq01c61: folder import left title-less nodes at ids like
@@ -102,6 +103,48 @@ describe("firstHeading / sanitizeImportedTags — pathological input (CodeQL js/
   });
 });
 
+describe("planImportPaths — distinct files never collapse onto one id", () => {
+  it("disambiguates colliding slugs deterministically in input order, warning each time", async () => {
+    const plan = await planImportPaths(
+      ["nodes/Untitled (1).md", "nodes/Untitled_1.md", "nodes/Untitled - 1.md", "nodes/other.md"],
+      async () => false,
+    );
+    expect(plan.map((p) => p.path)).toEqual([
+      "nodes/untitled-1.md",
+      "nodes/untitled-1-2.md",
+      "nodes/untitled-1-3.md",
+      "nodes/other.md",
+    ]);
+    expect(plan[0].warnings).toEqual(["nodes/Untitled (1).md: written as nodes/untitled-1.md (path slugified)"]);
+    expect(plan[1].warnings.join("\n")).toMatch(/nodes\/Untitled_1\.md: written as nodes\/untitled-1-2\.md/);
+    expect(plan[1].warnings.join("\n")).toMatch(/nodes\/Untitled \(1\)\.md/);
+    expect(plan[3].warnings).toEqual([]);
+  });
+
+  it("treats a file already on disk as a collision instead of overwriting it", async () => {
+    const onDisk = new Set(["nodes/existing.md", "nodes/existing-2.md"]);
+    const plan = await planImportPaths(["nodes/Existing.md"], async (p) => onDisk.has(p));
+    expect(plan[0].path).toBe("nodes/existing-3.md");
+    expect(plan[0].warnings.join("\n")).toMatch(/already exists in the vault/);
+  });
+
+  it("keeps all-non-Latin names apart", async () => {
+    const plan = await planImportPaths(["nodes/日本語.md", "nodes/Ελληνικά.md"], async () => false);
+    expect(plan.map((p) => p.path)).toEqual(["nodes/untitled.md", "nodes/untitled-2.md"]);
+  });
+});
+
+describe("firstHeading — fenced code blocks", () => {
+  it("does not take a comment inside a code fence for the title", () => {
+    const body = "```sh\n# not a title\necho hi\n```\n\n# Real Title\n\ntext\n";
+    expect(firstHeading(body)).toBe("Real Title");
+    const tilde = "~~~\n# not a title\n~~~\n# Real Title\n";
+    expect(firstHeading(tilde)).toBe("Real Title");
+    // Indented fence markers (up to 3 spaces) still open a fence.
+    expect(firstHeading("  ```\n# nope\n  ```\n# Yes\n")).toBe("Yes");
+  });
+});
+
 describe("sanitizeImportedFrontmatter", () => {
   const node = (content: string, id = "nodes/dr-smith") =>
     parseDocument(`${id}.md`, content, id);
@@ -130,6 +173,7 @@ describe("sanitizeImportedFrontmatter", () => {
     expect(out.patch.tags).toEqual(["#ok", "#gtm", "#contextnest", "#promptowl"]);
     expect(out.warnings).toHaveLength(1);
     expect(out.warnings[0]).toMatch(/bad tag/);
+    expect(out.warnings[0]).toMatch(/tags must start with a letter and contain only letters, digits, _ - :/);
   });
 
   it("returns an empty patch for a file with valid frontmatter (regression)", () => {
@@ -210,6 +254,39 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
       const result = validateDocument(doc);
       expect(result.errors, doc.id).toEqual([]);
     }
+  });
+
+  it("lands colliding filenames under distinct ids, counting each file written", async () => {
+    const api = createEngineApi();
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", "existing.md"), "---\ntitle: Kept\ntype: document\n---\nkeep me\n");
+    const staged = await api.run<ImportResult>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/Untitled (1).md", content: "# First\n" },
+          { path: "nodes/Untitled_1.md", content: "# Second\n" },
+          { path: "nodes/Untitled - 1.md", content: "# Third\n" },
+          { path: "nodes/Existing.md", content: "# Newcomer\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(staged.failed).toEqual([]);
+    expect(staged.written).toBe(4);
+    for (const name of ["untitled-1", "untitled-1-2", "untitled-1-3", "existing", "existing-2"]) {
+      expect(existsSync(join(dir, "nodes", `${name}.md`)), name).toBe(true);
+    }
+    // Nothing was overwritten: each body is where its own path landed.
+    expect(await readFile(join(dir, "nodes", "untitled-1.md"), "utf-8")).toContain("# First");
+    expect(await readFile(join(dir, "nodes", "untitled-1-2.md"), "utf-8")).toContain("# Second");
+    expect(await readFile(join(dir, "nodes", "untitled-1-3.md"), "utf-8")).toContain("# Third");
+    expect(await readFile(join(dir, "nodes", "existing.md"), "utf-8")).toContain("keep me");
+    expect(await readFile(join(dir, "nodes", "existing-2.md"), "utf-8")).toContain("# Newcomer");
+    const warnings = staged.warnings ?? [];
+    expect(warnings.some((w) => w.startsWith("nodes/Untitled_1.md:") && /untitled-1-2/.test(w))).toBe(true);
+    expect(warnings.some((w) => w.startsWith("nodes/Existing.md:") && /existing-2/.test(w))).toBe(true);
   });
 
   it("writes a file with valid frontmatter verbatim under its own id (regression)", async () => {

@@ -54,6 +54,77 @@ export function slugifyImportPath(relPath: string): string {
     .join("/");
 }
 
+/** Where the last path segment's extension starts, or its length if none. */
+function extensionStart(segment: string): number {
+  const ext = segment.match(EXTENSION)?.[0] ?? "";
+  return segment.length - ext.length;
+}
+
+/**
+ * Decide where every file in a `files[]` batch lands, so that no two files
+ * — and no file and one already in the vault — share an id.
+ *
+ * Slugifying is lossy: `Untitled (1).md`, `Untitled_1.md` and
+ * `Untitled - 1.md` all become `untitled-1.md`, and every all-non-Latin name
+ * becomes `untitled.md`. Written concurrently, the last one silently wins
+ * and `written` counts files that are not there. So the targets are planned
+ * up front, sequentially and in input order: the first claim on a slug keeps
+ * it, the next gets `-2`, then `-3`, and so on — deterministic, so a re-run
+ * of the same batch lands the same way. A target that already exists in the
+ * vault counts as taken too: an import must never overwrite what it did not
+ * write. Every rename is warned, naming what it collided with.
+ */
+export async function planImportPaths(
+  rawPaths: string[],
+  isTaken: (relPath: string) => Promise<boolean>,
+): Promise<Array<{ raw: string; path: string; warnings: string[] }>> {
+  const claimed = new Map<string, string>(); // target → raw path that owns it
+  const plan: Array<{ raw: string; path: string; warnings: string[] }> = [];
+  for (const raw of rawPaths) {
+    const warnings: string[] = [];
+    const base = slugifyImportPath(raw);
+    const cut = base.lastIndexOf("/") + 1;
+    const dir = base.slice(0, cut);
+    const last = base.slice(cut);
+    const stemEnd = extensionStart(last);
+    const stem = last.slice(0, stemEnd);
+    const ext = last.slice(stemEnd);
+
+    let target = base;
+    let takenBy: string | undefined;
+    for (let n = 2; ; n++) {
+      const owner = claimed.get(target);
+      if (owner !== undefined) {
+        takenBy ??= owner;
+      } else if (await isTaken(target)) {
+        takenBy ??= "an existing vault file";
+      } else {
+        break;
+      }
+      target = `${dir}${stem}-${n}${ext}`;
+    }
+    claimed.set(target, raw);
+
+    if (takenBy !== undefined) {
+      const reason =
+        takenBy === "an existing vault file"
+          ? `"${base}" already exists in the vault`
+          : `"${base}" is already taken by ${takenBy}`;
+      warnings.push(`${raw}: written as ${target} (${reason})`);
+    } else if (target !== raw) {
+      warnings.push(`${raw}: written as ${target} (path slugified)`);
+    }
+    plan.push({ raw, path: target, warnings });
+  }
+  return plan;
+}
+
+/** A line that opens or closes a fenced code block (``` or ~~~, ≤3 spaces indent). */
+function isFenceLine(line: string): boolean {
+  const t = line.trimStart();
+  return line.length - t.length <= 3 && (t.startsWith("```") || t.startsWith("~~~"));
+}
+
 /**
  * The first top-level `# Heading` in a markdown body, if there is one.
  *
@@ -61,10 +132,19 @@ export function slugifyImportPath(relPath: string): string {
  * natural pattern (`^#[ \t]+(.+?)[ \t]*#*[ \t]*$`) has overlapping
  * quantifiers that backtrack polynomially on a line of `#` followed by
  * thousands of tabs (CodeQL js/polynomial-redos).
+ *
+ * Lines inside a fenced code block are skipped: a shell comment in a
+ * ```` ```sh ```` block is not the note's title.
  */
 export function firstHeading(body: string): string | undefined {
+  let inFence = false;
   for (const rawLine of body.split("\n")) {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (isFenceLine(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
     // Exactly one `#`, then at least one space or tab: `##` is a section.
     if (line.charCodeAt(0) !== 0x23 /* # */) continue;
     const second = line.charAt(1);
@@ -115,7 +195,7 @@ export function sanitizeImportedTags(
     for (const candidate of splitTagEntry(entry.trim())) {
       if (!TAG_PATTERN.test(candidate)) {
         warnings.push(
-          `${label}: dropped tag "${entry}" (a tag must match ${TAG_PATTERN.source})`,
+          `${label}: dropped tag "${entry}" (tags must start with a letter and contain only letters, digits, _ - :)`,
         );
         continue;
       }
@@ -171,6 +251,8 @@ export function sanitizeImportedFrontmatter(
     );
   }
 
+  // `parseDocument` has already normalized `tags` to a `#`-prefixed string
+  // array (or dropped it); only the entries themselves are suspect here.
   if (Array.isArray(fm.tags)) {
     const before = fm.tags as unknown[];
     const { tags, warnings: tagWarnings } = sanitizeImportedTags(before, label);
