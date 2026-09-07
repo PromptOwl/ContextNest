@@ -4,6 +4,7 @@
  */
 
 import { InvalidSelectorError } from "../errors.js";
+import { SELECTOR_FILTERS } from "./grammar.js";
 
 export type TokenType =
   | "TAG"
@@ -118,6 +119,21 @@ export function tokenize(input: string): Token[] {
       continue;
     }
 
+    // Bare node id: nodes/<id> or sources/<id> — the same URI atom as if the
+    // user had typed `contextnest://nodes/<id>`, so `ctx query "nodes/gtm/foo"`
+    // selects one node without the scheme. Terminates exactly like the URI
+    // branch above (whitespace, `+`, `|`, parens; `-` stays inside the id).
+    if (/^(nodes|sources)\//.test(input.slice(pos))) {
+      const idStart = pos;
+      while (pos < input.length && !/[\s+|()]/.test(input[pos])) pos++;
+      tokens.push({
+        type: "URI",
+        value: `contextnest://${input.slice(idStart, pos)}`,
+        position: idStart,
+      });
+      continue;
+    }
+
     // Keyword atoms: type:X, status:X, transport:X, server:X, pack:X
     const wordMatch = input.slice(pos).match(/^([a-zA-Z_][a-zA-Z0-9_]*)/);
     if (wordMatch) {
@@ -177,14 +193,21 @@ export function tokenize(input: string): Token[] {
             break;
           default:
             throw new InvalidSelectorError(
-              `Unknown filter type "${word}" at position ${start}`,
+              `Unknown filter "${word}" at position ${start} — valid filters: ${SELECTOR_FILTERS.join(", ")}`,
             );
         }
         continue;
       }
 
-      // Just a word — error
-      throw new InvalidSelectorError(`Unexpected token "${word}" at position ${start}`);
+      // Just a word — error. Report the whole run up to the next delimiter
+      // (`gtm/foo`, `api-design`), not only the leading identifier, so the
+      // hint below is something the user can paste back.
+      let wordEnd = pos;
+      while (wordEnd < input.length && !/[\s+|()]/.test(input[wordEnd])) wordEnd++;
+      const bare = input.slice(pos, wordEnd);
+      throw new InvalidSelectorError(
+        `Unexpected token "${bare}" at position ${start} — did you mean "nodes/${bare}" (a node id) or "#${bare}" (a tag)?`,
+      );
     }
 
     throw new InvalidSelectorError(`Unexpected character "${ch}" at position ${pos}`);

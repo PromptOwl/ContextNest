@@ -1539,3 +1539,58 @@ describe("[regression] file safety — generic folder names in a vault", () => {
     expect(readFileSync(join(tmp, "nodes", "out", "formats.md"), "utf-8")).toContain("original");
   });
 });
+
+// ─── selector grammar: bare node ids + one grammar line ──────────────────────
+
+describe("[regression] selector grammar — bare node ids and --help", () => {
+  // The canonical line every surface renders. Imported from the built engine
+  // so this test fails the moment the CLI's help text drifts from it.
+  let SELECTOR_GRAMMAR: string;
+  beforeEach(async () => {
+    ({ SELECTOR_GRAMMAR } = await import("@promptowl/contextnest-engine"));
+  });
+
+  it.each(["query", "resolve"])("`ctx %s --help` prints the grammar line verbatim", (name) => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, [name, "--help"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain(SELECTOR_GRAMMAR);
+  });
+
+  it("`ctx init` banner prints the grammar line and no longer advertises path:/&", () => {
+    // Fresh directory (re-init of an existing vault refuses without consent),
+    // and a starter: the post-init banner is only printed on the starter path.
+    const res = runCtxResult(tmp, ["init", "--name", "grammar-vault", "--starter", "personal"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain(SELECTOR_GRAMMAR);
+    expect(res.stdout).not.toContain("path:nodes");
+    expect(res.stdout).not.toMatch(/\+ \(union\)/);
+  });
+
+  it("selects a single node by bare id in query and resolve", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/gtm/foo", "--title", "Foo", "--tags", "#strategy"]);
+    runCtx(tmp, ["add", "nodes/gtm/bar", "--title", "Bar", "--tags", "#strategy"]);
+    runCtx(tmp, ["publish", "--all", "--yes"]);
+    runCtx(tmp, ["index", "--yes"]);
+
+    const q = JSON.parse(runCtx(tmp, ["query", "nodes/gtm/foo", "--hops", "0", "--json"]));
+    expect(q.documents.map((d: { id: string }) => d.id)).toEqual(["nodes/gtm/foo"]);
+
+    const r = JSON.parse(runCtx(tmp, ["resolve", "nodes/gtm/foo", "--json"]));
+    expect(r.map((d: { id: string }) => d.id)).toEqual(["nodes/gtm/foo"]);
+
+    const and = JSON.parse(
+      runCtx(tmp, ["query", "nodes/gtm/foo + #strategy", "--hops", "0", "--json"]),
+    );
+    expect(and.documents.map((d: { id: string }) => d.id)).toEqual(["nodes/gtm/foo"]);
+  });
+
+  it("a bare word without nodes/ still fails, with a did-you-mean hint", () => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, ["query", "gtm/foo"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/INVALID_SELECTOR/);
+    expect(res.stderr).toContain('did you mean "nodes/gtm/foo"');
+  });
+});

@@ -58,6 +58,7 @@ import {
   isPublished,
   isRejected,
   HARNESSES,
+  SELECTOR_GRAMMAR,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -1407,12 +1408,32 @@ program
     if (hasErrors) process.exit(1);
   });
 
+/**
+ * Selector grammar block appended to `ctx query --help` / `ctx resolve --help`.
+ * The grammar line itself is the engine's SELECTOR_GRAMMAR — the same string
+ * the init banner, README and generated CLAUDE.md render — never a local copy.
+ */
+function selectorHelp(cmd: "query" | "resolve"): string {
+  return [
+    "",
+    "Selector grammar:",
+    `  ${SELECTOR_GRAMMAR}`,
+    "",
+    "Examples:",
+    `  ctx ${cmd} "#api + status:published"`,
+    `  ctx ${cmd} "nodes/gtm/foo"                 # one node by id`,
+    `  ctx ${cmd} "(#api | #v2) - #deprecated"`,
+    "",
+  ].join("\n");
+}
+
 // ─── ctx resolve ───────────────────────────────────────────────────────────────
 
 program
   .command("resolve <selector>")
   .description("Execute a selector query and list matching documents")
   .option("--json", "Output as JSON")
+  .addHelpText("after", selectorHelp("resolve"))
   .action(async (selector, opts) => {
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
@@ -1948,6 +1969,7 @@ program
   .option("--hops <n>", "Graph traversal depth (default: 2)", parseInt)
   .option("--full", "Force full-load mode (load all documents)")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
+  .addHelpText("after", selectorHelp("query"))
   .action(async (selector, opts) => {
     // Cloud pack: @org/pack-name routes to PromptOwl API
     if (selector.startsWith("@")) {
