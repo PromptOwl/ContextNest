@@ -369,8 +369,11 @@ export function samePath(a, b) {
 }
 
 /**
- * True when `path` is `root` or lives under it. `path.relative` is already
- * case-insensitive on Windows; realpath'd forms are compared too (see samePath).
+ * True when `path` is `root` or lives under it. Both the given and the
+ * realpath'd forms of each side are compared (see samePath), so a symlinked
+ * temp dir still matches. Note: `path.relative` does not case-fold; on Windows
+ * the realpath step normalizes to on-disk casing when the path exists, and a
+ * not-yet-existing path is compared as given.
  */
 function isUnder(path, root) {
   const inside = (p, r) => {
