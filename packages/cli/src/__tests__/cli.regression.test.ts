@@ -800,6 +800,22 @@ describe("[regression] ctx index", () => {
     const yaml = readFileSync(join(tmp, "context.yaml"), "utf-8");
     expect(yaml).toContain("nodes/indexed");
   });
+
+  // [CU-wdqcq01c60] A vault authored with [[wikilinks]] used to index with
+  // zero relationships, making --hops a no-op. Two docs, one wikilink: the
+  // edge must land in context.yaml and the summary line must say where it
+  // came from.
+  it("turns a [[wikilink]] into a reference edge and reports it", () => {
+    runCtx(tmp, [
+      "add", "nodes/linker",
+      "--title", "Linker",
+      "--body", "Read [[Indexed]] and [[Nowhere To Be Found]].",
+    ]);
+    const out = runCtx(tmp, ["index"]);
+    expect(out).toMatch(/1 relationship edges? \(1 from wikilinks, 1 unresolved\)/);
+    const yaml = readFileSync(join(tmp, "context.yaml"), "utf-8");
+    expect(yaml).toMatch(/from: nodes\/linker\s+to: nodes\/indexed\s+type: reference/);
+  });
 });
 
 // ─── checkpoint ───────────────────────────────────────────────────────────────

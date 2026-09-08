@@ -25,7 +25,9 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
-  generateContextYaml,
+  assertVaultRoot,
+  isRefusedCwd,
+  generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -389,6 +391,12 @@ function getVaultRoot(): string {
   if (resolved.warning && resolved.source !== "local") {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
+  // The bare-cwd fallback is the only step that hands back an unvalidated
+  // directory. Refuse it here, centrally (NO_VAULT), so no command reads a
+  // folder of repos as documents or auto-indexes a context.yaml into it.
+  // `init` (getInitRoot) and the `vault *` registry commands never come
+  // through this helper. Same engine guard as the MCP server.
+  assertVaultRoot(resolved);
   resolvedVaultRoot = resolved.path;
   return resolvedVaultRoot;
 }
@@ -1845,9 +1853,20 @@ program
     const published = docs.filter((d) => d.frontmatter.status === "published");
 
     // Generate context.yaml
-    const contextYaml = generateContextYaml(published, config, latestCheckpoint);
+    const { contextYaml, stats } = generateContextYamlWithStats(
+      published,
+      config,
+      latestCheckpoint,
+    );
     await storage.writeContextYaml(contextYaml);
     console.log(chalk.green("Generated context.yaml"));
+    // Where the graph came from. A vault authored with [[wikilinks]] used to
+    // index with zero edges and --hops silently did nothing; the unresolved
+    // count is the hint that a link's title does not match any published doc.
+    console.log(
+      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved)`,
+    );
 
     // Generate INDEX.md for each folder
     const folders = new Map<string, ContextNode[]>();
@@ -2934,17 +2953,46 @@ vaultCmd
 vaultCmd
   .command("which")
   .description("Show which vault the CLI would use right now, and why (respects --vault)")
-  .action(() => {
+  .option("--json", "Output as JSON ({kind, path|endpoint, source, alias?, warning?})")
+  .action((opts) => {
     try {
       const resolved = resolveNest({
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
+      // which is what users run right after a NO_VAULT error, so it must not
+      // report a bare cwd that every other command refuses as if it resolved.
+      const refused = resolved.kind === "local" && isRefusedCwd(resolved);
       // which is the diagnostic command — always surface a stale-env advisory,
       // even when a vault resolved (unlike normal commands, which stay quiet for
       // a local resolution).
       if (resolved.warning) {
         console.error(chalk.yellow(resolved.warning));
+      }
+      if (opts.json) {
+        // Machine-readable form for scripted callers (the plugin hooks use it
+        // to find the vault in the working directory). Same fields as the text
+        // output, no colour, one object.
+        const out =
+          resolved.kind === "remote"
+            ? {
+                kind: "remote",
+                alias: resolved.alias,
+                source: resolved.source,
+                transport: resolved.remote.transport,
+                endpoint: describeRemoteEndpoint(resolved.remote),
+                ...(resolved.warning ? { warning: resolved.warning } : {}),
+              }
+            : {
+                kind: "local",
+                path: resolved.path,
+                source: resolved.source,
+                ...(refused ? { refused: true } : {}),
+                ...(resolved.alias ? { alias: resolved.alias } : {}),
+                ...(resolved.warning ? { warning: resolved.warning } : {}),
+              };
+        console.log(JSON.stringify(out, null, 2));
+        return;
       }
       if (resolved.kind === "remote") {
         console.log(`${resolved.alias} ${chalk.magenta(`(remote, ${resolved.remote.transport})`)}`);
@@ -2956,6 +3004,13 @@ vaultCmd
       console.log(
         chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
       );
+      if (refused) {
+        console.log(
+          chalk.yellow(
+            'not a vault — commands here fail with NO_VAULT. Run `ctx init` here, or pass --vault <alias>.',
+          ),
+        );
+      }
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);
