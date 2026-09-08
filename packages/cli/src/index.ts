@@ -25,6 +25,8 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
+  assertVaultRoot,
+  isRefusedCwd,
   generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
@@ -387,6 +389,12 @@ function getVaultRoot(): string {
   if (resolved.warning && resolved.source !== "local") {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
+  // The bare-cwd fallback is the only step that hands back an unvalidated
+  // directory. Refuse it here, centrally (NO_VAULT), so no command reads a
+  // folder of repos as documents or auto-indexes a context.yaml into it.
+  // `init` (getInitRoot) and the `vault *` registry commands never come
+  // through this helper. Same engine guard as the MCP server.
+  assertVaultRoot(resolved);
   resolvedVaultRoot = resolved.path;
   return resolvedVaultRoot;
 }
@@ -2960,6 +2968,9 @@ vaultCmd
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
+      // which is what users run right after a NO_VAULT error, so it must not
+      // report a bare cwd that every other command refuses as if it resolved.
+      const refused = resolved.kind === "local" && isRefusedCwd(resolved);
       // which is the diagnostic command — always surface a stale-env advisory,
       // even when a vault resolved (unlike normal commands, which stay quiet for
       // a local resolution).
@@ -2984,6 +2995,7 @@ vaultCmd
                 kind: "local",
                 path: resolved.path,
                 source: resolved.source,
+                ...(refused ? { refused: true } : {}),
                 ...(resolved.alias ? { alias: resolved.alias } : {}),
                 ...(resolved.warning ? { warning: resolved.warning } : {}),
               };
@@ -3000,6 +3012,13 @@ vaultCmd
       console.log(
         chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
       );
+      if (refused) {
+        console.log(
+          chalk.yellow(
+            'not a vault — commands here fail with NO_VAULT. Run `ctx init` here, or pass --vault <alias>.',
+          ),
+        );
+      }
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);
