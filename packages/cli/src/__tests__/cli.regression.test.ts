@@ -571,6 +571,16 @@ describe("[regression] ctx search ranking and --limit", () => {
       expect(out).not.toMatch(/more/);
     });
 
+    it("--json keeps stdout a clean array and puts the footer on stderr", () => {
+      // The footer must never land in stdout: `ctx search --json | jq` has to
+      // keep parsing when the list was cut.
+      const res = runCtxResult(tmp, ["search", "needle", "--json"]);
+      expect(res.status).toBe(0);
+      expect(JSON.parse(res.stdout)).toHaveLength(10);
+      expect(res.stdout).not.toMatch(/more/);
+      expect(res.stderr).toMatch(/15 more/);
+    });
+
     it("--limit 3 prints exactly 3 (regression)", () => {
       const out = runCtx(tmp, ["search", "needle", "--limit", "3"]);
       expect(listedIds(out)).toHaveLength(3);

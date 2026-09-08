@@ -1,4 +1,4 @@
-import chalk from "chalk";
+import chalk from "./color.js";
 
 /**
  * Shared view shapes and formatting for commands that run against BOTH a

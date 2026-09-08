@@ -13,7 +13,7 @@
  * interchangeably.
  */
 
-import chalk from "chalk";
+import chalk from "./color.js";
 import {
   ContextNestError,
   connectRemoteNest,
@@ -71,6 +71,8 @@ interface NodeSummary {
   tags?: string[];
   body?: string;
   source?: Record<string, unknown>;
+  /** BM25 relevance score; absent from a nest running an older engine. */
+  score?: number;
 }
 
 // ─── Read surface ───────────────────────────────────────────────────────────
