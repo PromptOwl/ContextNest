@@ -25,6 +25,8 @@
  * kept separate on purpose; neither supersedes the other.
  */
 
+import { codeMask, stripInlineCode } from "./markdown-mask.js";
+
 /** Minimal doc shape these primitives need — id + title + body. */
 export interface WikiDocLike {
   id: string;
@@ -36,7 +38,9 @@ export interface WikiDocLike {
  * Extract wiki-link targets from a markdown body.
  * Handles `[[Target]]` and `[[Target|alias]]` (alias dropped). Targets are
  * trimmed and de-duplicated; a target may be a title ("Onboarding") or a node
- * id ("nodes/onboarding").
+ * id ("nodes/onboarding"). Fenced code blocks and inline code spans are
+ * skipped, matching `extractContextLinks`: a `[[..]]` quoted as an example is
+ * not a link.
  */
 export function extractWikiLinks(body: string): string[] {
   const out = new Set<string>();
@@ -44,10 +48,17 @@ export function extractWikiLinks(body: string): string[] {
   // overlapping '[[' — keeps this linear and avoids the polynomial-ReDoS
   // pattern CodeQL flags for `[^\]]+?` on uncontrolled document bodies.
   const re = /\[\[([^[\]]+)\]\]/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) {
-    const target = m[1].split("|")[0].trim();
-    if (target) out.add(target);
+  const lines = body.split(/\r?\n/);
+  const mask = codeMask(lines);
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) continue;
+    const line = stripInlineCode(lines[i]);
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(line)) !== null) {
+      const target = m[1].split("|")[0].trim();
+      if (target) out.add(target);
+    }
   }
   return [...out];
 }
@@ -79,11 +90,37 @@ export function buildWikiTitleIndex(docs: WikiDocLike[]): WikiTitleIndex {
   return { byTitle, byTitleLower, ids };
 }
 
-/** Resolve one wiki target (id or title, optionally wrapped in `[[ ]]`) to a node id. */
-function resolveTarget(target: string, index: WikiTitleIndex): string | null {
+/**
+ * Resolve one wiki target (id or title, optionally wrapped in `[[ ]]`, with an
+ * optional `#anchor` suffix) to a node id, or null when nothing matches.
+ * Shared by seed resolution here and by index-time edge extraction in
+ * `inline.ts` so a `[[..]]` resolves identically in both places.
+ */
+export function resolveWikiTarget(target: string, index: WikiTitleIndex): string | null {
   let t = target.trim();
   const wrapped = t.match(/^\[\[([^[\]]+)\]\]$/);
   if (wrapped) t = wrapped[1].split("|")[0].trim();
+  if (!t) return null;
+  // The whole string first: `#` is legal in a title (`C#`, `Fix #123`), so it
+  // is only an anchor if nothing matches as written. Stripping first would
+  // make `[[C#]]` resolve to a doc titled `C` — a wrong edge, not a missing one.
+  const whole = lookup(t, index);
+  if (whole !== null) return whole;
+  // `[[Title#section]]` — the anchor addresses a section of the target doc;
+  // the edge is to the doc. Try the longest prefix first (strip at the LAST
+  // `#`, then earlier ones) so `[[C# Guide#setup]]` reaches `C# Guide` rather
+  // than `C`. A bare `[[#section]]` is a self-anchor: no target.
+  for (let hash = t.lastIndexOf("#"); hash > 0; hash = t.lastIndexOf("#", hash - 1)) {
+    const stripped = t.slice(0, hash).trim();
+    if (!stripped) break;
+    const hit = lookup(stripped, index);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/** One exact lookup: id, then exact title, then case-insensitive title. */
+function lookup(t: string, index: WikiTitleIndex): string | null {
   // Precedence: id match wins over title match. A string that is BOTH a node id
   // and some other doc's title resolves to the id. Intentional — ids are exact
   // and unambiguous; titles are user-authored free text and can collide.
@@ -98,7 +135,7 @@ function resolveTarget(target: string, index: WikiTitleIndex): string | null {
 export function resolveWikiSeeds(seeds: string[], index: WikiTitleIndex): string[] {
   const out = new Set<string>();
   for (const seed of seeds) {
-    const id = resolveTarget(seed, index);
+    const id = resolveWikiTarget(seed, index);
     if (id) out.add(id);
   }
   return [...out];
@@ -144,7 +181,7 @@ export function traverseWikiGraph(
   };
   for (const doc of docs) {
     for (const target of extractWikiLinks(doc.body)) {
-      const to = resolveTarget(target, index);
+      const to = resolveWikiTarget(target, index);
       if (to) link(doc.id, to);
     }
   }

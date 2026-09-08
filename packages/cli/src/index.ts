@@ -25,7 +25,7 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
-  generateContextYaml,
+  generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -1843,9 +1843,20 @@ program
     const published = docs.filter((d) => d.frontmatter.status === "published");
 
     // Generate context.yaml
-    const contextYaml = generateContextYaml(published, config, latestCheckpoint);
+    const { contextYaml, stats } = generateContextYamlWithStats(
+      published,
+      config,
+      latestCheckpoint,
+    );
     await storage.writeContextYaml(contextYaml);
     console.log(chalk.green("Generated context.yaml"));
+    // Where the graph came from. A vault authored with [[wikilinks]] used to
+    // index with zero edges and --hops silently did nothing; the unresolved
+    // count is the hint that a link's title does not match any published doc.
+    console.log(
+      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved)`,
+    );
 
     // Generate INDEX.md for each folder
     const folders = new Map<string, ContextNode[]>();
