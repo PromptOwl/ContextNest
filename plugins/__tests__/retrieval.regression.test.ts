@@ -19,6 +19,25 @@ const distPath = join(here, "..", "..", "packages", "cli", "dist", "index.js");
 
 // Sandbox the central registry so `ctx init` never touches the real config.
 const CONFIG_DIR = mkdtempSync(join(tmpdir(), "cn-plugin-reg-cfg-"));
+
+// The core's getConfig() reads the real override files when the caller doesn't
+// inject cwd/homedir, and the file layers beat env — so a developer's own
+// ~/.contextnest/plugin-settings.json (a pinned vault, or retrieval_mode:
+// "query") silently overrides the CONTEXTNEST_RETRIEVAL_MODE these tests pass
+// and changes both the targets and the rendered format. Point the home and
+// project dirs at an empty temp dir before baseEnv is built, so the in-process
+// run() calls and the spawned CLI both see it. os.homedir() reads $HOME on
+// POSIX and %USERPROFILE% on Windows, so both are set.
+const NO_SETTINGS = mkdtempSync(join(tmpdir(), "cn-plugin-reg-nosettings-"));
+const realEnv = {
+  HOME: process.env.HOME,
+  USERPROFILE: process.env.USERPROFILE,
+  CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR,
+};
+process.env.HOME = NO_SETTINGS;
+process.env.USERPROFILE = NO_SETTINGS;
+process.env.CLAUDE_PROJECT_DIR = NO_SETTINGS;
+
 const baseEnv = {
   ...process.env,
   CONTEXTNEST_NO_BROWSER: "1",
@@ -84,7 +103,12 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+  for (const [key, value] of Object.entries(realEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   rmSync(CONFIG_DIR, { recursive: true, force: true });
+  rmSync(NO_SETTINGS, { recursive: true, force: true });
   rmSync(workspace, { recursive: true, force: true });
   rmSync(scratchDir, { recursive: true, force: true });
 });
