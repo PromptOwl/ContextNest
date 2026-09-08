@@ -8,7 +8,7 @@ import pathMod from "node:path";
 import readline from "node:readline";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
-import { Command, Help } from "commander";
+import { Command, Help, InvalidArgumentError } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "./color.js";
@@ -2047,6 +2047,18 @@ program
     }
   });
 
+/**
+ * Shared `--limit` parser. Commander hands "-5" over as the value, so validate
+ * here — once, ahead of both the local and the remote branch — rather than let
+ * a negative or fractional limit slip through as "everything".
+ */
+function parseLimit(v: string): number {
+  if (!/^\d+$/.test(v.trim())) {
+    throw new InvalidArgumentError("--limit must be 0 or a positive integer.");
+  }
+  return parseInt(v, 10);
+}
+
 // ─── ctx list ─────────────────────────────────────────────────────────────────
 
 program
@@ -2055,7 +2067,7 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
-  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
+  .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2200,16 +2212,7 @@ program
   .command("search <query>")
   .description("Full-text search across vault documents, best match first")
   .option("--json", "Output as JSON (each hit carries its relevance score)")
-  .option("--limit <n>", "Max results (default 10; 0 = all)", (v) => {
-    // Commander hands "-5" over as the value, so validate here — once, ahead
-    // of both the local and the remote branch — rather than let a negative
-    // or fractional limit slip through as "everything".
-    if (!/^\d+$/.test(v.trim())) {
-      console.error(chalk.red("--limit must be 0 or a positive integer."));
-      process.exit(1);
-    }
-    return parseInt(v, 10);
-  })
+  .option("--limit <n>", "Max results (default 10; 0 = all)", parseLimit)
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {

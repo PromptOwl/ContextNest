@@ -35,12 +35,13 @@ node belongs to exactly one curator).
 
 ## 2. Sweep before you touch anything
 
-`ctx search` is **ranked and published-only** — it cannot see drafts and does
-not promise completeness, so it is a starting point, never proof. The sweep:
+`ctx search` is **ranked, capped at 10 by default, and published-only** — it
+cannot see drafts and does not promise completeness, so it is a starting point,
+never proof. The sweep:
 
-1. `ctx search "<old value>" --json` — published candidates.
-2. `ctx search "<new value>" --json` — catches nodes already partly corrected,
-   which is how vaults end up self-contradictory.
+1. `ctx search "<old value>" --json --limit 0` — published candidates.
+2. `ctx search "<new value>" --json --limit 0` — catches nodes already partly
+   corrected, which is how vaults end up self-contradictory.
 3. `ctx list --json` and `ctx list --status draft --json` — the full inventory,
    including the drafts search cannot reach.
 4. `ctx read <id> --raw` on every candidate whose title, tags, or description

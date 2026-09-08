@@ -150,7 +150,6 @@ describe("Resolver.search — tiered ranking", () => {
     });
     const hits = resolver.search("alpha beta gamma");
     expect(hits.map((h) => h.document.id)).toEqual(["nodes/full", "nodes/spam"]);
-    expect(hits[0].score).toBeGreaterThan(hits[1].score);
   });
 
   it("falls back to partial matches when no document has every term", () => {

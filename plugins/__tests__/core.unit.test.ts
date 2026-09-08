@@ -51,6 +51,7 @@ import {
   makeExec,
   winQuote,
   MAX_FANOUT_VAULTS,
+  MAX_LIST_SCAN,
 } from "../shared/core/lib.js";
 
 /** Transcript stub in the shape the gate's reader returns. */
@@ -853,10 +854,10 @@ describe("sweep-check", () => {
   it("findStragglers: confirms by read, spans nests, excludes only the written node in its own nest", () => {
     const exec = fakeExec([
       // eng: sibling still asserts redis; the written node does not any more.
-      ["search redis --json --vault eng", [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
       ["read nodes/sibling --raw --vault eng", "---\nt: x\n---\nCounters kept in Redis."],
       // mkt: fuzzy hit whose body does NOT contain the term → must be dropped.
-      ["search redis --json --vault mkt", [{ id: "nodes/fuzzy" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/fuzzy" }]],
       ["read nodes/fuzzy --raw --vault mkt", "---\nt: x\n---\nNothing relevant here."],
     ]);
     const { found, truncated } = findStragglers(exec, ["redis"], "nodes/written", "eng", ["eng", "mkt"]);
@@ -869,7 +870,7 @@ describe("sweep-check", () => {
       // Tagged with the entity, body words the fact without the literal term.
       ["list --tag redis", [{ id: "nodes/brand" }]],
       ["read nodes/brand --raw --vault mkt", "---\nt: x\n---\nOur flagship in-memory engine."],
-      ["search redis --json --vault mkt", []],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, []],
     ]);
     const { found } = findStragglers(exec, ["redis"], "nodes/x", "eng", ["mkt"]);
     // Reported as stale: the node either asserts the fact in other words (needs
@@ -929,8 +930,8 @@ describe("sweep-check", () => {
       ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
       ["history nodes/a --json --vault eng", history],
       ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
-      ["search redis --json --vault eng", [{ id: "nodes/a" }]],
-      ["search redis --json --vault mkt", [{ id: "nodes/pitch" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/a" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/pitch" }]],
       ["read nodes/pitch --raw --vault mkt", "---\nt: x\n---\nWe brag about Redis speed."],
     ]);
     const out = sweepCheck({
