@@ -4,12 +4,14 @@
  * Runs `ctx vault list --json`. If ctx is unavailable, injects a one-line
  * warning instead of failing (a hook must never break the session). Otherwise
  * injects the registered vault aliases + descriptions, marks the pinned/default
- * one, and nudges the model to use the vault before answering.
+ * one, names the vault found in the working directory (if any), and nudges the
+ * model to use the vault before answering.
  */
 
 import {
   getConfig,
   ctxJson,
+  cwdVault,
   isVaultRegistered,
   squish,
   runAsHook,
@@ -59,9 +61,24 @@ export function run({ env, exec }) {
     lines.push(`Pinned vault: \`${config.vault}\` (all queries/captures use it).`);
   }
 
+  // The vault in the working directory is what auto-retrieval searches first
+  // (see vaultTargets); say so, and whether it is also a registered alias.
+  const local = cwdVault(exec, vaults);
+  if (local) {
+    const how = local.alias
+      ? `registered as \`${local.alias}\``
+      : "not registered — cited without an alias prefix";
+    const rank = pinnedIsRegistered
+      ? "the pinned vault takes precedence for auto-retrieval"
+      : "searched first on every prompt";
+    lines.push(`Working-directory vault: \`${local.path}\` (${how}; ${rank}).`);
+  }
+
   if (vaults.length === 0) {
     lines.push(
-      "No vaults are registered; `ctx` will resolve a local `.context` vault from the working directory if present.",
+      local
+        ? "No vaults are registered; `ctx` resolves the working-directory vault above."
+        : "No vaults are registered; `ctx` will resolve a local `.context` vault from the working directory if present.",
     );
   } else {
     lines.push("Registered vaults:");
