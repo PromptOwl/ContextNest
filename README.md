@@ -490,7 +490,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
 | `ctx vault remove <alias>` | Unregister an alias |
 | `ctx vault default <alias>` | Set the default vault |
-| `ctx vault which` | Show the resolved vault and the reason |
+| `ctx vault which [--json]` | Show the resolved vault and the reason |
 
 ### Document Management
 
