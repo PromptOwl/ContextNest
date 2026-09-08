@@ -732,6 +732,16 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
 }
 
 /**
+ * True when a resolution is the bare-cwd fallback into a directory that is not
+ * a vault — the one case {@link assertVaultRoot} refuses. Exported so a caller
+ * that must not throw (`ctx vault which`, the diagnostic command, still has to
+ * report what resolved) can ask the guard instead of restating its condition.
+ */
+export function isRefusedCwd(resolved: ResolvedVault): boolean {
+  return resolved.source === "cwd" && !isVaultRoot(resolved.path);
+}
+
+/**
  * Refuse a resolution that landed on the bare working directory when that
  * directory is not a vault root. Every other resolution source is validated
  * with {@link isVaultRoot} before it is returned; the cwd fallback is the one
@@ -746,7 +756,7 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
  * a resolved path must call this, or it will still read an arbitrary folder.
  */
 export function assertVaultRoot(resolved: ResolvedVault): ResolvedVault {
-  if (resolved.source === "cwd" && !isVaultRoot(resolved.path)) {
+  if (isRefusedCwd(resolved)) {
     // Remotes share the alias namespace with local vaults, so a user whose
     // only registered nest is remote still gets an alias to reach for.
     const reg = readRegistry();

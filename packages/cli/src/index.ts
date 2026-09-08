@@ -26,7 +26,7 @@ import {
   publishDocument,
   ContextNestError,
   assertVaultRoot,
-  isVaultRoot,
+  isRefusedCwd,
   generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
@@ -2970,8 +2970,7 @@ vaultCmd
       });
       // which is what users run right after a NO_VAULT error, so it must not
       // report a bare cwd that every other command refuses as if it resolved.
-      const refused =
-        resolved.kind === "local" && resolved.source === "cwd" && !isVaultRoot(resolved.path);
+      const refused = resolved.kind === "local" && isRefusedCwd(resolved);
       // which is the diagnostic command — always surface a stale-env advisory,
       // even when a vault resolved (unlike normal commands, which stay quiet for
       // a local resolution).

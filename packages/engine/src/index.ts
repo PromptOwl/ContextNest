@@ -194,6 +194,7 @@ export {
   getRegistryPath,
   readRegistry,
   isVaultRoot,
+  isRefusedCwd,
   assertVaultRoot,
   findLocalVault,
   addVault,
