@@ -681,6 +681,8 @@ Context Nest defines a composable query language for selecting documents. Select
 |--------|------|---------|
 | `#tag` | Tag | Nodes where `tags` array contains `#tag` |
 | `contextnest://path` | URI | Node at the given path (see §4) |
+| `nodes/<id>` | Bare node id | The node at `nodes/<id>` — shorthand for `contextnest://nodes/<id>` |
+| `sources/<id>` | Bare source id | The source node at `sources/<id>` — shorthand for `contextnest://sources/<id>` |
 | `contextnest://tag/{name}` | Tag URI | All nodes carrying the given tag |
 | `contextnest://folder/` | Folder URI | All nodes within the given folder |
 | `contextnest://search/{query}` | Search URI | Nodes matching a full-text search query |
@@ -717,6 +719,10 @@ ctx resolve "contextnest://tag/onboarding"
 
 # By document path
 ctx resolve "contextnest://engineering/api-design"
+
+# By bare node id — the same atom without the scheme
+ctx resolve "nodes/gtm/foo"
+ctx resolve "sources/jira"
 
 # By folder
 ctx resolve "contextnest://engineering/"

@@ -268,6 +268,7 @@ export { tokenize } from "./selector/lexer.js";
 export type { Token, TokenType } from "./selector/lexer.js";
 export { parseSelector } from "./selector/parser.js";
 export type { SelectorNode } from "./selector/parser.js";
+export { SELECTOR_GRAMMAR, SELECTOR_FILTERS } from "./selector/grammar.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
 

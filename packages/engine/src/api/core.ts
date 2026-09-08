@@ -13,6 +13,7 @@
  * source for both the on-disk format and the wire contract.
  */
 import { z } from "zod";
+import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
@@ -117,7 +118,7 @@ const queryOp: OperationDescriptor = {
   name: "context_query",
   namespace: "core",
   description:
-    "Run a selector query with graph traversal. Supports #tag, type:X, [[Title]], scope:X, combined with +AND, |OR, -NOT.",
+    `Run a selector query with graph traversal. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     query: z.string().min(1).describe("Selector query expression"),
     hops: z
@@ -157,7 +158,7 @@ const resolveOp: OperationDescriptor = {
   name: "context_resolve",
   namespace: "core",
   description:
-    "Full context resolution — run a selector and return complete node content within a token budget.",
+    `Full context resolution — run a selector and return complete node content within a token budget. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     selector: z.string().min(1).describe("Selector query string"),
     max_tokens: z

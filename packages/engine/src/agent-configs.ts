@@ -8,6 +8,7 @@
  */
 
 import type { ContextYaml, NestConfig, Pack } from "./types.js";
+import { SELECTOR_GRAMMAR } from "./selector/grammar.js";
 
 const SECTION_BEGIN = "<!-- BEGIN CONTEXT NEST (auto-generated, do not edit this section) -->";
 const SECTION_END = "<!-- END CONTEXT NEST -->";
@@ -163,9 +164,12 @@ function buildCoreInstructions(input: AgentConfigInput): string {
   lines.push('ctx query "#topic"              # By tag');
   lines.push('ctx query "type:document"        # By type');
   lines.push('ctx query "pack:pack-name"       # Load a pack');
+  lines.push('ctx query "nodes/<id>"           # One node by id');
   lines.push('ctx query "#tag" --hops 3        # Deeper graph traversal');
   lines.push('ctx query "#tag" --full           # Load everything (large vaults)');
   lines.push("```");
+  lines.push("");
+  lines.push(`Selector grammar: \`${SELECTOR_GRAMMAR}\``);
   lines.push("");
 
   // Maintenance directive — read from config, fall back to default
