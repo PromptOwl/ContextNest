@@ -8,7 +8,7 @@ import pathMod from "node:path";
 import readline from "node:readline";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
-import { Command, Help } from "commander";
+import { Command, Help, InvalidArgumentError } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "./color.js";
@@ -25,7 +25,9 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
-  generateContextYaml,
+  assertVaultRoot,
+  isRefusedCwd,
+  generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -77,7 +79,9 @@ import {
 import {
   listJsonEntry,
   queryJsonPayload,
-  searchJsonEntry,
+  searchLimit,
+  printSearchResults,
+  type SearchHitView,
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
@@ -388,6 +392,12 @@ function getVaultRoot(): string {
   if (resolved.warning && resolved.source !== "local") {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
+  // The bare-cwd fallback is the only step that hands back an unvalidated
+  // directory. Refuse it here, centrally (NO_VAULT), so no command reads a
+  // folder of repos as documents or auto-indexes a context.yaml into it.
+  // `init` (getInitRoot) and the `vault *` registry commands never come
+  // through this helper. Same engine guard as the MCP server.
+  assertVaultRoot(resolved);
   resolvedVaultRoot = resolved.path;
   return resolvedVaultRoot;
 }
@@ -1864,9 +1874,20 @@ program
     const published = docs.filter((d) => d.frontmatter.status === "published");
 
     // Generate context.yaml
-    const contextYaml = generateContextYaml(published, config, latestCheckpoint);
+    const { contextYaml, stats } = generateContextYamlWithStats(
+      published,
+      config,
+      latestCheckpoint,
+    );
     await storage.writeContextYaml(contextYaml);
     console.log(chalk.green("Generated context.yaml"));
+    // Where the graph came from. A vault authored with [[wikilinks]] used to
+    // index with zero edges and --hops silently did nothing; the unresolved
+    // count is the hint that a link's title does not match any published doc.
+    console.log(
+      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved)`,
+    );
 
     // Generate INDEX.md for each folder
     const folders = new Map<string, ContextNode[]>();
@@ -2048,6 +2069,18 @@ program
     }
   });
 
+/**
+ * Shared `--limit` parser. Commander hands "-5" over as the value, so validate
+ * here — once, ahead of both the local and the remote branch — rather than let
+ * a negative or fractional limit slip through as "everything".
+ */
+function parseLimit(v: string): number {
+  if (!/^\d+$/.test(v.trim())) {
+    throw new InvalidArgumentError("--limit must be 0 or a positive integer.");
+  }
+  return parseInt(v, 10);
+}
+
 // ─── ctx list ─────────────────────────────────────────────────────────────────
 
 program
@@ -2056,7 +2089,7 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
-  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
+  .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2199,9 +2232,9 @@ program
 
 program
   .command("search <query>")
-  .description("Full-text search across vault documents")
-  .option("--json", "Output as JSON")
-  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
+  .description("Full-text search across vault documents, best match first")
+  .option("--json", "Output as JSON (each hit carries its relevance score)")
+  .option("--limit <n>", "Max results (default 10; 0 = all)", parseLimit)
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -2209,33 +2242,14 @@ program
       return;
     }
     const storage = getStorage();
-    const { results } = await createEngineApi().run<{
-      results: Array<{ id: string; title: string; description?: string; type: string }>;
-    }>(
+    const limit = searchLimit(opts.limit);
+    const out = await createEngineApi().run<{ results: SearchHitView[]; total?: number }>(
       "context_search",
-      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      { query, ...(limit ? { limit } : {}) },
       opContext(storage, "cli@contextnest.local"),
     );
-
-    if (opts.json) {
-      // Field selection shared with the remote branch (doc-views.ts).
-      console.log(
-        JSON.stringify(
-          results.map(searchJsonEntry),
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    if (results.length === 0) {
-      console.log(chalk.yellow("No results found."));
-      return;
-    }
-    console.log(chalk.bold(`${results.length} result(s):\n`));
-    for (const doc of results) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
-    }
+    // Rendering shared with the remote branch (doc-views.ts).
+    printSearchResults(out, opts);
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────
@@ -2964,17 +2978,46 @@ vaultCmd
 vaultCmd
   .command("which")
   .description("Show which vault the CLI would use right now, and why (respects --vault)")
-  .action(() => {
+  .option("--json", "Output as JSON ({kind, path|endpoint, source, alias?, warning?})")
+  .action((opts) => {
     try {
       const resolved = resolveNest({
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
+      // which is what users run right after a NO_VAULT error, so it must not
+      // report a bare cwd that every other command refuses as if it resolved.
+      const refused = resolved.kind === "local" && isRefusedCwd(resolved);
       // which is the diagnostic command — always surface a stale-env advisory,
       // even when a vault resolved (unlike normal commands, which stay quiet for
       // a local resolution).
       if (resolved.warning) {
         console.error(chalk.yellow(resolved.warning));
+      }
+      if (opts.json) {
+        // Machine-readable form for scripted callers (the plugin hooks use it
+        // to find the vault in the working directory). Same fields as the text
+        // output, no colour, one object.
+        const out =
+          resolved.kind === "remote"
+            ? {
+                kind: "remote",
+                alias: resolved.alias,
+                source: resolved.source,
+                transport: resolved.remote.transport,
+                endpoint: describeRemoteEndpoint(resolved.remote),
+                ...(resolved.warning ? { warning: resolved.warning } : {}),
+              }
+            : {
+                kind: "local",
+                path: resolved.path,
+                source: resolved.source,
+                ...(refused ? { refused: true } : {}),
+                ...(resolved.alias ? { alias: resolved.alias } : {}),
+                ...(resolved.warning ? { warning: resolved.warning } : {}),
+              };
+        console.log(JSON.stringify(out, null, 2));
+        return;
       }
       if (resolved.kind === "remote") {
         console.log(`${resolved.alias} ${chalk.magenta(`(remote, ${resolved.remote.transport})`)}`);
@@ -2986,6 +3029,13 @@ vaultCmd
       console.log(
         chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
       );
+      if (refused) {
+        console.log(
+          chalk.yellow(
+            'not a vault — commands here fail with NO_VAULT. Run `ctx init` here, or pass --vault <alias>.',
+          ),
+        );
+      }
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);

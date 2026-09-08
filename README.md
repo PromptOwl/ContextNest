@@ -418,7 +418,10 @@ agent_instructions: |
 
 ### File safety
 
-No `ctx` command writes to your working directory without saying so.
+No `ctx` command writes to your working directory without saying so. And no
+command reads or indexes a directory that is not a vault: when nothing resolves
+a vault (no `--vault`, no local vault, no registry default), `ctx` refuses with
+`Error [NO_VAULT]` instead of treating your current folder as one.
 
 | Flag | Effect |
 |---|---|
@@ -487,7 +490,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
 | `ctx vault remove <alias>` | Unregister an alias |
 | `ctx vault default <alias>` | Set the default vault |
-| `ctx vault which` | Show the resolved vault and the reason |
+| `ctx vault which [--json]` | Show the resolved vault and the reason |
 
 ### Document Management
 
