@@ -158,7 +158,7 @@ const resolveOp: OperationDescriptor = {
   name: "context_resolve",
   namespace: "core",
   description:
-    "Full context resolution — run a selector and return complete node content within a token budget.",
+    `Full context resolution — run a selector and return complete node content within a token budget. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     selector: z.string().min(1).describe("Selector query string"),
     max_tokens: z

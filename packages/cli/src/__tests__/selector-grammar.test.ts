@@ -28,6 +28,9 @@ const cliRoot = join(here, "..", "..");
 describe("SELECTOR_GRAMMAR is the one grammar line", () => {
   it("names every atom and operator, and none of the fakes", () => {
     expect(SELECTOR_GRAMMAR).toContain("nodes/<id>");
+    expect(SELECTOR_GRAMMAR).toContain("sources/<id>");
+    // ASCII only: the line is printed to legacy Windows consoles (cp437/cp850).
+    expect(SELECTOR_GRAMMAR).toMatch(/^[\x20-\x7e]+$/);
     expect(SELECTOR_GRAMMAR).toContain("#tag");
     expect(SELECTOR_GRAMMAR).toMatch(/AND/);
     expect(SELECTOR_GRAMMAR).toMatch(/OR/);

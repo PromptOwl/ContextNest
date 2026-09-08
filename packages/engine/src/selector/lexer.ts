@@ -39,6 +39,24 @@ function bareIdToUri(value: string): string | null {
   return BARE_ID_PREFIX.test(value) ? `contextnest://${value}` : null;
 }
 
+/**
+ * The one "did you mean" error for a token that is neither a known atom nor a
+ * bare id. Shared by the bare-word branch and the quoted-string branch so
+ * `gtm/foo` and `"gtm/foo"` fail identically, instead of the quoted spelling
+ * escaping into an opaque INVALID_URI from `parseUri` two layers down.
+ */
+function unexpectedToken(bare: string, position: number): InvalidSelectorError {
+  // `Nodes/foo` is a mis-cased prefix, not a tag: suggest `nodes/foo`,
+  // never `nodes/Nodes/foo`.
+  const miscased = /^(nodes|sources)\//i.test(bare) && !BARE_ID_PREFIX.test(bare);
+  const hint = miscased
+    ? `"${bare.replace(/^(nodes|sources)\//i, (m) => m.toLowerCase())}" (a node id)`
+    : `"nodes/${bare}" (a node id) or "#${bare}" (a tag)`;
+  return new InvalidSelectorError(
+    `Unexpected token "${bare}" at position ${position} — did you mean ${hint}?`,
+  );
+}
+
 export function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
   let pos = 0;
@@ -126,8 +144,11 @@ export function tokenize(input: string): Token[] {
         tokens.push({ type: "PACK", value: value.slice(5), position: start });
       } else {
         // A quoted bare id gets the scheme like the unquoted form; anything
-        // else is treated as a URI by default (and fails in parseUri later).
-        tokens.push({ type: "URI", value: bareIdToUri(value) ?? value, position: start });
+        // else is the same mistake as an unquoted bare word, so it gets the
+        // same hint rather than an INVALID_URI two layers down.
+        const uri = bareIdToUri(value);
+        if (!uri) throw unexpectedToken(value, start);
+        tokens.push({ type: "URI", value: uri, position: start });
       }
       continue;
     }
@@ -217,16 +238,7 @@ export function tokenize(input: string): Token[] {
       // hint below is something the user can paste back.
       let wordEnd = pos;
       while (wordEnd < input.length && !/[\s+|()]/.test(input[wordEnd])) wordEnd++;
-      const bare = input.slice(pos, wordEnd);
-      // `Nodes/foo` is a mis-cased prefix, not a tag: suggest `nodes/foo`,
-      // never `nodes/Nodes/foo`.
-      const miscased = /^(nodes|sources)\//i.test(bare) && !BARE_ID_PREFIX.test(bare);
-      const hint = miscased
-        ? `"${bare.replace(/^(nodes|sources)\//i, (m) => m.toLowerCase())}" (a node id)`
-        : `"nodes/${bare}" (a node id) or "#${bare}" (a tag)`;
-      throw new InvalidSelectorError(
-        `Unexpected token "${bare}" at position ${start} — did you mean ${hint}?`,
-      );
+      throw unexpectedToken(input.slice(pos, wordEnd), start);
     }
 
     throw new InvalidSelectorError(`Unexpected character "${ch}" at position ${pos}`);

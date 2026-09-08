@@ -230,10 +230,10 @@ Edge priorities:
 Grammar, one line:
 
 ```
-#tag  type:X  status:X  pack:id  nodes/<id>   ·   space or + = AND, | = OR, - = NOT, ( ) to group
+Atoms: #tag  type:X  status:X  pack:id  nodes/<id>  sources/<id>   Operators: space or + = AND, | = OR, - = NOT, ( ) to group
 ```
 
-`nodes/<id>` is a bare node id — `ctx query "nodes/gtm/foo"` selects that one node (the long form `contextnest://nodes/gtm/foo` still works). A bare word without the `nodes/` prefix is an error, with a hint. `tag:#x`, `transport:X` and `server:X` are also accepted.
+`nodes/<id>` is a bare node id — `ctx query "nodes/gtm/foo"` selects that one node (the long form `contextnest://nodes/gtm/foo` still works); `sources/<id>` does the same for a source node. A bare word without the `nodes/` prefix is an error, with a hint. `tag:#x`, `transport:X` and `server:X` are also accepted.
 
 ```bash
 ctx query "#engineering"                   # All docs with a tag
@@ -243,6 +243,7 @@ ctx query "type:skill + #engineering"      # Engineering skills only
 ctx query "pack:engineering-essentials"    # All docs in a pack
 ctx query "status:published"              # By status
 ctx query "nodes/gtm/foo"                 # One node by id
+ctx query "sources/jira"                  # One source node by id
 ctx query "#api + #v2"                    # Intersection (AND): both tags
 ctx query "#api | #v2"                    # Union (OR): either tag
 ctx query "#api - #deprecated"            # Difference (NOT)

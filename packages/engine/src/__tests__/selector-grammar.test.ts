@@ -25,9 +25,9 @@ import { VersionManager } from "../versioning.js";
 import { publishDocument } from "../publish.js";
 import { serializeDocument } from "../parser.js";
 import { generateContextYaml } from "../index-generator.js";
-import { createEngineApi } from "../api/index.js";
+import { createEngineApi, listOperations } from "../api/index.js";
 import * as engine from "../index.js";
-import type { ContextNode, Frontmatter } from "../types.js";
+import type { ContextNode, Frontmatter, SourceMeta } from "../types.js";
 
 // ─── Part 1: existing grammar (must pass before AND after the lexer change) ──
 
@@ -185,6 +185,29 @@ describe("selector grammar — bare node ids (nodes/<id>, sources/<id>)", () => 
     });
   });
 
+  it("a QUOTED word without the prefix gets the same hint, not an opaque INVALID_URI", () => {
+    // The quoted spelling used to lex as URI "gtm/foo" and fail later in
+    // parseUri with `URI must start with contextnest://`. Same mistake as the
+    // unquoted form, so it must produce the same error. (review on PR #100)
+    let quoted = "";
+    try {
+      parseSelector('\"gtm/foo\"');
+    } catch (e) {
+      quoted = (e as Error).message;
+    }
+    let bare = "";
+    try {
+      parseSelector("gtm/foo");
+    } catch (e) {
+      bare = (e as Error).message;
+    }
+    expect(quoted).toBe(bare);
+    expect(() => parseSelector('\"gtm/foo\"')).toThrow(InvalidSelectorError);
+    expect(quoted).toContain('did you mean "nodes/gtm/foo"');
+    // A quoted mis-cased prefix is hinted the same way too.
+    expect(() => parseSelector('\"Nodes/foo\"')).toThrow(/did you mean "nodes\/foo"/);
+  });
+
   it("a mis-cased prefix (Nodes/foo) is hinted as nodes/foo, never nodes/Nodes/foo", () => {
     let msg = "";
     try {
@@ -243,11 +266,21 @@ describe("SELECTOR_GRAMMAR", () => {
   it("is exported from the engine and names every atom and operator", () => {
     const g = (engine as Record<string, unknown>).SELECTOR_GRAMMAR;
     expect(typeof g).toBe("string");
-    for (const piece of ["#tag", "type:X", "status:X", "pack:id", "nodes/<id>", "AND", "OR", "NOT", "( )"]) {
+    for (const piece of ["#tag", "type:X", "status:X", "pack:id", "nodes/<id>", "sources/<id>", "AND", "OR", "NOT", "( )"]) {
       expect(g).toContain(piece);
     }
     expect(g).not.toContain("&");
     expect(g).not.toContain("path:");
+  });
+
+  it("is carried by BOTH selector-taking MCP tool descriptions, not just one", () => {
+    // context_resolve used to describe the token budget and nothing about the
+    // grammar, so an agent calling it never learned the bare-id atom.
+    for (const name of ["context_query", "context_resolve"]) {
+      const op = listOperations("core").find((o) => o.name === name);
+      expect(op, name).toBeDefined();
+      expect(op!.description).toContain(engine.SELECTOR_GRAMMAR);
+    }
   });
 });
 
@@ -277,6 +310,28 @@ describe("bare node ids through the query engine", () => {
     if (publish) await publishDocument(storage, id, { editedBy: "test@local", note: "test" });
   }
 
+  async function addSource(id: string): Promise<void> {
+    const source: SourceMeta = { transport: "mcp", server: "jira", tools: ["list_issues"] };
+    const frontmatter: Frontmatter = {
+      title: id,
+      type: "source",
+      status: "draft",
+      version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      tags: ["#strategy"],
+      source,
+    };
+    const node: ContextNode = {
+      id,
+      filePath: "",
+      frontmatter,
+      body: `\n# ${id}\n\nBody of ${id}.\n`,
+      rawContent: "",
+    };
+    await storage.writeDocument(id, serializeDocument(node));
+    await publishDocument(storage, id, { editedBy: "test@local", note: "test" });
+  }
+
   async function reindex(): Promise<void> {
     const docs = await storage.discoverDocuments();
     const config = await storage.readConfig();
@@ -293,6 +348,7 @@ describe("bare node ids through the query engine", () => {
     await addDoc("nodes/gtm/foo", ["strategy"]);
     await addDoc("nodes/gtm/bar", ["strategy"]);
     await addDoc("nodes/gtm/foo-draft", ["strategy"], false);
+    await addSource("sources/jira");
     await reindex();
   });
 
@@ -320,6 +376,17 @@ describe("bare node ids through the query engine", () => {
     const bare = await gqe.query("nodes/gtm/foo", { hops: 0 });
     expect(quoted.documents.map((d) => d.id)).toEqual(bare.documents.map((d) => d.id));
     expect(quoted.documents.map((d) => d.id)).toEqual(["nodes/gtm/foo"]);
+  });
+
+  it("sources/<id> resolves the source node, not a document", async () => {
+    // The other half of the atom: `sources/` nodes come back on sourceNodes,
+    // so a lexer-only assertion would not have caught a storage/evaluator gap.
+    const gqe = new GraphQueryEngine(storage);
+    const result = await gqe.query("sources/jira", { hops: 0 });
+    expect(result.sourceNodes.map((d) => d.id)).toEqual(["sources/jira"]);
+    expect(result.documents).toEqual([]);
+    const long = await gqe.query("contextnest://sources/jira", { hops: 0 });
+    expect(long.sourceNodes.map((d) => d.id)).toEqual(["sources/jira"]);
   });
 
   it("context_resolve lists it", async () => {
