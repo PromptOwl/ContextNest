@@ -8,7 +8,7 @@ import pathMod from "node:path";
 import readline from "node:readline";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
-import { Command, Help } from "commander";
+import { Command, Help, InvalidArgumentError } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "./color.js";
@@ -78,7 +78,9 @@ import {
 import {
   listJsonEntry,
   queryJsonPayload,
-  searchJsonEntry,
+  searchLimit,
+  printSearchResults,
+  type SearchHitView,
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
@@ -2045,6 +2047,18 @@ program
     }
   });
 
+/**
+ * Shared `--limit` parser. Commander hands "-5" over as the value, so validate
+ * here — once, ahead of both the local and the remote branch — rather than let
+ * a negative or fractional limit slip through as "everything".
+ */
+function parseLimit(v: string): number {
+  if (!/^\d+$/.test(v.trim())) {
+    throw new InvalidArgumentError("--limit must be 0 or a positive integer.");
+  }
+  return parseInt(v, 10);
+}
+
 // ─── ctx list ─────────────────────────────────────────────────────────────────
 
 program
@@ -2053,7 +2067,7 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
-  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
+  .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2196,9 +2210,9 @@ program
 
 program
   .command("search <query>")
-  .description("Full-text search across vault documents")
-  .option("--json", "Output as JSON")
-  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
+  .description("Full-text search across vault documents, best match first")
+  .option("--json", "Output as JSON (each hit carries its relevance score)")
+  .option("--limit <n>", "Max results (default 10; 0 = all)", parseLimit)
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -2206,33 +2220,14 @@ program
       return;
     }
     const storage = getStorage();
-    const { results } = await createEngineApi().run<{
-      results: Array<{ id: string; title: string; description?: string; type: string }>;
-    }>(
+    const limit = searchLimit(opts.limit);
+    const out = await createEngineApi().run<{ results: SearchHitView[]; total?: number }>(
       "context_search",
-      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      { query, ...(limit ? { limit } : {}) },
       opContext(storage, "cli@contextnest.local"),
     );
-
-    if (opts.json) {
-      // Field selection shared with the remote branch (doc-views.ts).
-      console.log(
-        JSON.stringify(
-          results.map(searchJsonEntry),
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    if (results.length === 0) {
-      console.log(chalk.yellow("No results found."));
-      return;
-    }
-    console.log(chalk.bold(`${results.length} result(s):\n`));
-    for (const doc of results) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
-    }
+    // Rendering shared with the remote branch (doc-views.ts).
+    printSearchResults(out, opts);
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────

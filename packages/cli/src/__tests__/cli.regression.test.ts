@@ -16,6 +16,7 @@ import { execFileSync, execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import {
   mkdtempSync,
+  mkdirSync,
   writeFileSync,
   readFileSync,
   appendFileSync,
@@ -489,6 +490,114 @@ describe("[regression] ctx search", () => {
     const ids = parsed.map((d: { id: string }) => d.id);
     expect(ids).toContain("stray");
   });
+});
+
+// CU-wdqcq01c5w: hits used to come back in id order (the evaluator dropped
+// MiniSearch's score) and every hit printed, so a 673-doc vault answered
+// "strategy roadmap 2026" with 607 alphabetical novel chapters.
+describe("[regression] ctx search ranking and --limit", () => {
+  /** Drop a document straight onto disk — discovery is live, no re-index. */
+  function writeDoc(id: string, body: string, status = "published"): void {
+    mkdirSync(join(tmp, dirname(id)), { recursive: true });
+    writeFileSync(
+      join(tmp, `${id}.md`),
+      [
+        "---",
+        `title: ${id.split("/").pop()}`,
+        "type: document",
+        `status: ${status}`,
+        "version: 1",
+        "---",
+        "",
+        body,
+        "",
+      ].join("\n"),
+    );
+  }
+
+  /** Result lines of the human listing: "  <id>: <title>". */
+  function listedIds(out: string): string[] {
+    return out
+      .split("\n")
+      .map((l) => l.match(/^\s+(nodes\/\S+):/)?.[1])
+      .filter((x): x is string => Boolean(x));
+  }
+
+  beforeEach(() => {
+    initVault(tmp);
+  });
+
+  it("ranks the all-terms match above the single-term match, with numeric scores", () => {
+    // Ids sort the wrong way round on purpose: a-partial < m-other < z-full.
+    writeDoc("nodes/z-full", "alpha beta gamma");
+    writeDoc("nodes/a-partial", "alpha");
+    writeDoc("nodes/m-other", "zzz");
+    const parsed = JSON.parse(runCtx(tmp, ["search", "alpha beta gamma", "--json"]));
+    expect(parsed.map((d: { id: string }) => d.id)).toEqual([
+      "nodes/z-full",
+      "nodes/a-partial",
+    ]);
+    expect(typeof parsed[0].score).toBe("number");
+    expect(typeof parsed[1].score).toBe("number");
+    expect(parsed[0].score).toBeGreaterThan(parsed[1].score);
+  });
+
+  it("does not return a draft that matches the term (published-only)", () => {
+    writeDoc("nodes/z-full", "alpha beta gamma");
+    writeDoc("nodes/b-draft", "alpha beta gamma", "draft");
+    const parsed = JSON.parse(runCtx(tmp, ["search", "alpha", "--json"]));
+    const ids = parsed.map((d: { id: string }) => d.id);
+    expect(ids).toContain("nodes/z-full");
+    expect(ids).not.toContain("nodes/b-draft");
+  });
+
+  describe("with 25 matching documents", () => {
+    beforeEach(() => {
+      for (let i = 1; i <= 25; i++) {
+        writeDoc(`nodes/needle-${String(i).padStart(2, "0")}`, `needle number ${i}`);
+      }
+    });
+
+    it("prints 10 by default and a footer naming the remainder", () => {
+      const out = runCtx(tmp, ["search", "needle"]);
+      expect(listedIds(out)).toHaveLength(10);
+      expect(out).toMatch(/15 more/);
+      expect(out).toMatch(/--limit/);
+    });
+
+    it("--limit 0 prints every hit and no footer", () => {
+      const out = runCtx(tmp, ["search", "needle", "--limit", "0"]);
+      expect(listedIds(out)).toHaveLength(25);
+      expect(out).not.toMatch(/more/);
+    });
+
+    it("--json keeps stdout a clean array and puts the footer on stderr", () => {
+      // The footer must never land in stdout: `ctx search --json | jq` has to
+      // keep parsing when the list was cut.
+      const res = runCtxResult(tmp, ["search", "needle", "--json"]);
+      expect(res.status).toBe(0);
+      expect(JSON.parse(res.stdout)).toHaveLength(10);
+      expect(res.stdout).not.toMatch(/more/);
+      expect(res.stderr).toMatch(/15 more/);
+    });
+
+    it("--limit 3 prints exactly 3 (regression)", () => {
+      const out = runCtx(tmp, ["search", "needle", "--limit", "3"]);
+      expect(listedIds(out)).toHaveLength(3);
+      expect(out).toMatch(/22 more/);
+    });
+  });
+
+  it.each(["-5", "abc", "2.5"])(
+    "rejects --limit %s with a clear message and exit 1",
+    (bad) => {
+      // Commander hands "-5" over as the value, so without a guard a negative
+      // limit silently meant "everything".
+      const res = runCtxResult(tmp, ["search", "needle", "--limit", bad]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toMatch(/--limit must be 0 or a positive integer/);
+    },
+  );
 });
 
 // ─── update ──────────────────────────────────────────────────────────────────

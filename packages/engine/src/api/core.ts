@@ -95,7 +95,11 @@ const searchOp: OperationDescriptor = {
     limit: z.number().int().positive().optional().describe("Max results"),
   }),
   output: z.object({
+    // Best hit first: documents matching every query term, then partial
+    // matches, each tier by descending BM25 `score`.
     results: z.array(nodeSummary.extend({ score: z.number().optional() })),
+    // Matches before `limit` was applied, so a caller can say "N more".
+    total: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["search"],

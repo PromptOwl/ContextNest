@@ -13,7 +13,7 @@
  * interchangeably.
  */
 
-import chalk from "chalk";
+import chalk from "./color.js";
 import {
   ContextNestError,
   connectRemoteNest,
@@ -26,7 +26,8 @@ import { confirmOrExit, isDryRun } from "./safety.js";
 import {
   listJsonEntry,
   queryJsonPayload,
-  searchJsonEntry,
+  searchLimit,
+  printSearchResults,
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
@@ -70,6 +71,8 @@ interface NodeSummary {
   tags?: string[];
   body?: string;
   source?: Record<string, unknown>;
+  /** BM25 relevance score; absent from a nest running an older engine. */
+  score?: number;
 }
 
 // ─── Read surface ───────────────────────────────────────────────────────────
@@ -171,23 +174,15 @@ export async function remoteSearch(
   opts: { json?: boolean; limit?: number },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ results: NodeSummary[] }>("context_search", {
+    const limit = searchLimit(opts.limit);
+    const out = await conn.run<{ results: NodeSummary[]; total?: number }>("context_search", {
       query,
-      ...(opts.limit ? { limit: opts.limit } : {}),
+      ...(limit ? { limit } : {}),
     });
-    if (opts.json) {
-      // Field selection shared with the local branch (doc-views.ts).
-      console.log(JSON.stringify(out.results.map(searchJsonEntry), null, 2));
-      return;
-    }
-    if (out.results.length === 0) {
-      console.log(chalk.yellow("No results found."));
-      return;
-    }
-    console.log(chalk.bold(`${out.results.length} result(s):\n`));
-    for (const doc of out.results) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
-    }
+    // Rendering shared with the local branch (doc-views.ts). An older remote
+    // engine sends neither `score` nor `total`; both degrade to the previous
+    // output.
+    printSearchResults(out, opts);
   });
 }
 

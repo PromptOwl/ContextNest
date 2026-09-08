@@ -27,7 +27,7 @@ import os from "node:os";
 import pathMod from "node:path";
 import readline from "node:readline";
 import { createHash } from "node:crypto";
-import chalk from "chalk";
+import chalk from "./color.js";
 import { getRegistryDir } from "@promptowl/contextnest-engine";
 
 // ─── Flags ──────────────────────────────────────────────────────────────────
