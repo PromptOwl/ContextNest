@@ -50,6 +50,8 @@ import {
   VALID_RETRIEVAL_MODES,
   makeExec,
   winQuote,
+  MAX_FANOUT_VAULTS,
+  MAX_LIST_SCAN,
 } from "../shared/core/lib.js";
 
 /** Transcript stub in the shape the gate's reader returns. */
@@ -388,6 +390,78 @@ describe("lib helpers", () => {
     expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "gone" }), missing)).toEqual([null]);
   });
 
+  // CU-wdqcq01c5v — the vault in the working directory used to be ignored
+  // whenever the registry was non-empty, and the fan-out happily hit demo/tmp
+  // vaults ahead of it.
+  it("vaultTargets: the cwd vault is searched first (as null), then the registry", () => {
+    const ex = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "crm", path: "/vaults/crm", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(getConfig({}), ex)).toEqual([null, "demo", "crm"]);
+  });
+
+  it("vaultTargets: a cwd vault that is also registered is searched once, by alias, first", () => {
+    const ex = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "crm", path: "/vaults/crm", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/vaults/crm", source: "local" }],
+    ]);
+    expect(vaultTargets(getConfig({}), ex)).toEqual(["crm", "demo"]);
+  });
+
+  it("vaultTargets: registry entries that are missing or live under os.tmpdir() are never targeted", () => {
+    const scratch = join(tmpdir(), "cn-scratch-vault");
+    const registry = [
+      { alias: "gone", path: "/vaults/gone", exists: false },
+      { alias: "scratch", path: scratch, exists: true },
+      { alias: "demo", path: "/vaults/demo", exists: true },
+    ];
+    // No cwd vault (ctx would fall back to the bare cwd) → only the real one.
+    const noCwd = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(getConfig({}), noCwd)).toEqual(["demo"]);
+    // Nothing eligible and no cwd vault → let ctx resolve, as with an empty registry.
+    const nothing = fakeExec([
+      ["vault list", registry.slice(0, 2)],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(getConfig({}), nothing)).toEqual([null]);
+    // A cwd vault that happens to live under tmp is a deliberate choice → kept.
+    const cwdInTmp = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: scratch, source: "local" }],
+    ]);
+    expect(vaultTargets(getConfig({}), cwdInTmp)).toEqual(["scratch", "demo"]);
+  });
+
+  it("vaultTargets: the cwd vault counts against MAX_FANOUT_VAULTS", () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ alias: `v${i}`, path: `/vaults/v${i}`, exists: true }));
+    const ex = fakeExec([
+      ["vault list", many],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    const targets = vaultTargets(getConfig({}), ex);
+    expect(targets).toHaveLength(MAX_FANOUT_VAULTS);
+    expect(targets[0]).toBeNull();
+    expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
+  });
+
+  it("vaultTargets: a registered pin still short-circuits, even with a cwd vault", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
+  });
+
   it("isVaultRegistered: true only for a registered, present alias", () => {
     const vaults = [{ alias: "a", exists: true }, { alias: "gone", exists: false }];
     expect(isVaultRegistered("a", vaults)).toBe(true);
@@ -442,6 +516,22 @@ describe("retrieve", () => {
     const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
     expect(additional(out)).toContain("work:nodes/w");
     expect(additional(out)).toContain("home:nodes/h");
+  });
+
+  it("search → the cwd vault's hits come first and are cited without an alias prefix", () => {
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) return json([{ alias: "demo", path: "/vaults/demo", exists: true }]);
+      if (k.includes("vault which")) return json({ kind: "local", path: "/work/notes", source: "local" });
+      if (k.includes("--vault demo")) return json([{ id: "nodes/gi", title: "Gastro", type: "document" }]);
+      if (k.startsWith("search")) return json([{ id: "nodes/local", title: "Local Note", type: "document" }]);
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const text = additional(out)!;
+    expect(text).toContain("- nodes/local — Local Note");
+    expect(text).toContain("- demo:nodes/gi — Gastro");
+    expect(text.indexOf("nodes/local")).toBeLessThan(text.indexOf("demo:nodes/gi"));
   });
 
   it("query → maps ids to tags via ctx list then injects graph documents", () => {
@@ -542,6 +632,37 @@ describe("session-start", () => {
     // Must NOT claim the ghost pin is in effect, and no vault is flagged pinned.
     expect(ctx).not.toContain("all queries/captures use it");
     expect(ctx).not.toContain("pinned");
+  });
+
+  it("mentions a working-directory vault when one is detected", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/proj/notes", source: "local" }],
+    ]);
+    const out = sessionStart({ input: { cwd: "/proj/notes" }, env: {}, exec: ex });
+    const ctx = additional(out)!;
+    expect(ctx).toMatch(/working-directory vault/i);
+    expect(ctx).toContain("/proj/notes");
+    expect(ctx).toMatch(/not registered/i);
+  });
+
+  it("names the alias when the working-directory vault is registered", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/vaults/work", source: "local" }],
+    ]);
+    const ctx = additional(sessionStart({ input: {}, env: {}, exec: ex }))!;
+    expect(ctx).toMatch(/working-directory vault/i);
+    expect(ctx).toContain("`work`");
+    expect(ctx).not.toMatch(/not registered/i);
+  });
+
+  it("does not mention a working-directory vault when the cwd is not a vault", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "default", alias: "work" }],
+    ]);
+    expect(additional(sessionStart({ input: {}, env: {}, exec: ex }))).not.toMatch(/working-directory vault/i);
   });
 
   it("notes local resolution when no vaults are registered", () => {
@@ -733,10 +854,10 @@ describe("sweep-check", () => {
   it("findStragglers: confirms by read, spans nests, excludes only the written node in its own nest", () => {
     const exec = fakeExec([
       // eng: sibling still asserts redis; the written node does not any more.
-      ["search redis --json --vault eng", [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
       ["read nodes/sibling --raw --vault eng", "---\nt: x\n---\nCounters kept in Redis."],
       // mkt: fuzzy hit whose body does NOT contain the term → must be dropped.
-      ["search redis --json --vault mkt", [{ id: "nodes/fuzzy" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/fuzzy" }]],
       ["read nodes/fuzzy --raw --vault mkt", "---\nt: x\n---\nNothing relevant here."],
     ]);
     const { found, truncated } = findStragglers(exec, ["redis"], "nodes/written", "eng", ["eng", "mkt"]);
@@ -749,7 +870,7 @@ describe("sweep-check", () => {
       // Tagged with the entity, body words the fact without the literal term.
       ["list --tag redis", [{ id: "nodes/brand" }]],
       ["read nodes/brand --raw --vault mkt", "---\nt: x\n---\nOur flagship in-memory engine."],
-      ["search redis --json --vault mkt", []],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, []],
     ]);
     const { found } = findStragglers(exec, ["redis"], "nodes/x", "eng", ["mkt"]);
     // Reported as stale: the node either asserts the fact in other words (needs
@@ -809,8 +930,8 @@ describe("sweep-check", () => {
       ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
       ["history nodes/a --json --vault eng", history],
       ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
-      ["search redis --json --vault eng", [{ id: "nodes/a" }]],
-      ["search redis --json --vault mkt", [{ id: "nodes/pitch" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/a" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/pitch" }]],
       ["read nodes/pitch --raw --vault mkt", "---\nt: x\n---\nWe brag about Redis speed."],
     ]);
     const out = sweepCheck({

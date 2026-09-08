@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
-import { ConfigError, UnknownAliasError } from "./errors.js";
+import { ConfigError, NoVaultError, UnknownAliasError } from "./errors.js";
 import type { RemoteNestSpec, VaultRegistry, VaultRegistryEntry } from "./types.js";
 
 /**
@@ -728,5 +728,42 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     );
   }
   const { kind: _kind, ...resolved } = nest;
+  return resolved;
+}
+
+/**
+ * True when a resolution is the bare-cwd fallback into a directory that is not
+ * a vault — the one case {@link assertVaultRoot} refuses. Exported so a caller
+ * that must not throw (`ctx vault which`, the diagnostic command, still has to
+ * report what resolved) can ask the guard instead of restating its condition.
+ */
+export function isRefusedCwd(resolved: ResolvedVault): boolean {
+  return resolved.source === "cwd" && !isVaultRoot(resolved.path);
+}
+
+/**
+ * Refuse a resolution that landed on the bare working directory when that
+ * directory is not a vault root. Every other resolution source is validated
+ * with {@link isVaultRoot} before it is returned; the cwd fallback is the one
+ * step that hands back an unvalidated path, and operating on it is how a
+ * folder of repos gets read as documents (and, before the engine guard,
+ * auto-indexed). Shared by the CLI and the MCP server so both refuse with the
+ * same `NO_VAULT` error, which names the registered aliases as a way out.
+ *
+ * Returns the resolution unchanged when it is acceptable, so callers can
+ * write `assertVaultRoot(resolveVaultPath(opts))`. The engine guards the
+ * auto-index write only; every new entry point that builds a NestStorage from
+ * a resolved path must call this, or it will still read an arbitrary folder.
+ */
+export function assertVaultRoot(resolved: ResolvedVault): ResolvedVault {
+  if (isRefusedCwd(resolved)) {
+    // Remotes share the alias namespace with local vaults, so a user whose
+    // only registered nest is remote still gets an alias to reach for.
+    const reg = readRegistry();
+    throw new NoVaultError(resolved.path, [
+      ...Object.keys(reg.vaults),
+      ...Object.keys(reg.remotes ?? {}),
+    ]);
+  }
   return resolved;
 }

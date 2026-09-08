@@ -62,6 +62,7 @@ export {
   FederationNotSupportedError,
   ConfigError,
   UnknownAliasError,
+  NoVaultError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,
@@ -193,6 +194,8 @@ export {
   getRegistryPath,
   readRegistry,
   isVaultRoot,
+  isRefusedCwd,
+  assertVaultRoot,
   findLocalVault,
   addVault,
   addRemote,
@@ -254,15 +257,18 @@ export {
   extractMentions,
   countTasks,
   buildRelationships,
+  buildRelationshipsWithStats,
   buildBacklinks,
   extractSection,
 } from "./inline.js";
+export type { RelationshipStats } from "./inline.js";
 
 // Selector grammar
 export { tokenize } from "./selector/lexer.js";
 export type { Token, TokenType } from "./selector/lexer.js";
 export { parseSelector } from "./selector/parser.js";
 export type { SelectorNode } from "./selector/parser.js";
+export { SELECTOR_GRAMMAR, SELECTOR_FILTERS } from "./selector/grammar.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
 
@@ -272,6 +278,7 @@ export {
   extractWikiLinks,
   buildWikiTitleIndex,
   resolveWikiSeeds,
+  resolveWikiTarget,
   traverseWikiGraph,
 } from "./wiki-graph.js";
 export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
@@ -347,7 +354,8 @@ export {
 } from "./source-graph.js";
 
 // Index generation
-export { generateContextYaml } from "./index-generator.js";
+export { generateContextYaml, generateContextYamlWithStats } from "./index-generator.js";
+export type { GenerateContextYamlOptions } from "./index-generator.js";
 export { generateIndexMd } from "./index-md-generator.js";
 
 // Injection

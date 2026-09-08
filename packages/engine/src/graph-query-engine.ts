@@ -24,6 +24,7 @@ import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
+import { isVaultRoot } from "./registry.js";
 
 export interface GraphQueryOptions {
   /** Number of hops from seed nodes (default: 2) */
@@ -58,8 +59,11 @@ export class GraphQueryEngine {
     if (!full && !includeDrafts) {
       let contextYaml = await this.storage.readContextYaml();
 
-      // Auto-generate context.yaml if missing
-      if (!contextYaml) {
+      // Auto-generate context.yaml if missing — but only inside a real vault.
+      // A storage rooted at an arbitrary directory (the CLI's bare-cwd
+      // fallback, a mistyped path) must not have a context.yaml written into
+      // it: that is how a folder of repos ends up "indexed" as documents.
+      if (!contextYaml && isVaultRoot(this.storage.root)) {
         console.error("[ctx] No context.yaml found. Auto-indexing vault...");
         contextYaml = await this.autoIndex();
       }

@@ -216,7 +216,16 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
         ),
         [],
       );
-      const searched = ctxJson(exec, withVault(["search", term, "--json"], alias), []);
+      // ctx search caps at 10 hits by default; the sweep needs every candidate
+      // or it under-reports while still claiming truncated:false.
+      const searched = ctxJson(
+        exec,
+        withVault(
+          ["search", term, "--json", "--limit", String(MAX_LIST_SCAN)],
+          alias,
+        ),
+        [],
+      );
       const tagHits = Array.isArray(tagged) ? tagged : [];
       const taggedIds = new Set(tagHits.map((d) => d?.id).filter(Boolean));
       // Tag hits first: when the budget bites, the stored claims outrank the

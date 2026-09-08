@@ -13,6 +13,7 @@
  * source for both the on-disk format and the wire contract.
  */
 import { z } from "zod";
+import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
@@ -95,7 +96,11 @@ const searchOp: OperationDescriptor = {
     limit: z.number().int().positive().optional().describe("Max results"),
   }),
   output: z.object({
+    // Best hit first: documents matching every query term, then partial
+    // matches, each tier by descending BM25 `score`.
     results: z.array(nodeSummary.extend({ score: z.number().optional() })),
+    // Matches before `limit` was applied, so a caller can say "N more".
+    total: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["search"],
@@ -113,7 +118,7 @@ const queryOp: OperationDescriptor = {
   name: "context_query",
   namespace: "core",
   description:
-    "Run a selector query with graph traversal. Supports #tag, type:X, [[Title]], scope:X, combined with +AND, |OR, -NOT.",
+    `Run a selector query with graph traversal. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     query: z.string().min(1).describe("Selector query expression"),
     hops: z
@@ -153,7 +158,7 @@ const resolveOp: OperationDescriptor = {
   name: "context_resolve",
   namespace: "core",
   description:
-    "Full context resolution — run a selector and return complete node content within a token budget.",
+    `Full context resolution — run a selector and return complete node content within a token budget. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     selector: z.string().min(1).describe("Selector query string"),
     max_tokens: z

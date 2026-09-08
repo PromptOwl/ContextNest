@@ -99,7 +99,7 @@ Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retri
 
 **Statuses**: `draft`, `pending_review`, `approved`, `published`, `rejected`. Parse-time aliasing normalizes legacy/foreign values (case-insensitive; unknown → `draft`); disk always stores canonical values, re-canonicalized on round-trip through `serializeDocument` or `ctx index`.
 
-**Selector grammar**: `#tag`, `type:document`, `pack:onboarding.basics`, with `+` (AND), `|` (OR), `-` (NOT).
+**Selector grammar**: `#tag`, `type:document`, `status:published`, `pack:onboarding.basics`, `nodes/<id>` / `sources/<id>` (a bare node id — shorthand for `contextnest://nodes/<id>`), with a space or `+` (AND), `|` (OR), `-` (NOT), and `( )` to group. The one canonical line is `SELECTOR_GRAMMAR` in `packages/engine/src/selector/grammar.ts`; every surface that teaches the grammar renders it verbatim, so change it there and nowhere else.
 
 **URI scheme**: `contextnest://path`, `@N` (pinned to checkpoint N), `#section`.
 
