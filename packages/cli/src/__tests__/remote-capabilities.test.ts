@@ -51,7 +51,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remotePublish, remoteVerify } = await import("../remote.js");
+const { remoteAdd, remotePublish, remoteVerify } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -163,5 +163,25 @@ describe("remotePublish — capability gate", () => {
     expect((err as Error).message).toContain("Nothing was published");
     expect(calls).toEqual([]);
     expect(closed).toBe(opened);
+  });
+});
+
+describe("remoteAdd — folder", () => {
+  it("sends the folder segment alongside the id so a nest that ignores id still files it right", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = { id: "nodes/repo/thing", version: 1 };
+
+    await remoteAdd(target, "nodes/repo/thing", {});
+
+    expect(calls[0].input).toMatchObject({ id: "nodes/repo/thing", folder: "repo" });
+  });
+
+  it("omits folder for a node at the nest root", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = { id: "nodes/thing", version: 1 };
+
+    await remoteAdd(target, "nodes/thing", {});
+
+    expect(calls[0].input).not.toHaveProperty("folder");
   });
 });
