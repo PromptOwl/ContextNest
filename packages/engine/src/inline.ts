@@ -9,7 +9,6 @@ import {
   buildWikiTitleIndex,
   extractWikiLinks,
   resolveWikiTarget,
-  type WikiTitleIndex,
 } from "./wiki-graph.js";
 
 // Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
@@ -102,15 +101,9 @@ export interface RelationshipStats {
  * `[[Title|alias]]`, `[[Title#anchor]]` and `[[nodes/id]]` all resolve
  * through the same `wiki-graph` helpers the query side uses. A target that
  * matches nothing produces no edge and is counted in `unresolvedWikilinks`.
- *
- * @param titleIndex Optional pre-built title index (e.g. when the caller has
- *   already built one over the same documents); built from `documents` when
- *   omitted. Only documents in the index can be wikilink targets, so passing
- *   an index over a wider set than `documents` is the caller's decision.
  */
 export function buildRelationshipsWithStats(
   documents: ContextNode[],
-  titleIndex?: WikiTitleIndex,
 ): { edges: RelationshipEdge[]; stats: RelationshipStats } {
   const edges: RelationshipEdge[] = [];
   const seen = new Set<string>();
@@ -125,7 +118,7 @@ export function buildRelationshipsWithStats(
     return true;
   };
 
-  const index = titleIndex ?? buildWikiTitleIndex(documents);
+  const index = buildWikiTitleIndex(documents);
 
   for (const doc of documents) {
     // Extract reference edges from inline links
@@ -180,11 +173,8 @@ export function buildRelationshipsWithStats(
  * Build a relationship edge list from all documents.
  * See `buildRelationshipsWithStats` — this is the same list without the counts.
  */
-export function buildRelationships(
-  documents: ContextNode[],
-  titleIndex?: WikiTitleIndex,
-): RelationshipEdge[] {
-  return buildRelationshipsWithStats(documents, titleIndex).edges;
+export function buildRelationships(documents: ContextNode[]): RelationshipEdge[] {
+  return buildRelationshipsWithStats(documents).edges;
 }
 
 /**
