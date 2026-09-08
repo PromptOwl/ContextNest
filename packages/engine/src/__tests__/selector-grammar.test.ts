@@ -208,6 +208,18 @@ describe("selector grammar — bare node ids (nodes/<id>, sources/<id>)", () => 
     expect(() => parseSelector('\"Nodes/foo\"')).toThrow(/did you mean "nodes\/foo"/);
   });
 
+  it("a quoted filter is hinted as a filter, not as a node id or a tag", () => {
+    // `"type:document"` reaches the same branch as a bare word, but neither
+    // `nodes/type:document` nor `#type:document` is the fix — dropping the
+    // quotes is. Only quoted input gets here: the unquoted spelling is a
+    // filter, and an unquoted bad one is an "Unknown filter" error.
+    expect(() => parseSelector('\"type:document\"')).toThrow(
+      /did you mean type:document without the quotes \(a filter\)/,
+    );
+    expect(() => parseSelector('\"tag:#x\"')).toThrow(/did you mean tag:#x without the quotes/);
+    expect(() => parseSelector("folder:nodes")).toThrow(/Unknown filter "folder"/);
+  });
+
   it("a mis-cased prefix (Nodes/foo) is hinted as nodes/foo, never nodes/Nodes/foo", () => {
     let msg = "";
     try {
@@ -219,6 +231,18 @@ describe("selector grammar — bare node ids (nodes/<id>, sources/<id>)", () => 
     expect(msg).toContain('did you mean "nodes/foo"');
     expect(msg).not.toContain("nodes/Nodes");
     expect(() => parseSelector("SOURCES/feed")).toThrow(/did you mean "sources\/feed"/);
+  });
+
+  it("a trailing slash is the folder URI atom, exactly as the scheme form is", () => {
+    // `nodes/` is not an empty id: `contextnest://folder/` is a documented
+    // atom (spec 2.1), so the bare form has to mean the same thing or
+    // `nodes/gtm/` would be the one folder selector needing the scheme.
+    expect(parseSelector("nodes/")).toEqual({ type: "uri", value: "contextnest://nodes/" });
+    expect(parseSelector("nodes/gtm/")).toEqual({
+      type: "uri",
+      value: "contextnest://nodes/gtm/",
+    });
+    expect(parseSelector("sources/")).toEqual({ type: "uri", value: "contextnest://sources/" });
   });
 
   it("emits a URI token whose position is where the bare id started", () => {
@@ -376,6 +400,19 @@ describe("bare node ids through the query engine", () => {
     const bare = await gqe.query("nodes/gtm/foo", { hops: 0 });
     expect(quoted.documents.map((d) => d.id)).toEqual(bare.documents.map((d) => d.id));
     expect(quoted.documents.map((d) => d.id)).toEqual(["nodes/gtm/foo"]);
+  });
+
+  it("a bare folder (nodes/gtm/) selects the folder, same as the scheme form", async () => {
+    const gqe = new GraphQueryEngine(storage);
+    const bare = await gqe.query("nodes/gtm/", { hops: 0 });
+    const scheme = await gqe.query("contextnest://nodes/gtm/", { hops: 0 });
+    expect(bare.documents.map((d) => d.id).sort()).toEqual([
+      "nodes/gtm/bar",
+      "nodes/gtm/foo",
+    ]);
+    expect(bare.documents.map((d) => d.id).sort()).toEqual(
+      scheme.documents.map((d) => d.id).sort(),
+    );
   });
 
   it("sources/<id> resolves the source node, not a document", async () => {

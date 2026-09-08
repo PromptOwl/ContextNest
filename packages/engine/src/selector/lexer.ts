@@ -49,9 +49,15 @@ function unexpectedToken(bare: string, position: number): InvalidSelectorError {
   // `Nodes/foo` is a mis-cased prefix, not a tag: suggest `nodes/foo`,
   // never `nodes/Nodes/foo`.
   const miscased = /^(nodes|sources)\//i.test(bare) && !BARE_ID_PREFIX.test(bare);
+  // A `word:` shape only reaches here from inside quotes (the unquoted form
+  // goes to the filter branch, or fails as an unknown filter), so the fix is
+  // to drop the quotes, not to prefix it with `nodes/` or `#`.
+  const filterLike = /^[a-zA-Z_][a-zA-Z0-9_]*:/.test(bare);
   const hint = miscased
     ? `"${bare.replace(/^(nodes|sources)\//i, (m) => m.toLowerCase())}" (a node id)`
-    : `"nodes/${bare}" (a node id) or "#${bare}" (a tag)`;
+    : filterLike
+      ? `${bare} without the quotes (a filter)`
+      : `"nodes/${bare}" (a node id) or "#${bare}" (a tag)`;
   return new InvalidSelectorError(
     `Unexpected token "${bare}" at position ${position} — did you mean ${hint}?`,
   );
