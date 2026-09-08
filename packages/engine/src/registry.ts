@@ -741,11 +741,19 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
  * same `NO_VAULT` error, which names the registered aliases as a way out.
  *
  * Returns the resolution unchanged when it is acceptable, so callers can
- * write `assertVaultRoot(resolveVaultPath(opts))`.
+ * write `assertVaultRoot(resolveVaultPath(opts))`. The engine guards the
+ * auto-index write only; every new entry point that builds a NestStorage from
+ * a resolved path must call this, or it will still read an arbitrary folder.
  */
 export function assertVaultRoot(resolved: ResolvedVault): ResolvedVault {
   if (resolved.source === "cwd" && !isVaultRoot(resolved.path)) {
-    throw new NoVaultError(resolved.path, Object.keys(readRegistry().vaults));
+    // Remotes share the alias namespace with local vaults, so a user whose
+    // only registered nest is remote still gets an alias to reach for.
+    const reg = readRegistry();
+    throw new NoVaultError(resolved.path, [
+      ...Object.keys(reg.vaults),
+      ...Object.keys(reg.remotes ?? {}),
+    ]);
   }
   return resolved;
 }

@@ -194,7 +194,7 @@ export class NoVaultError extends ContextNestError {
         ? `(registered: ${registered.join(", ")})`
         : `(see "ctx vault list")`;
     super(
-      `${dir} is not a Context Nest vault. Run "ctx init" here, or pass --vault <alias> ${hint}.`,
+      `${dir} is not a Context Nest vault. Run "ctx init" here, or name a vault — "ctx --vault <alias>", or CONTEXTNEST_VAULT=<alias> on any surface ${hint}.`,
       "NO_VAULT",
       "§11",
     );

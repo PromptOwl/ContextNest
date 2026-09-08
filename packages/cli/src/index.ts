@@ -26,6 +26,7 @@ import {
   publishDocument,
   ContextNestError,
   assertVaultRoot,
+  isVaultRoot,
   generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
@@ -2967,6 +2968,10 @@ vaultCmd
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
+      // which is what users run right after a NO_VAULT error, so it must not
+      // report a bare cwd that every other command refuses as if it resolved.
+      const refused =
+        resolved.kind === "local" && resolved.source === "cwd" && !isVaultRoot(resolved.path);
       // which is the diagnostic command — always surface a stale-env advisory,
       // even when a vault resolved (unlike normal commands, which stay quiet for
       // a local resolution).
@@ -2991,6 +2996,7 @@ vaultCmd
                 kind: "local",
                 path: resolved.path,
                 source: resolved.source,
+                ...(refused ? { refused: true } : {}),
                 ...(resolved.alias ? { alias: resolved.alias } : {}),
                 ...(resolved.warning ? { warning: resolved.warning } : {}),
               };
@@ -3007,6 +3013,13 @@ vaultCmd
       console.log(
         chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
       );
+      if (refused) {
+        console.log(
+          chalk.yellow(
+            'not a vault — commands here fail with NO_VAULT. Run `ctx init` here, or pass --vault <alias>.',
+          ),
+        );
+      }
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);

@@ -147,6 +147,20 @@ describe("[regression] NO_VAULT — read commands refuse a non-vault cwd", () =>
     expect(readdirSync(polluted).sort()).toEqual(["context.yaml"]);
   });
 
+  it("ctx vault which marks the refused cwd instead of reporting it as the vault", () => {
+    // which is the diagnostic users run right after the NO_VAULT error; it is
+    // exempt from the guard (it must still say what resolved) but must not
+    // present a directory every other command rejects as a usable vault.
+    const res = runCtxResult(plain, ["vault", "which", "--json"]);
+
+    expect(res.status).toBe(0);
+    const out = JSON.parse(res.stdout) as { source: string; refused?: boolean };
+    expect(out.source).toBe("cwd");
+    expect(out.refused).toBe(true);
+    expect(runCtxResult(plain, ["vault", "which"]).stdout).toContain("NO_VAULT");
+    expect(readdirSync(plain).sort()).toEqual(["readme.md"]);
+  });
+
   it("ctx add in a non-vault cwd also refuses and writes nothing", () => {
     const res = runCtxResult(plain, ["add", "nodes/stray", "--title", "Stray"]);
 

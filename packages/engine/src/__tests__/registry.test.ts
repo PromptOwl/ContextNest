@@ -13,6 +13,7 @@ import {
   getRegistryPath,
   resolveVaultPath,
   assertVaultRoot,
+  addRemote,
 } from "../registry.js";
 import { NestStorage } from "../storage.js";
 import { ConfigError, NoVaultError } from "../errors.js";
@@ -352,6 +353,22 @@ describe("vault registry", () => {
       expect((caught as NoVaultError).code).toBe("NO_VAULT");
       expect((caught as Error).message).toContain(`${outside} is not a Context Nest vault`);
       expect((caught as Error).message).toContain("registered: delta");
+      // Remotes share the alias namespace, so a registered remote must be
+      // named too — otherwise a user whose nests are all remote is told to
+      // pass an alias and shown none. (A remote can only be reached here when
+      // it is not the default: a default remote fails earlier, in
+      // resolveVaultPath, as "local-only operation".)
+      addVault("epsilon", alpha);
+      addRemote("hosted", { transport: "http", url: "https://example.com/mcp" });
+      removeVault("epsilon");
+      let withRemote: unknown;
+      try {
+        assertVaultRoot(resolveVaultPath({ cwd: outside }));
+      } catch (err) {
+        withRemote = err;
+      }
+      expect((withRemote as Error).message).toContain("registered: delta, hosted");
+      removeVault("hosted");
       // A bare context.yaml is not a vault either — that is the residue the
       // old auto-index bug left behind, and must not re-admit the folder.
       writeFileSync(join(outside, "context.yaml"), "version: 1\n");
