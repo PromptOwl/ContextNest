@@ -27,46 +27,6 @@ import {
 const CONTEXT_LINK =
   /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
 
-  for (let i = 0; i < lines.length; i++) {
-    const marker = /^\s{0,3}(`{3,}|~{3,})/.exec(lines[i]);
-    if (fence) {
-      mask[i] = true;
-      const closes =
-        marker !== null &&
-        marker[1][0] === fence[0] &&
-        marker[1].length >= fence.length &&
-        lines[i].slice(marker[0].length).trim() === "";
-      if (closes) fence = null;
-    } else if (marker) {
-      mask[i] = true;
-      fence = marker[1];
-    }
-  }
-
-  return mask;
-}
-
-/** Blank out inline code spans so their contents are not scanned. */
-function stripInlineCode(line: string): string {
-  return line.replace(/`+[^`]*`+/g, (span) => " ".repeat(span.length));
-}
-
-// Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
-// Reference definitions are deliberately not matched — they were not links
-// in the AST either.
-//
-// Only ONE `\s*` before the destination: two of them separated by an optional
-// `<` would leave the split between them ambiguous and backtrack quadratically
-// over a long run of spaces (CodeQL js/polynomial-redos). Markdown does not
-// allow whitespace between `<` and the destination anyway.
-//
-// The link text excludes `[` as well as `]` and is length-bounded, for the same
-// reason the rule-4 check in parser.ts is bounded: otherwise a line of many `[`
-// with no closing bracket rescans to the end from every one of them. Unescaped
-// `[` is not valid inline link text, so nothing real is lost.
-const CONTEXT_LINK =
-  /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
-
 /** Extract all contextnest:// link targets from a markdown body */
 export function extractContextLinks(body: string): string[] {
   // Split on CRLF as well as LF: `.` does not match `\r` in a JS regex, so a
