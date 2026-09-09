@@ -41,7 +41,11 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
-import { planImportPaths, sanitizeImportedFrontmatter } from "../import-hygiene.js";
+import {
+  isVersionArtifactPath,
+  planImportPaths,
+  sanitizeImportedFrontmatter,
+} from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -825,7 +829,15 @@ async function writeImportedFile(
   const { raw, path: relPath } = f;
   let content = f.content ?? "";
   const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
-  if (/\.md$/i.test(lastSegment) && !lastSegment.startsWith(".")) {
+  // A keyframe under `.versions/` is a whole document, so `v1.md` passes every
+  // test a live node passes — but its bytes are hashed into that version's
+  // `content_hash`. Repairing one would make `ctx verify` report a version the
+  // import itself rewrote as tampered. Sealed history travels verbatim.
+  if (
+    !isVersionArtifactPath(relPath) &&
+    /\.md$/i.test(lastSegment) &&
+    !lastSegment.startsWith(".")
+  ) {
     const id = relPath.replace(/\.md$/i, "");
     let node: ContextNode | undefined;
     try {

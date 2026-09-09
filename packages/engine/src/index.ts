@@ -373,6 +373,7 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 export {
   slugifyImportPath,
+  isVersionArtifactPath,
   sanitizeImportedFrontmatter,
   sanitizeImportedTags,
 } from "./import-hygiene.js";

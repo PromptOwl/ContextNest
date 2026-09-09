@@ -43,6 +43,12 @@ const EXTENSION = /\.[a-z0-9]{1,8}$/i;
  * A dot-directory is lower-cased on the way through: every other segment
  * comes out lowercase, so leaving `.Versions` and `.versions` distinct would
  * plan two targets that are one file on Windows and macOS.
+ *
+ * `..` also starts with a dot and so passes through untouched. That is not an
+ * oversight and this is NOT the traversal guard: `NestStorage.vaultFilePath`
+ * refuses `..` outright, so such a path fails at its own write and is reported
+ * as one failed file rather than being silently rewritten into something that
+ * looks legitimate.
  */
 export function slugifyImportPath(relPath: string): string {
   const segments = String(relPath ?? "").split(/[/\\]/).filter(Boolean);
@@ -66,23 +72,57 @@ function extensionStart(segment: string): number {
 }
 
 /**
- * Split `<dir>/.versions/<stem>/<rest>` — the version history of the document
- * `<dir>/<stem>.md` — into the document it belongs to and the pieces needed to
- * rebuild the path under a different stem.
+ * Whether a path lives inside a `.versions/` directory — a sealed version
+ * artifact (`v{N}.md`, `v{N}.diff`, `history.yaml`) rather than a live document.
+ *
+ * A keyframe is a whole document, so `v1.md` looks exactly like a node to
+ * anything that only inspects the last path segment. Its bytes are hashed into
+ * the version's `content_hash` and chained, so repairing its frontmatter breaks
+ * the chain: `ctx verify` then reports a version the import itself rewrote as
+ * tampered. Sealed history is imported verbatim, whatever state it is in.
  */
-function versionPathParts(
-  path: string,
-): { docKey: string; prefix: string; suffix: string } | undefined {
+export function isVersionArtifactPath(relPath: string): boolean {
+  return String(relPath ?? "")
+    .split(/[/\\]/)
+    .some((segment) => segment.toLowerCase() === ".versions");
+}
+
+/**
+ * Split `<dir>/.versions/<stem>/<rest>` into the pieces needed to rebuild the
+ * path under a different stem.
+ */
+function versionPathParts(path: string): { prefix: string; suffix: string } | undefined {
   const segments = path.split("/");
   const i = segments.indexOf(".versions");
   if (i < 0 || i + 1 >= segments.length) return undefined;
-  const dir = segments.slice(0, i).join("/");
-  const stem = segments[i + 1];
   return {
-    docKey: dir ? `${dir}/${stem}` : stem,
     prefix: segments.slice(0, i + 1).join("/"),
     suffix: segments.slice(i + 2).join("/"),
   };
+}
+
+/**
+ * The document a path belongs to, as its ORIGINAL `<dir>/<stem>`:
+ * `nodes/Dr. Smith.md` and `nodes/.versions/Dr. Smith/v1.md` both key to
+ * `nodes/Dr. Smith`.
+ *
+ * Deliberately keyed on the raw path, not the slugified one. Two different
+ * source documents can collapse onto one slug (`nodes/foo.md` and
+ * `nodes/Foo.md`), and only the second of them is renamed — a rename recorded
+ * under the shared slug would then redirect the FIRST document's history into
+ * the second's `.versions/` directory, which is the corruption this map exists
+ * to prevent.
+ */
+function rawDocKey(rawPath: string): string {
+  const segments = String(rawPath ?? "")
+    .split(/[/\\]/)
+    .filter(Boolean);
+  const i = segments.findIndex((segment) => segment.toLowerCase() === ".versions");
+  if (i >= 0 && i + 1 < segments.length) {
+    return [...segments.slice(0, i), segments[i + 1]].join("/");
+  }
+  const last = segments.pop() ?? "";
+  return [...segments, last.slice(0, extensionStart(last))].join("/");
 }
 
 /**
@@ -129,7 +169,7 @@ export async function planImportPaths(
     const raw = rawPaths[i];
     const warnings: string[] = [];
     const parts = versionPathParts(bases[i]);
-    const movedStem = parts ? renamedStems.get(parts.docKey) : undefined;
+    const movedStem = parts ? renamedStems.get(rawDocKey(raw)) : undefined;
     const base =
       parts && movedStem !== undefined
         ? [parts.prefix, movedStem, parts.suffix].filter(Boolean).join("/")
@@ -155,7 +195,9 @@ export async function planImportPaths(
       target = `${dir}${stem}-${n}${ext}`;
     }
     claimed.set(target, raw);
-    if (!parts && target !== base) renamedStems.set(`${dir}${stem}`, target.slice(cut, -ext.length || undefined));
+    if (!parts && target !== base) {
+      renamedStems.set(rawDocKey(raw), target.slice(cut, -ext.length || undefined));
+    }
 
     if (takenBy !== undefined) {
       const reason =

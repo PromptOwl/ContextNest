@@ -165,6 +165,27 @@ describe("planImportPaths — distinct files never collapse onto one id", () => 
     expect(plan.flatMap((p) => p.warnings)).toEqual([]);
   });
 
+  it("keeps two source names that collapse to one slug from sharing a version directory", async () => {
+    // `nodes/foo.md` keeps its slug; `nodes/Foo.md` is a DIFFERENT document
+    // that collides and moves to `-2`. Keying the rename by the shared slug
+    // would send the first document's history into the second's directory.
+    const plan = await planImportPaths(
+      [
+        "nodes/foo.md",
+        "nodes/Foo.md",
+        "nodes/.versions/foo/v1.md",
+        "nodes/.versions/Foo/v1.md",
+      ],
+      async () => false,
+    );
+    expect(plan.map((p) => p.path)).toEqual([
+      "nodes/foo.md",
+      "nodes/foo-2.md",
+      "nodes/.versions/foo/v1.md",
+      "nodes/.versions/foo-2/v1.md",
+    ]);
+  });
+
   it("lower-cases a dot-directory so two spellings cannot collide on disk", () => {
     expect(slugifyImportPath("nodes/.Versions/api/history.yaml")).toBe(
       "nodes/.versions/api/history.yaml",
@@ -325,6 +346,32 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     const warnings = staged.warnings ?? [];
     expect(warnings.some((w) => w.startsWith("nodes/Untitled_1.md:") && /untitled-1-2/.test(w))).toBe(true);
     expect(warnings.some((w) => w.startsWith("nodes/Existing.md:") && /existing-2/.test(w))).toBe(true);
+  });
+
+  it("writes a sealed keyframe verbatim, however malformed its frontmatter is", async () => {
+    // `.versions/<doc>/v1.md` is a whole document, so it passes every test a
+    // live node passes — but its bytes are hashed into that version's
+    // `content_hash`. Repairing it would make `ctx verify` report a version the
+    // import itself rewrote as tampered.
+    const api = createEngineApi();
+    const keyframe = '---\ntype: note\ntags: ["bad tag"]\n---\n# Old Heading\n\nv1 body\n';
+    const staged = await api.run<ImportResult>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/handbook.md", content: "---\ntitle: Handbook\ntype: document\n---\nnow\n" },
+          { path: "nodes/.versions/handbook/v1.md", content: keyframe },
+          { path: "nodes/.versions/handbook/history.yaml", content: "versions: []\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(staged.failed).toEqual([]);
+    expect(staged.written).toBe(3);
+    expect(await readFile(join(dir, "nodes/.versions/handbook/v1.md"), "utf-8")).toBe(keyframe);
+    // No `type "note"` / `bad tag` warning: sealed history is not repaired.
+    expect(staged.warnings ?? []).toEqual([]);
   });
 
   it("re-runs the same batch idempotently with overwrite, duplicates without it", async () => {
