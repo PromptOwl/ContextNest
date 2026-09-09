@@ -418,7 +418,10 @@ agent_instructions: |
 
 ### File safety
 
-No `ctx` command writes to your working directory without saying so.
+No `ctx` command writes to your working directory without saying so. And no
+command reads or indexes a directory that is not a vault: when nothing resolves
+a vault (no `--vault`, no local vault, no registry default), `ctx` refuses with
+`Error [NO_VAULT]` instead of treating your current folder as one.
 
 | Flag | Effect |
 |---|---|
@@ -498,7 +501,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault remove <alias>` | Unregister an alias |
 | `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
-| `ctx vault which` | Show the resolved vault and the reason |
+| `ctx vault which [--json]` | Show the resolved vault and the reason |
 | `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management

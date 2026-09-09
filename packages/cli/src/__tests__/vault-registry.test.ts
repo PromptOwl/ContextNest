@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -103,6 +103,25 @@ describe("ctx vault — central registry", () => {
     const which = run(["vault", "which"], outside, { CONTEXTNEST_VAULT: "alpha" });
     expect(which).toContain("source: env-alias");
     expect(which).toContain("alias: alpha");
+  });
+
+  it("vault which --json reports the resolved vault as a machine-readable object [CU-wdqcq01c5v]", () => {
+    const a = join(tmp, "a");
+    mkdirSync(a, { recursive: true });
+    run(["init", "--name", "A", "--vault", "alpha"], a);
+
+    // Inside the vault: resolved by the cwd walk-up.
+    const local = JSON.parse(run(["vault", "which", "--json"], a));
+    expect(local.kind).toBe("local");
+    expect(local.source).toBe("local");
+    expect(realpathSync(local.path)).toBe(realpathSync(a));
+    expect(local.alias).toBeUndefined();
+
+    // Outside, by flag: same shape, with the alias that was used.
+    const outside = join(tmp, "outside");
+    mkdirSync(outside, { recursive: true });
+    const flagged = JSON.parse(run(["vault", "which", "--json", "--vault", "alpha"], outside));
+    expect(flagged).toMatchObject({ kind: "local", source: "flag", alias: "alpha" });
   });
 
   it("surfaces a clear error for an unknown --vault alias", () => {

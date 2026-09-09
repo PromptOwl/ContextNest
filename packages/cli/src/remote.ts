@@ -13,7 +13,7 @@
  * interchangeably.
  */
 
-import chalk from "chalk";
+import chalk from "./color.js";
 import {
   ContextNestError,
   connectRemoteNest,
@@ -26,7 +26,8 @@ import { confirmOrExit, isDryRun } from "./safety.js";
 import {
   listJsonEntry,
   queryJsonPayload,
-  searchJsonEntry,
+  searchLimit,
+  printSearchResults,
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
@@ -70,6 +71,8 @@ interface NodeSummary {
   tags?: string[];
   body?: string;
   source?: Record<string, unknown>;
+  /** BM25 relevance score; absent from a nest running an older engine. */
+  score?: number;
 }
 
 // ─── Read surface ───────────────────────────────────────────────────────────
@@ -171,23 +174,15 @@ export async function remoteSearch(
   opts: { json?: boolean; limit?: number },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ results: NodeSummary[] }>("context_search", {
+    const limit = searchLimit(opts.limit);
+    const out = await conn.run<{ results: NodeSummary[]; total?: number }>("context_search", {
       query,
-      ...(opts.limit ? { limit: opts.limit } : {}),
+      ...(limit ? { limit } : {}),
     });
-    if (opts.json) {
-      // Field selection shared with the local branch (doc-views.ts).
-      console.log(JSON.stringify(out.results.map(searchJsonEntry), null, 2));
-      return;
-    }
-    if (out.results.length === 0) {
-      console.log(chalk.yellow("No results found."));
-      return;
-    }
-    console.log(chalk.bold(`${out.results.length} result(s):\n`));
-    for (const doc of out.results) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
-    }
+    // Rendering shared with the local branch (doc-views.ts). An older remote
+    // engine sends neither `score` nor `total`; both degrade to the previous
+    // output.
+    printSearchResults(out, opts);
   });
 }
 
@@ -337,6 +332,17 @@ async function confirmRemoteWrite(
   await confirmOrExit(question, opts);
 }
 
+/**
+ * Folder segment of a document id — everything between the `nodes/` root and
+ * the final slug. `nodes/repo/thing` -> `repo`; `nodes/thing` -> `""`.
+ */
+export function folderFromId(id: string): string {
+  const segments = id.split("/");
+  if (segments[0] === "nodes") segments.shift();
+  segments.pop();
+  return segments.join("/");
+}
+
 export async function remoteAdd(
   target: RemoteTarget,
   path: string,
@@ -362,6 +368,13 @@ export async function remoteAdd(
       title,
       content: opts.body ? `\n${opts.body}\n` : `\n# ${title}\n\n`,
     };
+    // Send the folder alongside the id. A nest whose `context_create` predates
+    // the catalog's `id` parameter drops that key and derives the id from the
+    // title alone, filing every remote `ctx add nodes/<folder>/<slug>` flat at
+    // the nest root; `folder` has been in the op the whole time. A catalog-
+    // conformant nest is unaffected — an explicit `id` overrides `folder`.
+    const folder = folderFromId(id);
+    if (folder) input.folder = folder;
     if (opts.type) input.type = opts.type;
     if (tags) input.tags = tags;
 

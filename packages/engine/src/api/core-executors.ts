@@ -18,9 +18,11 @@ import {
   normalizeTags,
   normalizeStatus,
   isRejected,
+  isPublished,
   explicitStatus,
   parseDocument,
 } from "../parser.js";
+import { Resolver } from "../resolver.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -39,6 +41,11 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import {
+  isVersionArtifactPath,
+  planImportPaths,
+  sanitizeImportedFrontmatter,
+} from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -234,22 +241,32 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
 };
 
 const search: OperationExecutor = async (ctx, input: any) => {
-  // Go through the engine's published-only, ranked full-text search (the
-  // `contextnest://search/…` resolver, which indexes title/description/body/tags
-  // and filters to published) instead of a hand-rolled substring scorer — never
-  // leaks unpublished content. `full: true` routes through the Resolver; graph
-  // mode would only match context.yaml metadata (no body).
-  // Slugify the query before embedding it in the URI. This string is re-lexed
-  // by the selector grammar, whose URI token terminates on whitespace/+/|/()
-  // (lexer.ts), and parseUri rejects '//'. Raw user text (spaces, a '/' from a
-  // pasted URL, '+') would truncate the token or throw INVALID_URI. Hyphens are
-  // lexer-safe URI path chars and MiniSearch tokenizes on them, so slugifying
-  // keeps recall while guaranteeing a single well-formed URI token.
-  const q = slugify(String(input.query));
-  if (!q) return { results: [] };
-  const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
-  const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
-  return { results: docs.map((d) => toSummary(d)) };
+  // Go straight to the engine's ranked, published-only full-text index
+  // (Resolver.search: title/description/body/tags, MiniSearch) rather than
+  // through `ctx.query.query("contextnest://search/…")`. The selector route
+  // had two problems: the query had to be slugified into a single lexer-safe
+  // URI token, and the selector evaluator collapsed the hits into a Set and
+  // re-filtered the discovery list, so the score — and the order — were gone
+  // by the time results reached a caller. Here the raw text goes to
+  // MiniSearch as-is and every hit carries its score.
+  // discoverDocuments() drops rejected nodes and the resolver indexes only
+  // published ones; the isPublished filter is belt-and-braces so this
+  // surface can never leak unpublished content.
+  // Note for the selector route (`context_query`): the evaluator keeps the
+  // order of a search URI only when it is the LEFTMOST operand — set
+  // intersection/union walk the left side first, so
+  // `type:document + contextnest://search/foo` comes back in discovery order.
+  const query = String(input.query).trim();
+  if (!query) return { results: [], total: 0 };
+  const docs = await ctx.storage.discoverDocuments();
+  const hits = new Resolver({ documents: docs })
+    .search(query)
+    .filter((h) => isPublished(h.document));
+  const kept = input.limit ? hits.slice(0, input.limit) : hits;
+  return {
+    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    total: hits.length,
+  };
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
@@ -790,9 +807,65 @@ const packs: OperationExecutor = async (ctx) => {
 // Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
 const nests: OperationExecutor = () => ({ nests: listVaults() });
 
+/**
+ * Land one imported file at the path `planImportPaths` chose for it — the
+ * slugified id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), disambiguated
+ * against the rest of the batch and the vault. A markdown document that
+ * would not validate as it arrived — no title, a type outside the spec, tags
+ * with spaces — is repaired on the way in, each repair reported as a warning.
+ * A file that is already valid, and every non-document file (version
+ * histories, indexes), is written byte for byte: the source's frontmatter is
+ * its own.
+ *
+ * The title falls back to the ORIGINAL filename, human casing intact: after
+ * the rename only the slug survives, and `dr-smith` is a worse title than
+ * `Dr. Smith`.
+ */
+async function writeImportedFile(
+  ctx: OperationContext,
+  f: { raw: string; path: string; content?: string },
+  warnings: string[],
+): Promise<void> {
+  const { raw, path: relPath } = f;
+  let content = f.content ?? "";
+  const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
+  // A keyframe under `.versions/` is a whole document, so `v1.md` passes every
+  // test a live node passes — but its bytes are hashed into that version's
+  // `content_hash`. Repairing one would make `ctx verify` report a version the
+  // import itself rewrote as tampered. Sealed history travels verbatim.
+  if (
+    !isVersionArtifactPath(relPath) &&
+    /\.md$/i.test(lastSegment) &&
+    !lastSegment.startsWith(".")
+  ) {
+    const id = relPath.replace(/\.md$/i, "");
+    let node: ContextNode | undefined;
+    try {
+      node = parseDocument(`${id}.md`, content, id);
+    } catch {
+      // Unparseable frontmatter is the author's to fix; land it as it came so
+      // nothing is lost, and let validate report it.
+    }
+    if (node) {
+      const { patch, warnings: repairs } = sanitizeImportedFrontmatter(
+        node,
+        lastSegment.replace(/\.md$/i, ""),
+      );
+      warnings.push(...repairs);
+      if (Object.keys(patch).length > 0) {
+        content = serializeDocument({ ...node, frontmatter: { ...node.frontmatter, ...patch } });
+      }
+    }
+  }
+  await ctx.storage.writeVaultFile(relPath, content);
+}
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
+  // Every repair the import made to something it did not author — a renamed
+  // path, a coerced type, a dropped tag. Reported, never fatal.
+  const warnings: string[] = [];
 
   // Ids of documents already in the vault publish as-is — their paths ARE their
   // ids, and the caller owns their frontmatter. Nothing is rewritten here.
@@ -804,14 +877,31 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
   if (incoming.length > 0) {
-    await mapInBatches(incoming, async (f) => {
+    // Targets are settled for the WHOLE batch BEFORE the parallel write: two
+    // files whose names slugify alike must not race for one path, and a
+    // renamed document has to take its `.versions/` history with it — neither
+    // is decidable one file at a time. By default a file already in the vault
+    // is never overwritten; `overwrite` opts back into replacing it, which is
+    // what makes re-running the same batch idempotent instead of duplicating.
+    // A path the guard refuses (`../`) reads as absent here and fails at its
+    // own write below, so it is reported per file rather than sinking the batch.
+    const plan = (
+      await planImportPaths(
+        incoming.map((f) => String(f.path ?? "")),
+        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+      )
+    ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
+    await mapInBatches(plan, async (f) => {
       try {
-        await ctx.storage.writeVaultFile(f.path, f.content ?? "");
+        // Into the file's OWN warning list: `mapInBatches` finishes in
+        // whatever order the writes complete, and the report is per input file.
+        await writeImportedFile(ctx, f, f.warnings);
         written++;
       } catch (err) {
-        failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
+        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
       }
     });
+    for (const p of plan) warnings.push(...p.warnings);
   }
 
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
@@ -830,7 +920,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // A staging call — files written, publishing deferred to the caller's final
   // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
   if (input.publish === false) {
-    return { published: [], failed, checkpoint: null, written };
+    return {
+      published: [],
+      failed,
+      checkpoint: null,
+      written,
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 2 (discover): the vault itself is the input. The scan, the metadata
@@ -839,6 +935,11 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // ids back — that pass cost a second full round trip per document.
   let held: ContextNode[] = [];
   let scanned: ContextNode[] = [];
+  // Frontmatter repairs for the documents the scan owns, by id. A caller that
+  // wrote the files itself and only asks the engine to discover them gets the
+  // same hygiene as one that sent them through `files`: without it a note
+  // with no title or a `type: note` is published as-is and fails validate.
+  const repairs = new Map<string, Partial<Frontmatter>>();
   if (input.discover) {
     const exclude = new Set<string>(input.exclude_ids ?? []);
     // Ids the caller supplied itself, via `ids` or staged from `documents`.
@@ -849,6 +950,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
       if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
+        doc,
+        doc.id.split("/").pop() ?? doc.id,
+      );
+      warnings.push(...repaired);
+      if (Object.keys(patch).length > 0) repairs.set(doc.id, patch);
       // Publishing is opt-in. Only a file that EXPLICITLY says it is published
       // or approved gets published; everything else is held as a draft for a
       // human to approve, including a file that states no status at all.
@@ -900,6 +1007,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
             discovered.has(node.id)
               ? {
                   title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...repairs.get(node.id),
                   ...(input.author ? { author: input.author } : {}),
                 }
               : null
@@ -914,7 +1022,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   }
 
   if (!input.discover) {
-    return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
+    return {
+      published,
+      failed,
+      checkpoint,
+      ...(incoming.length ? { written } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 3b: held documents never reach the publish write, so this is their
@@ -934,9 +1048,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // re-import of an already-stamped vault free.
   await mapInBatches(held, async (doc) => {
     const authored = explicitStatus(doc);
-    const stamp: Record<string, unknown> = {};
+    const stamp: Record<string, unknown> = { ...repairs.get(doc.id) };
 
-    const title = doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    const title = stamp.title ?? doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
     if (doc.frontmatter.title !== title) stamp.title = title;
     if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
     // Only when the author stated nothing — an explicit `pending_review` or
@@ -962,12 +1076,14 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const asRecord = (doc: ContextNode) => {
     const version = publishedVersion.get(doc.id);
     const own = Number(doc.frontmatter.version);
+    // Report what was written, repairs included, not what was found.
+    const frontmatter = { ...doc.frontmatter, ...repairs.get(doc.id) };
     return {
       id: doc.id,
-      title: doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      title: frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
       version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
       status: version !== undefined ? ("published" as const) : ("draft" as const),
-      tags: normalizeTags(doc.frontmatter.tags) ?? [],
+      tags: normalizeTags(frontmatter.tags) ?? [],
       content: doc.body ?? "",
     };
   };
@@ -976,6 +1092,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     failed,
     checkpoint,
     ...(incoming.length ? { written } : {}),
+    ...(warnings.length ? { warnings } : {}),
     documents: [...scanned, ...held].map(asRecord),
   };
 };
