@@ -403,15 +403,6 @@ function getInitRoot(): string {
   return sandboxPath() || process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
 }
 
-// Helper: resolve the target root for `ctx init`. Unlike getVaultRoot(), init
-// must NOT walk up the tree — initializing a vault is always a "create here"
-// operation. Walking up would resolve to an ancestor vault (e.g. a stray
-// ~/.context/config.yaml), causing init to operate on the wrong directory
-// (the "misresolved to home" bug). The explicit env override still wins.
-function getInitRoot(): string {
-  return process.env.CONTEXTNEST_VAULT_PATH || process.cwd();
-}
-
 function getStorage(): NestStorage {
   return new NestStorage(getVaultRoot());
 }

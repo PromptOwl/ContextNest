@@ -2258,12 +2258,6 @@ snapshots:
 
   dotenv@8.6.0: {}
 
-  dir-glob@3.0.1:
-    dependencies:
-      path-type: 4.0.0
-
-  dotenv@8.6.0: {}
-
   dunder-proto@1.0.1:
     dependencies:
       call-bind-apply-helpers: 1.0.2
@@ -2694,8 +2688,6 @@ snapshots:
 
   pify@4.0.1: {}
 
-  pify@4.0.1: {}
-
   pirates@4.0.7: {}
 
   pkce-challenge@5.0.1: {}
@@ -3032,13 +3024,6 @@ snapshots:
       '@vitest/coverage-v8': 4.1.9(vitest@4.1.9)
     transitivePeerDependencies:
       - msw
-
-  webidl-conversions@3.0.1: {}
-
-  whatwg-url@5.0.0:
-    dependencies:
-      tr46: 0.0.3
-      webidl-conversions: 3.0.1
 
   webidl-conversions@3.0.1: {}
 
