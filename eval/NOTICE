@@ -1,0 +1,26 @@
+ContextNest — GateMem benchmark artifact
+Copyright (c) 2026 Promptowl LLC.
+
+LICENSE
+  This directory (eval/) is licensed under the GNU Affero General Public
+  License v3.0 (AGPL-3.0) — see ./LICENSE. It inherits the license of the
+  ContextNest engine repository it ships within. It was previously
+  undeclared; this NOTICE + LICENSE make the license explicit.
+
+PATENT / METHOD NOTICE
+  The ContextNest governed-retrieval method — policy-enforced selective
+  working-set generation, the "eligibility gate" — is proprietary to
+  Promptowl LLC and is the subject of pending patent application(s).
+
+  The agent in gatemem/agents/contextnest.py is an LLM-gated RESEARCH
+  APPROXIMATION of that method, provided for benchmark reproducibility. It is
+  NOT the shipped structural production implementation and discloses no
+  production mechanism.
+
+  Nothing here grants any license, express or implied, to the patented method
+  beyond the terms of AGPL-3.0 — whose Section 11 patent grant is CONDITIONED
+  on AGPL compliance. A proprietary fork therefore receives no patent license.
+
+UPSTREAM
+  GateMem itself (Ren et al., CC-BY-4.0) is upstream at
+  https://github.com/rzhub/GateMem and is not redistributed here.
