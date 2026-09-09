@@ -861,7 +861,7 @@ const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in verbatim, and/or `discover` to let the engine find and publish everything already in the vault. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
   // Every input is optional and validated in the executor rather than through
   // a refined union: `.refine()` produces a ZodEffects, which degrades to a
   // useless JSON Schema through zod-to-json-schema — and MCP publishes
@@ -881,7 +881,13 @@ const importOp: OperationDescriptor = {
       .array(importFile)
       .optional()
       .describe(
-        "Files from an existing vault, written in verbatim at their own relative paths. Unlike `documents` nothing is synthesized: the source's frontmatter is preserved, and non-document files (`.versions/<doc>/history.yaml`) travel too, which is what lets an imported version chain still reconstruct.",
+        "Files from an existing vault, written in at their own relative paths. Unlike `documents` nothing is synthesized — but a path is slugified so the node has an addressable id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), a name already taken lands as `<name>-2` unless `overwrite` is set, and frontmatter is repaired where it would otherwise fail validation; a file that is already valid is written byte for byte. Non-document files (`.versions/<doc>/history.yaml`) travel too and move with their document if it is renamed, which is what lets an imported version chain still reconstruct.",
+      ),
+    overwrite: z
+      .boolean()
+      .optional()
+      .describe(
+        "With `files`: replace a path that is already in the vault instead of landing the incoming file beside it as `<name>-2` (default false). Set true to re-run the same batch idempotently, or to use `files` as an update path. Two incoming files that slugify alike are still kept apart.",
       ),
     publish: z
       .boolean()
@@ -921,6 +927,13 @@ const importOp: OperationDescriptor = {
     checkpoint: z.number().int().nullable(),
     /** `files` only: how many were written in. */
     written: z.number().int().optional(),
+    /**
+     * Repairs the import made to files it did not author — a path slugified,
+     * a missing title derived, a `type` outside the spec coerced to
+     * `document`, a tag that fails the tag rule dropped. One line each;
+     * present only when something was repaired.
+     */
+    warnings: z.array(z.string()).optional(),
     /**
      * `discover` only: every document the scan took responsibility for,
      * published or held back. Carries what a governance layer needs to record

@@ -404,6 +404,20 @@ describe("[regression] ctx list", () => {
     const ids = parsed.map((d: { id: string }) => d.id);
     expect(ids).toEqual(["nodes/doc-a"]);
   });
+
+  it("prints (untitled) rather than undefined for a document with no title [CU-wdqcq01c61]", () => {
+    // A hand-written (or badly imported) node that never got a title. Listing
+    // must still name it usefully instead of leaking `undefined`.
+    writeFileSync(
+      join(tmp, "nodes", "no-title.md"),
+      "---\ntype: document\n---\n\nNo title here.\n",
+      "utf-8",
+    );
+    const out = runCtx(tmp, ["list"]);
+    expect(out).toContain("nodes/no-title");
+    expect(out).toContain("(untitled)");
+    expect(out).not.toContain("undefined");
+  });
 });
 
 // ─── query ───────────────────────────────────────────────────────────────────
