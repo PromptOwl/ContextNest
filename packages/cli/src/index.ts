@@ -720,11 +720,23 @@ function slugifyAlias(name: string): string {
  * "not under tmp" for a directory that is.
  */
 function isUnderTempDir(dir: string): boolean {
+  // realpath needs the path to exist, and `ctx init` is routinely pointed at a
+  // directory it is about to create. Resolve the nearest existing ancestor and
+  // re-append the rest, so the symlink expansion still happens: a plain
+  // resolve() fallback yields /var/folders/... against a /private/var/folders/...
+  // base on macOS, and the check silently answers "not under tmp".
   const real = (p: string): string => {
-    try {
-      return fs.realpathSync.native(p);
-    } catch {
-      return pathMod.resolve(p);
+    let cur = pathMod.resolve(p);
+    const tail: string[] = [];
+    for (;;) {
+      try {
+        return pathMod.join(fs.realpathSync.native(cur), ...tail.reverse());
+      } catch {
+        const parent = pathMod.dirname(cur);
+        if (parent === cur) return pathMod.resolve(p);
+        tail.push(pathMod.basename(cur));
+        cur = parent;
+      }
     }
   };
   let base = real(tmpdir());
@@ -2874,7 +2886,16 @@ vaultCmd
     // A missing default is the one stale entry that changes behaviour for
     // every command run without --vault (resolution silently falls through to
     // cwd), so it gets its own line rather than just the [missing] marker.
-    if (vaults.some((v) => v.isDefault && v.kind === "local" && !v.exists)) {
+    // Same rule as `ctx doctor`'s default_missing — the two must agree — and
+    // the two ways it breaks need different fixes: prune only removes entries
+    // that exist, so a default naming no entry at all has to be re-pointed.
+    const defaultAlias = readRegistry().default ?? null;
+    const defaultEntry = defaultAlias ? vaults.find((v) => v.alias === defaultAlias) : undefined;
+    if (defaultAlias && !defaultEntry) {
+      console.log(
+        chalk.yellow(`\n  default vault "${defaultAlias}" is not registered — run ctx vault default <alias>`),
+      );
+    } else if (defaultEntry && defaultEntry.kind === "local" && !defaultEntry.exists) {
       console.log(chalk.yellow("\n  default vault is missing — run ctx vault prune"));
     }
     console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
@@ -3190,7 +3211,12 @@ program
       if (reg.default === null) {
         sub(chalk.dim("default: (none)"));
       } else if (reg.default_missing) {
-        sub(`default: ${reg.default} ${chalk.red("[missing]")}`);
+        // prune only drops aliases that are in the registry, so a default
+        // naming no entry at all needs re-pointing instead.
+        const fix = reg.missing_aliases.includes(reg.default)
+          ? `run ${chalk.cyan("ctx vault prune")}`
+          : `not registered — run ${chalk.cyan("ctx vault default <alias>")}`;
+        sub(`default: ${reg.default} ${chalk.red("[missing]")} — ${fix}`);
       } else {
         sub(`default: ${reg.default}`);
       }

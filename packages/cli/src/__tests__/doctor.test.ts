@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compareVersions } from "../doctor.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const distPath = join(here, "..", "..", "dist", "index.js");
@@ -209,4 +210,23 @@ describe("ctx doctor", () => {
       expect((JSON.parse(res.stdout) as DoctorReport).latest).toBeNull();
     },
   );
+});
+
+describe("compareVersions", () => {
+  it("orders by x.y.z", () => {
+    expect(compareVersions("2.4.0", "2.5.0")).toBe(-1);
+    expect(compareVersions("2.10.0", "2.9.0")).toBe(1);
+    expect(compareVersions("2.5.0", "2.5.0")).toBe(0);
+  });
+
+  it("sorts a prerelease before the release it leads to", () => {
+    // Otherwise `ctx doctor` tells someone on a beta they are up to date.
+    expect(compareVersions("2.5.0-beta.1", "2.5.0")).toBe(-1);
+    expect(compareVersions("2.5.0", "2.5.0-beta.1")).toBe(1);
+  });
+
+  it("returns null when either side is unparsable", () => {
+    expect(compareVersions("not-a-version", "2.5.0")).toBeNull();
+    expect(compareVersions("2.5.0", "")).toBeNull();
+  });
 });

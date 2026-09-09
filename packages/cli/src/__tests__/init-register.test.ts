@@ -46,7 +46,7 @@ describe("ctx init — registration under the OS temp dir", () => {
   let tmp: string;
   let cfgDir: string;
 
-  function run(args: string[], cwd: string): string {
+  function run(args: string[], cwd: string, extraEnv: NodeJS.ProcessEnv = {}): string {
     return execFileSync("node", [distPath, ...args], {
       cwd,
       env: {
@@ -55,6 +55,7 @@ describe("ctx init — registration under the OS temp dir", () => {
         CONTEXTNEST_CONFIG_DIR: cfgDir,
         CONTEXTNEST_VAULT: "",
         CONTEXTNEST_VAULT_PATH: "",
+        ...extraEnv,
       },
       encoding: "utf-8",
     });
@@ -112,6 +113,21 @@ describe("ctx init — registration under the OS temp dir", () => {
     expect(out).not.toContain("Not registering");
     expect(registryText()).toContain("scratch");
     expect(registeredPaths()).toContain(realpath(dir));
+  });
+
+  it("skips registration for a temp dir init creates itself", () => {
+    // The target does not exist when the tmp check runs, so realpath throws.
+    // A resolve() fallback loses the symlink expansion (/var vs /private/var on
+    // macOS, 8.3 short names on Windows) and the vault gets auto-registered —
+    // exactly what this feature exists to prevent.
+    const dir = join(tmp, "not-created-yet");
+    const before = registryText();
+
+    const out = run(["init", "--name", "Scratch"], tmp, { CONTEXTNEST_VAULT_PATH: dir });
+
+    expect(existsSync(join(dir, ".context", "config.yaml"))).toBe(true);
+    expect(out).toContain("Not registering");
+    expect(registryText()).toBe(before);
   });
 
   it("an explicit --vault <alias> is a registration request too", () => {

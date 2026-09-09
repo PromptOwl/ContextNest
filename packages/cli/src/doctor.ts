@@ -74,6 +74,10 @@ export function isDoctorOffline(env: NodeJS.ProcessEnv = process.env): boolean {
  * Uses spawn rather than execFile so the timer alone decides when to give up:
  * execFile waits for stdio to close, and a grandchild (npm spawns helpers)
  * holding the pipe open would stretch a "3s timeout" to however long it lived.
+ *
+ * `pkgName` MUST be a trusted constant. On Windows the spawn runs through a
+ * shell (npm is a .cmd shim), so an attacker-controlled name would be a command
+ * injection. The only call site passes CLI_PACKAGE_NAME; keep it that way.
  */
 export function fetchLatestVersion(
   pkgName: string,
@@ -153,18 +157,26 @@ export function fetchLatestVersion(
   });
 }
 
-/** Numeric x.y.z comparison; prerelease/build tags are ignored. null when unparsable. */
+/**
+ * Numeric x.y.z comparison, with semver's rule that a prerelease sorts before
+ * the release it leads to — otherwise someone on `2.5.0-beta.1` is told they
+ * are up to date with a published `2.5.0`. null when unparsable.
+ *
+ * ponytail: two prereleases of the same x.y.z compare equal (no identifier
+ * ordering); reach for a real semver parser if that ever needs to be exact.
+ */
 export function compareVersions(a: string, b: string): number | null {
   const parse = (v: string) => {
-    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(v.trim());
+    return m ? { nums: [Number(m[1]), Number(m[2]), Number(m[3])], pre: Boolean(m[4]) } : null;
   };
   const pa = parse(a);
   const pb = parse(b);
   if (!pa || !pb) return null;
   for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+    if (pa.nums[i] !== pb.nums[i]) return pa.nums[i] < pb.nums[i] ? -1 : 1;
   }
+  if (pa.pre !== pb.pre) return pa.pre ? -1 : 1;
   return 0;
 }
 
