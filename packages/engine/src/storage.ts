@@ -758,6 +758,11 @@ export class NestStorage {
    * Whether a vault-relative path already holds a file. Same path guard as
    * `writeVaultFile`, so an import can plan where a batch lands before it
    * writes anything, and never overwrites what it did not write.
+   *
+   * A path that escapes the vault reads as absent rather than throwing —
+   * planning must not sink a whole batch over one bad path. `writeVaultFile`
+   * is the guard that actually refuses it, so the caller sees that path fail
+   * on its own. Do not read a `false` here as "safe to write".
    */
   async hasVaultFile(relPath: string): Promise<boolean> {
     try {

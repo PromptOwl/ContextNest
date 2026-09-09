@@ -865,32 +865,31 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
   if (incoming.length > 0) {
-    // Targets are settled BEFORE the parallel write, in input order: two
-    // files whose names slugify alike must not race for one path, and a file
-    // already in the vault is never overwritten. A path the guard refuses
-    // (`../`) is reported per file rather than sinking the batch.
-    const plan: Array<{ raw: string; path: string; content: string; warnings: string[] }> = [];
-    for (const f of incoming) {
-      const raw = String(f.path ?? "");
-      try {
-        const [planned] = await planImportPaths([raw], async (p) => {
-          const owner = plan.find((q) => q.path === p);
-          return owner !== undefined || (await ctx.storage.hasVaultFile(p));
-        });
-        plan.push({ ...planned, content: f.content ?? "" });
-      } catch (err) {
-        failed.push({ id: raw, error: err instanceof Error ? err.message : String(err) });
-      }
-    }
-    for (const p of plan) warnings.push(...p.warnings);
+    // Targets are settled for the WHOLE batch BEFORE the parallel write: two
+    // files whose names slugify alike must not race for one path, and a
+    // renamed document has to take its `.versions/` history with it — neither
+    // is decidable one file at a time. By default a file already in the vault
+    // is never overwritten; `overwrite` opts back into replacing it, which is
+    // what makes re-running the same batch idempotent instead of duplicating.
+    // A path the guard refuses (`../`) reads as absent here and fails at its
+    // own write below, so it is reported per file rather than sinking the batch.
+    const plan = (
+      await planImportPaths(
+        incoming.map((f) => String(f.path ?? "")),
+        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+      )
+    ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
     await mapInBatches(plan, async (f) => {
       try {
-        await writeImportedFile(ctx, f, warnings);
+        // Into the file's OWN warning list: `mapInBatches` finishes in
+        // whatever order the writes complete, and the report is per input file.
+        await writeImportedFile(ctx, f, f.warnings);
         written++;
       } catch (err) {
         failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
       }
     });
+    for (const p of plan) warnings.push(...p.warnings);
   }
 
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).

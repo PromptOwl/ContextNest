@@ -39,12 +39,17 @@ const EXTENSION = /\.[a-z0-9]{1,8}$/i;
  * that are already clean pass through unchanged, so an exported vault's own
  * layout — version histories included — survives the trip, and a directory
  * is renamed the same way as the document it belongs to.
+ *
+ * A dot-directory is lower-cased on the way through: every other segment
+ * comes out lowercase, so leaving `.Versions` and `.versions` distinct would
+ * plan two targets that are one file on Windows and macOS.
  */
 export function slugifyImportPath(relPath: string): string {
   const segments = String(relPath ?? "").split(/[/\\]/).filter(Boolean);
   return segments
     .map((segment, i) => {
-      if (segment.startsWith(".") || CLEAN_SEGMENT.test(segment)) return segment;
+      if (segment.startsWith(".")) return segment.toLowerCase();
+      if (CLEAN_SEGMENT.test(segment)) return segment;
       const isLast = i === segments.length - 1;
       const ext = isLast ? (segment.match(EXTENSION)?.[0] ?? "") : "";
       const stem = ext ? segment.slice(0, -ext.length) : segment;
@@ -61,28 +66,74 @@ function extensionStart(segment: string): number {
 }
 
 /**
+ * Split `<dir>/.versions/<stem>/<rest>` — the version history of the document
+ * `<dir>/<stem>.md` — into the document it belongs to and the pieces needed to
+ * rebuild the path under a different stem.
+ */
+function versionPathParts(
+  path: string,
+): { docKey: string; prefix: string; suffix: string } | undefined {
+  const segments = path.split("/");
+  const i = segments.indexOf(".versions");
+  if (i < 0 || i + 1 >= segments.length) return undefined;
+  const dir = segments.slice(0, i).join("/");
+  const stem = segments[i + 1];
+  return {
+    docKey: dir ? `${dir}/${stem}` : stem,
+    prefix: segments.slice(0, i + 1).join("/"),
+    suffix: segments.slice(i + 2).join("/"),
+  };
+}
+
+/**
  * Decide where every file in a `files[]` batch lands, so that no two files
  * — and no file and one already in the vault — share an id.
  *
  * Slugifying is lossy: `Untitled (1).md`, `Untitled_1.md` and
  * `Untitled - 1.md` all become `untitled-1.md`, and every all-non-Latin name
  * becomes `untitled.md`. Written concurrently, the last one silently wins
- * and `written` counts files that are not there. So the targets are planned
- * up front, sequentially and in input order: the first claim on a slug keeps
- * it, the next gets `-2`, then `-3`, and so on — deterministic, so a re-run
- * of the same batch lands the same way. A target that already exists in the
- * vault counts as taken too: an import must never overwrite what it did not
- * write. Every rename is warned, naming what it collided with.
+ * and `written` counts files that are not there. So the targets for the WHOLE
+ * batch are planned up front, sequentially and in input order: the first claim
+ * on a slug keeps it, the next gets `-2`, then `-3`, and so on —
+ * deterministic, so a re-run of the same batch lands the same way. A target
+ * `isTaken` reports counts as claimed too. Every rename is warned, naming what
+ * it collided with.
+ *
+ * A renamed document takes its version history with it. `.versions/<stem>/`
+ * is addressed by the document's stem (`storage.readVersion`), so leaving the
+ * history at the old stem while the document moves to `<stem>-2` either
+ * strands it or files it under a DIFFERENT document that already owns that
+ * directory — silent corruption of someone else's chain. Documents therefore
+ * claim their targets before any version file is placed, since a batch may
+ * well list `history.yaml` first.
  */
 export async function planImportPaths(
   rawPaths: string[],
   isTaken: (relPath: string) => Promise<boolean>,
 ): Promise<Array<{ raw: string; path: string; warnings: string[] }>> {
   const claimed = new Map<string, string>(); // target → raw path that owns it
-  const plan: Array<{ raw: string; path: string; warnings: string[] }> = [];
-  for (const raw of rawPaths) {
+  const renamedStems = new Map<string, string>(); // `<dir>/<stem>` → new stem
+  const bases = rawPaths.map((raw) => slugifyImportPath(raw));
+  const plan: Array<{ raw: string; path: string; warnings: string[] }> = new Array(rawPaths.length);
+  // Stable sort, so documents — and version files among themselves — keep
+  // their input order and the `-2`/`-3` numbering stays deterministic.
+  const order = bases
+    .map((_, i) => i)
+    .sort(
+      (a, b) =>
+        Number(versionPathParts(bases[a]) !== undefined) -
+        Number(versionPathParts(bases[b]) !== undefined),
+    );
+
+  for (const i of order) {
+    const raw = rawPaths[i];
     const warnings: string[] = [];
-    const base = slugifyImportPath(raw);
+    const parts = versionPathParts(bases[i]);
+    const movedStem = parts ? renamedStems.get(parts.docKey) : undefined;
+    const base =
+      parts && movedStem !== undefined
+        ? [parts.prefix, movedStem, parts.suffix].filter(Boolean).join("/")
+        : bases[i];
     const cut = base.lastIndexOf("/") + 1;
     const dir = base.slice(0, cut);
     const last = base.slice(cut);
@@ -104,6 +155,7 @@ export async function planImportPaths(
       target = `${dir}${stem}-${n}${ext}`;
     }
     claimed.set(target, raw);
+    if (!parts && target !== base) renamedStems.set(`${dir}${stem}`, target.slice(cut, -ext.length || undefined));
 
     if (takenBy !== undefined) {
       const reason =
@@ -111,10 +163,12 @@ export async function planImportPaths(
           ? `"${base}" already exists in the vault`
           : `"${base}" is already taken by ${takenBy}`;
       warnings.push(`${raw}: written as ${target} (${reason})`);
+    } else if (movedStem !== undefined) {
+      warnings.push(`${raw}: written as ${target} (follows its renamed document)`);
     } else if (target !== raw) {
       warnings.push(`${raw}: written as ${target} (path slugified)`);
     }
-    plan.push({ raw, path: target, warnings });
+    plan[i] = { raw, path: target, warnings };
   }
   return plan;
 }
@@ -145,15 +199,18 @@ export function firstHeading(body: string): string | undefined {
       continue;
     }
     if (inFence) continue;
+    // Up to 3 leading spaces still opens a heading, same as a fence.
+    const text0 = line.trimStart();
+    if (line.length - text0.length > 3) continue;
     // Exactly one `#`, then at least one space or tab: `##` is a section.
-    if (line.charCodeAt(0) !== 0x23 /* # */) continue;
-    const second = line.charAt(1);
+    if (text0.charCodeAt(0) !== 0x23 /* # */) continue;
+    const second = text0.charAt(1);
     if (second !== " " && second !== "\t") continue;
     // Trailing closing hashes (`# Title ##`) are decoration, not title.
-    let end = line.length;
-    while (end > 1 && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
-    while (end > 1 && line[end - 1] === "#") end--;
-    const text = line.slice(1, end).trim();
+    let end = text0.length;
+    while (end > 1 && (text0[end - 1] === " " || text0[end - 1] === "\t")) end--;
+    while (end > 1 && text0[end - 1] === "#") end--;
+    const text = text0.slice(1, end).trim();
     if (text) return text;
   }
   return undefined;
@@ -181,7 +238,8 @@ function splitTagEntry(raw: string): string[] {
 /**
  * Normalize an imported tag list: split pasted hashtag lists, drop entries
  * that fail the spec tag rule, prefix with `#`, de-duplicate. Returns the
- * tags to keep and one warning per dropped entry.
+ * tags to keep and at most one warning per entry — the warning quotes the
+ * whole entry, so one per bad candidate would repeat the same line.
  */
 export function sanitizeImportedTags(
   raw: unknown[],
@@ -192,17 +250,21 @@ export function sanitizeImportedTags(
   const warnings: string[] = [];
   for (const entry of raw) {
     if (typeof entry !== "string" || entry.trim() === "") continue;
+    let dropped = false;
     for (const candidate of splitTagEntry(entry.trim())) {
       if (!TAG_PATTERN.test(candidate)) {
-        warnings.push(
-          `${label}: dropped tag "${entry}" (tags must start with a letter and contain only letters, digits, _ - :)`,
-        );
+        dropped = true;
         continue;
       }
       const tag = `#${candidate}`;
       if (seen.has(tag)) continue;
       seen.add(tag);
       tags.push(tag);
+    }
+    if (dropped) {
+      warnings.push(
+        `${label}: dropped tag "${entry}" (tags must start with a letter and contain only letters, digits, _ - :)`,
+      );
     }
   }
   return { tags, warnings };

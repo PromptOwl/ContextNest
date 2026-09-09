@@ -132,6 +132,44 @@ describe("planImportPaths — distinct files never collapse onto one id", () => 
     const plan = await planImportPaths(["nodes/日本語.md", "nodes/Ελληνικά.md"], async () => false);
     expect(plan.map((p) => p.path)).toEqual(["nodes/untitled.md", "nodes/untitled-2.md"]);
   });
+
+  it("moves a renamed document's version history with it, whichever order it arrives in", async () => {
+    // `.versions/<stem>/` is addressed by the document's stem: left behind,
+    // the history lands in the directory of the doc already at that id.
+    const onDisk = new Set(["nodes/dr-smith.md"]);
+    const plan = await planImportPaths(
+      [
+        "nodes/.versions/Dr. Smith/history.yaml",
+        "nodes/Dr. Smith.md",
+        "nodes/.versions/Dr. Smith/v1.md",
+      ],
+      async (p) => onDisk.has(p),
+    );
+    expect(plan.map((p) => p.path)).toEqual([
+      "nodes/.versions/dr-smith-2/history.yaml",
+      "nodes/dr-smith-2.md",
+      "nodes/.versions/dr-smith-2/v1.md",
+    ]);
+    expect(plan[0].warnings.join("\n")).toMatch(/follows its renamed document/);
+  });
+
+  it("leaves a version directory alone when its document is not renamed", async () => {
+    const plan = await planImportPaths(
+      ["nodes/handbook.md", "nodes/.versions/handbook/history.yaml"],
+      async () => false,
+    );
+    expect(plan.map((p) => p.path)).toEqual([
+      "nodes/handbook.md",
+      "nodes/.versions/handbook/history.yaml",
+    ]);
+    expect(plan.flatMap((p) => p.warnings)).toEqual([]);
+  });
+
+  it("lower-cases a dot-directory so two spellings cannot collide on disk", () => {
+    expect(slugifyImportPath("nodes/.Versions/api/history.yaml")).toBe(
+      "nodes/.versions/api/history.yaml",
+    );
+  });
 });
 
 describe("firstHeading — fenced code blocks", () => {
@@ -287,6 +325,33 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     const warnings = staged.warnings ?? [];
     expect(warnings.some((w) => w.startsWith("nodes/Untitled_1.md:") && /untitled-1-2/.test(w))).toBe(true);
     expect(warnings.some((w) => w.startsWith("nodes/Existing.md:") && /existing-2/.test(w))).toBe(true);
+  });
+
+  it("re-runs the same batch idempotently with overwrite, duplicates without it", async () => {
+    // `files[]` is the update path for a caller that owns the frontmatter, and
+    // a chunked upload may retry a batch. Without `overwrite` a second run
+    // lands `-2`; with it the same call twice leaves one file.
+    const api = createEngineApi();
+    const files = [{ path: "nodes/handbook.md", content: "# Handbook\nv1\n" }];
+    await api.run<ImportResult>("context_import", { files, publish: false }, ctx);
+
+    const again = await api.run<ImportResult>("context_import", { files, publish: false }, ctx);
+    expect(again.warnings?.join("\n")).toMatch(/already exists in the vault/);
+    expect(existsSync(join(dir, "nodes", "handbook-2.md"))).toBe(true);
+
+    const over = await api.run<ImportResult>(
+      "context_import",
+      {
+        files: [{ path: "nodes/handbook.md", content: "# Handbook\nv2\n" }],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(over.failed).toEqual([]);
+    expect(over.warnings ?? []).toEqual([]);
+    expect(existsSync(join(dir, "nodes", "handbook-3.md"))).toBe(false);
+    expect(await readFile(join(dir, "nodes", "handbook.md"), "utf-8")).toContain("v2");
   });
 
   it("writes a file with valid frontmatter verbatim under its own id (regression)", async () => {
