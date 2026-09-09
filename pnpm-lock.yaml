@@ -32,6 +32,10 @@ importers:
       commander:
         specifier: ^13.0.0
         version: 13.1.0
+    optionalDependencies:
+      chalk:
+        specifier: ^5.4.0
+        version: 5.6.2
     devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
@@ -54,10 +58,6 @@ importers:
       zod:
         specifier: ^3.24.0
         version: 3.25.76
-    optionalDependencies:
-      chalk:
-        specifier: ^5.4.0
-        version: 5.6.2
 
   packages/engine:
     dependencies:
@@ -68,8 +68,8 @@ importers:
         specifier: ^9.0.0
         version: 9.0.0
       js-yaml:
-        specifier: ^4.2.0
-        version: 4.2.0
+        specifier: ^4.3.2
+        version: 4.3.2
       minisearch:
         specifier: ^7.0.0
         version: 7.2.0
@@ -1047,8 +1047,8 @@ packages:
     resolution: {integrity: sha512-PMSmkqxr106Xa156c2M265Z+FTrPl+oxd/rgOQy2tijQeK5TxQ43psO1ZCwhVOSdnn+RzkzlRz/eY4BgJBYVpg==}
     hasBin: true
 
-  js-yaml@4.2.0:
-    resolution: {integrity: sha512-ePWsvanv0DWuDRsW8dnt+R4jQ31SCRCQ7hhNcPXZPsoBZiemuZNYGf7adZdqX2D86j6rvKp3RpCxVTSb8WQlOw==}
+  js-yaml@4.3.2:
+    resolution: {integrity: sha512-SFNOvSJ+Dgf/9An904Yx+CgSlIPCkIpao4qo51lpee25TIRejdH3rhR4EZMGoNx3/TP3O+wzWuiTFl4sqbltzA==}
     hasBin: true
 
   json-schema-traverse@1.0.0:
@@ -1765,7 +1765,7 @@ snapshots:
   '@changesets/parse@0.4.3':
     dependencies:
       '@changesets/types': 6.1.0
-      js-yaml: 4.2.0
+      js-yaml: 4.3.2
 
   '@changesets/pre@2.0.2':
     dependencies:
@@ -2535,7 +2535,7 @@ snapshots:
       argparse: 1.0.10
       esprima: 4.0.1
 
-  js-yaml@4.2.0:
+  js-yaml@4.3.2:
     dependencies:
       argparse: 2.0.1
 

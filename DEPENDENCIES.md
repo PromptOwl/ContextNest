@@ -55,7 +55,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `@promptowl/contextnest-engine` | 2.4.0 | AGPL-3.0 |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
 | `diff` | 9.0.0 | BSD-3-Clause |
-| `js-yaml` | 4.2.0 | MIT |
+| `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
 | `toposort` | 2.0.2 | MIT |
 | `zod` | 3.25.76 | MIT |
@@ -158,7 +158,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | --- | --- | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
-| `js-yaml` | 4.2.0 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
+| `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
 | `toposort` | 2.0.2 | MIT | yes | Dependency ordering for `source` node graphs. |
 | `zod` | 3.25.76 | MIT | yes | Runtime validation of frontmatter and operation inputs (spec §13 rules 1–17). |
@@ -295,7 +295,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `express-rate-limit` | 8.4.1 | MIT |
 | `hono` | 4.12.16 | MIT |
 | `jose` | 6.1.3 | MIT |
-| `js-yaml` | 4.2.0 | MIT |
+| `js-yaml` | 4.3.2 | MIT |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
 | `minisearch` | 7.2.0 | MIT |
 | `pkce-challenge` | 5.0.1 | MIT |
