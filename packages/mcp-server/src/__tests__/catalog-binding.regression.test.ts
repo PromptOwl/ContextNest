@@ -66,10 +66,13 @@ async function freshVault(): Promise<string> {
 }
 
 async function connect(vaultPath: string): Promise<Client> {
-  const env: Record<string, string> = { CONTEXTNEST_VAULT_PATH: vaultPath };
+  // Override applied AFTER the copy — see the note in mcp-server.regression.
+  const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
+  delete env.CTX_NEST_HOME;
+  env.CONTEXTNEST_VAULT_PATH = vaultPath;
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [SERVER_ENTRY],

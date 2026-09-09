@@ -16,6 +16,7 @@ import { execFileSync, execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import {
   mkdtempSync,
+  mkdirSync,
   writeFileSync,
   readFileSync,
   appendFileSync,
@@ -141,6 +142,88 @@ function startMockEngine(
       resolve({
         url: `http://localhost:${port}`,
         lastBody: () => captured,
+        close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
+}
+
+/**
+ * Like runCtxAsync, but tolerates a non-zero exit — needed for the gated-push
+ * paths that exit non-zero (rejected/expired) while an in-process mock server
+ * must stay responsive (so spawnSync/runCtxResult, which blocks the event loop,
+ * would deadlock the poll). Returns status + captured streams.
+ */
+async function runCtxAsyncResult(
+  cwd: string,
+  args: string[],
+): Promise<{ status: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync("node", [distPath, ...args], {
+      cwd,
+      env: ENV,
+      encoding: "utf-8",
+    });
+    return { status: 0, stdout, stderr };
+  } catch (e: any) {
+    return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+  }
+}
+
+interface GatedServer {
+  url: string;
+  /** The most recently received publish (POST) body, parsed. */
+  lastBody: () => unknown;
+  /** How many times the pending-push poll endpoint was hit. */
+  pollCount: () => number;
+  close: () => Promise<void>;
+}
+
+/**
+ * A mock engine that gates the push: POST /nests/:id/publish answers 202 with a
+ * pending_confirmation envelope, and GET /nests/:id/pending-pushes/:pid returns
+ * the next body in `pollSequence` (repeating the last), so the CLI's confirm-gate
+ * polling can be driven end to end. The first terminal poll returns immediately,
+ * so tests never pay the real backoff.
+ */
+function startGatedEngine(pollSequence: Array<Record<string, unknown>>): Promise<GatedServer> {
+  const polls = [...pollSequence];
+  return new Promise((resolve) => {
+    let captured: unknown;
+    let gets = 0;
+    const server: Server = createServer((req, res) => {
+      if (req.method === "POST") {
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          captured = JSON.parse(raw);
+          const nest = (req.url ?? "").split("/")[2] ?? "nest-1";
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              status: "pending_confirmation",
+              pending_id: "pid1",
+              confirm_url: "https://ui.example/confirm/pid1",
+              poll_url: `/nests/${nest}/pending-pushes/pid1`,
+              message: "This nest requires confirmation before the push is applied.",
+              expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+            }),
+          );
+        });
+        return;
+      }
+      // GET poll
+      gets++;
+      const body = polls.length > 1 ? polls.shift()! : polls[0];
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    server.listen(0, () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        url: `http://localhost:${port}`,
+        lastBody: () => captured,
+        pollCount: () => gets,
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -321,6 +404,20 @@ describe("[regression] ctx list", () => {
     const ids = parsed.map((d: { id: string }) => d.id);
     expect(ids).toEqual(["nodes/doc-a"]);
   });
+
+  it("prints (untitled) rather than undefined for a document with no title [CU-wdqcq01c61]", () => {
+    // A hand-written (or badly imported) node that never got a title. Listing
+    // must still name it usefully instead of leaking `undefined`.
+    writeFileSync(
+      join(tmp, "nodes", "no-title.md"),
+      "---\ntype: document\n---\n\nNo title here.\n",
+      "utf-8",
+    );
+    const out = runCtx(tmp, ["list"]);
+    expect(out).toContain("nodes/no-title");
+    expect(out).toContain("(untitled)");
+    expect(out).not.toContain("undefined");
+  });
 });
 
 // ─── query ───────────────────────────────────────────────────────────────────
@@ -407,6 +504,114 @@ describe("[regression] ctx search", () => {
     const ids = parsed.map((d: { id: string }) => d.id);
     expect(ids).toContain("stray");
   });
+});
+
+// CU-wdqcq01c5w: hits used to come back in id order (the evaluator dropped
+// MiniSearch's score) and every hit printed, so a 673-doc vault answered
+// "strategy roadmap 2026" with 607 alphabetical novel chapters.
+describe("[regression] ctx search ranking and --limit", () => {
+  /** Drop a document straight onto disk — discovery is live, no re-index. */
+  function writeDoc(id: string, body: string, status = "published"): void {
+    mkdirSync(join(tmp, dirname(id)), { recursive: true });
+    writeFileSync(
+      join(tmp, `${id}.md`),
+      [
+        "---",
+        `title: ${id.split("/").pop()}`,
+        "type: document",
+        `status: ${status}`,
+        "version: 1",
+        "---",
+        "",
+        body,
+        "",
+      ].join("\n"),
+    );
+  }
+
+  /** Result lines of the human listing: "  <id>: <title>". */
+  function listedIds(out: string): string[] {
+    return out
+      .split("\n")
+      .map((l) => l.match(/^\s+(nodes\/\S+):/)?.[1])
+      .filter((x): x is string => Boolean(x));
+  }
+
+  beforeEach(() => {
+    initVault(tmp);
+  });
+
+  it("ranks the all-terms match above the single-term match, with numeric scores", () => {
+    // Ids sort the wrong way round on purpose: a-partial < m-other < z-full.
+    writeDoc("nodes/z-full", "alpha beta gamma");
+    writeDoc("nodes/a-partial", "alpha");
+    writeDoc("nodes/m-other", "zzz");
+    const parsed = JSON.parse(runCtx(tmp, ["search", "alpha beta gamma", "--json"]));
+    expect(parsed.map((d: { id: string }) => d.id)).toEqual([
+      "nodes/z-full",
+      "nodes/a-partial",
+    ]);
+    expect(typeof parsed[0].score).toBe("number");
+    expect(typeof parsed[1].score).toBe("number");
+    expect(parsed[0].score).toBeGreaterThan(parsed[1].score);
+  });
+
+  it("does not return a draft that matches the term (published-only)", () => {
+    writeDoc("nodes/z-full", "alpha beta gamma");
+    writeDoc("nodes/b-draft", "alpha beta gamma", "draft");
+    const parsed = JSON.parse(runCtx(tmp, ["search", "alpha", "--json"]));
+    const ids = parsed.map((d: { id: string }) => d.id);
+    expect(ids).toContain("nodes/z-full");
+    expect(ids).not.toContain("nodes/b-draft");
+  });
+
+  describe("with 25 matching documents", () => {
+    beforeEach(() => {
+      for (let i = 1; i <= 25; i++) {
+        writeDoc(`nodes/needle-${String(i).padStart(2, "0")}`, `needle number ${i}`);
+      }
+    });
+
+    it("prints 10 by default and a footer naming the remainder", () => {
+      const out = runCtx(tmp, ["search", "needle"]);
+      expect(listedIds(out)).toHaveLength(10);
+      expect(out).toMatch(/15 more/);
+      expect(out).toMatch(/--limit/);
+    });
+
+    it("--limit 0 prints every hit and no footer", () => {
+      const out = runCtx(tmp, ["search", "needle", "--limit", "0"]);
+      expect(listedIds(out)).toHaveLength(25);
+      expect(out).not.toMatch(/more/);
+    });
+
+    it("--json keeps stdout a clean array and puts the footer on stderr", () => {
+      // The footer must never land in stdout: `ctx search --json | jq` has to
+      // keep parsing when the list was cut.
+      const res = runCtxResult(tmp, ["search", "needle", "--json"]);
+      expect(res.status).toBe(0);
+      expect(JSON.parse(res.stdout)).toHaveLength(10);
+      expect(res.stdout).not.toMatch(/more/);
+      expect(res.stderr).toMatch(/15 more/);
+    });
+
+    it("--limit 3 prints exactly 3 (regression)", () => {
+      const out = runCtx(tmp, ["search", "needle", "--limit", "3"]);
+      expect(listedIds(out)).toHaveLength(3);
+      expect(out).toMatch(/22 more/);
+    });
+  });
+
+  it.each(["-5", "abc", "2.5"])(
+    "rejects --limit %s with a clear message and exit 1",
+    (bad) => {
+      // Commander hands "-5" over as the value, so without a guard a negative
+      // limit silently meant "everything".
+      const res = runCtxResult(tmp, ["search", "needle", "--limit", bad]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toMatch(/--limit must be 0 or a positive integer/);
+    },
+  );
 });
 
 // ─── update ──────────────────────────────────────────────────────────────────
@@ -618,6 +823,22 @@ describe("[regression] ctx index", () => {
     runCtx(tmp, ["index"]);
     const yaml = readFileSync(join(tmp, "context.yaml"), "utf-8");
     expect(yaml).toContain("nodes/indexed");
+  });
+
+  // [CU-wdqcq01c60] A vault authored with [[wikilinks]] used to index with
+  // zero relationships, making --hops a no-op. Two docs, one wikilink: the
+  // edge must land in context.yaml and the summary line must say where it
+  // came from.
+  it("turns a [[wikilink]] into a reference edge and reports it", () => {
+    runCtx(tmp, [
+      "add", "nodes/linker",
+      "--title", "Linker",
+      "--body", "Read [[Indexed]] and [[Nowhere To Be Found]].",
+    ]);
+    const out = runCtx(tmp, ["index"]);
+    expect(out).toMatch(/1 relationship edges? \(1 from wikilinks, 1 unresolved\)/);
+    const yaml = readFileSync(join(tmp, "context.yaml"), "utf-8");
+    expect(yaml).toMatch(/from: nodes\/linker\s+to: nodes\/indexed\s+type: reference/);
   });
 });
 
@@ -946,6 +1167,68 @@ describe("[regression] ctx push", () => {
       expect(res.stdout).toMatch(/No documents to push/);
     } finally {
       rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  // ─── confirmation gate (202) ────────────────────────────────────────────────
+  // A gated nest parks the push for a human to confirm and answers 202 instead
+  // of applying. The CLI must recognize that, surface the confirm URL, and (by
+  // default) poll to the decision — never misreport the pending 202 as applied.
+
+  it("a gated push (202) polls to 'applied' and reports the confirmed count (exit 0)", async () => {
+    const server = await startGatedEngine([{ status: "applied", applied_node_count: 1, decided_by: "steward@ex" }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toMatch(/Pushed 1 document/);
+      expect(server.pollCount()).toBeGreaterThanOrEqual(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a gated push that is rejected exits non-zero and says nothing was applied", async () => {
+    const server = await startGatedEngine([{ status: "rejected", decided_by: "steward@ex" }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toMatch(/rejected/i);
+      expect(res.stdout).not.toMatch(/Pushed/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("--no-wait submits, prints the confirm URL, and exits 0 without polling", async () => {
+    const server = await startGatedEngine([{ status: "pending" }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+        "--no-wait",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).not.toMatch(/Pushed/);
+      expect(server.pollCount()).toBe(0);
+    } finally {
+      await server.close();
     }
   });
 });
@@ -1317,7 +1600,7 @@ describe("[regression] file safety — command coverage", () => {
   const CLASSIFIED = [
     "init", "add", "update", "delete", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
-    "vault add", "vault describe", "vault remove", "vault default",
+    "vault add", "vault describe", "vault remove", "vault default", "vault prune",
   ];
 
   it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {
@@ -1393,5 +1676,60 @@ describe("[regression] file safety — generic folder names in a vault", () => {
     // Modified, not created — the subtree made it into the sandbox copy.
     expect(res.stderr).toContain("~ nodes/out/formats.md");
     expect(readFileSync(join(tmp, "nodes", "out", "formats.md"), "utf-8")).toContain("original");
+  });
+});
+
+// ─── selector grammar: bare node ids + one grammar line ──────────────────────
+
+describe("[regression] selector grammar — bare node ids and --help", () => {
+  // The canonical line every surface renders. Imported from the built engine
+  // so this test fails the moment the CLI's help text drifts from it.
+  let SELECTOR_GRAMMAR: string;
+  beforeEach(async () => {
+    ({ SELECTOR_GRAMMAR } = await import("@promptowl/contextnest-engine"));
+  });
+
+  it.each(["query", "resolve"])("`ctx %s --help` prints the grammar line verbatim", (name) => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, [name, "--help"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain(SELECTOR_GRAMMAR);
+  });
+
+  it("`ctx init` banner prints the grammar line and no longer advertises path:/&", () => {
+    // Fresh directory (re-init of an existing vault refuses without consent),
+    // and a starter: the post-init banner is only printed on the starter path.
+    const res = runCtxResult(tmp, ["init", "--name", "grammar-vault", "--starter", "personal"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain(SELECTOR_GRAMMAR);
+    expect(res.stdout).not.toContain("path:nodes");
+    expect(res.stdout).not.toMatch(/\+ \(union\)/);
+  });
+
+  it("selects a single node by bare id in query and resolve", () => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/gtm/foo", "--title", "Foo", "--tags", "#strategy"]);
+    runCtx(tmp, ["add", "nodes/gtm/bar", "--title", "Bar", "--tags", "#strategy"]);
+    runCtx(tmp, ["publish", "--all", "--yes"]);
+    runCtx(tmp, ["index", "--yes"]);
+
+    const q = JSON.parse(runCtx(tmp, ["query", "nodes/gtm/foo", "--hops", "0", "--json"]));
+    expect(q.documents.map((d: { id: string }) => d.id)).toEqual(["nodes/gtm/foo"]);
+
+    const r = JSON.parse(runCtx(tmp, ["resolve", "nodes/gtm/foo", "--json"]));
+    expect(r.map((d: { id: string }) => d.id)).toEqual(["nodes/gtm/foo"]);
+
+    const and = JSON.parse(
+      runCtx(tmp, ["query", "nodes/gtm/foo + #strategy", "--hops", "0", "--json"]),
+    );
+    expect(and.documents.map((d: { id: string }) => d.id)).toEqual(["nodes/gtm/foo"]);
+  });
+
+  it("a bare word without nodes/ still fails, with a did-you-mean hint", () => {
+    initVault(tmp);
+    const res = runCtxResult(tmp, ["query", "gtm/foo"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/INVALID_SELECTOR/);
+    expect(res.stderr).toContain('did you mean "nodes/gtm/foo"');
   });
 });

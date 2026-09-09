@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
-import { ConfigError, UnknownAliasError } from "./errors.js";
+import { ConfigError, NoVaultError, UnknownAliasError } from "./errors.js";
 import type { RemoteNestSpec, VaultRegistry, VaultRegistryEntry } from "./types.js";
 
 /**
@@ -416,6 +416,45 @@ export function removeVault(alias: string): RemoveVaultResult {
   return { registry, wasDefault };
 }
 
+export interface PrunedVault {
+  alias: string;
+  path: string;
+  /** True if this alias was the registry default (the default is now unset). */
+  wasDefault: boolean;
+}
+
+export interface PruneVaultsResult {
+  registry: VaultRegistry;
+  /** Local aliases removed, in registry order. Empty when nothing was missing. */
+  removed: PrunedVault[];
+  /** True when the default alias was among the removed entries and has been cleared. */
+  defaultCleared: boolean;
+}
+
+/**
+ * Remove every LOCAL alias whose path is no longer a vault — the directory is
+ * gone, or its `.context/config.yaml` is. Same rule `listVaults()` uses for
+ * `exists`, so `vault list`'s `[missing]` marker and this function always
+ * agree on what is stale. Remotes are never touched: their reachability is
+ * only known by probing, which a registry sweep must not do.
+ *
+ * Writes the registry only when something was actually removed, so a clean
+ * registry is left byte-identical. Clears the default when it was pruned.
+ */
+export function pruneVaults(): PruneVaultsResult {
+  const registry = readRegistry();
+  const removed: PrunedVault[] = [];
+  for (const [alias, entry] of Object.entries(registry.vaults)) {
+    if (isVaultRoot(entry.path)) continue;
+    removed.push({ alias, path: entry.path, wasDefault: registry.default === alias });
+    delete registry.vaults[alias];
+  }
+  const defaultCleared = removed.some((r) => r.wasDefault);
+  if (defaultCleared) delete registry.default;
+  if (removed.length > 0) writeRegistry(registry);
+  return { registry, removed, defaultCleared };
+}
+
 /** Set the default alias. A remote nest may be the default. */
 export function setDefaultVault(alias: string): VaultRegistry {
   assertSafeAlias(alias);
@@ -728,5 +767,42 @@ export function resolveVaultPath(opts: ResolveVaultOptions = {}): ResolvedVault 
     );
   }
   const { kind: _kind, ...resolved } = nest;
+  return resolved;
+}
+
+/**
+ * True when a resolution is the bare-cwd fallback into a directory that is not
+ * a vault — the one case {@link assertVaultRoot} refuses. Exported so a caller
+ * that must not throw (`ctx vault which`, the diagnostic command, still has to
+ * report what resolved) can ask the guard instead of restating its condition.
+ */
+export function isRefusedCwd(resolved: ResolvedVault): boolean {
+  return resolved.source === "cwd" && !isVaultRoot(resolved.path);
+}
+
+/**
+ * Refuse a resolution that landed on the bare working directory when that
+ * directory is not a vault root. Every other resolution source is validated
+ * with {@link isVaultRoot} before it is returned; the cwd fallback is the one
+ * step that hands back an unvalidated path, and operating on it is how a
+ * folder of repos gets read as documents (and, before the engine guard,
+ * auto-indexed). Shared by the CLI and the MCP server so both refuse with the
+ * same `NO_VAULT` error, which names the registered aliases as a way out.
+ *
+ * Returns the resolution unchanged when it is acceptable, so callers can
+ * write `assertVaultRoot(resolveVaultPath(opts))`. The engine guards the
+ * auto-index write only; every new entry point that builds a NestStorage from
+ * a resolved path must call this, or it will still read an arbitrary folder.
+ */
+export function assertVaultRoot(resolved: ResolvedVault): ResolvedVault {
+  if (isRefusedCwd(resolved)) {
+    // Remotes share the alias namespace with local vaults, so a user whose
+    // only registered nest is remote still gets an alias to reach for.
+    const reg = readRegistry();
+    throw new NoVaultError(resolved.path, [
+      ...Object.keys(reg.vaults),
+      ...Object.keys(reg.remotes ?? {}),
+    ]);
+  }
   return resolved;
 }

@@ -49,8 +49,19 @@ export async function publishDocument(
   // frontmatter.version (>1) but has no recorded history yet. Without this,
   // its pre-publish body becomes permanently unreachable via read_version
   // once we bump to the next number.
-  const existingHistory = await storage.readHistory(docId);
-  if (!existingHistory && (node.frontmatter.version || 0) > 1) {
+  //
+  // Resilient read: an unreadable history.yaml no longer refuses the publish.
+  // It is preserved under `.corrupt-<ts>.yaml` and the chain restarts here —
+  // numbering still clears every artifact on disk, so nothing is overwritten.
+  //
+  // The seed is skipped on that restart path. It exists to rescue a body that
+  // has no artifact; after a quarantine every artifact is still on disk, and
+  // seeding would write `v{current}.md` at a number the old chain may already
+  // have sealed as a keyframe — an exclusive create that throws, which would
+  // put the author right back behind the corrupt file we just worked around.
+  const { history: existingHistory, quarantinedAs } =
+    await versionManager.historyOrRepair(docId);
+  if (!existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1) {
     await versionManager.createVersion(node, "system:seed", {
       note: "Pre-publish snapshot (auto-seeded — no prior history)",
     });
@@ -199,8 +210,11 @@ export async function publishDocuments(
       if (stamp) node = { ...node, frontmatter: { ...node.frontmatter, ...stamp } };
 
       const versionManager = new VersionManager(storage);
-      const existingHistory = await storage.readHistory(docId);
-      if (!existingHistory && (node.frontmatter.version || 0) > 1) {
+      // Same resilient read, and the same seed skip on a restart — see the
+      // note in publishDocument.
+      const { history: existingHistory, quarantinedAs } =
+        await versionManager.historyOrRepair(docId);
+      if (!existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1) {
         await versionManager.createVersion(node, "system:seed", {
           note: "Pre-publish snapshot (auto-seeded — no prior history)",
         });

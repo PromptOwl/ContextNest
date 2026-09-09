@@ -11,15 +11,18 @@
  * existing surfaces (published-only search, index regeneration after publish,
  * status/tag normalization, document validation before write).
  */
-import type { ContextNode, Frontmatter, SkillMeta } from "../types.js";
+import type { ContextNode, Frontmatter, SkillMeta, SourceMeta } from "../types.js";
 import {
   serializeDocument,
   validateDocument,
   normalizeTags,
   normalizeStatus,
   isRejected,
+  isPublished,
   explicitStatus,
+  parseDocument,
 } from "../parser.js";
+import { Resolver } from "../resolver.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -27,7 +30,22 @@ import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import {
+  buildInstallManifest,
+  renderSkill,
+  NotASkillNodeError,
+  type Harness,
+  type InstallMode,
+  type InstallScope,
+} from "../skills.js";
+import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
+import { withVaultLock } from "../vault-lock.js";
+import {
+  isVersionArtifactPath,
+  planImportPaths,
+  sanitizeImportedFrontmatter,
+} from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
@@ -223,22 +241,32 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
 };
 
 const search: OperationExecutor = async (ctx, input: any) => {
-  // Go through the engine's published-only, ranked full-text search (the
-  // `contextnest://search/…` resolver, which indexes title/description/body/tags
-  // and filters to published) instead of a hand-rolled substring scorer — never
-  // leaks unpublished content. `full: true` routes through the Resolver; graph
-  // mode would only match context.yaml metadata (no body).
-  // Slugify the query before embedding it in the URI. This string is re-lexed
-  // by the selector grammar, whose URI token terminates on whitespace/+/|/()
-  // (lexer.ts), and parseUri rejects '//'. Raw user text (spaces, a '/' from a
-  // pasted URL, '+') would truncate the token or throw INVALID_URI. Hyphens are
-  // lexer-safe URI path chars and MiniSearch tokenizes on them, so slugifying
-  // keeps recall while guaranteeing a single well-formed URI token.
-  const q = slugify(String(input.query));
-  if (!q) return { results: [] };
-  const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
-  const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
-  return { results: docs.map((d) => toSummary(d)) };
+  // Go straight to the engine's ranked, published-only full-text index
+  // (Resolver.search: title/description/body/tags, MiniSearch) rather than
+  // through `ctx.query.query("contextnest://search/…")`. The selector route
+  // had two problems: the query had to be slugified into a single lexer-safe
+  // URI token, and the selector evaluator collapsed the hits into a Set and
+  // re-filtered the discovery list, so the score — and the order — were gone
+  // by the time results reached a caller. Here the raw text goes to
+  // MiniSearch as-is and every hit carries its score.
+  // discoverDocuments() drops rejected nodes and the resolver indexes only
+  // published ones; the isPublished filter is belt-and-braces so this
+  // surface can never leak unpublished content.
+  // Note for the selector route (`context_query`): the evaluator keeps the
+  // order of a search URI only when it is the LEFTMOST operand — set
+  // intersection/union walk the left side first, so
+  // `type:document + contextnest://search/foo` comes back in discovery order.
+  const query = String(input.query).trim();
+  if (!query) return { results: [], total: 0 };
+  const docs = await ctx.storage.discoverDocuments();
+  const hits = new Resolver({ documents: docs })
+    .search(query)
+    .filter((h) => isPublished(h.document));
+  const kept = input.limit ? hits.slice(0, input.limit) : hits;
+  return {
+    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    total: hits.length,
+  };
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
@@ -264,10 +292,49 @@ const list: OperationExecutor = async (ctx, input: any) => {
   // includeRetired, or `status: "rejected"` matches nothing: discovery drops
   // retired documents before the filter ever sees them. filterDocuments hides
   // them again whenever no status was asked for.
-  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
+  // `folder` goes to discovery, not to filterDocuments: it decides which files
+  // are read at all, so narrowing afterwards would save nothing.
+  const docs = await ctx.storage.discoverDocuments({
+    includeRetired: true,
+    ...(input.folder !== undefined ? { folder: input.folder } : {}),
+    ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
+  });
   const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
   return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
+
+const folders: OperationExecutor = async (ctx, input: any) => {
+  // Reads directory entries only — the shape of the vault is answerable
+  // without opening a single document.
+  return {
+    folders: await ctx.storage.listFolders({
+      ...(input?.folder !== undefined ? { folder: input.folder } : {}),
+      ...(input?.recursive !== undefined ? { recursive: input.recursive } : {}),
+    }),
+  };
+};
+
+/**
+ * Collapse the `content` / `body` pair to one value.
+ *
+ * They name the same field: `content` is the op's parameter, `body` is what
+ * the frontmatter, the legacy create_document/update_document tools, and
+ * therefore most agents call it. Accepting both is what stops a caller's text
+ * from going nowhere; disagreeing values are refused rather than silently
+ * picking one, because either choice discards work the caller sent.
+ */
+function resolveContentAlias(input: { content?: unknown; body?: unknown }): string | undefined {
+  const { content, body } = input;
+  if (typeof content === "string" && typeof body === "string" && content !== body) {
+    throw new ContextNestError(
+      "`content` and `body` are aliases for the same field but were given different text — pass only one.",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (typeof content === "string") return content;
+  if (typeof body === "string") return body;
+  return undefined;
+}
 
 /**
  * Build a fresh draft node from create/import input. Slugifies each folder
@@ -285,11 +352,13 @@ function buildDraftNode(input: {
   folder?: string;
   metadata?: Record<string, unknown>;
   status?: Frontmatter["status"];
+  description?: string;
   trigger?: string;
   tools_required?: string[];
   output_format?: SkillMeta["output_format"];
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
+  source?: SourceMeta;
 }): ContextNode {
   const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
@@ -301,36 +370,43 @@ function buildDraftNode(input: {
   const id = input.id
     ? normalizeDocumentId(input.id)
     : normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  const type = (input.type as Frontmatter["type"]) ?? "document";
   const frontmatter: Frontmatter = {
     title: input.title,
-    type: (input.type as Frontmatter["type"]) ?? "document",
+    type,
+    ...(input.description !== undefined ? { description: input.description } : {}),
     ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
-    // Skill nodes carry a `skill` block — `trigger` is required there for
-    // type:"skill" and the block must be ABSENT on every other type, so these
-    // cannot ride along inside `metadata`.
-    ...(input.trigger
-      ? {
-          skill: {
-            trigger: input.trigger,
-            ...(input.inputs ? { inputs: input.inputs } : {}),
-            ...(input.tools_required ? { tools_required: input.tools_required } : {}),
-            ...(input.output_format ? { output_format: input.output_format } : {}),
-            ...(input.guard_rails ? { guard_rails: input.guard_rails } : {}),
-          },
-        }
-      : {}),
     status: (input.status as Frontmatter["status"]) ?? "draft",
     created_at: now,
     // A node is "updated" at birth; without this a draft carries no
     // updated_at until its first edit, and every surface renders it blank.
     updated_at: now,
   };
+  // `source` and `skill` are required by one type and forbidden on the others,
+  // so they cannot ride along inside `metadata` and cannot be added afterwards
+  // — a source node written without its block fails every later update.
+  applyTypedBlocks(frontmatter, {
+    type,
+    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
+    ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
+    ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
+    ...(input.inputs !== undefined ? { inputs: input.inputs } : {}),
+    ...(input.guard_rails !== undefined ? { guard_rails: input.guard_rails } : {}),
+  });
   return { id, filePath: "", rawContent: "", frontmatter, body: input.content };
 }
 
 const create: OperationExecutor = async (ctx, input: any) => {
-  const node = buildDraftNode(input);
+  const content = resolveContentAlias(input);
+  if (content === undefined) {
+    throw new ContextNestError(
+      "A node needs a body: pass `content` (or its alias `body`).",
+      "VALIDATION_FAILED",
+    );
+  }
+  const node = buildDraftNode({ ...input, content });
   // A rejected node cannot be published — publish refuses one by design. Left
   // to fall through, the write below lands and publish then throws, stranding a
   // file on disk with no version and no history, and making the caller's retry
@@ -403,6 +479,13 @@ const update: OperationExecutor = async (ctx, input: any) => {
     frontmatter.title = input.title;
   }
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  // An empty string CLEARS the description, the same convention `metadata`
+  // uses for null: over a JSON wire an absent key cannot be told apart from
+  // "leave this alone", so without it a caller has no way to remove one.
+  if (typeof input.description === "string") {
+    if (input.description === "") delete frontmatter.description;
+    else frontmatter.description = input.description;
+  }
   if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
   if (input.metadata) {
     const merged: Record<string, unknown> = {
@@ -418,15 +501,31 @@ const update: OperationExecutor = async (ctx, input: any) => {
     }
     frontmatter.metadata = merged;
   }
+  // The typed blocks are settled against the node's POST-write type — the one
+  // passed in this call, or the one it already carries. Without this an
+  // existing type:source node has no way to gain the block rule 9 demands, and
+  // every update it is ever given fails validation.
+  const nextType = (input.type as Frontmatter["type"]) ?? frontmatter.type ?? "document";
+  if (input.type !== undefined) frontmatter.type = nextType;
+  applyTypedBlocks(frontmatter, {
+    type: nextType,
+    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
+    ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
+    ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
+    ...(input.inputs !== undefined ? { inputs: input.inputs } : {}),
+    ...(input.guard_rails !== undefined ? { guard_rails: input.guard_rails } : {}),
+  });
   frontmatter.updated_at = new Date().toISOString();
+  const newContent = resolveContentAlias(input);
   let body = existing.body;
-  if (typeof input.content === "string") body = input.content;
+  if (newContent !== undefined) body = newContent;
   if (typeof input.append === "string") body = `${body}\n${input.append}`;
   // The checksum describes the PUBLISHED body, so any body change invalidates
   // it — including one whose publish then fails, which would otherwise leave a
   // stale checksum on disk and make the next verified read cry external drift.
   // Frontmatter-only edits keep it: the checksum covers the body alone.
-  if (typeof input.content === "string" || typeof input.append === "string") {
+  if (newContent !== undefined || typeof input.append === "string") {
     delete frontmatter.checksum;
   }
 
@@ -575,6 +674,7 @@ const init: OperationExecutor = async (ctx, input: any) => {
           name: config.name,
           ...(config.description ? { description: config.description } : {}),
           servers: config.servers ? Object.keys(config.servers) : [],
+          ...(config.skills?.bootstrap ? { skill_bootstrap: config.skills.bootstrap } : {}),
         }
       : null,
     total: docs.length,
@@ -584,6 +684,108 @@ const init: OperationExecutor = async (ctx, input: any) => {
     // Counts and tags answer most opening questions; a large vault's node list
     // dwarfs them, so it is opt-in.
     ...(input?.include_nodes ? { nodes: listed.map((d) => toSummary(d)) } : {}),
+  };
+};
+
+/**
+ * Shared preamble for the two skill operations: load the node, and settle the
+ * caller-supplied names. `server_alias` falls back to the vault's own name
+ * because a caller that omits it usually configured the server under that name;
+ * a wrong-but-plausible prefix is at least recognizable, where an empty one
+ * renders `mcp____context_skill`.
+ */
+async function loadSkillNode(ctx: OperationContext, input: any) {
+  const id = normalizeDocumentId(String(input.id ?? ""));
+  assertSafeDocumentId(id);
+  const [live, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
+
+  // A rejected node does not dead-end: it falls back to the last APPROVED version,
+  // so an agent keeps working from the last steps a steward signed off on while the
+  // author fixes the live file (which update/publish still accept — being rejected
+  // is what you edit your way out of). Rendering the rejected text itself is what
+  // is refused: an installed skill is matched on and executed, not just displayed.
+  // Only a rejected node with nothing approved behind it has nothing safe to serve.
+  let node = live;
+  let servedVersion: number | null = null;
+  if (isRejected(live)) {
+    const history = await ctx.versions.getHistory(id);
+    // published_at is the local marker of an approved version — the approval
+    // publish path is the only writer. Highest wins; history is append-only.
+    const approved = [...(history?.versions ?? [])].reverse().find((v) => v.published_at);
+    if (!approved) throw new RejectedDocumentError(id);
+    node = parseDocument(id, await ctx.versions.reconstructVersion(id, approved.version), id);
+    servedVersion = approved.version;
+  }
+  const vaultName = config?.name;
+  return {
+    doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    servedVersion,
+    vaultName,
+    serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
+    harness: (input.harness ?? "claude-code") as Harness,
+    scope: (input.scope ?? "user") as InstallScope,
+    mode: (input.mode ?? "loader") as InstallMode,
+  };
+}
+
+/** NotASkillNodeError carries a caller-actionable message; keep it, drop the class. */
+function asValidationError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof NotASkillNodeError) {
+      throw new ContextNestError(err.message, "VALIDATION_FAILED");
+    }
+    throw err;
+  }
+}
+
+const skill: OperationExecutor = async (ctx, input: any) => {
+  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
+    ctx,
+    input,
+  );
+  const rendered = asValidationError(() =>
+    renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
+  );
+  return {
+    name: rendered.name,
+    description: rendered.description,
+    content: rendered.content,
+    relative_path: rendered.relativePath,
+    base: rendered.base,
+    harness,
+    source_path: doc.id,
+    version: doc.frontmatter.version ?? null,
+    ...(servedVersion === null ? {} : { served_version: servedVersion, notes: rejectedNote(doc.id, servedVersion) }),
+  };
+};
+
+/** Said out loud on both ops: what you got is not what is on disk right now. */
+function rejectedNote(id: string, version: number): string {
+  return `${id} is rejected; serving approved version ${version}.`;
+}
+
+const skillInstall: OperationExecutor = async (ctx, input: any) => {
+  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
+    ctx,
+    input,
+  );
+  const manifest = asValidationError(() =>
+    buildInstallManifest(doc, {
+      harness,
+      serverAlias,
+      vaultName,
+      vaultId: vaultName ?? serverAlias,
+      scope,
+      mode,
+    }),
+  );
+  if (servedVersion === null) return manifest;
+  return {
+    ...manifest,
+    served_version: servedVersion,
+    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
   };
 };
 
@@ -605,9 +807,65 @@ const packs: OperationExecutor = async (ctx) => {
 // Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
 const nests: OperationExecutor = () => ({ nests: listVaults() });
 
+/**
+ * Land one imported file at the path `planImportPaths` chose for it — the
+ * slugified id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), disambiguated
+ * against the rest of the batch and the vault. A markdown document that
+ * would not validate as it arrived — no title, a type outside the spec, tags
+ * with spaces — is repaired on the way in, each repair reported as a warning.
+ * A file that is already valid, and every non-document file (version
+ * histories, indexes), is written byte for byte: the source's frontmatter is
+ * its own.
+ *
+ * The title falls back to the ORIGINAL filename, human casing intact: after
+ * the rename only the slug survives, and `dr-smith` is a worse title than
+ * `Dr. Smith`.
+ */
+async function writeImportedFile(
+  ctx: OperationContext,
+  f: { raw: string; path: string; content?: string },
+  warnings: string[],
+): Promise<void> {
+  const { raw, path: relPath } = f;
+  let content = f.content ?? "";
+  const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
+  // A keyframe under `.versions/` is a whole document, so `v1.md` passes every
+  // test a live node passes — but its bytes are hashed into that version's
+  // `content_hash`. Repairing one would make `ctx verify` report a version the
+  // import itself rewrote as tampered. Sealed history travels verbatim.
+  if (
+    !isVersionArtifactPath(relPath) &&
+    /\.md$/i.test(lastSegment) &&
+    !lastSegment.startsWith(".")
+  ) {
+    const id = relPath.replace(/\.md$/i, "");
+    let node: ContextNode | undefined;
+    try {
+      node = parseDocument(`${id}.md`, content, id);
+    } catch {
+      // Unparseable frontmatter is the author's to fix; land it as it came so
+      // nothing is lost, and let validate report it.
+    }
+    if (node) {
+      const { patch, warnings: repairs } = sanitizeImportedFrontmatter(
+        node,
+        lastSegment.replace(/\.md$/i, ""),
+      );
+      warnings.push(...repairs);
+      if (Object.keys(patch).length > 0) {
+        content = serializeDocument({ ...node, frontmatter: { ...node.frontmatter, ...patch } });
+      }
+    }
+  }
+  await ctx.storage.writeVaultFile(relPath, content);
+}
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
+  // Every repair the import made to something it did not author — a renamed
+  // path, a coerced type, a dropped tag. Reported, never fatal.
+  const warnings: string[] = [];
 
   // Ids of documents already in the vault publish as-is — their paths ARE their
   // ids, and the caller owns their frontmatter. Nothing is rewritten here.
@@ -619,14 +877,31 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
   if (incoming.length > 0) {
-    await mapInBatches(incoming, async (f) => {
+    // Targets are settled for the WHOLE batch BEFORE the parallel write: two
+    // files whose names slugify alike must not race for one path, and a
+    // renamed document has to take its `.versions/` history with it — neither
+    // is decidable one file at a time. By default a file already in the vault
+    // is never overwritten; `overwrite` opts back into replacing it, which is
+    // what makes re-running the same batch idempotent instead of duplicating.
+    // A path the guard refuses (`../`) reads as absent here and fails at its
+    // own write below, so it is reported per file rather than sinking the batch.
+    const plan = (
+      await planImportPaths(
+        incoming.map((f) => String(f.path ?? "")),
+        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+      )
+    ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
+    await mapInBatches(plan, async (f) => {
       try {
-        await ctx.storage.writeVaultFile(f.path, f.content ?? "");
+        // Into the file's OWN warning list: `mapInBatches` finishes in
+        // whatever order the writes complete, and the report is per input file.
+        await writeImportedFile(ctx, f, f.warnings);
         written++;
       } catch (err) {
-        failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
+        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
       }
     });
+    for (const p of plan) warnings.push(...p.warnings);
   }
 
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
@@ -645,7 +920,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // A staging call — files written, publishing deferred to the caller's final
   // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
   if (input.publish === false) {
-    return { published: [], failed, checkpoint: null, written };
+    return {
+      published: [],
+      failed,
+      checkpoint: null,
+      written,
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 2 (discover): the vault itself is the input. The scan, the metadata
@@ -654,6 +935,11 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // ids back — that pass cost a second full round trip per document.
   let held: ContextNode[] = [];
   let scanned: ContextNode[] = [];
+  // Frontmatter repairs for the documents the scan owns, by id. A caller that
+  // wrote the files itself and only asks the engine to discover them gets the
+  // same hygiene as one that sent them through `files`: without it a note
+  // with no title or a `type: note` is published as-is and fails validate.
+  const repairs = new Map<string, Partial<Frontmatter>>();
   if (input.discover) {
     const exclude = new Set<string>(input.exclude_ids ?? []);
     // Ids the caller supplied itself, via `ids` or staged from `documents`.
@@ -664,6 +950,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
       if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
+        doc,
+        doc.id.split("/").pop() ?? doc.id,
+      );
+      warnings.push(...repaired);
+      if (Object.keys(patch).length > 0) repairs.set(doc.id, patch);
       // Publishing is opt-in. Only a file that EXPLICITLY says it is published
       // or approved gets published; everything else is held as a draft for a
       // human to approve, including a file that states no status at all.
@@ -715,6 +1007,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
             discovered.has(node.id)
               ? {
                   title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...repairs.get(node.id),
                   ...(input.author ? { author: input.author } : {}),
                 }
               : null
@@ -729,7 +1022,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   }
 
   if (!input.discover) {
-    return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
+    return {
+      published,
+      failed,
+      checkpoint,
+      ...(incoming.length ? { written } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 3b: held documents never reach the publish write, so this is their
@@ -749,9 +1048,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // re-import of an already-stamped vault free.
   await mapInBatches(held, async (doc) => {
     const authored = explicitStatus(doc);
-    const stamp: Record<string, unknown> = {};
+    const stamp: Record<string, unknown> = { ...repairs.get(doc.id) };
 
-    const title = doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    const title = stamp.title ?? doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
     if (doc.frontmatter.title !== title) stamp.title = title;
     if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
     // Only when the author stated nothing — an explicit `pending_review` or
@@ -777,12 +1076,14 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const asRecord = (doc: ContextNode) => {
     const version = publishedVersion.get(doc.id);
     const own = Number(doc.frontmatter.version);
+    // Report what was written, repairs included, not what was found.
+    const frontmatter = { ...doc.frontmatter, ...repairs.get(doc.id) };
     return {
       id: doc.id,
-      title: doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      title: frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
       version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
       status: version !== undefined ? ("published" as const) : ("draft" as const),
-      tags: normalizeTags(doc.frontmatter.tags) ?? [],
+      tags: normalizeTags(frontmatter.tags) ?? [],
       content: doc.body ?? "",
     };
   };
@@ -791,9 +1092,22 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     failed,
     checkpoint,
     ...(incoming.length ? { written } : {}),
+    ...(warnings.length ? { warnings } : {}),
     documents: [...scanned, ...held].map(asRecord),
   };
 };
+
+/**
+ * Serialize a mutating executor on the vault's write lock. Every mutation
+ * read-modify-writes the nest-level checkpoint chain; without this, concurrent
+ * writers (parallel agents, two terminals, N remote clients on one server)
+ * silently lose seals and break `ctx verify`. Applied at the binding so each
+ * operation locks exactly once, at its outer edge.
+ */
+const locked =
+  (executor: OperationExecutor): OperationExecutor =>
+  (ctx, input) =>
+    withVaultLock(ctx.storage.root, () => Promise.resolve(executor(ctx, input)));
 
 /** name → executor for the built-in `core` namespace. */
 export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({
@@ -802,15 +1116,18 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_search: search,
   context_get: get,
   context_list: list,
-  context_create: create,
-  context_update: update,
-  context_publish: publish,
-  context_delete: del,
+  context_folders: folders,  
+  context_create: locked(create),
+  context_update: locked(update),
+  context_publish: locked(publish),
+  context_delete: locked(del),
   context_versions: versions,
   context_reconstruct: reconstruct,
   context_verify: verify,
   context_init: init,
   context_packs: packs,
   context_nests: nests,
-  context_import: importDocs,
+  context_import: locked(importDocs),
+  context_skill: skill,
+  context_skill_install: skillInstall,
 });

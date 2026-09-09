@@ -6,7 +6,7 @@
  * test cannot do, whereas this module is pure aside from the stderr advisory.
  */
 
-import { resolveVaultPath } from "@promptowl/contextnest-engine";
+import { assertVaultRoot, resolveVaultPath } from "@promptowl/contextnest-engine";
 
 /**
  * Resolve which vault to serve via the engine resolver, which owns the full
@@ -24,5 +24,9 @@ export function resolveMcpVaultPath(argPath: string | undefined = process.argv[2
   if (resolved.warning) {
     process.stderr.write(`contextnest-mcp: ${resolved.warning}\n`);
   }
-  return resolved.path;
+  // The cwd fallback is refused unless cwd is a real vault (NO_VAULT): serving
+  // an arbitrary directory would let context_list / context_search / context_query
+  // walk its .md files as documents. The bootstrap catches this, prints the
+  // message and exits non-zero. Same engine guard as the CLI.
+  return assertVaultRoot(resolved).path;
 }

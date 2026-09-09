@@ -1,5 +1,93 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.3.0
+
+### Minor Changes
+
+- a061c4a: Refuse unknown write parameters instead of silently dropping them, and accept `body`/`content` as aliases.
+
+  A caller that misnamed a parameter — `content` where `update_document` takes `body` — got a success response for a write that never landed: zod's default object mode stripped the key, the handler saw no body, the version bumped, `updated_at` moved, and a checkpoint and chain hash were written over unchanged text. The only way to notice was to read the document back and compare.
+
+  - `EngineApi.run()` now rejects any key an operation's input schema does not declare (`VALIDATION_FAILED`, naming the unknown keys and listing the accepted ones).
+  - The MCP server registers every tool through `registerTool` with a strict ZodObject, so the schema it publishes (`additionalProperties: false`) is the one it enforces. Previously it advertised strictness and stripped instead.
+  - `context_create` / `context_update` accept `body` as an alias for `content`, and `create_document` / `update_document` accept `content` as an alias for `body`. Two values that disagree are refused rather than resolved by preference.
+  - `context_create`, `context_update`, `create_document` and `update_document` take a `description`. It is one of the three fields the metadata index matches on, so a node without one is markedly harder to retrieve; update clears it with an empty string, matching `metadata`'s null convention.
+  - `list_documents` gains the `path` filter its canonical twin `context_list` has as `folder`, matching on segment boundaries.
+
+  Also: make `type: source` nodes writable at all.
+
+  `create_document` built a `skill:` block for skill nodes but had no `source` equivalent, and skipped `validateDocument` entirely. A `type: source` node was therefore written and published with no `source:` block — which §13 rule 9 requires, but only enforces on the way out. Every subsequent update then failed validation, with no parameter able to supply the missing field: the node was write-once, recoverable only by `delete_document`, which destroys its version history. `context_create` was better behaved (it validates, so it failed loudly) but source nodes were simply uncreatable there.
+
+  - New `applyTypedBlocks` settles `source` and `skill` against a node's post-write `type` BEFORE anything is written, shared by `context_create`, `context_update`, `create_document` and `update_document`. Entering `source`/`skill` requires that block (rules 9 / 18); leaving it drops the old one (rules 17 / 19).
+  - `context_create` and `create_document` take a `source` block; `create_document` now validates before the write, so an invalid create leaves nothing on disk.
+  - `context_update` and `update_document` take `type`, `source`, `trigger`, `tools_required` and `output_format`, so a node broken by this bug can be repaired without losing its history, and a node can be re-typed with its block swapped in the same call.
+  - `sourceMetaSchema` is exported, so the write operations accept a source block against the same shape frontmatter validation enforces.
+
+- ca294a1: Vault-hosted skills: install a `type: skill` node into an agent harness
+
+  A skill node can now be rendered as a Claude Code `SKILL.md`, a Cursor rule, a
+  Codex skill, or raw markdown, and installed into the caller's project or home
+  directory. `skill.trigger` becomes the harness's local matcher — the one field
+  that must exist locally, since matching happens before anything can be fetched,
+  so a skill node without a trigger is refused rather than given a guessed one.
+
+  The default install writes a **loader**: the trigger plus an instruction to fetch
+  the procedure from the vault at runtime. A loader cannot go stale because it
+  never holds a copy. `mode: "full"` embeds an offline snapshot instead, and says
+  out loud that the copy will drift.
+
+  - New engine module `skills.ts` (`renderSkill`, `buildInstallManifest`).
+  - New catalog operations `context_skill` and `context_skill_install`, which the
+    MCP server registers automatically — 38 tools now.
+  - New CLI commands `ctx skill <path>` and `ctx skill install <path> [--write]`.
+    Writes land outside the vault, so they go through the same never-clobber guard
+    and dry-run accounting as `ctx read --out`.
+  - New `skills.bootstrap` key in `.context/config.yaml`, naming the skill that
+    teaches an agent to use this vault. `context_init` returns it as
+    `config.skill_bootstrap`.
+  - Node bodies can write `{{server_alias}}` / `{{vault_id}}` / `{{node_path}}`
+    instead of hardcoding an `mcp__…__` prefix that is only correct on one client.
+
+### Patch Changes
+
+- a061c4a: Refuse unknown keys inside nested write objects too, and let `context_import` carry typed blocks.
+
+  The unknown-key guard added alongside the strict MCP tool schemas reads an operation's OUTER shape only, so nested objects went on silently stripping — the same failure it was written to stop, one level down. A bulk import saying `body` instead of `content` published a node with the wrong text; a `source` block with a typo'd `server` was written incomplete and sealed into the chain.
+
+  - `importDoc` and `importFile` are strict. The `files[]` case was the sharper one: the executor writes `f.content ?? ""`, so a stripped key landed an EMPTY file and still counted itself in `written`.
+  - The `source` parameter of `context_create`, `context_update`, `create_document` and `update_document` is strict at each call site. `sourceMetaSchema` itself stays lenient by design — it also parses documents already on disk, where an unrecognized key is a file to keep reading rather than a caller to refuse. Making the base strict would start failing existing vault files.
+  - `context_import` accepts `description` and the typed-block fields (`source`, `trigger`, `tools_required`, `output_format`, `inputs`, `guard_rails`). `buildDraftNode` already forwarded them to `applyTypedBlocks`, but the schema dropped them first, so `type: source` and `type: skill` nodes could not be imported at all — import was the one write surface the source-node fix missed.
+  - `metadata` stays permissive; arbitrary keys are its purpose.
+
+  Also repairs two handlers mangled in the merge of the vault-lock and strict-schema branches: `create_document` and `update_document` had a block-bodied arrow around `lockedHandler(...)`, whose return value was therefore discarded — the tool resolved `undefined` and the write ran unawaited. Both are back to the concise form the other locked tools use.
+
+## 2.2.1
+
+### Patch Changes
+
+- e247037: Pick up the checkpoint-chain write fix, and stop `ctx index` reading the whole chain.
+
+  Both binaries compile the engine into `dist/` and declare it as a devDependency, so an engine-only release would leave installed copies still running the old code — the checkpoint fix reaches `ctx` and the OSS MCP server only when they are rebuilt and republished. Every write path in both already routes through `publishDocument` / `publishDocuments` / `storage.regenerateIndex()`, so no call-site change was needed for them to inherit it.
+
+  `ctx index` was the one exception. It reimplements `regenerateIndex` inline and carried its own copy of the whole-chain read for a single field (`checkpoints.at(-1)`); it now takes the head through `readLatestCheckpoint()` like the engine does. One-shot rather than per-write, so it was never part of the timeout, but it is the same O(chain size) cost.
+
+## 2.2.0
+
+### Minor Changes
+
+- Remote nests: point `ctx` at a nest served over MCP and use it like a local vault.
+
+  The vault registry grows a top-level `remotes:` map — stdio or HTTP specs, env-ref-only auth, sharing one alias namespace with local `vaults:`. Older CLIs strip the unknown key and keep working. `resolveNest()` resolves an alias to either a local path or a remote spec at the documented precedence; `resolveVaultPath()` wraps it and fails with a clear local-only error when an alias points at a remote.
+
+  `--vault <remote-alias>` then routes read and write commands through an MCP client (`connectRemoteNest()`, SDK loaded lazily) instead of the local engine, with JSON output shape-identical to the local path. Local-only commands fail fast on a remote alias rather than pretending to work, and an unreachable remote exits 3 naming the alias.
+
+  The wire contract is the engine's canonical operation catalog, so the MCP server now binds every core op under its canonical `context_*` name with catalog-sourced schemas, keeps the legacy tool names as deprecated aliases, and returns catalog output shapes and structured `{code, message}` errors. That closes the drift between engine, CLI and MCP server on the remote path.
+
+  Capability-aware behaviour on top of it:
+
+  - `ctx publish` against a remote that has no `context_publish` routes through the remote's review flow instead of failing — Community publishes via steward review.
+  - `ctx verify` refuses to report a verification the remote cannot perform, rather than fabricating a pass.
+
 ## 2.1.0
 
 ### Minor Changes

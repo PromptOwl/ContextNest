@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-engine",
-  "version": "2.1.0",
+  "version": "2.4.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -45,7 +45,7 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts src/api/index.ts --format esm --dts --clean",
+    "build": "tsup",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",

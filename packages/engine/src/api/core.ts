@@ -13,12 +13,15 @@
  * source for both the on-disk format and the wire contract.
  */
 import { z } from "zod";
+import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
   TAG_PATTERN,
   frontmatterSchema,
+  sourceMetaSchema,
 } from "../schemas.js";
+import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import type { OperationDescriptor } from "./types.js";
 
 const tag = z.string().regex(TAG_PATTERN);
@@ -93,7 +96,11 @@ const searchOp: OperationDescriptor = {
     limit: z.number().int().positive().optional().describe("Max results"),
   }),
   output: z.object({
+    // Best hit first: documents matching every query term, then partial
+    // matches, each tier by descending BM25 `score`.
     results: z.array(nodeSummary.extend({ score: z.number().optional() })),
+    // Matches before `limit` was applied, so a caller can say "N more".
+    total: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["search"],
@@ -111,7 +118,7 @@ const queryOp: OperationDescriptor = {
   name: "context_query",
   namespace: "core",
   description:
-    "Run a selector query with graph traversal. Supports #tag, type:X, [[Title]], scope:X, combined with +AND, |OR, -NOT.",
+    `Run a selector query with graph traversal. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     query: z.string().min(1).describe("Selector query expression"),
     hops: z
@@ -151,7 +158,7 @@ const resolveOp: OperationDescriptor = {
   name: "context_resolve",
   namespace: "core",
   description:
-    "Full context resolution — run a selector and return complete node content within a token budget.",
+    `Full context resolution — run a selector and return complete node content within a token budget. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     selector: z.string().min(1).describe("Selector query string"),
     max_tokens: z
@@ -220,7 +227,8 @@ const getOp: OperationDescriptor = {
 const listOp: OperationDescriptor = {
   name: "context_list",
   namespace: "core",
-  description: "Browse vault contents with optional type, tag, status, or limit filters.",
+  description:
+    "Browse vault contents with optional folder, type, tag, status, or limit filters.",
   input: z.object({
     // An array as well as a single value: callers that browse a family of types
     // (every runnable type, say) would otherwise have to list, then re-filter.
@@ -236,6 +244,20 @@ const listOp: OperationDescriptor = {
       .optional()
       .describe("Filter by status (aliases normalized). Retired nodes are hidden unless asked for."),
     limit: z.number().int().positive().optional().describe("Max nodes to return"),
+    // Narrows the CRAWL, not just the result. Filtering a whole-vault listing
+    // down to one folder costs exactly as much as not filtering it.
+    folder: z
+      .string()
+      .optional()
+      .describe(
+        'Read only this folder, as a path relative to the vault root — the id prefix ("nodes/gtm", not "gtm"). Empty string means the vault root itself.',
+      ),
+    recursive: z
+      .boolean()
+      .optional()
+      .describe(
+        "With `folder`: include subfolders (default true). Pass false for one level only, so nested folders are never read.",
+      ),
     include_retired: z
       .boolean()
       .optional()
@@ -252,8 +274,49 @@ const listOp: OperationDescriptor = {
   output: z.object({
     documents: z.array(nodeSummary),
   }),
-  errors: ["VALIDATION_FAILED"],
+  // `folder` is a free-form string to zod, so a `..` in it clears validation
+  // and is rejected by the folder normalizer instead — a consumer generating
+  // handling from this list has to know that code can arrive.
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
   aliases: ["list_documents"],
+};
+
+// ─── context_folders ─────────────────────────────────────────────────────────
+
+const foldersOp: OperationDescriptor = {
+  name: "context_folders",
+  namespace: "core",
+  description:
+    "List the vault's folders and their document counts, without reading any document.",
+  input: z.object({
+    folder: z
+      .string()
+      .optional()
+      .describe(
+        'List folders under this one, as a path relative to the vault root — the id prefix ("nodes/gtm", not "gtm"). Omit for the whole vault.',
+      ),
+    recursive: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include nested folders (default true). Pass false for the immediate children only.",
+      ),
+  }),
+  output: z.object({
+    folders: z.array(
+      z.object({
+        path: z.string().describe("Path relative to the vault root"),
+        count: z
+          .number()
+          .int()
+          .describe("Documents directly in this folder, excluding its subfolders"),
+      }),
+    ),
+  }),
+  // No alias: aliases are a migration path off tool names that already
+  // existed in the wild, and nothing ever called this one.
+  // INVALID_DOCUMENT_ID for the same reason as context_list — see there.
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
 };
 
 // ─── context_create ──────────────────────────────────────────────────────────
@@ -264,7 +327,18 @@ const createOp: OperationDescriptor = {
   description: "Create a new knowledge node in the vault.",
   input: z.object({
     title: z.string().min(1).max(200).describe("Descriptive title"),
-    content: z.string().describe("Markdown content body"),
+    content: z.string().optional().describe("Markdown content body"),
+    // Alias, not a second field. `body` is what the legacy create_document
+    // tool and the frontmatter itself call this, so agents reach for it
+    // constantly; before the runtime refused unknown keys it was dropped in
+    // silence and the node was written empty.
+    body: z.string().optional().describe("Alias for `content` — pass one or the other, not both"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
+      ),
     type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
@@ -310,6 +384,15 @@ const createOp: OperationDescriptor = {
     // skill block has exactly one authoritative schema.
     inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
     guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
+    // The `source` block's counterpart to `trigger`: REQUIRED for type:"source"
+    // and forbidden on every other type, so it cannot ride inside `metadata`
+    // either. Without it a source node simply could not be created.
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        'Source block (required for type:source): how an agent fetches the live data this node stands for.',
+      ),
   }),
   output: z.object({
     id: z.string(),
@@ -321,7 +404,12 @@ const createOp: OperationDescriptor = {
       .nullable()
       .describe("Checkpoint sealing the publish, or null when created as a draft"),
   }),
-  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID", "DOCUMENT_ALREADY_EXISTS"],
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["create_document"],
 };
 
@@ -342,6 +430,13 @@ const updateOp: OperationDescriptor = {
       ),
     title: z.string().optional().describe("New title"),
     content: z.string().optional().describe("New content (replaces body)"),
+    body: z.string().optional().describe("Alias for `content` — pass one or the other, not both"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "New one-line summary for frontmatter. An empty string removes it. Indexed for retrieval alongside title and tags.",
+      ),
     append: z.string().optional().describe("Content to append"),
     tags: z.array(tag).optional().describe("New tags (replaces existing)"),
     metadata: z
@@ -374,6 +469,33 @@ const updateOp: OperationDescriptor = {
       .describe(
         "Explicit version to stamp, for governed callers that assign version numbers themselves (a draft revision awaiting review). Ignored when publishing, which assigns the version.",
       ),
+    // Re-typing and the typed blocks travel together: source/skill blocks are
+    // required by one type and forbidden on the others, so a node can only be
+    // re-typed if its block is added or dropped in the SAME call. Freezing a
+    // block at creation is the trap `description` was in before this PR.
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+      ),
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    trigger: z
+      .string()
+      .optional()
+      .describe("New skill trigger, for a node that is (or is becoming) type:skill"),
+    tools_required: z.array(z.string()).optional().describe("New tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("New skill output format"),
+    inputs: z.array(z.record(z.unknown())).optional().describe("New skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("New skill execution constraints"),
   }),
   output: z.object({
     id: z.string(),
@@ -390,6 +512,7 @@ const updateOp: OperationDescriptor = {
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
 };
@@ -420,6 +543,7 @@ const publishOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
     "REJECTED_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["publish_document"],
 };
@@ -436,21 +560,38 @@ const deleteOp: OperationDescriptor = {
     title: z.string().describe("Title of the deleted node, read before removal"),
     deleted: z.literal(true),
   }),
-  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "VAULT_LOCK_TIMEOUT",
+  ],
   aliases: ["delete_document"],
 };
 
 // ─── context_versions ────────────────────────────────────────────────────────
 
+// Optional where a server may legitimately have nothing to report, not
+// because the field is decorative. `keyframe`/`content_hash`/`chain_hash`
+// describe the keyframe+diff storage model and its per-version hash chain; a
+// nest that stores content whole and enforces integrity server-side has no
+// equivalent and omits them rather than faking a value. Same reason
+// `published_at` and `status` are both optional: a nest either publishes
+// versions or approves them, never both.
 const versionEntryOut = z.object({
   version: z.number().int(),
-  keyframe: z.boolean(),
+  keyframe: z.boolean().optional(),
   edited_by: z.string(),
   edited_at: z.string(),
   published_at: z.string().optional(),
+  status: z
+    .string()
+    .optional()
+    .describe("Lifecycle status of this version on a nest that approves rather than publishes"),
   note: z.string().optional(),
-  content_hash: z.string(),
-  chain_hash: z.string(),
+  content_hash: z.string().optional(),
+  chain_hash: z.string().optional(),
   /** Only present when the caller passes `include_diff`. Absent for a keyframe
    *  (a full snapshot has no patch) and for v1. */
   diff: z.string().optional().describe("Unified diff from the previous version"),
@@ -473,7 +614,16 @@ const versionsOp: OperationDescriptor = {
   }),
   output: z.object({
     id: z.string(),
-    keyframe_interval: z.number().int(),
+    // Absent from a server with no keyframe+diff model — see versionEntryOut.
+    keyframe_interval: z.number().int().optional(),
+    approved_version: z
+      .number()
+      .int()
+      .nullable()
+      .optional()
+      .describe(
+        "The version a governed nest currently serves to agents; null when none is approved yet. Absent from a nest that publishes rather than approves.",
+      ),
     versions: z.array(versionEntryOut),
   }),
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI"],
@@ -563,6 +713,12 @@ const initOp: OperationDescriptor = {
         name: z.string(),
         description: z.string().optional(),
         servers: z.array(z.string()).describe("Names of the MCP servers the vault declares"),
+        skill_bootstrap: z
+          .string()
+          .optional()
+          .describe(
+            "The vault's entry-point skill node (config `skills.bootstrap`), if it designates one. Render it with context_skill and install it with context_skill_install — it is how this vault teaches an agent to use it.",
+          ),
       })
       .nullable(),
     total: z.number().int(),
@@ -640,30 +796,72 @@ const nestsOp: OperationDescriptor = {
 
 // ─── context_import ──────────────────────────────────────────────────────────
 
-/** One node to create in a bulk import — same shape as context_create input. */
-const importDoc = z.object({
-  title: z.string().min(1).max(200).describe("Descriptive title"),
-  content: z.string().describe("Markdown content body"),
-  type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
-  tags: z.array(tag).optional().describe("Tags"),
-  folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
-  metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
-});
+/**
+ * One node to create in a bulk import — the fields `context_create` takes.
+ *
+ * `.strict()` for the same reason `EngineApi.run()` refuses unknown top-level
+ * keys: that check reads the OUTER shape only, so without this a caller who
+ * writes `body` here has it stripped in silence and the node is published with
+ * the wrong text. `metadata` stays permissive — arbitrary keys are its purpose.
+ *
+ * The typed-block fields are what make a `type: source` or `type: skill` node
+ * importable at all: `buildDraftNode` settles them through `applyTypedBlocks`,
+ * which requires the block of the type being entered, and nothing else here
+ * can supply it.
+ */
+const importDoc = z
+  .object({
+    title: z.string().min(1).max(200).describe("Descriptive title"),
+    content: z.string().describe("Markdown content body"),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
+      ),
+    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    tags: z.array(tag).optional().describe("Tags"),
+    folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
+    metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Source block (required for type:source): how an agent fetches the live data this node stands for.",
+      ),
+    trigger: z.string().optional().describe("Skill trigger (required for type:skill)"),
+    tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("Skill output format"),
+    inputs: z.array(z.record(z.unknown())).optional().describe("Skill input parameters"),
+    guard_rails: z.array(z.string()).optional().describe("Skill execution constraints"),
+  })
+  .strict();
 
-/** One file from an existing vault, written in exactly as given. */
-const importFile = z.object({
-  path: z
-    .string()
-    .min(1)
-    .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
-  content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
-});
+/**
+ * One file from an existing vault, written in exactly as given.
+ *
+ * `.strict()` because a misnamed `content` is not an inert typo here: the
+ * executor writes `f.content ?? ""`, so a stripped key lands an EMPTY file and
+ * still counts itself in `written`.
+ */
+const importFile = z
+  .object({
+    path: z
+      .string()
+      .min(1)
+      .describe("Vault-relative path, e.g. `notes/api.md` or `notes/.versions/api/history.yaml`"),
+    content: z.string().describe("Full file contents, frontmatter included, written verbatim"),
+  })
+  .strict();
 
 const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in verbatim, and/or `discover` to let the engine find and publish everything already in the vault. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
   // Every input is optional and validated in the executor rather than through
   // a refined union: `.refine()` produces a ZodEffects, which degrades to a
   // useless JSON Schema through zod-to-json-schema — and MCP publishes
@@ -683,7 +881,13 @@ const importOp: OperationDescriptor = {
       .array(importFile)
       .optional()
       .describe(
-        "Files from an existing vault, written in verbatim at their own relative paths. Unlike `documents` nothing is synthesized: the source's frontmatter is preserved, and non-document files (`.versions/<doc>/history.yaml`) travel too, which is what lets an imported version chain still reconstruct.",
+        "Files from an existing vault, written in at their own relative paths. Unlike `documents` nothing is synthesized — but a path is slugified so the node has an addressable id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), a name already taken lands as `<name>-2` unless `overwrite` is set, and frontmatter is repaired where it would otherwise fail validation; a file that is already valid is written byte for byte. Non-document files (`.versions/<doc>/history.yaml`) travel too and move with their document if it is renamed, which is what lets an imported version chain still reconstruct.",
+      ),
+    overwrite: z
+      .boolean()
+      .optional()
+      .describe(
+        "With `files`: replace a path that is already in the vault instead of landing the incoming file beside it as `<name>-2` (default false). Set true to re-run the same batch idempotently, or to use `files` as an update path. Two incoming files that slugify alike are still kept apart.",
       ),
     publish: z
       .boolean()
@@ -724,6 +928,13 @@ const importOp: OperationDescriptor = {
     /** `files` only: how many were written in. */
     written: z.number().int().optional(),
     /**
+     * Repairs the import made to files it did not author — a path slugified,
+     * a missing title derived, a `type` outside the spec coerced to
+     * `document`, a tag that fails the tag rule dropped. One line each;
+     * present only when something was repaired.
+     */
+    warnings: z.array(z.string()).optional(),
+    /**
      * `discover` only: every document the scan took responsibility for,
      * published or held back. Carries what a governance layer needs to record
      * the import without re-reading the vault itself.
@@ -741,7 +952,107 @@ const importOp: OperationDescriptor = {
       )
       .optional(),
   }),
-  errors: ["VALIDATION_FAILED"],
+  errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
+};
+
+
+// ─── context_skill / context_skill_install ───────────────────────────────────
+
+const skillOp: OperationDescriptor = {
+  name: "context_skill",
+  namespace: "core",
+  description:
+    "Render a `type: skill` node as a harness-ready skill file (Claude Code SKILL.md, a Cursor rule, and so on). The node's `skill.trigger` becomes the harness's matcher, and `{{server_alias}}` / `{{vault_id}}` / `{{node_path}}` placeholders in the node resolve to this caller's names. Returns the file content and where it belongs; it writes nothing.",
+  input: z.object({
+    id: z.string().describe("Node path of the skill, e.g. `nodes/skills/release-checklist`"),
+    harness: z
+      .enum(HARNESSES)
+      .optional()
+      .describe("Target agent harness. Default `claude-code`."),
+    server_alias: z
+      .string()
+      .optional()
+      .describe(
+        "What YOUR client calls this MCP server — the `mcp__<alias>__*` prefix baked into the rendered file. The prefix is client configuration, not a server fact, so pass your own. Defaults to the vault name.",
+      ),
+    scope: z
+      .enum(INSTALL_SCOPES)
+      .optional()
+      .describe("`user` (home directory, default) or `project` (repo root). Decides the path only."),
+  }),
+  output: z.object({
+    name: z.string().describe("Slugified skill / rule name"),
+    description: z.string().describe("The harness's local matcher text, from `skill.trigger`"),
+    content: z.string().describe("Complete file content, harness frontmatter included"),
+    relative_path: z.string().describe("Path relative to `base`"),
+    base: z.enum(["project_root", "home"]),
+    harness: z.enum(HARNESSES),
+    source_path: z.string(),
+    version: z.number().int().nullable(),
+    served_version: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Present only when the node is rejected: the approved version served in its place. The live file is NOT what you got.",
+      ),
+    notes: z.string().optional().describe("Only set when an approved version stood in for a rejected node"),
+  }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
+};
+
+const skillInstallOp: OperationDescriptor = {
+  name: "context_skill_install",
+  namespace: "core",
+  description:
+    "Build the file manifest that installs a vault skill into an agent harness. Defaults to `mode: \"loader\"` — a small file carrying the trigger and a fetch instruction back to the vault, so it CANNOT drift from the node. Use `mode: \"full\"` only when the agent must work offline; that copy will go stale silently. Returns files and paths; the caller writes them (`ctx skill install --write`, or your own file tools).",
+  input: z.object({
+    id: z.string().describe("Node path of the skill"),
+    harness: z.enum(HARNESSES).optional().describe("Target agent harness. Default `claude-code`."),
+    server_alias: z
+      .string()
+      .optional()
+      .describe("What YOUR client calls this MCP server. Defaults to the vault name."),
+    scope: z
+      .enum(INSTALL_SCOPES)
+      .optional()
+      .describe("`user` (home directory, default) or `project` (repo root)."),
+    mode: z
+      .enum(INSTALL_MODES)
+      .optional()
+      .describe(
+        "`loader` (default) fetches the procedure at runtime and never drifts. `full` embeds an offline snapshot that will.",
+      ),
+  }),
+  output: z.object({
+    files: z.array(
+      z.object({
+        relative_path: z.string(),
+        base: z.enum(["project_root", "home"]),
+        content: z.string(),
+      }),
+    ),
+    post_install: z.string().describe("What the user must do for the harness to pick it up"),
+    notes: z.string(),
+    served_version: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "Present only when the node is rejected: the approved version served in its place. The live file is NOT what you got.",
+      ),
+
+    skill: z.object({
+      name: z.string(),
+      source_path: z.string(),
+      version: z.number().int().nullable(),
+      harness: z.enum(HARNESSES),
+      scope: z.enum(INSTALL_SCOPES),
+      mode: z.enum(INSTALL_MODES),
+      server_alias: z.string(),
+    }),
+  }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
 };
 
 /** All `core` namespace operations, in catalog order. */
@@ -750,6 +1061,7 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   queryOp,
   resolveOp,
   listOp,
+  foldersOp,
   searchOp,
   createOp,
   updateOp,
@@ -762,4 +1074,6 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   packsOp,
   nestsOp,
   importOp,
+  skillOp,
+  skillInstallOp,
 ];

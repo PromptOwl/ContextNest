@@ -34,9 +34,17 @@ describe("plugin manifest", () => {
     expect(typeof manifest.description).toBe("string");
   });
 
-  it("declares the four userConfig options with valid types", () => {
+  it("declares the userConfig options with valid types", () => {
     const keys = Object.keys(manifest.userConfig);
-    expect(keys.sort()).toEqual(["auto_capture", "ctx_command", "retrieval_mode", "vault"]);
+    // auto_capture is deprecated but retained: dropping it would silently reset
+    // the enable-time answer of every existing install.
+    expect(keys.sort()).toEqual([
+      "auto_capture",
+      "capture_mode",
+      "ctx_command",
+      "retrieval_mode",
+      "vault",
+    ]);
     for (const k of keys) {
       expect(["string", "number", "boolean", "directory", "file"]).toContain(manifest.userConfig[k].type);
       expect(manifest.userConfig[k].title).toBeTruthy();
@@ -50,7 +58,12 @@ describe("hooks.json", () => {
 
   it("registers only known events", () => {
     for (const event of Object.keys(hooks)) expect(KNOWN_EVENTS.has(event)).toBe(true);
-    expect(Object.keys(hooks).sort()).toEqual(["SessionStart", "Stop", "UserPromptSubmit"]);
+    expect(Object.keys(hooks).sort()).toEqual([
+      "PostToolUse",
+      "SessionStart",
+      "Stop",
+      "UserPromptSubmit",
+    ]);
   });
 
   it("every command references an existing core script via CLAUDE_PLUGIN_ROOT", () => {
@@ -86,6 +99,7 @@ describe("agent + skill frontmatter", () => {
   const files = [
     "agents/contextnest-retriever.md",
     "agents/contextnest-capture.md",
+    "agents/contextnest-curator.md",
     "skills/recall/SKILL.md",
   ];
 
@@ -110,14 +124,63 @@ describe("config command (CU-wdqcpzw825: settings must be changeable after enabl
     expect(existsSync(commandPath)).toBe(true);
   });
 
-  it("command has description frontmatter and covers all four settings", () => {
+  it("command has description frontmatter and covers every setting", () => {
     const text = read(commandPath);
     const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
     expect(fm, "frontmatter present").toBeTruthy();
     expect(fm![1]).toMatch(/\bdescription:\s*\S+/);
-    for (const key of ["retrieval_mode", "auto_capture", "vault", "ctx_command"]) {
+    for (const key of ["retrieval_mode", "capture_mode", "auto_capture", "vault", "ctx_command"]) {
       expect(text).toContain(key);
     }
+  });
+});
+
+describe("sweep-check hook registration", () => {
+  const hooks = readJson(join(plugin, "hooks", "hooks.json")).hooks;
+
+  it("PostToolUse is scoped to Bash and carries an explicit timeout", () => {
+    const groups = hooks.PostToolUse;
+    expect(groups).toHaveLength(1);
+    // Matcher keeps the hook off Read/Edit/etc — it only ever inspects shell
+    // commands, so firing anywhere else is pure overhead.
+    expect(groups[0].matcher).toBe("Bash");
+    const h = groups[0].hooks[0];
+    expect(h.command).toContain("core/sweep-check.js");
+    // It shells out to ctx several times; an explicit ceiling keeps a slow
+    // vault from stalling the loop on every Bash call.
+    expect(typeof h.timeout).toBe("number");
+    expect(h.timeout).toBeGreaterThan(0);
+  });
+});
+
+describe("dispatched agents run in the background", () => {
+  // The Stop hook parks work instead of blocking the turn, and the next prompt
+  // dispatches it. If these lose `background: true`, the dispatch runs inline
+  // and delays the user's next request instead of overlapping it.
+  it.each(["agents/contextnest-capture.md", "agents/contextnest-curator.md"])(
+    "%s declares background: true",
+    (rel) => {
+      const fm = read(join(plugin, rel)).match(/^---\r?\n([\s\S]*?)\r?\n---/)![1];
+      expect(fm).toMatch(/^background:\s*true\s*$/m);
+    },
+  );
+
+  it("the read-only retriever is NOT backgrounded — its answer is needed inline", () => {
+    const fm = read(join(plugin, "agents/contextnest-retriever.md")).match(
+      /^---\r?\n([\s\S]*?)\r?\n---/,
+    )![1];
+    expect(fm).not.toMatch(/background:/);
+  });
+});
+
+describe("capture command", () => {
+  it("ships a /contextnest:capture escape hatch with description frontmatter", () => {
+    const commandPath = join(plugin, "commands", "capture.md");
+    expect(existsSync(commandPath)).toBe(true);
+    const text = read(commandPath);
+    expect(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1]).toMatch(/\bdescription:\s*\S+/);
+    // The command exists precisely because capture_mode can be `off`.
+    expect(text).toContain("contextnest-capture");
   });
 });
 
@@ -131,7 +194,15 @@ describe("vendored core sync", () => {
   });
 
   it("vendored core files are byte-identical to the shared source", () => {
-    for (const name of ["lib.js", "retrieve.js", "session-start.js", "capture-gate.js"]) {
+    for (const name of [
+      "lib.js",
+      "retrieve.js",
+      "session-start.js",
+      "capture-gate.js",
+      "signals.js",
+      "ledger.js",
+      "sweep-check.js",
+    ]) {
       expect(read(join(plugin, "core", name))).toBe(
         read(join(repo, "plugins", "shared", "core", name)),
       );

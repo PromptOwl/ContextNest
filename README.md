@@ -226,6 +226,10 @@ folders:
     description: "Project documents"
   sources:
     description: "Live data sources"
+skills:
+  # The type: skill node that teaches an agent how to use this vault.
+  # A pointer, not content — the node stays the source of truth.
+  bootstrap: "nodes/skills/onboarding"
 servers:
   jira:
     url: "https://mcp.atlassian.com/sse"
@@ -352,6 +356,42 @@ skill:
 
 Skills are queryable like any other node: `ctx query "type:skill + #engineering"`
 
+#### Installing a skill into an agent harness
+
+A skill node is not just documentation — it can be **installed** into Claude Code,
+Cursor, or Codex, where the harness matches on it and runs it:
+
+```bash
+ctx skill nodes/review-pr                          # render it and look at it
+ctx skill install nodes/review-pr --write          # install for Claude Code, user scope
+ctx skill install nodes/review-pr --harness cursor --scope project --write
+```
+
+`skill.trigger` becomes the harness's local matcher (Claude Code's `description`
+frontmatter, a Cursor rule description). It is the one field that must exist
+locally, because matching happens before anything can be fetched — which is why a
+skill node without a trigger is refused rather than given a guessed one.
+
+The default install writes a **loader**: a small file carrying the trigger and an
+instruction to fetch the procedure from the vault at runtime. A loader cannot go
+stale, because it never holds a copy of the procedure. `--mode full` embeds an
+offline snapshot instead — useful when the agent cannot reach the vault, and a
+deliberate trade: that copy *will* drift as the node changes, silently, while the
+agent keeps working confidently from superseded rules.
+
+Node bodies should write `{{server_alias}}`, `{{vault_id}}`, and `{{node_path}}`
+rather than hardcoding a tool prefix: the same vault is `mcp__contextnest__*` on
+one machine and `mcp__team-ctx__*` on another, so the prefix is resolved per
+caller at render time.
+
+Point `skills.bootstrap` at the skill that teaches an agent to use *this* vault,
+and `context_init` will hand it to every agent that opens the vault:
+
+```yaml
+skills:
+  bootstrap: nodes/skills/onboarding
+```
+
 ### 7. Add context packs
 
 Packs are saved queries in `packs/` as YAML files:
@@ -378,7 +418,10 @@ agent_instructions: |
 
 ### File safety
 
-No `ctx` command writes to your working directory without saying so.
+No `ctx` command writes to your working directory without saying so. And no
+command reads or indexes a directory that is not a vault: when nothing resolves
+a vault (no `--vault`, no local vault, no registry default), `ctx` refuses with
+`Error [NO_VAULT]` instead of treating your current folder as one.
 
 | Flag | Effect |
 |---|---|
@@ -392,8 +435,8 @@ stdout stay clean. Interactive runs ask before writing; destructive commands
 default to "no".
 
 **For scripts:** `ctx delete`, `ctx checkpoint rebuild`, `ctx drift approve`,
-`ctx vault remove` and `ctx push` refuse to run without `--yes` (or `--force`)
-when there is no TTY. Additive commands proceed as before — a non-interactive
+`ctx vault remove`, `ctx vault prune` and `ctx push` refuse to run without
+`--yes` (or `--force`) when there is no TTY. Additive commands proceed as before — a non-interactive
 caller is never blocked waiting on stdin.
 
 ### Choosing a vault
@@ -417,10 +460,20 @@ ctx vault add personal /path/to/personal-vault --description "Second brain"
 
 # Use a registered vault from any directory
 ctx list --vault work
-ctx vault list          # show all registered vaults (* = default)
+ctx vault list          # show all registered vaults (* = default, [missing] = gone from disk)
 ctx vault default work  # change the default
 ctx vault which         # show which vault resolves right now, and why
+ctx vault prune         # drop aliases whose vault no longer exists (--dry-run to preview)
+ctx doctor              # versions, registry health, current vault, plugin version
 ```
+
+`ctx init` registers the new vault automatically — except when the vault lives
+under the OS temp dir (`/tmp`, `%TEMP%`), where scratch vaults created by agents
+and test runs would otherwise pile up as `[missing]` aliases. It prints
+`Not registering: vault is under the temp dir (pass --register to force)`;
+`--register`, or an explicit `--vault <alias>` / `--set-default`, registers it
+anyway. When the default alias itself has gone missing, `ctx vault list` says so
+and points at `ctx vault prune`.
 
 A vault is resolved with this precedence (highest first):
 
@@ -446,14 +499,16 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault add <alias> [path]` | Register a vault (path defaults to the current vault) |
 | `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
 | `ctx vault remove <alias>` | Unregister an alias |
+| `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
-| `ctx vault which` | Show the resolved vault and the reason |
+| `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
 
 | Command | Description |
 |---|---|
-| `ctx init` | Initialize a new vault (supports `--starter` recipes) |
+| `ctx init` | Initialize a new vault (supports `--starter` recipes; `--register` to register one created under the OS temp dir) |
 | `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
 | `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
@@ -461,6 +516,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx delete <path>` | Delete a document and its version history |
 | `ctx read <path>` | Read and display a document in the terminal |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
+| `ctx skill <path>` | Render a `type: skill` node for an agent harness and print it |
+| `ctx skill install <path>` | Install a vault skill into Claude Code / Cursor / Codex (`--write` to actually write) |
 | `ctx validate [path]` | Validate documents against the spec |
 | `ctx publish <path>` | Publish a document (creates version + checkpoint) |
 | `ctx publish --all` | Publish every unpublished document in one batch — one checkpoint, one index pass |
@@ -517,7 +574,7 @@ full stack trace back.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 35 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 38 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -584,8 +641,11 @@ cloud:
 |---|---|
 | `context_init` | Open a vault: instructions, configuration, path, and what it holds (`include_nodes` to also list nodes) |
 | `context_nests` | List every nest in the central registry |
+| `context_skill` | Render a `type: skill` node as a harness-ready skill file |
+| `context_skill_install` | Build the file manifest that installs a vault skill locally |
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
-| `context_list` | List nodes with type / status / tag filters (`include_retired`, `full`, `limit`) |
+| `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
+| `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |
 | `context_search` | Full-text search with graph traversal |
 | `context_query` | Selector query with graph traversal (`include_drafts`) |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |

@@ -1,5 +1,182 @@
 # @promptowl/contextnest-engine
 
+## 2.4.0
+
+### Minor Changes
+
+- a061c4a: Refuse unknown write parameters instead of silently dropping them, and accept `body`/`content` as aliases.
+
+  A caller that misnamed a parameter — `content` where `update_document` takes `body` — got a success response for a write that never landed: zod's default object mode stripped the key, the handler saw no body, the version bumped, `updated_at` moved, and a checkpoint and chain hash were written over unchanged text. The only way to notice was to read the document back and compare.
+
+  - `EngineApi.run()` now rejects any key an operation's input schema does not declare (`VALIDATION_FAILED`, naming the unknown keys and listing the accepted ones).
+  - The MCP server registers every tool through `registerTool` with a strict ZodObject, so the schema it publishes (`additionalProperties: false`) is the one it enforces. Previously it advertised strictness and stripped instead.
+  - `context_create` / `context_update` accept `body` as an alias for `content`, and `create_document` / `update_document` accept `content` as an alias for `body`. Two values that disagree are refused rather than resolved by preference.
+  - `context_create`, `context_update`, `create_document` and `update_document` take a `description`. It is one of the three fields the metadata index matches on, so a node without one is markedly harder to retrieve; update clears it with an empty string, matching `metadata`'s null convention.
+  - `list_documents` gains the `path` filter its canonical twin `context_list` has as `folder`, matching on segment boundaries.
+
+  Also: make `type: source` nodes writable at all.
+
+  `create_document` built a `skill:` block for skill nodes but had no `source` equivalent, and skipped `validateDocument` entirely. A `type: source` node was therefore written and published with no `source:` block — which §13 rule 9 requires, but only enforces on the way out. Every subsequent update then failed validation, with no parameter able to supply the missing field: the node was write-once, recoverable only by `delete_document`, which destroys its version history. `context_create` was better behaved (it validates, so it failed loudly) but source nodes were simply uncreatable there.
+
+  - New `applyTypedBlocks` settles `source` and `skill` against a node's post-write `type` BEFORE anything is written, shared by `context_create`, `context_update`, `create_document` and `update_document`. Entering `source`/`skill` requires that block (rules 9 / 18); leaving it drops the old one (rules 17 / 19).
+  - `context_create` and `create_document` take a `source` block; `create_document` now validates before the write, so an invalid create leaves nothing on disk.
+  - `context_update` and `update_document` take `type`, `source`, `trigger`, `tools_required` and `output_format`, so a node broken by this bug can be repaired without losing its history, and a node can be re-typed with its block swapped in the same call.
+  - `sourceMetaSchema` is exported, so the write operations accept a source block against the same shape frontmatter validation enforces.
+
+- ca294a1: Serialize concurrent vault writes behind a per-vault lock.
+
+  Every mutating operation read-modify-writes the nest-level
+  `.versions/context_history.yaml` hash chain. With nothing serializing that,
+  concurrent writers corrupted it _silently_ — measured with 6 parallel
+  `ctx update` processes on one vault: all bodies landed, 3 checkpoint seals were
+  lost, and `ctx verify` then reported `cross_chain_mismatch`. Reachable with two
+  terminals today; guaranteed once parallel agents write the same vault.
+
+  - New `vault-lock.ts`, exported as `withVaultLock`, `VaultLockTimeoutError` and
+    `LOCK_DIRNAME`. The mechanism is `mkdir` of `<root>/.versions/.lock` — atomic
+    on POSIX and Windows alike, no open file handle. Writers acquire with jittered
+    bounded backoff; reads never lock.
+  - A holder heartbeats while its critical section runs, so a live writer is never
+    judged stale however long the write takes. Only a holder that stops
+    heartbeating (a crashed process) goes stale and is stolen, and each
+    acquisition writes an owner token so a stolen holder cannot delete the next
+    writer's live lock on its way out.
+  - Every mutating core executor and the four approval-path entry points
+    (`approveSuggestion`, `rejectSuggestion`, `rollbackDocument`,
+    `czarDirectEdit`) run inside the lock.
+  - New `VAULT_LOCK_TIMEOUT` error code on the affected core operations, returned
+    when the lock cannot be acquired within the bound. **Callers that map engine
+    error codes need an entry for it.**
+
+  Out of scope, so the boundary stays explicit: several server _instances_ over
+  shared object storage (a filesystem lock cannot span that; the upgrade path is
+  optimistic concurrency on the chain's parent `chain_hash`), and a vault inside a
+  Dropbox/iCloud-synced folder edited from two machines.
+
+- ca294a1: Vault-hosted skills: install a `type: skill` node into an agent harness
+
+  A skill node can now be rendered as a Claude Code `SKILL.md`, a Cursor rule, a
+  Codex skill, or raw markdown, and installed into the caller's project or home
+  directory. `skill.trigger` becomes the harness's local matcher — the one field
+  that must exist locally, since matching happens before anything can be fetched,
+  so a skill node without a trigger is refused rather than given a guessed one.
+
+  The default install writes a **loader**: the trigger plus an instruction to fetch
+  the procedure from the vault at runtime. A loader cannot go stale because it
+  never holds a copy. `mode: "full"` embeds an offline snapshot instead, and says
+  out loud that the copy will drift.
+
+  - New engine module `skills.ts` (`renderSkill`, `buildInstallManifest`).
+  - New catalog operations `context_skill` and `context_skill_install`, which the
+    MCP server registers automatically — 38 tools now.
+  - New CLI commands `ctx skill <path>` and `ctx skill install <path> [--write]`.
+    Writes land outside the vault, so they go through the same never-clobber guard
+    and dry-run accounting as `ctx read --out`.
+  - New `skills.bootstrap` key in `.context/config.yaml`, naming the skill that
+    teaches an agent to use this vault. `context_init` returns it as
+    `config.skill_bootstrap`.
+  - Node bodies can write `{{server_alias}}` / `{{vault_id}}` / `{{node_path}}`
+    instead of hardcoding an `mcp__…__` prefix that is only correct on one client.
+
+### Patch Changes
+
+- c567793: Read the `structuredContent` half of a remote nest's reply.
+
+  A nest that also serves chat clients answers with human-readable prose in
+  `content` and the catalog payload alongside it in `structuredContent`. The
+  remote client only read `content`, so every operation against such a nest
+  failed as "returned a non-JSON payload" — and on the error path a typed
+  `DOCUMENT_NOT_FOUND` was downgraded to `INTERNAL`. Both paths now read the
+  structured half when it is there, and fall back to parsing the text when it
+  is not.
+
+  Follow-on fixes for what that contract implies:
+
+  - `context_versions` no longer requires `keyframe_interval`, `keyframe`,
+    `content_hash` or `chain_hash` — a nest that stores content whole and
+    enforces integrity server-side has no keyframe+diff model and omits them.
+    The equivalents it does report (per-version `status`, top-level
+    `approved_version`) are now part of the schema, and `ctx history` reads them
+    instead of labelling every approved version "draft".
+  - `ctx publish` against a nest that publishes through steward review falls
+    back to `context_submit_review` and reports the node as submitted rather
+    than published.
+  - `ctx verify` against a nest that exposes no `context_verify` refuses with a
+    clear message instead of failing on an unknown tool.
+
+- a061c4a: Refuse unknown keys inside nested write objects too, and let `context_import` carry typed blocks.
+
+  The unknown-key guard added alongside the strict MCP tool schemas reads an operation's OUTER shape only, so nested objects went on silently stripping — the same failure it was written to stop, one level down. A bulk import saying `body` instead of `content` published a node with the wrong text; a `source` block with a typo'd `server` was written incomplete and sealed into the chain.
+
+  - `importDoc` and `importFile` are strict. The `files[]` case was the sharper one: the executor writes `f.content ?? ""`, so a stripped key landed an EMPTY file and still counted itself in `written`.
+  - The `source` parameter of `context_create`, `context_update`, `create_document` and `update_document` is strict at each call site. `sourceMetaSchema` itself stays lenient by design — it also parses documents already on disk, where an unrecognized key is a file to keep reading rather than a caller to refuse. Making the base strict would start failing existing vault files.
+  - `context_import` accepts `description` and the typed-block fields (`source`, `trigger`, `tools_required`, `output_format`, `inputs`, `guard_rails`). `buildDraftNode` already forwarded them to `applyTypedBlocks`, but the schema dropped them first, so `type: source` and `type: skill` nodes could not be imported at all — import was the one write surface the source-node fix missed.
+  - `metadata` stays permissive; arbitrary keys are its purpose.
+
+  Also repairs two handlers mangled in the merge of the vault-lock and strict-schema branches: `create_document` and `update_document` had a block-bodied arrow around `lockedHandler(...)`, whose return value was therefore discarded — the tool resolved `undefined` and the write ran unawaited. Both are back to the concise form the other locked tools use.
+
+## 2.3.0
+
+### Minor Changes
+
+- eebbbbd: Folder-scoped discovery and folder listing.
+
+  `context_list` and `NestStorage.discoverDocuments` accept `folder` (a path relative to the vault root, i.e. the id prefix) and `recursive`.
+
+  New `context_folders` operation and `NestStorage.listFolders`: the vault's folders and their document counts, read from directory entries without opening a single document. Discovery's cost is parsing every markdown file it finds, so a caller that only needs the vault's shape — a navigable tree, a folder picker, per-folder counts — now pays none of it. Folders are read rather than inferred from the documents inside them, so a folder holding only subfolders still appears.
+
+  This narrows the crawl rather than the result. Previously the only way to browse one folder was to read and parse every document in the vault and filter afterwards, which costs the same as not filtering — painful on a large vault, and worse on a network-backed mount where each document is a round trip. With `recursive: false` a folder's subfolders are never opened either, so a lazily-expanded document tree pays only for the level it is showing.
+
+  The vault walk now also stops descending once no pattern can match any deeper, so existing callers with non-recursive patterns (e.g. `listSuggestionIds`) stop reading subtrees they were already discarding.
+
+- e247037: Stop making every write pay for the whole checkpoint chain, and stop letting a broken chain block the author.
+
+  Writes on a mature vault were timing out while reads stayed instant. The cause was the same file at both ends of every write. `.versions/context_history.yaml` gains one entry per published document per checkpoint and is never pruned, and each write both **read it whole** (`regenerateIndex` parsed and schema-validated the entire chain to stamp one field into `context.yaml`) and **wrote it whole** (sealing loaded the chain, pushed one checkpoint, and dumped it back with an fsync). Cost per write was O(chain size), so cumulative cost was quadratic — and on a network-backed mount the fsync re-uploaded the entire file each time. Read paths never touch it, which is why only writes degraded.
+
+  - `regenerateIndex` and the publish seal now take the chain's head through `readLatestCheckpoint()` — a small pointer file validated against the chain's size, a bounded tail read of the chain, then a full read only for a file too small to have a usable tail. None of the three grows with the chain.
+  - `context_query` did the same thing on the way in, loading the whole chain to stamp one number onto each trace it logs — so the hottest read path paid the cost too, ~3.3s per query on that same chain, now 6ms. It takes a non-throwing variant: a retrieval must not fail because the chain file hiccuped, and a trace recording checkpoint 0 is a far smaller harm than a query that errors. Write paths keep the throwing read, where a transient failure has to surface rather than be mistaken for "no chain".
+  - Sealing **appends** one checkpoint instead of rewriting the file. The bytes are identical either way: `yaml.dump({checkpoints: […]})` emits exactly `checkpoints:` followed by each item indented two spaces, which is what the append writes. Whole-file rewrites remain for the §7.3 rebuild.
+  - The pointer is a cache, never an authority. It is stamped with the chain file's size and mtime and rejected when either moves, so a rebuild, a restored backup or an append from another process invalidates it instead of mislinking. That is a staleness check, not a proof of identity — the chain's own hash linkage remains what `verify` checks.
+  - Reading the chain reports a state, not a nullable checkpoint: `absent`, `empty`, `head`, or `unreadable`, with any other I/O failure thrown. Only `unreadable` licenses the quarantine below. Collapsing those was a data-loss bug in its own right — a valid `checkpoints: []` would be renamed aside as corrupt, and on the network-backed mounts this change exists for, one flaky read would rename a healthy multi-megabyte chain aside and restart numbering at 1.
+
+  An unreadable integrity file no longer refuses the write, either. A torn `history.yaml` — a null-byte-padded interrupted write, a hand edit, a schema-invalid file — used to throw `CorruptHistoryError` out of every publish and every edit of that document, permanently, from every surface. The document was fine; only its ledger was unreadable, and there was no way for the author to get past it.
+
+  - `VersionManager.historyOrRepair()` moves an unreadable `history.yaml` aside as `history.corrupt-<ts>.yaml` and reports the document as having no history, so the current write restarts the chain from a fresh keyframe. The same policy now covers an unreadable `context_history.yaml`.
+  - Nothing is destroyed to do it. The quarantined bytes stay on disk, and numbering continues past every `v{N}` artifact already sealed there (`nextVersion` now consults the artifacts as well as the ledger), so no keyframe or diff is ever reused — `writeVersionArtifact`'s exclusive create remains the backstop.
+  - The break stays visible: the entry that begins the replacement chain carries a note saying so, `verify` still reports the gap, and the quarantined file names it.
+  - The pre-publish seed is skipped on that restart path. It exists to rescue a body with no artifact; after a quarantine every artifact is still on disk, and seeding would write `v{current}.md` at a number the old chain may already have sealed as a keyframe — throwing, and putting the author right back behind the corruption.
+
+  Behaviour change: publishing a document whose history is corrupt now succeeds by quarantining, where it previously failed with `CorruptHistoryError`. `storage.readHistory()` itself still throws — the resilience is in `VersionManager`, so the low-level reader stays honest for callers that need to know.
+
+## 2.2.0
+
+### Minor Changes
+
+- Tell remote timeouts and auth failures apart from an unreachable remote, and read the payload from the right field.
+
+  `connectRemoteNest()` collapsed three distinct failure modes into `RemoteUnreachableError`:
+
+  - `RemoteTimeoutError` (`REMOTE_TIMEOUT`) — a call that times out after a successful handshake was delivered and may have executed. Reporting it as "unreachable" told users nothing had happened when a node had in fact been created, and the retry then collided with it.
+  - `RemoteAuthError` (`REMOTE_AUTH_FAILED`) — HTTP 401/403 at connect or mid-call. The server answered on purpose, so the body already says why. This also keeps a dead credential off the CLI's exit-3 path, where a plugin hook would otherwise have stopped syncing silently.
+  - `REMOTE_HTTP_DEFAULT_TIMEOUT_MS` is 30s for HTTP; a scale-to-zero host cold-starts past the 10s stdio default with the write already landed.
+
+  Tool results are now read from `structuredContent` when present, on both the success and error paths. The catalog payload lives there (MCP 2025-06-18) and the text block is prose for chat clients that need not mirror it, so parsing text first failed on every op against a `contextnest-community` nest. A non-JSON payload is quoted in the error, which prose, an HTML error page and an empty response were previously indistinguishable in.
+
+  CLI: `remoteHistory` falls back to `entry.status === "published"`, which is how Community reports it — otherwise every version rendered as `draft`.
+
+- Remote nests: point `ctx` at a nest served over MCP and use it like a local vault.
+
+  The vault registry grows a top-level `remotes:` map — stdio or HTTP specs, env-ref-only auth, sharing one alias namespace with local `vaults:`. Older CLIs strip the unknown key and keep working. `resolveNest()` resolves an alias to either a local path or a remote spec at the documented precedence; `resolveVaultPath()` wraps it and fails with a clear local-only error when an alias points at a remote.
+
+  `--vault <remote-alias>` then routes read and write commands through an MCP client (`connectRemoteNest()`, SDK loaded lazily) instead of the local engine, with JSON output shape-identical to the local path. Local-only commands fail fast on a remote alias rather than pretending to work, and an unreachable remote exits 3 naming the alias.
+
+  The wire contract is the engine's canonical operation catalog, so the MCP server now binds every core op under its canonical `context_*` name with catalog-sourced schemas, keeps the legacy tool names as deprecated aliases, and returns catalog output shapes and structured `{code, message}` errors. That closes the drift between engine, CLI and MCP server on the remote path.
+
+  Capability-aware behaviour on top of it:
+
+  - `ctx publish` against a remote that has no `context_publish` routes through the remote's review flow instead of failing — Community publishes via steward review.
+  - `ctx verify` refuses to report a verification the remote cannot perform, rather than fabricating a pass.
+
 ## 2.1.0
 
 ### Minor Changes

@@ -41,6 +41,7 @@ const TARGETS = [
     prompts: [
       { file: "agents/contextnest-retriever.md", prompt: "retriever" },
       { file: "agents/contextnest-capture.md", prompt: "capture" },
+      { file: "agents/contextnest-curator.md", prompt: "curate" },
       { file: "skills/recall/SKILL.md", prompt: "recall" },
     ],
   },

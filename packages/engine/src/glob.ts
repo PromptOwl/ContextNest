@@ -45,10 +45,14 @@ function globToRegExp(pattern: string, dot: boolean): RegExp {
  * must survive a single permission-denied subdirectory (this is what
  * fast-glob's `suppressErrors` bought us).
  */
-async function walkFiles(root: string, base: string): Promise<string[]> {
+async function walkFiles(
+  root: string,
+  base: string,
+  maxDepth = Infinity,
+): Promise<string[]> {
   const files: string[] = [];
 
-  async function walk(dir: string, prefix: string): Promise<void> {
+  async function walk(dir: string, prefix: string, depth: number): Promise<void> {
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -60,15 +64,37 @@ async function walkFiles(root: string, base: string): Promise<string[]> {
       if (entry.isDirectory()) {
         // Never a knowledge node, and descending is pure cost.
         if (entry.name === "node_modules") continue;
-        await walk(join(dir, entry.name), rel);
+        // Files inside this directory sit at depth + 2; if no pattern can
+        // match that deep, reading it is pure cost too.
+        if (depth + 1 < maxDepth) await walk(join(dir, entry.name), rel, depth + 1);
       } else if (entry.isFile()) {
         files.push(rel);
       }
     }
   }
 
-  await walk(base ? join(root, base) : root, base);
+  const baseDepth = base ? base.split("/").length : 0;
+  await walk(base ? join(root, base) : root, base, baseDepth);
   return files;
+}
+
+/**
+ * How many path segments the deepest match can have, or Infinity when any
+ * pattern contains `**` and so spans arbitrarily many directories.
+ *
+ * A pattern without `**` matches a fixed number of segments, so the walk can
+ * stop descending instead of reading a subtree it must then throw away —
+ * which is what makes a single-folder listing cheap rather than merely
+ * narrow. Exported for tests: like sharedBase, the pruning is observable
+ * only in how much of the tree was read.
+ */
+export function maxMatchDepth(patterns: string[]): number {
+  let deepest = 0;
+  for (const pattern of patterns) {
+    if (pattern.includes("**")) return Infinity;
+    deepest = Math.max(deepest, pattern.split("/").length);
+  }
+  return deepest;
 }
 
 /**
@@ -122,9 +148,10 @@ export async function globFiles(
   // Ignores always see dotted paths, so an exclusion cannot be dodged by one.
   const exclude = ignore.map((p) => globToRegExp(p, true));
 
-  // Descend only into the subtree the patterns can match. Paths still come back
-  // relative to `cwd`, so patterns and ignores are unaffected by the narrowing.
-  const files = await walkFiles(cwd, sharedBase(list));
+  // Descend only into the subtree the patterns can match, and no deeper than
+  // they can reach. Paths still come back relative to `cwd`, so patterns and
+  // ignores are unaffected by the narrowing.
+  const files = await walkFiles(cwd, sharedBase(list), maxMatchDepth(list));
   return files.filter(
     (file) =>
       include.some((re) => re.test(file)) && !exclude.some((re) => re.test(file)),
