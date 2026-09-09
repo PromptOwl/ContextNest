@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addVault,
+  addRemote,
+  pruneVaults,
   removeVault,
   setDefaultVault,
   setVaultDescription,
@@ -13,7 +15,6 @@ import {
   getRegistryPath,
   resolveVaultPath,
   assertVaultRoot,
-  addRemote,
 } from "../registry.js";
 import { NestStorage } from "../storage.js";
 import { ConfigError, NoVaultError } from "../errors.js";
@@ -182,6 +183,56 @@ describe("vault registry", () => {
     setDefaultVault("b");
     expect(readRegistry().default).toBe("b");
     expect(() => setDefaultVault("nope")).toThrow(/No vault registered/);
+  });
+
+  describe("pruneVaults", () => {
+    it("removes local aliases whose path is gone, clears a pruned default, leaves remotes alone", () => {
+      const a = makeVault(join(tmp, "a"));
+      const b = makeVault(join(tmp, "b"));
+      addVault("a", a);
+      addVault("b", b, { setDefault: true });
+      addRemote("far", { transport: "http", url: "https://nest.example.com/mcp" });
+      rmSync(b, { recursive: true, force: true });
+
+      const result = pruneVaults();
+      expect(result.removed).toEqual([{ alias: "b", path: b, wasDefault: true }]);
+      expect(result.defaultCleared).toBe(true);
+
+      const reg = readRegistry();
+      expect(Object.keys(reg.vaults)).toEqual(["a"]);
+      expect(reg.default).toBeUndefined();
+      expect(reg.remotes?.far).toBeDefined();
+    });
+
+    it("keeps a default that still exists", () => {
+      const a = makeVault(join(tmp, "a"));
+      const b = makeVault(join(tmp, "b"));
+      addVault("a", a, { setDefault: true });
+      addVault("b", b);
+      rmSync(b, { recursive: true, force: true });
+
+      const result = pruneVaults();
+      expect(result.removed.map((r) => r.alias)).toEqual(["b"]);
+      expect(result.defaultCleared).toBe(false);
+      expect(readRegistry().default).toBe("a");
+    });
+
+    it("treats a directory that lost its .context/config.yaml as missing (same rule as `vault list`)", () => {
+      const a = makeVault(join(tmp, "a"));
+      addVault("a", a);
+      rmSync(join(a, ".context"), { recursive: true, force: true });
+      expect(listVaults()[0].exists).toBe(false);
+      expect(pruneVaults().removed.map((r) => r.alias)).toEqual(["a"]);
+    });
+
+    it("is a no-op that does not rewrite the file when nothing is missing", () => {
+      addVault("a", makeVault(join(tmp, "a")));
+      const before = readFileSync(getRegistryPath(), "utf-8");
+      const result = pruneVaults();
+      expect(result.removed).toEqual([]);
+      expect(result.defaultCleared).toBe(false);
+      expect(readFileSync(getRegistryPath(), "utf-8")).toBe(before);
+    });
   });
 
   describe("readRegistry rejects corrupt config", () => {

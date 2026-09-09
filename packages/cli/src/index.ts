@@ -6,8 +6,9 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -47,6 +48,7 @@ import {
   addVault,
   addRemote,
   removeVault,
+  pruneVaults,
   setDefaultVault,
   setVaultDescription,
   listVaults,
@@ -96,6 +98,7 @@ import type {
   VaultRegistry,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
+import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
@@ -157,6 +160,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["init", "Create a new vault here (try --starter for a ready-made template)"],
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
+      ["doctor", "Check versions, the vault registry and the current directory for problems"],
     ],
   },
   {
@@ -308,6 +312,7 @@ const REGISTRY_WRITE_COMMANDS = new Set([
   "vault describe",
   "vault remove",
   "vault default",
+  "vault prune",
 ]);
 
 /** Full space-separated path of a command, e.g. `drift approve`. */
@@ -708,6 +713,41 @@ function slugifyAlias(name: string): string {
   return slug || "vault";
 }
 
+/**
+ * True when `dir` resolves to the OS temp dir or somewhere below it. Both sides
+ * go through realpath: on macOS `os.tmpdir()` is a symlink (/var → /private/var)
+ * and on Windows it can be an 8.3 short name, so a plain prefix test would say
+ * "not under tmp" for a directory that is.
+ */
+function isUnderTempDir(dir: string): boolean {
+  // realpath needs the path to exist, and `ctx init` is routinely pointed at a
+  // directory it is about to create. Resolve the nearest existing ancestor and
+  // re-append the rest, so the symlink expansion still happens: a plain
+  // resolve() fallback yields /var/folders/... against a /private/var/folders/...
+  // base on macOS, and the check silently answers "not under tmp".
+  const real = (p: string): string => {
+    let cur = pathMod.resolve(p);
+    const tail: string[] = [];
+    for (;;) {
+      try {
+        return pathMod.join(fs.realpathSync.native(cur), ...tail.reverse());
+      } catch {
+        const parent = pathMod.dirname(cur);
+        if (parent === cur) return pathMod.resolve(p);
+        tail.push(pathMod.basename(cur));
+        cur = parent;
+      }
+    }
+  };
+  let base = real(tmpdir());
+  let target = real(dir);
+  if (process.platform === "win32") {
+    base = base.toLowerCase();
+    target = target.toLowerCase();
+  }
+  return target === base || target.startsWith(base + pathMod.sep);
+}
+
 // Pick a default alias for `root` that doesn't collide with a different vault
 // already in the registry. Re-running init in the same directory reuses the
 // existing alias (idempotent); a clash with a *different* path gets a numeric
@@ -899,9 +939,15 @@ program
   .description("Initialize a new Context Nest vault")
   .option("-l, --layout <mode>", "Layout mode: structured or obsidian", "structured")
   .option("-n, --name <name>", "Vault name", "My Context Nest")
-  .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
+  // Generated from the starter registry so the help text cannot drift from
+  // --list-starters (it did: `personal` was missing for a release).
+  .option("-s, --starter <recipe>", `Starter recipe: ${listStarters().map((s) => s.id).join(", ")}`)
   .option("--list-starters", "List available starter recipes")
   .option("--set-default", "Make the new vault the registry default")
+  .option(
+    "--register",
+    "Register the vault even when it lives under the OS temp dir (skipped there by default)",
+  )
   .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
   .action(async (opts) => {
     // List starters and exit
@@ -938,10 +984,19 @@ program
     let registerAlias = selectedVaultAlias;
     let registerDescription = opts.description as string | undefined;
     const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    // A vault under the OS temp dir is a scratchpad — agents and test runs
+    // create them by the dozen and the directory is gone within the hour.
+    // Auto-registering those filled real registries with `[missing]` aliases
+    // and, worse, a default pointing at a deleted directory. So under tmp the
+    // derived-alias registration is skipped unless the user asked for it:
+    // --register, or an explicit --vault <alias> / --set-default, which are
+    // registration requests in their own right.
+    const explicitRegister = Boolean(opts.register || selectedVaultAlias || opts.setDefault);
+    const skipRegister = !explicitRegister && isUnderTempDir(displayRoot);
     // One registry read for both the derived-alias collision check and the
     // ownership check below (addVault re-reads internally for its write).
     const registrySnapshot = readRegistry();
-    if (!registerAlias) {
+    if (!registerAlias && !skipRegister) {
       const defaultAlias = defaultAliasFor(displayRoot, registrySnapshot);
       if (canPrompt) {
         console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
@@ -962,6 +1017,12 @@ program
     // below) so an interruption mid-starter never leaves a registry alias
     // pointing at a half-populated vault.
     const registerVault = (): void => {
+      if (skipRegister) {
+        console.log(
+          chalk.dim("  Not registering: vault is under the temp dir (pass --register to force)"),
+        );
+        return;
+      }
       if (!registerAlias) return;
       const resolvedRoot = pathMod.resolve(displayRoot);
       // Own-property check: a `--vault __proto__` would otherwise read back
@@ -2822,6 +2883,19 @@ vaultCmd
       if (v.description) console.log(`     ${chalk.dim(v.description)}`);
       console.log(`     ${chalk.dim(v.path)}`);
     }
+    // A missing default is the one stale entry that changes behaviour for
+    // every command run without --vault (resolution silently falls through to
+    // cwd), so it gets its own line rather than just the [missing] marker.
+    // defaultVaultStatus() is the one rule; `ctx doctor` renders the same call.
+    const defaultAlias = readRegistry().default ?? null;
+    const status = defaultVaultStatus(vaults, defaultAlias);
+    if (status === "unregistered") {
+      console.log(
+        chalk.yellow(`\n  default vault "${defaultAlias}" is not registered — run ctx vault default <alias>`),
+      );
+    } else if (status === "missing_path") {
+      console.log(chalk.yellow("\n  default vault is missing — run ctx vault prune"));
+    }
     console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
   });
 
@@ -2964,6 +3038,49 @@ vaultCmd
   });
 
 vaultCmd
+  .command("prune")
+  .description("Unregister local aliases whose vault no longer exists on disk (remotes are left alone)")
+  .action(async () => {
+    try {
+      // Same rule as the [missing] marker in `vault list`: the directory is
+      // gone, or it is no longer a vault. Remotes never appear here.
+      const stale = listVaults().filter((v) => v.kind === "local" && !v.exists);
+      if (stale.length === 0) {
+        console.log(chalk.green("Nothing to prune — every registered vault exists on disk."));
+        return;
+      }
+      const noun = stale.length === 1 ? "alias" : "aliases";
+      console.log(chalk.bold(`\n${stale.length} missing ${noun} in ${registryPathForLog()}:\n`));
+      for (const v of stale) {
+        const why = fs.existsSync(v.path ?? "") ? "no .context/config.yaml" : "directory gone";
+        const marker = v.isDefault ? chalk.green(" (default)") : "";
+        console.log(`  ${chalk.cyan(v.alias)}${marker}  ${chalk.dim(`${v.path} — ${why}`)}`);
+      }
+      console.log("");
+      await confirmOrExit(
+        `Remove ${stale.length === 1 ? "this alias" : `these ${stale.length} aliases`} from ${registryPathForLog()}? ` +
+          "Only the registry entries go; nothing on disk is touched.",
+        { destructive: true },
+      );
+      const { removed, defaultCleared } = pruneVaults();
+      for (const r of removed) {
+        console.log(chalk.yellow(`Removed vault alias "${r.alias}" → ${r.path}`));
+      }
+      if (defaultCleared) {
+        console.log(
+          chalk.dim(
+            "  That was the default vault — no default is set now. " +
+              "Set one with `ctx vault default <alias>`.",
+          ),
+        );
+      }
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
   .command("default <alias>")
   .description("Set the default vault")
   .action(async (alias: string) => {
@@ -3042,6 +3159,79 @@ vaultCmd
       console.log(chalk.red((err as Error).message));
       process.exit(1);
     }
+  });
+
+// ─── ctx doctor ────────────────────────────────────────────────────────────────
+
+program
+  .command("doctor")
+  .description("Check installed versions, the vault registry and the current directory for problems")
+  .option("--json", "Output the report as JSON")
+  .action(async (opts) => {
+    // Diagnostics never fail: every probe degrades to null/"unknown" and the
+    // exit code stays 0, so a script can always read the report.
+    const report = await buildDoctorReport({
+      cliVersion: pkg.version,
+      cliPath: fileURLToPath(import.meta.url),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    const row = (label: string, value: string) => console.log(`  ${label.padEnd(14)} ${value}`);
+    const sub = (value: string) => console.log(`  ${"".padEnd(14)} ${value}`);
+    console.log(chalk.bold("\nctx doctor\n"));
+    row("CLI", `${report.cli.version}  ${chalk.dim(report.cli.path)}`);
+    row("Engine", report.engine.version);
+    if (report.latest === null) {
+      row("Latest npm", chalk.dim("unknown (offline, or npm unavailable)"));
+    } else if (report.update_available) {
+      row(
+        "Latest npm",
+        `${report.latest}  ${chalk.yellow("update available:")} npm i -g ${chalk.cyan("@promptowl/contextnest-cli")}`,
+      );
+    } else {
+      row("Latest npm", `${report.latest}  ${chalk.green("up to date")}`);
+    }
+    const reg = report.registry;
+    row("Registry", reg.path);
+    if (reg.error) {
+      sub(chalk.red(`unreadable: ${reg.error}`));
+    } else {
+      const counts = `${reg.vaults} local, ${reg.remotes} remote`;
+      if (reg.missing > 0) {
+        sub(
+          `${counts}, ${chalk.red(`${reg.missing} missing`)} (${reg.missing_aliases.join(", ")}) — run ${chalk.cyan("ctx vault prune")}`,
+        );
+      } else {
+        sub(`${counts}, ${chalk.green("none missing")}`);
+      }
+      if (reg.default === null) {
+        sub(chalk.dim("default: (none)"));
+      } else if (reg.default_missing) {
+        // prune only drops aliases that are in the registry, so a default
+        // naming no entry at all needs re-pointing instead.
+        const fix = reg.missing_aliases.includes(reg.default)
+          ? `run ${chalk.cyan("ctx vault prune")}`
+          : `not registered — run ${chalk.cyan("ctx vault default <alias>")}`;
+        sub(`default: ${reg.default} ${chalk.red("[missing]")} — ${fix}`);
+      } else {
+        sub(`default: ${reg.default}`);
+      }
+    }
+    if (report.cwd.in_vault) {
+      const alias = report.cwd.alias ? ` (alias: ${report.cwd.alias})` : chalk.dim(" (not registered)");
+      row("Current dir", `inside vault ${report.cwd.vault_path}${alias}`);
+    } else {
+      row("Current dir", chalk.dim("not inside a vault"));
+    }
+    row(
+      "Claude plugin",
+      report.plugin.version
+        ? `${report.plugin.version}  ${chalk.dim(report.plugin.path ?? "")}`
+        : chalk.dim("not installed (no contextnest entry in installed_plugins.json)"),
+    );
+    console.log("");
   });
 
 // Parse and run

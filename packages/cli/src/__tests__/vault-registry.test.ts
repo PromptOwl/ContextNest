@@ -73,8 +73,10 @@ describe("ctx vault — central registry", () => {
   it("vault add / list / remove round-trip", () => {
     const a = join(tmp, "a");
     mkdirSync(a, { recursive: true });
-    // init auto-registers the vault under a directory-derived alias ("a").
-    run(["init", "--name", "Standalone"], a);
+    // init registers the vault under a directory-derived alias ("a"). The
+    // sandbox lives under the OS temp dir, where init no longer auto-registers,
+    // so ask for it explicitly.
+    run(["init", "--name", "Standalone", "--register"], a);
     expect(run(["vault", "list"], tmp)).toContain("a");
 
     run(["vault", "add", "work", a, "--description", "Work vault"], tmp);

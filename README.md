@@ -435,8 +435,8 @@ stdout stay clean. Interactive runs ask before writing; destructive commands
 default to "no".
 
 **For scripts:** `ctx delete`, `ctx checkpoint rebuild`, `ctx drift approve`,
-`ctx vault remove` and `ctx push` refuse to run without `--yes` (or `--force`)
-when there is no TTY. Additive commands proceed as before — a non-interactive
+`ctx vault remove`, `ctx vault prune` and `ctx push` refuse to run without
+`--yes` (or `--force`) when there is no TTY. Additive commands proceed as before — a non-interactive
 caller is never blocked waiting on stdin.
 
 ### Choosing a vault
@@ -460,10 +460,20 @@ ctx vault add personal /path/to/personal-vault --description "Second brain"
 
 # Use a registered vault from any directory
 ctx list --vault work
-ctx vault list          # show all registered vaults (* = default)
+ctx vault list          # show all registered vaults (* = default, [missing] = gone from disk)
 ctx vault default work  # change the default
 ctx vault which         # show which vault resolves right now, and why
+ctx vault prune         # drop aliases whose vault no longer exists (--dry-run to preview)
+ctx doctor              # versions, registry health, current vault, plugin version
 ```
+
+`ctx init` registers the new vault automatically — except when the vault lives
+under the OS temp dir (`/tmp`, `%TEMP%`), where scratch vaults created by agents
+and test runs would otherwise pile up as `[missing]` aliases. It prints
+`Not registering: vault is under the temp dir (pass --register to force)`;
+`--register`, or an explicit `--vault <alias>` / `--set-default`, registers it
+anyway. When the default alias itself has gone missing, `ctx vault list` says so
+and points at `ctx vault prune`.
 
 A vault is resolved with this precedence (highest first):
 
@@ -489,14 +499,16 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault add <alias> [path]` | Register a vault (path defaults to the current vault) |
 | `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
 | `ctx vault remove <alias>` | Unregister an alias |
+| `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
 
 | Command | Description |
 |---|---|
-| `ctx init` | Initialize a new vault (supports `--starter` recipes) |
+| `ctx init` | Initialize a new vault (supports `--starter` recipes; `--register` to register one created under the OS temp dir) |
 | `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
 | `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
