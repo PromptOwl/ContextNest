@@ -22,6 +22,7 @@ import {
   listVaults,
   readRegistry,
 } from "@promptowl/contextnest-engine";
+import type { VaultListEntry } from "@promptowl/contextnest-engine";
 
 export const CLI_PACKAGE_NAME = "@promptowl/contextnest-cli";
 /** How long `npm view` gets before the doctor gives up and reports `null`. */
@@ -162,7 +163,7 @@ export function fetchLatestVersion(
  * the release it leads to — otherwise someone on `2.5.0-beta.1` is told they
  * are up to date with a published `2.5.0`. null when unparsable.
  *
- * ponytail: two prereleases of the same x.y.z compare equal (no identifier
+ * Note: two prereleases of the same x.y.z compare equal (no identifier
  * ordering); reach for a real semver parser if that ever needs to be exact.
  */
 export function compareVersions(a: string, b: string): number | null {
@@ -227,6 +228,28 @@ function realpathOr(p: string): string {
   }
 }
 
+/**
+ * How the registry's default alias stands, judged against an already-loaded
+ * `listVaults()` view. `ctx vault list` and `ctx doctor` both render this, and
+ * they have to agree — the drift between "what the registry says" and "what is
+ * on disk" is the whole reason this module exists.
+ *
+ * The two failure modes are deliberately distinct because they need different
+ * fixes: `vault prune` only removes aliases that are in the registry, so a
+ * default naming no entry at all has to be re-pointed instead.
+ */
+export type DefaultVaultStatus = "none" | "ok" | "unregistered" | "missing_path";
+
+export function defaultVaultStatus(
+  entries: VaultListEntry[],
+  defaultAlias: string | null,
+): DefaultVaultStatus {
+  if (!defaultAlias) return "none";
+  const entry = entries.find((v) => v.alias === defaultAlias);
+  if (!entry) return "unregistered";
+  return entry.kind === "local" && !entry.exists ? "missing_path" : "ok";
+}
+
 /** Registry health, from the same `listVaults()` view `ctx vault list` renders. */
 export function inspectRegistry(): DoctorReport["registry"] {
   const path = getRegistryPath();
@@ -236,9 +259,8 @@ export function inspectRegistry(): DoctorReport["registry"] {
     const locals = entries.filter((v) => v.kind === "local");
     const missing = locals.filter((v) => !v.exists).map((v) => v.alias);
     const def = reg.default ?? null;
-    const defaultEntry = def ? entries.find((v) => v.alias === def) : undefined;
-    const defaultMissing =
-      def !== null && (!defaultEntry || (defaultEntry.kind === "local" && !defaultEntry.exists));
+    const status = defaultVaultStatus(entries, def);
+    const defaultMissing = status === "unregistered" || status === "missing_path";
     return {
       path,
       vaults: locals.length,

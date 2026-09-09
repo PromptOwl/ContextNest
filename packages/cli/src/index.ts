@@ -98,7 +98,7 @@ import type {
   VaultRegistry,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
-import { buildDoctorReport } from "./doctor.js";
+import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
@@ -2886,16 +2886,14 @@ vaultCmd
     // A missing default is the one stale entry that changes behaviour for
     // every command run without --vault (resolution silently falls through to
     // cwd), so it gets its own line rather than just the [missing] marker.
-    // Same rule as `ctx doctor`'s default_missing — the two must agree — and
-    // the two ways it breaks need different fixes: prune only removes entries
-    // that exist, so a default naming no entry at all has to be re-pointed.
+    // defaultVaultStatus() is the one rule; `ctx doctor` renders the same call.
     const defaultAlias = readRegistry().default ?? null;
-    const defaultEntry = defaultAlias ? vaults.find((v) => v.alias === defaultAlias) : undefined;
-    if (defaultAlias && !defaultEntry) {
+    const status = defaultVaultStatus(vaults, defaultAlias);
+    if (status === "unregistered") {
       console.log(
         chalk.yellow(`\n  default vault "${defaultAlias}" is not registered — run ctx vault default <alias>`),
       );
-    } else if (defaultEntry && defaultEntry.kind === "local" && !defaultEntry.exists) {
+    } else if (status === "missing_path") {
       console.log(chalk.yellow("\n  default vault is missing — run ctx vault prune"));
     }
     console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);

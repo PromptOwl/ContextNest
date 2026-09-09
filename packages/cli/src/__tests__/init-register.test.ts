@@ -137,6 +137,17 @@ describe("ctx init — registration under the OS temp dir", () => {
     expect(registryText()).toContain("explicit:");
   });
 
+  it("--set-default is a registration request too", () => {
+    const dir = join(tmp, "scratch");
+    mkdirSync(dir, { recursive: true });
+
+    const out = run(["init", "--name", "Scratch", "--set-default"], dir);
+
+    expect(out).not.toContain("Not registering");
+    expect(registryText()).toContain("scratch");
+    expect(registeredPaths()).toContain(realpath(dir));
+  });
+
   it("outside the temp dir, init still registers (regression)", (ctx) => {
     if (isUnderTmp(NON_TMP_ROOT)) {
       // The checkout itself lives under the temp dir; there is no non-tmp
