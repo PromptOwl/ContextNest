@@ -1,5 +1,84 @@
 # @promptowl/contextnest-cli
 
+## 2.5.0
+
+### Minor Changes
+
+- 2b9ae05: Registry hygiene and `ctx doctor`.
+
+  A real registry was found with its default pointing at a deleted `/tmp` scratchpad and four of nine aliases `[missing]`: `ctx init` auto-registered every vault it created, including the throwaway ones agents and test runs make under the OS temp dir, and nothing could clean them up short of editing `config.yaml` by hand. Separately, the installed CLI sat two minors behind npm and the Claude Code plugin one behind its release for months, unnoticed, and `ctx init --help` listed five starters while `--list-starters` had six.
+
+  - `ctx vault prune [--dry-run] [-y]` removes local aliases whose vault is no longer on disk (directory gone, or `.context/config.yaml` gone — the same rule `vault list` marks `[missing]`). Remotes are never touched. If the default was among them it is cleared and the command says so. Destructive: refuses without `--yes` when there is no TTY, and `--dry-run` previews against a throwaway copy of the registry. Engine: new `pruneVaults()`.
+  - `ctx init` no longer registers a vault whose root is under `os.tmpdir()` (realpath on both sides, resolving the nearest existing ancestor so a directory init is about to create is judged correctly). It prints `Not registering: vault is under the temp dir (pass --register to force)`; `--register`, or an explicit `--vault <alias>` / `--set-default`, registers anyway. Outside the temp dir nothing changes.
+  - `ctx vault list` prints `default vault is missing — run ctx vault prune` when the default alias points at a missing vault, and `default vault "<alias>" is not registered — run ctx vault default <alias>` when it names no entry at all (prune cannot fix that one). `ctx doctor` renders the same two remediations, and both surfaces now share the rule.
+  - `ctx init --help` generates the `--starter` list from the starter registry, so it cannot drift from `--list-starters` again.
+  - `ctx doctor [--json]` reports the CLI version, the bundled engine version (new `ENGINE_VERSION` export, baked in at build time), the latest published CLI version from `npm view` (3s timeout; offline or `CONTEXTNEST_DOCTOR_OFFLINE=1` → `null`, never an error), registry health (path, counts, missing aliases, whether the default is missing), whether the current directory is inside a vault and under which alias, and the installed Claude Code plugin version from `installed_plugins.json` (honours `CLAUDE_CONFIG_DIR`). Always exits 0. A prerelease sorts before the release it leads to, so `2.5.0-beta.1` is not reported as up to date with a published `2.5.0`.
+
+- f88f102: Selectors accept a bare node id, and one grammar line is published everywhere.
+
+  `ctx query "nodes/gtm/foo"` and `ctx resolve "nodes/gtm/foo"` now select that one node: a token starting with `nodes/` or `sources/` lexes as the same URI atom as `contextnest://nodes/gtm/foo`, composes with the rest of the grammar (`nodes/gtm/foo + #strategy`, `nodes/a | nodes/b`, `nodes/a - #old`), and terminates on the same delimiters the scheme form does. `sources/<id>` does the same for a source node. A bare word without that prefix still fails with `INVALID_SELECTOR`, but the message now suggests the fix: `Unexpected token "gtm/foo" at position 0 — did you mean "nodes/gtm/foo" (a node id) or "#gtm/foo" (a tag)?`. An unknown `word:` filter lists the valid ones (`type, status, tag, pack, transport, server`). The quoted spelling of a bad token (`"gtm/foo"`) gets the same hint instead of an opaque `INVALID_URI` from a layer down.
+
+  The engine exports a single `SELECTOR_GRAMMAR` constant and every surface that teaches the grammar renders it verbatim, replacing four copies that disagreed with the lexer: `ctx query --help` and `ctx resolve --help` (previously no grammar at all), the `ctx init` banner (advertised `path:` and `&`, which throw, and called `+` "union"), the CLI README Selectors section (labelled `#api + #v2` as Union), the generated CLAUDE.md / agent-config block (gains a `nodes/<id>` example), and the `context_query` and `context_resolve` tool descriptions (`context_query` claimed `[[Title]]` and `scope:`, which the lexer does not accept; `context_resolve` taught no grammar at all). `CONTEXT_NEST_SPEC.md` §2.1 lists the new atom, so the normative source agrees too. Structural tests hold each surface to the constant, and the line is ASCII so it survives a legacy Windows console. Real `path:` / `folder:` filters remain out of scope.
+
+### Patch Changes
+
+- df17b1f: Cap the tag list in generated agent configs, and make folder import produce nodes that validate.
+
+  The `## Vault Overview` block written into CLAUDE.md (and the other agent config files) listed every tag in the vault — around 700 on a real vault, malformed ones included — and became the bulk of the agent's system prompt. It now lists the 40 most-used tags (ties alphabetical) followed by `… and N more (run ctx list --json for all)`, and leaves out any tag that fails the spec's tag rule (§13 rule 5), since such a tag cannot be queried anyway.
+
+  `context_import` used to land whatever a notes tool exported: files named `Untitled 1.md` or `?tab=t.vdb3f3osszzz.md` became nodes at those ids, frontmatter with no `title`, `type: note`, and hashtag lists pasted into one tag all went through as-is — so `ctx validate` failed on the vault and `ctx list` printed `undefined`. Import now repairs the minimum needed for each node to validate and reports every repair in a new `warnings: string[]` on the result:
+
+  - Paths sent through `files[]` are slugified segment by segment (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`, `nodes/?tab=t.vdb3f3osszzz.md` → `nodes/tab-t-vdb3f3osszzz.md`); already-clean segments and dot-directories such as `.versions` are untouched, so an exported version chain still lines up with its document. Two files that slugify alike are kept apart (`-2`, `-3`), and a document renamed that way takes its `.versions/<stem>/` history with it rather than leaving it in another document's directory.
+  - A path already in the vault is not overwritten: the incoming file lands beside it as `<name>-2`, with a warning. Set the new `overwrite: true` to replace it instead — which is what a retried batch, or a caller using `files[]` as an update path, wants.
+  - A missing `title` is derived from the body's first `# heading`, else from the original filename with its casing intact (`Dr. Smith`).
+  - A missing `type` is written as `document` (deliberate, so `type:document` selectors reach imported notes); a `type` outside the spec's node types is coerced to `document` with a warning.
+  - Tags that fail the tag rule are dropped with a warning; an entry containing `#` is split into its hashtags first, so `"#gtm #contextnest"` becomes two tags rather than one invalid one.
+  - The same frontmatter repairs apply on `discover`, for documents a caller wrote into the vault itself.
+  - A file whose frontmatter is already valid and states its `type` is written byte for byte, as before.
+
+  `ctx list` prints `(untitled)` instead of `undefined` for a node that has no title, so existing vaults with such nodes remain readable. Rewriting those existing nodes (`ctx validate --fix`) is a follow-up.
+
+- c15544b: Rank `ctx search` / `context_search` by relevance, attach a `score` to every hit, and default `--limit` to 10.
+
+  On a 673-document vault, `ctx search "strategy roadmap 2026"` returned 607 hits with the first screen sorted alphabetically by id — the strategy node itself was nowhere near the top. The resolver's MiniSearch index had scored the hits correctly, but the selector evaluator collapsed them into a `Set` and then filtered the discovery list against it, which re-sorted every match into id order and dropped the score; and because the executor had to slugify the query into one lexer-safe URI token, the hyphen-joined words ran as an OR search, so nearly every document matched. `context_search` now calls the resolver's new `search()` directly with the raw query: documents matching every query term come first, then partial matches, each tier by descending BM25 score, and each result carries a numeric `score` plus a top-level `total` (matches before `limit`). The evaluator now preserves the resolver's order, so `ctx query "contextnest://search/…"` in full mode comes back ranked too. `ctx search` prints the top 10 unless `--limit` says otherwise (`--limit 0` prints everything) and, when the list is cut, ends with `… N more — raise --limit`; `--json` includes `score`. Remote nests get the same rendering, degrading gracefully when the remote engine sends no `score`/`total`.
+
+- c3378c4: Refuse to auto-index or read a directory that is not a vault.
+
+  When nothing else resolved a vault (no `--vault`, no env override, no local vault above cwd, no registry default), `ctx` fell through to the bare working directory and treated it as one: `ctx query "#x"` in a plain folder printed "No context.yaml found. Auto-indexing vault..." and wrote a `context.yaml` there, and `ctx list` then reported every `.md` under the folder as a draft document. From `$HOME`, `ctx search` crashed on an unrelated YAML file.
+
+  - The CLI and the MCP server now refuse that bare-cwd fallback (via one shared engine helper, `assertVaultRoot`) unless the directory is a real vault root (`.context/config.yaml`; a bare `context.yaml` left behind by the old bug does not count). Both print `Error [NO_VAULT]: <dir> is not a Context Nest vault. Run "ctx init" here, or name a vault — "ctx --vault <alias>", or CONTEXTNEST_VAULT=<alias> on any surface (registered: a, b, c).` — exit 1, nothing written. Registered remote nests are named alongside local ones, and `contextnest-mcp` (which has no `--vault` flag) gets a hint that works there. The check lives in the shared vault-resolution helper, so every read command (`query`, `resolve`, `search`, `list`, `read`, `info`, `verify`, `validate`, `history`, `pack list`, `checkpoint list`, …) and, for free, the vault write commands (`add`, `update`, `index`, …) are covered. `ctx init` and the `ctx vault *` registry commands are exempt. `contextnest-mcp` started from a non-vault directory with nothing else resolving prints the same message and exits non-zero instead of serving the directory. The other resolution steps are unchanged: a local vault above cwd and a registry default still resolve as before.
+  - New `NoVaultError` (code `NO_VAULT`) in the engine, following the existing error-class pattern.
+  - `ctx vault which` marks a bare-cwd resolution that is not a vault as refused (`refused: true` in `--json`), instead of reporting a directory every other command now rejects.
+  - `GraphQueryEngine.query()` only auto-generates a missing `context.yaml` when the storage root is a real vault (`.context/config.yaml` present). A real vault whose `context.yaml` was deleted still regenerates it on the next query.
+
+- `ctx add` against a remote nest sends the folder alongside the id, so documents stop landing flat at the nest root.
+
+  `remoteAdd` sent only `id` to `context_create`. A nest whose inline schema for that operation predates the catalog's `id` parameter drops the key and derives the id from the title alone, so every remote `ctx add nodes/<folder>/<slug>` was written to the nest root instead of the folder the caller named. The folder is now derived from the normalized id and sent too: older nests honour `folder`, and catalog-conformant nests are unaffected because an explicit `id` still wins.
+
+- 0a756b1: `ctx vault which --json`: machine-readable resolution (`{kind, path|endpoint, source, alias?, warning?}`), so scripted callers — the coding-agent plugin hooks in particular — can find the vault in the working directory without parsing the coloured text output.
+- 5e0251f: `[[wikilinks]]` become `reference` edges at index time, so `--hops` works on vaults authored in wiki style.
+
+  `buildRelationships()` only extracted `contextnest://` inline links and `depends_on`, so a vault whose documents link each other with `[[Title]]` — the common Obsidian/wiki convention — indexed with an empty `relationships:` list in `context.yaml`. Graph-aware queries then had nothing to traverse: `ctx query --hops N` returned only the seed documents and hubs were empty, with no hint that anything was wrong.
+
+  - `buildRelationships()` (and therefore `buildBacklinks()`, so the engine backlinks API and `context.yaml` cannot disagree) now resolves `[[Title]]`, `[[title]]` (case-insensitive), `[[Title|alias]]`, `[[Title#anchor]]` and `[[nodes/id]]` through the same `wiki-graph` helpers the query side uses, emitting `{from, to, type: "reference"}` edges. Edges are de-duplicated by (from, to, type) — a doc that links the same target both ways yields one edge — and self-links are dropped. Wikilink edges count toward hubs like any other inbound reference.
+  - Unresolvable wikilinks produce no edge and are counted. New `buildRelationshipsWithStats()` and `generateContextYamlWithStats()` return `{edges, fromWikilinks, unresolvedWikilinks}` alongside the result; `resolveWikiTarget()` is exported.
+  - `ctx index` prints `N relationship edges (M from wikilinks, K unresolved)` after `Generated context.yaml`. A non-zero unresolved count is the hint that a link's title matches no published document.
+
+## 2.4.0
+
+### Minor Changes
+
+- 326e718: `ctx push`: honor a nest's push-confirmation gate instead of misreporting a pending push as applied.
+
+  A hosted nest can require a human to confirm an incoming push in the web UI before it is applied. When it does, the publish endpoint answers `202 { status: "pending_confirmation", … }` and parks the documents rather than applying them. `ctx push` treated any 2xx as success, so against a gated nest it printed "Pushed N documents" though nothing had landed.
+
+  - On `202 pending_confirmation`, the CLI now prints the server's message and a `Confirm in the UI: <confirm_url>` line, then — unless `--no-wait` — polls `poll_url` (`/nests/:id/pending-pushes/:pid`, same Bearer key) on a capped 2s→10s backoff until the decision.
+  - The process exit code reflects the outcome: `0` when the push is applied, non-zero for rejected / expired / timeout.
+  - New flags: `--no-wait` (submit, print the confirm URL, exit 0 without polling) and `--timeout <sec>` (default: the server's `expires_at` window, else 15m).
+  - The 200 path (ungated / allowlisted nests) is unchanged.
+
+  Wire contract shared with the paired Community server change (PromptOwl/contextnest-community).
+
 ## 2.3.0
 
 ### Minor Changes

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3
+
+Keep the sweep-check whole now that `ctx search` caps its output.
+
+- **The sweep no longer under-reports.** `ctx search` returns 10 hits by
+  default since CLI 2.5.0, so the sweep-check's full-text channel saw at most
+  ten candidates while still reporting `truncated: false`. It now passes an
+  explicit `--limit` covering the whole scan budget.
+- The retrieval prompt and the curator agent describe the new ranked, capped
+  search, so the agent knows to raise `--limit` itself.
+
 ## 0.5.2
 
 Auto-retrieval searches the vault you are standing in first, and stops
