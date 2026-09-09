@@ -91,11 +91,6 @@ beforeAll(() => {
   scratchDir = mkdtempSync(join(tmpdir(), "cn-plugin-reg-scratch-"));
   mkdirSync(alphaDir, { recursive: true });
   mkdirSync(betaDir, { recursive: true });
-  // `ctx init` initializes in the cwd and registers an alias = --name. The
-  // sandbox lives under the OS temp dir, where init no longer auto-registers,
-  // so --register asks for it explicitly.
-  ctl(alphaDir, ["init", "--name", "alpha", "--description", "security and auth", "--register"]);
-  ctl(betaDir, ["init", "--name", "beta", "--description", "performance and caching", "--register"]);
   mkdirSync(gammaDir, { recursive: true });
   // `ctx init` initializes in the cwd and registers it under --vault <alias>.
   ctl(alphaDir, ["init", "--name", "alpha", "--vault", "alpha", "--description", "security and auth"]);

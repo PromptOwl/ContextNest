@@ -15,7 +15,6 @@ import {
   getRegistryPath,
   resolveVaultPath,
   assertVaultRoot,
-  addRemote,
 } from "../registry.js";
 import { NestStorage } from "../storage.js";
 import { ConfigError, NoVaultError } from "../errors.js";
