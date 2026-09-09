@@ -26,6 +26,21 @@ Getting started is one question: *what are you trying to capture?* Point your ag
 
 See all starters: `ctx init --list-starters`
 
+### What the install puts on your disk
+
+**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install.
+The MCP server installs zero dependencies. For a lean install without terminal colour:
+
+```bash
+npm install -g @promptowl/contextnest-cli --omit=optional
+```
+
+That leaves exactly one package. The rest of the code is compiled into the published bundle rather
+than resolved from npm, so the install is deterministic — and every bundled package is listed with
+its version and licence alongside the installed ones in
+**[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
+uploads the machine-readable graph as the `dependency-graph` build artifact.
+
 ## For the solo developer
 
 Your brain, cached for your agent.
@@ -86,6 +101,53 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) | Core library — parsing, storage, versioning, integrity | AGPL-3.0 |
 | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server for AI agent access | AGPL-3.0 |
 
+## Performance
+
+How the engine behaves as a vault grows. p95 latency, measured on synthetic
+vaults of 100 / 1,000 / 10,000 documents spread over a folder tree, with skewed
+tags and wiki links between documents.
+
+| Operation | 100 docs | 1,000 docs | 10,000 docs | Scaling |
+|---|---|---|---|---|
+| `context_query` (retrieval) | 6ms | 74ms | **841ms** | linear (1.14×) |
+| `context_search` | 21ms | 174ms | **1.3s** | linear (0.76×) |
+| `context_list` | 12ms | 177ms | **1.4s** | linear (0.77×) |
+| `discoverDocuments` (vault crawl) | 11ms | 263ms | **1.2s** | linear (0.45×) |
+| `regenerateIndex` | 66ms | 383ms | **3.8s** | linear (0.98×) |
+| `context_import` (bulk import) | 0.7s | 11.3s | **108s** | linear (0.95×) |
+| Peak RSS | 74 MB | 126 MB | **262 MB** | linear |
+
+"Scaling" is the change in **per-document** cost from 1,000 to 10,000
+documents. 1.0× means the cost of a vault is proportional to what is in it —
+ten times the documents, ten times the work, no worse. Every operation measures
+between 0.45× and 1.15×, so nothing here degrades as a vault grows.
+
+Two honest caveats. Bulk import is linear but expensive in absolute terms:
+importing 10,000 documents takes around two minutes, because every document is
+published, versioned and hash-chained on the way in. And these numbers come
+from a developer machine (Node 22, win32-x64), so read them as orders of
+magnitude and scaling shape, not as a spec your hardware will reproduce.
+
+The suite lives in [`packages/engine/bench`](packages/engine/bench) and runs in
+CI. Reproduce it yourself:
+
+```bash
+pnpm build
+cd packages/engine
+pnpm bench                      # 100 / 1,000 / 10,000 documents
+pnpm bench --sizes 100,1000     # quicker
+pnpm bench:check                # run, then enforce the performance budget
+pnpm bench:profile              # writes a V8 CPU profile to bench/profiles/
+```
+
+`bench:check` is the CI gate. It fails when an operation's per-document cost
+grows beyond its budget — that is, when something stops scaling linearly. The
+budget is expressed as scaling shape rather than millisecond ceilings on
+purpose: CI runners differ in speed by several times, so ceilings tight enough
+to catch a real regression would fail constantly on a slow runner, and loose
+enough to survive one they would catch nothing. See
+[`bench/budget.json`](packages/engine/bench/budget.json).
+
 ## Prerequisites
 
 - **Node.js** >= 20.0.0
@@ -114,6 +176,7 @@ context-nest/
 │   ├── engine/        # Core library — parsing, storage, versioning, integrity
 │   ├── cli/           # Command-line tool (ctx)
 │   └── mcp-server/    # MCP server for AI agent access
+├── plugins/           # Coding-agent plugins driving the ctx CLI (not published to npm)
 ├── fixtures/
 │   └── minimal-vault/ # Example vault for reference and testing
 └── CONTEXT_NEST_SPEC.md   # Full specification
@@ -163,6 +226,10 @@ folders:
     description: "Project documents"
   sources:
     description: "Live data sources"
+skills:
+  # The type: skill node that teaches an agent how to use this vault.
+  # A pointer, not content — the node stays the source of truth.
+  bootstrap: "nodes/skills/onboarding"
 servers:
   jira:
     url: "https://mcp.atlassian.com/sse"
@@ -289,6 +356,42 @@ skill:
 
 Skills are queryable like any other node: `ctx query "type:skill + #engineering"`
 
+#### Installing a skill into an agent harness
+
+A skill node is not just documentation — it can be **installed** into Claude Code,
+Cursor, or Codex, where the harness matches on it and runs it:
+
+```bash
+ctx skill nodes/review-pr                          # render it and look at it
+ctx skill install nodes/review-pr --write          # install for Claude Code, user scope
+ctx skill install nodes/review-pr --harness cursor --scope project --write
+```
+
+`skill.trigger` becomes the harness's local matcher (Claude Code's `description`
+frontmatter, a Cursor rule description). It is the one field that must exist
+locally, because matching happens before anything can be fetched — which is why a
+skill node without a trigger is refused rather than given a guessed one.
+
+The default install writes a **loader**: a small file carrying the trigger and an
+instruction to fetch the procedure from the vault at runtime. A loader cannot go
+stale, because it never holds a copy of the procedure. `--mode full` embeds an
+offline snapshot instead — useful when the agent cannot reach the vault, and a
+deliberate trade: that copy *will* drift as the node changes, silently, while the
+agent keeps working confidently from superseded rules.
+
+Node bodies should write `{{server_alias}}`, `{{vault_id}}`, and `{{node_path}}`
+rather than hardcoding a tool prefix: the same vault is `mcp__contextnest__*` on
+one machine and `mcp__team-ctx__*` on another, so the prefix is resolved per
+caller at render time.
+
+Point `skills.bootstrap` at the skill that teaches an agent to use *this* vault,
+and `context_init` will hand it to every agent that opens the vault:
+
+```yaml
+skills:
+  bootstrap: nodes/skills/onboarding
+```
+
 ### 7. Add context packs
 
 Packs are saved queries in `packs/` as YAML files:
@@ -313,25 +416,96 @@ agent_instructions: |
 
 ## CLI Reference
 
-Set the vault path (defaults to current directory):
+### File safety
+
+No `ctx` command writes to your working directory without saying so.
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Runs the command against a throwaway copy of the vault, prints the exact files it *would* touch, and leaves your vault untouched |
+| `-y, --yes` | Skips confirmation prompts — the "prior explicit consent" for scripts and CI |
+| `--force` | Overwrites an existing file, repoints a taken vault alias, or allows a plaintext-HTTP push |
+
+Every write command ends with an action log of the files created (`+`), modified
+(`~`) or deleted (`-`), written to stderr so `--json` output and redirected
+stdout stay clean. Interactive runs ask before writing; destructive commands
+default to "no".
+
+**For scripts:** `ctx delete`, `ctx checkpoint rebuild`, `ctx drift approve`,
+`ctx vault remove` and `ctx push` refuse to run without `--yes` (or `--force`)
+when there is no TTY. Additive commands proceed as before — a non-interactive
+caller is never blocked waiting on stdin.
+
+### Choosing a vault
+
+By default `ctx` operates on the vault in (or above) the current directory. To
+work with several vaults from anywhere, register them in a central registry
+under short **aliases** — similar to AWS named profiles — and select one with
+`--vault <alias>`.
+
+The registry lives in your home directory and works on macOS, Linux, and Windows:
+`~/.contextnest/config.yaml` (i.e. `$HOME/.contextnest/config.yaml`, or
+`%USERPROFILE%\.contextnest\config.yaml` on Windows). Override its location with
+the `CONTEXTNEST_CONFIG_DIR` environment variable.
 
 ```bash
+# Create a vault and register it under an alias
+ctx init --name "Work" --vault work --set-default
+
+# Register an existing vault
+ctx vault add personal /path/to/personal-vault --description "Second brain"
+
+# Use a registered vault from any directory
+ctx list --vault work
+ctx vault list          # show all registered vaults (* = default)
+ctx vault default work  # change the default
+ctx vault which         # show which vault resolves right now, and why
+```
+
+A vault is resolved with this precedence (highest first):
+
+1. `--vault <alias>` flag
+2. `CONTEXTNEST_VAULT` env var (an alias — overrides the default vault)
+3. `CONTEXTNEST_VAULT_PATH` env var (an absolute path)
+4. a vault found by walking up from the current directory
+5. the registry's default alias
+6. the current directory
+
+```bash
+# Override the default vault for a shell session
+export CONTEXTNEST_VAULT=work
+# …or point directly at a path (no registry needed)
 export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 ```
+
+### Vault Registry
+
+| Command | Description |
+|---|---|
+| `ctx vault list` | List registered vaults (`* ` marks the default) |
+| `ctx vault add <alias> [path]` | Register a vault (path defaults to the current vault) |
+| `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
+| `ctx vault remove <alias>` | Unregister an alias |
+| `ctx vault default <alias>` | Set the default vault |
+| `ctx vault which` | Show the resolved vault and the reason |
 
 ### Document Management
 
 | Command | Description |
 |---|---|
 | `ctx init` | Initialize a new vault (supports `--starter` recipes) |
-| `ctx add <path>` | Create a new document (auto-publishes and regenerates index) |
+| `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
+| `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
 | `ctx update <path>` | Update a document's title, tags, or body (auto-publishes) |
 | `ctx delete <path>` | Delete a document and its version history |
 | `ctx read <path>` | Read and display a document in the terminal |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
+| `ctx skill <path>` | Render a `type: skill` node for an agent harness and print it |
+| `ctx skill install <path>` | Install a vault skill into Claude Code / Cursor / Codex (`--write` to actually write) |
 | `ctx validate [path]` | Validate documents against the spec |
 | `ctx publish <path>` | Publish a document (creates version + checkpoint) |
+| `ctx publish --all` | Publish every unpublished document in one batch — one checkpoint, one index pass |
 
 ### Querying
 
@@ -340,9 +514,10 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx query <selector>` | Query context with graph traversal (default: 2 hops) |
 | `ctx query <selector> --hops 4` | Deeper traversal for more related context |
 | `ctx query <selector> --full` | Load all documents (bypass graph traversal) |
+| `ctx query <selector> --include-drafts` | Include drafts (default: published only) |
 | `ctx query @org/pack` | Query from a cloud-hosted pack via [PromptOwl](https://promptowl.ai) |
-| `ctx list` | List all documents (filter with `--type`, `--status`, `--tag`) |
-| `ctx search <query>` | Full-text search across vault documents |
+| `ctx list` | List all documents (filter with `--type`, `--status`, `--tag`; cap with `--limit`) |
+| `ctx search <query>` | Full-text search across vault documents (`--limit` to cap) |
 | `ctx resolve <selector>` | Execute a selector query (low-level) |
 
 ### Selectors
@@ -362,8 +537,13 @@ ctx query "#api + status:published"       # Intersection
 | Command | Description |
 |---|---|
 | `ctx history <path>` | Show version history |
-| `ctx reconstruct <path> <version>` | Reconstruct a specific version |
-| `ctx verify` | Verify integrity of all hash chains |
+| `ctx history <path> --diff` | Include each version's unified diff from the one before |
+| `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
+| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped) |
+
+Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
+errors, plain `Error: message` for the rest. Set `CONTEXTNEST_DEBUG=1` to get the
+full stack trace back.
 
 ### Packs, Checkpoints & Index
 
@@ -379,13 +559,26 @@ ctx query "#api + status:published"       # Intersection
 
 ## MCP Server
 
-The MCP server exposes vault operations as 19 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 38 tools for AI agents over stdio transport.
 
 ### Running the server
 
 ```bash
 node packages/mcp-server/dist/index.js /path/to/your/vault
 ```
+
+### Running the server in Docker
+
+For Glama.ai and any MCP client that runs servers as containers:
+
+```bash
+docker build -t contextnest-mcp .
+
+docker run -i --rm contextnest-mcp                    # demo vault baked into the image
+docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
+```
+
+The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
 
 ### Configuring with Claude Code
 
@@ -425,30 +618,57 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ### Available MCP Tools
 
-**Read tools:**
+**Canonical tools** — name, description and input schema come straight from the
+engine's operation catalog, so this surface cannot drift from the CLI or the
+cloud:
 
 | Tool | Description |
 |---|---|
-| `vault_info` | Get vault identity and configuration summary |
-| `resolve` | Execute a selector query with graph traversal |
-| `read_document` | Read a document by URI or path |
-| `list_documents` | List documents with optional type/status/tag filters |
+| `context_init` | Open a vault: instructions, configuration, path, and what it holds (`include_nodes` to also list nodes) |
+| `context_nests` | List every nest in the central registry |
+| `context_skill` | Render a `type: skill` node as a harness-ready skill file |
+| `context_skill_install` | Build the file manifest that installs a vault skill locally |
+| `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
+| `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
+| `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |
+| `context_search` | Full-text search with graph traversal |
+| `context_query` | Selector query with graph traversal (`include_drafts`) |
+| `context_resolve` | Resolve a selector to full bodies within a token budget |
+| `context_versions` | List a document's version history |
+| `context_reconstruct` | Reconstruct a specific version |
+| `context_packs` | List packs with their `includes` and `excludes` |
+| `context_verify` | Verify every hash chain in the vault |
+| `context_create` | Create a node — own `id`, `publish: false`, initial `status`, `note`, full `skill` block |
+| `context_update` | Update a node — rename, set `status`, stamp a `version`, clear metadata with `null` |
+| `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
+| `context_delete` | Delete a node and its history; returns the deleted node's `title` |
+| `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
+
+**Vault tools:**
+
+| Tool | Description |
+|---|---|
 | `document_format` | Get the document format spec (call before creating docs) |
 | `read_index` | Return the context.yaml index |
 | `read_pack` | Resolve and return a context pack with documents |
-| `search` | Full-text search with graph traversal |
-| `verify_integrity` | Verify all hash chains |
 | `list_checkpoints` | List recent checkpoints |
-| `read_version` | Read a specific version of a document |
 
-**Mutation tools** (all auto-publish and regenerate the index):
+**Deprecated tools** — still registered and unchanged, so existing clients keep
+working; removed in a future major:
 
-| Tool | Description |
+| Deprecated | Use instead |
 |---|---|
-| `create_document` | Create a new document with frontmatter and optional body |
-| `update_document` | Update a document's title, tags, status, or body |
-| `delete_document` | Delete a document and its version history |
-| `publish_document` | Explicitly publish a document (bump version, create checkpoint) |
+| `vault_info` | `context_init` |
+| `read_document` | `context_get` |
+| `list_documents` | `context_list` |
+| `search` | `context_search` |
+| `resolve` | `context_resolve` |
+| `read_version` | `context_reconstruct` |
+| `verify_integrity` | `context_verify` |
+| `create_document` | `context_create` |
+| `update_document` | `context_update` |
+| `publish_document` | `context_publish` |
+| `delete_document` | `context_delete` |
 
 **Drift governance tools** (resolve out-of-band edits without touching the canonical doc or hash chain until approved):
 

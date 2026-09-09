@@ -1,0 +1,16 @@
+{
+  "name": "contextnest",
+  "owner": {
+    "name": "PromptOwl"
+  },
+  "metadata": {
+    "description": "Context Nest plugins for coding agents — vault-aware retrieval and automatic knowledge capture."
+  },
+  "plugins": [
+    {
+      "name": "contextnest",
+      "description": "Vault-aware context retrieval + automatic capture for Claude Code, powered by the ctx CLI.",
+      "source": "./plugins/claude-code"
+    }
+  ]
+}

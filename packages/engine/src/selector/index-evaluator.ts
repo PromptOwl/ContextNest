@@ -10,6 +10,7 @@ import MiniSearch from "minisearch";
 import type { SelectorNode } from "./parser.js";
 import type { ContextYamlDocument, Pack } from "../types.js";
 import { parseUri } from "../uri.js";
+import { normalizeStatus } from "../parser.js";
 
 export interface IndexEvaluatorOptions {
   packLoader?: (packId: string) => Pack | undefined;
@@ -208,9 +209,12 @@ function evaluateTypeFilter(type: string, docs: ContextYamlDocument[]): Set<stri
 }
 
 function evaluateStatusFilter(status: string, docs: ContextYamlDocument[]): Set<string> {
+  // Normalize the filter value so aliases (`cancelled`, `superseded`, …)
+  // match the canonical status stored in context.yaml.
+  const wanted = normalizeStatus(status);
   const result = new Set<string>();
   for (const doc of docs) {
-    if (doc.status === status) result.add(doc.id);
+    if (doc.status === wanted) result.add(doc.id);
   }
   return result;
 }

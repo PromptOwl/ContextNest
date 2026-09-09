@@ -3,6 +3,8 @@
  * Tokenizes selector strings into atoms and operators.
  */
 
+import { InvalidSelectorError } from "../errors.js";
+
 export type TokenType =
   | "TAG"
   | "URI"
@@ -73,7 +75,9 @@ export function tokenize(input: string): Token[] {
       while (pos < input.length && /[a-zA-Z0-9_-]/.test(input[pos])) pos++;
       const tagValue = input.slice(tagStart, pos);
       if (!tagValue) {
-        throw new Error(`Invalid tag at position ${start}: expected tag name after #`);
+        throw new InvalidSelectorError(
+          `Invalid tag at position ${start}: expected tag name after #`,
+        );
       }
       tokens.push({ type: "TAG", value: tagValue, position: start });
       continue;
@@ -83,8 +87,12 @@ export function tokenize(input: string): Token[] {
     if (input.slice(pos).startsWith("contextnest://")) {
       const uriStart = pos;
       pos += "contextnest://".length;
-      // Read until whitespace or operator or paren
-      while (pos < input.length && !/[\s+|\-()]/.test(input[pos])) pos++;
+      // Read until whitespace, a binary/group operator, or paren. Note `-` is
+      // NOT a delimiter here: hyphens are valid URI path characters (e.g.
+      // `contextnest://nodes/api-design`), mirroring tag tokenization which
+      // also consumes `-`. The NOT operator is whitespace-delimited in practice
+      // (`uri - #tag`), so it still tokenizes correctly after the URI ends.
+      while (pos < input.length && !/[\s+|()]/.test(input[pos])) pos++;
       tokens.push({ type: "URI", value: input.slice(uriStart, pos), position: uriStart });
       continue;
     }
@@ -157,7 +165,9 @@ export function tokenize(input: string): Token[] {
             const tagValueStart = pos;
             while (pos < input.length && /[a-zA-Z0-9_-]/.test(input[pos])) pos++;
             if (pos === tagValueStart) {
-              throw new Error(`Invalid tag filter at position ${start}: expected tag name after "tag:"`);
+              throw new InvalidSelectorError(
+                `Invalid tag filter at position ${start}: expected tag name after "tag:"`,
+              );
             }
             tokens.push({
               type: "TAG",
@@ -166,16 +176,18 @@ export function tokenize(input: string): Token[] {
             });
             break;
           default:
-            throw new Error(`Unknown filter type "${word}" at position ${start}`);
+            throw new InvalidSelectorError(
+              `Unknown filter type "${word}" at position ${start}`,
+            );
         }
         continue;
       }
 
       // Just a word — error
-      throw new Error(`Unexpected token "${word}" at position ${start}`);
+      throw new InvalidSelectorError(`Unexpected token "${word}" at position ${start}`);
     }
 
-    throw new Error(`Unexpected character "${ch}" at position ${pos}`);
+    throw new InvalidSelectorError(`Unexpected character "${ch}" at position ${pos}`);
   }
 
   tokens.push({ type: "EOF", value: "", position: pos });

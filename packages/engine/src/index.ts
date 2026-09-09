@@ -44,6 +44,10 @@ export type {
   TraversalOptions,
   TraversalResult,
   GraphQueryResult,
+  VaultRegistry,
+  VaultRegistryEntry,
+  RemoteNestSpec,
+  RemoteNestAuth,
 } from "./types.js";
 
 // Errors
@@ -52,14 +56,21 @@ export {
   ValidationFailedError,
   DocumentNotFoundError,
   InvalidUriError,
+  InvalidSelectorError,
   CircularDependencyError,
   IntegrityError,
   FederationNotSupportedError,
   ConfigError,
+  UnknownAliasError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,
   ChainBreakError,
+  RejectedDocumentError,
+  CorruptHistoryError,
+  VersionArtifactExistsError,
+  /** @deprecated retained for back-compat; never thrown post-1.2.0. */
+  SupersededDocumentError,
 } from "./errors.js";
 
 // RBAC
@@ -132,7 +143,9 @@ export {
   hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
+  STATUS_ALIASES,
   TRANSPORTS,
+  sourceMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
   HASH_CHAIN_EVENT_TYPES,
@@ -140,6 +153,10 @@ export {
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
 } from "./schemas.js";
+
+// Typed frontmatter blocks (source / skill) — see typed-blocks.ts
+export { applyTypedBlocks } from "./typed-blocks.js";
+export type { TypedBlockArgs } from "./typed-blocks.js";
 
 // Parser
 export {
@@ -149,15 +166,79 @@ export {
   normalizeTags,
   stripTagPrefix,
   getChecksumContent,
+  normalizeStatus,
+  explicitStatus,
+  isDraft,
+  isPendingReview,
+  isApproved,
+  isPublished,
+  isRejected,
+  isRetrievable,
+  /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
+  isSuperseded,
 } from "./parser.js";
 
 // Config
 export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
 
+// Vault registry (central alias → path mapping).
+// NOTE: writeRegistry is intentionally NOT re-exported — it bypasses alias/path
+// validation, so external callers must go through addVault/removeVault/
+// setDefaultVault. It stays exported from ./registry.js for the engine's own
+// tests, but is not part of the public API surface.
+export {
+  ALIAS_PATTERN,
+  getRegistryDir,
+  getRegistryPath,
+  readRegistry,
+  isVaultRoot,
+  findLocalVault,
+  addVault,
+  addRemote,
+  removeVault,
+  setDefaultVault,
+  setVaultDescription,
+  listVaults,
+  resolveVaultPath,
+  resolveNest,
+  describeRemoteEndpoint,
+} from "./registry.js";
+export type {
+  AddVaultOptions,
+  AddRemoteOptions,
+  RemoveVaultResult,
+  VaultListEntry,
+  VaultResolutionSource,
+  ResolveVaultOptions,
+  ResolvedVault,
+  ResolvedNest,
+} from "./registry.js";
+
+// Remote nest client (MCP over stdio/http; lazy-loads the MCP SDK).
+export {
+  connectRemoteNest,
+  RemoteUnreachableError,
+  RemoteTimeoutError,
+  RemoteAuthError,
+  REMOTE_DEFAULT_TIMEOUT_MS,
+  REMOTE_HTTP_DEFAULT_TIMEOUT_MS,
+} from "./remote-nest.js";
+export type { RemoteNestConnection } from "./remote-nest.js";
+
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL } from "./storage.js";
-export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
+export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId, normalizeFolder } from "./storage.js";
+export type {
+  LayoutMode,
+  ReadDocumentOptions,
+  CheckpointChainState,
+  FolderEntry,
+} from "./storage.js";
+
+// Document filtering — shared by context_list and by surfaces that filter a
+// document list they already hold.
+export { filterDocuments } from "./filters.js";
+export type { DocumentFilters } from "./filters.js";
 
 // URI
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";
@@ -184,6 +265,24 @@ export { parseSelector } from "./selector/parser.js";
 export type { SelectorNode } from "./selector/parser.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
+
+// Wiki-link seeds + ungated traversal (plumbing — the eligibility GATE stays
+// with the consumer; these primitives never gate by status/permission)
+export {
+  extractWikiLinks,
+  buildWikiTitleIndex,
+  resolveWikiSeeds,
+  traverseWikiGraph,
+} from "./wiki-graph.js";
+export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
+
+// Stewards format (parse/serialize only — enforcement stays with the consumer)
+export {
+  parseStewards,
+  serializeStewards,
+  STEWARDS_FILENAMES,
+} from "./stewards.js";
+export type { StewardRole, StewardEntry, StewardsConfig } from "./stewards.js";
 
 // Packs
 export { PackLoader } from "./packs.js";
@@ -232,8 +331,13 @@ export type {
 } from "./hygienist.js";
 
 // Publish
-export { publishDocument } from "./publish.js";
-export type { PublishOptions, PublishResult } from "./publish.js";
+export { publishDocument, publishDocuments } from "./publish.js";
+export type {
+  PublishOptions,
+  PublishResult,
+  BulkPublishOptions,
+  BulkPublishResult,
+} from "./publish.js";
 
 // Source graph
 export {
@@ -266,3 +370,27 @@ export { TraceLogger } from "./tracing.js";
 
 // Chain event log (persistent governance audit trail)
 export { ChainEventLog } from "./chain-log.js";
+
+// Vault-hosted skills
+export {
+  HARNESSES,
+  INSTALL_SCOPES,
+  INSTALL_MODES,
+  NotASkillNodeError,
+  assertSkillNode,
+  skillNameFromPath,
+  substitutePlaceholders,
+  renderSkill,
+  buildInstallManifest,
+} from "./skills.js";
+export type {
+  Harness,
+  InstallScope,
+  InstallMode,
+  SkillSource,
+  RenderOptions,
+  RenderedSkill,
+  ManifestFile,
+  InstallManifest,
+} from "./skills.js";
+export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";

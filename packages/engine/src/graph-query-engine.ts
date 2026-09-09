@@ -19,8 +19,7 @@ import { PackLoader } from "./packs.js";
 import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
-import { isPublished } from "./parser.js";
-import { getLatestCheckpoint, getLatestCheckpointNumber } from "./checkpoint.js";
+import { isPublished, isRetrievable } from "./parser.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
@@ -50,10 +49,13 @@ export class GraphQueryEngine {
     selector: string,
     options: GraphQueryOptions = {},
   ): Promise<GraphQueryResult> {
-    const { hops = 2, full = false } = options;
+    const { hops = 2, full = false, includeDrafts = false } = options;
 
-    // Try graph mode first
-    if (!full) {
+    // Graph mode reads from context.yaml, which is published-only by design
+    // (see `ctx index` and `autoIndex` below). Drafts therefore never appear
+    // as seed candidates and graph mode cannot honor `includeDrafts`. Force
+    // full mode so draft documents actually surface when callers opt in.
+    if (!full && !includeDrafts) {
       let contextYaml = await this.storage.readContextYaml();
 
       // Auto-generate context.yaml if missing
@@ -67,8 +69,8 @@ export class GraphQueryEngine {
       }
     }
 
-    // Full mode: existing behavior
-    return this.fullQuery(selector);
+    // Full mode: existing behavior, with the same retrieval gates applied.
+    return this.fullQuery(selector, options);
   }
 
   private async graphQuery(
@@ -110,6 +112,12 @@ export class GraphQueryEngine {
     const sourceNodes: ContextNode[] = [];
 
     for (const doc of docMap.values()) {
+      // Rejected + approved docs are never returned, even with includeDrafts.
+      // Rejected = terminal hide (steward retired). Approved = signed off
+      // but not yet live — surfaces only after publish.
+      if (!isRetrievable(doc)) {
+        continue;
+      }
       if (!options.includeDrafts && !isPublished(doc)) {
         continue;
       }
@@ -123,9 +131,10 @@ export class GraphQueryEngine {
     // 5. Order source nodes topologically
     const orderedSourceNodes = orderSourceNodesTopologically(sourceNodes);
 
-    // 6. Log traces
-    const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
+    // 6. Log traces. Head only — a query runs on every retrieval, and loading
+    // the whole chain for one number made the hottest READ path pay the same
+    // O(chain size) cost the write path was just freed from.
+    const currentCheckpoint = await this.storage.readLatestCheckpointNumber();
 
     for (const doc of [...regularDocs, ...orderedSourceNodes]) {
       traceLogger.logAccess({
@@ -155,8 +164,11 @@ export class GraphQueryEngine {
     try {
       const docs = await this.storage.discoverDocuments();
       const config = await this.storage.readConfig();
-      const checkpointHistory = await this.storage.readCheckpointHistory();
-      const latestCheckpoint = getLatestCheckpoint(checkpointHistory);
+      // Throwing variant deliberately: this one PERSISTS the number into
+      // context.yaml, so a transient read must abandon the auto-index (the
+      // catch below) and retry on the next query, rather than baking in a
+      // checkpoint of 0 that survives until something else regenerates.
+      const latestCheckpoint = await this.storage.readLatestCheckpoint();
       const published = docs.filter(isPublished);
 
       const contextYaml = generateContextYaml(published, config, latestCheckpoint);
@@ -169,12 +181,17 @@ export class GraphQueryEngine {
     }
   }
 
-  /** Fallback: full-load mode (existing behavior) */
-  private async fullQuery(selector: string): Promise<GraphQueryResult> {
+  /** Fallback: full-load mode (existing behavior, post-filtered by status). */
+  private async fullQuery(
+    selector: string,
+    options: GraphQueryOptions = {},
+  ): Promise<GraphQueryResult> {
+    // discoverDocuments excludes rejected by default, so the resolver
+    // never sees retired docs (parity with the graph-mode filter above).
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
-    const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
+    // Head only — same as graph mode; this is a read path stamping a trace.
+    const currentCheckpoint = await this.storage.readLatestCheckpointNumber();
 
     const resolver = new Resolver({ documents: docs });
     const packLoader = new PackLoader(packs);
@@ -186,8 +203,23 @@ export class GraphQueryEngine {
 
     const result = await injector.inject(selector);
 
+    // Apply the same retrieval gates as graphQuery so approved/rejected
+    // never leak to LLMs, and drafts surface only when explicitly opted in.
+    const filteredDocs = result.documents.filter((doc) => {
+      if (!isRetrievable(doc)) return false;
+      if (!options.includeDrafts && !isPublished(doc)) return false;
+      return true;
+    });
+    const filteredSources = result.sourceNodes.filter((doc) => {
+      if (!isRetrievable(doc)) return false;
+      if (!options.includeDrafts && !isPublished(doc)) return false;
+      return true;
+    });
+
     return {
       ...result,
+      documents: filteredDocs,
+      sourceNodes: filteredSources,
       hopsUsed: 0,
       nodesTraversed: docs.length,
       mode: "full",

@@ -13,6 +13,7 @@
 
 import type { Token, TokenType } from "./lexer.js";
 import { tokenize } from "./lexer.js";
+import { InvalidSelectorError } from "../errors.js";
 
 export type SelectorNode =
   | { type: "tag"; value: string }
@@ -57,7 +58,7 @@ class SelectorParser {
   private expect(type: TokenType): Token {
     const token = this.peek();
     if (token.type !== type) {
-      throw new Error(
+      throw new InvalidSelectorError(
         `Expected ${type} but got ${token.type} ("${token.value}") at position ${token.position}`,
       );
     }
@@ -73,7 +74,7 @@ class SelectorParser {
   parse(): SelectorNode {
     const result = this.parseOrExpr();
     if (this.peek().type !== "EOF") {
-      throw new Error(
+      throw new InvalidSelectorError(
         `Unexpected token "${this.peek().value}" at position ${this.peek().position}`,
       );
     }
@@ -155,7 +156,7 @@ class SelectorParser {
         return expr;
       }
       default:
-        throw new Error(
+        throw new InvalidSelectorError(
           `Unexpected token "${token.value}" at position ${token.position}`,
         );
     }

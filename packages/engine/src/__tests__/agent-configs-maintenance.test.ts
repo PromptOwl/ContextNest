@@ -3,11 +3,14 @@ import { generateAgentConfigs } from "../agent-configs.js";
 import type { ContextYaml, NestConfig } from "../types.js";
 
 const emptyContextYaml: ContextYaml = {
-  schema_version: 1,
+  version: 1,
   generated_at: new Date().toISOString(),
+  checkpoint: 0,
+  checkpoint_at: new Date().toISOString(),
   documents: [],
   relationships: [],
   hubs: [],
+  external_dependencies: { mcp_servers: [] },
 };
 
 describe("generateAgentConfigs — maintenance directive", () => {

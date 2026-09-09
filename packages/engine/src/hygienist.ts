@@ -26,6 +26,7 @@
 import type { NestStorage } from "./storage.js";
 import type {
   ContextNode,
+  DocumentHistory,
   GovernanceTier,
   RbacHook,
   SuggestionMeta,
@@ -86,7 +87,8 @@ export interface HygienistResult {
 export async function runHygienistScan(
   input: HygienistInput,
 ): Promise<HygienistResult> {
-  const docs = await input.storage.discoverDocuments();
+  // Hygienist audits every doc including retired ones.
+  const docs = await input.storage.discoverDocuments({ includeRetired: true });
   const entries: HygienistEntry[] = [];
   for (const doc of docs) {
     entries.push(await scanOne(doc, input));
@@ -145,7 +147,22 @@ async function scanOne(
     }
   }
 
-  const history = await input.storage.readHistory(documentId);
+  // readHistory throws on a present-but-unreadable history. That is one
+  // document's problem — this scan promises never to fail on a per-doc failure,
+  // so it is reported as a skip like any other unusable chain head.
+  // readHistory throws on a present-but-unreadable history. That is one
+  // document's problem — this scan promises never to fail on a per-doc failure,
+  // so it is reported as a skip like any other unusable chain head.
+  let history: DocumentHistory | null;
+  try {
+    history = await input.storage.readHistory(documentId);
+  } catch (err) {
+    return {
+      documentId,
+      drifted: true,
+      skippedReason: `unreadable-history: ${(err as Error).message.split("\n")[0]}`,
+    };
+  }
   if (!history || history.versions.length === 0) {
     return {
       documentId,

@@ -3,7 +3,7 @@
  * See CONTEXT_NEST_SPEC-v3.md for the full specification.
  */
 
-/** Node types (§1.6) */
+/** Node types (§1.6). Keep in lockstep with `NODE_TYPES` in schemas.ts. */
 export type NodeType =
   | "document"
   | "snippet"
@@ -13,10 +13,38 @@ export type NodeType =
   | "source"
   | "tool"
   | "reference"
-  | "skill";
+  | "skill"
+  | "agent"
+  | "artifact"
+  | "table";
 
-/** Document status (§1.5) */
-export type Status = "draft" | "published";
+/** Document status (§1.5)
+ *
+ * Lifecycle:
+ *   draft           → editable scratch state. Hidden from LLM retrieval
+ *                     unless `includeDrafts: true` is set on the query.
+ *   pending_review  → author submitted for review; reviewer has not yet
+ *                     signed off. Hidden from LLM but visible to stewards.
+ *   approved        → reviewer signed off; ready for publish ceremony but
+ *                     not yet live. Hidden from LLM retrieval.
+ *   published       → live, retrievable, the only status surfaced to LLMs
+ *                     by default.
+ *   rejected        → terminal hide. `publishDocument` refuses rejected
+ *                     docs to prevent silent resurrection. Stewards revive
+ *                     by setting status back to draft/pending_review/
+ *                     approved/published.
+ *
+ * Aliases (e.g. `cancelled` → `rejected`, `superseded` → `draft`,
+ * `review` → `pending_review`, `active` → `published`) are normalized to
+ * canonical at parse time — see `STATUS_ALIASES` in `schemas.ts`. Unknown
+ * values fall back to `"draft"`.
+ */
+export type Status =
+  | "draft"
+  | "pending_review"
+  | "approved"
+  | "published"
+  | "rejected";
 
 /** Source transport protocol (§1.9.1) */
 export type Transport = "mcp" | "rest" | "cli" | "function";
@@ -134,6 +162,22 @@ export interface ContextNode {
   body: string;
   /** Full raw file content */
   rawContent: string;
+  /**
+   * The `status` the author actually wrote, before normalization, or `null`
+   * when the frontmatter carried no `status:` key at all.
+   *
+   * `frontmatter.status` cannot answer that question: a missing status is
+   * normalized to `draft`, so an author's deliberate draft is indistinguishable
+   * from a status-less hand-authored note once parsed. Folder import needs the
+   * distinction — a status-less file is fair game to publish, an explicit
+   * `draft`/`pending_review` must be held back. Read it through
+   * `explicitStatus()`, which canonicalizes aliases.
+   *
+   * Taken from the same YAML load that produces `frontmatter`, so it sees
+   * whatever the author wrote, however they wrote it. Only `parseDocument` sets
+   * it; nodes built in memory leave it undefined.
+   */
+  authoredStatus?: string | null;
   /**
    * Set when live file bytes differ from the last-approved canonical content
    * (bridge-function-spec Story 3.1, hootie-inbox-spec §4.2). When present,
@@ -331,6 +375,17 @@ export interface NestConfig {
     auto_index?: boolean;
   };
   /**
+   * Vault-hosted skills (see `skills.ts`).
+   *
+   * `bootstrap` names the `type: skill` node an agent should install first —
+   * the entry point that teaches it how to use this particular vault. It is a
+   * pointer, not content: the node stays the source of truth, so the vault can
+   * change what onboarding means without anyone reinstalling anything.
+   */
+  skills?: {
+    bootstrap?: string;
+  };
+  /**
    * Agent maintenance directive — emitted into the managed section of
    * CLAUDE.md / GEMINI.md / .cursorrules / .windsurfrules /
    * .github/copilot-instructions.md by `ctx index`. Tells the agent
@@ -340,6 +395,80 @@ export interface NestConfig {
    * index time, a sensible default is used.
    */
   agent_maintenance_directive?: string;
+  /**
+   * Agentic tools whose config files this vault writes. Tool ids:
+   * "claude" | "gemini" | "cursor" | "windsurf" | "copilot".
+   * Set by `ctx init`'s tool picker. When undefined or empty, ALL targets are
+   * written (back-compat). `ctx index` honors this; `ctx init` overwrites it.
+   */
+  agent_tools?: string[];
+}
+
+/**
+ * A single registered vault in the central registry (~/.contextnest/config.yaml).
+ * The registry only stores paths — vaults are not physically relocated.
+ */
+export interface VaultRegistryEntry {
+  /** Absolute path to the vault root (the directory containing .context/config.yaml). */
+  path: string;
+  /** Optional short label for this alias, independent of the vault's own name. */
+  description?: string;
+}
+
+/**
+ * Auth for an HTTP remote nest. Secrets are stored as environment-variable
+ * REFERENCES only (the *_env fields name the variable to read at connect
+ * time); the registry schema rejects raw secret values outright.
+ */
+export interface RemoteNestAuth {
+  /** Env var holding a bearer token, sent as `Authorization: Bearer <value>`. */
+  bearer_env?: string;
+  /** Custom header name, paired with header_env for its value. */
+  header_name?: string;
+  /** Env var holding the value for header_name. */
+  header_env?: string;
+}
+
+/**
+ * A registered remote nest — an MCP endpoint speaking the canonical operation
+ * catalog (`context_*` tools; legacy tool names accepted as aliases). Lives in
+ * the registry's top-level `remotes:` map, NEVER inside `vaults:`, so older
+ * CLIs (which strip unknown top-level keys) skip remotes instead of failing to
+ * parse the whole registry.
+ */
+export type RemoteNestSpec =
+  | {
+      transport: "stdio";
+      /** Executable to spawn (argv[0]); args are passed as an array, never a shell string. */
+      command: string;
+      args?: string[];
+      description?: string;
+      /** Per-call timeout in milliseconds (default 10000). */
+      timeout_ms?: number;
+    }
+  | {
+      transport: "http";
+      /** Streamable-HTTP MCP endpoint URL. */
+      url: string;
+      auth?: RemoteNestAuth;
+      description?: string;
+      /** Per-call timeout in milliseconds (default 10000). */
+      timeout_ms?: number;
+    };
+
+/**
+ * Central vault registry. Maps short aliases to vault paths so the CLI and MCP
+ * server can target any vault from any working directory (analogous to AWS
+ * named profiles). Stored at ~/.contextnest/config.yaml.
+ */
+export interface VaultRegistry {
+  version: number;
+  /** Alias of the default vault, used when no flag/env selects one. */
+  default?: string;
+  /** Registered vaults, keyed by alias. */
+  vaults: Record<string, VaultRegistryEntry>;
+  /** Registered remote nests, keyed by alias. Shares one alias namespace with `vaults`. */
+  remotes?: Record<string, RemoteNestSpec>;
 }
 
 /** Trace entry for document access (§9.2) */
@@ -455,7 +584,8 @@ export interface VerificationReport {
       | "chain_hash_mismatch"
       | "cross_chain_mismatch"
       | "checkpoint_hash_mismatch"
-      | "body_drift";
+      | "body_drift"
+      | "unreadable_history";
     document?: string;
     version?: number;
     checkpoint?: number;

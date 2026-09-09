@@ -3,32 +3,74 @@
  * Extracts contextnest:// links, #tags, @mentions, and task checkboxes.
  */
 
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
 import type { ContextNode, RelationshipEdge } from "./types.js";
 
-const processor = unified().use(remarkParse).use(remarkGfm);
+/**
+ * Mark which lines sit inside a fenced code block, so link and heading
+ * scanning skips them the way a real markdown parse would.
+ */
+function codeMask(lines: string[]): boolean[] {
+  const mask: boolean[] = new Array(lines.length).fill(false);
+  let fence: string | null = null;
 
-/** Extract all contextnest:// link targets from a markdown body */
-export function extractContextLinks(body: string): string[] {
-  const tree = processor.parse(body);
-  const links: string[] = [];
-
-  function walk(node: any) {
-    if (node.type === "link" && typeof node.url === "string") {
-      if (node.url.startsWith("contextnest://")) {
-        links.push(node.url);
-      }
-    }
-    if (node.children) {
-      for (const child of node.children) {
-        walk(child);
-      }
+  for (let i = 0; i < lines.length; i++) {
+    const marker = /^\s{0,3}(`{3,}|~{3,})/.exec(lines[i]);
+    if (fence) {
+      mask[i] = true;
+      const closes =
+        marker !== null &&
+        marker[1][0] === fence[0] &&
+        marker[1].length >= fence.length &&
+        lines[i].slice(marker[0].length).trim() === "";
+      if (closes) fence = null;
+    } else if (marker) {
+      mask[i] = true;
+      fence = marker[1];
     }
   }
 
-  walk(tree);
+  return mask;
+}
+
+/** Blank out inline code spans so their contents are not scanned. */
+function stripInlineCode(line: string): string {
+  return line.replace(/`+[^`]*`+/g, (span) => " ".repeat(span.length));
+}
+
+// Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
+// Reference definitions are deliberately not matched — they were not links
+// in the AST either.
+//
+// Only ONE `\s*` before the destination: two of them separated by an optional
+// `<` would leave the split between them ambiguous and backtrack quadratically
+// over a long run of spaces (CodeQL js/polynomial-redos). Markdown does not
+// allow whitespace between `<` and the destination anyway.
+//
+// The link text excludes `[` as well as `]` and is length-bounded, for the same
+// reason the rule-4 check in parser.ts is bounded: otherwise a line of many `[`
+// with no closing bracket rescans to the end from every one of them. Unescaped
+// `[` is not valid inline link text, so nothing real is lost.
+const CONTEXT_LINK =
+  /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
+
+/** Extract all contextnest:// link targets from a markdown body */
+export function extractContextLinks(body: string): string[] {
+  // Split on CRLF as well as LF: `.` does not match `\r` in a JS regex, so a
+  // stray carriage return would defeat every end-anchored pattern below.
+  const lines = body.split(/\r?\n/);
+  const mask = codeMask(lines);
+  const links: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) continue;
+    const line = stripInlineCode(lines[i]);
+    CONTEXT_LINK.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = CONTEXT_LINK.exec(line)) !== null) {
+      links.push(match[1] ?? match[2]);
+    }
+  }
+
   return links;
 }
 
@@ -129,50 +171,101 @@ export function buildBacklinks(documents: ContextNode[]): Map<string, string[]> 
  * Returns the content from the matched heading to the next heading of same or higher level.
  */
 export function extractSection(body: string, anchor: string): string | null {
-  const tree = processor.parse(body) as any;
-  let found = false;
-  let foundDepth = 0;
+  // Slice from the raw lines so the returned section keeps its original line
+  // endings; scan a CR-stripped copy so the patterns still anchor (see above).
   const lines = body.split("\n");
-  let startLine = -1;
+  const headings = topLevelHeadings(lines.map((l) => l.replace(/\r$/, "")));
+
+  const start = headings.findIndex((h) => h.anchor === anchor);
+  if (start === -1) return null;
+
   let endLine = lines.length;
-
-  for (const node of tree.children) {
-    if (node.type === "heading") {
-      // Convert heading text to anchor: lowercase, spaces to hyphens, strip non-alphanumeric except hyphens
-      const text = getHeadingText(node);
-      const headingAnchor = text
-        .toLowerCase()
-        .replace(/\s+/g, "-")
-        .replace(/[^a-z0-9-]/g, "");
-
-      if (found && node.depth <= foundDepth) {
-        // Found the end of the section
-        endLine = (node.position?.start.line ?? endLine) - 1;
-        break;
-      }
-
-      if (headingAnchor === anchor) {
-        found = true;
-        foundDepth = node.depth;
-        startLine = (node.position?.start.line ?? 1) - 1;
-      }
+  for (let i = start + 1; i < headings.length; i++) {
+    if (headings[i].depth <= headings[start].depth) {
+      endLine = headings[i].line;
+      break;
     }
   }
 
-  if (!found) return null;
-  return lines.slice(startLine, endLine).join("\n").trim();
+  return lines.slice(headings[start].line, endLine).join("\n").trim();
 }
 
-function getHeadingText(node: any): string {
-  const parts: string[] = [];
-  if (node.children) {
-    for (const child of node.children) {
-      if (child.type === "text") {
-        parts.push(child.value);
-      } else if (child.children) {
-        parts.push(getHeadingText(child));
-      }
+interface Heading {
+  depth: number;
+  anchor: string;
+  /** 0-based index of the line the heading starts on */
+  line: number;
+}
+
+/**
+ * Collect top-level (unindented, outside code fences) ATX and setext headings.
+ * Headings nested in lists or blockquotes are skipped, matching the previous
+ * behaviour of only walking the AST root's children.
+ */
+function topLevelHeadings(lines: string[]): Heading[] {
+  const mask = codeMask(lines);
+  const headings: Heading[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) continue;
+
+    // Deliberately does NOT capture the heading text with a trailing `(.*)$`.
+    // Pairing `\s+` with `.*` leaves the boundary between them ambiguous, and
+    // `.` cannot match a line terminator, so a long whitespace run followed by
+    // text and a stray CR makes the engine retry every split — quadratic
+    // (CodeQL js/polynomial-redos). The marker is all the match is needed for;
+    // the text comes from a slice.
+    // Up to 3 leading spaces are allowed on an ATX heading (CommonMark); 4 or
+    // more makes it an indented code block instead.
+    const atx = /^ {0,3}(#{1,6})\s/.exec(lines[i]);
+    if (atx) {
+      const depth = atx[1].length;
+      // Drop an optional closing sequence: `## Title ##`. Trailing whitespace
+      // goes first so the pattern can anchor to the end with nothing ambiguous
+      // in front of it.
+      const text = lines[i].slice(atx[0].length).trimEnd().replace(/#+$/, "");
+      headings.push({ depth, anchor: toAnchor(text), line: i });
+      continue;
+    }
+
+    const underline = lines[i + 1];
+    const isSetext =
+      underline !== undefined &&
+      !mask[i + 1] &&
+      lines[i].trim() !== "" &&
+      !/^\s{0,3}[-*+>]\s/.test(lines[i]) &&
+      /^\s{0,3}(=+|-+)\s*$/.test(underline);
+    if (isSetext) {
+      headings.push({
+        depth: underline.trim()[0] === "=" ? 1 : 2,
+        anchor: toAnchor(lines[i]),
+        line: i,
+      });
+      i++;
     }
   }
-  return parts.join("");
+
+  return headings;
+}
+
+/**
+ * Heading text to anchor: strip inline markup, lowercase, spaces to hyphens,
+ * drop anything that is not alphanumeric or a hyphen.
+ */
+function toAnchor(raw: string): string {
+  return raw
+    .replace(/`+/g, "")
+    // Each span excludes its own opening delimiter as well as its closing one,
+    // and both are length-bounded (CodeQL js/polynomial-redos). Two separate
+    // inputs are quadratic otherwise: a run of `[`, where the text span scans
+    // to end-of-line from every one of them, and a run of `[](`, where the
+    // destination span does the same. Excluding `[` and `(` makes both fail on
+    // the first character instead, and neither is valid unescaped in the span
+    // it is excluded from.
+    .replace(/!?\[([^\][]{0,2048})\]\([^()]{0,2048}\)/g, "$1")
+    .replace(/[*_~]+/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "");
 }

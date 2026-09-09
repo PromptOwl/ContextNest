@@ -232,6 +232,11 @@ export function verifyDocumentChain(
   docId: string,
   history: DocumentHistory,
   readKeyframe: (version: number) => string | null,
+  /** Change log for a non-keyframe version, when it lives in a v{N}.diff file
+   *  rather than inline on the entry. A caller that cannot read version files
+   *  omits this; its non-keyframe content checks are then skipped rather than
+   *  failed, the same way a missing keyframe file is skipped. */
+  readDiff?: (version: number) => string | null,
 ): VerificationReport {
   const errors: VerificationReport["errors"] = [];
 
@@ -244,7 +249,20 @@ export function verifyDocumentChain(
     if (entry.keyframe) {
       actualContent = readKeyframe(entry.version);
     } else {
-      actualContent = entry.diff || "";
+      // Externalized change log wins; inline patch is the legacy fallback.
+      //
+      // With a reader supplied, "neither available" means the change log is
+      // gone and the version can no longer be reconstructed — hash "" so it
+      // surfaces as a content_hash_mismatch, because unlike a missing keyframe
+      // (recoverable by replaying from an earlier one) a missing diff breaks
+      // every version after it.
+      //
+      // Without a reader, we simply cannot see the change log, which is not
+      // evidence of tampering — skip the content check as we do for a keyframe
+      // whose file we could not read, and let the chain_hash check below stand.
+      actualContent = readDiff
+        ? (readDiff(entry.version) ?? entry.diff ?? "")
+        : (entry.diff ?? null);
     }
 
     if (actualContent !== null) {
@@ -298,19 +316,35 @@ export function verifyCheckpointChain(
 
   for (const cp of checkpoints) {
     // Step 4: Cross-chain binding verification.
-    // Skip rows where the current history entry post-dates the checkpoint —
-    // that means the document was deleted and recreated; the new identity
-    // is not the same as the one the checkpoint sealed.
     for (const [docPath, expectedChainHash] of Object.entries(cp.document_chain_hashes)) {
       const history = documentHistories.get(docPath);
       if (!history) continue;
 
       const version = cp.document_versions[docPath];
-      const entry = history.versions.find((v) => v.version === version);
-      if (!entry) continue;
-      if (entry.edited_at > cp.at) continue;
+      const idx = history.versions.findIndex((v) => v.version === version);
+      if (idx === -1) continue;
+      const entry = history.versions[idx];
 
       if (entry.chain_hash !== expectedChainHash) {
+        // A mismatch can mean two very different things. If the entry post-dates
+        // the checkpoint it is normally a delete+recreate — a new identity the
+        // checkpoint never sealed, which we must NOT flag. But that timestamp
+        // check alone would also let a back-dated tamper slip through (rewrite
+        // chain_hash, set a future edited_at). Only treat the row as a benign
+        // recreate when the entry's own chain hash is internally self-consistent;
+        // a tampered hash fails this recompute and is reported.
+        if (entry.edited_at > cp.at) {
+          const prev = idx > 0 ? history.versions[idx - 1].chain_hash : null;
+          const selfHash = computeChainHash(
+            prev,
+            entry.content_hash,
+            entry.version,
+            entry.edited_by,
+            entry.edited_at,
+          );
+          if (selfHash === entry.chain_hash) continue; // genuine recreate
+        }
+
         errors.push({
           type: "cross_chain_mismatch",
           document: docPath,

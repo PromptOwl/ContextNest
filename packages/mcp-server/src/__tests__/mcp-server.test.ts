@@ -15,6 +15,9 @@ import {
   generateContextYaml,
   generateIndexMd,
   DocumentNotFoundError,
+  RejectedDocumentError,
+  normalizeStatus,
+  isRejected,
 } from "@promptowl/contextnest-engine";
 import type { ContextNode, Frontmatter, ContextYaml } from "@promptowl/contextnest-engine";
 
@@ -367,3 +370,150 @@ describe("index regeneration", () => {
     expect(indexContent).toContain("Nodes");
   });
 });
+
+// ─── update_document — status lifecycle + aliases ─────────────────────────────
+
+/**
+ * Mirrors the MCP server's `update_document` handler:
+ *   - Normalizes incoming status via `normalizeStatus`.
+ *   - Refuses content-only edits on rejected docs (REJECTED_DOCUMENT).
+ *   - Routes `rejected`/`approved`/`pending_review` through a metadata-only
+ *     path (no publishDocument call, no version cut).
+ *   - Other status values fall through to publishDocument.
+ *
+ * Returns either `{ message }` for metadata-only paths or the publish result.
+ */
+async function mcpUpdateDocument(
+  storage: NestStorage,
+  id: string,
+  args: { title?: string; tags?: string[]; status?: string; body?: string },
+): Promise<{ error?: string; code?: string; status?: string; message?: string; version?: number }> {
+  const doc = await storage.readDocument(id);
+  const normalizedStatus =
+    args.status !== undefined ? normalizeStatus(args.status) : undefined;
+
+  if (isRejected(doc) && normalizedStatus === undefined) {
+    return {
+      error: `Document "${id}" is rejected — set status before further updates`,
+      code: "REJECTED_DOCUMENT",
+    };
+  }
+
+  if (args.title !== undefined) doc.frontmatter.title = args.title;
+  if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
+  if (args.tags !== undefined) {
+    doc.frontmatter.tags = args.tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
+  }
+  doc.frontmatter.updated_at = new Date().toISOString();
+  if (args.body !== undefined) doc.body = `\n${args.body}\n`;
+
+  await storage.writeDocument(id, serializeDocument(doc));
+
+  if (
+    normalizedStatus === "rejected" ||
+    normalizedStatus === "approved" ||
+    normalizedStatus === "pending_review" ||
+    normalizedStatus === "draft"
+  ) {
+    return { status: normalizedStatus, message: `metadata-only: ${normalizedStatus}` };
+  }
+
+  const result = await publishDocument(storage, id, {
+    editedBy: "mcp-test@contextnest.local",
+    note: "Updated via test",
+  });
+  return {
+    status: result.node.frontmatter.status,
+    version: result.node.frontmatter.version,
+  };
+}
+
+describe("update_document status lifecycle + aliases", () => {
+  beforeAll(async () => {
+    await createDocument(storage, "nodes/test-status-lifecycle", "Status Lifecycle Doc");
+  });
+
+  it("accepts alias 'submitted' and persists canonical 'pending_review'", async () => {
+    const result = await mcpUpdateDocument(storage, "nodes/test-status-lifecycle", {
+      status: "submitted",
+    });
+    expect(result.status).toBe("pending_review");
+    const onDisk = await readFile(
+      join(vaultPath, "nodes/test-status-lifecycle.md"),
+      "utf-8",
+    );
+    expect(onDisk).toMatch(/status:\s*pending_review/);
+  });
+
+  it("pending_review path does NOT cut a new version", async () => {
+    const before = (await storage.readHistory("nodes/test-status-lifecycle"))!.versions.length;
+    await mcpUpdateDocument(storage, "nodes/test-status-lifecycle", {
+      status: "review", // alias → pending_review
+      body: "Edited body during review",
+    });
+    const after = (await storage.readHistory("nodes/test-status-lifecycle"))!.versions.length;
+    expect(after).toBe(before);
+  });
+
+  it("accepts alias 'cancelled' and persists canonical 'rejected'", async () => {
+    await createDocument(storage, "nodes/test-cancel-alias", "Cancel Alias");
+    const result = await mcpUpdateDocument(storage, "nodes/test-cancel-alias", {
+      status: "cancelled",
+    });
+    expect(result.status).toBe("rejected");
+    const onDisk = await readFile(
+      join(vaultPath, "nodes/test-cancel-alias.md"),
+      "utf-8",
+    );
+    expect(onDisk).toMatch(/status:\s*rejected/);
+  });
+
+  it("refuses content-only edit on rejected doc with REJECTED_DOCUMENT", async () => {
+    await createDocument(storage, "nodes/test-rejected-guard", "Guard Test");
+    await mcpUpdateDocument(storage, "nodes/test-rejected-guard", { status: "rejected" });
+
+    const result = await mcpUpdateDocument(storage, "nodes/test-rejected-guard", {
+      body: "Sneaky edit",
+    });
+    expect(result.code).toBe("REJECTED_DOCUMENT");
+    expect(result.error).toContain("rejected");
+  });
+
+  it("allows reviving rejected → draft, then republishing", async () => {
+    await createDocument(storage, "nodes/test-revive", "Revive Test");
+    await mcpUpdateDocument(storage, "nodes/test-revive", { status: "rejected" });
+    const revived = await mcpUpdateDocument(storage, "nodes/test-revive", {
+      status: "draft",
+    });
+    expect(revived.status).toBe("draft");
+
+    const republished = await mcpUpdateDocument(storage, "nodes/test-revive", {
+      body: "Back from the dead",
+    });
+    expect(republished.status).toBe("published");
+    expect(republished.version).toBeGreaterThanOrEqual(2);
+  });
+
+  it("approved path does NOT cut a new version", async () => {
+    await createDocument(storage, "nodes/test-approved-path", "Approved Path");
+    const beforeHistory = await storage.readHistory("nodes/test-approved-path");
+    const beforeVersions = beforeHistory!.versions.length;
+    const result = await mcpUpdateDocument(storage, "nodes/test-approved-path", {
+      status: "reviewed", // alias → approved
+    });
+    expect(result.status).toBe("approved");
+    const afterHistory = await storage.readHistory("nodes/test-approved-path");
+    expect(afterHistory!.versions.length).toBe(beforeVersions);
+  });
+
+  it("unknown status falls back to draft (silent normalize, metadata-only)", async () => {
+    await createDocument(storage, "nodes/test-unknown-status", "Unknown");
+    const result = await mcpUpdateDocument(storage, "nodes/test-unknown-status", {
+      status: "garbage_status_value",
+    });
+    // garbage normalizes to "draft" → metadata-only path, no version cut,
+    // doc stays draft.
+    expect(result.status).toBe("draft");
+  });
+});
+

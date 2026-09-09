@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "contextnest",
+  "displayName": "Context Nest",
+  "version": "0.5.1",
+  "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
+  "author": { "name": "PromptOwl" },
+  "homepage": "https://github.com/promptowl/contextnest",
+  "repository": "https://github.com/promptowl/contextnest",
+  "license": "AGPL-3.0",
+  "keywords": ["context", "knowledge-base", "rag", "memory", "contextnest"],
+  "userConfig": {
+    "retrieval_mode": {
+      "type": "string",
+      "title": "Retrieval effort",
+      "description": "How much context to auto-inject on each prompt: off | search (cheap full-text) | query (graph) | agent (full reasoning).",
+      "default": "search"
+    },
+    "capture_mode": {
+      "type": "string",
+      "title": "Capture behaviour",
+      "description": "What happens when the plugin spots something worth keeping: off (never, use /contextnest:capture) | propose (review and propose in one line, write only once you agree) | auto (write unattended). Supersedes auto_capture.",
+      "default": "propose"
+    },
+    "auto_capture": {
+      "type": "boolean",
+      "title": "Auto-capture knowledge (deprecated)",
+      "description": "Deprecated — use capture_mode. Kept so existing installs keep working: true maps to propose, false maps to off. capture_mode wins when both are set.",
+      "default": true
+    },
+    "vault": {
+      "type": "string",
+      "title": "Pinned vault alias",
+      "description": "Always use this registered vault. Leave empty to let the agents pick the relevant vault(s) automatically.",
+      "default": ""
+    },
+    "ctx_command": {
+      "type": "string",
+      "title": "ctx binary",
+      "description": "Command used to invoke the Context Nest CLI. Falls back to `npx -y @promptowl/contextnest-cli` if not found.",
+      "default": "ctx"
+    }
+  }
+}
