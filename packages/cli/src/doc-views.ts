@@ -1,3 +1,5 @@
+import chalk from "./color.js";
+
 /**
  * Shared view shapes and formatting for commands that run against BOTH a
  * local vault and a remote nest.
@@ -70,14 +72,75 @@ export function queryJsonPayload(p: {
   };
 }
 
+/** One hit of `context_search`, as the CLI renders it. */
+export interface SearchHitView {
+  id: string;
+  title: string;
+  description?: string;
+  type?: string;
+  /** BM25 relevance score; absent from a remote nest running an older engine. */
+  score?: number;
+}
+
 /** One entry of `ctx search --json`. */
-export function searchJsonEntry(d: { id: string; title: string; description?: string; type?: string }) {
+export function searchJsonEntry(d: SearchHitView) {
   return {
     id: d.id,
     title: d.title,
     description: d.description,
     type: d.type || "document",
+    ...(typeof d.score === "number" ? { score: d.score } : {}),
   };
+}
+
+/** `ctx search` prints this many hits unless `--limit` says otherwise. */
+export const DEFAULT_SEARCH_LIMIT = 10;
+
+/**
+ * Turn the parsed `--limit` value into the `limit` sent to `context_search`:
+ * absent → the default; `0` → undefined, i.e. everything; `n` → `n`.
+ * The option parser rejects anything else before it gets here; this guard
+ * only keeps a programmatic caller honest.
+ */
+export function searchLimit(raw: number | undefined): number | undefined {
+  if (raw === undefined) return DEFAULT_SEARCH_LIMIT;
+  if (!Number.isInteger(raw) || raw < 0) {
+    throw new Error("--limit must be 0 or a positive integer.");
+  }
+  return raw > 0 ? raw : undefined;
+}
+
+/**
+ * Render `context_search` output, local or remote. Hits arrive best-first;
+ * when `total` says the list was cut, a footer names the remainder (on
+ * stderr in `--json` mode so stdout stays a parseable array).
+ */
+export function printSearchResults(
+  out: { results: SearchHitView[]; total?: number },
+  opts: { json?: boolean },
+): void {
+  const { results } = out;
+  const total = out.total ?? results.length;
+  const more = Math.max(0, total - results.length);
+  const footer = `… ${more} more — raise --limit (0 = all)`;
+  if (opts.json) {
+    console.log(JSON.stringify(results.map(searchJsonEntry), null, 2));
+    if (more > 0) console.error(chalk.dim(footer));
+    return;
+  }
+  if (results.length === 0) {
+    console.log(chalk.yellow("No results found."));
+    return;
+  }
+  console.log(
+    chalk.bold(
+      more > 0 ? `Top ${results.length} of ${total} result(s):\n` : `${results.length} result(s):\n`,
+    ),
+  );
+  for (const doc of results) {
+    console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+  }
+  if (more > 0) console.log(chalk.dim(`\n${footer}`));
 }
 
 /** Derive a display title from a doc id leaf: "nodes/foo-bar" → "Foo Bar". */

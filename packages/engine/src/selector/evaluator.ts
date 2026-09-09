@@ -24,7 +24,17 @@ export async function evaluate(
   const allDocs = options.resolver.getAllDocuments();
 
   const resultIds = await evaluateNode(node, allDocs, options);
-  return allDocs.filter((d) => resultIds.has(d.id));
+  // Walk the result set, not `allDocs`: a Set keeps insertion order, and for
+  // a `contextnest://search/…` URI that order is the resolver's relevance
+  // ranking. Filtering `allDocs` re-sorted every hit into discovery (id)
+  // order, which is how `ctx search` came to print alphabetically.
+  const byId = new Map(allDocs.map((d) => [d.id, d] as const));
+  const out: ContextNode[] = [];
+  for (const id of resultIds) {
+    const doc = byId.get(id);
+    if (doc) out.push(doc);
+  }
+  return out;
 }
 
 async function evaluateNode(

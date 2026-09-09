@@ -6,14 +6,18 @@ import type {
   ContextNode,
   ContextYaml,
   ContextYamlDocument,
-  RelationshipEdge,
   HubEntry,
   ExternalServer,
   NestConfig,
   Checkpoint,
 } from "./types.js";
-import { buildRelationships } from "./inline.js";
+import { buildRelationshipsWithStats, type RelationshipStats } from "./inline.js";
 import { stripTagPrefix } from "./parser.js";
+
+export interface GenerateContextYamlOptions {
+  namespace?: string;
+  federation?: "none" | "federated" | "scoped";
+}
 
 /**
  * Generate context.yaml from the current vault state.
@@ -22,11 +26,24 @@ export function generateContextYaml(
   publishedDocuments: ContextNode[],
   config: NestConfig | null,
   latestCheckpoint: Checkpoint | null,
-  options: {
-    namespace?: string;
-    federation?: "none" | "federated" | "scoped";
-  } = {},
+  options: GenerateContextYamlOptions = {},
 ): ContextYaml {
+  return generateContextYamlWithStats(publishedDocuments, config, latestCheckpoint, options)
+    .contextYaml;
+}
+
+/**
+ * Same as `generateContextYaml`, plus how the relationship edge list was
+ * built (`ctx index` prints it). Every index path — `ctx index`,
+ * `storage.regenerateIndex()` after a write, and the query engine's
+ * auto-index — comes through here, so they cannot disagree on edges.
+ */
+export function generateContextYamlWithStats(
+  publishedDocuments: ContextNode[],
+  config: NestConfig | null,
+  latestCheckpoint: Checkpoint | null,
+  options: GenerateContextYamlOptions = {},
+): { contextYaml: ContextYaml; stats: RelationshipStats } {
   // Build documents array
   const documents: ContextYamlDocument[] = publishedDocuments.map((doc) => {
     const entry: ContextYamlDocument = {
@@ -77,7 +94,7 @@ export function generateContextYaml(
   });
 
   // Build relationships edge list, applying explicit edge priorities from frontmatter
-  const relationships: RelationshipEdge[] = buildRelationships(publishedDocuments);
+  const { edges: relationships, stats } = buildRelationshipsWithStats(publishedDocuments);
 
   // Apply explicit edge_priority from document metadata
   const priorityByDocId = new Map<string, number>();
@@ -135,7 +152,7 @@ export function generateContextYaml(
 
   const now = new Date().toISOString();
 
-  return {
+  const contextYaml: ContextYaml = {
     version: 1,
     generated_at: now,
     checkpoint: latestCheckpoint?.checkpoint ?? 0,
@@ -151,4 +168,6 @@ export function generateContextYaml(
       mcp_servers: mcpServers,
     },
   };
+
+  return { contextYaml, stats };
 }

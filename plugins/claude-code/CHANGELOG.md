@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.3
+
+Keep the sweep-check whole now that `ctx search` caps its output.
+
+- **The sweep no longer under-reports.** `ctx search` returns 10 hits by
+  default since CLI 2.5.0, so the sweep-check's full-text channel saw at most
+  ten candidates while still reporting `truncated: false`. It now passes an
+  explicit `--limit` covering the whole scan budget.
+- The retrieval prompt and the curator agent describe the new ranked, capped
+  search, so the agent knows to raise `--limit` itself.
+
+## 0.5.2
+
+Auto-retrieval searches the vault you are standing in first, and stops
+injecting nodes from vaults you never meant to search.
+
+- **The working-directory vault is searched first.** `vaultTargets()` fanned
+  out across the first five registry entries, in registry order, and never
+  looked at the vault in the working directory once the registry was
+  non-empty. A session inside an unregistered vault got every prompt answered
+  with six nodes from a demo vault instead. Targets now resolve as: pinned
+  alias (if registered) → the vault `ctx vault which` finds from the cwd → the
+  registry, capped at five in total. The cwd vault is searched with no
+  `--vault` flag, so ctx resolves it locally and its hits are cited as a bare
+  `id`. When that same directory is also registered, it is searched once, by
+  its alias, still first — a hit keeps a citable `alias:id` and is never
+  listed twice.
+- **Missing and scratch vaults are skipped.** Registry entries whose path is
+  gone (`exists: false`) or lives under the OS temp directory — the throwaway
+  vaults agents `ctx init` while testing — are no longer fanned out to. A cwd
+  vault or a pin is a deliberate choice and is never filtered.
+- **SessionStart names the working-directory vault** and whether it is
+  registered, so "which vault is this session using?" is answered up front.
+- Needs a CLI that knows `ctx vault which --json` (any release after
+  2.3.0); an older CLI simply behaves as before, minus the cwd-first step.
+
 ## 0.5.1
 
 Retrieval worked on paper and returned nothing on Windows, and returned too
