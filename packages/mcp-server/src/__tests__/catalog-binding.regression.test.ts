@@ -65,11 +65,15 @@ async function freshVault(): Promise<string> {
   return dir;
 }
 
-async function connect(vaultPath: string): Promise<Client> {
+async function connect(
+  vaultPath: string,
+  extraEnv: Record<string, string> = {},
+): Promise<Client> {
   const env: Record<string, string> = { CONTEXTNEST_VAULT_PATH: vaultPath };
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
+  Object.assign(env, extraEnv);
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [SERVER_ENTRY],
@@ -588,5 +592,72 @@ describe("[regression] catalog binding — structured error contract", () => {
 
     const getErr = await callError(client, "context_get", { id: "nodes/retired-probe" });
     expect(getErr.code).toBe("REJECTED_DOCUMENT");
+  });
+});
+
+
+// ─── Attribution is optional ────────────────────────────────────────────────
+
+describe("[regression] catalog binding — attribution is optional", () => {
+  let vault: string;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+  });
+  afterAll(async () => {
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("records nothing when CONTEXTNEST_NO_ATTRIBUTION=1", async () => {
+    const client = await connect(vault, { CONTEXTNEST_NO_ATTRIBUTION: "1" });
+    try {
+      const created = await callJson(client, "context_create", {
+        title: "Opted Out",
+        content: "body",
+      });
+      const versions = await callJson(client, "context_versions", { id: created.id });
+      // Absent, not an empty object: "not attributed" and "attributed to
+      // nobody" are different claims, and history should only make the first.
+      expect(versions.versions.at(-1)).not.toHaveProperty("client");
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("still honours a caller's own client when the server adds none", async () => {
+    // Opting the SERVER out is not a gag order on the caller — a client that
+    // deliberately sends attribution has chosen to record it.
+    const client = await connect(vault, { CONTEXTNEST_NO_ATTRIBUTION: "1" });
+    try {
+      const created = await callJson(client, "context_create", {
+        title: "Caller Insisted",
+        content: "body",
+        client: { agent: "explicit-agent" },
+      });
+      const versions = await callJson(client, "context_versions", { id: created.id });
+      expect(versions.versions.at(-1)!.client).toEqual({ agent: "explicit-agent" });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("lets CONTEXTNEST_AGENT / CONTEXTNEST_SESSION_ID override what the connection reports", async () => {
+    const client = await connect(vault, {
+      CONTEXTNEST_AGENT: "operator-named",
+      CONTEXTNEST_SESSION_ID: "s-operator",
+    });
+    try {
+      const created = await callJson(client, "context_create", {
+        title: "Operator Named",
+        content: "body",
+      });
+      const versions = await callJson(client, "context_versions", { id: created.id });
+      expect(versions.versions.at(-1)!.client).toEqual({
+        agent: "operator-named",
+        session_id: "s-operator",
+      });
+    } finally {
+      await client.close();
+    }
   });
 });

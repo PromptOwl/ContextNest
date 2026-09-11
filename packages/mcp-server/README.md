@@ -135,12 +135,29 @@ A write that publishes records it on the version-history entry it seals, so
 `context_versions` can answer *which agent wrote v7, in which session*; a graph
 read stamps it on the access traces it emits.
 
+**Every field is optional** — `client` itself, and `agent`/`session_id` within
+it. Send none, one, or all.
+
 **You usually do not need to send it.** The server fills both fields from what
 the connection already tells it: `agent` from the `clientInfo.name` in your
 `initialize` handshake, and `session_id` from a per-process id — over stdio one
 server process is one client connection, so every call sharing that id really
 did come from one session. Anything you send wins, merged **per key**: supply
 just `agent` and you keep it while still getting a session id.
+
+| Env var | Effect |
+|---------|--------|
+| `CONTEXTNEST_NO_ATTRIBUTION=1` | Server derives nothing; nothing is recorded unless a caller sends its own `client` |
+| `CONTEXTNEST_AGENT` | Overrides the `agent` the handshake reports |
+| `CONTEXTNEST_SESSION_ID` | Overrides the per-process session id |
+
+Precedence per key: **caller > env > connection.** With attribution off and no
+caller value, the `client` key is left off the record entirely rather than
+written as `{}` — "not attributed" and "attributed to nobody" are different
+claims, and history should only make the first. The opt-out matters because
+what gets derived lands in an append-only history: an operator who does not
+want their client's name recorded in a vault needs to say so before the first
+write, not scrub it after.
 
 It is a label, never an identity claim — `clientInfo.name` is your self-report,
 the server authenticates neither, and it never authorizes from either — and it

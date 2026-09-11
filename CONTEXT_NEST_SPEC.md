@@ -1476,7 +1476,11 @@ sessions, cannot attribute either from the record alone: `edited_by` names a
 person or a service account, and a read leaves no author at all.
 
 Every read and every write operation SHOULD therefore accept an optional
-`client` object describing the CALL:
+`client` object describing the CALL. Every part of it is optional — the object,
+and each field within it. An implementation MUST NOT require `agent`,
+`session_id`, or the object itself, and MUST NOT reject a call that omits them:
+attribution is evidence a caller offers, not a toll it pays. An unattributed
+call is a valid call.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1538,6 +1542,16 @@ A binding MUST NOT invent a value it cannot stand behind. Where the transport
 knows nothing — a REST call with no session concept — the field is better absent
 than filled with a placeholder, because a reader cannot tell a synthesized value
 from a real one.
+
+For the same reason, a record with no attribution MUST omit `client` rather than
+store an empty object: "not attributed" and "attributed to nobody" are different
+claims, and only the first is true.
+
+A binding that derives defaults SHOULD let an operator turn that off. What a
+binding derives is written to an append-only history, so consent has to be
+available before the first write — there is no later pass to remove it. Turning
+derivation off MUST NOT discard a `client` a caller sent explicitly; that is the
+caller's own record to make.
 
 Defaults do not change the trust level of anything in §9.4: `clientInfo.name` is
 a client's self-report, exactly like a caller-supplied `agent`, and neither is

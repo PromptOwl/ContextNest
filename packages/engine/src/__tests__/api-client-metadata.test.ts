@@ -59,6 +59,27 @@ describe("client metadata — catalog surface", () => {
     }
   });
 
+  it("never requires `client`, nor any field inside it", () => {
+    // Attribution is evidence a caller offers, not a toll it pays (spec §9.4).
+    // Pinned as a contract because the easy mistake is the opposite: a schema
+    // that quietly makes agent mandatory breaks every existing caller.
+    for (const op of listOperations("core")) {
+      const schema = inputJsonSchema(op) as {
+        required?: string[];
+        properties?: Record<string, { required?: string[] }>;
+      };
+      expect(schema.required ?? [], `${op.name} requires client`).not.toContain("client");
+      expect(
+        schema.properties?.client?.required ?? [],
+        `${op.name} requires fields inside client`,
+      ).toEqual([]);
+    }
+    // Every partial shape validates, including the empty object.
+    for (const shape of [{}, { agent: "a" }, { session_id: "s" }, { workspace: "acme" }]) {
+      expect(clientMetadataSchema.safeParse(shape).success, JSON.stringify(shape)).toBe(true);
+    }
+  });
+
   it("does not collide with the frontmatter `metadata` argument", () => {
     // Both exist on context_create and mean opposite things: `metadata` lands in
     // the document, `client` describes the call that wrote it.

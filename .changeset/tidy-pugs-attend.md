@@ -19,10 +19,17 @@ A write that publishes records it on the version-history entry it seals, so
 read stamps it on the §9.2 access traces it emits; every other operation hands
 it to extension `authorize` / `onResult` hooks.
 
+Everything about it is optional: the object, and each field within it. No
+operation requires it, and an unattributed call is a valid call.
+
 **MCP** fills both fields from the connection when the caller sends none —
 `agent` from the `initialize` handshake's `clientInfo.name`, `session_id` from a
 per-process id (over stdio, one process is one client connection). Caller values
-win, merged per key, so supplying only `agent` still gains a session id.
+win, merged per key, so supplying only `agent` still gains a session id. Set
+`CONTEXTNEST_NO_ATTRIBUTION=1` to derive nothing, or `CONTEXTNEST_AGENT` /
+`CONTEXTNEST_SESSION_ID` to override what the connection reports — precedence
+per key is caller > env > connection. With nothing to record, `client` is left
+off the record entirely rather than written as `{}`.
 
 **CLI** gains three global flags: `--agent <name>`, `--session <id>` and a
 repeatable `--client <key=value>`, with `CONTEXTNEST_AGENT` /

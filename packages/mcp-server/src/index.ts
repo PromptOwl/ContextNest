@@ -125,19 +125,37 @@ function opCtx(): OperationContext {
 const MCP_SESSION_ID = `mcp-${randomUUID()}`;
 
 /**
+ * Whether the server derives attribution at all.
+ *
+ * Set CONTEXTNEST_NO_ATTRIBUTION=1 to turn it off. This is a real opt-out, not
+ * a tidiness knob: what the server derives is written into an append-only
+ * version history, so an operator who does not want their MCP client's name
+ * recorded in a vault permanently needs a way to say so BEFORE the first write,
+ * not a way to scrub it after. A caller that sends its own `client` is still
+ * honoured — that is the caller's choice to record, not ours to strip.
+ */
+const ATTRIBUTION_ENABLED = process.env.CONTEXTNEST_NO_ATTRIBUTION !== "1";
+
+/**
  * Attribution derived from the MCP `initialize` handshake, for calls that
  * supply none of their own. `clientInfo.name` is the client's self-report, the
  * same trust level as a caller-supplied `agent` — which is why neither is ever
  * used to authorize.
  *
+ * CONTEXTNEST_AGENT / CONTEXTNEST_SESSION_ID override what the connection
+ * reports, matching the CLI's env vars so an operator names the agent the same
+ * way on both surfaces. A caller's own value still beats both.
+ *
  * Read per call rather than cached: the handshake completes after this module
  * is evaluated, so a value captured at load time would always be undefined.
  */
 function defaultClient(): Record<string, string> {
+  if (!ATTRIBUTION_ENABLED) return {};
   const info = server.server.getClientVersion();
+  const agent = process.env.CONTEXTNEST_AGENT || info?.name;
   return {
-    ...(info?.name ? { agent: info.name } : {}),
-    session_id: MCP_SESSION_ID,
+    ...(agent ? { agent } : {}),
+    session_id: process.env.CONTEXTNEST_SESSION_ID || MCP_SESSION_ID,
   };
 }
 
@@ -154,10 +172,16 @@ function withClientDefaults(input: Record<string, unknown>): Record<string, unkn
   if (supplied !== undefined && (typeof supplied !== "object" || supplied === null || Array.isArray(supplied))) {
     return input;
   }
-  return {
-    ...input,
-    client: { ...defaultClient(), ...(supplied as Record<string, unknown> | undefined) },
-  };
+  const merged = { ...defaultClient(), ...(supplied as Record<string, unknown> | undefined) };
+  // No defaults and nothing supplied: leave `client` OFF the input entirely
+  // rather than sending `{}`. An empty object would write an empty `client:`
+  // key into history, which reads as "attributed to nobody" instead of "not
+  // attributed" — and the field is optional precisely so absence stays sayable.
+  if (Object.keys(merged).length === 0) {
+    const { client: _client, ...rest } = input;
+    return rest;
+  }
+  return { ...input, client: merged };
 }
 
 function toolResult(payload: unknown) {
