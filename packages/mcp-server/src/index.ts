@@ -937,6 +937,9 @@ tool(
         result = await publishDocument(storage, id, {
           editedBy: "mcp@contextnest.local",
           note: "Created via MCP server",
+          // Derived attribution only — the legacy tools take no `client` of
+          // their own (additive parity with the catalog tools, per CLAUDE.md).
+          client: defaultClient(),
         });
       } catch (err) {
         try {
@@ -1167,6 +1170,7 @@ tool(
       const result = await publishDocument(storage, id, {
         editedBy: "mcp@contextnest.local",
         note: "Updated via MCP server",
+        client: defaultClient(),
       });
 
       await regenerateIndex();
@@ -1246,6 +1250,7 @@ tool(
       const result = await publishDocument(storage, id, {
         editedBy: author,
         note,
+        client: defaultClient(),
       });
 
       await regenerateIndex();

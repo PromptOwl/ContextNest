@@ -15,7 +15,11 @@ import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { computeChainHash } from "../integrity.js";
-import { clientMetadataSchema, CLIENT_METADATA_MAX_CUSTOM_KEYS } from "../schemas.js";
+import {
+  clientMetadataSchema,
+  versionEntrySchema,
+  CLIENT_METADATA_MAX_CUSTOM_KEYS,
+} from "../schemas.js";
 import {
   createEngineApi,
   inputJsonSchema,
@@ -110,6 +114,34 @@ describe("client metadata — validation bounds", () => {
 
   it("rejects an over-long value", () => {
     expect(clientMetadataSchema.safeParse({ agent: "x".repeat(513) }).success).toBe(false);
+  });
+
+  it("bounds custom key NAMES too — empty or over-long keys are refused", () => {
+    // Keys land in the same append-only trail as values; an unbounded key is
+    // the same bloat vector with a different spelling.
+    for (const key of ["", "   ", "x".repeat(513)]) {
+      expect(clientMetadataSchema.safeParse({ [key]: "v" }).success, JSON.stringify(key)).toBe(
+        false,
+      );
+    }
+    expect(clientMetadataSchema.safeParse({ ["x".repeat(512)]: "v" }).success).toBe(true);
+  });
+
+  it("stays lenient on READ so an input-side tightening can never quarantine a chain", () => {
+    // versionEntrySchema is what storage validates history.yaml against, and a
+    // failure there is CorruptHistoryError → historyOrRepair restarts the chain.
+    // An entry carrying a client the INPUT schema would now refuse must still
+    // load: the annotation is not hashed, so it cannot be allowed to break one.
+    const entry = {
+      version: 1,
+      edited_by: "someone",
+      edited_at: "2026-01-01T00:00:00.000Z",
+      content_hash: `sha256:${"a".repeat(64)}`,
+      chain_hash: `sha256:${"b".repeat(64)}`,
+      client: { sessionId: "near-miss", ["k".repeat(600)]: "long key" },
+    };
+    expect(clientMetadataSchema.safeParse(entry.client).success).toBe(false);
+    expect(versionEntrySchema.safeParse(entry).success).toBe(true);
   });
 
   it("rejects a near-miss on a reserved key rather than filing it as custom", () => {

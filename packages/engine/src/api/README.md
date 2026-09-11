@@ -97,7 +97,7 @@ Three things it is not:
   mean opposite things, which is why they cannot share a name.
 
 Bounded on purpose (`clientMetadataSchema` in `schemas.ts`): values are scalars
-of at most 512 chars, and at most 16 custom keys beyond the reserved two.
+of at most 512 chars, key names likewise, and at most 16 custom keys beyond the reserved two.
 It is written into an append-only audit trail by a caller we do not trust.
 
 ## Public API

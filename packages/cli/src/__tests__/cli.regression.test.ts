@@ -45,6 +45,10 @@ const ENV = {
   // Neutralize any ambient selectors so resolution is deterministic.
   CONTEXTNEST_VAULT: "",
   CONTEXTNEST_VAULT_PATH: "",
+  // Likewise ambient attribution — the "no client block" assertions depend on
+  // nothing being supplied. Empty is falsy in buildCallClient.
+  CONTEXTNEST_AGENT: "",
+  CONTEXTNEST_SESSION_ID: "",
 } as NodeJS.ProcessEnv;
 
 /** Run the CLI and return stdout. Throws on a non-zero exit. */
@@ -1813,18 +1817,22 @@ describe("[regression] caller attribution — --agent / --session / --client", (
   });
 
   it("rejects a malformed --client pair instead of recording a broken key", () => {
-    const res = runCtxResult(dir, [
-      "add",
-      "nodes/bad-pair",
-      "--title",
-      "Bad Pair",
-      "--body",
-      "body",
-      "--client",
-      "no-equals-sign",
-    ]);
-    expect(res.status).not.toBe(0);
-    expect(res.stderr).toMatch(/expected key=value/);
+    // `" =v"` has an `=` past position 0 but no key once trimmed — it used to
+    // slip through and record an empty key.
+    for (const pair of ["no-equals-sign", "=value", " =value"]) {
+      const res = runCtxResult(dir, [
+        "add",
+        "nodes/bad-pair",
+        "--title",
+        "Bad Pair",
+        "--body",
+        "body",
+        "--client",
+        pair,
+      ]);
+      expect(res.status, JSON.stringify(pair)).not.toBe(0);
+      expect(res.stderr).toMatch(/expected key=value/);
+    }
   });
 
   it("attributes reads too, not only writes", () => {

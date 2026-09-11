@@ -75,6 +75,11 @@ async function connect(
     if (typeof v === "string") env[k] = v;
   }
   delete env.CTX_NEST_HOME;
+  // A developer's ambient attribution would otherwise leak into the "derived
+  // from the handshake" assertions below.
+  delete env.CONTEXTNEST_AGENT;
+  delete env.CONTEXTNEST_SESSION_ID;
+  delete env.CONTEXTNEST_NO_ATTRIBUTION;
   env.CONTEXTNEST_VAULT_PATH = vaultPath;
   // Last, so a test's own override beats both the inherited environment and
   // the vault path set just above.
@@ -420,6 +425,21 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
     const recorded = versions.versions.at(-1)!.client;
     expect(recorded.agent).toBe("catalog-regression-test");
     expect(recorded.session_id).toMatch(/^mcp-[0-9a-f-]{36}$/);
+  });
+
+  it("derives the same attribution for the deprecated write tools", async () => {
+    // create_document / update_document / publish_document call publishDocument
+    // directly, bypassing runOp. Without this, a client still on the legacy
+    // tools writes unattributed history while the catalog tools are attributed.
+    await callJson(client, "create_document", { path: "nodes/legacy-attributed", title: "Legacy" });
+    await callJson(client, "update_document", { path: "nodes/legacy-attributed", title: "Legacy v2" });
+    await callJson(client, "publish_document", { path: "nodes/legacy-attributed" });
+    const versions = await callJson(client, "context_versions", { id: "nodes/legacy-attributed" });
+    expect(versions.versions).toHaveLength(3);
+    for (const v of versions.versions) {
+      expect(v.client.agent).toBe("catalog-regression-test");
+      expect(v.client.session_id).toMatch(/^mcp-/);
+    }
   });
 
   it("lets a caller override the defaults per key, not all-or-nothing", async () => {

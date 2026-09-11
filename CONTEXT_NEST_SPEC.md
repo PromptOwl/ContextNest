@@ -1538,7 +1538,7 @@ appearing to succeed. Reject it and name the intended key.
 
 Custom keys and reserved keys share one namespace and travel together in the
 same object. An implementation SHOULD bound the number of custom keys and the
-length of every value, and SHOULD restrict values to scalars.
+length of every key and every value, and SHOULD restrict values to scalars.
 
 #### 9.4.2 Binding conventions
 

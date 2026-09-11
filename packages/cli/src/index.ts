@@ -336,11 +336,12 @@ function buildCallClient(opts: {
     // Split on the FIRST `=` only — a value may legitimately contain one
     // (a URL, a base64 fragment), and splitting on every one would truncate it.
     const eq = pair.indexOf("=");
-    if (eq <= 0) {
+    const key = eq > 0 ? pair.slice(0, eq).trim() : "";
+    // `" =v"` has an `=` past position 0 but no key once trimmed.
+    if (!key) {
       console.error(chalk.red(`Invalid --client "${pair}" — expected key=value`));
       process.exit(1);
     }
-    const key = pair.slice(0, eq).trim();
     // Recorded as a STRING, always. Coercing digits to numbers would silently
     // rewrite `version=1.0` as 1 and `build=007` as 7 — a shell argument is
     // text, and an audit record that quietly loses characters is worse than one

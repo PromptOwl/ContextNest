@@ -363,6 +363,16 @@ export const clientMetadataSchema = z
     // open catchall cannot catch on its own, and the caller cannot see it
     // happen. Naming the intended key is cheaper than auditing the miss later.
     for (const key of custom) {
+      // Key NAMES are bounded like values: they land in the same append-only
+      // trail, and an empty key is unreadable in history.yaml.
+      if (key.trim().length === 0 || key.length > CLIENT_METADATA_MAX_VALUE_LENGTH) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `client metadata keys must be non-empty and at most ${CLIENT_METADATA_MAX_VALUE_LENGTH} chars`,
+        });
+        continue;
+      }
       const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
       const collision = CLIENT_METADATA_RESERVED_KEYS.find(
         (r) => r.replace(/[^a-z0-9]/g, "") === normalized,
@@ -388,7 +398,13 @@ export const versionEntrySchema = z.object({
   content_hash: z.string().regex(CHECKSUM_PATTERN),
   chain_hash: z.string().regex(CHECKSUM_PATTERN),
   // Annotation, not chained evidence — see VersionEntry.client in types.ts.
-  client: clientMetadataSchema.optional(),
+  // Lenient on READ, deliberately: the input bounds above are enforced when a
+  // caller sends the block, not when a history is loaded. Reusing them here
+  // would let a future tightening (or a hand-edited entry) fail
+  // documentHistorySchema, which storage raises as CorruptHistoryError and
+  // historyOrRepair answers by quarantining the file and restarting the chain
+  // — a whole chain lost over an annotation that is not even hashed.
+  client: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 
 export const documentHistorySchema = z.object({

@@ -218,7 +218,6 @@ CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 ### Index & Agent Configs
 - `ctx index` — Regenerate context.yaml, INDEX.md, and agent config files (CLAUDE.md, GEMINI.md, .cursorrules, .windsurfrules, .github/copilot-instructions.md)
 
-
 ## Upgrading to 2.0
 
 Your vault files are untouched — no migration to run. Behaviour that changes:
