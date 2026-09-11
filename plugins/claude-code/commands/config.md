@@ -15,7 +15,8 @@ Settings and valid values:
 | Key | Values | Meaning |
 |-----|--------|---------|
 | `retrieval_mode` | `off` \| `search` \| `query` \| `agent` | Retrieval effort per prompt |
-| `auto_capture` | `true` \| `false` | Persist new knowledge at end of turn |
+| `capture_mode` | `off` \| `propose` \| `auto` | What happens when something looks worth keeping |
+| `auto_capture` | `true` \| `false` | **Deprecated** — superseded by `capture_mode` (`true`→`propose`, `false`→`off`) |
 | `vault` | registered vault alias, or `""` to unpin | Pinned vault |
 | `ctx_command` | any command string | Override the `ctx` binary |
 
@@ -36,10 +37,15 @@ rather than making the user remember and type an exact string.
 ### Step 1 — always show current effective settings first
 
 Read both override files (if present) and the
-`CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE`, `CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE`,
-`CLAUDE_PLUGIN_OPTION_VAULT`, `CLAUDE_PLUGIN_OPTION_CTX_COMMAND` environment
-variables, then present a small table: each setting, its effective value, and
-which layer it came from (project file / user file / enable-time / default).
+`CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE`, `CLAUDE_PLUGIN_OPTION_CAPTURE_MODE`,
+`CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE`, `CLAUDE_PLUGIN_OPTION_VAULT`,
+`CLAUDE_PLUGIN_OPTION_CTX_COMMAND` environment variables, then present a small
+table: each setting, its effective value, and which layer it came from (project
+file / user file / enable-time / default).
+
+When `capture_mode` is unset anywhere, show the value the legacy `auto_capture`
+maps to (`true`→`propose`, `false`→`off`, absent→`propose`) and label the layer
+as "auto_capture (deprecated)", so the effective behaviour is never a mystery.
 
 ### Step 2 — decide how the change is specified
 
@@ -52,12 +58,17 @@ the change interactively with `AskUserQuestion`:
 
 1. **Which setting** — if the user didn't already name one, ask which setting
    to change with one question whose options are `retrieval_mode`,
-   `auto_capture`, `vault`, `ctx_command` (label each with its current value).
+   `capture_mode`, `vault`, `ctx_command` (label each with its current value).
+   Don't offer `auto_capture` in the picker — it's deprecated; steer anyone who
+   names it to `capture_mode` instead.
 2. **Which value** — ask a follow-up whose options are that setting's choices:
    - `retrieval_mode` → `off`, `search`, `query`, `agent` (describe each:
      off = no injection, search = cheap full-text, query = graph, agent = full
      reasoning).
-   - `auto_capture` → `true`, `false`.
+   - `capture_mode` → `off` (never writes on its own; use
+     `/contextnest:capture`), `propose` (reviews the turn and proposes in one
+     line, writes only once you agree), `auto` (writes unattended, still behind
+     the capture ladder and the cooldown).
    - `vault` → enumerate the registered vault aliases by running
      `<ctx_command> vault list --json` (fall back to `ctx vault list --json`);
      offer each alias as an option (label it with its description), plus an
@@ -74,7 +85,10 @@ the change interactively with `AskUserQuestion`:
 
 1. Validate — the key must be one of the four, and its value must pass:
    - `retrieval_mode` → one of `off|search|query|agent` (case-insensitive).
+   - `capture_mode` → one of `off|propose|auto` (case-insensitive).
    - `auto_capture` → a boolean spelling: `true|1|yes|on` or `false|0|no|off`.
+     Still accepted for existing installs, but when someone sets it, write
+     `capture_mode` instead (`true`→`propose`, `false`→`off`) and tell them why.
    - `vault` → either the empty string `""` (unpin) or a registered alias.
      Check membership by running `<ctx_command> vault list --json` (fall back
      to `ctx vault list --json`); reject an alias that isn't registered and

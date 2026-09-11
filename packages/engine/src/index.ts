@@ -63,6 +63,7 @@ export {
   FederationNotSupportedError,
   ConfigError,
   UnknownAliasError,
+  NoVaultError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,
@@ -147,6 +148,7 @@ export {
   STATUSES,
   STATUS_ALIASES,
   TRANSPORTS,
+  sourceMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
   HASH_CHAIN_EVENT_TYPES,
@@ -157,6 +159,10 @@ export {
   CLIENT_METADATA_MAX_CUSTOM_KEYS,
   CLIENT_METADATA_MAX_VALUE_LENGTH,
 } from "./schemas.js";
+
+// Typed frontmatter blocks (source / skill) — see typed-blocks.ts
+export { applyTypedBlocks } from "./typed-blocks.js";
+export type { TypedBlockArgs } from "./typed-blocks.js";
 
 // Parser
 export {
@@ -178,6 +184,9 @@ export {
   isSuperseded,
 } from "./parser.js";
 
+// Engine version (baked in at build time; see version.ts).
+export { ENGINE_VERSION } from "./version.js";
+
 // Config
 export { parseConfig, parseSyntaxConfig } from "./config.js";
 export type { SyntaxConfig } from "./config.js";
@@ -193,10 +202,13 @@ export {
   getRegistryPath,
   readRegistry,
   isVaultRoot,
+  isRefusedCwd,
+  assertVaultRoot,
   findLocalVault,
   addVault,
   addRemote,
   removeVault,
+  pruneVaults,
   setDefaultVault,
   setVaultDescription,
   listVaults,
@@ -208,6 +220,8 @@ export type {
   AddVaultOptions,
   AddRemoteOptions,
   RemoveVaultResult,
+  PrunedVault,
+  PruneVaultsResult,
   VaultListEntry,
   VaultResolutionSource,
   ResolveVaultOptions,
@@ -227,8 +241,13 @@ export {
 export type { RemoteNestConnection } from "./remote-nest.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";
-export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
+export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId, normalizeFolder } from "./storage.js";
+export type {
+  LayoutMode,
+  ReadDocumentOptions,
+  CheckpointChainState,
+  FolderEntry,
+} from "./storage.js";
 
 // Document filtering — shared by context_list and by surfaces that filter a
 // document list they already hold.
@@ -249,15 +268,18 @@ export {
   extractMentions,
   countTasks,
   buildRelationships,
+  buildRelationshipsWithStats,
   buildBacklinks,
   extractSection,
 } from "./inline.js";
+export type { RelationshipStats } from "./inline.js";
 
 // Selector grammar
 export { tokenize } from "./selector/lexer.js";
 export type { Token, TokenType } from "./selector/lexer.js";
 export { parseSelector } from "./selector/parser.js";
 export type { SelectorNode } from "./selector/parser.js";
+export { SELECTOR_GRAMMAR, SELECTOR_FILTERS } from "./selector/grammar.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
 
@@ -267,6 +289,7 @@ export {
   extractWikiLinks,
   buildWikiTitleIndex,
   resolveWikiSeeds,
+  resolveWikiTarget,
   traverseWikiGraph,
 } from "./wiki-graph.js";
 export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
@@ -342,7 +365,8 @@ export {
 } from "./source-graph.js";
 
 // Index generation
-export { generateContextYaml } from "./index-generator.js";
+export { generateContextYaml, generateContextYamlWithStats } from "./index-generator.js";
+export type { GenerateContextYamlOptions } from "./index-generator.js";
 export { generateIndexMd } from "./index-md-generator.js";
 
 // Injection
@@ -358,6 +382,12 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+export {
+  slugifyImportPath,
+  isVersionArtifactPath,
+  sanitizeImportedFrontmatter,
+  sanitizeImportedTags,
+} from "./import-hygiene.js";
 export type { AgentConfigInput, AgentConfigFile } from "./agent-configs.js";
 
 // Tracing
@@ -365,3 +395,27 @@ export { TraceLogger } from "./tracing.js";
 
 // Chain event log (persistent governance audit trail)
 export { ChainEventLog } from "./chain-log.js";
+
+// Vault-hosted skills
+export {
+  HARNESSES,
+  INSTALL_SCOPES,
+  INSTALL_MODES,
+  NotASkillNodeError,
+  assertSkillNode,
+  skillNameFromPath,
+  substitutePlaceholders,
+  renderSkill,
+  buildInstallManifest,
+} from "./skills.js";
+export type {
+  Harness,
+  InstallScope,
+  InstallMode,
+  SkillSource,
+  RenderOptions,
+  RenderedSkill,
+  ManifestFile,
+  InstallManifest,
+} from "./skills.js";
+export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";

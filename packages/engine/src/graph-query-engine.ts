@@ -21,11 +21,11 @@ import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
 import { isPublished, isRetrievable } from "./parser.js";
-import { getLatestCheckpoint, getLatestCheckpointNumber } from "./checkpoint.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
+import { isVaultRoot } from "./registry.js";
 
 export interface GraphQueryOptions {
   /** Number of hops from seed nodes (default: 2) */
@@ -66,8 +66,11 @@ export class GraphQueryEngine {
     if (!full && !includeDrafts) {
       let contextYaml = await this.storage.readContextYaml();
 
-      // Auto-generate context.yaml if missing
-      if (!contextYaml) {
+      // Auto-generate context.yaml if missing — but only inside a real vault.
+      // A storage rooted at an arbitrary directory (the CLI's bare-cwd
+      // fallback, a mistyped path) must not have a context.yaml written into
+      // it: that is how a folder of repos ends up "indexed" as documents.
+      if (!contextYaml && isVaultRoot(this.storage.root)) {
         console.error("[ctx] No context.yaml found. Auto-indexing vault...");
         contextYaml = await this.autoIndex();
       }
@@ -139,9 +142,10 @@ export class GraphQueryEngine {
     // 5. Order source nodes topologically
     const orderedSourceNodes = orderSourceNodesTopologically(sourceNodes);
 
-    // 6. Log traces
-    const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
+    // 6. Log traces. Head only — a query runs on every retrieval, and loading
+    // the whole chain for one number made the hottest READ path pay the same
+    // O(chain size) cost the write path was just freed from.
+    const currentCheckpoint = await this.storage.readLatestCheckpointNumber();
 
     for (const doc of [...regularDocs, ...orderedSourceNodes]) {
       traceLogger.logAccess({
@@ -172,8 +176,11 @@ export class GraphQueryEngine {
     try {
       const docs = await this.storage.discoverDocuments();
       const config = await this.storage.readConfig();
-      const checkpointHistory = await this.storage.readCheckpointHistory();
-      const latestCheckpoint = getLatestCheckpoint(checkpointHistory);
+      // Throwing variant deliberately: this one PERSISTS the number into
+      // context.yaml, so a transient read must abandon the auto-index (the
+      // catch below) and retry on the next query, rather than baking in a
+      // checkpoint of 0 that survives until something else regenerates.
+      const latestCheckpoint = await this.storage.readLatestCheckpoint();
       const published = docs.filter(isPublished);
 
       const contextYaml = generateContextYaml(published, config, latestCheckpoint);
@@ -195,8 +202,8 @@ export class GraphQueryEngine {
     // never sees retired docs (parity with the graph-mode filter above).
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
-    const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
+    // Head only — same as graph mode; this is a read path stamping a trace.
+    const currentCheckpoint = await this.storage.readLatestCheckpointNumber();
 
     const resolver = new Resolver({ documents: docs });
     const packLoader = new PackLoader(packs);

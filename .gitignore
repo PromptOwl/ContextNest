@@ -20,3 +20,6 @@ coverage/
 # baseline is bench/budget.json, not any one run.
 packages/engine/bench/results-*.json
 packages/engine/bench/profiles/
+
+# Non-tmp sandbox used by init-register.test.ts (init must not auto-register under the OS temp dir)
+.tmp-test/

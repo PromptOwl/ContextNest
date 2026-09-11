@@ -249,6 +249,7 @@ Documents support the following inline constructs:
 | Construct | Syntax | Description |
 |-----------|--------|-------------|
 | Context link | `[Title](contextnest://path)` or `[Title](contextnest://path#section)` | Reference to another document or section (see §4) |
+| Wikilink | `[[Title]]`, `[[Title|alias]]`, `[[Title#anchor]]` or `[[nodes/id]]` | Reference to another document by title or path (Obsidian-compatible) |
 | Tag | `#tag` | Shared taxonomy label |
 | Mention | `@user` or `@team:name` | Attribution or team reference |
 | Task checkbox | `- [ ]` or `- [x]` | Embedded work item (GFM syntax) |
@@ -262,7 +263,15 @@ See [v2 snapshot](contextnest://engineering/api-design@7) for the pinned version
 See [Current Sprint Tickets](contextnest://sources/current-sprint-tickets) for live data.
 ```
 
-**Backlinks** — automatic tracking of what documents reference a given document — are maintained by the implementation by scanning all `contextnest://` hrefs across the nest. Backlinks apply equally to all node types including source nodes.
+**Wikilinks** use Obsidian's `[[...]]` syntax and resolve to the same `reference` edges as `contextnest://` links. A target resolves against document titles first (case-insensitively), then document paths; an alias after `|` and an anchor after `#` are display-only and do not affect resolution. A target that matches no published document produces no edge. Wikilinks inside fenced code blocks or inline code are ignored.
+
+```markdown
+See [[Architecture Overview]] for context.
+See [[API Design#Error Handling]] for the specific section.
+See [[nodes/api-design-guidelines|the guidelines]] for the same document by path.
+```
+
+**Backlinks** — automatic tracking of what documents reference a given document — are maintained by the implementation by scanning all `contextnest://` hrefs and `[[wikilinks]]` across the nest. Backlinks apply equally to all node types including source nodes.
 
 **Tags** in frontmatter use the `#` prefix: `tags: ["#api", "#security"]`. Obsidian users may omit the `#` in frontmatter — tools SHOULD normalize both formats.
 
@@ -672,6 +681,8 @@ Context Nest defines a composable query language for selecting documents. Select
 |--------|------|---------|
 | `#tag` | Tag | Nodes where `tags` array contains `#tag` |
 | `contextnest://path` | URI | Node at the given path (see §4) |
+| `nodes/<id>` | Bare node id | The node at `nodes/<id>` — shorthand for `contextnest://nodes/<id>` |
+| `sources/<id>` | Bare source id | The source node at `sources/<id>` — shorthand for `contextnest://sources/<id>` |
 | `contextnest://tag/{name}` | Tag URI | All nodes carrying the given tag |
 | `contextnest://folder/` | Folder URI | All nodes within the given folder |
 | `contextnest://search/{query}` | Search URI | Nodes matching a full-text search query |
@@ -708,6 +719,10 @@ ctx resolve "contextnest://tag/onboarding"
 
 # By document path
 ctx resolve "contextnest://engineering/api-design"
+
+# By bare node id — the same atom without the scheme
+ctx resolve "nodes/gtm/foo"
+ctx resolve "sources/jira"
 
 # By folder
 ctx resolve "contextnest://engineering/"
@@ -1084,7 +1099,7 @@ Each edge in the `relationships` list carries a `type` field:
 
 | Edge Type | Meaning | Derived From |
 |-----------|---------|-------------|
-| `reference` | One document links to another via a `contextnest://` href in its body | Inline context links (§1.7) |
+| `reference` | One document links to another via a `contextnest://` href or a `[[wikilink]]` in its body | Inline context links and wikilinks (§1.7) |
 | `depends_on` | A source node requires another source to be hydrated first | `source.depends_on` frontmatter (§1.9.1) |
 
 The `reference` type is the default. The `depends_on` type is automatically generated when a source node declares dependencies. A single pair of nodes may have both edge types if the source body also contains an inline link to its dependency (which is the recommended pattern per §1.9.4).

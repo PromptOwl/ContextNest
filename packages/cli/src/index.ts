@@ -6,8 +6,10 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
+import { homedir, tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { Command, Help } from "commander";
+import { fileURLToPath } from "node:url";
+import { Command, Help, InvalidArgumentError } from "commander";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 import chalk from "./color.js";
@@ -24,7 +26,9 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
-  generateContextYaml,
+  assertVaultRoot,
+  isRefusedCwd,
+  generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -44,6 +48,7 @@ import {
   addVault,
   addRemote,
   removeVault,
+  pruneVaults,
   setDefaultVault,
   setVaultDescription,
   listVaults,
@@ -56,6 +61,8 @@ import {
   normalizeDocumentId,
   isPublished,
   isRejected,
+  HARNESSES,
+  SELECTOR_GRAMMAR,
 } from "@promptowl/contextnest-engine";
 import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -74,7 +81,9 @@ import {
 import {
   listJsonEntry,
   queryJsonPayload,
-  searchJsonEntry,
+  searchLimit,
+  printSearchResults,
+  type SearchHitView,
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
@@ -90,6 +99,7 @@ import type {
   ClientMetadata,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
+import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
@@ -110,6 +120,13 @@ import {
   assertNotRedirected,
   NO_REDIRECT,
 } from "./safety.js";
+import {
+  asPendingConfirmation,
+  pollUntilDecided,
+  resolveTimeoutMs,
+  exitCodeFor,
+  type TerminalOutcome,
+} from "./push-confirm.js";
 
 /** Commander collector for repeatable `--client key=value` flags. */
 function collectClientPair(value: string, previous: string[]): string[] {
@@ -166,6 +183,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["init", "Create a new vault here (try --starter for a ready-made template)"],
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
+      ["doctor", "Check versions, the vault registry and the current directory for problems"],
     ],
   },
   {
@@ -408,6 +426,7 @@ const REGISTRY_WRITE_COMMANDS = new Set([
   "vault describe",
   "vault remove",
   "vault default",
+  "vault prune",
 ]);
 
 /** Full space-separated path of a command, e.g. `drift approve`. */
@@ -493,6 +512,12 @@ function getVaultRoot(): string {
   if (resolved.warning && resolved.source !== "local") {
     console.error(chalk.yellow(`Warning: ${resolved.warning}`));
   }
+  // The bare-cwd fallback is the only step that hands back an unvalidated
+  // directory. Refuse it here, centrally (NO_VAULT), so no command reads a
+  // folder of repos as documents or auto-indexes a context.yaml into it.
+  // `init` (getInitRoot) and the `vault *` registry commands never come
+  // through this helper. Same engine guard as the MCP server.
+  assertVaultRoot(resolved);
   resolvedVaultRoot = resolved.path;
   return resolvedVaultRoot;
 }
@@ -803,6 +828,41 @@ function slugifyAlias(name: string): string {
   return slug || "vault";
 }
 
+/**
+ * True when `dir` resolves to the OS temp dir or somewhere below it. Both sides
+ * go through realpath: on macOS `os.tmpdir()` is a symlink (/var → /private/var)
+ * and on Windows it can be an 8.3 short name, so a plain prefix test would say
+ * "not under tmp" for a directory that is.
+ */
+function isUnderTempDir(dir: string): boolean {
+  // realpath needs the path to exist, and `ctx init` is routinely pointed at a
+  // directory it is about to create. Resolve the nearest existing ancestor and
+  // re-append the rest, so the symlink expansion still happens: a plain
+  // resolve() fallback yields /var/folders/... against a /private/var/folders/...
+  // base on macOS, and the check silently answers "not under tmp".
+  const real = (p: string): string => {
+    let cur = pathMod.resolve(p);
+    const tail: string[] = [];
+    for (;;) {
+      try {
+        return pathMod.join(fs.realpathSync.native(cur), ...tail.reverse());
+      } catch {
+        const parent = pathMod.dirname(cur);
+        if (parent === cur) return pathMod.resolve(p);
+        tail.push(pathMod.basename(cur));
+        cur = parent;
+      }
+    }
+  };
+  let base = real(tmpdir());
+  let target = real(dir);
+  if (process.platform === "win32") {
+    base = base.toLowerCase();
+    target = target.toLowerCase();
+  }
+  return target === base || target.startsWith(base + pathMod.sep);
+}
+
 // Pick a default alias for `root` that doesn't collide with a different vault
 // already in the registry. Re-running init in the same directory reuses the
 // existing alias (idempotent); a clash with a *different* path gets a numeric
@@ -994,9 +1054,15 @@ program
   .description("Initialize a new Context Nest vault")
   .option("-l, --layout <mode>", "Layout mode: structured or obsidian", "structured")
   .option("-n, --name <name>", "Vault name", "My Context Nest")
-  .option("-s, --starter <recipe>", "Starter recipe: developer, executive, analyst, team, sales")
+  // Generated from the starter registry so the help text cannot drift from
+  // --list-starters (it did: `personal` was missing for a release).
+  .option("-s, --starter <recipe>", `Starter recipe: ${listStarters().map((s) => s.id).join(", ")}`)
   .option("--list-starters", "List available starter recipes")
   .option("--set-default", "Make the new vault the registry default")
+  .option(
+    "--register",
+    "Register the vault even when it lives under the OS temp dir (skipped there by default)",
+  )
   .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
   .action(async (opts) => {
     // List starters and exit
@@ -1033,10 +1099,19 @@ program
     let registerAlias = selectedVaultAlias;
     let registerDescription = opts.description as string | undefined;
     const canPrompt = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    // A vault under the OS temp dir is a scratchpad — agents and test runs
+    // create them by the dozen and the directory is gone within the hour.
+    // Auto-registering those filled real registries with `[missing]` aliases
+    // and, worse, a default pointing at a deleted directory. So under tmp the
+    // derived-alias registration is skipped unless the user asked for it:
+    // --register, or an explicit --vault <alias> / --set-default, which are
+    // registration requests in their own right.
+    const explicitRegister = Boolean(opts.register || selectedVaultAlias || opts.setDefault);
+    const skipRegister = !explicitRegister && isUnderTempDir(displayRoot);
     // One registry read for both the derived-alias collision check and the
     // ownership check below (addVault re-reads internally for its write).
     const registrySnapshot = readRegistry();
-    if (!registerAlias) {
+    if (!registerAlias && !skipRegister) {
       const defaultAlias = defaultAliasFor(displayRoot, registrySnapshot);
       if (canPrompt) {
         console.log(chalk.dim("\n  Register this vault so you can target it from anywhere with --vault:"));
@@ -1057,6 +1132,12 @@ program
     // below) so an interruption mid-starter never leaves a registry alias
     // pointing at a half-populated vault.
     const registerVault = (): void => {
+      if (skipRegister) {
+        console.log(
+          chalk.dim("  Not registering: vault is under the temp dir (pass --register to force)"),
+        );
+        return;
+      }
       if (!registerAlias) return;
       const resolvedRoot = pathMod.resolve(displayRoot);
       // Own-property check: a `--vault __proto__` would otherwise read back
@@ -1259,6 +1340,105 @@ program
     console.log(doc.body.trim());
   });
 
+// ─── ctx skill ─────────────────────────────────────────────────────────────────
+
+const HARNESS_CHOICES = HARNESSES.join(" | ");
+
+/** Resolve a manifest entry's `base` to a real directory on this machine. */
+function resolveInstallBase(base: "project_root" | "home"): string {
+  return base === "home" ? homedir() : process.cwd();
+}
+
+async function runSkillOp<T>(op: string, input: Record<string, unknown>): Promise<T> {
+  const storage = getStorage();
+  // cliApi(), not createEngineApi(): the skill ops are catalog calls like any
+  // other, so they carry this run's caller attribution too.
+  return cliApi().run<T>(op, input, opContext(storage, "cli@contextnest.local"));
+}
+
+const skillCmd = program
+  .command("skill")
+  .description("Render and install vault-hosted skills (type: skill nodes)");
+
+skillCmd
+  .command("show <path>", { isDefault: true })
+  .description("Render a skill node for an agent harness and print it")
+  .option(`--harness <name>`, `Target harness (${HARNESS_CHOICES})`, "claude-code")
+  .option("--server-alias <name>", "What your MCP client calls this server (default: vault name)")
+  .option("--scope <scope>", "user | project — decides the install path only", "user")
+  .action(async (path, opts) => {
+    const rendered = await runSkillOp<{
+      name: string;
+      description: string;
+      content: string;
+      relative_path: string;
+      base: "project_root" | "home";
+    }>("context_skill", {
+      id: normalizeDocumentId(path),
+      harness: opts.harness,
+      scope: opts.scope,
+      ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
+    });
+
+    console.log(chalk.dim(`# ${pathMod.join(resolveInstallBase(rendered.base), rendered.relative_path)}`));
+    console.log(rendered.content);
+  });
+
+skillCmd
+  .command("install <path>")
+  .description("Build (and optionally write) the files that install a vault skill locally")
+  .option(`--harness <name>`, `Target harness (${HARNESS_CHOICES})`, "claude-code")
+  .option("--server-alias <name>", "What your MCP client calls this server (default: vault name)")
+  .option("--scope <scope>", "user (home directory) | project (cwd)", "user")
+  .option(
+    "--mode <mode>",
+    "loader — fetch the procedure at runtime, cannot drift; full — offline snapshot that will",
+    "loader",
+  )
+  .option("--write", "Actually write the files (otherwise they are only printed)")
+  .action(async (path, opts) => {
+    const manifest = await runSkillOp<{
+      files: { relative_path: string; base: "project_root" | "home"; content: string }[];
+      post_install: string;
+      notes: string;
+      skill: { name: string; source_path: string; version: number | null };
+    }>("context_skill_install", {
+      id: normalizeDocumentId(path),
+      harness: opts.harness,
+      scope: opts.scope,
+      mode: opts.mode,
+      ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
+    });
+
+    for (const file of manifest.files) {
+      const target = pathMod.join(resolveInstallBase(file.base), file.relative_path);
+
+      if (!opts.write) {
+        console.log(chalk.dim(`# ${target}`));
+        console.log(file.content);
+        continue;
+      }
+
+      // These land outside the vault, in the user's project or home directory,
+      // so they get the same never-clobber-without-consent guard as `read --out`.
+      await ensureOverwritable(target, "Skill file");
+      noteExternalWrite(target);
+      if (isDryRun()) continue;
+
+      await mkdir(pathMod.dirname(target), { recursive: true });
+      await writeFile(target, file.content, "utf-8");
+      console.log(chalk.green(`Written to ${target}`));
+    }
+
+    if (!opts.write) {
+      console.log();
+      console.log(chalk.dim("Re-run with --write to install these files."));
+    }
+    console.log();
+    console.log(chalk.dim(manifest.notes));
+    if (opts.write && !isDryRun()) console.log(chalk.yellow(manifest.post_install));
+  });
+
 // ─── ctx add ───────────────────────────────────────────────────────────────────
 
 program
@@ -1416,12 +1596,32 @@ program
     if (hasErrors) process.exit(1);
   });
 
+/**
+ * Selector grammar block appended to `ctx query --help` / `ctx resolve --help`.
+ * The grammar line itself is the engine's SELECTOR_GRAMMAR — the same string
+ * the init banner, README and generated CLAUDE.md render — never a local copy.
+ */
+function selectorHelp(cmd: "query" | "resolve"): string {
+  return [
+    "",
+    "Selector grammar:",
+    `  ${SELECTOR_GRAMMAR}`,
+    "",
+    "Examples:",
+    `  ctx ${cmd} "#api + status:published"`,
+    `  ctx ${cmd} "nodes/gtm/foo"                 # one node by id`,
+    `  ctx ${cmd} "(#api | #v2) - #deprecated"`,
+    "",
+  ].join("\n");
+}
+
 // ─── ctx resolve ───────────────────────────────────────────────────────────────
 
 program
   .command("resolve <selector>")
   .description("Execute a selector query and list matching documents")
   .option("--json", "Output as JSON")
+  .addHelpText("after", selectorHelp("resolve"))
   .action(async (selector, opts) => {
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
@@ -1849,14 +2049,27 @@ program
     }
 
     const config = await storage.readConfig();
-    const checkpointHistory = await storage.readCheckpointHistory();
-    const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
+    // Head only — same reason storage.regenerateIndex() takes it this way: the
+    // chain grows by one entry per published doc per checkpoint, and only its
+    // newest entry reaches context.yaml.
+    const latestCheckpoint = await storage.readLatestCheckpoint();
     const published = docs.filter((d) => d.frontmatter.status === "published");
 
     // Generate context.yaml
-    const contextYaml = generateContextYaml(published, config, latestCheckpoint);
+    const { contextYaml, stats } = generateContextYamlWithStats(
+      published,
+      config,
+      latestCheckpoint,
+    );
     await storage.writeContextYaml(contextYaml);
     console.log(chalk.green("Generated context.yaml"));
+    // Where the graph came from. A vault authored with [[wikilinks]] used to
+    // index with zero edges and --hops silently did nothing; the unresolved
+    // count is the hint that a link's title does not match any published doc.
+    console.log(
+      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved)`,
+    );
 
     // Generate INDEX.md for each folder
     const folders = new Map<string, ContextNode[]>();
@@ -1959,6 +2172,7 @@ program
   .option("--hops <n>", "Graph traversal depth (default: 2)", parseInt)
   .option("--full", "Force full-load mode (load all documents)")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
+  .addHelpText("after", selectorHelp("query"))
   .action(async (selector, opts) => {
     // Cloud pack: @org/pack-name routes to PromptOwl API
     if (selector.startsWith("@")) {
@@ -2037,6 +2251,18 @@ program
     }
   });
 
+/**
+ * Shared `--limit` parser. Commander hands "-5" over as the value, so validate
+ * here — once, ahead of both the local and the remote branch — rather than let
+ * a negative or fractional limit slip through as "everything".
+ */
+function parseLimit(v: string): number {
+  if (!/^\d+$/.test(v.trim())) {
+    throw new InvalidArgumentError("--limit must be 0 or a positive integer.");
+  }
+  return parseInt(v, 10);
+}
+
 // ─── ctx list ─────────────────────────────────────────────────────────────────
 
 program
@@ -2045,7 +2271,7 @@ program
   .option("-t, --type <type>", "Filter by node type")
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
-  .option("--limit <n>", "Max documents to return", (v) => parseInt(v, 10))
+  .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2093,7 +2319,9 @@ program
         : doc.status === "rejected" ? chalk.red
         : chalk.yellow;
       console.log(`  ${chalk.cyan(doc.id)} [${doc.type}] ${statusColor(doc.status)}`);
-      console.log(`    ${doc.title}`);
+      // A node imported or hand-written without a title still has to be named
+      // in a listing — `undefined` is not a name.
+      console.log(`    ${doc.title || "(untitled)"}`);
     }
   });
 
@@ -2188,9 +2416,9 @@ program
 
 program
   .command("search <query>")
-  .description("Full-text search across vault documents")
-  .option("--json", "Output as JSON")
-  .option("--limit <n>", "Max results", (v) => parseInt(v, 10))
+  .description("Full-text search across vault documents, best match first")
+  .option("--json", "Output as JSON (each hit carries its relevance score)")
+  .option("--limit <n>", "Max results (default 10; 0 = all)", parseLimit)
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -2198,33 +2426,14 @@ program
       return;
     }
     const storage = getStorage();
-    const { results } = await cliApi().run<{
-      results: Array<{ id: string; title: string; description?: string; type: string }>;
-    }>(
+    const limit = searchLimit(opts.limit);
+    const out = await cliApi().run<{ results: SearchHitView[]; total?: number }>(
       "context_search",
-      { query, ...(opts.limit ? { limit: opts.limit } : {}) },
+      { query, ...(limit ? { limit } : {}) },
       opContext(storage, "cli@contextnest.local"),
     );
-
-    if (opts.json) {
-      // Field selection shared with the remote branch (doc-views.ts).
-      console.log(
-        JSON.stringify(
-          results.map(searchJsonEntry),
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    if (results.length === 0) {
-      console.log(chalk.yellow("No results found."));
-      return;
-    }
-    console.log(chalk.bold(`${results.length} result(s):\n`));
-    for (const doc of results) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
-    }
+    // Rendering shared with the remote branch (doc-views.ts).
+    printSearchResults(out, opts);
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────
@@ -2367,6 +2576,33 @@ program
 
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
+/** Print the terminal result of a gated push. Success stays on stdout. */
+function reportPushOutcome(outcome: TerminalOutcome): void {
+  switch (outcome.kind) {
+    case "applied": {
+      const n = outcome.result.applied_node_count ?? outcome.result.doc_count ?? 0;
+      console.log(chalk.green(`Pushed ${n} document${n !== 1 ? "s" : ""}`));
+      if (outcome.result.decided_by) console.log(chalk.dim(`  confirmed by ${outcome.result.decided_by}`));
+      return;
+    }
+    case "rejected":
+      console.error(
+        chalk.red(
+          `Push rejected${outcome.result.decided_by ? ` by ${outcome.result.decided_by}` : ""} — nothing was applied.`,
+        ),
+      );
+      return;
+    case "expired":
+      console.error(chalk.red("Push expired before it was confirmed — nothing was applied."));
+      return;
+    case "timeout":
+      console.error(
+        chalk.yellow("Timed out waiting for confirmation. The push is still pending — confirm it in the UI."),
+      );
+      return;
+  }
+}
+
 program
   .command("push")
   .description("Push the local vault to a hosted ContextNest server")
@@ -2374,6 +2610,22 @@ program
   .requiredOption("--nest <id>", "Target nest ID")
   .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
+  .option(
+    "--no-wait",
+    "For a nest that gates pushes: submit, print the confirmation URL, and exit without waiting for the decision",
+  )
+  .option(
+    "--timeout <sec>",
+    "Max seconds to wait for a gated push to be confirmed (default: the server's window, else 15m)",
+    (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error(chalk.red("--timeout must be a positive number of seconds."));
+        process.exit(1);
+      }
+      return n;
+    },
+  )
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
@@ -2445,13 +2697,55 @@ program
       // every document body to an unvalidated destination.
       assertNotRedirected(res, "--server");
 
-      if (!res.ok) {
+      if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
         process.exit(1);
       }
 
-      const data = (await res.json()) as { published: number; context_md_updated: boolean; node_ids: string[] };
+      const payload = await res.json().catch(() => null);
+
+      // A gated nest does not apply the push; it parks it for a human to
+      // confirm in the UI and answers 202. Treating that as success (any 2xx
+      // used to print "Pushed N") would misreport a push that never landed.
+      const pending = asPendingConfirmation(res.status, payload);
+      if (pending) {
+        console.log(chalk.yellow(pending.message || "This nest requires confirmation before the push is applied."));
+        console.log(chalk.cyan(`Confirm in the UI: ${pending.confirm_url}`));
+
+        // --no-wait → commander sets opts.wait = false.
+        if (opts.wait === false) {
+          console.error(chalk.dim("Submitted. Not waiting for the decision (--no-wait)."));
+          return; // exit 0: the submission itself succeeded
+        }
+
+        const timeoutMs = resolveTimeoutMs(opts.timeout as number | undefined, pending.expires_at);
+        console.error(chalk.dim("Waiting for confirmation… (Ctrl-C to stop; the push stays pending)"));
+
+        let printedProgress = false;
+        const outcome = await pollUntilDecided({
+          serverUrl,
+          pollUrl: pending.poll_url,
+          apiKey,
+          timeoutMs,
+          onPending: () => {
+            printedProgress = true;
+            process.stderr.write(chalk.dim("."));
+          },
+        });
+        if (printedProgress) process.stderr.write("\n");
+        reportPushOutcome(outcome);
+        process.exit(exitCodeFor(outcome));
+      }
+
+      if (res.status === 202) {
+        // 202, but not the pending-confirmation envelope we understand — do not
+        // claim success for a response whose meaning we can't read.
+        console.error(chalk.red("Push returned 202 with an unrecognized body — treating as not applied."));
+        process.exit(1);
+      }
+
+      const data = (payload ?? {}) as { published: number; context_md_updated: boolean; node_ids: string[] };
       console.log(chalk.green(`Pushed ${data.published} document${data.published !== 1 ? "s" : ""}`));
       if (data.context_md_updated) console.log(chalk.green("  CONTEXT.md updated"));
       for (const id of data.node_ids) {
@@ -2710,6 +3004,19 @@ vaultCmd
       if (v.description) console.log(`     ${chalk.dim(v.description)}`);
       console.log(`     ${chalk.dim(v.path)}`);
     }
+    // A missing default is the one stale entry that changes behaviour for
+    // every command run without --vault (resolution silently falls through to
+    // cwd), so it gets its own line rather than just the [missing] marker.
+    // defaultVaultStatus() is the one rule; `ctx doctor` renders the same call.
+    const defaultAlias = readRegistry().default ?? null;
+    const status = defaultVaultStatus(vaults, defaultAlias);
+    if (status === "unregistered") {
+      console.log(
+        chalk.yellow(`\n  default vault "${defaultAlias}" is not registered — run ctx vault default <alias>`),
+      );
+    } else if (status === "missing_path") {
+      console.log(chalk.yellow("\n  default vault is missing — run ctx vault prune"));
+    }
     console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
   });
 
@@ -2852,6 +3159,49 @@ vaultCmd
   });
 
 vaultCmd
+  .command("prune")
+  .description("Unregister local aliases whose vault no longer exists on disk (remotes are left alone)")
+  .action(async () => {
+    try {
+      // Same rule as the [missing] marker in `vault list`: the directory is
+      // gone, or it is no longer a vault. Remotes never appear here.
+      const stale = listVaults().filter((v) => v.kind === "local" && !v.exists);
+      if (stale.length === 0) {
+        console.log(chalk.green("Nothing to prune — every registered vault exists on disk."));
+        return;
+      }
+      const noun = stale.length === 1 ? "alias" : "aliases";
+      console.log(chalk.bold(`\n${stale.length} missing ${noun} in ${registryPathForLog()}:\n`));
+      for (const v of stale) {
+        const why = fs.existsSync(v.path ?? "") ? "no .context/config.yaml" : "directory gone";
+        const marker = v.isDefault ? chalk.green(" (default)") : "";
+        console.log(`  ${chalk.cyan(v.alias)}${marker}  ${chalk.dim(`${v.path} — ${why}`)}`);
+      }
+      console.log("");
+      await confirmOrExit(
+        `Remove ${stale.length === 1 ? "this alias" : `these ${stale.length} aliases`} from ${registryPathForLog()}? ` +
+          "Only the registry entries go; nothing on disk is touched.",
+        { destructive: true },
+      );
+      const { removed, defaultCleared } = pruneVaults();
+      for (const r of removed) {
+        console.log(chalk.yellow(`Removed vault alias "${r.alias}" → ${r.path}`));
+      }
+      if (defaultCleared) {
+        console.log(
+          chalk.dim(
+            "  That was the default vault — no default is set now. " +
+              "Set one with `ctx vault default <alias>`.",
+          ),
+        );
+      }
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+vaultCmd
   .command("default <alias>")
   .description("Set the default vault")
   .action(async (alias: string) => {
@@ -2868,17 +3218,46 @@ vaultCmd
 vaultCmd
   .command("which")
   .description("Show which vault the CLI would use right now, and why (respects --vault)")
-  .action(() => {
+  .option("--json", "Output as JSON ({kind, path|endpoint, source, alias?, warning?})")
+  .action((opts) => {
     try {
       const resolved = resolveNest({
         vaultAlias: selectedVaultAlias,
         cwd: process.cwd(),
       });
+      // which is what users run right after a NO_VAULT error, so it must not
+      // report a bare cwd that every other command refuses as if it resolved.
+      const refused = resolved.kind === "local" && isRefusedCwd(resolved);
       // which is the diagnostic command — always surface a stale-env advisory,
       // even when a vault resolved (unlike normal commands, which stay quiet for
       // a local resolution).
       if (resolved.warning) {
         console.error(chalk.yellow(resolved.warning));
+      }
+      if (opts.json) {
+        // Machine-readable form for scripted callers (the plugin hooks use it
+        // to find the vault in the working directory). Same fields as the text
+        // output, no colour, one object.
+        const out =
+          resolved.kind === "remote"
+            ? {
+                kind: "remote",
+                alias: resolved.alias,
+                source: resolved.source,
+                transport: resolved.remote.transport,
+                endpoint: describeRemoteEndpoint(resolved.remote),
+                ...(resolved.warning ? { warning: resolved.warning } : {}),
+              }
+            : {
+                kind: "local",
+                path: resolved.path,
+                source: resolved.source,
+                ...(refused ? { refused: true } : {}),
+                ...(resolved.alias ? { alias: resolved.alias } : {}),
+                ...(resolved.warning ? { warning: resolved.warning } : {}),
+              };
+        console.log(JSON.stringify(out, null, 2));
+        return;
       }
       if (resolved.kind === "remote") {
         console.log(`${resolved.alias} ${chalk.magenta(`(remote, ${resolved.remote.transport})`)}`);
@@ -2890,10 +3269,90 @@ vaultCmd
       console.log(
         chalk.dim(`source: ${resolved.source}${resolved.alias ? ` (alias: ${resolved.alias})` : ""}`),
       );
+      if (refused) {
+        console.log(
+          chalk.yellow(
+            'not a vault — commands here fail with NO_VAULT. Run `ctx init` here, or pass --vault <alias>.',
+          ),
+        );
+      }
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);
     }
+  });
+
+// ─── ctx doctor ────────────────────────────────────────────────────────────────
+
+program
+  .command("doctor")
+  .description("Check installed versions, the vault registry and the current directory for problems")
+  .option("--json", "Output the report as JSON")
+  .action(async (opts) => {
+    // Diagnostics never fail: every probe degrades to null/"unknown" and the
+    // exit code stays 0, so a script can always read the report.
+    const report = await buildDoctorReport({
+      cliVersion: pkg.version,
+      cliPath: fileURLToPath(import.meta.url),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    const row = (label: string, value: string) => console.log(`  ${label.padEnd(14)} ${value}`);
+    const sub = (value: string) => console.log(`  ${"".padEnd(14)} ${value}`);
+    console.log(chalk.bold("\nctx doctor\n"));
+    row("CLI", `${report.cli.version}  ${chalk.dim(report.cli.path)}`);
+    row("Engine", report.engine.version);
+    if (report.latest === null) {
+      row("Latest npm", chalk.dim("unknown (offline, or npm unavailable)"));
+    } else if (report.update_available) {
+      row(
+        "Latest npm",
+        `${report.latest}  ${chalk.yellow("update available:")} npm i -g ${chalk.cyan("@promptowl/contextnest-cli")}`,
+      );
+    } else {
+      row("Latest npm", `${report.latest}  ${chalk.green("up to date")}`);
+    }
+    const reg = report.registry;
+    row("Registry", reg.path);
+    if (reg.error) {
+      sub(chalk.red(`unreadable: ${reg.error}`));
+    } else {
+      const counts = `${reg.vaults} local, ${reg.remotes} remote`;
+      if (reg.missing > 0) {
+        sub(
+          `${counts}, ${chalk.red(`${reg.missing} missing`)} (${reg.missing_aliases.join(", ")}) — run ${chalk.cyan("ctx vault prune")}`,
+        );
+      } else {
+        sub(`${counts}, ${chalk.green("none missing")}`);
+      }
+      if (reg.default === null) {
+        sub(chalk.dim("default: (none)"));
+      } else if (reg.default_missing) {
+        // prune only drops aliases that are in the registry, so a default
+        // naming no entry at all needs re-pointing instead.
+        const fix = reg.missing_aliases.includes(reg.default)
+          ? `run ${chalk.cyan("ctx vault prune")}`
+          : `not registered — run ${chalk.cyan("ctx vault default <alias>")}`;
+        sub(`default: ${reg.default} ${chalk.red("[missing]")} — ${fix}`);
+      } else {
+        sub(`default: ${reg.default}`);
+      }
+    }
+    if (report.cwd.in_vault) {
+      const alias = report.cwd.alias ? ` (alias: ${report.cwd.alias})` : chalk.dim(" (not registered)");
+      row("Current dir", `inside vault ${report.cwd.vault_path}${alias}`);
+    } else {
+      row("Current dir", chalk.dim("not inside a vault"));
+    }
+    row(
+      "Claude plugin",
+      report.plugin.version
+        ? `${report.plugin.version}  ${chalk.dim(report.plugin.path ?? "")}`
+        : chalk.dim("not installed (no contextnest entry in installed_plugins.json)"),
+    );
+    console.log("");
   });
 
 // Parse and run

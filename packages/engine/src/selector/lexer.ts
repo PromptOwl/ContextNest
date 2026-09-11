@@ -4,6 +4,7 @@
  */
 
 import { InvalidSelectorError } from "../errors.js";
+import { SELECTOR_FILTERS } from "./grammar.js";
 
 export type TokenType =
   | "TAG"
@@ -24,6 +25,42 @@ export interface Token {
   type: TokenType;
   value: string;
   position: number;
+}
+
+/** Bare node id prefixes that lex as a URI atom without the scheme. */
+const BARE_ID_PREFIX = /^(nodes|sources)\//;
+
+/**
+ * `nodes/<id>` / `sources/<id>` → `contextnest://nodes/<id>`; anything else →
+ * null. Shared by the bare-id branch and the quoted-string branch so the two
+ * spellings (`nodes/x` and `"nodes/x"`) can never diverge.
+ */
+function bareIdToUri(value: string): string | null {
+  return BARE_ID_PREFIX.test(value) ? `contextnest://${value}` : null;
+}
+
+/**
+ * The one "did you mean" error for a token that is neither a known atom nor a
+ * bare id. Shared by the bare-word branch and the quoted-string branch so
+ * `gtm/foo` and `"gtm/foo"` fail identically, instead of the quoted spelling
+ * escaping into an opaque INVALID_URI from `parseUri` two layers down.
+ */
+function unexpectedToken(bare: string, position: number): InvalidSelectorError {
+  // `Nodes/foo` is a mis-cased prefix, not a tag: suggest `nodes/foo`,
+  // never `nodes/Nodes/foo`.
+  const miscased = /^(nodes|sources)\//i.test(bare) && !BARE_ID_PREFIX.test(bare);
+  // A `word:` shape only reaches here from inside quotes (the unquoted form
+  // goes to the filter branch, or fails as an unknown filter), so the fix is
+  // to drop the quotes, not to prefix it with `nodes/` or `#`.
+  const filterLike = /^[a-zA-Z_][a-zA-Z0-9_]*:/.test(bare);
+  const hint = miscased
+    ? `"${bare.replace(/^(nodes|sources)\//i, (m) => m.toLowerCase())}" (a node id)`
+    : filterLike
+      ? `${bare} without the quotes (a filter)`
+      : `"nodes/${bare}" (a node id) or "#${bare}" (a tag)`;
+  return new InvalidSelectorError(
+    `Unexpected token "${bare}" at position ${position} — did you mean ${hint}?`,
+  );
 }
 
 export function tokenize(input: string): Token[] {
@@ -112,9 +149,28 @@ export function tokenize(input: string): Token[] {
       } else if (value.startsWith("pack:")) {
         tokens.push({ type: "PACK", value: value.slice(5), position: start });
       } else {
-        // Treat as URI by default
-        tokens.push({ type: "URI", value, position: start });
+        // A quoted bare id gets the scheme like the unquoted form; anything
+        // else is the same mistake as an unquoted bare word, so it gets the
+        // same hint rather than an INVALID_URI two layers down.
+        const uri = bareIdToUri(value);
+        if (!uri) throw unexpectedToken(value, start);
+        tokens.push({ type: "URI", value: uri, position: start });
       }
+      continue;
+    }
+
+    // Bare node id: nodes/<id> or sources/<id> — the same URI atom as if the
+    // user had typed `contextnest://nodes/<id>`, so `ctx query "nodes/gtm/foo"`
+    // selects one node without the scheme. Terminates exactly like the URI
+    // branch above (whitespace, `+`, `|`, parens; `-` stays inside the id).
+    if (BARE_ID_PREFIX.test(input.slice(pos))) {
+      const idStart = pos;
+      while (pos < input.length && !/[\s+|()]/.test(input[pos])) pos++;
+      tokens.push({
+        type: "URI",
+        value: bareIdToUri(input.slice(idStart, pos))!,
+        position: idStart,
+      });
       continue;
     }
 
@@ -177,14 +233,18 @@ export function tokenize(input: string): Token[] {
             break;
           default:
             throw new InvalidSelectorError(
-              `Unknown filter type "${word}" at position ${start}`,
+              `Unknown filter "${word}" at position ${start} — valid filters: ${SELECTOR_FILTERS.join(", ")}`,
             );
         }
         continue;
       }
 
-      // Just a word — error
-      throw new InvalidSelectorError(`Unexpected token "${word}" at position ${start}`);
+      // Just a word — error. Report the whole run up to the next delimiter
+      // (`gtm/foo`, `api-design`), not only the leading identifier, so the
+      // hint below is something the user can paste back.
+      let wordEnd = pos;
+      while (wordEnd < input.length && !/[\s+|()]/.test(input[wordEnd])) wordEnd++;
+      throw unexpectedToken(input.slice(pos, wordEnd), start);
     }
 
     throw new InvalidSelectorError(`Unexpected character "${ch}" at position ${pos}`);

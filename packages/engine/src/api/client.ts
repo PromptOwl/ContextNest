@@ -16,8 +16,10 @@
  *    entry they seal, so `context_versions` can answer "which agent wrote v7,
  *    in which session". It is not an input to the chain hash — see
  *    `VersionEntry.client`.
- *  - **reads** that traverse the graph (`context_query`, `context_resolve`,
- *    `context_search`) stamp it on the §9.2 access traces they emit.
+ *  - **reads** that traverse the graph (`context_query`, `context_resolve`)
+ *    stamp it on the §9.2 access traces they emit. `context_search` does NOT:
+ *    it goes straight to the ranked full-text index rather than through the
+ *    query engine, so it emits no traces for anything to ride on.
  *  - **every** operation, read or write, hands it to extension `authorize` /
  *    `onResult` hooks along with the rest of the validated input — which is how
  *    a consumer logs or gates on it for the operations that write nothing.

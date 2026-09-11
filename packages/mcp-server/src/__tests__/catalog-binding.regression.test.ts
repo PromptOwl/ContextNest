@@ -69,10 +69,15 @@ async function connect(
   vaultPath: string,
   extraEnv: Record<string, string> = {},
 ): Promise<Client> {
-  const env: Record<string, string> = { CONTEXTNEST_VAULT_PATH: vaultPath };
+  // Override applied AFTER the copy — see the note in mcp-server.regression.
+  const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
+  delete env.CTX_NEST_HOME;
+  env.CONTEXTNEST_VAULT_PATH = vaultPath;
+  // Last, so a test's own override beats both the inherited environment and
+  // the vault path set just above.
   Object.assign(env, extraEnv);
   const transport = new StdioClientTransport({
     command: process.execPath,

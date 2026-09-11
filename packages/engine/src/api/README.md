@@ -32,6 +32,7 @@ Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
 `context_delete` · `context_import` (bulk create+publish, one checkpoint)
 History/audit: `context_versions` · `context_reconstruct` · `context_verify`
 Registry: `context_nests` (list every registered nest)
+Skills: `context_skill`, `context_skill_install` (render/install a vault-hosted skill)
 
 These cover the operations all three surfaces (OSS MCP, CLI, Community MCP)
 expose, so Phase 2 bindings import them instead of hand-rolling. `governance`,
@@ -80,7 +81,7 @@ agent and its session, plus any custom scalar keys (spec §9.4):
 | Operation kind | Where it lands |
 |---|---|
 | Writes that publish (`context_create`, `context_update`, `context_publish`, `context_import`) | The version-history entry the publish seals — `context_versions` returns it as `client` on each entry |
-| Graph reads (`context_query`, `context_resolve`, `context_search`) | The §9.2 access traces the query emits |
+| Graph reads (`context_query`, `context_resolve`) | The §9.2 access traces the query emits. `context_search` bypasses the query engine for the ranked full-text index, so it emits no traces |
 | Everything else | Extension `authorize` / `onResult` hooks, which receive the validated input |
 
 Three things it is not:
