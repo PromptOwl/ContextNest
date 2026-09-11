@@ -4,7 +4,7 @@
  * and returns documents with trace entries.
  */
 
-import type { ContextNode, ResolvedResult } from "./types.js";
+import type { ClientMetadata, ContextNode, ResolvedResult } from "./types.js";
 import { Resolver } from "./resolver.js";
 import { PackLoader } from "./packs.js";
 import { parseSelector } from "./selector/parser.js";
@@ -16,6 +16,12 @@ export interface InjectorOptions {
   resolver: Resolver;
   packLoader: PackLoader;
   currentCheckpoint: number;
+  /**
+   * Caller metadata (§9.4) stamped on every access trace this injector emits,
+   * so a §9.2 provenance record names the agent and session that read the
+   * document, not only the document.
+   */
+  client?: ClientMetadata;
 }
 
 export class ContextInjector {
@@ -23,12 +29,14 @@ export class ContextInjector {
   private packLoader: PackLoader;
   private traceLogger: TraceLogger;
   private currentCheckpoint: number;
+  private client?: ClientMetadata;
 
   constructor(options: InjectorOptions) {
     this.resolver = options.resolver;
     this.packLoader = options.packLoader;
     this.traceLogger = new TraceLogger();
     this.currentCheckpoint = options.currentCheckpoint;
+    this.client = options.client;
   }
 
   /**
@@ -66,6 +74,7 @@ export class ContextInjector {
         checkpoint: this.currentCheckpoint,
         author: doc.frontmatter.author,
         editedAt: doc.frontmatter.updated_at,
+        client: this.client,
       });
     }
 
