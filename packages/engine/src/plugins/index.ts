@@ -11,4 +11,4 @@ export type { PluginHost, PluginHostOptions, IngestResult, IngestTarget, Outcome
 export { SYNC_OPERATIONS } from "./ops.js";
 export { createSafeFetch, isPrivateAddress } from "./safe-fetch.js";
 export type { SafeFetchOptions } from "./safe-fetch.js";
-export { defaultProcess, defaultNodePath, defaultTags } from "./mapper.js";
+export { defaultProcess, defaultNodePath, defaultFolder, defaultTags } from "./mapper.js";

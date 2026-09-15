@@ -129,7 +129,8 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
   });
 
   it("honours target status/publish so a governed host can land pending_review drafts", async () => {
-    const out = await run(fakePlugin([item()]), { target: { status: "pending_review", publish: false } });
+    const out = await run(fakePlugin([item()]), { target: { status: "pending_review", publish: false, folder: "review/inbound" } });
+    expect(out.results[0].id).toBe("review/inbound/2026-09-15-acme-discovery");
     const doc = await ctx.storage.readDocument(out.results[0].id);
     expect(doc.frontmatter.status).toBe("pending_review");
   });
@@ -194,14 +195,15 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
   });
 
   it("a host-supplied write port replaces the engine upsert but keeps mapping, cursor policy and conflict semantics", async () => {
-    const seen: Array<{ id: string; author: string }> = [];
+    const seen: Array<{ id: string; folder?: string; author: string }> = [];
     const out = await run(fakePlugin([item(), item({ externalId: "call-2", title: "Second" })]), {}, {
-      write: async (_ctx: unknown, plugin: any, draft: any) => {
-        seen.push({ id: draft.path, author: `system:plugin:${plugin.manifest.name}` });
+      write: async (_ctx: unknown, plugin: any, draft: any, target: any) => {
+        seen.push({ id: draft.path, folder: target.folder, author: `system:plugin:${plugin.manifest.name}` });
         return { id: draft.path, outcome: draft.provenance.externalId === "call-2" ? "conflict" : "created" };
       },
     });
-    expect(seen.map((s) => s.id)).toEqual(["inbox/fake/2026-09-15-acme-discovery", "inbox/fake/2026-09-15-second"]);
+    expect(seen.map((s) => s.id)).toEqual(["2026-09-15-acme-discovery", "2026-09-15-second"]);
+    expect(seen.map((s) => s.folder)).toEqual(["inbox/fake", "inbox/fake"]);
     expect(out).toMatchObject({ created: 1, conflicts: [{ externalId: "call-2" }], clean: false });
     expect(out.nextCursor).toBeUndefined();
     await expect(ctx.storage.readDocument("inbox/fake/2026-09-15-acme-discovery")).rejects.toThrow(); // engine never wrote

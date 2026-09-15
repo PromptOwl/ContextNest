@@ -93,8 +93,10 @@ describe("[regression] ctx plugin", () => {
     const pull = ok(tmp, ["plugin", "pull", "memo", "--json"]);
     const r = JSON.parse(pull);
     expect(r).toMatchObject({ created: 1, clean: true, nextCursor: { n: 1 } });
+    expect(r.results[0].id).toMatch(/^nodes\/inbox\/memo\//); // structured vault → rooted under nodes/
     expect(ok(tmp, ["read", r.results[0].id])).toMatch(/first memo/);
     expect(ok(tmp, ["read", r.results[0].id])).toMatch(/Memo one/);
+    expect(ok(tmp, ["list"])).toMatch(/Memo one/); // discoverable, not orphaned outside nodes/
 
     // second run: cursor advanced → plugin yields nothing
     const again = JSON.parse(ok(tmp, ["plugin", "pull", "memo", "--json"]));

@@ -22,6 +22,7 @@ import yaml from "js-yaml";
 import type { Command } from "commander";
 import chalk from "./color.js";
 import { createEngineApi, type OperationContext } from "@promptowl/contextnest-engine/api";
+import { NestStorage } from "@promptowl/contextnest-engine";
 import { createPluginHost, loadPlugins, type Distiller } from "@promptowl/contextnest-engine/plugins";
 import { secretKeys, type NestPlugin } from "@promptowl/contextnest-plugin-sdk";
 import { confirmOrExit } from "./safety.js";
@@ -135,6 +136,18 @@ function distillerFromEnv(): Distiller | undefined {
       return text;
     }
   };
+}
+
+/**
+ * Where plugin nodes go. A structured vault discovers documents under
+ * `nodes/`, so the folder is rooted there unless the operator already said so;
+ * a flat (Obsidian-style) vault takes the folder as given. No folder → the
+ * host's default (`inbox/<plugin>`), rooted the same way.
+ */
+async function targetFolder(root: string, folder: string | undefined, pluginName: string): Promise<string> {
+  const layout = await new NestStorage(root).detectLayout();
+  const f = (folder ?? `inbox/${pluginName}`).replace(/^\/+|\/+$/g, "");
+  return layout === "structured" && !/^nodes(\/|$)/.test(f) ? `nodes/${f}` : f;
 }
 
 function parseKv(pairs: string[]): Record<string, unknown> {
@@ -260,7 +273,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
         settings: resolveSettings(plugin, entry),
         cursor: opts.reset ? undefined : entry.cursor,
         mode,
-        ...(opts.folder ?? entry.folder ? { target: { folder: opts.folder ?? entry.folder } } : {}),
+        target: { folder: await targetFolder(root, opts.folder ?? entry.folder, name) },
         ...(deps.client() ? { client: deps.client() } : {}),
       };
       const result = await api.run<{ created: number; updated: number; unchanged: number; conflicts: Array<{ externalId: string; id: string }>; failed: Array<{ externalId: string; error: string }>; clean: boolean; nextCursor?: unknown; results: unknown[] }>("context_ingest", input, deps.opContext(root));
@@ -330,7 +343,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const api = createEngineApi({ extensions: [host.extension] });
       const result = await api.run<{ id: string; outcome: string }>(
         "context_promote",
-        { plugin: name, settings: resolveSettings(plugin, entry), externalId, mode: opts.mode ?? entry.mode ?? "raw", ...(entry.folder ? { target: { folder: entry.folder } } : {}), ...(deps.client() ? { client: deps.client() } : {}) },
+        { plugin: name, settings: resolveSettings(plugin, entry), externalId, mode: opts.mode ?? entry.mode ?? "raw", target: { folder: await targetFolder(root, entry.folder, name) }, ...(deps.client() ? { client: deps.client() } : {}) },
         deps.opContext(root),
       );
       if (opts.json) console.log(JSON.stringify(result, null, 2));

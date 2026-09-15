@@ -34,7 +34,7 @@ import type { EngineExtension } from "../api/extension.js";
 import type { OperationContext } from "../api/context.js";
 import { CORE_EXECUTORS } from "../api/core-executors.js";
 import { createSafeFetch, type SafeFetchOptions } from "./safe-fetch.js";
-import { defaultProcess } from "./mapper.js";
+import { defaultProcess, defaultFolder } from "./mapper.js";
 import { SYNC_OPERATIONS } from "./ops.js";
 
 export type HostLog = (level: "debug" | "info" | "warn" | "error", msg: string, data?: unknown) => void;
@@ -63,6 +63,8 @@ export interface PluginHostOptions {
   fetch?: SafeFetchOptions;
   /** Replace the engine's upsert with the host's own write path. */
   write?: DraftWriter;
+  /** What plugins see as `ctx.nestId`. Defaults to the vault's root path. */
+  nestId?: string;
 }
 
 export interface IngestTarget {
@@ -185,7 +187,7 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
 
   function pluginContext(ctx: OperationContext, plugin: NestPlugin, settings: Record<string, unknown>): PluginContext {
     return {
-      nestId: ctx.storage.root,
+      nestId: options.nestId ?? ctx.storage.root,
       settings,
       log: (level, msg, data) => log(level, `[${plugin.manifest.name}] ${msg}`, data),
       fetch: createSafeFetch(options.fetch),
@@ -250,8 +252,12 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
     return write(ctx, plugin, parsed.data, target);
   }
 
-  async function processOne(ctx: OperationContext, plugin: NestPlugin, pctx: PluginContext, item: InboundItem, mode: ProcessMode, target: IngestTarget) {
+  async function processOne(ctx: OperationContext, plugin: NestPlugin, pctx: PluginContext, item: InboundItem, mode: ProcessMode, targetIn: IngestTarget) {
     const valid = validateItem(item);
+    // Draft paths are relative; the target folder is the prefix. A plugin with
+    // its own process() chooses its layout (github-markdown mirrors the repo
+    // tree), so it gets no default folder — the default mapper does.
+    const target: IngestTarget = plugin.process || targetIn.folder ? targetIn : { ...targetIn, folder: defaultFolder(plugin.manifest.name) };
     const drafts = plugin.process ? await plugin.process(pctx, valid, mode) : await defaultProcess(plugin.manifest.name, pctx, valid, mode);
     if (drafts.length === 0) throw new Error(`process() returned no drafts for ${valid.externalId}`);
     // One item may fan out to several nodes; the outcome reported is the "worst" one.

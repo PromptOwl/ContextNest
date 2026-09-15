@@ -2,7 +2,8 @@
  * Default InboundItem → NodeDraft mapping, used when a plugin has no
  * `process()` of its own.
  *
- *  raw      — body verbatim at `inbox/<plugin>/<yyyy-mm-dd>-<slug>`.
+ *  raw      — body verbatim at `<yyyy-mm-dd>-<slug>` (relative: the host
+ *             prefixes the target folder, which defaults to `inbox/<plugin>`).
  *  summary  — `distill` the body and write the summary, with the raw body
  *             kept beneath it in a fenced appendix. Summary NEVER discards
  *             raw: the appendix is what lets a reviewer audit the summary.
@@ -26,10 +27,13 @@ const DEFAULT_INSTRUCTIONS: Record<string, string> = {
   file: "Describe what this file contains and what it is for.",
 };
 
-export function defaultNodePath(pluginName: string, item: InboundItem): string {
-  const day = item.occurredAt.slice(0, 10);
-  return `inbox/${pluginName}/${day}-${slug(item.title)}`;
+/** Relative node path for an item; the host prefixes the target folder. */
+export function defaultNodePath(item: InboundItem): string {
+  return `${item.occurredAt.slice(0, 10)}-${slug(item.title)}`;
 }
+
+/** Where default-mapped drafts land when the operator names no folder. */
+export const defaultFolder = (pluginName: string) => `inbox/${pluginName}`;
 
 /** Flat string metadata → tags (`account: acme` → `#account-acme`), plus `#<kind>` and `#plugin-<name>`. */
 export function defaultTags(pluginName: string, item: InboundItem): string[] {
@@ -47,7 +51,7 @@ export async function defaultProcess(
   mode: ProcessMode,
 ): Promise<NodeDraft[]> {
   const base = {
-    path: defaultNodePath(pluginName, item),
+    path: defaultNodePath(item),
     type: "document" as const,
     title: item.title,
     tags: defaultTags(pluginName, item),
