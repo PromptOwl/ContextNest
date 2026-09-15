@@ -209,6 +209,26 @@ normal output.
 CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 ```
 
+### Plugins
+
+Connect outside sources — GitHub, Gong, Slack, Teams, email, your own tools — through
+[Nest Plugins](https://github.com/PromptOwl/contextnest-plugin-sdk) (Apache-2.0 SDK; plugins may be any licence).
+
+```bash
+ctx plugin add @promptowl/contextnest-plugin-github-markdown
+ctx plugin set github-markdown repo=PromptOwl/ContextNest folder=vendor/contextnest
+ctx plugin pull github-markdown              # upserts changed files; keeps nodes you edited
+ctx plugin search "onboarding"               # vault hits (governed) + live plugin hits
+ctx plugin promote slack 1726000000.000100   # land one live hit through the normal path
+ctx plugin list --json
+```
+
+Settings live in `.context/plugins.yaml` (mode 600). A secret setting may also be supplied as
+`CONTEXTNEST_PLUGIN_<NAME>_<KEY>`, which always wins. `--mode summary` needs an LLM: point
+`CONTEXTNEST_DISTILL_URL` at an endpoint accepting `POST {body, kind, instructions}`; without one,
+summary requests land raw with a warning — never dropped. The cursor advances only after a clean run,
+so failures and local-edit conflicts are retried next time.
+
 ### Packs & Checkpoints
 - `ctx pack list` — List context packs
 - `ctx pack show <id>` — Show pack details

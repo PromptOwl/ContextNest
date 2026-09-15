@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 96 | 11 | 96 |
+| `@promptowl/contextnest-engine` | 97 | 11 | 97 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,12 +48,13 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 98 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@promptowl/contextnest-engine` | 2.5.0 | AGPL-3.0 |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
+| `@promptowl/contextnest-plugin-sdk` | 0.1.0 | Apache-2.0 |
 | `diff` | 9.0.0 | BSD-3-Clause |
 | `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
@@ -157,6 +158,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | Package | Version | Licence | Required | Why |
 | --- | --- | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
+| `@promptowl/contextnest-plugin-sdk` | 0.1.0 | Apache-2.0 | yes | The Nest Plugin contract (manifest + item schemas) the plugin host validates against. Apache-2.0 on purpose: plugins import it, never the AGPL engine. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
@@ -275,7 +277,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 98 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -283,6 +285,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `@promptowl/contextnest-engine` | 2.5.0 | AGPL-3.0 |
 | `zod` | 3.25.76 | MIT |
 | `@hono/node-server` | 1.19.14 | MIT |
+| `@promptowl/contextnest-plugin-sdk` | 0.1.0 | Apache-2.0 |
 | `ajv` | 8.18.0 | MIT |
 | `ajv-formats` | 3.0.1 | MIT |
 | `content-type` | 1.0.5 | MIT |
