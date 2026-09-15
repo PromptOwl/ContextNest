@@ -23,7 +23,7 @@ import type { Command } from "commander";
 import chalk from "./color.js";
 import { createEngineApi, type OperationContext } from "@promptowl/contextnest-engine/api";
 import { NestStorage } from "@promptowl/contextnest-engine";
-import { createPluginHost, loadPlugins, type Distiller } from "@promptowl/contextnest-engine/plugins";
+import { createPluginHost, loadPlugins, trimSlashes, type Distiller } from "@promptowl/contextnest-engine/plugins";
 import { secretKeys, type NestPlugin } from "@promptowl/contextnest-plugin-sdk";
 import { confirmOrExit } from "./safety.js";
 
@@ -60,11 +60,16 @@ function writeFile(root: string, data: PluginsFile): void {
   const p = path.join(root, FILE);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, yaml.dump(data, { lineWidth: 120 }), { mode: 0o600 });
+  // `mode` on writeFileSync applies only when the file is created; an existing
+  // file keeps its bits, so re-assert them (no-op on Windows).
   try {
     fs.chmodSync(p, 0o600);
   } catch {
     /* windows */
   }
+  // No lock on this bookkeeping file: two concurrent `ctx plugin pull`s on one
+  // vault can race each other's cursor write. Node writes themselves go
+  // through the engine's vault lock; this is accepted for a single-operator CLI.
 }
 
 /** Resolve a package name from the vault (then cwd), or a path relative to the vault. */
@@ -126,6 +131,8 @@ function distillerFromEnv(): Distiller | undefined {
       method: "POST",
       headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
       body: JSON.stringify(input),
+      // An LLM call that hangs must not hang `ctx plugin pull` forever.
+      signal: AbortSignal.timeout(Number(process.env.CONTEXTNEST_DISTILL_TIMEOUT_MS) || 120_000),
     });
     if (!res.ok) throw new Error(`distill endpoint returned HTTP ${res.status}`);
     const text = await res.text();
@@ -146,7 +153,7 @@ function distillerFromEnv(): Distiller | undefined {
  */
 async function targetFolder(root: string, folder: string | undefined, pluginName: string): Promise<string> {
   const layout = await new NestStorage(root).detectLayout();
-  const f = (folder ?? `inbox/${pluginName}`).replace(/^\/+|\/+$/g, "");
+  const f = trimSlashes(folder ?? `inbox/${pluginName}`);
   return layout === "structured" && !/^nodes(\/|$)/.test(f) ? `nodes/${f}` : f;
 }
 

@@ -28,6 +28,14 @@ export interface SafeFetchOptions {
 }
 
 const MAX_REDIRECTS = 5;
+/** Headers that must not follow a redirect to a different origin (what browsers/undici do). */
+const CREDENTIAL_HEADERS = ["authorization", "cookie", "proxy-authorization"];
+
+function withoutCredentials(headers: HeadersInit | undefined): Headers {
+  const h = new Headers(headers);
+  for (const k of CREDENTIAL_HEADERS) h.delete(k);
+  return h;
+}
 
 function ipv4Octets(ip: string): number[] | null {
   const m = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
@@ -55,9 +63,40 @@ export function isPrivateAddress(ip: string): boolean {
     if (lower === "::" || lower === "::1") return true;
     if (/^f[cd]/.test(lower)) return true; // fc00::/7 unique local
     if (/^fe[89ab]/.test(lower)) return true; // fe80::/10 link local
+    // IPv4 reachable through an IPv6 encoding: unwrap and re-check the
+    // embedded address rather than trusting the v6 prefix.
+    const embedded = embeddedIPv4(lower);
+    if (embedded) return isPrivateAddress(embedded);
+    // Teredo (2001:0::/32) embeds a v4 server + obfuscated client address;
+    // refuse the whole range — nothing a plugin legitimately needs lives there.
+    if (/^2001:0*:/.test(lower) && /^2001:0{0,4}:/.test(lower)) return true;
     return false;
   }
   return true; // not an IP at all — caller should have resolved it
+}
+
+/** Expand `::` shorthand into eight 16-bit groups (lower-case hex, no padding). */
+function ipv6Groups(ip: string): number[] | null {
+  const [head, tail] = ip.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail !== undefined ? (tail ? tail.split(":") : []) : [];
+  if (ip.includes("::") ? h.length + t.length > 7 : h.length !== 8) return null;
+  const groups = [...h, ...Array(8 - h.length - t.length).fill("0"), ...t];
+  const out = groups.map((g) => parseInt(g || "0", 16));
+  return out.some((n) => Number.isNaN(n)) ? null : out;
+}
+
+/** The IPv4 address embedded in a mapped (::ffff:a.b.c.d / ::ffff:xxxx:xxxx), 6to4 (2002::/16) or NAT64 (64:ff9b::/96) literal. */
+function embeddedIPv4(ip: string): string | null {
+  const dotted = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) return dotted[1];
+  const g = ipv6Groups(ip);
+  if (!g) return null;
+  const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) return v4(g[6], g[7]); // ::ffff:xxxx:xxxx
+  if (g[0] === 0x2002) return v4(g[1], g[2]); // 6to4
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) return v4(g[6], g[7]); // NAT64
+  return null;
 }
 
 async function assertPublicHost(host: string, lookupFn: NonNullable<SafeFetchOptions["lookupFn"]>): Promise<void> {
@@ -106,7 +145,10 @@ export function createSafeFetch(opts: SafeFetchOptions = {}): typeof fetch {
         const location = res.headers.get("location");
         if ([301, 302, 303, 307, 308].includes(res.status) && location) {
           if (hop >= MAX_REDIRECTS) throw new Error(`fetch refused: more than ${MAX_REDIRECTS} redirects`);
-          url = new URL(location, url);
+          const next = new URL(location, url);
+          // A cross-origin hop never carries the plugin's credentials along.
+          if (next.origin !== url.origin) baseInit.headers = withoutCredentials(baseInit.headers);
+          url = next;
           if (res.status === 303 || ((res.status === 301 || res.status === 302) && baseInit.method && baseInit.method !== "GET")) {
             baseInit.method = "GET";
             delete baseInit.body;

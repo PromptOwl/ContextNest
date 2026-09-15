@@ -158,6 +158,64 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
     expect(doc.body).toContain("Human note.");
   });
 
+  it("a title-only or tags-only human edit also counts as a human edit (review finding #1)", async () => {
+    const first = await run(fakePlugin([item()]));
+    const id = first.results[0].id;
+    await createEngineApi().run("context_update", { id, title: "Renamed by a human" }, ctx);
+    const out = await run(fakePlugin([item({ provenance: { ...item().provenance, hash: "h9" } })]));
+    expect(out.conflicts).toEqual([{ externalId: "call-1", id }]);
+    expect((await ctx.storage.readDocument(id)).frontmatter.title).toBe("Renamed by a human");
+  });
+
+  it("a pull() iterator that throws mid-stream keeps the partial result and records one failure (review finding)", async () => {
+    const p = fakePlugin([], {
+      pull() {
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield item({ externalId: "ok-1" });
+            throw new Error("page 2 timed out");
+          },
+        };
+      },
+    });
+    const out = await run(p);
+    expect(out.created).toBe(1);
+    expect(out.failed).toEqual([{ externalId: "(pull)", error: "page 2 timed out" }]);
+    expect(out.clean).toBe(false);
+    expect(out.nextCursor).toBeUndefined();
+  });
+
+  it("process() returning no drafts is a skip, not a failure — the cursor still advances (review finding #3)", async () => {
+    const p = fakePlugin([item({ externalId: "bot-msg" }), item({ externalId: "real" })], {
+      async process(_c, i, mode) {
+        if (i.externalId === "bot-msg") return [];
+        return [{ path: "kept", type: "document", title: "Kept", tags: [], body: "x", provenance: { ...i.provenance, plugin: "fake", externalId: i.externalId, mode } }];
+      },
+    });
+    const out = await run(p);
+    expect(out).toMatchObject({ created: 1, skipped: 1, clean: true, nextCursor: { page: 2 } });
+    expect(out.results.find((r: any) => r.externalId === "bot-msg")).toMatchObject({ outcome: "skipped" });
+  });
+
+  it("a plugin's validateSettings() is honoured by the engine host, not just the CLI (review finding)", async () => {
+    const p = fakePlugin([item()], { validateSettings(s) { if (!s.token) throw new Error("token is required"); } });
+    await expect(run(p, { settings: {} })).rejects.toThrow(/token is required/);
+  });
+
+  it("refuses target.status 'published' without publish:true — a status claim must be backed by the audit trail (review finding)", async () => {
+    await expect(run(fakePlugin([item()]), { target: { status: "published" } })).rejects.toThrow(/publish/);
+  });
+
+  it("an unreadable existing document is an error, not a silent create (review finding #4)", async () => {
+    const first = await run(fakePlugin([item()]));
+    const id = first.results[0].id;
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(dir, `${id}.md`), "---\ntitle: [broken\n---\nbody", "utf8");
+    const out = await run(fakePlugin([item({ provenance: { ...item().provenance, hash: "h9" } })]));
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0].error).not.toMatch(/already exists/i);
+  });
+
   it("a failing item is recorded, does not stop the others, and dirties the run", async () => {
     const out = await run(fakePlugin([item({ externalId: "bad", body: "" , title: "" } as any), item({ externalId: "ok" })]));
     expect(out.failed).toHaveLength(1);
@@ -240,6 +298,28 @@ describe("isPrivateAddress", () => {
   it("classifies the usual suspects", () => {
     for (const ip of ["127.0.0.1", "10.0.0.5", "172.16.0.1", "192.168.1.1", "169.254.169.254", "::1", "fd00::1", "0.0.0.0"]) expect(isPrivateAddress(ip), ip).toBe(true);
     for (const ip of ["8.8.8.8", "140.82.112.3", "2606:4700::1"]) expect(isPrivateAddress(ip), ip).toBe(false);
+  });
+  it("refuses IPv4-embedded IPv6 transition ranges (6to4, NAT64, Teredo, mapped) — review finding #2", () => {
+    for (const ip of ["2002:7f00:1::", "64:ff9b::7f00:1", "64:ff9b::c0a8:101", "2001:0:53aa:64c:0:0:0:1", "::ffff:7f00:1", "::ffff:10.0.0.1"]) expect(isPrivateAddress(ip), ip).toBe(true);
+  });
+});
+
+describe("createSafeFetch redirects", () => {
+  it("drops Authorization/Cookie when a redirect crosses origins, keeps them on the same origin (review finding #2)", async () => {
+    const { createSafeFetch } = await import("../plugins/safe-fetch.js");
+    const seen: Array<{ url: string; auth: string | null }> = [];
+    const fetchFn = async (input: any, init: any) => {
+      const url = String(input);
+      const h = new Headers(init.headers);
+      seen.push({ url, auth: h.get("authorization") });
+      if (url === "https://api.example/a") return new Response(null, { status: 302, headers: { location: "https://api.example/b" } });
+      if (url === "https://api.example/b") return new Response(null, { status: 302, headers: { location: "https://evil.example/c" } });
+      return new Response("ok", { status: 200 });
+    };
+    const f = createSafeFetch({ fetchFn: fetchFn as any, lookupFn: async () => [{ address: "93.184.216.34" }] });
+    const res = await f("https://api.example/a", { headers: { Authorization: "Bearer s3cret", Cookie: "sid=1", "X-Trace": "t" } });
+    expect(res.status).toBe(200);
+    expect(seen.map((s) => s.auth)).toEqual(["Bearer s3cret", "Bearer s3cret", null]);
   });
 });
 

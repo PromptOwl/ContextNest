@@ -13,12 +13,12 @@ const mode = z.enum(PROCESS_MODES).default("raw").describe("raw: verbatim. summa
 const target = z
   .object({
     folder: z.string().optional().describe("Folder prefix for every node the run writes"),
-    status: z.enum(["draft", "pending_review", "published"]).optional().describe("Status to land nodes with (a governed host passes pending_review)"),
+    status: z.enum(["draft", "pending_review", "published"]).optional().describe("Status to land nodes with (a governed host passes pending_review). \"published\" requires publish: true"),
     publish: z.boolean().optional().describe("Whether to publish (default: true unless a status is given)"),
   })
   .optional();
 
-const outcome = z.enum(["created", "updated", "unchanged", "conflict"]);
+const outcome = z.enum(["created", "updated", "unchanged", "conflict", "skipped"]);
 const itemResult = z.object({ externalId: z.string(), id: z.string(), outcome });
 
 const ingestOutput = z.object({
@@ -26,6 +26,7 @@ const ingestOutput = z.object({
   created: z.number(),
   updated: z.number(),
   unchanged: z.number(),
+  skipped: z.number(),
   conflicts: z.array(z.object({ externalId: z.string(), id: z.string() })),
   failed: z.array(z.object({ externalId: z.string(), error: z.string() })),
   results: z.array(itemResult),

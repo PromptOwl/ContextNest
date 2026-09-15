@@ -6,7 +6,7 @@
  * and exposes them as the `sync` capability namespace of the operation
  * catalog via an `EngineExtension`.
  */
-export { createPluginHost, loadPlugins, authorFor, bodyHash } from "./host.js";
+export { createPluginHost, loadPlugins, authorFor, bodyHash, editHash, trimSlashes } from "./host.js";
 export type { PluginHost, PluginHostOptions, IngestResult, IngestTarget, Outcome, FederatedSearchResult, LoadResult, HostLog, Distiller, DraftWriter, StoredProvenance } from "./host.js";
 export { SYNC_OPERATIONS } from "./ops.js";
 export { createSafeFetch, isPrivateAddress } from "./safe-fetch.js";

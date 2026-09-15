@@ -74,13 +74,15 @@ export interface IngestTarget {
   publish?: boolean;
 }
 
-export type Outcome = "created" | "updated" | "unchanged" | "conflict";
+export type Outcome = "created" | "updated" | "unchanged" | "conflict" | "skipped";
 
 export interface IngestResult {
   plugin: string;
   created: number;
   updated: number;
   unchanged: number;
+  /** Items the plugin's process() chose not to land (returned no drafts). Not a failure. */
+  skipped: number;
   conflicts: Array<{ externalId: string; id: string }>;
   failed: Array<{ externalId: string; error: string }>;
   results: Array<{ externalId: string; id: string; outcome: Outcome }>;
@@ -153,16 +155,40 @@ export async function loadPlugins(
 
 /** Version author the host stamps on every plugin write. */
 export const authorFor = (plugin: string) => `system:plugin:${plugin}`;
-// trimEnd: the engine serializes with a trailing newline, and line-end churn is
-// not a human edit. Interior differences still count.
-/** Hash of a body as the host compares it — exported so a custom writer agrees with the default. */
+
+/**
+ * What "the plugin last wrote" means for the human-edit check: title, tags
+ * and body together — a human renaming or re-tagging a node is an edit too.
+ * Body is trimEnd'd because the engine serializes with a trailing newline
+ * and line-end churn is not a human edit; interior differences still count.
+ * Exported so a custom writer agrees with the default.
+ */
+export const editHash = (doc: { title: string; tags?: readonly string[]; body: string }) =>
+  createHash("sha256")
+    .update(doc.title)
+    .update("\u0000")
+    .update([...(doc.tags ?? [])].sort().join(" "))
+    .update("\u0000")
+    .update(doc.body.trimEnd())
+    .digest("hex");
+/** @deprecated use editHash — kept for a custom writer that only hashed the body. */
 export const bodyHash = (body: string) => createHash("sha256").update(body.trimEnd()).digest("hex");
-const joinPath = (folder: string | undefined, path: string) => (folder ? `${folder.replace(/^\/+|\/+$/g, "")}/${path}` : path);
+
+/** Strip leading/trailing slashes without a backtracking regex (CodeQL: polynomial on repeated '/'). */
+export function trimSlashes(s: string): string {
+  let a = 0;
+  let b = s.length;
+  while (a < b && s.charCodeAt(a) === 47) a++;
+  while (b > a && s.charCodeAt(b - 1) === 47) b--;
+  return s.slice(a, b);
+}
+const joinPath = (folder: string | undefined, path: string) => (folder ? `${trimSlashes(folder)}/${path}` : path);
 
 export interface StoredProvenance {
   plugin: string;
   externalId: string;
   hash: string;
+  /** editHash() of what the plugin last wrote (title + tags + body). */
   bodyHash: string;
   mode: ProcessMode;
   url?: string;
@@ -185,7 +211,15 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
     return p;
   }
 
-  function pluginContext(ctx: OperationContext, plugin: NestPlugin, settings: Record<string, unknown>): PluginContext {
+  async function pluginContext(ctx: OperationContext, plugin: NestPlugin, settings: Record<string, unknown>): Promise<PluginContext> {
+    // The plugin's own veto runs on every host, not just the CLI's `set`.
+    if (plugin.validateSettings) {
+      try {
+        await plugin.validateSettings(settings);
+      } catch (e) {
+        throw new ContextNestError(`Invalid settings for plugin ${plugin.manifest.name}: ${(e as Error).message}`, "VALIDATION_FAILED");
+      }
+    }
     return {
       nestId: options.nestId ?? ctx.storage.root,
       settings,
@@ -200,21 +234,28 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
     const id = joinPath(target.folder, d.path);
     const author = authorFor(plugin.manifest.name);
     const actorCtx: OperationContext = { ...ctx, actor: author };
-    const provenance: StoredProvenance = { ...d.provenance, bodyHash: bodyHash(d.body) };
+    const provenance: StoredProvenance = { ...d.provenance, bodyHash: editHash(d) };
     const status = target.status;
     const publish = target.publish ?? status === undefined;
 
     let existing: Awaited<ReturnType<OperationContext["storage"]["readDocument"]>> | null = null;
     try {
       existing = await ctx.storage.readDocument(id);
-    } catch {
+    } catch (e) {
+      // Only "there is no such document" means create. Anything else — a file
+      // that exists but will not parse, a permission problem — is a real error.
+      if ((e as { code?: string })?.code !== "DOCUMENT_NOT_FOUND") throw e;
       existing = null;
     }
     if (existing) {
       const prev = (existing.frontmatter.metadata as { provenance?: StoredProvenance } | undefined)?.provenance;
       // A node at this path that the plugin did not write, or that a human
-      // has edited since (body no longer matches what we last wrote): keep it.
-      const humanEdited = !prev || prev.plugin !== d.provenance.plugin || prev.externalId !== d.provenance.externalId || bodyHash(existing.body) !== prev.bodyHash;
+      // has edited since (title/tags/body no longer match what we last wrote): keep it.
+      const humanEdited =
+        !prev ||
+        prev.plugin !== d.provenance.plugin ||
+        prev.externalId !== d.provenance.externalId ||
+        editHash({ title: existing.frontmatter.title, tags: existing.frontmatter.tags, body: existing.body }) !== prev.bodyHash;
       if (humanEdited) return { id, outcome: "conflict" };
       if (prev.hash === d.provenance.hash && prev.mode === d.provenance.mode) return { id, outcome: "unchanged" };
       await CORE_EXECUTORS.context_update(actorCtx, {
@@ -245,6 +286,18 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
 
   const write = options.write ?? engineWrite;
 
+  /**
+   * A caller error, checked once per operation (not per item, where it would
+   * masquerade as a plugin failure): a status of "published" is a claim the
+   * audit trail must back, so it needs the real publish (checkpoint + chain).
+   */
+  function validateTarget(target: IngestTarget): IngestTarget {
+    if (target.status === "published" && target.publish !== true) {
+      throw new ContextNestError('target.status "published" requires target.publish: true — a node cannot claim to be published without going through publish', "VALIDATION_FAILED");
+    }
+    return target;
+  }
+
   /** Validate the draft, then hand it to whichever write path this host uses. */
   async function upsertDraft(ctx: OperationContext, plugin: NestPlugin, draft: NodeDraft, target: IngestTarget) {
     const parsed = nodeDraftSchema.safeParse(draft);
@@ -259,9 +312,11 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
     // tree), so it gets no default folder — the default mapper does.
     const target: IngestTarget = plugin.process || targetIn.folder ? targetIn : { ...targetIn, folder: defaultFolder(plugin.manifest.name) };
     const drafts = plugin.process ? await plugin.process(pctx, valid, mode) : await defaultProcess(plugin.manifest.name, pctx, valid, mode);
-    if (drafts.length === 0) throw new Error(`process() returned no drafts for ${valid.externalId}`);
+    // A plugin that filters an item out (bot message, empty transcript) returns
+    // no drafts. That is a decision, not a failure — it must not dirty the run.
+    if (drafts.length === 0) return { externalId: valid.externalId, id: "", outcome: "skipped" as Outcome };
     // One item may fan out to several nodes; the outcome reported is the "worst" one.
-    const rank: Outcome[] = ["unchanged", "updated", "created", "conflict"];
+    const rank: Outcome[] = ["skipped", "unchanged", "updated", "created", "conflict"];
     let worst: { id: string; outcome: Outcome } | null = null;
     for (const draft of drafts) {
       const r = await upsertDraft(ctx, plugin, draft, target);
@@ -273,11 +328,25 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
   const ingest: PluginHost["ingest"] = async (ctx, input) => {
     const plugin = get(input.plugin);
     if (!plugin.pull) throw new ContextNestError(`Plugin ${input.plugin} has no pull() face`, "VALIDATION_FAILED");
-    const pctx = pluginContext(ctx, plugin, input.settings);
-    const target = input.target ?? {};
-    const result: IngestResult = { plugin: input.plugin, created: 0, updated: 0, unchanged: 0, conflicts: [], failed: [], results: [], clean: true };
+    const target = validateTarget(input.target ?? {});
+    const pctx = await pluginContext(ctx, plugin, input.settings);
+    const result: IngestResult = { plugin: input.plugin, created: 0, updated: 0, unchanged: 0, skipped: 0, conflicts: [], failed: [], results: [], clean: true };
     const iter = plugin.pull(pctx, input.cursor);
-    for await (const item of iter) {
+    // Drive the iterator by hand so a failure PRODUCING the next item (a paging
+    // fetch that times out) is one more failed entry, not a lost run: what was
+    // already written stays reported, and the dirty run keeps the old cursor.
+    const it = iter[Symbol.asyncIterator]();
+    for (;;) {
+      let step: IteratorResult<InboundItem>;
+      try {
+        step = await it.next();
+      } catch (e) {
+        result.failed.push({ externalId: "(pull)", error: (e as Error).message });
+        log("error", `[${input.plugin}] pull() failed mid-stream: ${(e as Error).message}`);
+        break;
+      }
+      if (step.done) break;
+      const item = step.value;
       const externalId = String((item as InboundItem)?.externalId ?? "?");
       try {
         const r = await processOne(ctx, plugin, pctx, item, input.mode, target);
@@ -296,8 +365,9 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
 
   const ingestItem: PluginHost["ingestItem"] = async (ctx, input) => {
     const plugin = get(input.plugin);
-    const pctx = pluginContext(ctx, plugin, input.settings);
-    return processOne(ctx, plugin, pctx, input.item, input.mode, input.target ?? {});
+    const target = validateTarget(input.target ?? {});
+    const pctx = await pluginContext(ctx, plugin, input.settings);
+    return processOne(ctx, plugin, pctx, input.item, input.mode, target);
   };
 
   const search: PluginHost["search"] = async (ctx, input) => {
@@ -312,7 +382,7 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
         try {
           const plugin = get(name);
           if (!plugin.search) throw new Error("plugin has no search() face");
-          const hits = await plugin.search(pluginContext(ctx, plugin, settings), { text: input.text, limit, since: input.since });
+          const hits = await plugin.search(await pluginContext(ctx, plugin, settings), { text: input.text, limit, since: input.since });
           out.live.push({ plugin: name, hits: hits.map((h) => ({ ...h, governed: false as const, promotable: true as const })) });
         } catch (e) {
           out.errors.push({ plugin: name, error: (e as Error).message });
@@ -326,9 +396,10 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
   const promote: PluginHost["promote"] = async (ctx, input) => {
     const plugin = get(input.plugin);
     if (!plugin.fetchOne) throw new ContextNestError(`Plugin ${input.plugin} has no fetchOne() face`, "VALIDATION_FAILED");
-    const pctx = pluginContext(ctx, plugin, input.settings);
+    const target = validateTarget(input.target ?? {});
+    const pctx = await pluginContext(ctx, plugin, input.settings);
     const item = await plugin.fetchOne(pctx, input.externalId);
-    return processOne(ctx, plugin, pctx, item, input.mode, input.target ?? {});
+    return processOne(ctx, plugin, pctx, item, input.mode, target);
   };
 
   function describe() {
