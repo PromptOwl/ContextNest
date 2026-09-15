@@ -193,6 +193,20 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
     expect(out.results[0].id).toBe("custom/place");
   });
 
+  it("a host-supplied write port replaces the engine upsert but keeps mapping, cursor policy and conflict semantics", async () => {
+    const seen: Array<{ id: string; author: string }> = [];
+    const out = await run(fakePlugin([item(), item({ externalId: "call-2", title: "Second" })]), {}, {
+      write: async (_ctx: unknown, plugin: any, draft: any) => {
+        seen.push({ id: draft.path, author: `system:plugin:${plugin.manifest.name}` });
+        return { id: draft.path, outcome: draft.provenance.externalId === "call-2" ? "conflict" : "created" };
+      },
+    });
+    expect(seen.map((s) => s.id)).toEqual(["inbox/fake/2026-09-15-acme-discovery", "inbox/fake/2026-09-15-second"]);
+    expect(out).toMatchObject({ created: 1, conflicts: [{ externalId: "call-2" }], clean: false });
+    expect(out.nextCursor).toBeUndefined();
+    await expect(ctx.storage.readDocument("inbox/fake/2026-09-15-acme-discovery")).rejects.toThrow(); // engine never wrote
+  });
+
   it("refuses an unknown plugin and a plugin without pull", async () => {
     await expect(run(fakePlugin([]), { plugin: "nope" })).rejects.toThrow(/unknown plugin/i);
     const searchOnly = definePlugin({

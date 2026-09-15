@@ -40,12 +40,29 @@ import { SYNC_OPERATIONS } from "./ops.js";
 export type HostLog = (level: "debug" | "info" | "warn" | "error", msg: string, data?: unknown) => void;
 export type Distiller = NonNullable<PluginContext["distill"]>;
 
+/**
+ * The write port. The engine's default writes through its own `context_create`
+ * / `context_update` executors. A host with its own write path — governance
+ * rows, audit tables, notifications — supplies one and keeps everything else
+ * (loading, faces, mapping, fetch guard, cursor policy). It must honour the
+ * same contract: never overwrite a node a human edited (return `conflict`),
+ * treat an unchanged hash as `unchanged`.
+ */
+export type DraftWriter = (
+  ctx: OperationContext,
+  plugin: NestPlugin,
+  draft: NodeDraft,
+  target: IngestTarget,
+) => Promise<{ id: string; outcome: Outcome }>;
+
 export interface PluginHostOptions {
   plugins: readonly NestPlugin[];
   /** LLM port for summary mode. Absent → summary requests land raw with a warning. */
   distill?: Distiller;
   log?: HostLog;
   fetch?: SafeFetchOptions;
+  /** Replace the engine's upsert with the host's own write path. */
+  write?: DraftWriter;
 }
 
 export interface IngestTarget {
@@ -132,13 +149,15 @@ export async function loadPlugins(
 
 // ─── host ────────────────────────────────────────────────────────────────
 
-const authorFor = (plugin: string) => `system:plugin:${plugin}`;
+/** Version author the host stamps on every plugin write. */
+export const authorFor = (plugin: string) => `system:plugin:${plugin}`;
 // trimEnd: the engine serializes with a trailing newline, and line-end churn is
 // not a human edit. Interior differences still count.
-const bodyHash = (body: string) => createHash("sha256").update(body.trimEnd()).digest("hex");
+/** Hash of a body as the host compares it — exported so a custom writer agrees with the default. */
+export const bodyHash = (body: string) => createHash("sha256").update(body.trimEnd()).digest("hex");
 const joinPath = (folder: string | undefined, path: string) => (folder ? `${folder.replace(/^\/+|\/+$/g, "")}/${path}` : path);
 
-interface StoredProvenance {
+export interface StoredProvenance {
   plugin: string;
   externalId: string;
   hash: string;
@@ -174,11 +193,8 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
     };
   }
 
-  /** The single write path. Returns the outcome; never throws for a conflict. */
-  async function upsertDraft(ctx: OperationContext, plugin: NestPlugin, draft: NodeDraft, target: IngestTarget): Promise<{ id: string; outcome: Outcome }> {
-    const parsed = nodeDraftSchema.safeParse(draft);
-    if (!parsed.success) throw new Error(`invalid node draft from ${plugin.manifest.name}: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
-    const d = parsed.data;
+  /** The engine's own write path. Returns the outcome; never throws for a conflict. */
+  const engineWrite: DraftWriter = async (ctx, plugin, d, target) => {
     const id = joinPath(target.folder, d.path);
     const author = authorFor(plugin.manifest.name);
     const actorCtx: OperationContext = { ...ctx, actor: author };
@@ -223,6 +239,15 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
       publish,
     });
     return { id, outcome: "created" };
+  };
+
+  const write = options.write ?? engineWrite;
+
+  /** Validate the draft, then hand it to whichever write path this host uses. */
+  async function upsertDraft(ctx: OperationContext, plugin: NestPlugin, draft: NodeDraft, target: IngestTarget) {
+    const parsed = nodeDraftSchema.safeParse(draft);
+    if (!parsed.success) throw new Error(`invalid node draft from ${plugin.manifest.name}: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+    return write(ctx, plugin, parsed.data, target);
   }
 
   async function processOne(ctx: OperationContext, plugin: NestPlugin, pctx: PluginContext, item: InboundItem, mode: ProcessMode, target: IngestTarget) {
