@@ -162,7 +162,7 @@ wire; in-process callers supply it, wire transports leave it undefined.
 
 ## Plugins
 
-`@promptowl/contextnest-engine/plugins` hosts [Nest Plugins](https://github.com/PromptOwl/contextnest-plugin-sdk):
+`@promptowl/contextnest-engine/plugins` hosts [Nest Plugins](https://github.com/PromptOwl/CommunityNestSDK):
 connectors written against an Apache-2.0 SDK that bring outside sources into a vault (raw or summarized) and
 answer queries live. The host owns everything a plugin must not: node upserts keyed on
 `metadata.provenance` (`plugin` + `externalId`), the never-overwrite-a-human-edit rule, the wrapped `fetch`

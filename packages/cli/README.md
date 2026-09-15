@@ -212,7 +212,7 @@ CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 ### Plugins
 
 Connect outside sources — GitHub, Gong, Slack, Teams, email, your own tools — through
-[Nest Plugins](https://github.com/PromptOwl/contextnest-plugin-sdk) (Apache-2.0 SDK; plugins may be any licence).
+[Nest Plugins](https://github.com/PromptOwl/CommunityNestSDK) (Apache-2.0 SDK; plugins may be any licence).
 
 ```bash
 ctx plugin add @promptowl/contextnest-plugin-github-markdown
