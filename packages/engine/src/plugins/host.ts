@@ -413,6 +413,7 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
       settingsSchema: p.manifest.settings,
       secretKeys: secretKeys(p.manifest),
       ...(p.manifest.webhook ? { webhook: p.manifest.webhook } : {}),
+      ...(p.manifest.oauth ? { oauth: p.manifest.oauth } : {}),
       ...(p.manifest.cursor ? { cursor: p.manifest.cursor } : {}),
       faces: {
         pull: !!p.pull,

@@ -89,6 +89,18 @@ describe("loadPlugins", () => {
 });
 
 describe("context_plugins", () => {
+  it("surfaces a plugin's oauth declaration so a host can offer Connect", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      const p = definePlugin({ manifest: { name: "oauthy", version: "1", displayName: "O", description: "d", capabilities: ["pull"], settings: { type: "object" }, oauth: { provider: "google", scopes: ["https://www.googleapis.com/auth/drive.readonly"] } }, pull() { return { async *[Symbol.asyncIterator]() {} }; } });
+      const api = createEngineApi({ extensions: [createPluginHost({ plugins: [p] }).extension] });
+      const out = await api.run<any>("context_plugins", {}, ctx);
+      expect(out.plugins[0].oauth).toEqual({ provider: "google", scopes: ["https://www.googleapis.com/auth/drive.readonly"] });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("lists manifests with secret keys called out and never includes function bodies", async () => {
     const { ctx, dir } = await makeContext();
     try {
