@@ -229,6 +229,12 @@ Settings live in `.context/plugins.yaml` (mode 600). A secret setting may also b
 summary requests land raw with a warning — never dropped. The cursor advances only after a clean run,
 so failures and local-edit conflicts are retried next time.
 
+"Nodes you edited" means title, tags or body: a plugin never overwrites those. A status change alone
+(say, holding a plugin-written node as `draft`) is not an edit — the next upstream change re-lands the
+node published. Hold with a one-word edit to the body, or run a governed host (Community), which routes
+plugin writes through review. Secret settings are listed masked; the names to mask are recorded in
+`plugins.yaml` at `add` time so masking holds even if the plugin package later fails to load.
+
 ### Packs & Checkpoints
 - `ctx pack list` — List context packs
 - `ctx pack show <id>` — Show pack details

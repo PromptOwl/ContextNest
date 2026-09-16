@@ -103,6 +103,26 @@ describe("[regression] ctx plugin", () => {
     expect(again).toMatchObject({ created: 0, updated: 0, nextCursor: { n: 2 } });
   });
 
+  it("list keeps secrets masked even when the plugin module no longer loads (regression: masking must not depend on a re-import)", () => {
+    ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
+    ok(tmp, ["plugin", "set", "memo", "prefix=Memo", "token=sekrit"]);
+    rmSync(join(tmp, "plugins", "memo.mjs"));
+    const listed = ok(tmp, ["plugin", "list", "--json"]);
+    expect(listed).not.toContain("sekrit");
+    expect(listed).toMatch(/••••/);
+    expect(listed).toMatch(/"error"/);
+    expect(ok(tmp, ["plugin", "list"])).not.toContain("sekrit");
+    writeFileSync(join(tmp, "plugins", "memo.mjs"), PLUGIN_SRC);
+  });
+
+  it("set keeps a string-typed setting a string even when the value looks like a number or boolean", () => {
+    ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
+    ok(tmp, ["plugin", "set", "memo", "prefix=12345", "token=true"]);
+    const yaml = readFileSync(join(tmp, ".context", "plugins.yaml"), "utf-8");
+    expect(yaml).toMatch(/prefix: ['"]12345['"]/);
+    expect(yaml).toMatch(/token: ['"]true['"]/);
+  });
+
   it("an env var overrides a stored secret", () => {
     ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
     ok(tmp, ["plugin", "set", "memo", "prefix=Memo", "token=wrong"]);

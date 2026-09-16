@@ -69,7 +69,7 @@ export function isPrivateAddress(ip: string): boolean {
     if (embedded) return isPrivateAddress(embedded);
     // Teredo (2001:0::/32) embeds a v4 server + obfuscated client address;
     // refuse the whole range — nothing a plugin legitimately needs lives there.
-    if (/^2001:0*:/.test(lower) && /^2001:0{0,4}:/.test(lower)) return true;
+    if (/^2001:0{0,4}:/.test(lower)) return true;
     return false;
   }
   return true; // not an IP at all — caller should have resolved it

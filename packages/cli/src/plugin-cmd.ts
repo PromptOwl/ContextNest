@@ -29,6 +29,9 @@ import { confirmOrExit } from "./safety.js";
 
 interface PluginEntry {
   package: string;
+  /** Secret setting names, copied from the manifest at add time so `list`
+   *  can mask them even when the module no longer loads. */
+  secrets?: string[];
   settings?: Record<string, unknown>;
   cursor?: unknown;
   mode?: "raw" | "summary";
@@ -157,14 +160,36 @@ async function targetFolder(root: string, folder: string | undefined, pluginName
   return layout === "structured" && !/^nodes(\/|$)/.test(f) ? `nodes/${f}` : f;
 }
 
-function parseKv(pairs: string[]): Record<string, unknown> {
+/** Names that are credentials by convention — masked when no manifest can say. */
+const LOOKS_SECRET = /(token|secret|password|passwd|credential|api[-_]?key|private[-_]?key|auth)/i;
+
+/** Setting names to mask for an entry: the manifest if it loaded, else what
+ *  `add` recorded, else the credential-shaped names — never nothing. */
+function secretNamesFor(plugin: NestPlugin | undefined, entry: PluginEntry): (key: string) => boolean {
+  if (plugin) { const s = new Set(secretKeys(plugin.manifest)); return (k) => s.has(k); }
+  if (entry.secrets) { const s = new Set(entry.secrets); return (k) => s.has(k) || LOOKS_SECRET.test(k); }
+  return (k) => LOOKS_SECRET.test(k);
+}
+
+/** key=value pairs, coerced by the setting's declared type: a field declared
+ *  boolean / integer / number parses; a string field — or one the schema
+ *  doesn't name — keeps "12345" / "true" as text, so numeric ids and PATs
+ *  survive. */
+function parseKv(pairs: string[], schema: { properties?: Record<string, { type?: string }> }): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const p of pairs) {
     const i = p.indexOf("=");
     if (i <= 0) throw new Error(`expected key=value, got "${p}"`);
     const k = p.slice(0, i);
     const raw = p.slice(i + 1);
-    out[k] = raw === "true" ? true : raw === "false" ? false : /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : raw;
+    const type = schema.properties?.[k]?.type;
+    if (type === "boolean") {
+      if (raw !== "true" && raw !== "false") throw new Error(`${k} must be true or false`);
+      out[k] = raw === "true";
+    } else if (type === "integer" || type === "number") {
+      if (!/^-?\d+(\.\d+)?$/.test(raw)) throw new Error(`${k} must be a number`);
+      out[k] = Number(raw);
+    } else out[k] = raw;
   }
   return out;
 }
@@ -183,7 +208,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       if (file.plugins[name] && file.plugins[name].package !== spec) {
         await confirmOrExit(`Plugin "${name}" is already recorded from ${file.plugins[name].package}. Replace with ${spec}?`);
       }
-      file.plugins[name] = { ...(file.plugins[name] ?? {}), package: spec };
+      file.plugins[name] = { ...(file.plugins[name] ?? {}), package: spec, secrets: secretKeys(plugin.manifest) };
       writeFile(root, file);
       console.log(`${chalk.green("✓")} ${chalk.bold(name)} v${plugin.manifest.version} — ${plugin.manifest.description}`);
       console.log(chalk.dim(`  faces: ${plugin.manifest.capabilities.join(", ")}`));
@@ -203,8 +228,8 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const { plugins, errors } = await loadAll(root, file);
       const rows = Object.entries(file.plugins).map(([name, entry]) => {
         const p = plugins.find((x) => x.manifest.name === name);
-        const secrets = p ? new Set(secretKeys(p.manifest)) : new Set<string>();
-        const settings = Object.fromEntries(Object.entries(entry.settings ?? {}).map(([k, v]) => [k, secrets.has(k) ? mask(v) : v]));
+        const isSecret = secretNamesFor(p, entry);
+        const settings = Object.fromEntries(Object.entries(entry.settings ?? {}).map(([k, v]) => [k, isSecret(k) ? mask(v) : v]));
         return { name, package: entry.package, version: p?.manifest.version, capabilities: p?.manifest.capabilities, mode: entry.mode ?? "raw", folder: entry.folder, settings, cursor: entry.cursor, last_run_at: entry.last_run_at, last_status: entry.last_status, error: errors.find((e) => e.startsWith(`${name}:`)) };
       });
       if (opts.json) {
@@ -234,7 +259,8 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const entry = file.plugins[name];
       if (!entry) throw new Error(`No plugin "${name}" — add it first: ctx plugin add <package>`);
       const plugin = await loadOne(root, entry.package);
-      const next = { ...(entry.settings ?? {}), ...parseKv(pairs) };
+      const kv = parseKv(pairs, plugin.manifest.settings as { properties?: Record<string, { type?: string }> });
+      const next = { ...(entry.settings ?? {}), ...kv };
       if (plugin.validateSettings) await plugin.validateSettings(resolveSettings(plugin, { ...entry, settings: next }));
       entry.settings = next;
       if (opts.mode) {
@@ -243,7 +269,8 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       }
       if (opts.folder !== undefined) entry.folder = opts.folder;
       writeFile(root, file);
-      console.log(`${chalk.green("✓")} ${name}: ${Object.keys(parseKv(pairs)).join(", ") || "options"} saved`);
+      entry.secrets = secretKeys(plugin.manifest);
+      console.log(`${chalk.green("✓")} ${name}: ${Object.keys(kv).join(", ") || "options"} saved`);
     });
 
   cmd
