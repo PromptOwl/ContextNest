@@ -33,6 +33,7 @@ export type {
   CheckpointHistory,
   NestConfig,
   AccessTrace,
+  ClientMetadata,
   SourceHydrationTrace,
   TraceEntry,
   ValidationError,
@@ -138,6 +139,7 @@ export {
   packSchema,
   versionEntrySchema,
   documentHistorySchema,
+  clientMetadataSchema,
   checkpointSchema,
   checkpointHistorySchema,
   suggestionMetaSchema,
@@ -153,6 +155,9 @@ export {
   TAG_PATTERN,
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
+  CLIENT_METADATA_RESERVED_KEYS,
+  CLIENT_METADATA_MAX_CUSTOM_KEYS,
+  CLIENT_METADATA_MAX_VALUE_LENGTH,
 } from "./schemas.js";
 
 // Typed frontmatter blocks (source / skill) — see typed-blocks.ts

@@ -24,6 +24,14 @@ import {
 import { CORE_OPERATIONS } from "./core.js";
 
 export * from "./types.js";
+export {
+  clientField,
+  clientMetadataSchema,
+  CLIENT_METADATA_RESERVED_KEYS,
+  CLIENT_METADATA_MAX_CUSTOM_KEYS,
+  CLIENT_METADATA_MAX_VALUE_LENGTH,
+  type ClientMetadata,
+} from "./client.js";
 export { CORE_OPERATIONS } from "./core.js";
 export { CORE_EXECUTORS } from "./core-executors.js";
 export type { OperationContext, OperationExecutor } from "./context.js";

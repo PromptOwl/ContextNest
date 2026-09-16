@@ -317,6 +317,76 @@ export const packSchema = z.object({
   audiences: z.array(z.string()).optional(),
 });
 
+// ─── Client (caller) metadata (§9.4) ─────────────────────────────────────────
+
+/** Reserved keys of {@link clientMetadataSchema}; everything else is custom. */
+export const CLIENT_METADATA_RESERVED_KEYS = ["agent", "session_id"] as const;
+/** How many CUSTOM keys a caller may attach beyond the reserved two. */
+export const CLIENT_METADATA_MAX_CUSTOM_KEYS = 16;
+/** Longest string value accepted for any key. */
+export const CLIENT_METADATA_MAX_VALUE_LENGTH = 512;
+
+/**
+ * Caller metadata attached to an API call — the calling agent's name, its
+ * session id, and any custom keys it wants recorded alongside the action.
+ *
+ * Bounds are not decoration. This object is written into the append-only
+ * version history and into access traces, so an unbounded one lets any caller
+ * grow a vault's audit trail without limit. Values are scalars for the same
+ * reason: a nested payload has no natural size, and YAML-round-tripping one
+ * through history.yaml would make the entry unreadable.
+ */
+export const clientMetadataSchema = z
+  .object({
+    agent: z.string().min(1).max(CLIENT_METADATA_MAX_VALUE_LENGTH).optional(),
+    session_id: z.string().min(1).max(CLIENT_METADATA_MAX_VALUE_LENGTH).optional(),
+  })
+  .catchall(
+    z.union([
+      z.string().max(CLIENT_METADATA_MAX_VALUE_LENGTH),
+      z.number(),
+      z.boolean(),
+    ]),
+  )
+  .superRefine((value, ctx) => {
+    const reserved = new Set<string>(CLIENT_METADATA_RESERVED_KEYS);
+    const custom = Object.keys(value).filter((key) => !reserved.has(key));
+    if (custom.length > CLIENT_METADATA_MAX_CUSTOM_KEYS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `client metadata accepts at most ${CLIENT_METADATA_MAX_CUSTOM_KEYS} custom keys, got ${custom.length}`,
+      });
+    }
+    // Refuse a near-miss on a reserved key. `sessionId` is valid as a custom
+    // key and would be recorded — but NOT in the slot `context_versions` reads,
+    // so the write ends up silently un-attributed. That is the one failure an
+    // open catchall cannot catch on its own, and the caller cannot see it
+    // happen. Naming the intended key is cheaper than auditing the miss later.
+    for (const key of custom) {
+      // Key NAMES are bounded like values: they land in the same append-only
+      // trail, and an empty key is unreadable in history.yaml.
+      if (key.trim().length === 0 || key.length > CLIENT_METADATA_MAX_VALUE_LENGTH) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `client metadata keys must be non-empty and at most ${CLIENT_METADATA_MAX_VALUE_LENGTH} chars`,
+        });
+        continue;
+      }
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const collision = CLIENT_METADATA_RESERVED_KEYS.find(
+        (r) => r.replace(/[^a-z0-9]/g, "") === normalized,
+      );
+      if (collision) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `client metadata key "${key}" looks like the reserved key "${collision}" — use "${collision}" exactly, or rename it`,
+        });
+      }
+    }
+  });
+
 export const versionEntrySchema = z.object({
   version: z.number().int().min(1),
   keyframe: z.boolean().optional(),
@@ -327,6 +397,14 @@ export const versionEntrySchema = z.object({
   note: z.string().optional(),
   content_hash: z.string().regex(CHECKSUM_PATTERN),
   chain_hash: z.string().regex(CHECKSUM_PATTERN),
+  // Annotation, not chained evidence — see VersionEntry.client in types.ts.
+  // Lenient on READ, deliberately: the input bounds above are enforced when a
+  // caller sends the block, not when a history is loaded. Reusing them here
+  // would let a future tightening (or a hand-edited entry) fail
+  // documentHistorySchema, which storage raises as CorruptHistoryError and
+  // historyOrRepair answers by quarantining the file and restarting the chain
+  // — a whole chain lost over an annotation that is not even hashed.
+  client: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 
 export const documentHistorySchema = z.object({
