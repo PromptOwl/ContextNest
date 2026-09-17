@@ -23,8 +23,8 @@ describe("welcome.html", () => {
     expect(html).not.toMatch(/&#(1\d{5}|9000|10003);/);
     // Raw emoji code points.
     expect(html).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
-    // The inline SVG icons replaced them, and the mascot no longer leaks .lo1/.lo2 classes.
+    // The inline SVG icons replaced them; the brand logo is an <img>.
     expect(html).toContain('<svg viewBox="0 0 24 24"');
-    expect(html).not.toMatch(/\.lo[12]\{/);
+    expect(html).toMatch(/<img src="[^"]+" alt="PromptOwl">/);
   });
 });
