@@ -145,17 +145,34 @@ function inlineMarkdown(text: string): string {
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   // Italic
   s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  // Links
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-  // Wikilinks: [[nodes/x]] and [[nodes/x|label]] — the vault's own edges.
-  s = s.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target: string, label?: string) => {
+  // Links — only web/mail schemes and in-page anchors become <a>. Vault
+  // bodies can come from imported, untrusted files and this page auto-opens
+  // in a browser, so a `javascript:` or `data:` URL is rendered as text.
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m: string, text: string, url: string) =>
+    safeHref(url) ? `<a href="${url.trim()}">${text}</a>` : `${text} (${url.trim()})`,
+  );
+  // Wikilinks: [[nodes/x]] and [[nodes/x|label]] — the vault's own edges. A
+  // target is a vault-relative id; one carrying a scheme is not a wikilink.
+  s = s.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m: string, target: string, label?: string) => {
     const t = target.trim();
-    return `<a class="wikilink" href="${t}">${label?.trim() || t}</a>`;
+    const shown = label?.trim() || t;
+    return isVaultRelative(t) ? `<a class="wikilink" href="${t}">${shown}</a>` : shown;
   });
   // Pandoc-style superscript / subscript: 10^9^, H~2~O.
   s = s.replace(/\^([^\s^]+)\^/g, "<sup>$1</sup>");
   s = s.replace(/~([^\s~]+)~/g, "<sub>$1</sub>");
   return s;
+}
+
+/** `http(s)`, `ftp`, `mailto`, or an in-page `#anchor`. Anything else is not a link. */
+function safeHref(url: string): boolean {
+  const u = url.trim();
+  return /^(?:https?:|ftp:|mailto:)/i.test(u) || (u.startsWith("#") && !/[\s"'<>]/.test(u));
+}
+
+/** A wikilink target: no scheme, no protocol-relative `//`, no control/quote characters. */
+function isVaultRelative(target: string): boolean {
+  return target.length > 0 && !/^[a-z][a-z0-9+.-]*:/i.test(target) && !target.startsWith("//") && !/[\s"'<>]/.test(target);
 }
 
 /** Split a GFM table row on pipes that are not escaped as `\|` (and unescape `\\`). */

@@ -67,7 +67,7 @@
         },
         {
           "name": "fast-xml-parser",
-          "version": "5.11.1",
+          "version": "4.5.7",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -135,16 +135,6 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
-          ]
-        },
-        {
-          "name": "@nodable/entities",
-          "version": "3.0.0",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
           ]
         },
         {
@@ -253,16 +243,6 @@
           ]
         },
         {
-          "name": "fast-xml-builder",
-          "version": "1.3.1",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
-          ]
-        },
-        {
           "name": "hono",
           "version": "4.12.16",
           "license": "MIT",
@@ -270,16 +250,6 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
-          ]
-        },
-        {
-          "name": "is-unsafe",
-          "version": "2.0.2",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
           ]
         },
         {
@@ -300,17 +270,6 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
-          ]
-        },
-        {
-          "name": "path-expression-matcher",
-          "version": "1.6.2",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-builder",
-            "fast-xml-parser"
           ]
         },
         {
@@ -336,22 +295,11 @@
         },
         {
           "name": "strnum",
-          "version": "2.4.2",
+          "version": "1.1.2",
           "license": "MIT",
           "depth": 3,
           "optional": false,
           "via": [
-            "fast-xml-parser"
-          ]
-        },
-        {
-          "name": "xml-naming",
-          "version": "0.3.0",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-builder",
             "fast-xml-parser"
           ]
         },
@@ -363,16 +311,6 @@
           "optional": false,
           "via": [
             "express"
-          ]
-        },
-        {
-          "name": "anynum",
-          "version": "1.0.1",
-          "license": "MIT",
-          "depth": 4,
-          "optional": false,
-          "via": [
-            "strnum"
           ]
         },
         {
@@ -1169,8 +1107,8 @@
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 104,
-      "minimalTotal": 104,
+      "total": 98,
+      "minimalTotal": 98,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
@@ -1194,7 +1132,7 @@
         },
         {
           "name": "fast-xml-parser",
-          "version": "5.11.1",
+          "version": "4.5.7",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -1262,16 +1200,6 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
-          ]
-        },
-        {
-          "name": "@nodable/entities",
-          "version": "3.0.0",
-          "license": "MIT",
-          "depth": 2,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
           ]
         },
         {
@@ -1380,16 +1308,6 @@
           ]
         },
         {
-          "name": "fast-xml-builder",
-          "version": "1.3.1",
-          "license": "MIT",
-          "depth": 2,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
-          ]
-        },
-        {
           "name": "hono",
           "version": "4.12.16",
           "license": "MIT",
@@ -1397,16 +1315,6 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
-          ]
-        },
-        {
-          "name": "is-unsafe",
-          "version": "2.0.2",
-          "license": "MIT",
-          "depth": 2,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
           ]
         },
         {
@@ -1427,17 +1335,6 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
-          ]
-        },
-        {
-          "name": "path-expression-matcher",
-          "version": "1.6.2",
-          "license": "MIT",
-          "depth": 2,
-          "optional": false,
-          "via": [
-            "fast-xml-builder",
-            "fast-xml-parser"
           ]
         },
         {
@@ -1463,22 +1360,11 @@
         },
         {
           "name": "strnum",
-          "version": "2.4.2",
+          "version": "1.1.2",
           "license": "MIT",
           "depth": 2,
           "optional": false,
           "via": [
-            "fast-xml-parser"
-          ]
-        },
-        {
-          "name": "xml-naming",
-          "version": "0.3.0",
-          "license": "MIT",
-          "depth": 2,
-          "optional": false,
-          "via": [
-            "fast-xml-builder",
             "fast-xml-parser"
           ]
         },
@@ -1490,16 +1376,6 @@
           "optional": false,
           "via": [
             "express"
-          ]
-        },
-        {
-          "name": "anynum",
-          "version": "1.0.1",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "strnum"
           ]
         },
         {
@@ -2442,7 +2318,7 @@
         },
         {
           "name": "fast-xml-parser",
-          "version": "5.11.1",
+          "version": "4.5.7",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -2540,16 +2416,6 @@
           "via": [
             "@modelcontextprotocol/sdk",
             "@promptowl/contextnest-engine"
-          ]
-        },
-        {
-          "name": "@nodable/entities",
-          "version": "3.0.0",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
           ]
         },
         {
@@ -2696,16 +2562,6 @@
           ]
         },
         {
-          "name": "fast-xml-builder",
-          "version": "1.3.1",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
-          ]
-        },
-        {
           "name": "finalhandler",
           "version": "2.1.1",
           "license": "MIT",
@@ -2747,16 +2603,6 @@
           "optional": false,
           "via": [
             "express-rate-limit"
-          ]
-        },
-        {
-          "name": "is-unsafe",
-          "version": "2.0.2",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-parser"
           ]
         },
         {
@@ -2836,17 +2682,6 @@
             "finalhandler",
             "router",
             "serve-static"
-          ]
-        },
-        {
-          "name": "path-expression-matcher",
-          "version": "1.6.2",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-builder",
-            "fast-xml-parser"
           ]
         },
         {
@@ -2957,7 +2792,7 @@
         },
         {
           "name": "strnum",
-          "version": "2.4.2",
+          "version": "1.1.2",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -2995,27 +2830,6 @@
           "optional": false,
           "via": [
             "cross-spawn"
-          ]
-        },
-        {
-          "name": "xml-naming",
-          "version": "0.3.0",
-          "license": "MIT",
-          "depth": 3,
-          "optional": false,
-          "via": [
-            "fast-xml-builder",
-            "fast-xml-parser"
-          ]
-        },
-        {
-          "name": "anynum",
-          "version": "1.0.1",
-          "license": "MIT",
-          "depth": 4,
-          "optional": false,
-          "via": [
-            "strnum"
           ]
         },
         {

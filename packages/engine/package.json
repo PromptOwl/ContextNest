@@ -57,7 +57,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "diff": "^9.0.0",
-    "fast-xml-parser": "^5.11.1",
+    "fast-xml-parser": "^4.5.7",
     "js-yaml": "^4.3.2",
     "minisearch": "^7.0.0",
     "toposort": "^2.0.2",

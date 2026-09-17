@@ -365,6 +365,13 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
       continue;
     }
     opts.onProgress?.(`${p.id} → PMID ${pmid}`);
+    const clash = byPmid.get(pmid);
+    if (clash) {
+      // Two nodes resolving to one PMID is a metadata problem to surface,
+      // not a paper to silently drop on the floor.
+      failed.push({ id: p.id, error: `resolves to PMID ${pmid}, already claimed by ${clash.id} in this batch` });
+      continue;
+    }
     byPmid.set(pmid, p);
   }
 

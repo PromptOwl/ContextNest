@@ -1920,3 +1920,89 @@ describe("[regression] import jats", () => {
     expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
   });
 });
+
+// ─── ctx import pubmed / ctx enrich pubtator — end to end against an NCBI stub ─
+
+describe("[regression] import pubmed + enrich pubtator", () => {
+  // The CLI argument surface (--term, --max, --tag-limit, --api-key fallback
+  // via NCBI_API_KEY) is exercised through the built binary; NCBI itself is a
+  // local stub selected with CONTEXTNEST_EUTILS_BASE / CONTEXTNEST_PUBTATOR_BASE.
+  const fixture = join(here, "..", "..", "..", "engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+  const bioc = readFileSync(join(here, "fixtures", "pubtator-30056182.json"), "utf-8");
+
+  function startNcbiStub(): Promise<{ url: string; requests: string[]; close: () => Promise<void> }> {
+    return new Promise((resolve) => {
+      const requests: string[] = [];
+      const jats = readFileSync(fixture, "utf-8");
+      const server: Server = createServer((req, res) => {
+        const url = req.url ?? "";
+        requests.push(url);
+        const send = (type: string, body: string) => {
+          res.writeHead(200, { "Content-Type": type });
+          res.end(body);
+        };
+        if (url.includes("/esearch.fcgi")) {
+          const pmc = url.includes("db=pmc");
+          // pmc: two hits; pubmed (PMID lookup): one.
+          send("application/json", JSON.stringify({ esearchresult: pmc ? { idlist: ["9990001", "9990002"], count: "2" } : { idlist: ["30056182"], count: "1" } }));
+        } else if (url.includes("/efetch.fcgi")) {
+          const id = /id=(\d+)/.exec(url)?.[1] ?? "0";
+          // Second article: different DOI + no PMID so enrich has to resolve it.
+          const body = id === "9990002"
+            ? jats.replace('<article-id pub-id-type="pmid">99900001</article-id>', "").replace("10.9999/jsg.2024.001", "10.9999/jsg.2024.002")
+            : jats;
+          send("application/xml", `<pmc-articleset>${body.replace(/^<\?xml[^>]*>/, "")}</pmc-articleset>`);
+        } else if (url.includes("/publications/export/biocjson")) {
+          send("application/json", bioc.replace('"pmid": 30056182', '"pmid": 30056182'));
+        } else {
+          res.writeHead(404);
+          res.end("no");
+        }
+      });
+      server.listen(0, () => {
+        const port = (server.address() as AddressInfo).port;
+        resolve({
+          url: `http://localhost:${port}`,
+          requests,
+          close: () => new Promise((r) => server.close(() => r())),
+        });
+      });
+    });
+  }
+
+  it("fetches --max articles, imports them, then enriches with --tag-limit and the NCBI_API_KEY fallback", async () => {
+    initVault(tmp);
+    const stub = await startNcbiStub();
+    const env = {
+      ...ENV,
+      CONTEXTNEST_EUTILS_BASE: stub.url,
+      CONTEXTNEST_PUBTATOR_BASE: stub.url,
+      NCBI_API_KEY: "test-key-123",
+    } as NodeJS.ProcessEnv;
+    const run = (args: string[]) =>
+      execFileAsync("node", [distPath, ...args], { cwd: tmp, env, encoding: "utf-8" });
+    try {
+      const imp = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
+      expect(imp.stdout).toMatch(/2 match\(es\) in PMC; fetched 2/);
+      expect(imp.stdout).toMatch(/Published 2 document\(s\)/);
+      expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+      expect(existsSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"))).toBe(true);
+      const esearch = stub.requests.find((u) => u.includes("esearch") && u.includes("db=pmc"))!;
+      expect(esearch).toContain("retmax=2");
+      expect(esearch).toContain("api_key=test-key-123");
+
+      // The stub only knows PMID 30056182: the DOI-only paper resolves to it
+      // and is enriched; the paper carrying PMID 99900001 is reported, not lost.
+      const enr = await run(["enrich", "pubtator", "--tag-limit", "1", "-y"]);
+      expect(enr.stdout).toMatch(/Enriched 1 document\(s\)/);
+      expect(enr.stdout).toMatch(/pmid-99900001 \(PubTator has no record for PMID 99900001\)/);
+      const twin = readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8");
+      expect(twin).toContain("pmid: '30056182'");
+      expect((twin.match(/#mesh-/g) ?? []).length).toBe(1);
+      // The PMID lookup for the PMID-less paper went to the stub (PMCID first, DOI as fallback).
+      expect(stub.requests.some((u) => u.includes("db=pubmed") && /%5B(pmcid|doi)%5D/.test(u))).toBe(true);
+    } finally {
+      await stub.close();
+    }
+  });
+});

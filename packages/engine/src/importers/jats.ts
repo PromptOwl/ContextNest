@@ -221,9 +221,14 @@ function inline(n: XNode | string): string {
     }
     case "ext-link":
     case "uri": {
-      const href = n.attrs.href ?? squash(inner());
+      // Only web/mail schemes become links. The XML is untrusted input and
+      // `ctx read --html` opens in a browser: a `javascript:` href must never
+      // reach an <a>. Anything else keeps its text, and the URL if it differs.
+      const href = (n.attrs.href ?? squash(inner())).trim();
       const text = squash(inner()) || href;
-      return href && href !== text ? `[${text}](${href})` : text;
+      if (!href) return text;
+      if (!SAFE_LINK.test(href)) return href !== text ? `${text} (${href})` : text;
+      return href !== text ? `[${text}](${href})` : text;
     }
     case "pub-id": {
       const type = (n.attrs["pub-id-type"] ?? "").toLowerCase();
@@ -248,6 +253,9 @@ function inline(n: XNode | string): string {
       return inner();
   }
 }
+
+/** Schemes a twin may link to. Matches the renderer's allowlist. */
+const SAFE_LINK = /^(?:https?:|ftp:|mailto:)/i;
 
 function wrapIfText(s: string, mark: string): string {
   const t = s.trim();
@@ -292,7 +300,17 @@ function pushBlank(st: RenderState): void {
 function renderParagraph(p: XNode, st: RenderState): void {
   const text = paragraphText(p);
   if (!text) return;
-  const id = p.attrs.id;
+  let id: string | undefined = p.attrs.id;
+  if (id && !/^[A-Za-z0-9_.:-]+$/.test(id)) {
+    st.warnings.push(`paragraph id "${id}" is not a valid anchor; dropped`);
+    id = undefined;
+  }
+  if (id && st.paragraphIds.includes(id)) {
+    // Two <p> with one id would give the twin two identical anchors and the
+    // HTML two identical element ids; only the first keeps it.
+    st.warnings.push(`duplicate paragraph id "${id}"; anchor kept on the first only`);
+    id = undefined;
+  }
   if (id) st.paragraphIds.push(id);
   st.lines.push(id ? `${text} ^${id}` : text);
   st.lines.push("");
@@ -624,9 +642,10 @@ function refIds(ref: XNode): { doi?: string; pmid?: string } {
   }
   if (!out.doi) {
     for (const link of findAll(ref, "ext-link")) {
-      const m = (link.attrs.href ?? "").match(/doi\.org\/(10\.\S+)/);
+      const m = (link.attrs.href ?? "").match(/doi\.org\/(10\.[^\s"'<>]+)/);
       if (m) {
-        out.doi = m[1];
+        // A DOI pasted into prose often drags trailing punctuation along.
+        out.doi = m[1].replace(/[.,;:)\]]+$/, "");
         break;
       }
     }

@@ -24,8 +24,9 @@ export interface NcbiOptions {
   email?: string;
 }
 
-const EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
-const PUBTATOR = "https://www.ncbi.nlm.nih.gov/research/pubtator3-api";
+// Overridable so a test can stand up a local stub instead of calling NCBI.
+const EUTILS = process.env.CONTEXTNEST_EUTILS_BASE || "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+const PUBTATOR = process.env.CONTEXTNEST_PUBTATOR_BASE || "https://www.ncbi.nlm.nih.gov/research/pubtator3-api";
 
 let lastCall = 0;
 

@@ -44,6 +44,25 @@ describe("render-html — importer constructs", () => {
     expect(html).toContain("<th>Threshold</th>");
   });
 
+  it("refuses javascript:/data: schemes in links and wikilinks (page auto-opens in a browser)", () => {
+    const html = renderDocumentHtml(
+      node(
+        "[ok](https://a.b/c) [mail](mailto:x@y.z) [anchor](#p_1_1) [bad](javascript:alert(1)) [worse](data:text/html,x) " +
+          "[[javascript:alert(2)|wiki]] [[//evil.example/x]] [[nodes/fine|fine]]\n",
+      ),
+    );
+    expect(html).toContain('<a href="https://a.b/c">ok</a>');
+    expect(html).toContain('<a href="mailto:x@y.z">mail</a>');
+    expect(html).toContain('<a href="#p_1_1">anchor</a>');
+    expect(html).toContain('<a class="wikilink" href="nodes/fine">fine</a>');
+    expect(html).not.toContain("javascript:alert(1)\"");
+    expect(html).not.toContain('href="data:');
+    expect(html).not.toContain('href="javascript:');
+    expect(html).not.toContain('href="//evil');
+    expect(html).toContain("bad (javascript:alert(1))");
+    expect(html).toContain("wiki");
+  });
+
   it("leaves LaTeX untouched for a downstream math renderer", () => {
     const html = renderDocumentHtml(node("rate $p = \\frac{k}{n}$ ^p_2_1\n\n$$\\hat{p} = 1$$\n"));
     expect(html).toContain("rate $p = \\frac{k}{n}$");

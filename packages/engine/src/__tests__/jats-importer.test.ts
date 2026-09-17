@@ -184,6 +184,40 @@ describe("jatsToDocument — governance signals", () => {
   });
 });
 
+describe("jatsToDocument — untrusted input", () => {
+  const withLinks = xml.replace(
+    "<p id=\"p_3_1\">Clinical resolution occurred in 32 of 40 patients.</p>",
+    `<p id="p_3_1">See <ext-link ext-link-type="uri" xlink:href="https://example.org/trial">the registry</ext-link>, ` +
+      `<ext-link xlink:href="javascript:alert(1)">this</ext-link> and ` +
+      `<ext-link xlink:href="data:text/html,x">that</ext-link>.</p>`,
+  );
+
+  it("links only web/mail schemes; javascript:/data: hrefs stay plain text", () => {
+    const body = parseDocument("x.md", jatsToDocument(withLinks).content, "x").body;
+    expect(body).toContain("[the registry](https://example.org/trial)");
+    expect(body).toContain("this (javascript:alert(1))");
+    expect(body).not.toContain("](javascript:");
+    expect(body).not.toContain("](data:");
+  });
+
+  it("trims trailing punctuation from a DOI found in an ext-link href", () => {
+    const doiLink = xml.replace(
+      '<pub-id pub-id-type="doi">10.1016/j.cgh.2018.07.026</pub-id>',
+      '<ext-link xlink:href="https://doi.org/10.1016/j.cgh.2018.07.026).">link</ext-link>',
+    );
+    expect(jatsToDocument(doiLink).meta.refs[0].doi).toBe("10.1016/j.cgh.2018.07.026");
+  });
+
+  it("keeps only the first anchor for a duplicated paragraph id and warns", () => {
+    const dup = xml.replace('<p id="p_1_2">', '<p id="p_1_1">');
+    const r = jatsToDocument(dup);
+    expect(r.meta.paragraph_ids.filter((id) => id === "p_1_1")).toHaveLength(1);
+    expect(r.warnings).toContain('duplicate paragraph id "p_1_1"; anchor kept on the first only');
+    const anchors = r.content.split("\n").filter((l) => l.endsWith(" ^p_1_1"));
+    expect(anchors).toHaveLength(1);
+  });
+});
+
 describe("linkCitations — in-vault citation graph", () => {
   it("wikilinks reference lines whose DOI/PMID match a vault paper and records cites", () => {
     const r = jatsToDocument(xml, { sourcePath: "sample.jats.xml" });

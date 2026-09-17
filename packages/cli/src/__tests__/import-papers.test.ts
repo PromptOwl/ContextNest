@@ -179,6 +179,17 @@ describe("enrichPubTator", () => {
     expect(doc.frontmatter.version).toBe(3);
   });
 
+  it("reports a PMID collision instead of silently dropping the second paper", async () => {
+    // Two distinct papers (different DOIs) whose DOIs both resolve to one PMID.
+    const other = citedXml.replace("10.1016/j.cgh.2018.07.026", "10.1016/j.cgh.2018.07.099");
+    await importJats({ storage, api, ctx, sources: [{ name: "a.xml", xml: citedXml }, { name: "b.xml", xml: other }] });
+    const r = await enrichPubTator({ storage, api, ctx, fetchImpl, minIntervalMs: 0 });
+    expect(r.enriched).toHaveLength(1);
+    expect(r.failed).toEqual([
+      { id: expect.stringMatching(/^nodes\/papers\/doi-/), error: expect.stringMatching(/already claimed by nodes\/papers\/doi-/) },
+    ]);
+  });
+
   it("reports papers with no resolvable PMID instead of failing", async () => {
     const noIds = xml
       .replace('<article-id pub-id-type="pmid">99900001</article-id>', "")
