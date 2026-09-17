@@ -23,7 +23,8 @@ describe("welcome.html", () => {
     expect(html).not.toMatch(/&#(1\d{5}|9000|10003);/);
     // Raw emoji code points.
     expect(html).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
-    // The inline SVG icons replaced them; the brand logo is an <img>.
+    // The inline SVG icons replaced them; the brand logo is an <img>. (Whether its
+    // src is a data URL is a build concern — see the welcome regression test.)
     expect(html).toContain('<svg viewBox="0 0 24 24"');
     expect(html).toMatch(/<img src="[^"]+" alt="PromptOwl">/);
   });
