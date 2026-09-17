@@ -38,6 +38,8 @@ describe("render-html — importer constructs", () => {
       node("| Test | Threshold |\n| --- | --- |\n| Serum HIV \\| HBV | **Negative** |\n"),
     );
     expect(html).toContain("<td>Serum HIV | HBV</td>");
+    const bs = renderDocumentHtml(node("| a | b |\n| --- | --- |\n| C:\\\\path \\| x | y |\n"));
+    expect(bs).toContain("<td>C:\\path | x</td>");
     expect(html).toContain("<td><strong>Negative</strong></td>");
     expect(html).toContain("<th>Threshold</th>");
   });

@@ -425,6 +425,7 @@ export {
   jatsToDocument,
   linkCitations,
   buildCitationIndex,
+  trimSlashes,
   JATS_IMPORTER_VERSION,
 } from "./importers/jats.js";
 export type {

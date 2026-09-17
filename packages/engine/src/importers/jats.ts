@@ -314,8 +314,9 @@ function labelAndCaption(n: XNode, fallback: string): string {
   return captionText ? `**${lab}.** ${captionText}` : `**${lab}.**`;
 }
 
+/** GFM cell text: a backslash is escaped before a pipe so the renderer's `\|` unescape cannot misread a literal one. */
 function cellText(td: XNode): string {
-  return squash(td.children.map(inline).join("")).replace(/\|/g, "\\|");
+  return squash(td.children.map(inline).join("")).replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
 }
 
 function renderTable(wrap: XNode, st: RenderState): void {
@@ -668,6 +669,13 @@ function description(text: string, max = 300): string | undefined {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
+/** Drop trailing slashes without a regex that backtracks on long runs of `/`. */
+export function trimSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s[end - 1] === "/") end--;
+  return s.slice(0, end);
+}
+
 export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsImportResult {
   const normalized = xml.replace(/\r\n?/g, "\n");
   const sha256 = createHash("sha256").update(normalized).digest("hex");
@@ -948,7 +956,7 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   else if (doi) slugId = `doi-${slug(doi)}`;
   else if (pmcid) slugId = pmcid.toLowerCase();
   else slugId = slug(titlePlain).slice(0, 120) || "untitled-article";
-  const folder = (opts.folder ?? "nodes/papers").replace(/\/+$/, "");
+  const folder = trimSlashes(opts.folder ?? "nodes/papers");
   const path = `${folder}/${slugId}.md`;
 
   const frontmatter: Frontmatter = {

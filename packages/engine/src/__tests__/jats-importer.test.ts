@@ -162,6 +162,12 @@ describe("jatsToDocument — governance signals", () => {
     expect(doc.body.split("\n")[2]).toMatch(/^> ⚠️ \*\*RETRACTED\*\*/);
   });
 
+  it("escapes a literal backslash in a table cell so the renderer cannot misread it", () => {
+    const withBackslash = xml.replace("Serum HIV | HBV", "Serum HIV \\ HBV");
+    const body = parseDocument("x.md", jatsToDocument(withBackslash).content, "x").body;
+    expect(body.split("\n")).toContain("| Serum HIV \\\\ HBV | Negative |");
+  });
+
   it("falls back to DOI, then PMCID, then title for the node id", () => {
     const noPmid = xml.replace('<article-id pub-id-type="pmid">99900001</article-id>', "");
     expect(jatsToDocument(noPmid).slug).toBe("doi-10-9999-jsg-2024-001");

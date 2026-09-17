@@ -15,6 +15,7 @@ import {
   jatsToDocument,
   linkCitations,
   buildCitationIndex,
+  trimSlashes,
   parseDocument,
   serializeDocument,
   JATS_IMPORTER_VERSION,
@@ -80,7 +81,7 @@ function metadataOf(node: ContextNode): Record<string, unknown> {
 /** Papers already in the vault under `folder`. */
 async function existingPapers(storage: NestStorage, folder: string): Promise<ContextNode[]> {
   const docs = await storage.discoverDocuments();
-  const prefix = `${folder.replace(/\/+$/, "")}/`;
+  const prefix = `${trimSlashes(folder)}/`;
   return docs.filter((d) => d.id.startsWith(prefix) && typeof metadataOf(d).source_sha256 === "string");
 }
 
@@ -107,7 +108,7 @@ export async function collectJatsFiles(paths: string[]): Promise<JatsSource[]> {
 }
 
 export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary> {
-  const folder = (opts.folder ?? "nodes/papers").replace(/\/+$/, "");
+  const folder = trimSlashes(opts.folder ?? "nodes/papers");
   const relink = opts.relink !== false;
   const warnings: string[] = [];
   const failed: ImportSummary["failed"] = [];
@@ -328,7 +329,7 @@ export function applyPubTator(
 }
 
 export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary> {
-  const folder = (opts.folder ?? "nodes/papers").replace(/\/+$/, "");
+  const folder = trimSlashes(opts.folder ?? "nodes/papers");
   let papers = await existingPapers(opts.storage, folder);
   if (opts.ids?.length) {
     const want = new Set(opts.ids.map((i) => i.replace(/\.md$/, "")));

@@ -158,15 +158,15 @@ function inlineMarkdown(text: string): string {
   return s;
 }
 
-/** Split a GFM table row on pipes that are not escaped as `\|`. */
+/** Split a GFM table row on pipes that are not escaped as `\|` (and unescape `\\`). */
 function splitCells(row: string): string[] {
   const cells: string[] = [];
   let cur = "";
   const trimmed = row.trim().replace(/^\|/, "").replace(/\|$/, "");
   for (let i = 0; i < trimmed.length; i++) {
     const ch = trimmed[i];
-    if (ch === "\\" && trimmed[i + 1] === "|") {
-      cur += "|";
+    if (ch === "\\" && (trimmed[i + 1] === "|" || trimmed[i + 1] === "\\")) {
+      cur += trimmed[i + 1];
       i++;
     } else if (ch === "|") {
       cells.push(cur.trim());
