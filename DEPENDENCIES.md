@@ -160,7 +160,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | --- | --- | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
-| `fast-xml-parser` | 4.5.7 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Zero dependencies. |
+| `fast-xml-parser` | 4.5.7 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
 | `toposort` | 2.0.2 | MIT | yes | Dependency ordering for `source` node graphs. |
