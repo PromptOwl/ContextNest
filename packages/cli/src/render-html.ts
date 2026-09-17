@@ -169,10 +169,16 @@ function inlineMarkdown(text: string): string {
   return s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => code[Number(i)]);
 }
 
-/** `http(s)`, `ftp`, `mailto`, or an in-page `#anchor`. Anything else is not a link. */
+/**
+ * A link a vault page may follow: `http(s)`, `ftp`, `mailto`, the vault's own
+ * `contextnest://` scheme, an in-page `#anchor`, or a relative path (no scheme,
+ * no protocol-relative `//`). `javascript:`, `data:` and friends are not links.
+ */
 function safeHref(url: string): boolean {
   const u = url.trim();
-  return /^(?:https?:|ftp:|mailto:)/i.test(u) || (u.startsWith("#") && !/[\s"'<>]/.test(u));
+  if (!u || /[\s"'<>]/.test(u)) return false;
+  if (/^(?:https?:|ftp:|mailto:|contextnest:)/i.test(u)) return true;
+  return !/^[a-z][a-z0-9+.-]*:/i.test(u) && !u.startsWith("//");
 }
 
 /** A wikilink target: no scheme, no protocol-relative `//`, no control/quote characters. */

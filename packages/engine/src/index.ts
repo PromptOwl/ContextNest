@@ -383,6 +383,7 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 export {
+  slugify,
   slugifyImportPath,
   isVersionArtifactPath,
   sanitizeImportedFrontmatter,
@@ -426,7 +427,6 @@ export {
   linkCitations,
   buildCitationIndex,
   splitJatsArticles,
-  trimSlashes,
   JATS_IMPORTER_VERSION,
 } from "./importers/jats.js";
 export type {

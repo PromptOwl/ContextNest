@@ -1995,6 +1995,12 @@ describe("[regression] import pubmed + enrich pubtator", () => {
       expect(esearch).toContain("retmax=2");
       expect(esearch).toContain("api_key=test-key-123");
 
+      // Unchanged → skipped; the global --force republishes.
+      const again = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
+      expect(again.stdout).toMatch(/Published 0 document\(s\), skipped 2/);
+      const forced = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--force"]);
+      expect(forced.stdout).toMatch(/pmid-99900001 v2/);
+
       // The stub only knows PMID 30056182: the DOI-only paper resolves to it
       // and is enriched; the paper carrying PMID 99900001 is reported, not lost.
       // --tag-limit 0 means "no #mesh- tags", not "use the default".

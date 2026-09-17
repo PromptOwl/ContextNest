@@ -63,6 +63,13 @@ describe("render-html — importer constructs", () => {
     expect(html).toContain("wiki");
   });
 
+  it("keeps relative and contextnest:// links clickable (pre-existing vault content)", () => {
+    const html = renderDocumentHtml(node("[appendix](appendix.md) [spec](contextnest://nodes/spec) [up](../notes/x.md)\n"));
+    expect(html).toContain('<a href="appendix.md">appendix</a>');
+    expect(html).toContain('<a href="contextnest://nodes/spec">spec</a>');
+    expect(html).toContain('<a href="../notes/x.md">up</a>');
+  });
+
   it("leaves inline code alone — no sup/sub/wikilink/emphasis rewriting inside backticks", () => {
     const html = renderDocumentHtml(node("mutation `rpoB^S531L^` and `[[not-a-link]]` and `*raw*` but 10^9^ outside\n"));
     expect(html).toContain("<code>rpoB^S531L^</code>");

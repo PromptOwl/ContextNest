@@ -16,7 +16,7 @@ import {
   linkCitations,
   buildCitationIndex,
   splitJatsArticles,
-  trimSlashes,
+  normalizeFolder,
   parseDocument,
   serializeDocument,
   JATS_IMPORTER_VERSION,
@@ -79,11 +79,30 @@ function metadataOf(node: ContextNode): Record<string, unknown> {
   return (node.frontmatter.metadata ?? {}) as Record<string, unknown>;
 }
 
-/** Papers already in the vault under `folder`. */
+/**
+ * Papers already in the vault under `folder` — rejected ones included, so a
+ * steward's decision to retire a paper is seen by the dedup check rather than
+ * bypassed by a re-import that cannot see the node it would overwrite.
+ */
 async function existingPapers(storage: NestStorage, folder: string): Promise<ContextNode[]> {
-  const docs = await storage.discoverDocuments();
-  const prefix = `${trimSlashes(folder)}/`;
+  const docs = await storage.discoverDocuments({ includeRetired: true });
+  const prefix = `${normalizeFolder(folder)}/`;
   return docs.filter((d) => d.id.startsWith(prefix) && typeof metadataOf(d).source_sha256 === "string");
+}
+
+/** Stage `files` and publish them as one batch (one checkpoint). */
+async function publishFiles(
+  api: ApiRunner,
+  ctx: OperationContext,
+  files: Array<{ path: string; content: string }>,
+): Promise<ImportResult> {
+  // `files` only stages; the ids publish them in the same batch. Paths are
+  // already slugs, so the staged id is the final id.
+  return api.run<ImportResult>(
+    "context_import",
+    { files, ids: files.map((f) => f.path.replace(/\.md$/, "")), overwrite: true },
+    ctx,
+  );
 }
 
 /** Read every `*.xml` / `*.nxml` under the given paths (files or directories). */
@@ -109,7 +128,7 @@ export async function collectJatsFiles(paths: string[]): Promise<JatsSource[]> {
 }
 
 export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary> {
-  const folder = trimSlashes(opts.folder ?? "nodes/papers");
+  const folder = normalizeFolder(opts.folder ?? "nodes/papers") || "nodes/papers";
   const relink = opts.relink !== false;
   const warnings: string[] = [];
   const failed: ImportSummary["failed"] = [];
@@ -159,6 +178,12 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
   for (const r of byPath.values()) {
     const id = r.path.replace(/\.md$/, "");
     const prev = existingById.get(id);
+    if (prev && prev.frontmatter.status === "rejected") {
+      // Governance wins over ingestion: a retired paper is not resurrected by
+      // re-running the import. Change its status first if that is intended.
+      skipped.push(`${id} (rejected by a steward — not republished)`);
+      continue;
+    }
     const prevMeta = prev ? metadataOf(prev) : undefined;
     if (
       !opts.force &&
@@ -216,25 +241,19 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
 
   // 5. Originals, when asked for. Written beside the twins, inside the vault,
   //    so a re-import can be audited against exactly what was ingested.
-  if (opts.keepXml) {
-    for (const r of fresh) {
-      const target = pathMod.join(opts.storage.root, "assets", "jats", `${r.slug}.jats.xml`);
-      await fs.mkdir(pathMod.dirname(target), { recursive: true });
-      await fs.writeFile(target, xmlBySha.get(r.sha256) ?? "", "utf8");
-    }
+  if (opts.keepXml && fresh.length) {
+    const dir = pathMod.join(opts.storage.root, "assets", "jats");
+    await fs.mkdir(dir, { recursive: true });
+    await Promise.all(
+      fresh.map((r) => fs.writeFile(pathMod.join(dir, `${r.slug}.jats.xml`), xmlBySha.get(r.sha256) ?? "", "utf8")),
+    );
   }
 
   if (files.length === 0) {
     return { published: [], skipped, failed, relinked, checkpoint: null, warnings };
   }
 
-  const result = await opts.api.run<ImportResult>(
-    "context_import",
-    // `files` only stages; the ids publish them in the same batch (one
-    // checkpoint). Paths are already slugs, so the staged id is the final id.
-    { files, ids: files.map((f) => f.path.replace(/\.md$/, "")), overwrite: true },
-    opts.ctx,
-  );
+  const result = await publishFiles(opts.api, opts.ctx, files);
   for (const w of result.warnings ?? []) warnings.push(w);
   return {
     published: result.published,
@@ -316,6 +335,7 @@ export interface EnrichSummary {
   unresolved: string[];
   failed: Array<{ id?: string; title?: string; error: string }>;
   checkpoint: number | null;
+  warnings?: string[];
 }
 
 export const PUBTATOR_VERSION = "pubtator3/1";
@@ -353,15 +373,27 @@ export function applyPubTator(
 }
 
 export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary> {
-  const folder = trimSlashes(opts.folder ?? "nodes/papers");
+  const folder = normalizeFolder(opts.folder ?? "nodes/papers") || "nodes/papers";
   let papers = await existingPapers(opts.storage, folder);
+  const unknown: string[] = [];
   if (opts.ids?.length) {
-    const want = new Set(opts.ids.map((i) => i.replace(/\.md$/, "")));
-    papers = papers.filter((p) => want.has(p.id));
+    // `pmid-123`, `papers/pmid-123`, `nodes/papers/pmid-123` and `….md` all
+    // name the same twin; an id that names nothing is reported, not ignored.
+    const byId = new Map(papers.map((p) => [p.id, p]));
+    const chosen: ContextNode[] = [];
+    for (const raw of opts.ids) {
+      const bare = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+      const candidates = [bare, `${folder}/${bare}`, `${folder}/${bare.replace(/^nodes\//, "")}`, `nodes/${bare}`];
+      const hit = candidates.map((c) => byId.get(c)).find(Boolean);
+      if (hit) {
+        if (!chosen.includes(hit)) chosen.push(hit);
+      } else unknown.push(raw);
+    }
+    papers = chosen;
   }
   const skipped: string[] = [];
   const unresolved: string[] = [];
-  const failed: EnrichSummary["failed"] = [];
+  const failed: EnrichSummary["failed"] = unknown.map((id) => ({ id, error: `no paper with this id under ${folder}` }));
 
   // 1. Every paper needs a PMID; resolve from DOI / PMCID when the XML had none.
   const byPmid = new Map<string, ContextNode>();
@@ -425,18 +457,13 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
   }
   if (files.length === 0) return { enriched: [], skipped, unresolved, failed, checkpoint: null };
 
-  const result = await opts.api.run<ImportResult>(
-    "context_import",
-    // `files` only stages; the ids publish them in the same batch (one
-    // checkpoint). Paths are already slugs, so the staged id is the final id.
-    { files, ids: files.map((f) => f.path.replace(/\.md$/, "")), overwrite: true },
-    opts.ctx,
-  );
+  const result = await publishFiles(opts.api, opts.ctx, files);
   return {
     enriched: result.published,
     skipped,
     unresolved,
     failed: [...failed, ...result.failed],
     checkpoint: result.checkpoint,
+    ...(result.warnings?.length ? { warnings: result.warnings } : {}),
   };
 }

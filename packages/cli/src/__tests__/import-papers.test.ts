@@ -120,6 +120,19 @@ describe("importJats", () => {
     expect(a.body).toContain("→ [[nodes/papers/doi-10-1016-j-cgh-2018-07-026]]");
   });
 
+  it("does not resurrect a paper a steward rejected", async () => {
+    await importJats({ storage, api, ctx, sources: [{ name: "a.xml", xml }] });
+    const id = "nodes/papers/pmid-99900001";
+    const doc = (await storage.discoverDocuments()).find((d) => d.id === id)!;
+    await storage.writeDocument(id, doc.rawContent.replace("status: published", "status: rejected"));
+
+    const r = await importJats({ storage, api, ctx, sources: [{ name: "a.xml", xml }], force: true });
+    expect(r.published).toEqual([]);
+    expect(r.skipped).toEqual([`${id} (rejected by a steward — not republished)`]);
+    const after = (await storage.discoverDocuments({ includeRetired: true })).find((d) => d.id === id)!;
+    expect(after.frontmatter.status).toBe("rejected");
+  });
+
   it("reports a malformed file without aborting the batch", async () => {
     const r = await importJats({
       storage,
@@ -192,6 +205,16 @@ describe("enrichPubTator", () => {
     expect(doc.frontmatter.tags).toContain("#mesh-d015179");
     expect((doc.frontmatter.metadata as Record<string, unknown>).pmid).toBe("30056182");
     expect(doc.frontmatter.version).toBe(3);
+  });
+
+  it("accepts a short id and reports an unknown one", async () => {
+    await importJats({ storage, api, ctx, sources: [{ name: "cited.xml", xml: citedXml }] });
+    const r = await enrichPubTator({
+      storage, api, ctx, fetchImpl, minIntervalMs: 0,
+      ids: ["doi-10-1016-j-cgh-2018-07-026", "nope-123"],
+    });
+    expect(r.enriched.map((e) => e.id)).toEqual(["nodes/papers/doi-10-1016-j-cgh-2018-07-026"]);
+    expect(r.failed).toEqual([{ id: "nope-123", error: "no paper with this id under nodes/papers" }]);
   });
 
   it("reports a PMID collision instead of silently dropping the second paper", async () => {

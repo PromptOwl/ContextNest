@@ -244,6 +244,51 @@ describe("jatsToDocument — publisher variations", () => {
   });
 });
 
+describe("jatsToDocument — publisher variations (2)", () => {
+  it("takes the licence URL from a nested <ext-link> when <license xlink:href> is empty", () => {
+    const empty = xml.replace(
+      '<license license-type="open-access" xlink:href="http://creativecommons.org/licenses/by/4.0/">',
+      '<license license-type="open-access" xlink:href=""><ext-link xlink:href="https://creativecommons.org/licenses/by-nc/4.0/">CC</ext-link>',
+    );
+    const r = jatsToDocument(empty);
+    expect(r.meta.license).toBe("https://creativecommons.org/licenses/by-nc/4.0/");
+    expect(r.content).toContain("'#license-cc-by-nc'");
+  });
+
+  it("reads a structured abstract whose paragraphs sit under nested <sec>", () => {
+    const structured = xml.replace(
+      /<abstract>[\s\S]*?<\/abstract>/,
+      "<abstract><sec><title>Background</title><sec><title>Aims</title><p>Nested aim.</p></sec><p>Direct.</p></sec><sec><title>Methods:</title><p>How.</p></sec></abstract>",
+    );
+    const doc = parseDocument("x.md", jatsToDocument(structured).content, "x");
+    expect(doc.frontmatter.description).toBe("Aims: Nested aim. Background: Direct. Methods: How.");
+    expect(doc.body).toContain("Aims: Nested aim.");
+  });
+
+  it("caps a hostile colspan and warns instead of allocating it", () => {
+    const wide = xml.replace("<th>Test</th>", '<th colspan="999999999">Test</th>');
+    const r = jatsToDocument(wide);
+    expect(r.warnings).toContain("table tbl1: colspan 999999999 capped at 64");
+    const header = r.content.split("\n").find((l) => l.startsWith("| Test |"))!;
+    expect(header.split("|").length).toBeLessThan(80);
+  });
+
+  it("normalises the folder like the rest of the engine (backslashes, empty segments) and refuses traversal", () => {
+    expect(jatsToDocument(xml, { folder: "nodes\\lit\\" }).path).toBe("nodes/lit/pmid-99900001.md");
+    expect(jatsToDocument(xml, { folder: "nodes//lit/" }).path).toBe("nodes/lit/pmid-99900001.md");
+    expect(() => jatsToDocument(xml, { folder: "nodes/../etc" })).toThrow(/traversal/);
+  });
+
+  it("slugs a diacritic title with the engine's rule", () => {
+    const noIds = xml
+      .replace('<article-id pub-id-type="pmid">99900001</article-id>', "")
+      .replace('<article-id pub-id-type="pmc">PMC9990001</article-id>', "")
+      .replace('<article-id pub-id-type="doi">10.9999/jsg.2024.001</article-id>', "")
+      .replace("<article-title>Fecal Microbiota Transplantation for <italic>Clostridioides difficile</italic>: A Synthetic Trial</article-title>", "<article-title>Étude du café</article-title>");
+    expect(jatsToDocument(noIds).slug).toBe("etude-du-cafe");
+  });
+});
+
 describe("splitJatsArticles", () => {
   it("returns a single-article file whole and splits an articleset per article", () => {
     expect(splitJatsArticles(xml)).toEqual([xml]);
@@ -254,6 +299,18 @@ describe("splitJatsArticles", () => {
     expect(jatsToDocument(parts[0]).slug).toBe("pmid-99900001");
     expect(jatsToDocument(parts[1]).slug).toBe("pmid-99900002");
     expect(jatsToDocument(parts[0]).sha256).not.toBe(jatsToDocument(parts[1]).sha256);
+  });
+
+  it("skips a truncated article and keeps the ones after it", () => {
+    const body = xml.replace(/^<\?xml[^>]*>\s*/, "");
+    const truncated = body.replace("</article>", "");
+    const set = `<pmc-articleset>${body}${truncated}${body.replace("99900001", "99900003")}</pmc-articleset>`;
+    const parts = splitJatsArticles(set);
+    // The truncated article's slice runs to the NEXT close tag and so
+    // swallows its successor; what remains is still parseable, never dropped
+    // silently as "only the first".
+    expect(parts.length).toBeGreaterThanOrEqual(2);
+    expect(jatsToDocument(parts[0]).slug).toBe("pmid-99900001");
   });
 });
 

@@ -2657,6 +2657,7 @@ importCmd
       folder: opts.folder,
       keepXml: opts.keepXml,
       relink: opts.relink,
+      force: isForce(),
     });
     printImportSummary(r, opts.json);
   });
@@ -2684,7 +2685,8 @@ enrichCmd
       api: cliApi(),
       ctx: opContext(storage, opts.author),
       folder: opts.folder,
-      ids: ids.map(normalizeDocumentId),
+      // Raw: enrichPubTator resolves short ids against the papers folder itself.
+      ids,
       force: isForce(),
       // `--tag-limit 0` is a real request (no #mesh- tags), not a missing value.
       tagLimit: Number.isNaN(parseInt(opts.tagLimit, 10)) ? 12 : Math.max(0, parseInt(opts.tagLimit, 10)),
@@ -2700,6 +2702,7 @@ enrichCmd
       for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
       for (const u of r.unresolved) console.log(chalk.yellow(`  ? ${u}`));
       for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? "?"}: ${f.error}`);
+      for (const w of r.warnings ?? []) console.log(chalk.yellow(`  ! ${w}`));
       console.log(
         chalk.green(`Enriched ${r.enriched.length} document(s)`) +
           (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +

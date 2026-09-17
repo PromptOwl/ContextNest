@@ -27,6 +27,8 @@ import { createHash } from "node:crypto";
 import { XMLParser } from "fast-xml-parser";
 import { parseDocument, serializeDocument } from "../parser.js";
 import { TAG_PATTERN } from "../schemas.js";
+import { normalizeFolder } from "../storage.js";
+import { slugify } from "../import-hygiene.js";
 import type { Frontmatter } from "../types.js";
 
 /** Bumped when the twin's shape changes in a way worth re-importing for. */
@@ -344,6 +346,9 @@ function labelAndCaption(n: XNode, fallback: string): string {
 }
 
 /** GFM cell text: a backslash is escaped before a pipe so the renderer's `\|` unescape cannot misread a literal one. */
+/** Widest cell span honoured; wider is treated as malformed. */
+const MAX_COLSPAN = 64;
+
 function cellText(td: XNode): string {
   return squash(td.children.map(inline).join("")).replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
 }
@@ -360,7 +365,10 @@ function renderTable(wrap: XNode, st: RenderState): void {
     const cells: string[] = [];
     for (const c of tr.children) {
       if (!isNode(c) || (c.name !== "td" && c.name !== "th")) continue;
-      const span = Math.max(1, Number.parseInt(c.attrs.colspan ?? "1", 10) || 1);
+      // Bounded: a hostile colspan="999999999" must not allocate a row that size.
+      const requested = Number.parseInt(c.attrs.colspan ?? "1", 10) || 1;
+      const span = Math.min(Math.max(1, requested), MAX_COLSPAN);
+      if (requested > MAX_COLSPAN) st.warnings.push(`table ${wrap.attrs.id ?? ""}: colspan ${requested} capped at ${MAX_COLSPAN}`.trim());
       if (c.attrs.rowspan && c.attrs.rowspan !== "1") {
         st.warnings.push(`table ${wrap.attrs.id ?? ""}: rowspan flattened`.trim());
       }
@@ -550,13 +558,9 @@ function renderSection(sec: XNode, level: number, st: RenderState): void {
 
 // ─── Front matter extraction ─────────────────────────────────────────────────
 
+/** The engine's slug rule, after folding diacritics ("Café" → "cafe", not "caf"). */
 function slug(s: string): string {
-  return s
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+  return slugify(s.normalize("NFKD").replace(/[\u0300-\u036f]/g, ""));
 }
 
 function tagOk(t: string): boolean {
@@ -672,19 +676,20 @@ function firstAbstract(articleMeta: XNode | undefined): XNode | undefined {
 function abstractParagraphs(abs: XNode | undefined): XNode[] {
   if (!abs) return [];
   const out: XNode[] = [];
-  for (const c of abs.children) {
-    if (!isNode(c)) continue;
-    if (c.name === "p") out.push(c);
-    else if (c.name === "sec") {
-      const title = plain(child(c, "title"));
-      for (const p of children(c, "p")) {
-        if (title) {
-          // "Background: …" — fold the structured heading into the paragraph.
-          out.push({ ...p, children: [`${title.replace(/:$/, "")}: `, ...p.children] });
-        } else out.push(p);
+  // Structured abstracts nest <sec> (Background → Objective → …); walk every
+  // level and fold the nearest heading into each paragraph: "Background: …".
+  const walk = (node: XNode, heading: string) => {
+    for (const c of node.children) {
+      if (!isNode(c)) continue;
+      if (c.name === "p") {
+        out.push(heading ? { ...c, children: [`${heading}: `, ...c.children] } : c);
+      } else if (c.name === "sec") {
+        const title = plain(child(c, "title")).replace(/:$/, "");
+        walk(c, title || heading);
       }
     }
-  }
+  };
+  walk(abs, "");
   return out;
 }
 
@@ -715,19 +720,14 @@ export function splitJatsArticles(xml: string): string[] {
   if (starts.length <= 1) return [xml];
   const out: string[] = [];
   for (const start of starts) {
+    // An article with no close tag is truncated; skip it and keep the rest.
     const end = text.indexOf("</article>", start);
-    if (end === -1) break;
+    if (end === -1) continue;
     out.push(text.slice(start, end + "</article>".length));
   }
   return out.length ? out : [xml];
 }
 
-/** Drop trailing slashes without a regex that backtracks on long runs of `/`. */
-export function trimSlashes(s: string): string {
-  let end = s.length;
-  while (end > 0 && s[end - 1] === "/") end--;
-  return s.slice(0, end);
-}
 
 export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsImportResult {
   const normalized = xml.replace(/\r\n?/g, "\n");
@@ -827,11 +827,14 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   // PMC writes the machine-readable licence as <ali:license_ref>; publishers
   // use xlink:href on <license> or an <ext-link> inside it.
   const licenseRef = plain(find(licenseNode, "license_ref"));
+  // `||`, not `??`: a publisher's `<license xlink:href="">` is empty, not
+  // absent, and the real URL then sits in a nested <ext-link>.
   const licenseHref =
-    licenseNode?.attrs.href ??
-    (licenseRef && /^https?:/.test(licenseRef) ? licenseRef : undefined) ??
-    find(licenseNode, "ext-link")?.attrs.href ??
-    (plain(licenseNode).match(/https?:\/\/creativecommons\.org\/\S+?(?=[)\s]|$)/)?.[0] ?? undefined);
+    licenseNode?.attrs.href?.trim() ||
+    (licenseRef && /^https?:/.test(licenseRef) ? licenseRef : "") ||
+    find(licenseNode, "ext-link")?.attrs.href?.trim() ||
+    plain(licenseNode).match(/https?:\/\/creativecommons\.org\/\S+?(?=[)\s]|$)/)?.[0] ||
+    undefined;
   const license = licenseHref ?? (licenseNode ? plain(licenseNode) || undefined : undefined);
   const licenseTag = licenseSlug(licenseHref, licenseNode?.attrs["license-type"]);
 
@@ -1021,7 +1024,9 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   else if (doi) slugId = `doi-${slug(doi)}`;
   else if (pmcid) slugId = pmcid.toLowerCase();
   else slugId = slug(titlePlain).slice(0, 120) || "untitled-article";
-  const folder = trimSlashes(opts.folder ?? "nodes/papers");
+  // Same normalisation as every other folder the engine accepts: `\\` → `/`,
+  // empty segments dropped, `..` refused.
+  const folder = normalizeFolder(opts.folder ?? "nodes/papers") || "nodes/papers";
   const path = `${folder}/${slugId}.md`;
 
   const frontmatter: Frontmatter = {
