@@ -1111,6 +1111,11 @@ describe("[regression] html rendering", () => {
     const res = runCtx(tmp, ["welcome", "--no-open"]);
     expect(res).toMatch(/Generated welcome page/);
     expect(existsSync(join(tmp, ".context", "welcome.html"))).toBe(true);
+    // The brand logo must be inlined by tsup's `dataurl` loader — only the built
+    // CLI exercises that; vitest resolves the .png import through Vite instead.
+    expect(readFileSync(join(tmp, ".context", "welcome.html"), "utf-8")).toContain(
+      'src="data:image/png;base64,',
+    );
   });
 });
 
