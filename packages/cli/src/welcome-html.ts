@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import pathMod from "node:path";
 import { exec } from "node:child_process";
+import logoWhite from "./assets/logo-white.png";
 
 interface WelcomeNode {
   path: string;
@@ -22,6 +23,28 @@ interface WelcomeOptions {
   nodes: WelcomeNode[];
   timestamp: string;
   cliVersion: string;
+}
+
+/**
+ * Inline outline icons (24×24, stroke-based) so the page renders identically on
+ * every OS — emoji glyphs differ per platform. Path data from Lucide (ISC,
+ * https://lucide.dev), sized and coloured by the surrounding CSS.
+ */
+const ICON_PATHS = {
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
+  target: '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+  compass: '<circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>',
+  plug: '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
+  server: '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+  chat: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+  rocket: '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>',
+} satisfies Record<string, string>;
+
+function icon(name: keyof typeof ICON_PATHS): string {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name]}</svg>`;
 }
 
 /** Generate the branded welcome HTML and write to .context/welcome.html */
@@ -73,7 +96,7 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; colo
 
 /* Header */
 .hero {
-  background: linear-gradient(135deg, var(--midnight) 0%, #312E81 50%, var(--secondary) 100%);
+  background: linear-gradient(135deg, #0B0A1F 0%, var(--midnight) 55%, #312E81 100%);
   color: white;
   padding: 3rem 2rem 2.5rem;
   text-align: center;
@@ -87,24 +110,24 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; colo
   left: -50%;
   width: 200%;
   height: 200%;
-  background: radial-gradient(circle at 30% 70%, rgba(163,130,250,0.15) 0%, transparent 50%),
-              radial-gradient(circle at 70% 30%, rgba(243,111,33,0.1) 0%, transparent 50%);
+  background: radial-gradient(circle at 30% 70%, rgba(99,102,241,0.28) 0%, transparent 50%),
+              radial-gradient(circle at 70% 30%, rgba(167,139,250,0.18) 0%, transparent 50%);
   pointer-events: none;
 }
 .hero * { position: relative; }
-.hero .logo { display: flex; align-items: center; justify-content: center; gap: 0.5rem; margin-bottom: 1rem; opacity: 0.9; }
-.hero .logo svg { width: 36px; height: 28px; }
-.hero .logo .brand-text { font-family: 'Open Sans', sans-serif; font-size: 1.1rem; font-weight: 800; letter-spacing: -0.5px; color: white; }
-.hero .logo .brand-text span { color: var(--accent); }
+.hero .logo { display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 1.25rem; }
+.hero .logo img { height: 48px; width: auto; }
 .hero h1 { font-family: 'Open Sans', sans-serif; font-size: 2.25rem; font-weight: 800; letter-spacing: -0.025em; margin-bottom: 0.5rem; }
 .hero p { font-size: 1.05rem; opacity: 0.85; max-width: 500px; margin: 0 auto; }
-.hero .check-icon { display: inline-block; width: 48px; height: 48px; background: var(--green); border-radius: 50%; line-height: 48px; font-size: 1.5rem; margin-bottom: 1rem; }
+.hero .check-icon { display: inline-flex; align-items: center; justify-content: center; width: 52px; height: 52px; background: var(--green); border-radius: 50%; margin-bottom: 1rem; box-shadow: 0 0 0 6px rgba(16,185,129,0.25); }
+.hero .check-icon svg { width: 28px; height: 28px; stroke-width: 2.5; }
 
 /* Layout */
 .container { max-width: 900px; margin: 0 auto; padding: 2rem 1.5rem; }
 .card { background: white; border-radius: 1rem; border: 1px solid var(--border-light); padding: 1.5rem 2rem; margin-bottom: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
 .card h2 { font-family: 'Open Sans', sans-serif; font-size: 1.2rem; font-weight: 700; color: var(--primary); margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
-.card h2 .icon { font-size: 1.3rem; }
+.card h2 .icon { display: inline-flex; color: var(--secondary); }
+.card h2 .icon svg { width: 20px; height: 20px; }
 
 /* Stats bar */
 .stats { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
@@ -127,7 +150,7 @@ td { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border-light); }
 tr:hover td { background: var(--bg-alt); }
 
 /* Tree */
-.tree { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 0.85rem; background: var(--midnight); color: #E2E8F0; padding: 1.25rem 1.5rem; border-radius: 0.75rem; line-height: 1.6; overflow-x: auto; }
+.tree { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 0.85rem; background: var(--midnight); color: #E2E8F0; padding: 1.25rem 1.5rem; border-radius: 0.75rem; line-height: 1.6; overflow-x: auto; white-space: pre; }
 .tree .folder { color: var(--violet-echo); font-weight: 600; }
 .tree .file { color: #94A3B8; }
 .tree .highlight { color: var(--accent); font-weight: 600; }
@@ -152,7 +175,8 @@ tr:hover td { background: var(--bg-alt); }
 .surfaces { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
 .surface-card { background: white; border: 1px solid var(--border-light); border-radius: 0.75rem; padding: 1.25rem; text-align: center; transition: all 0.3s cubic-bezier(0.4,0,0.2,1); cursor: pointer; text-decoration: none; color: inherit; display: block; }
 .surface-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.08); border-color: rgba(99,102,241,0.3); }
-.surface-card .surface-icon { font-size: 2rem; margin-bottom: 0.5rem; }
+.surface-card .surface-icon { display: flex; justify-content: center; color: var(--secondary); margin-bottom: 0.6rem; }
+.surface-card .surface-icon svg { width: 32px; height: 32px; }
 .surface-card h3 { font-family: 'Open Sans', sans-serif; font-size: 0.95rem; font-weight: 700; color: var(--primary); margin-bottom: 0.25rem; }
 .surface-card p { font-size: 0.8rem; color: var(--text-light); }
 
@@ -195,10 +219,9 @@ gtag('event', 'vault_init', {
 <!-- Hero -->
 <div class="hero">
   <div class="logo">
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 135 100"><defs><style>.lo1{fill:#fff}.lo2{fill:#ff6500}</style></defs><path class="lo2" d="M66.79,43.23s0-4.26-6.62-8.84c-3.85-2.66-8.45-3.21-10.23-3.32-.21-.01-.26-.29-.08-.39,1.87-.92,7.62-3.3,16.93-3.3,9.31,0,15.05,2.38,16.93,3.3.19.09.13.37-.08.39-1.78.11-6.39.66-10.23,3.32-6.63,4.58-6.62,8.84-6.62,8.84Z"/><g><path class="lo1" d="M66.44,66.86l-3.4,3.4c-.27.27-.32.69-.11,1.01l3.18,5.04c.32.51,1.06.51,1.38,0l3.18-5.04c.2-.32.16-.74-.11-1.01l-3.4-3.4c-.19-.19-.51-.19-.71,0Z"/><path class="lo1" d="M107.85,21.18c-2.32,2.21-9.94,8.98-17.33,10.09h-.02c-.48.08-.58.72-.14.94.05.02.11.05.16.08.2.09.4.19.6.3.45.23.31.91-.19.94-.14.01-.27.02-.41.03-3.96.28-7.32,1.05-9.59,1.71h-.01c-1.05.26-2.08.6-3.06,1.03-.03.02-.05.02-.06.03h-.01c-2.51,1.11-4.74,2.75-6.54,4.77-1.8,2.03-3.17,4.44-3.98,7.11-.14.47-.81.47-.95,0-1.61-5.33-5.5-9.66-10.52-11.88h-.01s-.04,0-.07-.03c-.98-.43-2-.77-3.05-1.03h-.01c-2.27-.66-5.63-1.43-9.59-1.71-.14-.01-.27-.02-.41-.03-.5-.03-.64-.71-.2-.94.21-.11.41-.21.61-.3.05-.03.11-.06.16-.08.44-.22.34-.86-.14-.94h-.02c-7.39-1.11-15.01-7.88-17.33-10.09-.28-.27-.74-.07-.74.32v.02c.01,3.37.9,13.99,11.45,17.25,2.58.8,4.76,1.35,6.62,1.76,7.11,1.57,9.58,1.09,12.62,4.83-.48-.48-3.03-2.33-12.62-2.01-1.66.05-3.54.17-5.64.37-1.57.16-3.04-.02-4.42-.45-.35-.11-.73.03-.93.34-1.84,2.92-2.9,6.38-2.9,10.09,0,8.72,5.88,16.06,13.89,18.29,1.61.45,3.32.69,5.08.69,8.57,0,15.81-5.68,18.17-13.49.14-.47.81-.47.95,0,2.36,7.81,9.6,13.49,18.17,13.49,1.76,0,3.46-.24,5.08-.69,8.01-2.23,13.89-9.57,13.89-18.29,0-3.71-1.07-7.17-2.91-10.09-.19-.31-.57-.45-.92-.34-1.38.43-2.85.61-4.42.45-2.11-.2-3.98-.32-5.64-.37-9.59-.32-12.14,1.53-12.63,2.01,3.05-3.74,5.51-3.26,12.63-4.83,1.86-.41,4.04-.96,6.62-1.76,5.28-1.63,8.14-5.1,9.68-8.58,1.54-3.49,1.76-6.99,1.77-8.67v-.02c0-.39-.46-.59-.74-.32ZM54.89,52.46c-.03.08-.09.14-.18.18l-.77.3c-.11.09-.2.18-.29.29l-.3.77c-.05.12-.16.2-.29.2-.13,0-.24-.08-.29-.2l-.3-.77c-.09-.11-.18-.2-.29-.29l-.77-.3c-.16-.06-.24-.24-.18-.4.03-.08.09-.14.18-.18l.77-.3c.11-.09.2-.18.29-.29l.29-.76c.04-.11.14-.19.25-.2.14-.02.27.06.32.19l.3.77c.09.11.18.2.29.29l.77.3c.16.06.24.24.18.4ZM89.84,52.46c-.03.08-.09.14-.18.18l-.77.3c-.11.09-.2.18-.29.29l-.3.77c-.05.12-.16.2-.29.2-.13,0-.24-.08-.29-.2l-.3-.77c-.09-.11-.18-.2-.29-.29l-.77-.3c-.16-.06-.24-.24-.18-.4.03-.08.09-.14.18-.18l.77-.3c.11-.09.2-.18.29-.29l.29-.76c.04-.11.14-.19.25-.2.14-.02.27.06.32.19l.3.77c.09.11.18.2.29.29l.77.3c.16.06.24.24.18.4Z"/></g></svg>
-    <span class="brand-text">Prompt<span>Owl</span></span>
+    <img src="${logoWhite}" alt="PromptOwl">
   </div>
-  <div class="check-icon">&#10003;</div>
+  <div class="check-icon">${icon("check")}</div>
   <h1>Your Vault Is Ready</h1>
   <p>${escHtml(opts.vaultName)} &mdash; initialized at ${escHtml(new Date(opts.timestamp).toLocaleString())}</p>
 </div>
@@ -223,7 +246,7 @@ gtag('event', 'vault_init', {
 
   <!-- Activity Log -->
   <div class="card">
-    <h2><span class="icon">&#128337;</span> What Just Happened</h2>
+    <h2><span class="icon">${icon("clock")}</span> What Just Happened</h2>
     <div class="timeline">
       <div class="timeline-item">
         <span class="time">${escHtml(opts.timestamp)}</span>
@@ -258,7 +281,7 @@ gtag('event', 'vault_init', {
 
   <!-- Vault Structure -->
   <div class="card">
-    <h2><span class="icon">&#128193;</span> Vault Structure</h2>
+    <h2><span class="icon">${icon("folder")}</span> Vault Structure</h2>
     <div class="tree">${treeLines}</div>
   </div>
 
@@ -266,7 +289,7 @@ gtag('event', 'vault_init', {
   ${
     opts.nodes.length > 0
       ? `<div class="card">
-    <h2><span class="icon">&#128196;</span> Documents (${opts.nodes.length})</h2>
+    <h2><span class="icon">${icon("file")}</span> Documents (${opts.nodes.length})</h2>
     <table>
       <thead><tr><th>Path</th><th>Title</th><th>Type</th><th>Tags</th></tr></thead>
       <tbody>${nodeRows}</tbody>
@@ -277,7 +300,7 @@ gtag('event', 'vault_init', {
 
   <!-- What To Do Next -->
   <div class="card">
-    <h2><span class="icon">&#127919;</span> What To Do Next</h2>
+    <h2><span class="icon">${icon("target")}</span> What To Do Next</h2>
     <ul class="checklist">
       <li><div class="check-box" onclick="this.classList.toggle('checked')"></div><div><strong>Open this project in your AI assistant</strong> &mdash; it reads your vault automatically via CONTEXT.md</div></li>
       <li><div class="check-box" onclick="this.classList.toggle('checked')"></div><div><strong>Try searching:</strong> <code>ctx search "your topic"</code></div></li>
@@ -289,25 +312,25 @@ gtag('event', 'vault_init', {
 
   <!-- Explore PromptOwl -->
   <div class="card">
-    <h2><span class="icon">&#129417;</span> Explore PromptOwl</h2>
+    <h2><span class="icon">${icon("compass")}</span> Explore PromptOwl</h2>
     <div class="surfaces">
       <a class="surface-card" href="https://promptowl.ai/integrations" target="_blank">
-        <div class="surface-icon">&#9000;</div>
+        <div class="surface-icon">${icon("plug")}</div>
         <h3>AI Integrations</h3>
         <p>Works with Claude, Cursor, Copilot, GPT &amp; more</p>
       </a>
       <a class="surface-card" href="https://promptowl.ai/mcp" target="_blank">
-        <div class="surface-icon">&#128421;</div>
+        <div class="surface-icon">${icon("server")}</div>
         <h3>MCP Server</h3>
         <p>15 vault tools for any MCP-compatible AI</p>
       </a>
       <a class="surface-card" href="https://promptowl.ai/chat" target="_blank">
-        <div class="surface-icon">&#128172;</div>
+        <div class="surface-icon">${icon("chat")}</div>
         <h3>Hootie Web Chat</h3>
         <p>Talk to your knowledge in the browser</p>
       </a>
       <a class="surface-card" href="https://promptowl.ai/publish" target="_blank">
-        <div class="surface-icon">&#128640;</div>
+        <div class="surface-icon">${icon("rocket")}</div>
         <h3>Publish</h3>
         <p>Turn your vault into a product</p>
       </a>
