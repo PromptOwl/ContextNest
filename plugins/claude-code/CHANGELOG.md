@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.4
+
+The registry default vault is always searched, and no single vault can
+monopolize the auto-retrieval block.
+
+- **The default vault is always a target.** `vaultTargets()` fanned out across
+  the registry in registration order, capped at five, and never looked at
+  which entry was the default. With a handful of demo vaults registered
+  before the real one, the default was sliced off and never searched — every
+  prompt was answered with six nodes from the first demo vault instead.
+  Targets now resolve as: pinned alias (if registered) → the cwd vault →
+  the registry **default** → the rest of the registry, capped at five in
+  total. The default is a deliberate choice like the cwd vault and a pin, so
+  it is never filtered as missing-on-disk-only or tmp, and it counts once
+  when it is also the cwd vault.
+- **Hit slots are shared round-robin.** `searchAll()` took the first target's
+  hits until `MAX_HITS` was reached before the next target was even
+  consulted. On a stopword-heavy query against an older, unranked CLI that
+  meant one vault's alphabetical head filled the whole block. The six slots
+  are now handed out one hit per vault per round, and the survivors are
+  listed grouped in target order — the primary vault still leads, but every
+  vault with hits is represented.
+
 ## 0.5.3
 
 Keep the sweep-check whole now that `ctx search` caps its output.

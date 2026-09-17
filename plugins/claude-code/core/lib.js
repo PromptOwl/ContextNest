@@ -426,16 +426,24 @@ export function cwdVault(exec, vaults = []) {
  *  - Pinned alias, NOT registered (stale/removed pin) → ignore the pin and
  *    behave as unpinned, rather than passing ctx a bad --vault that resolves to
  *    nothing. session-start surfaces a warning so this isn't silent.
- *  - Unpinned → the vault in the working directory FIRST, then registered
- *    vaults in registry order, capped at MAX_FANOUT_VAULTS in total.
+ *  - Unpinned → the vault in the working directory FIRST, then the registry
+ *    DEFAULT (`ctx vault default`), then the remaining registered vaults in
+ *    registry order, capped at MAX_FANOUT_VAULTS in total.
  *      · The cwd vault is targeted as `null` (no --vault, ctx resolves it
  *        locally) and its hits are cited without an alias prefix. When that
  *        same directory is also registered it is targeted by its alias
  *        instead — once, still first — so a hit keeps a citable `alias:id`
  *        and is never listed twice.
+ *      · The default vault is the one the user chose to stand for "my
+ *        vault" when nothing more specific applies, so it is always a
+ *        target, wherever it sits in the registry. Before this it competed
+ *        for the MAX_FANOUT_VAULTS slots in plain registry order and lost to
+ *        whichever demo vaults happened to be registered earlier — the real
+ *        brain was never searched while its demos filled every prompt.
  *      · Registry entries whose path is missing (`exists: false`) or lives
  *        under os.tmpdir() (scratch vaults agents create) are skipped. A cwd
- *        vault or a pin is a deliberate choice and is never filtered.
+ *        vault, the default vault, or a pin is a deliberate choice and is
+ *        never filtered.
  *  - Unpinned + nothing eligible + no cwd vault → a single null target, i.e.
  *    let ctx resolve the local/default vault with no --vault flag.
  *
@@ -449,12 +457,20 @@ export function vaultTargets(config, exec) {
 
   const local = cwdVault(exec, present);
   const targets = [];
-  if (local) targets.push(local.alias);
+  const taken = new Set();
+  const take = (alias) => {
+    if (taken.has(alias)) return;
+    taken.add(alias);
+    targets.push(alias);
+  };
+  if (local) take(local.alias);
+  const preferred = present.find((v) => v.isDefault === true);
+  if (preferred) take(preferred.alias);
   for (const v of present) {
     if (targets.length >= MAX_FANOUT_VAULTS) break;
-    if (local && v.alias === local.alias) continue;
+    if (taken.has(v.alias)) continue;
     if (isTmpVaultPath(v.path)) continue;
-    targets.push(v.alias);
+    take(v.alias);
   }
   return targets.length === 0 ? [null] : targets;
 }

@@ -51,6 +51,7 @@ import {
   makeExec,
   winQuote,
   MAX_FANOUT_VAULTS,
+  MAX_HITS,
   MAX_LIST_SCAN,
 } from "../shared/core/lib.js";
 
@@ -488,6 +489,70 @@ describe("lib helpers", () => {
     expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
   });
 
+  // The registry default used to compete for the MAX_FANOUT_VAULTS slots in
+  // plain registry order. With a few demo vaults registered before it, the
+  // vault the user actually works in was sliced off and never searched, while
+  // the demos' nodes were injected into every prompt.
+  it("vaultTargets: the registry default is always targeted, even past the fan-out cap", () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ alias: `v${i}`, path: `/vaults/v${i}`, exists: true }));
+    const registry = many.map((v) => (v.alias === "v6" ? { ...v, isDefault: true } : v));
+    const ex = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    const targets = vaultTargets(cfg({}), ex);
+    expect(targets).toHaveLength(MAX_FANOUT_VAULTS);
+    expect(targets[0]).toBe("v6");
+    expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
+  });
+
+  it("vaultTargets: order is cwd vault, then the default, then the registry — each once", () => {
+    const registry = [
+      { alias: "demo", path: "/vaults/demo", exists: true },
+      { alias: "crm", path: "/vaults/crm", exists: true },
+      { alias: "brain", path: "/vaults/brain", exists: true, isDefault: true },
+    ];
+    // Unregistered cwd vault (null) leads; the default comes next, not "demo".
+    const cwdElsewhere = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdElsewhere)).toEqual([null, "brain", "demo", "crm"]);
+    // cwd IS the default → targeted once, by alias, first.
+    const cwdIsDefault = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/vaults/brain", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdIsDefault)).toEqual(["brain", "demo", "crm"]);
+    // cwd is some other registered vault → cwd, then default, then the rest.
+    const cwdIsCrm = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/vaults/crm", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdIsCrm)).toEqual(["crm", "brain", "demo"]);
+  });
+
+  it("vaultTargets: a default that is missing on disk is not targeted; one under tmp still is", () => {
+    const scratch = join(tmpdir(), "cn-default-scratch");
+    const gone = fakeExec([
+      ["vault list", [
+        { alias: "gone", path: "/vaults/gone", exists: false, isDefault: true },
+        { alias: "demo", path: "/vaults/demo", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), gone)).toEqual(["demo"]);
+    // Deliberately chosen as default → kept even though a plain tmp entry would be skipped.
+    const inTmp = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "scratch", path: scratch, exists: true, isDefault: true },
+      ]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), inTmp)).toEqual(["scratch", "demo"]);
+  });
+
   it("vaultTargets: a registered pin still short-circuits, even with a cwd vault", () => {
     const ex = fakeExec([
       ["vault list", [{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]],
@@ -566,6 +631,51 @@ describe("retrieve", () => {
     expect(text).toContain("- nodes/local — Local Note");
     expect(text).toContain("- demo:nodes/gi — Gastro");
     expect(text.indexOf("nodes/local")).toBeLessThan(text.indexOf("demo:nodes/gi"));
+  });
+
+  // One vault with a long hit list used to fill every slot before the next
+  // target was searched — on an unranked search that meant a demo vault's
+  // alphabetical head, every prompt, with the real vault never shown.
+  it("search → hit slots are shared round-robin across vaults, primary vault listed first", () => {
+    const many = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i) => ({ id: `nodes/${prefix}${i}`, title: `${prefix}${i}`, type: "document" }));
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) {
+        return json([{ alias: "demo", path: "/vaults/demo", exists: true }, { alias: "brain", path: "/vaults/brain", exists: true }]);
+      }
+      if (k.includes("--vault demo")) return json(many("d", 20));
+      if (k.includes("--vault brain")) return json(many("b", 20));
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const lines = additional(out)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines).toHaveLength(MAX_HITS);
+    expect(lines.map((l) => l.slice(2).split(" ")[0])).toEqual([
+      "demo:nodes/d0", "demo:nodes/d1", "demo:nodes/d2",
+      "brain:nodes/b0", "brain:nodes/b1", "brain:nodes/b2",
+    ]);
+  });
+
+  it("search → a vault with few hits gives its unused slots back to the others", () => {
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) {
+        return json([{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]);
+      }
+      if (k.includes("--vault a")) return json([{ id: "nodes/a0", title: "A0", type: "document" }]);
+      if (k.includes("--vault b")) {
+        return json(Array.from({ length: 10 }, (_, i) => ({ id: `nodes/b${i}`, title: `B${i}`, type: "document" })));
+      }
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const lines = additional(out)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines).toHaveLength(MAX_HITS);
+    expect(lines[0]).toContain("a:nodes/a0");
+    expect(lines.slice(1).map((l) => l.slice(2).split(" ")[0])).toEqual(
+      ["b0", "b1", "b2", "b3", "b4"].map((x) => `b:nodes/${x}`),
+    );
   });
 
   it("query → maps ids to tags via ctx list then injects graph documents", () => {
