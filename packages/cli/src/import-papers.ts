@@ -361,7 +361,7 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
       }
     }
     if (!pmid) {
-      unresolved.push(p.id);
+      unresolved.push(`${p.id} (no PMID — PubMed has no record for its DOI/PMCID)`);
       continue;
     }
     opts.onProgress?.(`${p.id} → PMID ${pmid}`);

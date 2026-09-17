@@ -2697,7 +2697,7 @@ enrichCmd
     } else {
       for (const p of r.enriched) console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}`);
       for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
-      for (const u of r.unresolved) console.log(chalk.yellow(`  ? ${u} — no PMID; nothing to fetch`));
+      for (const u of r.unresolved) console.log(chalk.yellow(`  ? ${u}`));
       for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? "?"}: ${f.error}`);
       console.log(
         chalk.green(`Enriched ${r.enriched.length} document(s)`) +
