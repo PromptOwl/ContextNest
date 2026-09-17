@@ -1610,6 +1610,7 @@ describe("[regression] file safety — command coverage", () => {
     "init", "add", "update", "delete", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
+    "import jats", "import pubmed", "enrich pubtator",
   ];
 
   it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {
@@ -1853,5 +1854,69 @@ describe("[regression] caller attribution — --agent / --session / --client", (
       "sess-cli-1",
     ]);
     expect(out).toBeDefined();
+  });
+});
+
+// ─── ctx import jats — markdown twins that render and retrieve ───────────────
+
+describe("[regression] import jats", () => {
+  // CU-wdqcq02c6w: JATS XML → markdown twin. The twin has to come back out
+  // through the surfaces an agent uses: `query` by the NLM-derived tags,
+  // `read --html` with anchors/tables/sup rendered, and a second import must
+  // not cut a version for unchanged XML.
+  const fixture = join(here, "..", "..", "..", "engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+
+  it("imports, is idempotent, and the twin is queryable by evidence-tier tags", () => {
+    initVault(tmp);
+    mkdirSync(join(tmp, "in"));
+    writeFileSync(join(tmp, "in", "paper.xml"), readFileSync(fixture));
+    writeFileSync(join(tmp, "in", "paper-copy.xml"), readFileSync(fixture));
+
+    const first = runCtxResult(tmp, ["import", "jats", join(tmp, "in"), "-y"]);
+    expect(first.status).toBe(0);
+    expect(first.stdout).toContain("nodes/papers/pmid-99900001");
+    expect(first.stdout).toMatch(/Published 1 document\(s\), skipped 1/);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+
+    const second = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "-y"]);
+    expect(second.status).toBe(0);
+    expect(second.stdout).toMatch(/Published 0 document\(s\), skipped 1/);
+
+    const srma = JSON.parse(runCtx(tmp, ["query", "#pubtype-srma", "--json"]));
+    expect(srma.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
+    const year = JSON.parse(runCtx(tmp, ["query", "#year-2024 #paper", "--json"]));
+    expect(year.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
+    const other = JSON.parse(runCtx(tmp, ["query", "#year-1999", "--json"]));
+    expect(other.documents).toHaveLength(0);
+
+    expect(runCtx(tmp, ["validate"])).not.toMatch(/invalid/i);
+  });
+
+  it("renders anchors, tables, sup/sub and LaTeX through read --html", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "jats", fixture, "-y"]);
+    const out = join(tmp, "paper.html");
+    const res = runCtxResult(tmp, ["read", "nodes/papers/pmid-99900001", "--html", "--out", out]);
+    expect(res.status).toBe(0);
+    const html = readFileSync(out, "utf-8");
+    expect(html).toContain('<p id="p_1_1">');
+    expect(html).toContain("10<sup>9</sup>");
+    expect(html).toContain("<td>Serum HIV | HBV</td>");
+    expect(html).toContain("$p = \\frac{k}{n}$");
+    expect(html).toContain('<h2 id="references">References</h2>');
+  });
+
+  it("is additive (no TTY consent needed) and honours --dry-run", () => {
+    initVault(tmp);
+    // Import creates, never destroys: off a TTY the command line is consent,
+    // same as `ctx add`. --dry-run runs the whole flow in the sandbox.
+    const dry = runCtxResult(tmp, ["import", "jats", fixture, "--dry-run"]);
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toMatch(/Published 1 document\(s\)/);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(false);
+
+    const real = runCtxResult(tmp, ["import", "jats", fixture]);
+    expect(real.status).toBe(0);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
   });
 });

@@ -35,13 +35,13 @@ function markdownToHtml(md: string): string {
     const rows = tableRows.filter((r) => !r.match(/^\s*\|[\s:-]+\|\s*$/)); // skip separator
     if (rows.length === 0) return;
     let t = "<table>\n<thead>\n<tr>";
-    const headerCells = rows[0].split("|").filter((c) => c.trim() !== "");
-    for (const c of headerCells) t += `<th>${c.trim()}</th>`;
+    const headerCells = splitCells(rows[0]);
+    for (const c of headerCells) t += `<th>${inlineMarkdown(c)}</th>`;
     t += "</tr>\n</thead>\n<tbody>\n";
     for (let i = 1; i < rows.length; i++) {
-      const cells = rows[i].split("|").filter((c) => c.trim() !== "");
+      const cells = splitCells(rows[i]);
       t += "<tr>";
-      for (const c of cells) t += `<td>${c.trim()}</td>`;
+      for (const c of cells) t += `<td>${inlineMarkdown(c)}</td>`;
       t += "</tr>\n";
     }
     t += "</tbody>\n</table>";
@@ -120,7 +120,13 @@ function markdownToHtml(md: string): string {
       continue;
     }
 
-    // Paragraph
+    // Paragraph — a trailing Obsidian block id (`… ^p_4_2`, as the JATS
+    // importer writes) becomes the element id so a citation can deep-link it.
+    const anchor = line.match(/^(.*?)\s+\^([A-Za-z0-9_.:-]+)$/);
+    if (anchor) {
+      out.push(`<p id="${esc(anchor[2])}">${inlineMarkdown(anchor[1])} <a class="anchor" href="#${esc(anchor[2])}">¶</a></p>`);
+      continue;
+    }
     out.push(`<p>${inlineMarkdown(line)}</p>`);
   }
 
@@ -141,7 +147,34 @@ function inlineMarkdown(text: string): string {
   s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
   // Links
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  // Wikilinks: [[nodes/x]] and [[nodes/x|label]] — the vault's own edges.
+  s = s.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target: string, label?: string) => {
+    const t = target.trim();
+    return `<a class="wikilink" href="${t}">${label?.trim() || t}</a>`;
+  });
+  // Pandoc-style superscript / subscript: 10^9^, H~2~O.
+  s = s.replace(/\^([^\s^]+)\^/g, "<sup>$1</sup>");
+  s = s.replace(/~([^\s~]+)~/g, "<sub>$1</sub>");
   return s;
+}
+
+/** Split a GFM table row on pipes that are not escaped as `\|`. */
+function splitCells(row: string): string[] {
+  const cells: string[] = [];
+  let cur = "";
+  const trimmed = row.trim().replace(/^\|/, "").replace(/\|$/, "");
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === "\\" && trimmed[i + 1] === "|") {
+      cur += "|";
+      i++;
+    } else if (ch === "|") {
+      cells.push(cur.trim());
+      cur = "";
+    } else cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
 }
 
 /** Render frontmatter as an HTML metadata panel */
@@ -339,6 +372,12 @@ body {
   color: inherit;
   font-size: 0.85rem;
 }
+.content p .anchor {
+  opacity: 0.35;
+  text-decoration: none;
+  font-size: 0.8em;
+}
+.content p:hover .anchor { opacity: 1; }
 .content blockquote {
   border-left: 3px solid var(--secondary);
   padding: 0.5rem 1rem;

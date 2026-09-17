@@ -419,3 +419,18 @@ export type {
   InstallManifest,
 } from "./skills.js";
 export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";
+
+// ─── Importers ───────────────────────────────────────────────────────────────
+export {
+  jatsToDocument,
+  linkCitations,
+  buildCitationIndex,
+  JATS_IMPORTER_VERSION,
+} from "./importers/jats.js";
+export type {
+  JatsImportOptions,
+  JatsImportResult,
+  JatsPaperMeta,
+  JatsRef,
+  CitationIndex,
+} from "./importers/jats.js";
