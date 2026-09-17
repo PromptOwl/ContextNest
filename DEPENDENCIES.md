@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 96 | 11 | 96 |
+| `@promptowl/contextnest-engine` | 104 | 11 | 104 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,19 +48,21 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 105 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@promptowl/contextnest-engine` | 2.5.0 | AGPL-3.0 |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
 | `diff` | 9.0.0 | BSD-3-Clause |
+| `fast-xml-parser` | 5.11.1 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
 | `toposort` | 2.0.2 | MIT |
 | `zod` | 3.25.76 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 | `@hono/node-server` | 1.19.14 | MIT |
+| `@nodable/entities` | 3.0.0 | MIT |
 | `ajv` | 8.18.0 | MIT |
 | `ajv-formats` | 3.0.1 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
@@ -71,12 +73,18 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT |
 | `express` | 5.2.1 | MIT |
 | `express-rate-limit` | 8.4.1 | MIT |
+| `fast-xml-builder` | 1.3.1 | MIT |
 | `hono` | 4.12.16 | MIT |
+| `is-unsafe` | 2.0.2 | MIT |
 | `jose` | 6.1.3 | MIT |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
+| `path-expression-matcher` | 1.6.2 | MIT |
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
+| `strnum` | 2.4.2 | MIT |
+| `xml-naming` | 0.3.0 | MIT |
 | `accepts` | 2.0.0 | MIT |
+| `anynum` | 1.0.1 | MIT |
 | `body-parser` | 2.2.2 | MIT |
 | `content-disposition` | 1.0.1 | MIT |
 | `cookie` | 0.7.2 | MIT |
@@ -158,6 +166,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | --- | --- | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
+| `fast-xml-parser` | 5.11.1 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Zero dependencies. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
 | `toposort` | 2.0.2 | MIT | yes | Dependency ordering for `source` node graphs. |
@@ -169,6 +178,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | Package | Version | Licence | Depth | Pulled in by |
 | --- | --- | --- | --- | --- |
 | `@hono/node-server` | 1.19.14 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `@nodable/entities` | 3.0.0 | MIT | 2 | `fast-xml-parser` |
 | `ajv` | 8.18.0 | MIT | 2 | `@modelcontextprotocol/sdk`, `ajv-formats` |
 | `ajv-formats` | 3.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `argparse` | 2.0.1 | Python-2.0 | 2 | `js-yaml` |
@@ -179,12 +189,18 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT | 2 | `@modelcontextprotocol/sdk`, `eventsource` |
 | `express` | 5.2.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `express-rate-limit` | 8.4.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `fast-xml-builder` | 1.3.1 | MIT | 2 | `fast-xml-parser` |
 | `hono` | 4.12.16 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `is-unsafe` | 2.0.2 | MIT | 2 | `fast-xml-parser` |
 | `jose` | 6.1.3 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause | 2 | `@modelcontextprotocol/sdk` |
+| `path-expression-matcher` | 1.6.2 | MIT | 2 | `fast-xml-builder`, `fast-xml-parser` |
 | `pkce-challenge` | 5.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `raw-body` | 3.0.2 | MIT | 2 | `@modelcontextprotocol/sdk`, `body-parser` |
+| `strnum` | 2.4.2 | MIT | 2 | `fast-xml-parser` |
+| `xml-naming` | 0.3.0 | MIT | 2 | `fast-xml-builder`, `fast-xml-parser` |
 | `accepts` | 2.0.0 | MIT | 3 | `express` |
+| `anynum` | 1.0.1 | MIT | 3 | `strnum` |
 | `body-parser` | 2.2.2 | MIT | 3 | `express` |
 | `content-disposition` | 1.0.1 | MIT | 3 | `express` |
 | `cookie` | 0.7.2 | MIT | 3 | `express` |
@@ -275,7 +291,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 105 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -293,6 +309,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT |
 | `express` | 5.2.1 | MIT |
 | `express-rate-limit` | 8.4.1 | MIT |
+| `fast-xml-parser` | 5.11.1 | MIT |
 | `hono` | 4.12.16 | MIT |
 | `jose` | 6.1.3 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
@@ -302,6 +319,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `raw-body` | 3.0.2 | MIT |
 | `toposort` | 2.0.2 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
+| `@nodable/entities` | 3.0.0 | MIT |
 | `accepts` | 2.0.0 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
 | `body-parser` | 2.2.2 | MIT |
@@ -315,10 +333,12 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `etag` | 1.8.1 | MIT |
 | `fast-deep-equal` | 3.1.3 | MIT |
 | `fast-uri` | 3.1.0 | BSD-3-Clause |
+| `fast-xml-builder` | 1.3.1 | MIT |
 | `finalhandler` | 2.1.1 | MIT |
 | `fresh` | 2.0.0 | MIT |
 | `http-errors` | 2.0.1 | MIT |
 | `ip-address` | 10.1.0 | MIT |
+| `is-unsafe` | 2.0.2 | MIT |
 | `json-schema-traverse` | 1.0.0 | MIT |
 | `merge-descriptors` | 2.0.0 | MIT |
 | `mime-types` | 3.0.2 | MIT |
@@ -326,6 +346,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `on-finished` | 2.4.1 | MIT |
 | `once` | 1.4.0 | ISC |
 | `parseurl` | 1.3.3 | MIT |
+| `path-expression-matcher` | 1.6.2 | MIT |
 | `path-key` | 3.1.1 | MIT |
 | `proxy-addr` | 2.0.7 | MIT |
 | `qs` | 6.15.0 | BSD-3-Clause |
@@ -336,9 +357,12 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `serve-static` | 2.2.1 | MIT |
 | `shebang-command` | 2.0.0 | MIT |
 | `statuses` | 2.0.2 | MIT |
+| `strnum` | 2.4.2 | MIT |
 | `type-is` | 2.0.1 | MIT |
 | `vary` | 1.1.2 | MIT |
 | `which` | 2.0.2 | ISC |
+| `xml-naming` | 0.3.0 | MIT |
+| `anynum` | 1.0.1 | MIT |
 | `bytes` | 3.1.2 | MIT |
 | `forwarded` | 0.2.0 | MIT |
 | `iconv-lite` | 0.7.2 | MIT |
