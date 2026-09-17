@@ -443,7 +443,8 @@ export function cwdVault(exec, vaults = []) {
  *      · Registry entries whose path is missing (`exists: false`) or lives
  *        under os.tmpdir() (scratch vaults agents create) are skipped. A cwd
  *        vault, the default vault, or a pin is a deliberate choice and is
- *        never filtered.
+ *        exempt from the tmp filter; a default missing on disk is still
+ *        skipped.
  *  - Unpinned + nothing eligible + no cwd vault → a single null target, i.e.
  *    let ctx resolve the local/default vault with no --vault flag.
  *

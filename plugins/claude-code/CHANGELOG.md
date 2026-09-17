@@ -13,8 +13,8 @@ monopolize the auto-retrieval block.
   Targets now resolve as: pinned alias (if registered) → the cwd vault →
   the registry **default** → the rest of the registry, capped at five in
   total. The default is a deliberate choice like the cwd vault and a pin, so
-  it is never filtered as missing-on-disk-only or tmp, and it counts once
-  when it is also the cwd vault.
+  it is exempt from the tmp filter (a default missing on disk is still
+  skipped), and it counts once when it is also the cwd vault.
 - **Hit slots are shared round-robin.** `searchAll()` took the first target's
   hits until `MAX_HITS` was reached before the next target was even
   consulted. On a stopword-heavy query against an older, unranked CLI that
