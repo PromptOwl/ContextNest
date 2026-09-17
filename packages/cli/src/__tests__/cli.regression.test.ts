@@ -1881,6 +1881,10 @@ describe("[regression] import jats", () => {
     const second = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "-y"]);
     expect(second.status).toBe(0);
     expect(second.stdout).toMatch(/Published 0 document\(s\), skipped 1/);
+    // The GLOBAL --force republishes an unchanged twin (a local --force would be shadowed by it).
+    const forced = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "--force"]);
+    expect(forced.status).toBe(0);
+    expect(forced.stdout).toMatch(/pmid-99900001 v2/);
 
     const srma = JSON.parse(runCtx(tmp, ["query", "#pubtype-srma", "--json"]));
     expect(srma.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
@@ -1993,7 +1997,12 @@ describe("[regression] import pubmed + enrich pubtator", () => {
 
       // The stub only knows PMID 30056182: the DOI-only paper resolves to it
       // and is enriched; the paper carrying PMID 99900001 is reported, not lost.
-      const enr = await run(["enrich", "pubtator", "--tag-limit", "1", "-y"]);
+      // --tag-limit 0 means "no #mesh- tags", not "use the default".
+      const zero = await run(["enrich", "pubtator", "--tag-limit", "0", "-y"]);
+      expect(zero.stdout).toMatch(/Enriched 1 document\(s\)/);
+      expect(readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8")).not.toContain("#mesh-");
+
+      const enr = await run(["enrich", "pubtator", "--tag-limit", "1", "--force", "-y"]);
       expect(enr.stdout).toMatch(/Enriched 1 document\(s\)/);
       expect(enr.stdout).toMatch(/pmid-99900001 \(PubTator has no record for PMID 99900001\)/);
       const twin = readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8");

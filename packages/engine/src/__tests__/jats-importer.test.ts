@@ -4,7 +4,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { parseDocument, validateDocument } from "../parser.js";
-import { jatsToDocument, linkCitations } from "../importers/jats.js";
+import { jatsToDocument, linkCitations, splitJatsArticles } from "../importers/jats.js";
 
 // CU-wdqcq02c6w: JATS (PubMed Central / publisher XML) → markdown twin whose
 // frontmatter carries the NLM graph as query tags. Deterministic, no LLM.
@@ -215,6 +215,45 @@ describe("jatsToDocument — untrusted input", () => {
     expect(r.warnings).toContain('duplicate paragraph id "p_1_1"; anchor kept on the first only');
     const anchors = r.content.split("\n").filter((l) => l.endsWith(" ^p_1_1"));
     expect(anchors).toHaveLength(1);
+  });
+});
+
+describe("jatsToDocument — publisher variations", () => {
+  it("finds a reference list wrapped in <back><sec> and refs nested in sub-lists", () => {
+    const wrapped = xml
+      .replace("<ref-list>", '<sec sec-type="references"><ref-list><title>Refs</title><ref-list>')
+      .replace("</ref-list>", "</ref-list></ref-list></sec>");
+    const r = jatsToDocument(wrapped);
+    expect(r.meta.refs.map((x) => x.n)).toEqual([1, 2, 3]);
+    expect(r.content).toContain("## References");
+  });
+
+  it("warns when <back> exists but carries no references", () => {
+    const none = xml.replace(/<ref-list>[\s\S]*<\/ref-list>/, "<fn-group/>");
+    const r = jatsToDocument(none);
+    expect(r.meta.refs).toEqual([]);
+    expect(r.warnings).toContain("<back> present but no <ref> found; citation graph will be empty");
+  });
+
+  it("drops a malformed PMID with a warning and falls back to the DOI id", () => {
+    const bad = xml.replace('<article-id pub-id-type="pmid">99900001</article-id>', '<article-id pub-id-type="pmid">99900001&amp;x=1</article-id>');
+    const r = jatsToDocument(bad);
+    expect(r.meta.pmid).toBeUndefined();
+    expect(r.slug).toBe("doi-10-9999-jsg-2024-001");
+    expect(r.warnings.some((w) => w.startsWith("ignoring malformed PMID"))).toBe(true);
+  });
+});
+
+describe("splitJatsArticles", () => {
+  it("returns a single-article file whole and splits an articleset per article", () => {
+    expect(splitJatsArticles(xml)).toEqual([xml]);
+    const second = xml.replace(/^<\?xml[^>]*>\s*/, "").replace("99900001", "99900002");
+    const set = `<?xml version="1.0"?><pmc-articleset>${xml.replace(/^<\?xml[^>]*>\s*/, "")}${second}</pmc-articleset>`;
+    const parts = splitJatsArticles(set);
+    expect(parts).toHaveLength(2);
+    expect(jatsToDocument(parts[0]).slug).toBe("pmid-99900001");
+    expect(jatsToDocument(parts[1]).slug).toBe("pmid-99900002");
+    expect(jatsToDocument(parts[0]).sha256).not.toBe(jatsToDocument(parts[1]).sha256);
   });
 });
 

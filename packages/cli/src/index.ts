@@ -2589,7 +2589,7 @@ importCmd
   .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
   .option("--keep-xml", "Also store each original under assets/jats/")
   .option("--no-relink", "Do not update existing papers whose references now resolve")
-  .option("--force", "Republish twins whose XML is unchanged")
+  // No local --force: the global one (see the root command) republishes unchanged twins.
   .option("-a, --author <email>", "Author email", "cli@contextnest.local")
   .option("--json", "Output as JSON")
   .action(async (paths: string[], opts) => {
@@ -2610,7 +2610,7 @@ importCmd
       folder: opts.folder,
       keepXml: opts.keepXml,
       relink: opts.relink,
-      force: opts.force,
+      force: isForce(),
     });
     printImportSummary(r, opts.json);
   });
@@ -2669,7 +2669,7 @@ enrichCmd
   .command("pubtator [ids...]")
   .description("Attach NCBI PubTator 3 entities and relations (MeSH-normalised) to imported papers")
   .option("--folder <folder>", "Folder holding the paper twins", "nodes/papers")
-  .option("--force", "Re-fetch papers that are already enriched")
+  // No local --force: the global one (see the root command) re-fetches enriched papers.
   .option("--tag-limit <n>", "Most-mentioned disease/chemical entities to promote to #mesh- tags", "12")
   .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY)")
   .option("-a, --author <email>", "Author email", "cli@contextnest.local")
@@ -2685,8 +2685,9 @@ enrichCmd
       ctx: opContext(storage, opts.author),
       folder: opts.folder,
       ids: ids.map(normalizeDocumentId),
-      force: opts.force,
-      tagLimit: Math.max(0, parseInt(opts.tagLimit, 10) || 12),
+      force: isForce(),
+      // `--tag-limit 0` is a real request (no #mesh- tags), not a missing value.
+      tagLimit: Number.isNaN(parseInt(opts.tagLimit, 10)) ? 12 : Math.max(0, parseInt(opts.tagLimit, 10)),
       apiKey: opts.apiKey ?? process.env.NCBI_API_KEY,
       onProgress: (msg) => {
         if (!opts.json) console.error(chalk.dim(`  ${msg}`));

@@ -63,6 +63,14 @@ describe("render-html — importer constructs", () => {
     expect(html).toContain("wiki");
   });
 
+  it("leaves inline code alone — no sup/sub/wikilink/emphasis rewriting inside backticks", () => {
+    const html = renderDocumentHtml(node("mutation `rpoB^S531L^` and `[[not-a-link]]` and `*raw*` but 10^9^ outside\n"));
+    expect(html).toContain("<code>rpoB^S531L^</code>");
+    expect(html).toContain("<code>[[not-a-link]]</code>");
+    expect(html).toContain("<code>*raw*</code>");
+    expect(html).toContain("10<sup>9</sup> outside");
+  });
+
   it("leaves LaTeX untouched for a downstream math renderer", () => {
     const html = renderDocumentHtml(node("rate $p = \\frac{k}{n}$ ^p_2_1\n\n$$\\hat{p} = 1$$\n"));
     expect(html).toContain("rate $p = \\frac{k}{n}$");

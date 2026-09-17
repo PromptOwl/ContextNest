@@ -15,6 +15,7 @@ import {
   jatsToDocument,
   linkCitations,
   buildCitationIndex,
+  splitJatsArticles,
   trimSlashes,
   parseDocument,
   serializeDocument,
@@ -119,7 +120,18 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
   const bySha = new Set<string>();
   const xmlBySha = new Map<string, string>();
   const byPath = new Map<string, ReturnType<typeof jatsToDocument>>();
+  // A file may hold several <article>s (a pmc-articleset dump); each is its
+  // own source, named `file#n`, hashed on its own.
+  const articles: JatsSource[] = [];
   for (const src of opts.sources) {
+    const parts = splitJatsArticles(src.xml);
+    if (parts.length === 1) articles.push(src);
+    else {
+      warnings.push(`${src.name}: ${parts.length} articles in one file — imported individually`);
+      parts.forEach((xml, i) => articles.push({ name: `${src.name}#${i + 1}`, xml }));
+    }
+  }
+  for (const src of articles) {
     let r: ReturnType<typeof jatsToDocument>;
     try {
       r = jatsToDocument(src.xml, { sourcePath: src.name, folder });
@@ -180,8 +192,20 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
   const relinked: string[] = [];
   if (relink && fresh.length) {
     const freshIds = new Set(fresh.map((r) => r.path.replace(/\.md$/, "")));
+    // Only a paper whose reference list names an arrival can gain an edge;
+    // everything else is left unparsed so the pass stays O(arrivals), not
+    // O(vault).
+    const freshDois = new Set(fresh.map((r) => r.meta.doi?.toLowerCase()).filter(Boolean));
+    const freshPmids = new Set(fresh.map((r) => r.meta.pmid).filter(Boolean));
     for (const d of existing) {
       if (freshIds.has(d.id)) continue;
+      const refs = metadataOf(d).refs;
+      const cites = Array.isArray(refs)
+        ? (refs as Array<{ doi?: string; pmid?: string }>).some(
+            (ref) => (ref.doi && freshDois.has(ref.doi.toLowerCase())) || (ref.pmid && freshPmids.has(ref.pmid)),
+          )
+        : false;
+      if (!cites) continue;
       const linked = linkCitations(d.rawContent, index);
       if (linked.changed) {
         files.push({ path: `${d.id}.md`, content: linked.content });

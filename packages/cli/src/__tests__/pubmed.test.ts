@@ -111,6 +111,14 @@ describe("NCBI clients (fetch injected)", () => {
     expect(map.get("30056182")?.entities.length).toBeGreaterThan(0);
   });
 
+  it("pubtatorFetch only sends digit PMIDs, encoded through URLSearchParams", async () => {
+    const fetchImpl = fakeFetch([[/pubtator3-api/, "[]"]]);
+    await pubtatorFetch(["30056182", "12&evil=1", "abc", "30056182"], { fetchImpl, minIntervalMs: 0 });
+    const calls = (fetchImpl as unknown as { calls: string[] }).calls;
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatch(/biocjson\?pmids=30056182$/);
+  });
+
   it("pubtatorFetch accepts one-JSON-document-per-line output", async () => {
     const doc = JSON.stringify({ pmid: "5", passages: [{ infons: {}, annotations: [{ infons: { identifier: "MESH:D1", type: "Disease" }, text: "x" }] }] });
     const fetchImpl = fakeFetch([[/pubtator3-api/, `${doc}\n${doc.replace('"pmid":"5"', '"pmid":"6"')}\n`]]);

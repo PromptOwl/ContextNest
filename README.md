@@ -604,16 +604,21 @@ ctx query "#fmt #pubtype-srma -#status-retracted"
 ```
 
 Imports are idempotent: unchanged XML (same `source_sha256`) is skipped, a
-changed file cuts a new version, and a batch shares one checkpoint. `import
+changed file cuts a new version, and a batch shares one checkpoint. A file
+holding several `<article>`s (a `pmc-articleset` dump) is imported article by
+article. The twin is *derived*: a re-import (`--force`, or changed XML)
+regenerates its body, tags and NLM metadata from the XML and carries over
+only enrichment (`metadata.entities` / `relations` / `pubtator`, `#mesh-`
+tags, a resolved `pmid`/`pmcid`) — hand edits to a twin do not survive. `import
 pubmed` and `enrich pubtator` call NCBI's public services (3 requests/s; set
 `NCBI_API_KEY` or `--api-key` for 10/s). Only the PMC open-access subset is
 fetchable; each twin records its licence.
 
 | Command | Description |
 |---|---|
-| `ctx import jats <paths...> [--folder nodes/papers] [--keep-xml] [--no-relink] [--force]` | Import JATS files or folders as markdown twins |
+| `ctx import jats <paths...> [--folder nodes/papers] [--keep-xml] [--no-relink]` | Import JATS files or folders as markdown twins (the global `--force` republishes unchanged twins) |
 | `ctx import pubmed --term <query> [--max 25] [--api-key]` | Search PMC (open access) and import the hits |
-| `ctx enrich pubtator [ids...] [--force] [--tag-limit 12]` | Attach PubTator 3 entities / relations and `#mesh-` tags to imported papers |
+| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations and `#mesh-` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
 
 ---
 

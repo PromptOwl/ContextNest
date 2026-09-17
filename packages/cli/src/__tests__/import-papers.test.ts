@@ -105,6 +105,21 @@ describe("importJats", () => {
     expect(again.published).toEqual([]);
   });
 
+  it("imports every article of a pmc-articleset file and says so", async () => {
+    const strip = (x: string) => x.replace(/^<\?xml[^>]*>\s*/, "");
+    const set = `<pmc-articleset>${strip(xml)}${strip(citedXml)}</pmc-articleset>`;
+    const r = await importJats({ storage, api, ctx, sources: [{ name: "set.xml", xml: set }] });
+    expect(r.published.map((p) => p.id).sort()).toEqual([
+      "nodes/papers/doi-10-1016-j-cgh-2018-07-026",
+      "nodes/papers/pmid-99900001",
+    ]);
+    expect(r.warnings).toContain("set.xml: 2 articles in one file — imported individually");
+    const a = (await storage.discoverDocuments()).find((d) => d.id === "nodes/papers/pmid-99900001")!;
+    expect((a.frontmatter.metadata as { source_path: string }).source_path).toBe("set.xml#1");
+    // Cross-article citation inside one file is linked in the same batch.
+    expect(a.body).toContain("→ [[nodes/papers/doi-10-1016-j-cgh-2018-07-026]]");
+  });
+
   it("reports a malformed file without aborting the batch", async () => {
     const r = await importJats({
       storage,

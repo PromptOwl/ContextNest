@@ -211,9 +211,13 @@ export async function pubtatorFetch(
   opts: NcbiOptions = {},
 ): Promise<Map<string, PubTatorSummary>> {
   const out = new Map<string, PubTatorSummary>();
-  for (let i = 0; i < pmids.length; i += 100) {
-    const batch = pmids.slice(i, i + 100);
-    const url = `${PUBTATOR}/publications/export/biocjson?pmids=${batch.join(",")}`;
+  // PMIDs come from imported metadata; only digit strings reach the URL.
+  const clean = [...new Set(pmids.filter((p) => /^\d{1,10}$/.test(p)))];
+  for (let i = 0; i < clean.length; i += 100) {
+    const batch = clean.slice(i, i + 100);
+    const u = new URL(`${PUBTATOR}/publications/export/biocjson`);
+    u.searchParams.set("pmids", batch.join(","));
+    const url = u.toString();
     const res = await nfetch(url, opts);
     const text = await res.text();
     // PubTator streams one JSON document per line for some batches and a

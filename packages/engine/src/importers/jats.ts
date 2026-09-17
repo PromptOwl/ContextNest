@@ -167,6 +167,17 @@ function findAll(n: XNode | undefined, name: string, acc: XNode[] = []): XNode[]
   return acc;
 }
 
+/** Elements named `name` that have no such ancestor — the outermost ones. */
+function topmost(n: XNode | undefined, name: string, acc: XNode[] = []): XNode[] {
+  if (!n) return acc;
+  for (const c of n.children) {
+    if (!isNode(c)) continue;
+    if (c.name === name) acc.push(c);
+    else topmost(c, name, acc);
+  }
+  return acc;
+}
+
 function itertext(n: XNode | string | undefined): string {
   if (n === undefined) return "";
   if (!isNode(n)) return n;
@@ -688,6 +699,29 @@ function description(text: string, max = 300): string | undefined {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
+/**
+ * Split a file into its `<article>` elements. A single-article file comes
+ * back whole (so its hash is the file's hash); a `<pmc-articleset>` or any
+ * other multi-record dump yields one raw XML string per article, each hashed
+ * on its own so a re-import skips exactly the articles that did not change.
+ * Articles do not nest in JATS, so a textual scan is enough.
+ */
+export function splitJatsArticles(xml: string): string[] {
+  const text = xml.replace(/\r\n?/g, "\n");
+  const open = /<article[\s>]/g;
+  const starts: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = open.exec(text)) !== null) starts.push(m.index);
+  if (starts.length <= 1) return [xml];
+  const out: string[] = [];
+  for (const start of starts) {
+    const end = text.indexOf("</article>", start);
+    if (end === -1) break;
+    out.push(text.slice(start, end + "</article>".length));
+  }
+  return out.length ? out : [xml];
+}
+
 /** Drop trailing slashes without a regex that backtracks on long runs of `/`. */
 export function trimSlashes(s: string): string {
   let end = s.length;
@@ -717,7 +751,13 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
     const v = plain(id);
     if (t && v && !ids[t]) ids[t] = v;
   }
-  const pmid = ids.pmid;
+  // A PMID is digits; anything else is not an identifier we will put in a
+  // URL or a node id.
+  let pmid: string | undefined = ids.pmid;
+  if (pmid && !/^\d{1,10}$/.test(pmid)) {
+    warnings.push(`ignoring malformed PMID "${pmid}"`);
+    pmid = undefined;
+  }
   const doi = ids.doi;
   let pmcid = ids.pmc ?? ids.pmcid;
   if (pmcid && !/^PMC/i.test(pmcid)) pmcid = `PMC${pmcid}`;
@@ -812,12 +852,16 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
 
   // ── references ──
   const back = child(article, "back");
-  const refLists = [...children(back, "ref-list"), ...children(article, "ref-list")];
+  // Publishers wrap reference lists differently — directly under <back>,
+  // under <back><sec sec-type="references">, or as nested <ref-list>s. Take
+  // every top-most <ref-list> under <back> (or, failing that, the article)
+  // and every <ref> beneath it, however deep.
+  const refLists = topmost(back ?? article, "ref-list");
   const refs: JatsRef[] = [];
   const refLines: string[] = [];
   let n = 0;
   for (const list of refLists) {
-    for (const ref of [...children(list, "ref"), ...children(list, "ref-list").flatMap((l) => children(l, "ref"))]) {
+    for (const ref of findAll(list, "ref")) {
       n++;
       const id = ref.attrs.id || `ref${n}`;
       const { doi: rdoi, pmid: rpmid } = refIds(ref);
@@ -834,6 +878,8 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
       refLines.push(`${n}. ${text || id}`);
     }
   }
+
+  if (back && refs.length === 0) warnings.push("<back> present but no <ref> found; citation graph will be empty");
 
   // ── body ──
   const st: RenderState = { lines: [], paragraphIds: [], warnings };

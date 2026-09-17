@@ -139,8 +139,13 @@ function markdownToHtml(md: string): string {
 /** Convert inline markdown (bold, italic, code, links) */
 function inlineMarkdown(text: string): string {
   let s = esc(text);
-  // Inline code
-  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  // Inline code is lifted out first so no later substitution (bold, italic,
+  // links, sup/sub, wikilinks) can rewrite a literal `^`, `*` or `[[` inside it.
+  const code: string[] = [];
+  s = s.replace(/`([^`]+)`/g, (_m, c: string) => {
+    code.push(`<code>${c}</code>`);
+    return `\u0000${code.length - 1}\u0000`;
+  });
   // Bold
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   // Italic
@@ -161,7 +166,7 @@ function inlineMarkdown(text: string): string {
   // Pandoc-style superscript / subscript: 10^9^, H~2~O.
   s = s.replace(/\^([^\s^]+)\^/g, "<sup>$1</sup>");
   s = s.replace(/~([^\s~]+)~/g, "<sub>$1</sub>");
-  return s;
+  return s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => code[Number(i)]);
 }
 
 /** `http(s)`, `ftp`, `mailto`, or an in-page `#anchor`. Anything else is not a link. */
