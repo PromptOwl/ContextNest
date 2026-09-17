@@ -4,6 +4,7 @@
 **Author**: ContextNest — PromptOwl, LLC
 **Compatible with**: Obsidian, PromptOwl, any markdown editor
 **File Extension**: `.md` (standard markdown)
+**License**: Apache-2.0 (see [LICENSE-SPEC](LICENSE-SPEC)) — this specification only; the reference implementation in this repository is AGPL-3.0
 
 ---
 
@@ -1818,7 +1819,7 @@ The following components are intended to be released as open source:
 
 | Component | License | Description |
 |-----------|---------|-------------|
-| Specification (this document) | CC-BY-4.0 | Open protocol specification |
+| Specification (this document) | Apache-2.0 | Open protocol specification |
 | Context Engine (`@promptowl/context-engine`) | AGPL-3.0 | Reference implementation of selectors, versioning, storage, and source node resolution |
 | MCP Server (`@contextnest/mcp-server`) | AGPL-3.0 | Model Context Protocol server for vault access, including source dependency resolution and hydration relay |
 | CLI (`contextnest-cli`) | AGPL-3.0 | Command-line tools for vault operations |
@@ -1850,4 +1851,4 @@ The following components remain proprietary:
 
 ---
 
-*ContextNest is a product of PromptOwl, LLC This specification covers components intended for open release under CC-BY-4.0. Proprietary components are identified in §15.*
+*ContextNest is a product of PromptOwl, LLC This specification is released under Apache-2.0. Other open components are licensed as listed in §15; proprietary components are identified there too.*
