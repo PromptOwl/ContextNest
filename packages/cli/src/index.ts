@@ -103,6 +103,7 @@ import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
+import { registerPluginCommands } from "./plugin-cmd.js";
 import {
   configureSafety,
   openWriteScope,
@@ -415,6 +416,11 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift stage",
   "drift approve",
   "drift reject",
+  "plugin add",
+  "plugin set",
+  "plugin remove",
+  "plugin pull",
+  "plugin promote",
 ]);
 
 /**
@@ -3355,6 +3361,12 @@ program
     );
     console.log("");
   });
+
+registerPluginCommands(program, {
+  getVaultRoot,
+  opContext: (root) => opContext(new NestStorage(root), "cli@contextnest.local"),
+  client: () => callClient as Record<string, unknown> | undefined,
+});
 
 // Parse and run
 program.parseAsync().catch((err: unknown) => {

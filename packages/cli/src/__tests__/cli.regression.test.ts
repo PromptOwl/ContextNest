@@ -1610,6 +1610,7 @@ describe("[regression] file safety — command coverage", () => {
     "init", "add", "update", "delete", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
+    "plugin add", "plugin set", "plugin remove", "plugin pull", "plugin promote",
   ];
 
   it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {

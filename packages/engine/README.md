@@ -160,6 +160,34 @@ wire; in-process callers supply it, wire transports leave it undefined.
 `~/.contextnest/config.yaml` rather than one vault, so it ignores its
 `OperationContext`.
 
+## Plugins
+
+`@promptowl/contextnest-engine/plugins` hosts [Nest Plugins](https://github.com/PromptOwl/CommunityNestSDK):
+connectors written against an Apache-2.0 SDK that bring outside sources into a vault (raw or summarized) and
+answer queries live. The host owns everything a plugin must not: node upserts keyed on
+`metadata.provenance` (`plugin` + `externalId`), the never-overwrite-a-human-edit rule, the wrapped `fetch`
+(no loopback/private hosts, timeouts, per-run budget) and the `distill` port. It registers the `sync`
+namespace of the operation catalog as an `EngineExtension`.
+
+```ts
+import { createEngineApi } from "@promptowl/contextnest-engine/api";
+import { createPluginHost, loadPlugins } from "@promptowl/contextnest-engine/plugins";
+
+const { plugins, errors } = await loadPlugins(["@promptowl/contextnest-plugin-github-markdown"]);
+const host = createPluginHost({ plugins, distill: myLlmPort });
+const api = createEngineApi({ extensions: [host.extension] });
+
+await api.run("context_ingest", {
+  plugin: "github-markdown",
+  settings: { repo: "PromptOwl/ContextNest", token: process.env.GH_TOKEN },
+  cursor: savedCursor,
+  mode: "raw",
+  target: { status: "pending_review", publish: false },   // a governed host lands drafts
+}, ctx);
+```
+
+Settings are passed per call; the engine stores no plugin configuration and no secrets.
+
 ## Browsing Without Reading
 
 Discovery's cost is parsing every markdown file it finds, so a caller that only
