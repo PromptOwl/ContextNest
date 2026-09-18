@@ -18,6 +18,7 @@ import {
   NODE_TYPES,
   STATUSES,
   TAG_PATTERN,
+  describeInvalidTag,
   frontmatterSchema,
   sourceMetaSchema,
 } from "../schemas.js";
@@ -25,7 +26,8 @@ import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
-const tag = z.string().regex(TAG_PATTERN);
+// Names the offending value and the rule — zod's default regex message is a bare "Invalid".
+const tag = z.string().refine((v) => TAG_PATTERN.test(v), (v) => ({ message: describeInvalidTag(v) }));
 
 /** A node as returned in list/query summaries (body optional/trimmed). */
 const nodeSummary = z.object({
