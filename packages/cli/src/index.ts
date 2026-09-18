@@ -2962,7 +2962,7 @@ drift
     console.log(`  archived_at: ${chalk.dim(result.archivedAt)}`);
     console.log(
       chalk.dim(
-        `\nNote: canonical file on disk still has the drifted bytes. To restore last-approved content, run:\n  ctx read-version ${id} <last-version> > ${id}.md`,
+        `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
       ),
     );
   });

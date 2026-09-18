@@ -150,6 +150,14 @@ export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
 // still matches.
 export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_:-]*$/;
 
+/** The tag rule in words a person can act on — `TAG_PATTERN.source` is not that. */
+export const TAG_RULE =
+  'tags start with a letter and contain only letters, digits, "_", ":" or "-" (e.g. #api, #q3-close, #v2)';
+
+/** One message for every surface that rejects a tag: names the value AND the rule. */
+export const describeInvalidTag = (value: unknown): string =>
+  `invalid tag ${JSON.stringify(value)} — ${TAG_RULE}`;
+
 /** Checksum pattern (§13 rule 8) */
 export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
@@ -158,7 +166,7 @@ export const CONTEXT_NEST_URI_PATTERN = /^contextnest:\/\//;
 
 const tagSchema = z
   .string()
-  .regex(TAG_PATTERN, `Tag must match pattern: ${TAG_PATTERN.source}`);
+  .refine((v) => TAG_PATTERN.test(v), (v) => ({ message: describeInvalidTag(v) }));
 
 const skillInputSchema = z.object({
   name: z.string().min(1),
