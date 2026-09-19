@@ -59,7 +59,7 @@ Skill nodes codify team procedures (PR review, incident response, deployment che
 
 A safe shared brain.
 
-Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **AGPL-licensed open standard — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
 
 ## How is this different from...
 
