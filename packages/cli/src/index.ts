@@ -77,6 +77,7 @@ import {
   remoteUpdate,
   remotePublish,
   remoteDelete,
+  folderFromId,
 } from "./remote.js";
 import {
   listJsonEntry,
@@ -2653,13 +2654,20 @@ program
     // Read CONTEXT.md
     const contextMd = await storage.readContextMd();
 
-    // Build payload
-    const documents = filtered.map((doc) => ({
-      title: doc.frontmatter.title || doc.id,
-      content: doc.body || "",
-      type: doc.frontmatter.type || "document",
-      tags: (doc.frontmatter.tags || []).map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
-    }));
+    // Build payload. Folder rides alongside title/content the same way
+    // `remoteAdd` sends it: the id itself is never sent (the receiving nest
+    // mints its own from the title), so without `folder` every document
+    // lands flat at the nest root regardless of where it lived locally.
+    const documents = filtered.map((doc) => {
+      const folder = folderFromId(doc.id);
+      return {
+        title: doc.frontmatter.title || doc.id,
+        content: doc.body || "",
+        type: doc.frontmatter.type || "document",
+        tags: (doc.frontmatter.tags || []).map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
+        ...(folder ? { folder } : {}),
+      };
+    });
 
     const serverUrl = opts.server.replace(/\/$/, "");
     const url = `${serverUrl}/nests/${opts.nest}/publish`;
