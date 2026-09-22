@@ -17,6 +17,7 @@
 
 import { ContextNestError } from "../errors.js";
 import { sha256Bytes } from "../integrity.js";
+import { TITLE_MAX_LENGTH } from "../schemas.js";
 
 /** Bumped when the body's shape changes in a way worth re-importing for. */
 export const PDF_IMPORTER_VERSION = "ctx-import-pdf/1";
@@ -38,8 +39,6 @@ export const DEFAULT_PDF_MAX_BYTES = 50 * 1024 * 1024;
 /** Every PDF file begins with this header (ISO 32000-1 §7.5.2). */
 const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d]; // "%PDF-"
 
-/** Longest title taken from a PDF's own metadata (frontmatter caps titles at 200). */
-const MAX_TITLE = 200;
 
 export interface PdfExtraction {
   /**
@@ -107,7 +106,7 @@ function cleanTitle(raw: unknown): string | undefined {
   // eslint-disable-next-line no-control-regex
   const title = raw.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
   if (!/[\p{L}\p{N}]/u.test(title)) return undefined;
-  return title.length > MAX_TITLE ? title.slice(0, MAX_TITLE).trimEnd() : title;
+  return title.length > TITLE_MAX_LENGTH ? title.slice(0, TITLE_MAX_LENGTH).trimEnd() : title;
 }
 
 /** Assemble the body from normalized page texts. */

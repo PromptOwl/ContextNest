@@ -153,6 +153,9 @@ export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
 // still matches.
 export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_:-]*$/;
 
+/** Longest `title` a document may carry (§1.4, §13 rule 2). */
+export const TITLE_MAX_LENGTH = 200;
+
 /** Checksum pattern (§13 rule 8) */
 export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
@@ -243,7 +246,7 @@ export const pdfMetaSchema = z.object({
 
 export const frontmatterSchema = z
   .object({
-    title: z.string().min(1).max(200),                    // Rule 2
+    title: z.string().min(1).max(TITLE_MAX_LENGTH),       // Rule 2
     description: z.string().min(1).max(500).optional(),
     type: z.enum(NODE_TYPES).optional(),                   // Rule 6
     tags: z.array(tagSchema).optional(),                   // Rule 5

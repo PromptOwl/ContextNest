@@ -61,6 +61,7 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import { TITLE_MAX_LENGTH } from "../schemas.js";
 import {
   isVersionArtifactPath,
   planImportPaths,
@@ -1157,8 +1158,11 @@ const BASE64_PATTERN = /^[A-Za-z0-9+/_-]*={0,2}$/;
 /** Decode the op's `bytes_base64`, refusing malformed input and anything over the cap. */
 function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
   // Refuse an obviously oversized payload before allocating its decoded copy.
-  // Encoded length bounds decoded length from above (4 chars → 3 bytes), with
-  // slack for line breaks some encoders insert.
+  // Base64 is 4 chars per 3 bytes, so a payload within the cap is at most
+  // ceil(maxBytes * 4 / 3) chars. The ×1.1 is slack for the line breaks MIME
+  // encoders insert (76-char lines + CRLF ≈ 2.6% overhead, rounded up well
+  // past it), the +1024 for padding and small-file rounding. Only a coarse
+  // pre-filter: the exact byteLength check after decoding is the real limit.
   if (b64.length > Math.ceil((maxBytes * 4) / 3) * 1.1 + 1024) {
     throw new ContextNestError(
       `PDF exceeds the ${maxBytes}-byte limit for an import.`,
@@ -1198,7 +1202,7 @@ function filenameStem(name: unknown): string | undefined {
   if (typeof name !== "string") return undefined;
   const base = name.split(/[/\\]/).pop() ?? "";
   const stem = base.replace(/\.pdf$/i, "").trim();
-  return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, 200) : undefined;
+  return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, TITLE_MAX_LENGTH) : undefined;
 }
 
 /**
