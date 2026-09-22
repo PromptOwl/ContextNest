@@ -21,6 +21,8 @@ import { createEngineApi, type OperationContext } from "../api/index.js";
 import { readPdfBinary } from "../pdf-nodes.js";
 import { rollbackDocument, czarDirectEdit, approveSuggestion } from "../approval.js";
 import { stageSuggestion } from "../suggestions.js";
+import { withVaultLock } from "../vault-lock.js";
+import { getOperation } from "../api/index.js";
 import type { RbacHook } from "../types.js";
 import { buildPdf, textPdf, textPdfV2, toBase64 } from "./fixtures/pdf-fixtures.js";
 
@@ -235,5 +237,92 @@ describe("pdf nodes across the lifecycle (PR #116 review)", () => {
     expect(report.errors).toContainEqual(
       expect.objectContaining({ type: "sidecar_missing", document: first.id }),
     );
+  });
+
+  // ─── review round 2 (claude-review on PR #116) ───────────────────────────
+
+  it("a pdf node cannot be published unless its sidecar is there and hashes to pdf.sha256", async () => {
+    // A `files` import can carry a hand-written pdf block with no binary behind it.
+    const forged = serializeDocument({
+      id: "nodes/forged",
+      filePath: "",
+      rawContent: "",
+      frontmatter: {
+        title: "Forged",
+        type: "pdf",
+        // Explicitly published, so the discover pass below claims it for publishing.
+        status: "published",
+        pdf: {
+          file: "nodes/forged.pdf",
+          sha256: `sha256:${"e".repeat(64)}`,
+          bytes: 1,
+          pages: 99,
+          text_layer: true,
+          extractor: "unpdf",
+          extractor_version: "made-up",
+          extracted_at: "2026-09-22T00:00:00.000Z",
+        },
+      },
+      body: "\nNot from any PDF.\n",
+    });
+    const res = await api.run<{ published: Array<{ id: string }>; failed: Array<{ id?: string; error: string }> }>(
+      "context_import",
+      { files: [{ path: "nodes/forged.md", content: forged }], discover: true },
+      ctx,
+    );
+    expect(res.published.map((p) => p.id)).not.toContain("nodes/forged");
+    expect(res.failed).toContainEqual(expect.objectContaining({ id: "nodes/forged", error: expect.stringMatching(/pdf/i) }));
+    expect(await storage.readHistory("nodes/forged")).toBeNull();
+
+    // And a real pdf node whose sidecar was swapped cannot be republished over the drift.
+    const real = await importPdf({ bytes_base64: toBase64(textPdf()), title: "Swapped" });
+    await writeFile(join(dir, real.pdf.file), third());
+    await expect(api.run("context_publish", { id: real.id }, ctx)).rejects.toMatchObject({
+      code: "INTEGRITY_ERROR",
+    });
+  });
+
+  it("extracts outside the vault lock: a bad PDF fails fast even while another writer holds the lock", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let acquired!: () => void;
+    const isHeld = new Promise<void>((r) => (acquired = r));
+    const holder = withVaultLock(dir, async () => {
+      acquired();
+      await held;
+    });
+    await isHeld;
+    try {
+      const outcome = await Promise.race([
+        importPdf({ bytes_base64: Buffer.from("not a pdf").toString("base64"), title: "X" }).then(
+          () => "resolved",
+          (err: { code?: string }) => err.code ?? "error",
+        ),
+        new Promise<string>((r) => setTimeout(() => r("waited-for-lock"), 3_000)),
+      ]);
+      expect(outcome).toBe("VALIDATION_FAILED");
+    } finally {
+      release();
+      await holder;
+    }
+  });
+
+  it("the type field of create/update/import tells a client that pdf nodes come from context_import_pdf", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const typeDescription = (op: string, pick: (shape: any) => any) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      String(pick((getOperation(op)!.input as any).shape).description ?? "");
+    expect(typeDescription("context_create", (s) => s.type)).toMatch(/context_import_pdf/);
+    expect(typeDescription("context_update", (s) => s.type)).toMatch(/context_import_pdf/);
+    expect(
+      typeDescription("context_import", (s) => s.documents.unwrap().element.shape.type),
+    ).toMatch(/context_import_pdf/);
+  });
+
+  it("re-importing identical bytes with the same tags in another order is still a no-op", async () => {
+    const first = await importPdf({ bytes_base64: toBase64(textPdf()), title: "Tagged", tags: ["#a", "#b"] });
+    const again = await importPdf({ bytes_base64: toBase64(textPdf()), id: first.id, tags: ["b", "#a"] });
+    expect(again.unchanged).toBe(true);
+    expect(again.version).toBe(first.version);
   });
 });

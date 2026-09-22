@@ -47,6 +47,7 @@ import {
   PDF_EXTRACTOR,
   extractPdf,
   pdfExtractorVersion,
+  type PdfExtraction,
 } from "../importers/pdf.js";
 import { pdfSidecarPath } from "../pdf-nodes.js";
 import {
@@ -1200,13 +1201,29 @@ function filenameStem(name: unknown): string | undefined {
   return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, 200) : undefined;
 }
 
+/**
+ * `context_import_pdf`. Decoding and text extraction run BEFORE the vault
+ * lock is taken: they touch no vault state, and parsing a large PDF is real
+ * work that would otherwise hold every other writer on the vault behind it
+ * (VAULT_LOCK_TIMEOUT for a concurrent `ctx update`). A bad PDF also fails
+ * here without ever queueing for the lock. Everything that reads or writes
+ * the vault runs under the lock, in {@link importPdfLocked}.
+ */
 const importPdf: OperationExecutor = async (ctx, input: any) => {
   const maxBytes = ctx.limits?.pdfMaxBytes ?? DEFAULT_PDF_MAX_BYTES;
   const bytes = decodePdfInput(String(input.bytes_base64), maxBytes);
   // Extract BEFORE anything is written: a file that is not a PDF, or one pdf.js
   // cannot read, fails here with nothing on disk.
   const extraction = await extractPdf(bytes);
+  return withVaultLock(ctx.storage.root, () => importPdfLocked(ctx, input, bytes, extraction));
+};
 
+async function importPdfLocked(
+  ctx: OperationContext,
+  input: any,
+  bytes: Uint8Array,
+  extraction: PdfExtraction,
+) {
   // ── Where it lands ──
   // An explicit id is used as stored if a node is there (flat-layout ids carry
   // no nodes/ prefix, and re-rooting would miss them), otherwise normalized
@@ -1293,9 +1310,13 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
     const fm = existing.frontmatter;
     const wantsPublish = publish && fm.status !== "published";
     const wantsTitle = input.title !== undefined && input.title !== fm.title;
+    // Tags are a set: the same tags in another order are not a change.
     const wantsTags =
       input.tags !== undefined &&
-      !isDeepStrictEqual(normalizeUniqueTags(input.tags) ?? [], fm.tags ?? []);
+      !isDeepStrictEqual(
+        [...(normalizeUniqueTags(input.tags) ?? [])].sort(),
+        [...new Set(fm.tags ?? [])].sort(),
+      );
     const wantsDescription =
       typeof input.description === "string" && input.description !== (fm.description ?? "");
     if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription) {
@@ -1435,7 +1456,7 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
     }
     throw err;
   }
-};
+}
 
 /**
  * Serialize a mutating executor on the vault's write lock. Every mutation
@@ -1468,7 +1489,8 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_packs: packs,
   context_nests: nests,
   context_import: locked(importDocs),
-  context_import_pdf: locked(importPdf),
+  // Locks internally, AFTER extraction — see importPdf.
+  context_import_pdf: importPdf,
   context_skill: skill,
   context_skill_install: skillInstall,
 });

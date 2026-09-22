@@ -196,3 +196,43 @@ export async function settlePdfForCommit(
   if (onDisk) await storage.archivePdfBinary(docId, onDisk);
   await storage.writeVaultBinary(sidecar, wanted);
 }
+
+/**
+ * Refuse to publish a pdf node whose binary is not the one its frontmatter
+ * records (§1.11.3). Publishing seals `pdf.sha256` into the chain; sealing a
+ * hash with no matching bytes behind it — a hand-written block arriving
+ * through a folder import, or a sidecar swapped on disk — would put a claim
+ * about a PDF into the audit trail that nothing can back.
+ *
+ * A no-op for every other node type.
+ */
+export async function assertPdfSidecarIntact(
+  storage: NestStorage,
+  docId: string,
+  node: ContextNode,
+): Promise<void> {
+  if (node.frontmatter.type !== "pdf") return;
+  const pdf = node.frontmatter.pdf;
+  if (!pdf) return; // rule 25 — validation reports it
+  let bytes: Buffer;
+  try {
+    bytes = await storage.readVaultBinary(pdfSidecarPath(docId));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    throw new ContextNestError(
+      `${docId} is a pdf node, but its PDF is not in the vault (${pdfSidecarPath(docId)}); ` +
+        "import the PDF with context_import_pdf rather than publishing the block alone.",
+      "INTEGRITY_ERROR",
+      "§8",
+    );
+  }
+  const actual = sha256Bytes(bytes);
+  if (actual !== pdf.sha256) {
+    throw new ContextNestError(
+      `${docId}: the PDF at ${pdfSidecarPath(docId)} (${actual}) is not the one its pdf block records ` +
+        `(${pdf.sha256}); run \`ctx verify\`, and re-import the PDF to record a new one.`,
+      "INTEGRITY_ERROR",
+      "§8",
+    );
+  }
+}

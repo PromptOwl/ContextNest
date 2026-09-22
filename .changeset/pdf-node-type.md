@@ -36,6 +36,9 @@ chain.
   edits may change a pdf node's metadata but not its text or `pdf:` block.
   A `context_import` of `files` re-points a renamed pdf node's `pdf.file`
   (with a warning — the binary itself does not travel as text).
+- **Publish guard:** a pdf node cannot be published (any path — publish,
+  update, bulk/folder import) unless its sidecar is present and hashes to
+  `pdf.sha256`; `INTEGRITY_ERROR` otherwise.
 - **Validation:** rules 25–29 — the `pdf:` block is present iff `type: pdf`,
   and `pdf.file` must be the node's own `<id>.pdf`.
 - **Engine exports** for hosts: `extractPdf`, `isPdf`, `readPdfBinary` (a

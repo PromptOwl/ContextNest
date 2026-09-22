@@ -351,7 +351,12 @@ const createOp: OperationDescriptor = {
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
       .string()
@@ -490,7 +495,7 @@ const updateOp: OperationDescriptor = {
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node. Nothing converts to or from `pdf`: pdf nodes come only from context_import_pdf.",
       ),
     source: sourceMetaSchema
       .strict()
@@ -846,7 +851,12 @@ const importDoc = z
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
     metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
