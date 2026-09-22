@@ -1143,8 +1143,14 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
 
 // ─── context_import_pdf ──────────────────────────────────────────────────────
 
-/** Base64 (standard or URL-safe alphabet, optional padding and whitespace). */
-const BASE64_PATTERN = /^[A-Za-z0-9+/_\-\s]*={0,2}\s*$/;
+/**
+ * Base64 (standard or URL-safe alphabet, optional padding), tested AFTER
+ * whitespace is stripped. The character class and the padding share no
+ * characters, so the match is linear — a class that also admitted `\s`
+ * followed by a trailing `\s*` backtracks quadratically on a long whitespace
+ * run ending in an invalid character.
+ */
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]*={0,2}$/;
 
 /** Decode the op's `bytes_base64`, refusing malformed input and anything over the cap. */
 function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
@@ -1157,10 +1163,12 @@ function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
       "VALIDATION_FAILED",
     );
   }
-  if (!BASE64_PATTERN.test(b64)) {
+  // Line-wrapped (MIME-style) base64 is common; the wrapping is not data.
+  const compact = b64.replace(/\s+/g, "");
+  if (!BASE64_PATTERN.test(compact)) {
     throw new ContextNestError("bytes_base64 is not valid base64.", "VALIDATION_FAILED");
   }
-  const bytes = new Uint8Array(Buffer.from(b64, "base64"));
+  const bytes = new Uint8Array(Buffer.from(compact, "base64"));
   if (bytes.byteLength === 0) {
     throw new ContextNestError("bytes_base64 decoded to an empty file.", "VALIDATION_FAILED");
   }

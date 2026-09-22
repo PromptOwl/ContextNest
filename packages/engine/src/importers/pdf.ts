@@ -90,7 +90,9 @@ function normalizePage(raw: string): string {
       // eslint-disable-next-line no-control-regex
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
       .split("\n")
-      .map((line) => line.replace(/[ \t ]+$/, ""))
+      // trimEnd, not a `[ \t]+$` regex: that retries from every position of a
+      // long whitespace run and goes quadratic on one that does not end the line.
+      .map((line) => line.trimEnd())
       .join("\n")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/<!--/g, "<\\!--")

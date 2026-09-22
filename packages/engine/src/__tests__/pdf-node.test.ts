@@ -165,6 +165,20 @@ describe("type: pdf nodes (CU-wdqcq02pmg)", () => {
       expect(existsSync(join(dir, "nodes", "x.md"))).toBe(false);
     });
 
+    it("accepts line-wrapped base64, and rejects malformed base64 in linear time", async () => {
+      const wrapped = toBase64(textPdf()).replace(/(.{76})/g, "$1\r\n");
+      const res = await importPdf({ bytes_base64: wrapped, title: "Wrapped" });
+      expect(res.pdf.sha256).toBe(`sha256:${hex(textPdf())}`);
+
+      // A whitespace run ending in an invalid character is the input that makes
+      // an overlapping `[…\s]*…\s*$` pattern backtrack quadratically.
+      const started = Date.now();
+      await expect(
+        importPdf({ bytes_base64: " ".repeat(40_000) + "!", title: "Bad" }),
+      ).rejects.toMatchObject({ code: "VALIDATION_FAILED", message: expect.stringMatching(/base64/) });
+      expect(Date.now() - started).toBeLessThan(1_000);
+    });
+
     it("rejects a PDF over the byte cap, and the cap is configurable per context", async () => {
       const bytes = textPdf();
       const capped: OperationContext = { ...ctx, limits: { pdfMaxBytes: bytes.byteLength - 1 } } as OperationContext;
