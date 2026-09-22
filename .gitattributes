@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# PDFs are bytes, never text: a sidecar is bound to its node by SHA-256, so
+# line-ending normalization of one would read as tampering.
+*.pdf binary

@@ -22,6 +22,7 @@ import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
   detectDrift,
+  sha256Bytes,
   verifyDocumentChain,
   verifyCheckpointChain,
 } from "./integrity.js";
@@ -613,6 +614,7 @@ export class NestStorage {
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
    *   - unreadable_history when a history.yaml exists but cannot be parsed
+   *   - sidecar_drift / sidecar_missing for pdf nodes (see verifyPdfSidecars)
    */
   async verifyVaultIntegrity(): Promise<VerificationReport> {
     const errors: VerificationReport["errors"] = [];
@@ -669,6 +671,7 @@ export class NestStorage {
 
     // Integrity check must verify every doc on disk, including retired ones.
     const liveDocs = await this.discoverDocuments({ includeRetired: true });
+    errors.push(...(await this.verifyPdfSidecars(liveDocs)));
     for (const doc of liveDocs) {
       const drift = await this.detectDocumentDrift(doc.id);
       if (drift && drift.drifted) {
@@ -773,6 +776,146 @@ export class NestStorage {
     }
   }
 
+  /**
+   * Write BYTES into the vault at a vault-relative path — the binary twin of
+   * {@link writeVaultFile}, behind the same path guard (`..` and absolute
+   * paths refused). Durable: written to a temp file, flushed, then renamed
+   * over the target, so a crash never leaves a torn file that a `pdf.sha256`
+   * would then report as tampering.
+   *
+   * For declared binary sidecars (a pdf node's `<id>.pdf`, §1.11). Nothing
+   * here makes a binary a node — discovery reads `.md` only.
+   */
+  async writeVaultBinary(relPath: string, bytes: Uint8Array): Promise<void> {
+    const filePath = this.vaultFilePath(relPath);
+    await mkdir(dirname(filePath), { recursive: true });
+    await this.writeFileDurable(filePath, bytes);
+  }
+
+  /** Read a vault file's raw bytes. Same path guard as {@link writeVaultBinary}. */
+  async readVaultBinary(relPath: string): Promise<Buffer> {
+    return readFile(this.vaultFilePath(relPath));
+  }
+
+  /**
+   * Remove a vault file. Same path guard. Returns false when there was nothing
+   * to remove rather than throwing — removal is idempotent.
+   */
+  async removeVaultFile(relPath: string): Promise<boolean> {
+    try {
+      await unlink(this.vaultFilePath(relPath));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+  }
+
+  /** Directory holding a document's version artifacts. */
+  private versionsDir(docId: string): string {
+    return join(this.root, dirname(docId), ".versions", basename(docId));
+  }
+
+  /**
+   * Preserve a pdf node's binary in its version history, content-addressed:
+   * `.versions/<doc>/<sha256-hex>.pdf` (§6.1, §1.11). Called with the PRIOR
+   * sidecar before a new one replaces it, so every version's `pdf.sha256`
+   * still names bytes that exist.
+   *
+   * Idempotent: a file already at that name is left alone — same name, same
+   * bytes, unless it was tampered with, which verification reports instead of
+   * this call silently repairing. Returns the archived file's absolute path.
+   */
+  async archivePdfBinary(docId: string, bytes: Uint8Array): Promise<string> {
+    const hex = sha256Bytes(bytes).slice("sha256:".length);
+    const dir = this.versionsDir(docId);
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, `${hex}.pdf`);
+    try {
+      await access(path);
+      return path;
+    } catch {
+      // Not archived yet.
+    }
+    await this.writeFileDurable(path, bytes);
+    return path;
+  }
+
+  /**
+   * Bytes of an archived pdf binary by its `sha256:<hex>` (or bare hex), or
+   * null when the history holds no such binary.
+   */
+  async readArchivedPdf(docId: string, sha256: string): Promise<Buffer | null> {
+    const hex = sha256.replace(/^sha256:/, "");
+    if (!/^[a-f0-9]{64}$/.test(hex)) return null;
+    try {
+      return await readFile(join(this.versionsDir(docId), `${hex}.pdf`));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  /**
+   * Re-hash every pdf node's binaries (§8.4): the live sidecar against the
+   * `pdf.sha256` in the node's frontmatter, and each archived prior binary
+   * against the hash that names it. A sidecar swapped on disk without a new
+   * version therefore surfaces as `sidecar_drift`; one that is gone as
+   * `sidecar_missing`.
+   *
+   * `docs` lets a caller that already discovered the vault skip a second walk.
+   */
+  async verifyPdfSidecars(docs?: ContextNode[]): Promise<VerificationReport["errors"]> {
+    const errors: VerificationReport["errors"] = [];
+    const nodes = docs ?? (await this.discoverDocuments({ includeRetired: true }));
+    for (const doc of nodes) {
+      const pdf = doc.frontmatter.pdf;
+      if (doc.frontmatter.type !== "pdf" || !pdf || typeof pdf.file !== "string") continue;
+      let bytes: Buffer | null = null;
+      try {
+        bytes = await this.readVaultBinary(pdf.file);
+      } catch (err) {
+        errors.push({
+          type: "sidecar_missing",
+          document: doc.id,
+          expected: typeof pdf.sha256 === "string" ? pdf.sha256 : null,
+          actual:
+            (err as NodeJS.ErrnoException).code === "ENOENT"
+              ? `no file at ${pdf.file}`
+              : `unreadable ${pdf.file}: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      if (bytes) {
+        const actual = sha256Bytes(bytes);
+        if (actual !== pdf.sha256) {
+          errors.push({
+            type: "sidecar_drift",
+            document: doc.id,
+            expected: typeof pdf.sha256 === "string" ? pdf.sha256 : null,
+            actual,
+          });
+        }
+      }
+
+      let archived: string[] = [];
+      try {
+        archived = (await readdir(this.versionsDir(doc.id))).filter((n) =>
+          /^[a-f0-9]{64}\.pdf$/.test(n),
+        );
+      } catch {
+        // No version history yet.
+      }
+      for (const name of archived.sort()) {
+        const expected = `sha256:${name.slice(0, 64)}`;
+        const actual = sha256Bytes(await readFile(join(this.versionsDir(doc.id), name)));
+        if (actual !== expected) {
+          errors.push({ type: "sidecar_drift", document: doc.id, expected, actual });
+        }
+      }
+    }
+    return errors;
+  }
+
   /** Resolve a caller-given vault-relative path, refusing anything that escapes. */
   private vaultFilePath(relPath: string): string {
     const segments = String(relPath ?? "")
@@ -792,10 +935,25 @@ export class NestStorage {
   }
 
   /**
-   * Delete a document and its version history from the vault.
+   * Delete a document and its version history from the vault — and, for a pdf
+   * node, its binary sidecar (archived prior binaries go with `.versions/`).
    */
   async deleteDocument(id: string): Promise<void> {
     const filePath = join(this.root, `${id}.md`);
+    // A pdf node owns the binary beside it (§1.11): find it BEFORE the .md —
+    // the only record of it — is gone. Only the node's own `<id>.pdf` is ever
+    // removed; a block naming some other path is invalid (§13 rule 26), and
+    // deleting a file on the say-so of an invalid block is how a node would
+    // delete another node's binary.
+    let sidecar: string | null = null;
+    try {
+      const raw = await readFile(filePath, "utf-8");
+      const fm = parseDocument(filePath, raw, id).frontmatter;
+      if (fm.type === "pdf" && fm.pdf?.file === `${id}.pdf`) sidecar = fm.pdf.file;
+    } catch {
+      // Missing or unparseable: the unlink below reports the former, and an
+      // unparseable file declares no sidecar.
+    }
     try {
       await unlink(filePath);
     } catch (err: unknown) {
@@ -814,6 +972,8 @@ export class NestStorage {
     } catch {
       // No version history to clean up
     }
+
+    if (sidecar) await this.removeVaultFile(sidecar);
   }
 
   /**
@@ -995,11 +1155,12 @@ export class NestStorage {
    * write. Unique temps keep the old last-write-wins semantics instead of
    * turning that overlap into a throw.
    */
-  private async writeFileDurable(path: string, content: string): Promise<void> {
+  private async writeFileDurable(path: string, content: string | Uint8Array): Promise<void> {
     const tmp = `${path}.${process.pid}.${++this.tmpWriteCounter}.tmp`;
     const handle = await open(tmp, "w");
     try {
-      await handle.writeFile(content, "utf-8");
+      if (typeof content === "string") await handle.writeFile(content, "utf-8");
+      else await handle.writeFile(content);
       await handle.sync();
     } finally {
       await handle.close();

@@ -203,6 +203,12 @@ export function parseDocument(
   if (parsed.data.created_at !== undefined) {
     parsed.data.created_at = normalizeDateField(parsed.data.created_at);
   }
+  // Same for the pdf block's timestamp: a hand-written, unquoted
+  // `extracted_at` loads as a Date and would fail the string schema.
+  const pdfBlock = parsed.data.pdf as Record<string, unknown> | undefined;
+  if (pdfBlock && typeof pdfBlock === "object" && pdfBlock.extracted_at !== undefined) {
+    parsed.data.pdf = { ...pdfBlock, extracted_at: normalizeDateField(pdfBlock.extracted_at) };
+  }
 
   // Capture what the author wrote BEFORE the line below overwrites it. A
   // missing status normalizes to `draft`, so this is the only point where an
@@ -269,6 +275,11 @@ export function validateDocument(
       else if (field.startsWith("source.depends_on")) rule = 13;
       else if (field === "source.cache_ttl") rule = 16;
       else if (field === "source" && issue.message.includes("must not")) rule = 17;
+      else if (field === "pdf" && issue.message.includes("required")) rule = 25;
+      else if (field === "pdf.file") rule = 26;
+      else if (field === "pdf.sha256") rule = 27;
+      else if (field.startsWith("pdf.")) rule = 28;
+      else if (field === "pdf" && issue.message.includes("must not")) rule = 29;
 
       errors.push({
         rule,
@@ -277,6 +288,26 @@ export function validateDocument(
         field: field || undefined,
       });
     }
+  }
+
+  // Rule 26: a pdf node's sidecar is its OWN — `<id>.pdf`, beside the .md.
+  // Checked here rather than in the schema because it needs the node id. Without
+  // it a node could declare another node's binary (or any vault file) as its
+  // sidecar, and deleting the node would delete that file.
+  const pdf = node.frontmatter.pdf;
+  if (
+    node.frontmatter.type === "pdf" &&
+    pdf &&
+    typeof pdf.file === "string" &&
+    node.id &&
+    pdf.file !== `${node.id}.pdf`
+  ) {
+    errors.push({
+      rule: 26,
+      path: node.id,
+      message: `pdf.file must be the node's own sidecar "${node.id}.pdf", got "${pdf.file}" (§13 rule 26)`,
+      field: "pdf.file",
+    });
   }
 
   // Rule 4: Context links use valid contextnest:// URIs.

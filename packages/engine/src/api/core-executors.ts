@@ -15,6 +15,7 @@ import type {
   ClientMetadata,
   ContextNode,
   Frontmatter,
+  PdfMeta,
   SkillMeta,
   SourceMeta,
 } from "../types.js";
@@ -35,7 +36,19 @@ import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
-import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import {
+  ContextNestError,
+  DocumentNotFoundError,
+  RejectedDocumentError,
+} from "../errors.js";
+import { sha256Bytes } from "../integrity.js";
+import {
+  DEFAULT_PDF_MAX_BYTES,
+  PDF_EXTRACTOR,
+  extractPdf,
+  pdfExtractorVersion,
+} from "../importers/pdf.js";
+import { pdfSidecarPath } from "../pdf-nodes.js";
 import {
   buildInstallManifest,
   renderSkill,
@@ -71,6 +84,9 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     ...(node.frontmatter.description ? { description: node.frontmatter.description } : {}),
     ...(node.frontmatter.type === "source" && node.frontmatter.source
       ? { source: node.frontmatter.source }
+      : {}),
+    ...(node.frontmatter.type === "pdf" && node.frontmatter.pdf
+      ? { pdf: node.frontmatter.pdf }
       : {}),
     ...(includeBody ? { body: node.body } : {}),
     ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
@@ -480,6 +496,19 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // of a document that stays rejected.
   if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
     throw new RejectedDocumentError(id);
+  }
+  // A pdf node's body is the text extracted from its binary; hand-editing it
+  // would leave the two disagreeing under one sealed version. The binary is the
+  // source of truth, so the way to change the text is a new PDF.
+  if (
+    existing.frontmatter.type === "pdf" &&
+    (resolveContentAlias(input) !== undefined || typeof input.append === "string")
+  ) {
+    throw new ContextNestError(
+      `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. ` +
+        "Import a new version of the PDF instead (context_import_pdf with this id / `ctx import pdf <file> --id <id>`).",
+      "VALIDATION_FAILED",
+    );
   }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
   // A rename leaves the id alone, so this is the id-free rule, not create's
@@ -1112,6 +1141,246 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   };
 };
 
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/** Base64 (standard or URL-safe alphabet, optional padding and whitespace). */
+const BASE64_PATTERN = /^[A-Za-z0-9+/_\-\s]*={0,2}\s*$/;
+
+/** Decode the op's `bytes_base64`, refusing malformed input and anything over the cap. */
+function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
+  // Refuse an obviously oversized payload before allocating its decoded copy.
+  // Encoded length bounds decoded length from above (4 chars → 3 bytes), with
+  // slack for line breaks some encoders insert.
+  if (b64.length > Math.ceil((maxBytes * 4) / 3) * 1.1 + 1024) {
+    throw new ContextNestError(
+      `PDF exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  if (!BASE64_PATTERN.test(b64)) {
+    throw new ContextNestError("bytes_base64 is not valid base64.", "VALIDATION_FAILED");
+  }
+  const bytes = new Uint8Array(Buffer.from(b64, "base64"));
+  if (bytes.byteLength === 0) {
+    throw new ContextNestError("bytes_base64 decoded to an empty file.", "VALIDATION_FAILED");
+  }
+  if (bytes.byteLength > maxBytes) {
+    throw new ContextNestError(
+      `PDF is ${bytes.byteLength} bytes, which exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return bytes;
+}
+
+/** Read a node, or null when there is none at that id. */
+async function readIfExists(ctx: OperationContext, id: string): Promise<ContextNode | null> {
+  try {
+    return await ctx.storage.readDocument(id);
+  } catch (err) {
+    if (err instanceof DocumentNotFoundError) return null;
+    throw err;
+  }
+}
+
+/** A file name without directory or `.pdf` extension, for a fallback title. */
+function filenameStem(name: unknown): string | undefined {
+  if (typeof name !== "string") return undefined;
+  const base = name.split(/[/\\]/).pop() ?? "";
+  const stem = base.replace(/\.pdf$/i, "").trim();
+  return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, 200) : undefined;
+}
+
+const importPdf: OperationExecutor = async (ctx, input: any) => {
+  const maxBytes = ctx.limits?.pdfMaxBytes ?? DEFAULT_PDF_MAX_BYTES;
+  const bytes = decodePdfInput(String(input.bytes_base64), maxBytes);
+  // Extract BEFORE anything is written: a file that is not a PDF, or one pdf.js
+  // cannot read, fails here with nothing on disk.
+  const extraction = await extractPdf(bytes);
+
+  // ── Where it lands ──
+  // An explicit id is used as stored if a node is there (flat-layout ids carry
+  // no nodes/ prefix, and re-rooting would miss them), otherwise normalized
+  // the way context_create normalizes one.
+  let id: string;
+  let existing: ContextNode | null;
+  if (input.id) {
+    const raw = sanitizeId(String(input.id));
+    existing = await readIfExists(ctx, raw);
+    id = existing ? raw : normalizeDocumentId(raw);
+    if (!existing && id !== raw) existing = await readIfExists(ctx, id);
+  } else {
+    const title =
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF";
+    const slug =
+      slugify(String(title)) ||
+      slugify(filenameStem(input.filename) ?? "") ||
+      `pdf-${extraction.sha256.slice("sha256:".length, "sha256:".length + 12)}`;
+    const folderSegments = String(input.folder ?? "")
+      .split("/")
+      .map(slugify)
+      .filter(Boolean);
+    id = normalizeDocumentId(["nodes", ...folderSegments, slug].join("/"));
+    existing = await readIfExists(ctx, id);
+    if (existing) {
+      throw new ContextNestError(
+        `Document "${id}" already exists. Pass id: "${id}" to import this PDF as its next version, or a different title/folder.`,
+        "DOCUMENT_ALREADY_EXISTS",
+      );
+    }
+  }
+  assertSafeDocumentId(id);
+
+  if (existing) {
+    if (existing.frontmatter.type !== "pdf") {
+      throw new ContextNestError(
+        `${id} is a "${existing.frontmatter.type ?? "document"}" node, not a PDF; a PDF can only be imported as a new node or as a new version of a pdf node.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    if (isRejected(existing)) throw new RejectedDocumentError(id);
+  }
+
+  const sidecar = pdfSidecarPath(id);
+  const pdf: PdfMeta = {
+    file: sidecar,
+    sha256: extraction.sha256,
+    bytes: extraction.bytes,
+    pages: extraction.pages,
+    text_layer: extraction.textLayer,
+    extractor: PDF_EXTRACTOR,
+    extractor_version: pdfExtractorVersion(),
+    extracted_at: new Date().toISOString(),
+  };
+
+  // Prior sidecar bytes, when they are the ones the current version records —
+  // archived before being replaced, and restored if this import fails.
+  let priorSidecar: Uint8Array | null = null;
+  if (existing?.frontmatter.pdf) {
+    try {
+      const onDisk = await ctx.storage.readVaultBinary(sidecar);
+      if (sha256Bytes(onDisk) === existing.frontmatter.pdf.sha256) priorSidecar = onDisk;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+
+    // Same bytes as the current version: nothing to version. A sidecar that is
+    // missing or was swapped is put back — the bytes hash to what the chain
+    // records, so this restores the record rather than rewriting it.
+    if (existing.frontmatter.pdf.sha256 === extraction.sha256) {
+      if (!priorSidecar) await ctx.storage.writeVaultBinary(sidecar, bytes);
+      return {
+        id,
+        version: existing.frontmatter.version ?? 1,
+        created: false,
+        unchanged: true,
+        status: existing.frontmatter.status ?? "draft",
+        checkpoint: null,
+        pdf: existing.frontmatter.pdf,
+        text_layer: existing.frontmatter.pdf.text_layer,
+      };
+    }
+  }
+
+  const publish = input.publish !== false;
+  const now = new Date().toISOString();
+  const body = extraction.text ? `\n${extraction.text}` : "";
+  let frontmatter: Frontmatter;
+  if (existing) {
+    frontmatter = { ...existing.frontmatter };
+    if (input.title) {
+      assertUsableTitle(String(input.title));
+      frontmatter.title = input.title;
+    }
+    if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
+    if (typeof input.description === "string") {
+      if (input.description === "") delete frontmatter.description;
+      else frontmatter.description = input.description;
+    }
+    frontmatter.pdf = pdf;
+    frontmatter.updated_at = now;
+    // The checksum describes the published body, which this replaces.
+    delete frontmatter.checksum;
+    if (!publish) frontmatter.status = "draft";
+  } else {
+    const title = String(
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF",
+    );
+    assertUsableTitle(title);
+    frontmatter = {
+      title,
+      type: "pdf",
+      ...(input.description ? { description: input.description } : {}),
+      ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
+      status: "draft",
+      created_at: now,
+      updated_at: now,
+      pdf,
+    };
+    // Publish assigns the version; a draft needs its own v1 (see context_create).
+    if (!publish) frontmatter.version = 1;
+  }
+  const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
+  assertValid(node);
+
+  // ── Write: archive the prior binary, sidecar, then the node, then publish ──
+  // The sidecar goes first so the node never points at a binary that is not
+  // there. On failure everything this call wrote is put back.
+  if (existing && priorSidecar) await ctx.storage.archivePdfBinary(id, priorSidecar);
+  // A failure AFTER publish sealed a version (say, at the checkpoint) must not
+  // be rolled back: the history already vouches for the new binary and text.
+  const sealedBefore = await ctx.storage.maxRecordedVersion(id);
+  let wroteNode = false;
+  try {
+    await ctx.storage.writeVaultBinary(sidecar, bytes);
+    await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: !existing });
+    wroteNode = true;
+    if (!publish) {
+      await ctx.storage.regenerateIndex();
+      return {
+        id,
+        version: frontmatter.version ?? 1,
+        created: !existing,
+        unchanged: false,
+        status: frontmatter.status ?? "draft",
+        checkpoint: null,
+        pdf,
+        text_layer: pdf.text_layer,
+      };
+    }
+    const result = await publishAndIndex(
+      ctx,
+      id,
+      input.note ?? (existing ? "New PDF version" : "Imported PDF"),
+      input.client,
+    );
+    return {
+      id,
+      version: result.version,
+      created: !existing,
+      unchanged: false,
+      status: "published",
+      checkpoint: result.checkpoint,
+      pdf,
+      text_layer: pdf.text_layer,
+    };
+  } catch (err) {
+    const sealedAfter = await ctx.storage.maxRecordedVersion(id).catch(() => sealedBefore);
+    if (sealedAfter > sealedBefore) throw err;
+    if (existing) {
+      if (wroteNode) await ctx.storage.writeDocument(id, existing.rawContent).catch(() => undefined);
+      if (priorSidecar) {
+        await ctx.storage.writeVaultBinary(sidecar, priorSidecar).catch(() => undefined);
+      }
+    } else if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) {
+      // A create that lost the exclusive-write race must not delete the winner's files.
+      if (wroteNode) await ctx.storage.deleteDocument(id).catch(() => undefined);
+      await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+    }
+    throw err;
+  }
+};
+
 /**
  * Serialize a mutating executor on the vault's write lock. Every mutation
  * read-modify-writes the nest-level checkpoint chain; without this, concurrent
@@ -1143,6 +1412,7 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_packs: packs,
   context_nests: nests,
   context_import: locked(importDocs),
+  context_import_pdf: locked(importPdf),
   context_skill: skill,
   context_skill_install: skillInstall,
 });

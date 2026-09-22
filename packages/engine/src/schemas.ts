@@ -21,6 +21,9 @@ export const NODE_TYPES = [
   "agent",
   "artifact",
   "table",
+  // A PDF document: the body is the text extracted from it, and the required
+  // `pdf:` block binds the binary sidecar beside the .md by SHA-256 (§1.11).
+  "pdf",
 ] as const;
 
 export const STATUSES = [
@@ -203,6 +206,41 @@ export const sourceMetaSchema = z.object({
   cache_ttl: z.number().int().positive().optional(), // Rule 16
 });
 
+/**
+ * The `pdf` block (§1.11) — present iff `type: pdf`.
+ *
+ * It is what makes the binary part of the governed record: `sha256` names the
+ * exact bytes of the sidecar at `file`, and because the block sits in
+ * frontmatter it is inside every version's content_hash, so the PDF is bound
+ * into the version chain without any change to the chain itself.
+ *
+ * Non-strict for the same reason as {@link sourceMetaSchema}: this parses
+ * files already on disk. `file` is only shape-checked here (relative, `.pdf`,
+ * no `..`); that it names the node's OWN sidecar (`<id>.pdf`) needs the node id
+ * and is checked in `validateDocument` (§13 rule 26).
+ */
+export const pdfMetaSchema = z.object({
+  file: z
+    .string()
+    .min(1)
+    .refine(
+      (f) =>
+        f.toLowerCase().endsWith(".pdf") &&
+        !f.startsWith("/") &&
+        !f.includes("\\") &&
+        !/^[a-zA-Z]:/.test(f) &&
+        !f.split("/").some((seg) => seg === ".." || seg === "."),
+      "pdf.file must be a vault-relative path ending in .pdf (forward slashes, no `..`)",
+    ),
+  sha256: z.string().regex(CHECKSUM_PATTERN, "pdf.sha256 must match sha256:<64 hex chars>"),
+  bytes: z.number().int().min(0),
+  pages: z.number().int().min(0),
+  text_layer: z.boolean(),
+  extractor: z.string().min(1),
+  extractor_version: z.string().min(1),
+  extracted_at: z.string().min(1),
+});
+
 export const frontmatterSchema = z
   .object({
     title: z.string().min(1).max(200),                    // Rule 2
@@ -219,6 +257,7 @@ export const frontmatterSchema = z
     metadata: z.record(z.unknown()).optional(),
     source: sourceMetaSchema.optional(),
     skill: skillMetaSchema.optional(),
+    pdf: pdfMetaSchema.optional(),
     zone: z
       .string()
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
@@ -256,6 +295,23 @@ export const frontmatterSchema = z
         code: z.ZodIssueCode.custom,
         message: "Skill block must not be present when type is not 'skill'",
         path: ["skill"],
+      });
+    }
+    // Rule 25: pdf block MUST be present when type is "pdf"
+    if (data.type === "pdf" && !data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block is required when type is 'pdf' (§13 rule 25)",
+        path: ["pdf"],
+      });
+    }
+    // Rule 29: pdf block MUST NOT be present on non-pdf types. An untyped
+    // node defaults to `document`, so it may not carry one either.
+    if (data.type !== "pdf" && data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block must not be present when type is not 'pdf' (§13 rule 29)",
+        path: ["pdf"],
       });
     }
   });

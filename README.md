@@ -574,7 +574,7 @@ full stack trace back.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 38 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 39 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -658,6 +658,7 @@ cloud:
 | `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
 | `context_delete` | Delete a node and its history; returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
+| `context_import_pdf` | Import a PDF as a `type: pdf` node — extracted text as the body, the PDF kept beside it and bound by SHA-256; pass `id` to version an existing one |
 
 Every tool above also takes an optional `client` object — `{ agent, session_id, …custom }` —
 naming the agent and session behind the call. A write that publishes records it on the
