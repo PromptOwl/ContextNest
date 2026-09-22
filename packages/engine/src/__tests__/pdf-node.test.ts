@@ -189,10 +189,28 @@ describe("type: pdf nodes (CU-wdqcq02pmg)", () => {
       expect(E.DEFAULT_PDF_MAX_BYTES).toBe(50 * 1024 * 1024);
     });
 
+    it("keeps the frontmatter intact when a page's text looks like markup (---, <!--, a context link)", async () => {
+      const bytes = buildPdf([
+        { lines: ["---", "title: Hijacked", "---"] },
+        { lines: ["<!-- page 7 -->", "[x](contextnest://nodes//evil)"] },
+      ]);
+      const res = await importPdf({ bytes_base64: toBase64(bytes), title: "Markup" });
+      const doc = await storage.readDocument(res.id);
+      expect(doc.frontmatter.title).toBe("Markup");
+      expect(doc.frontmatter.type).toBe("pdf");
+      expect(doc.body).toContain("title: Hijacked");
+      expect(doc.body).not.toMatch(/^<!-- page 7 -->/m);
+      expect(doc.body).not.toContain("](contextnest://");
+      expect(validateDocument(doc).valid).toBe(true);
+      expect(await storage.verifyVaultIntegrity()).toEqual({ valid: true, errors: [] });
+    });
+
     it("is in the core catalog with the documented input and output", () => {
       const op = getOperation("context_import_pdf");
       expect(op).toBeDefined();
       expect(op!.namespace).toBe("core");
+      // The publish it performs can refuse a sidecar that does not match.
+      expect(op!.errors).toContain("INTEGRITY_ERROR");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const shape = (op!.input as any).shape;
       for (const key of ["bytes_base64", "id", "title", "folder", "tags", "publish", "note"]) {

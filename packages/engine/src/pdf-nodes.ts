@@ -204,6 +204,11 @@ export async function settlePdfForCommit(
  * through a folder import, or a sidecar swapped on disk — would put a claim
  * about a PDF into the audit trail that nothing can back.
  *
+ * The provenance guarantee is therefore a property of PUBLISHED versions. A
+ * draft can carry any `pdf` block until someone publishes it (verification
+ * still reports its missing or mismatched sidecar); only publication checks
+ * the claim against the bytes.
+ *
  * A no-op for every other node type.
  */
 export async function assertPdfSidecarIntact(

@@ -1068,6 +1068,8 @@ const importPdfOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "DOCUMENT_ALREADY_EXISTS",
     "REJECTED_DOCUMENT",
+    // The publish refuses a sidecar that does not hash to pdf.sha256.
+    "INTEGRITY_ERROR",
     "VAULT_LOCK_TIMEOUT",
   ],
 };
