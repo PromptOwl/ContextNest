@@ -104,6 +104,11 @@ In any of those cases: **stop and ask.** Present the change-set — the ids, wha
 each would become, and which rung triggered the escalation — and wait. Do not
 begin a rename or a restructure on your own authority.
 
+Once the user approves: refile a node with `ctx move <id> <folder> --vault
+<alias>` (its id changes; history and links follow). That works on a remote
+Community nest only, and a rename (`ctx update --title`) does not work on a
+remote nest at all — ask the user to do those in the app.
+
 ## 5. Report
 
 One line per changed node (`updated: vault:id — <what changed>`), plus the

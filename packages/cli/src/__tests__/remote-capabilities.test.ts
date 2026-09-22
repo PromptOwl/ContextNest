@@ -51,7 +51,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remoteAdd, remotePublish, remoteVerify } = await import("../remote.js");
+const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -183,5 +183,34 @@ describe("remoteAdd — folder", () => {
     await remoteAdd(target, "nodes/thing", {});
 
     expect(calls[0].input).not.toHaveProperty("folder");
+  });
+});
+
+// A remote nest must take the same edits a local vault does (Stacey's
+// partner-nest report: tags couldn't change, move didn't exist).
+describe("remoteUpdate / remoteMove", () => {
+  it("sends --tags (replace) and --status to context_update", async () => {
+    advertised = new Set(["context_update"]);
+    replies = { context_update: { id: "nodes/a", version: 3, status: "draft" } };
+    await remoteUpdate(target, "nodes/a", { tags: "keep, other", status: "cancelled" });
+    expect(calls).toEqual([
+      { op: "context_update", input: { id: "nodes/a", tags: ["#keep", "#other"], status: "rejected" } },
+    ]);
+    expect(plain()).toContain("Status: draft");
+  });
+
+  it("refuses --title rather than sending a selector the nest would ignore", async () => {
+    const err = await remoteUpdate(target, "nodes/a", { title: "New" }).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
+    expect(calls).toEqual([]);
+  });
+
+  it("move calls context_move with id + folder and reports the new id", async () => {
+    advertised = new Set(["context_move"]);
+    replies = { context_move: { id: "nodes/archive/a", previous_id: "nodes/a" } };
+    await remoteMove(target, "nodes/a", "archive");
+    expect(calls).toEqual([{ op: "context_move", input: { id: "nodes/a", folder: "archive" } }]);
+    expect(plain()).toContain("nodes/a → nodes/archive/a");
+    expect(closed).toBe(opened);
   });
 });

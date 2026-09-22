@@ -77,6 +77,7 @@ import {
   remoteUpdate,
   remotePublish,
   remoteDelete,
+  remoteMove,
   folderFromId,
 } from "./remote.js";
 import {
@@ -2412,6 +2413,24 @@ program
       opContext(storage, "cli@contextnest.local"),
     );
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
+  });
+
+// ─── ctx move ─────────────────────────────────────────────────────────────────
+
+program
+  .command("move <path> <folder>")
+  .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
+  .action(async (path, folder) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (!remote) {
+      // ponytail: remote-only — the engine has no move op yet (a local move must
+      // rename the file, its history and every [[link]]). Add it upstream first.
+      throw new ContextNestError(
+        "ctx move works against a remote Community nest only (--vault <alias>); a local vault has no move operation yet.",
+        "NOT_IMPLEMENTED",
+      );
+    }
+    await remoteMove(remote, path, folder);
   });
 
 // ─── ctx search ───────────────────────────────────────────────────────────────

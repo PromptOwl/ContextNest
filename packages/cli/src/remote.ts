@@ -389,29 +389,34 @@ export async function remoteUpdate(
   path: string,
   opts: { title?: string; tags?: string; status?: string; body?: string },
 ): Promise<void> {
-  // The catalog's context_update covers content replacement (and tag ADDs);
-  // title/status/tags-replace semantics differ from the local command, so
-  // refuse them loudly instead of silently doing something different.
-  if (opts.title !== undefined || opts.status !== undefined || opts.tags !== undefined) {
+  // A rename stays refused: Community's context_update reads `title` as the
+  // node SELECTOR, so sending it next to `id` would be silently ignored.
+  if (opts.title !== undefined) {
     throw new ContextNestError(
-      "Only --body updates are supported against a remote nest for now (title/status/tags need the governance surface).",
+      "--title is not supported against a remote nest yet (the nest reads `title` as a selector, not a rename) — rename it in the app.",
       "NOT_IMPLEMENTED",
     );
   }
-  if (opts.body === undefined) {
-    throw new ContextNestError("Nothing to update — pass --body.", "VALIDATION_FAILED");
+  if (opts.body === undefined && opts.tags === undefined && opts.status === undefined) {
+    throw new ContextNestError("Nothing to update — pass --body, --tags or --status.", "VALIDATION_FAILED");
   }
   await confirmRemoteWrite(
     target,
-    `Rewrite ${normalizeDocumentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
+    `Update ${normalizeDocumentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
   );
   await withRemote(target, async (conn) => {
-    const updated = await conn.run<{ id: string; version: number }>("context_update", {
+    // Same fields the local branch sends; tags REPLACE, as locally.
+    const updated = await conn.run<{ id: string; version: number; status?: string }>("context_update", {
       id: normalizeDocumentId(path),
-      content: `\n${opts.body}\n`,
+      ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
+      ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
+      ...(opts.status !== undefined ? { status: normalizeStatus(opts.status) } : {}),
     });
-    console.log(chalk.green(`Updated and published ${updated.id} (remote: ${target.alias})`));
+    // The nest's stewardship decides whether the edit published, so report
+    // the status it came back with rather than assuming "published".
+    console.log(chalk.green(`Updated ${updated.id} (remote: ${target.alias})`));
     console.log(`  Version: ${updated.version}`);
+    if (updated.status) console.log(`  Status: ${updated.status}`);
   });
 }
 
@@ -521,5 +526,24 @@ export async function remoteDelete(target: RemoteTarget, path: string): Promise<
       id: normalizeDocumentId(path),
     });
     console.log(chalk.green(`Deleted ${out.id} (remote: ${target.alias})`));
+  });
+}
+
+/**
+ * Community-only: `context_move` is not a catalog operation (the id rewrite
+ * spans governance tables the engine doesn't own), so a nest that lacks it
+ * answers "tool not found".
+ */
+export async function remoteMove(target: RemoteTarget, path: string, folder: string): Promise<void> {
+  await confirmRemoteWrite(
+    target,
+    `Move ${normalizeDocumentId(path)} to folder "${folder}" on remote nest "${target.alias}"? Its id changes; history and links follow.`,
+  );
+  await withRemote(target, async (conn) => {
+    const out = await conn.run<{ id: string; previous_id: string }>("context_move", {
+      id: normalizeDocumentId(path),
+      folder,
+    });
+    console.log(chalk.green(`Moved ${out.previous_id} → ${out.id} (remote: ${target.alias})`));
   });
 }
