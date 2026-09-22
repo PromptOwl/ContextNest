@@ -56,6 +56,16 @@
           ]
         },
         {
+          "name": "@promptowl/contextnest-plugin-sdk",
+          "version": "0.1.0",
+          "license": "Apache-2.0",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "diff",
           "version": "9.0.0",
           "license": "BSD-3-Clause",
@@ -1082,17 +1092,28 @@
         "minisearch",
         "toposort",
         "zod",
-        "zod-to-json-schema"
+        "zod-to-json-schema",
+        "@promptowl/contextnest-plugin-sdk"
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 96,
-      "minimalTotal": 96,
+      "total": 97,
+      "minimalTotal": 97,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
           "version": "1.29.0",
           "license": "MIT",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "@promptowl/contextnest-plugin-sdk",
+          "version": "0.1.0",
+          "license": "Apache-2.0",
           "depth": 1,
           "optional": false,
           "via": [
@@ -2168,6 +2189,16 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "@promptowl/contextnest-plugin-sdk",
+          "version": "0.1.0",
+          "license": "Apache-2.0",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
           ]
         },
         {

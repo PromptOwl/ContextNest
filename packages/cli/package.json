@@ -57,7 +57,10 @@
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.9",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "@promptowl/contextnest-plugin-sdk": "^0.1.0",
+    "js-yaml": "^4.3.2",
+    "@types/js-yaml": "^4.0.9"
   },
   "files": [
     "dist",

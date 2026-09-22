@@ -671,6 +671,28 @@ Use `prompt` for text generation templates. Use `skill` for multi-step procedure
 
 ---
 
+### 1.11 Plugin Provenance (informative)
+
+Nodes written by a Nest Plugin host carry a `provenance` object under `metadata`:
+
+```yaml
+metadata:
+  provenance:
+    plugin: github-markdown        # manifest name; the node's version author is system:plugin:<name>
+    externalId: docs/setup.md      # stable id in the source; with `plugin` it is the idempotency key
+    hash: 5c3a…                    # content hash of the item as fetched (blob sha, etag, sha256:…)
+    bodyHash: 9f1e…                # sha256 of the body the host last wrote — a differing live body means a human edited it
+    mode: raw                      # raw | summary
+    url: https://github.com/…      # optional
+    fetchedAt: 2026-09-15T15:00:00Z
+    sourceVersion: 1a2b3c          # optional upstream version marker
+```
+
+A host re-ingesting an item MUST NOT overwrite a node whose live body no longer matches `bodyHash`
+(the node is reported as a conflict instead), and SHOULD treat an unchanged `hash` as a no-op.
+Consumers MAY rely on `metadata.provenance.plugin` to distinguish plugin-written nodes from
+human-authored ones. This block is not validated by §13; it is a convention of the plugin host.
+
 ## 2. Selector Grammar
 
 Context Nest defines a composable query language for selecting documents. Selectors are used by CLIs, MCP tools, and programmatic APIs. Selectors operate uniformly across all node types including source nodes.
