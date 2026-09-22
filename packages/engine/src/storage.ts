@@ -907,7 +907,20 @@ export class NestStorage {
       }
       for (const name of archived.sort()) {
         const expected = `sha256:${name.slice(0, 64)}`;
-        const actual = sha256Bytes(await readFile(join(this.versionsDir(doc.id), name)));
+        let actual: string;
+        try {
+          actual = sha256Bytes(await readFile(join(this.versionsDir(doc.id), name)));
+        } catch (err) {
+          // One unreadable entry is a finding about that entry, not a reason
+          // to abandon verifying the rest of the vault.
+          errors.push({
+            type: "sidecar_missing",
+            document: doc.id,
+            expected,
+            actual: `unreadable archived binary ${name}: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          continue;
+        }
         if (actual !== expected) {
           errors.push({ type: "sidecar_drift", document: doc.id, expected, actual });
         }

@@ -31,6 +31,11 @@ chain.
   keeps the `pdf:` block, allows title/tag/metadata/status edits, and refuses
   body edits and re-typing (import a new PDF instead). `context_create`
   cannot make a pdf node.
+- **Governance paths:** rollback restores the version's binary to the
+  sidecar (archiving what it replaces); suggestion approvals and czar direct
+  edits may change a pdf node's metadata but not its text or `pdf:` block.
+  A `context_import` of `files` re-points a renamed pdf node's `pdf.file`
+  (with a warning — the binary itself does not travel as text).
 - **Validation:** rules 25–29 — the `pdf:` block is present iff `type: pdf`,
   and `pdf.file` must be the node's own `<id>.pdf`.
 - **Engine exports** for hosts: `extractPdf`, `isPdf`, `readPdfBinary` (a

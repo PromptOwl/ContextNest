@@ -66,6 +66,7 @@ import {
   sanitizeImportedFrontmatter,
 } from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
+import { isDeepStrictEqual } from "node:util";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
 const MAX_HOPS = 10;
@@ -1250,49 +1251,85 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
   }
 
   const sidecar = pdfSidecarPath(id);
-  const pdf: PdfMeta = {
-    file: sidecar,
-    sha256: extraction.sha256,
-    bytes: extraction.bytes,
-    pages: extraction.pages,
-    text_layer: extraction.textLayer,
-    extractor: PDF_EXTRACTOR,
-    extractor_version: pdfExtractorVersion(),
-    extracted_at: new Date().toISOString(),
-  };
 
-  // Prior sidecar bytes, when they are the ones the current version records —
-  // archived before being replaced, and restored if this import fails.
-  let priorSidecar: Uint8Array | null = null;
-  if (existing?.frontmatter.pdf) {
+  // A new node must not land on a file already sitting at its sidecar path —
+  // that file is someone's, not this import's to overwrite (or, on a failed
+  // import, to delete).
+  if (!existing && (await ctx.storage.hasVaultFile(sidecar))) {
+    throw new ContextNestError(
+      `A file already exists at ${sidecar}, where this node's PDF would go. Move it, or import under another title/folder/id.`,
+      "DOCUMENT_ALREADY_EXISTS",
+    );
+  }
+
+  // Whatever is on disk at the sidecar path now — archived (content-addressed,
+  // so harmless) before it is replaced, and put back if this import fails.
+  // ALL bytes, not only ones matching the current frontmatter: after a
+  // rollback, or a hand swap, the file on disk may be a binary some other
+  // version records, and overwriting it unarchived would lose that version.
+  let priorOnDisk: Uint8Array | null = null;
+  if (existing) {
     try {
-      const onDisk = await ctx.storage.readVaultBinary(sidecar);
-      if (sha256Bytes(onDisk) === existing.frontmatter.pdf.sha256) priorSidecar = onDisk;
+      priorOnDisk = await ctx.storage.readVaultBinary(sidecar);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
-
-    // Same bytes as the current version: nothing to version. A sidecar that is
-    // missing or was swapped is put back — the bytes hash to what the chain
-    // records, so this restores the record rather than rewriting it.
-    if (existing.frontmatter.pdf.sha256 === extraction.sha256) {
-      if (!priorSidecar) await ctx.storage.writeVaultBinary(sidecar, bytes);
-      return {
-        id,
-        version: existing.frontmatter.version ?? 1,
-        created: false,
-        unchanged: true,
-        status: existing.frontmatter.status ?? "draft",
-        checkpoint: null,
-        pdf: existing.frontmatter.pdf,
-        text_layer: existing.frontmatter.pdf.text_layer,
-      };
     }
   }
 
   const publish = input.publish !== false;
+  const existingPdf = existing?.frontmatter.pdf;
+  const sameBytes = existingPdf?.sha256 === extraction.sha256;
+
+  if (existing && existingPdf && sameBytes) {
+    // Same PDF as the current version. A missing or swapped sidecar is put
+    // back — these bytes hash to what the chain records, so that restores the
+    // record rather than rewriting it. Anything the caller ASKED for besides
+    // the bytes (publish a draft, a new title/tags/description) still happens
+    // below; with nothing asked for, this is a no-op.
+    if (!priorOnDisk || sha256Bytes(priorOnDisk) !== existingPdf.sha256) {
+      if (priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+    }
+    const fm = existing.frontmatter;
+    const wantsPublish = publish && fm.status !== "published";
+    const wantsTitle = input.title !== undefined && input.title !== fm.title;
+    const wantsTags =
+      input.tags !== undefined &&
+      !isDeepStrictEqual(normalizeUniqueTags(input.tags) ?? [], fm.tags ?? []);
+    const wantsDescription =
+      typeof input.description === "string" && input.description !== (fm.description ?? "");
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription) {
+      return {
+        id,
+        version: fm.version ?? 1,
+        created: false,
+        unchanged: true,
+        status: fm.status ?? "draft",
+        checkpoint: null,
+        pdf: existingPdf,
+        text_layer: existingPdf.text_layer,
+      };
+    }
+  }
+
+  // Same bytes keep the recorded block and text (re-extracting would only
+  // restamp extracted_at); new bytes get both fresh.
+  const pdf: PdfMeta =
+    sameBytes && existingPdf
+      ? existingPdf
+      : {
+          file: sidecar,
+          sha256: extraction.sha256,
+          bytes: extraction.bytes,
+          pages: extraction.pages,
+          text_layer: extraction.textLayer,
+          extractor: PDF_EXTRACTOR,
+          extractor_version: pdfExtractorVersion(),
+          extracted_at: new Date().toISOString(),
+        };
   const now = new Date().toISOString();
-  const body = extraction.text ? `\n${extraction.text}` : "";
+  const body =
+    sameBytes && existing ? existing.body : extraction.text ? `\n${extraction.text}` : "";
   let frontmatter: Frontmatter;
   if (existing) {
     frontmatter = { ...existing.frontmatter };
@@ -1307,8 +1344,8 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
     }
     frontmatter.pdf = pdf;
     frontmatter.updated_at = now;
-    // The checksum describes the published body, which this replaces.
-    delete frontmatter.checksum;
+    // The checksum describes the published body, which this may replace.
+    if (!sameBytes) delete frontmatter.checksum;
     if (!publish) frontmatter.status = "draft";
   } else {
     const title = String(
@@ -1331,16 +1368,21 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
 
-  // ── Write: archive the prior binary, sidecar, then the node, then publish ──
+  // ── Write: archive what is on disk, sidecar, then the node, then publish ──
   // The sidecar goes first so the node never points at a binary that is not
   // there. On failure everything this call wrote is put back.
-  if (existing && priorSidecar) await ctx.storage.archivePdfBinary(id, priorSidecar);
+  const replacing = !sameBytes;
+  if (replacing && priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
   // A failure AFTER publish sealed a version (say, at the checkpoint) must not
   // be rolled back: the history already vouches for the new binary and text.
   const sealedBefore = await ctx.storage.maxRecordedVersion(id);
+  let wroteSidecar = false;
   let wroteNode = false;
   try {
-    await ctx.storage.writeVaultBinary(sidecar, bytes);
+    if (replacing) {
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+      wroteSidecar = true;
+    }
     await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: !existing });
     wroteNode = true;
     if (!publish) {
@@ -1359,7 +1401,7 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
     const result = await publishAndIndex(
       ctx,
       id,
-      input.note ?? (existing ? "New PDF version" : "Imported PDF"),
+      input.note ?? (!existing ? "Imported PDF" : replacing ? "New PDF version" : "PDF metadata update"),
       input.client,
     );
     return {
@@ -1377,13 +1419,19 @@ const importPdf: OperationExecutor = async (ctx, input: any) => {
     if (sealedAfter > sealedBefore) throw err;
     if (existing) {
       if (wroteNode) await ctx.storage.writeDocument(id, existing.rawContent).catch(() => undefined);
-      if (priorSidecar) {
-        await ctx.storage.writeVaultBinary(sidecar, priorSidecar).catch(() => undefined);
+      if (wroteSidecar) {
+        if (priorOnDisk) {
+          await ctx.storage.writeVaultBinary(sidecar, priorOnDisk).catch(() => undefined);
+        } else {
+          await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+        }
       }
     } else if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) {
-      // A create that lost the exclusive-write race must not delete the winner's files.
+      // A create that lost the exclusive-write race must not delete the
+      // winner's files; otherwise the sidecar is this call's own (a file
+      // already at that path was refused above).
       if (wroteNode) await ctx.storage.deleteDocument(id).catch(() => undefined);
-      await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+      if (wroteSidecar) await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
     }
     throw err;
   }
