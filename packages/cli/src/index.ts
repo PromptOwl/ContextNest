@@ -78,7 +78,6 @@ import {
   remotePublish,
   remoteDelete,
   remoteMove,
-  remoteVaultFix,
   folderFromId,
 } from "./remote.js";
 import {
@@ -431,7 +430,6 @@ const REGISTRY_WRITE_COMMANDS = new Set([
   "vault remove",
   "vault default",
   "vault prune",
-  "vault fix",
 ]);
 
 /** Full space-separated path of a command, e.g. `drift approve`. */
@@ -3182,20 +3180,6 @@ vaultCmd
           ),
         );
       }
-    } catch (err) {
-      console.log(chalk.red((err as Error).message));
-      process.exit(1);
-    }
-  });
-
-vaultCmd
-  .command("fix [alias]")
-  .description(
-    "Replace a server-level remote (<server>/mcp) with one alias per nest it reaches — ctx writes only work per nest",
-  )
-  .action(async (alias: string | undefined) => {
-    try {
-      await remoteVaultFix(alias);
     } catch (err) {
       console.log(chalk.red((err as Error).message));
       process.exit(1);
