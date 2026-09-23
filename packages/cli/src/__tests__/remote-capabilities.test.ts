@@ -41,6 +41,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
           if (!advertised.has(op)) {
             throw new ContextNestError(`Tool ${op} not found`, "INTERNAL");
           }
+          if (replies[op] instanceof Error) throw replies[op];
           return replies[op];
         },
         close: async () => {
@@ -51,7 +52,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove } = await import("../remote.js");
+const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, nestLabels } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -212,5 +213,74 @@ describe("remoteUpdate / remoteMove", () => {
     expect(calls).toEqual([{ op: "context_move", input: { id: "nodes/a", folder: "archive" } }]);
     expect(plain()).toContain("nodes/a → nodes/archive/a");
     expect(closed).toBe(opened);
+  });
+});
+
+// One server-level alias (`<server>/mcp`) standing for every nest behind it.
+describe("<server>/<nest> targets", () => {
+  const server = {
+    alias: "cn",
+    spec: { transport: "http", url: "https://cn.example/mcp" } as RemoteNestSpec,
+  };
+  const nests = [
+    { id: "id-strategy-000", name: "Strategy" },
+    { id: "id-chameleon-00", name: "Chameleon Collective" },
+  ];
+  let dir: string;
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    // Isolates the nest-list cache from the real ~/.contextnest.
+    dir = mkdtempSync(join(tmpdir(), "ctx-nests-"));
+    process.env.CONTEXTNEST_CONFIG_DIR = dir;
+    configureSafety({ yes: true }); // delete is destructive: no prompt in tests
+  });
+  afterEach(() => {
+    delete process.env.CONTEXTNEST_CONFIG_DIR;
+  });
+
+  it("labels nests by slugged name, disambiguating collisions with the id", () => {
+    const labels = nestLabels([...nests, { id: "abcdef12-zz", name: "strategy" }]);
+    expect([...labels.values()]).toEqual(["strategy-id-strat", "chameleon-collective", "strategy-abcdef12"]);
+  });
+
+  it("sends the resolved nest id with every call to <server>/<nest>", async () => {
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests }, context_delete: { id: "nodes/a", deleted: true } };
+    await remoteDelete({ ...server, alias: "cn/chameleon-collective", nest: "chameleon-collective" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: "id-chameleon-00" } });
+  });
+
+  it("names the available nests when the one asked for doesn't exist", async () => {
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests } };
+    const err = await remoteDelete({ ...server, alias: "cn/nope", nest: "nope" }, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("cn/chameleon-collective");
+    expect(calls.some((c) => c.op === "context_delete")).toBe(false);
+  });
+
+  it("labels fan-out hits with the --vault that addresses their nest", async () => {
+    advertised = new Set(["nest_index", "context_list"]);
+    replies = {
+      nest_index: { nests },
+      context_list: { documents: [{ id: "nodes/p", title: "P", nest: { id: "id-chameleon-00", name: "Chameleon Collective" } }] },
+    };
+    await remoteList(server, { json: true });
+    expect(JSON.parse(plain())[0].vault).toBe("cn/chameleon-collective");
+  });
+
+  it("turns a nest-less write on a server alias into an actionable error", async () => {
+    advertised = new Set(["context_delete"]);
+    // What the server-level endpoint answers when `nest` is missing.
+    replies = {
+      context_delete: new ContextNestError(
+        'MCP error -32602: Invalid arguments for tool context_delete: [{"code":"invalid_type","path":["nest"],"message":"Required"}]',
+        "INTERNAL",
+      ),
+    };
+    const err = await remoteDelete(server, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("--vault cn/<nest>");
   });
 });

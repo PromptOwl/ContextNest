@@ -68,6 +68,13 @@ export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
  */
 export const VALID_CAPTURE_MODES = ["off", "propose", "auto"];
 
+/**
+ * What capture does when no nest's description clearly fits a new node:
+ * `ask` the user (default — a wrong guess can land in a partner's nest), or
+ * write to the `default` vault (the pin, else the registry default).
+ */
+export const VALID_UNCLEAR_NEST = ["ask", "default"];
+
 /** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
 export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
 export const FALSY_VALUES = ["false", "0", "no", "off"];
@@ -81,7 +88,9 @@ export const FALSY_VALUES = ["false", "0", "no", "off"];
  * validates *shape*; whether the alias is actually registered is checked by
  * the /contextnest:config command, which can consult the registry.
  */
-export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+// An optional `/<nest>` suffix addresses one nest behind a server-level
+// remote (`ctx vault list` shows those as `<server>/<nest>` rows).
+export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)?$/;
 
 /**
  * Read a settings override file. Missing or malformed files are silently
@@ -216,6 +225,15 @@ export function getConfig(env = process.env, opts = {}) {
         : TRUTHY_VALUES.includes(rawAuto)
           ? "propose"
           : "off"),
+    unclearNest:
+      pick(
+        "unclear_nest",
+        ["CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST", "CONTEXTNEST_UNCLEAR_NEST"],
+        {
+          normalize: (s) => s.trim().toLowerCase(),
+          accept: (s) => VALID_UNCLEAR_NEST.includes(s),
+        },
+      ) || "ask",
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,
@@ -328,6 +346,11 @@ export function withVault(args, alias) {
 export function listVaults(exec) {
   const vaults = ctxJson(exec, ["vault", "list", "--json"], []);
   return Array.isArray(vaults) ? vaults : [];
+}
+
+/** Registry rows to SEARCH: everything but the `<server>/<nest>` rows its server row covers. */
+export function searchableVaults(vaults) {
+  return vaults.filter((v) => !v.parent);
 }
 
 /**
@@ -453,8 +476,13 @@ export function cwdVault(exec, vaults = []) {
  * @returns {(string|null)[]} list of alias targets (null = ctx default resolution)
  */
 export function vaultTargets(config, exec) {
-  const present = listVaults(exec).filter((v) => v.exists !== false);
-  if (isVaultRegistered(config.vault, present)) return [config.vault];
+  const listed = listVaults(exec).filter((v) => v.exists !== false);
+  if (isVaultRegistered(config.vault, listed)) return [config.vault];
+  // `<server>/<nest>` rows are for choosing a nest to WRITE to. Searching the
+  // server row already spans every one of its nests in one call (each hit
+  // names its nest), so fanning out over them too would search twice — and
+  // blow MAX_FANOUT_VAULTS on a server with dozens of partner nests.
+  const present = searchableVaults(listed);
 
   const local = cwdVault(exec, present);
   const targets = [];

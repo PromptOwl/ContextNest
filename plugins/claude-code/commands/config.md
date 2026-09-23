@@ -1,5 +1,5 @@
 ---
-description: View or change Context Nest plugin settings (retrieval effort, auto-capture, pinned vault, ctx binary) without re-enabling the plugin.
+description: View or change Context Nest plugin settings (retrieval effort, auto-capture, unclear-nest behaviour, pinned vault, ctx binary) without re-enabling the plugin.
 argument-hint: "[<setting> <value>] [--global]"
 ---
 
@@ -17,7 +17,8 @@ Settings and valid values:
 | `retrieval_mode` | `off` \| `search` \| `query` \| `agent` | Retrieval effort per prompt |
 | `capture_mode` | `off` \| `propose` \| `auto` | What happens when something looks worth keeping |
 | `auto_capture` | `true` \| `false` | **Deprecated** — superseded by `capture_mode` (`true`→`propose`, `false`→`off`) |
-| `vault` | registered vault alias, or `""` to unpin | Pinned vault |
+| `unclear_nest` | `ask` \| `default` | When no nest clearly fits a new note: ask which nest, or write to the pinned/default vault |
+| `vault` | registered vault alias (or `<server>/<nest>`), or `""` to unpin | Pinned vault |
 | `ctx_command` | any command string | Override the `ctx` binary |
 
 Override files (higher wins; both beat enable-time values):
@@ -38,7 +39,7 @@ rather than making the user remember and type an exact string.
 
 Read both override files (if present) and the
 `CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE`, `CLAUDE_PLUGIN_OPTION_CAPTURE_MODE`,
-`CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE`, `CLAUDE_PLUGIN_OPTION_VAULT`,
+`CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE`, `CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST`, `CLAUDE_PLUGIN_OPTION_VAULT`,
 `CLAUDE_PLUGIN_OPTION_CTX_COMMAND` environment variables, then present a small
 table: each setting, its effective value, and which layer it came from (project
 file / user file / enable-time / default).
@@ -58,7 +59,8 @@ the change interactively with `AskUserQuestion`:
 
 1. **Which setting** — if the user didn't already name one, ask which setting
    to change with one question whose options are `retrieval_mode`,
-   `capture_mode`, `vault`, `ctx_command` (label each with its current value).
+   `capture_mode`, `unclear_nest`, `vault`, `ctx_command` (label each with its
+   current value).
    Don't offer `auto_capture` in the picker — it's deprecated; steer anyone who
    names it to `capture_mode` instead.
 2. **Which value** — ask a follow-up whose options are that setting's choices:
@@ -69,6 +71,9 @@ the change interactively with `AskUserQuestion`:
      `/contextnest:capture`), `propose` (reviews the turn and proposes in one
      line, writes only once you agree), `auto` (writes unattended, still behind
      the capture ladder and the cooldown).
+   - `unclear_nest` → `ask` (capture asks which nest before writing a new note
+     no nest clearly fits — the safe choice when partner nests are listed),
+     `default` (writes it to the pinned vault, else the registry default).
    - `vault` → enumerate the registered vault aliases by running
      `<ctx_command> vault list --json` (fall back to `ctx vault list --json`);
      offer each alias as an option (label it with its description), plus an

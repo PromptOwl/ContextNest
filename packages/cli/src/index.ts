@@ -78,6 +78,7 @@ import {
   remotePublish,
   remoteDelete,
   remoteMove,
+  expandServerVaults,
   folderFromId,
 } from "./remote.js";
 import {
@@ -3002,10 +3003,10 @@ const vaultCmd = program
 
 vaultCmd
   .command("list")
-  .description("List registered vaults")
+  .description("List registered vaults (and each nest behind a server-level remote, as <alias>/<nest>)")
   .option("--json", "Output as JSON")
-  .action((opts) => {
-    const vaults = listVaults();
+  .action(async (opts) => {
+    const vaults = await expandServerVaults(listVaults());
     if (opts.json) {
       console.log(JSON.stringify(vaults, null, 2));
       return;
@@ -3020,6 +3021,10 @@ vaultCmd
     console.log(chalk.bold("\nRegistered vaults:\n"));
     for (const v of vaults) {
       const marker = v.isDefault ? chalk.green(" *") : "  ";
+      if (v.parent) {
+        console.log(`     ${chalk.cyan(v.alias)}${v.description ? `  ${chalk.dim(v.description)}` : ""}`);
+        continue;
+      }
       if (v.kind === "remote") {
         const endpoint = v.url ?? [v.command, ...(v.args ?? [])].join(" ");
         console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[remote:${v.transport}]`)}`);

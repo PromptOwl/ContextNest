@@ -43,7 +43,7 @@ export function run({ env, exec }) {
   // Naming the effective mode up front answers "did the plugin stop writing?"
   // for anyone whose legacy auto_capture:true now maps to propose.
   const lines = [
-    `Context Nest is active for this session (capture: ${config.captureMode}).`,
+    `Context Nest is active for this session (capture: ${config.captureMode}; unclear nest: ${config.unclearNest === "default" ? "write to the default" : "ask the user"}).`,
   ];
 
   // A pin is only honoured if it still resolves to a registered vault; it may

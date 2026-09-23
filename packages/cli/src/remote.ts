@@ -20,8 +20,13 @@ import {
   normalizeDocumentId,
   normalizeStatus,
   resolveNest,
+  serializeDocument,
+  getRegistryDir,
+  readRegistry,
 } from "@promptowl/contextnest-engine";
-import type { RemoteNestConnection, RemoteNestSpec } from "@promptowl/contextnest-engine";
+import fs from "node:fs";
+import pathMod from "node:path";
+import type { ContextNode, RemoteNestConnection, RemoteNestSpec, VaultListEntry } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
 import {
   listJsonEntry,
@@ -35,6 +40,13 @@ import {
 export interface RemoteTarget {
   alias: string;
   spec: RemoteNestSpec;
+  /**
+   * `--vault <server>/<nest>`: one nest behind a server-level (`…/mcp`) alias.
+   * Every call is sent with that nest's id as the `nest` argument. `alias` is
+   * the full `<server>/<nest>` form (for messages); the registry key is the
+   * part before the slash.
+   */
+  nest?: string;
 }
 
 /**
@@ -44,21 +56,174 @@ export interface RemoteTarget {
  * error for remote aliases.
  */
 export function remoteTarget(vaultAlias: string | undefined): RemoteTarget | null {
+  const requested = vaultAlias ?? process.env.CONTEXTNEST_VAULT;
+  const slash = requested?.indexOf("/") ?? -1;
+  if (requested && slash > 0) {
+    const base = requested.slice(0, slash);
+    const nest = resolveNest({ vaultAlias: base, cwd: process.cwd() });
+    if (nest.kind !== "remote") {
+      throw new ContextNestError(
+        `"${base}" is a local vault — only a remote server alias takes a /<nest> suffix.`,
+        "CONFIG_ERROR",
+      );
+    }
+    return { alias: requested, spec: nest.remote, nest: requested.slice(slash + 1) };
+  }
   const nest = resolveNest({ vaultAlias, cwd: process.cwd() });
   return nest.kind === "remote" ? { alias: nest.alias, spec: nest.remote } : null;
 }
 
-/** Connect, run, and always close — the standard remote command wrapper. */
+// ─── Nests behind a server-level alias ──────────────────────────────────────
+
+/** One nest as a Community server's `nest_index` reports it. */
+export interface IndexedNest {
+  id: string;
+  name: string;
+  description?: string | null;
+}
+
+/**
+ * Pure: the `<nest>` label for each nest id — its slugged name, or
+ * `<slug>-<id8>` when two nests the key can see slug the same (names are
+ * unique per owner only, so a shared nest can collide with your own).
+ */
+export function nestLabels(nests: IndexedNest[]): Map<string, string> {
+  const slug = (n: IndexedNest) =>
+    n.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "nest";
+  const counts = new Map<string, number>();
+  for (const n of nests) counts.set(slug(n), (counts.get(slug(n)) ?? 0) + 1);
+  return new Map(
+    nests.map((n) => [n.id, counts.get(slug(n))! > 1 ? `${slug(n)}-${n.id.slice(0, 8)}` : slug(n)]),
+  );
+}
+
+/** How long a server's nest list is reused before asking again. */
+export const NEST_INDEX_TTL_MS = 5 * 60_000;
+
+function nestCachePath(baseAlias: string): string {
+  return pathMod.join(getRegistryDir(), "cache", `nests-${baseAlias}.json`);
+}
+
+/**
+ * The nests behind a server-level alias, or null when the alias is an
+ * ordinary single-nest endpoint (it advertises no `nest_index`). Cached per
+ * alias for NEST_INDEX_TTL_MS so `ctx vault list` — which the plugin runs at
+ * every session start — doesn't cost a round trip each time. The cache is a
+ * convenience: unreadable or unwritable, it is simply skipped.
+ */
+export async function serverNests(
+  baseAlias: string,
+  spec: RemoteNestSpec,
+  conn?: RemoteNestConnection,
+  opts: { fresh?: boolean } = {},
+): Promise<IndexedNest[] | null> {
+  if (spec.transport !== "http") return null;
+  const file = nestCachePath(baseAlias);
+  if (!opts.fresh) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(file, "utf-8")) as {
+        at: number;
+        url: string;
+        nests: IndexedNest[] | null;
+      };
+      if (cached.url === spec.url && Date.now() - cached.at < NEST_INDEX_TTL_MS) return cached.nests;
+    } catch {
+      // no cache yet, or unreadable — ask the server
+    }
+  }
+  const fetchNests = async (c: RemoteNestConnection) =>
+    (await c.toolNames()).has("nest_index")
+      ? ((await c.run<{ nests?: IndexedNest[] }>("nest_index", {})).nests ?? [])
+      : null;
+  const nests = conn ? await fetchNests(conn) : await withRemote({ alias: baseAlias, spec }, fetchNests);
+  try {
+    fs.mkdirSync(pathMod.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: spec.url, nests }));
+  } catch {
+    // best-effort
+  }
+  return nests;
+}
+
+/** `--vault <server>/<nest>` → the nest id to send. Throws with the choices on a miss. */
+async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnection): Promise<string> {
+  const base = target.alias.slice(0, target.alias.indexOf("/"));
+  const wanted = target.nest!;
+  const find = (nests: IndexedNest[]) => {
+    const labels = nestLabels(nests);
+    return nests.find(
+      (n) => labels.get(n.id) === wanted || n.id === wanted || n.name.toLowerCase() === wanted.toLowerCase(),
+    );
+  };
+  let nests = await serverNests(base, target.spec, conn);
+  // A nest created or shared since the cache was written: ask once more, fresh.
+  if (nests && !find(nests)) nests = await serverNests(base, target.spec, conn, { fresh: true });
+  if (nests === null) {
+    throw new ContextNestError(
+      `"${base}" is a single-nest endpoint, not a server — drop the "/${wanted}" suffix.`,
+      "CONFIG_ERROR",
+    );
+  }
+  const hit = find(nests);
+  if (!hit) {
+    const labels = [...nestLabels(nests).values()].map((l) => `${base}/${l}`);
+    throw new ContextNestError(
+      `No nest "${wanted}" on "${base}". Available: ${labels.join(", ") || "(none)"}.`,
+      "CONFIG_ERROR",
+    );
+  }
+  return hit.id;
+}
+
+/**
+ * Connect, run, and always close — the standard remote command wrapper.
+ * With a `<server>/<nest>` target, every call carries that nest's id.
+ */
 async function withRemote<T>(
   target: RemoteTarget,
   fn: (conn: RemoteNestConnection) => Promise<T>,
 ): Promise<T> {
   const conn = await connectRemoteNest(target.alias, target.spec);
   try {
-    return await fn(conn);
+    if (!target.nest) return await fn(conn);
+    const nestId = await resolveTargetNest(target, conn);
+    return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) });
+  } catch (err) {
+    // A write through a server-level alias with no nest named: say how to name one.
+    if (
+      !target.nest &&
+      err instanceof ContextNestError &&
+      /\bnest\b/.test(err.message) &&
+      /requires|invalid_type|Required/i.test(err.message)
+    ) {
+      throw new ContextNestError(
+        `"${target.alias}" spans several nests — name one with --vault ${target.alias}/<nest> (\`ctx vault list\` shows them).`,
+        "VALIDATION_FAILED",
+      );
+    }
+    throw err;
   } finally {
     await conn.close();
   }
+}
+
+/**
+ * Hits from a server-level fan-out carry `nest: {id, name}`. Turn that into
+ * `vault: "<server>/<nest>"` — the exact --vault that addresses the hit's
+ * nest — so a caller (the coding-agent plugins) can cite and edit it.
+ */
+async function labelFanout<T extends { nest?: unknown }>(
+  target: RemoteTarget,
+  conn: RemoteNestConnection,
+  items: T[],
+): Promise<Array<T & { vault?: string }>> {
+  if (target.nest || !items.some((i) => i.nest && typeof i.nest === "object")) return items;
+  const labels = nestLabels((await serverNests(target.alias, target.spec, conn)) ?? []);
+  return items.map((i) => {
+    const n = i.nest as { id?: string } | undefined;
+    const label = n?.id ? labels.get(n.id) : undefined;
+    return label ? { ...i, vault: `${target.alias}/${label}` } : i;
+  });
 }
 
 // Wire shapes of the catalog operations this module consumes.
@@ -73,6 +238,10 @@ interface NodeSummary {
   source?: Record<string, unknown>;
   /** BM25 relevance score; absent from a nest running an older engine. */
   score?: number;
+  /** Server-level fan-out only: the nest the hit came from. */
+  nest?: { id: string; name: string };
+  /** Set by labelFanout: the `--vault <server>/<nest>` that addresses this hit. */
+  vault?: string;
 }
 
 // ─── Read surface ───────────────────────────────────────────────────────────
@@ -93,7 +262,7 @@ export async function remoteList(
       ...(opts.tag ? { tag: opts.tag } : {}),
       ...(opts.limit ? { limit: opts.limit } : {}),
     });
-    const docs = out.documents;
+    const docs = await labelFanout(target, conn, out.documents);
 
     if (opts.json) {
       console.log(JSON.stringify(docs.map(listJsonEntry), null, 2));
@@ -105,7 +274,7 @@ export async function remoteList(
     }
     console.log(chalk.bold(`${docs.length} document(s):\n`));
     for (const d of docs) {
-      console.log(`  ${chalk.cyan(d.id)} [${d.type || "document"}] ${d.status || "draft"}`);
+      console.log(`  ${chalk.cyan(d.vault ? `${d.vault}:${d.id}` : d.id)} [${d.type || "document"}] ${d.status || "draft"}`);
       console.log(`    ${d.title}`);
     }
   });
@@ -131,6 +300,7 @@ export async function remoteQuery(
       ...(opts.includeDrafts ? { include_drafts: true } : {}),
     });
 
+    out.documents = await labelFanout(target, conn, out.documents);
     const sourceNodes = out.source_nodes ?? [];
     if (opts.json) {
       // Field selection shared with the local branch (doc-views.ts).
@@ -152,7 +322,7 @@ export async function remoteQuery(
     }
     console.log(chalk.bold("Documents:"));
     for (const doc of out.documents) {
-      console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+      console.log(`  ${chalk.cyan(doc.vault ? `${doc.vault}:${doc.id}` : doc.id)}: ${doc.title}`);
     }
     if (sourceNodes.length > 0) {
       console.log(chalk.bold("\nSource Nodes (hydration order):"));
@@ -182,7 +352,7 @@ export async function remoteSearch(
     // Rendering shared with the local branch (doc-views.ts). An older remote
     // engine sends neither `score` nor `total`; both degrade to the previous
     // output.
-    printSearchResults(out, opts);
+    printSearchResults({ ...out, results: await labelFanout(target, conn, out.results) }, opts);
   });
 }
 
@@ -206,7 +376,11 @@ export async function remoteRead(
     }>("context_get", { id: normalizeDocumentId(path), include_raw: Boolean(opts.raw) });
 
     if (opts.raw) {
-      console.log(doc.raw ?? "");
+      // A nest that returns no `raw` (contextnest-community's context_get has
+      // no include_raw) used to print nothing here — and the plugin's
+      // sweep-check reads every candidate this way, so it found nothing on a
+      // remote nest. Rebuild the file from what did come back.
+      console.log(doc.raw ?? serializeDocument({ id: doc.id, frontmatter: doc.frontmatter, body: doc.body } as ContextNode));
       return;
     }
     const fm = doc.frontmatter;
@@ -546,4 +720,57 @@ export async function remoteMove(target: RemoteTarget, path: string, folder: str
     });
     console.log(chalk.green(`Moved ${out.previous_id} → ${out.id} (remote: ${target.alias})`));
   });
+}
+
+// ─── ctx vault list: nests behind a server alias ────────────────────────────
+
+/** A `ctx vault list` row: the registry's own, or a nest behind a server alias. */
+export type VaultRow = VaultListEntry & {
+  /** Nest rows only: the server alias they sit behind. */
+  parent?: string;
+  nest?: { id: string; name: string };
+};
+
+/** A listing must not stall on a dead server — the plugin runs it at every session start. */
+const LIST_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Insert one `<server>/<nest>` row after every server-level remote, so anything
+ * that picks a vault from the list (a person, or the plugin's agents choosing
+ * by description) sees each nest with its own description. The server row
+ * stays — it is how reads span every nest at once. A server that can't be
+ * reached is listed as it is, without nest rows.
+ */
+export async function expandServerVaults(vaults: VaultListEntry[]): Promise<VaultRow[]> {
+  const registry = readRegistry();
+  const rows: VaultRow[] = [];
+  for (const v of vaults) {
+    rows.push(v);
+    const spec = registry.remotes?.[v.alias];
+    if (v.kind !== "remote" || spec?.transport !== "http") continue;
+    let nests: IndexedNest[] | null = null;
+    try {
+      // ponytail: an unreachable server costs up to 5s per listing (no failure
+      // cache); cache "unreachable" briefly if that shows up in practice.
+      nests = await serverNests(v.alias, { ...spec, timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS) });
+    } catch {
+      continue;
+    }
+    if (!nests) continue;
+    if (!v.description) v.description = `All ${nests.length} nest(s) on this server — reads span every nest`;
+    const labels = nestLabels(nests);
+    for (const n of nests) {
+      rows.push({
+        alias: `${v.alias}/${labels.get(n.id)}`,
+        kind: "remote",
+        transport: "http",
+        url: v.url,
+        description: n.description?.trim() || n.name,
+        isDefault: false,
+        parent: v.alias,
+        nest: { id: n.id, name: n.name },
+      });
+    }
+  }
+  return rows;
 }

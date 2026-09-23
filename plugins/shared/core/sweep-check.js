@@ -30,6 +30,7 @@ import {
   getConfig,
   isMain,
   listVaults,
+  searchableVaults,
   MAX_LIST_SCAN,
   runAsHook,
   withVault,
@@ -137,7 +138,7 @@ export function parseUpdates(command) {
     if (!m) continue;
     const id = m[1].replace(/^["']|["']$/g, "");
     if (!id || id.startsWith("-")) continue;
-    const vault = segment.match(/--vault[= ]\s*["']?([A-Za-z0-9_-]+)/);
+    const vault = segment.match(/--vault[= ]\s*["']?([A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)?)/);
     const key = `${vault ? vault[1] : ""}::${id}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -201,11 +202,11 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
   const found = [];
   let truncated = false;
 
+  // The node just written is only excluded in the vault it was written to —
+  // a same-id node in another nest is a legitimate straggler.
+  checked.add(writtenAlias ? `${writtenAlias}:${excludeId}` : excludeId);
+
   for (const alias of targets) {
-    const ref = (id) => (alias ? `${alias}:${id}` : id);
-    // The node just written is only excluded in the vault it was written to —
-    // a same-id node in another nest is a legitimate straggler.
-    if ((alias || null) === (writtenAlias || null)) checked.add(ref(excludeId));
 
     for (const term of terms) {
       const tagged = ctxJson(
@@ -233,13 +234,17 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
       const candidates = [...tagHits, ...(Array.isArray(searched) ? searched : [])];
 
       for (const hit of candidates) {
+        // A server-level alias spans nests: each hit names its own
+        // `<server>/<nest>`, which is where it is read and cited.
+        const where = hit?.vault || alias;
+        const ref = (id) => (where ? `${where}:${id}` : id);
         if (!hit?.id || checked.has(ref(hit.id))) continue;
         if (checked.size >= budget) {
           truncated = true;
           return { found, truncated };
         }
         checked.add(ref(hit.id));
-        const raw = ctxText(exec, withVault(["read", hit.id, "--raw"], alias));
+        const raw = ctxText(exec, withVault(["read", hit.id, "--raw"], where));
         if (!raw) continue;
         if (bodyOf(raw).toLowerCase().includes(term)) {
           found.push({ ref: ref(hit.id), term, stale: false });
@@ -297,7 +302,7 @@ export const MAX_SWEEP_VAULTS = 8;
  * @returns {{targets: (string|null)[], capped: boolean}}
  */
 export function sweepTargets(exec, writtenAlias, env) {
-  const registered = listVaults(exec)
+  const registered = searchableVaults(listVaults(exec))
     .filter((v) => v.exists !== false)
     .map((v) => v.alias);
   const cap = envInt(env, "CONTEXTNEST_SWEEP_MAX_VAULTS", MAX_SWEEP_VAULTS) || MAX_SWEEP_VAULTS;

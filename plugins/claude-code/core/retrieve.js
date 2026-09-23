@@ -78,7 +78,9 @@ function searchVault(exec, query, alias) {
     id: h.id,
     title: h.title,
     type: h.type,
-    vault: alias || null,
+    // A server-level alias searches every nest; each hit names the
+    // `<server>/<nest>` it lives in, which is what it must be cited and edited as.
+    vault: h.vault || alias || null,
   }));
 }
 
@@ -101,7 +103,7 @@ function searchAll(exec, config, query) {
   for (const alias of targets) {
     const hits = [];
     for (const hit of searchVault(exec, query, alias)) {
-      const key = `${alias || ""}::${hit.id}`;
+      const key = `${hit.vault || ""}::${hit.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
       hits.push(hit);

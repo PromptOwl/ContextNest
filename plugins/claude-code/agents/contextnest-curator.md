@@ -24,6 +24,8 @@ their own slices — concurrent writes are safe, the vault serializes them, but 
 node belongs to exactly one curator).
 
 - **Given a scope: stay inside it.** Pass `--vault <alias>` to every command.
+  A node cited as `<server>/<nest>:id` is edited with `--vault <server>/<nest>`
+  — every write names its nest; a bare server alias can only be searched.
   If you were given node ids, touch only those nodes; your sweep confirms and
   fixes them, it does not expand the set.
 - **Evidence outside your scope** — the fact in another nest, or in nodes not
