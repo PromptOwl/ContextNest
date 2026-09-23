@@ -34,7 +34,7 @@ export {
 } from "./client.js";
 export { CORE_OPERATIONS } from "./core.js";
 export { CORE_EXECUTORS } from "./core-executors.js";
-export type { OperationContext, OperationExecutor } from "./context.js";
+export type { OperationContext, OperationExecutor, OperationLimits } from "./context.js";
 export type {
   EngineExtension,
   OperationEvent,

@@ -1,4 +1,5 @@
 import chalk from "./color.js";
+import { TAG_PATTERN, TAG_RULE } from "@promptowl/contextnest-engine";
 
 /**
  * Shared view shapes and formatting for commands that run against BOTH a
@@ -168,8 +169,18 @@ export function titleFromId(id: string): string {
 
 /** Parse a --tags option: comma/space separated, each tag #-prefixed. */
 export function parseTagsOption(tags: string): string[] {
-  return tags
+  const parsed = tags
     .split(/[,\s]+/)
     .filter((t: string) => t.length > 0)
     .map((t: string) => (t.startsWith("#") ? t : `#${t}`));
+  // Fail here, with the offending tag named, rather than deep in the engine with a bare
+  // "Invalid" — the spec requires a letter first (dates and versions like 2026-09-17 or
+  // 1.23.0 are not tags; prefix them: #d2026-09-17, #v1-23-0).
+  const bad = parsed.filter((t) => !TAG_PATTERN.test(t));
+  if (bad.length > 0) {
+    throw new Error(
+      `${bad.length === 1 ? "Invalid tag" : "Invalid tags"} ${bad.map((t) => JSON.stringify(t)).join(", ")} — ${TAG_RULE}`,
+    );
+  }
+  return parsed;
 }

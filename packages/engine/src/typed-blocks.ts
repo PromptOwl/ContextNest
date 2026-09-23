@@ -1,13 +1,16 @@
 /**
  * Reconciling a node's `type` with its typed frontmatter blocks.
  *
- * Two node types carry a required companion block, and the spec constrains them
- * from both sides:
+ * Three node types carry a required companion block, and the spec constrains
+ * them from both sides:
  *
  *   - `type: source` MUST have a `source:` block (§13 rule 9) and no other type
  *     may have one (rule 17).
  *   - `type: skill` MUST have a `skill:` block (§1.10 rule 18) and no other type
  *     may have one (rule 19).
+ *   - `type: pdf` MUST have a `pdf:` block (§1.11 rule 25) and no other type may
+ *     have one (rule 29). Unlike the other two it is never supplied here — see
+ *     the guard at the top of applyTypedBlocks.
  *
  * Enforced only at validation — on the way out — those rules produce write-once
  * nodes: a `type: source` node written without a block fails every subsequent
@@ -53,6 +56,28 @@ export interface TypedBlockArgs {
  */
 export function applyTypedBlocks(frontmatter: Frontmatter, args: TypedBlockArgs): void {
   const { type } = args;
+
+  // The `pdf` block is not caller-suppliable at all: it records the hash of a
+  // binary sidecar, and only `context_import_pdf` writes the binary. So a pdf
+  // node keeps the block it has, a node cannot BECOME a pdf here (there are no
+  // bytes to bind), and a pdf node cannot be re-typed away — dropping the
+  // block would orphan its sidecar and unbind the binary from the chain.
+  if (frontmatter.pdf !== undefined && type !== "pdf") {
+    throw new ContextNestError(
+      `This node is a PDF (type: pdf) and cannot be re-typed to "${type}": its pdf block binds a binary ` +
+        "sidecar. Delete it and create a new node instead.",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (type === "pdf") {
+    if (!frontmatter.pdf) {
+      throw new ContextNestError(
+        'A pdf block is required when type is "pdf" (§13 rule 25), and it is written only by ' +
+          "context_import_pdf, from the PDF's bytes. Import the file instead (`ctx import pdf <file>`).",
+        "VALIDATION_FAILED",
+      );
+    }
+  }
 
   if (args.source !== undefined && type !== "source") {
     throw new ContextNestError(
@@ -111,6 +136,13 @@ export function applyTypedBlocks(frontmatter: Frontmatter, args: TypedBlockArgs)
       ...pick("guard_rails", args.guard_rails ?? existing?.guard_rails),
     };
     delete frontmatter.source;
+    return;
+  }
+
+  if (type === "pdf") {
+    // Its block was settled at the top; a pdf node carries neither of the others.
+    delete frontmatter.source;
+    delete frontmatter.skill;
     return;
   }
 

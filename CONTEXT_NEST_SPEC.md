@@ -1,9 +1,10 @@
 # Context Nest Specification
 
-**Version**: 1.0
+**Version**: 1.1
 **Author**: ContextNest — PromptOwl, LLC
 **Compatible with**: Obsidian, PromptOwl, any markdown editor
 **File Extension**: `.md` (standard markdown)
+**License**: Apache-2.0 (see [LICENSE-SPEC](LICENSE-SPEC)) — this specification only; the reference implementation in this repository is AGPL-3.0
 
 ---
 
@@ -33,6 +34,7 @@ This specification is intended for developers building tools, integrations, or i
 14. [Extension Points](#14-extension-points)
 15. [Open Source Components](#15-open-source-components)
 16. [References](#16-references)
+17. [Changelog](#17-changelog)
 
 ---
 
@@ -54,9 +56,15 @@ my-context-nest/
 │   ├── api-design.md
 │   ├── brand-guidelines.md
 │   ├── onboarding-overview.md
+│   ├── q3-board-report.md       # A `type: pdf` node — extracted text (see §1.11)
+│   ├── q3-board-report.pdf      # …and its binary sidecar, bound by pdf.sha256
 │   └── .versions/               # Version history (see §6)
-│       └── api-design/
+│       ├── api-design/
+│       │   ├── v1.md
+│       │   └── history.yaml
+│       └── q3-board-report/
 │           ├── v1.md
+│           ├── <sha256-hex>.pdf # Prior binary, content-addressed (§1.11.3)
 │           └── history.yaml
 ├── sources/                     # Context source nodes (see §1.6, §1.9)
 │   ├── current-sprint-tickets.md
@@ -95,6 +103,8 @@ my-context-nest/
 ```
 
 In Obsidian mode, any `.md` file anywhere in the vault is treated as a context node. Hidden directories (`.`-prefixed) and `node_modules` are skipped.
+
+In either layout, only `.md` files are nodes. A `.pdf` beside a node is the binary sidecar of a `type: pdf` node (§1.11) and is never discovered as a node itself.
 
 Every document is standard Markdown with YAML frontmatter. Documents follow the GitHub Markdown spec (version 0.29-gfm). The raw content is never mutated — all editor features (context links, tags, mentions, task checkboxes) are rendered via decoration, not transformation. This ensures documents round-trip without loss between any Markdown-compatible tool (VS Code, Obsidian, any text editor).
 
@@ -195,6 +205,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `metadata` | object | `{}` | Extensible metadata (word_count, etc.) |
 | `source` | object | — | Source metadata block. Present only on `type: source` nodes (see §1.9) |
 | `skill` | object | — | Skill metadata block. Present only on `type: skill` nodes (see §1.10) |
+| `pdf` | object | — | PDF metadata block. Present only on `type: pdf` nodes (see §1.11) |
 
 ### 1.5.1 Status Lifecycle
 
@@ -239,8 +250,12 @@ Every document has a `type` that classifies its content:
 | `tool` | Tool documentation and usage guides | API integration guide, deployment workflow |
 | `reference` | External references, links, citations | Research papers, industry standards |
 | `skill` | Reusable agent procedures with triggers, inputs, and guard rails | PR review workflow, bug triage, RFC drafting |
+| `agent` | Agent definitions, as other tools in the ecosystem store them | An agent's role and configuration notes |
+| `artifact` | Generated outputs kept for reference | A produced report, a generated spec |
+| `table` | Tabular data | A pricing matrix, a feature comparison |
+| `pdf` | A PDF document: the body is the text extracted from it, and the PDF itself is kept beside the node as a binary sidecar | A contract, a board deck, a research paper |
 
-The `source` type is described in detail in §1.9. The `skill` type is described in detail in §1.10.
+The `source` type is described in detail in §1.9, the `skill` type in §1.10, and the `pdf` type in §1.11. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`.
 
 ### 1.7 Inline Syntax
 
@@ -668,6 +683,77 @@ Both `type: prompt` and `type: skill` contain instructions for agents, but they 
 | Output | Filled template | Task result |
 
 Use `prompt` for text generation templates. Use `skill` for multi-step procedures that may involve tool calls, have safety constraints, and produce structured output.
+
+### 1.11 PDF Nodes
+
+A PDF node is a markdown document that stands for a PDF. The PDF itself is the source of truth; the node's **body is the text extracted from it**, so the PDF participates in search, selectors, packs and context injection like any other node, while the original file travels with it. The binary is stored beside the node as a **sidecar** and bound to it by SHA-256 in the `pdf` frontmatter block.
+
+```
+nodes/
+├── q3-board-report.md     # type: pdf — frontmatter + extracted text
+└── q3-board-report.pdf    # the PDF, byte for byte
+```
+
+#### 1.11.1 PDF Frontmatter
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `pdf.file` | string | Yes | Vault-relative path of the sidecar, forward slashes. MUST be the node's own path with a `.pdf` extension: node `nodes/q3-board-report` → `nodes/q3-board-report.pdf` |
+| `pdf.sha256` | string | Yes | SHA-256 of the sidecar's exact bytes, `sha256:<64 lowercase hex>`. Binaries are hashed as stored, with none of the text normalization of §8.5 |
+| `pdf.bytes` | integer | Yes | Size of the sidecar in bytes |
+| `pdf.pages` | integer | Yes | Page count |
+| `pdf.text_layer` | boolean | Yes | `false` when no page yielded any text (a scanned PDF). The body is then empty |
+| `pdf.extractor` | string | Yes | The text extractor that produced the body, e.g. `unpdf` |
+| `pdf.extractor_version` | string | Yes | Importer and extractor version — the same bytes may extract differently under another extractor, so the record names the one that ran |
+| `pdf.extracted_at` | ISO 8601 | Yes | When the text was extracted |
+
+The `pdf` block MUST be present when `type` is `pdf`. It MUST NOT be present on other node types.
+
+```yaml
+---
+title: "Q3 Board Report"
+type: pdf
+tags: ["#finance", "#board"]
+status: published
+version: 2
+pdf:
+  file: nodes/q3-board-report.pdf
+  sha256: sha256:9f2c…
+  bytes: 482113
+  pages: 14
+  text_layer: true
+  extractor: unpdf
+  extractor_version: ctx-import-pdf/1 (unpdf 1.7.0)
+  extracted_at: "2026-09-22T14:02:11.000Z"
+checksum: sha256:1b7e…
+---
+
+<!-- page 1 -->
+
+Q3 Board Report
+…
+
+<!-- page 2 -->
+
+…
+```
+
+#### 1.11.2 Body
+
+The body is the extracted text as GitHub Flavored Markdown. Each page's text is preceded by a `<!-- page N -->` marker (1-based), so an agent can cite a page. Implementations SHOULD make extraction deterministic — the same bytes and extractor version always produce the same body — and SHOULD neutralize text in the PDF that would otherwise be read as markup (an `<!--` that would hide the rest of the body, a `contextnest://` link). A PDF with no text layer yields an empty body and `text_layer: false`; this specification does not define OCR.
+
+The body is derived data. Implementations SHOULD refuse direct edits to it: the way to change a PDF node's text is to import a new PDF, which re-extracts it. Frontmatter-only edits (title, tags, description, metadata, status) are permitted and version normally.
+
+#### 1.11.3 Versions and Integrity
+
+Because `pdf.sha256` is frontmatter, it is part of every version's content (§6) and therefore of its `content_hash` and `chain_hash` (§8). The binary is bound into the version chain without any change to the chain itself.
+
+- Importing a different PDF to an existing PDF node creates a new version. Before the new sidecar replaces the old one, the old binary MUST be preserved in the node's version history, content-addressed: `.versions/<doc>/<sha256-hex>.pdf`. Every version's `pdf.sha256` therefore names bytes that still exist — the live sidecar or an archived binary.
+- Importing the same bytes again is not a new version.
+- A PDF node MUST NOT be published unless its sidecar is present and hashes to `pdf.sha256`: publishing seals that hash into the chain, and a hash with no matching bytes behind it is an unbacked claim. The provenance guarantee therefore attaches to *published* versions: an unpublished draft's `pdf` block (for instance one arriving through a bulk import of files) is an assertion until publication checks it, and verification (§8.4) reports a draft whose sidecar is missing or different.
+- A sidecar replaced on disk without a new version no longer hashes to `pdf.sha256`; verification (§8.4) MUST report it (`sidecar_drift`), and a missing sidecar likewise (`sidecar_missing`).
+- Any operation that commits a version of a PDF node — including a rollback to an earlier version — MUST leave the live sidecar holding the binary that version records, archiving whatever it replaces. A commit whose binary no longer exists MUST be refused. Commits other than a PDF import or a rollback (a suggestion approval, a direct edit) MUST NOT change the body or the `pdf` block.
+- Deleting a PDF node MUST delete its sidecar along with its `.md` and version history.
 
 ---
 
@@ -1104,6 +1190,19 @@ Each edge in the `relationships` list carries a `type` field:
 
 The `reference` type is the default. The `depends_on` type is automatically generated when a source node declares dependencies. A single pair of nodes may have both edge types if the source body also contains an inline link to its dependency (which is the recommended pattern per §1.9.4).
 
+### 5.1.1 Graph Traversal (hops)
+
+A query MAY expand the documents a selector matches by walking `relationships` edges in either direction, up to a budget of `hops`. Each step costs hops according to the direction of travel:
+
+| Step | Cost |
+|------|------|
+| Along an edge with an explicit `priority` | the `priority` value |
+| Along `depends_on`, from a source to its dependency | 0 |
+| To a document listed in `hubs` | 0 |
+| Anything else, including backwards along `depends_on` and away from a hub | 1 |
+
+With `hops: 0` the result is therefore the selected documents plus what is reachable at zero cost: their source dependencies and any hub they link to. Walking away from a hub is never free, so selecting a hub does not pull in the documents that link to it. When a traversal reaches fewer documents than the implementation's minimum, it MAY retry with a larger budget; `hopsUsed` reports the deepest hop actually reached. Results are returned in a deterministic order: repeating the same query against the same index returns the same documents in the same order. A query that must return exactly the selector's matches, with no expansion, uses full mode (`--full`).
+
 ### 5.2 External Dependencies
 
 The `external_dependencies` section declares all external services required by the nest's source nodes. It is derived automatically from the `source.transport`, `source.server`, and `source.tools` fields across all published source nodes, cross-referenced with the `servers` registry in `.context/config.yaml` (§11.1).
@@ -1124,7 +1223,7 @@ For tools that support versioning, version history is stored in `.versions/{docu
 
 Version history uses a **keyframe + diff model** for efficiency:
 
-- **Keyframe versions** (version 1, and every `keyframe_interval` versions thereafter, default 10): stored as a full Markdown snapshot file (`v1.md`, `v10.md`, ...).
+- **Keyframe versions** (version 1, and every version *n* where (*n* − 1) is a multiple of `keyframe_interval`, default 10, i.e. versions 1, 11, 21, ...): stored as a full Markdown snapshot file (`v1.md`, `v11.md`, ...). An implementation also writes a keyframe whenever the previous version cannot be reconstructed, so a diff is never recorded against unknown content.
 - **All other versions**: stored as a unified diff from the previous version, recorded inline in `history.yaml`.
 - **Reconstruction**: apply diffs forward from the nearest keyframe to reach any target version.
 
@@ -1135,7 +1234,7 @@ my-context-nest/
 │   └── .versions/
 │       └── api-design/
 │           ├── v1.md              # Keyframe snapshot of version 1
-│           ├── v10.md             # Keyframe snapshot of version 10
+│           ├── v11.md             # Keyframe snapshot of version 11
 │           └── history.yaml       # Version metadata + inline diffs
 ├── sources/
 │   ├── current-sprint-tickets.md  # Current version (always latest)
@@ -1146,6 +1245,8 @@ my-context-nest/
 ```
 
 The live document is always the authoritative latest version; the `.versions/` folder is history only.
+
+For `type: pdf` nodes the folder also holds each prior binary, named by its SHA-256 (`<sha256-hex>.pdf`, see §1.11.3). These are content-addressed rather than numbered: a version finds its binary through the `pdf.sha256` in its own frontmatter.
 
 Implementations MUST be able to reconstruct any version by applying diffs forward from the nearest keyframe. Keyframe files are self-contained and safe to read without the diff chain.
 
@@ -1208,7 +1309,7 @@ versions:
     note: "WIP rate limiting section"
     content_hash: sha256:c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
     chain_hash:   sha256:2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6
-  - version: 10
+  - version: 11
     keyframe: true
     edited_by: jane.smith@example.com
     edited_at: 2024-03-01T10:00:00Z
@@ -1334,6 +1435,8 @@ For each version entry in `history.yaml`:
 
 Format: `sha256:<64-character lowercase hex>`.
 
+Before hashing, content is normalized: a leading UTF-8 byte-order mark is removed and CRLF and lone CR line endings become LF. This keeps hashes stable when a sync tool or editor rewrites line endings, and every implementation MUST apply the same normalization to produce matching hashes. The normalization applies to `content_hash` inputs and to the frontmatter `checksum`; `chain_hash` and `checkpoint_hash` inputs are built from already-normalized values.
+
 #### chain_hash
 
 ```
@@ -1408,6 +1511,7 @@ contextnest:genesis:v1
 - Implementations MUST compute and append `checkpoint_hash` when writing new checkpoint entries.
 - Implementations MUST populate `document_chain_hashes` by reading the `chain_hash` of each document's recorded version from its `history.yaml` at write time.
 - A verifier MUST confirm that each value in `document_chain_hashes` matches the `chain_hash` stored in the corresponding document's `history.yaml` at the recorded version. A mismatch indicates that a document's history was rewritten after the checkpoint was created, and MUST be reported as `cross_chain_mismatch`.
+- **Exception: delete and recreate.** When a document is deleted and a new document is later created at the same path, its new history restarts at version 1 and no longer matches what older checkpoints sealed. A verifier MUST NOT report `cross_chain_mismatch` for an entry whose `edited_at` is later than the checkpoint's `at`, **provided** the entry's own `chain_hash` recomputes correctly from its fields and the preceding entry. An entry that is later than the checkpoint but does not recompute is a tamper (for example, a rewritten hash with a forward-dated timestamp) and MUST be reported.
 - Implementations MAY verify the checkpoint chain on read; failures MUST be surfaced to the caller.
 
 ### 8.4 Verification
@@ -1419,7 +1523,8 @@ Implementations MAY expose a verification command or API that:
 3. Re-computes the `chain_hash` sequence from the genesis sentinel and compares each value to the stored entry.
 4. Reads `.versions/context_history.yaml` and for each checkpoint entry, confirms that each value in `document_chain_hashes` matches the `chain_hash` of the corresponding version in the document's `history.yaml`.
 5. Re-computes the `checkpoint_hash` sequence (incorporating `canonical_chain_hashes`) and compares each value to the stored entry.
-6. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, or `checkpoint_hash_mismatch`).
+6. For every `type: pdf` node, re-hashes the sidecar at `pdf.file` and compares it to `pdf.sha256`, and re-hashes each archived binary under `.versions/<doc>/` against the hash in its file name (§1.11.3).
+7. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, `checkpoint_hash_mismatch`, `sidecar_drift`, or `sidecar_missing`).
 
 Verification is idempotent and read-only. A clean verification result produces no file changes.
 
@@ -1430,7 +1535,7 @@ All hashes in this section use SHA-256 (FIPS 180-4).
 | Property | Value |
 |----------|-------|
 | Algorithm | SHA-256 |
-| Input encoding | UTF-8 |
+| Input encoding | UTF-8 (binary sidecars, §1.11: the raw bytes) |
 | Output format | `sha256:<64-character lowercase hex>` |
 
 The `sha256:` prefix identifies the algorithm and reserves space for future algorithm agility. When a future version of this specification adds support for additional algorithms, the prefix will change (e.g., `sha3-256:`). Verifiers MUST reject unknown prefixes rather than silently passing verification.
@@ -1740,7 +1845,7 @@ When imported to PromptOwl:
 
 ### 12.3 Git Compatibility
 
-- All files are plain text, diff-friendly
+- All files are plain text, diff-friendly — with one exception: the binary sidecar of a `type: pdf` node (§1.11), and the prior binaries archived under `.versions/`. Binaries are permitted ONLY as declared sidecars of `pdf` nodes; the node's extracted-text body is what diffs between versions. Mark them binary for git (`*.pdf binary` in `.gitattributes`) so line-ending conversion never alters bytes that are bound by hash
 - `.context/` folder should be committed
 - `.versions/` folder optional (PromptOwl can reconstruct from git history)
 - CONTEXT.md should be committed (vault identity)
@@ -1758,8 +1863,8 @@ A valid Context Nest document:
 3. Body is valid markdown (GitHub Markdown spec 0.29-gfm)
 4. Context links use valid `contextnest://` URIs
 5. Tags match the allowed pattern: `^#?[a-zA-Z][a-zA-Z0-9_-]*$`
-6. If `type` is present, it MUST be one of the 8 defined node types
-7. If `status` is present, it MUST be one of: `draft`, `published`
+6. If `type` is present, it MUST be one of the 13 defined node types (§1.6)
+7. If `status` is present, it MUST be one of: `draft`, `pending_review`, `approved`, `published`, `rejected` (after alias normalization, §1.5.1)
 8. If `checksum` is present, it MUST match the pattern `sha256:<64 hex chars>`
 
 ### 13.1 Source Node Validation
@@ -1791,6 +1896,18 @@ In addition to the base validation rules, `type: skill` nodes MUST satisfy:
 23. If a `type: source` node declares `depends_on` referencing source X, and the node's body contains an inline `contextnest://` link to X, implementations SHOULD NOT flag this as redundant — it is the recommended pattern (§1.9.4)
 24. If a `type: source` node's body contains inline `contextnest://` links to other source nodes that are NOT listed in `depends_on`, implementations SHOULD emit a warning suggesting the dependency be declared in frontmatter
 
+### 13.4 PDF Node Validation
+
+In addition to the base validation rules, `type: pdf` nodes MUST satisfy (rules 25–29):
+
+25. The `pdf` block MUST be present in frontmatter
+26. `pdf.file` MUST be the node's own path with a `.pdf` extension (`<node path>.pdf`), vault-relative, with forward slashes and no `..` segments
+27. `pdf.sha256` MUST match the pattern `sha256:<64 hex chars>`
+28. `pdf.bytes` and `pdf.pages` MUST be non-negative integers, `pdf.text_layer` MUST be a boolean, and `pdf.extractor`, `pdf.extractor_version` and `pdf.extracted_at` MUST be non-empty strings
+29. The `pdf` block MUST NOT be present on nodes where `type` is not `pdf`
+
+That the sidecar's bytes hash to `pdf.sha256` is an integrity property, checked by verification (§8.4), not a validation rule: validation reads the document alone.
+
 **Suggested MIME type**: `text/markdown; variant=context-nest`
 
 ---
@@ -1809,6 +1926,7 @@ Tools MAY extend the spec with:
 - Additional relationship edge types beyond `reference` and `depends_on`
 - Additional trace types beyond the three defined in §9.3
 - Additional entries in the `servers` registry in `.context/config.yaml`
+- Additional fields within the `pdf` block (prefixed with tool name: `pdf.promptowl_ocr: true`)
 
 ---
 
@@ -1818,7 +1936,7 @@ The following components are intended to be released as open source:
 
 | Component | License | Description |
 |-----------|---------|-------------|
-| Specification (this document) | CC-BY-4.0 | Open protocol specification |
+| Specification (this document) | Apache-2.0 | Open protocol specification |
 | Context Engine (`@promptowl/context-engine`) | AGPL-3.0 | Reference implementation of selectors, versioning, storage, and source node resolution |
 | MCP Server (`@contextnest/mcp-server`) | AGPL-3.0 | Model Context Protocol server for vault access, including source dependency resolution and hydration relay |
 | CLI (`contextnest-cli`) | AGPL-3.0 | Command-line tools for vault operations |
@@ -1850,4 +1968,19 @@ The following components remain proprietary:
 
 ---
 
-*ContextNest is a product of PromptOwl, LLC This specification covers components intended for open release under CC-BY-4.0. Proprietary components are identified in §15.*
+## 17. Changelog
+
+### 1.1 — 2026-09
+
+- **New node type `pdf`** (§1.11): a PDF as a first-class document. The body is the extracted text with `<!-- page N -->` markers; the PDF is a binary sidecar beside the node (`<node path>.pdf`), bound by the new `pdf` frontmatter block (`file`, `sha256`, `bytes`, `pages`, `text_layer`, `extractor`, `extractor_version`, `extracted_at`). Prior binaries are archived content-addressed under `.versions/<doc>/`. Validation rules 25–29 (§13.4); verification re-hashes sidecars and reports `sidecar_drift` / `sidecar_missing` (§8.4).
+- §12.3: binaries are permitted in a vault only as declared sidecars of `pdf` nodes.
+- §1.6 lists `agent`, `artifact` and `table`, which conforming implementations already accept, and `pdf`.
+- §13 rule 6 corrected to the full type list (it said "8 types"); rule 7 corrected to the five canonical statuses of §1.5.1 (it listed only `draft` and `published`).
+
+### 1.0
+
+- Initial published specification.
+
+---
+
+*ContextNest is a product of PromptOwl, LLC This specification is released under Apache-2.0. Other open components are licensed as listed in §15; proprietary components are identified there too.*

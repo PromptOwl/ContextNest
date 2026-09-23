@@ -32,16 +32,16 @@ function markdownToHtml(md: string): string {
   function flushTable() {
     if (!inTable) return;
     inTable = false;
-    const rows = tableRows.filter((r) => !r.match(/^\s*\|[\s:-]+\|\s*$/)); // skip separator
+    const rows = tableRows.filter((r) => !r.match(/^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/)); // skip separator
     if (rows.length === 0) return;
     let t = "<table>\n<thead>\n<tr>";
-    const headerCells = rows[0].split("|").filter((c) => c.trim() !== "");
-    for (const c of headerCells) t += `<th>${c.trim()}</th>`;
+    const headerCells = splitCells(rows[0]);
+    for (const c of headerCells) t += `<th>${inlineMarkdown(c)}</th>`;
     t += "</tr>\n</thead>\n<tbody>\n";
     for (let i = 1; i < rows.length; i++) {
-      const cells = rows[i].split("|").filter((c) => c.trim() !== "");
+      const cells = splitCells(rows[i]);
       t += "<tr>";
-      for (const c of cells) t += `<td>${c.trim()}</td>`;
+      for (const c of cells) t += `<td>${inlineMarkdown(c)}</td>`;
       t += "</tr>\n";
     }
     t += "</tbody>\n</table>";
@@ -120,7 +120,13 @@ function markdownToHtml(md: string): string {
       continue;
     }
 
-    // Paragraph
+    // Paragraph — a trailing Obsidian block id (`… ^p_4_2`, as the JATS
+    // importer writes) becomes the element id so a citation can deep-link it.
+    const anchor = line.match(/^(.*?)\s+\^([A-Za-z0-9_.:-]+)$/);
+    if (anchor) {
+      out.push(`<p id="${esc(anchor[2])}">${inlineMarkdown(anchor[1])} <a class="anchor" href="#${esc(anchor[2])}">¶</a></p>`);
+      continue;
+    }
     out.push(`<p>${inlineMarkdown(line)}</p>`);
   }
 
@@ -133,15 +139,73 @@ function markdownToHtml(md: string): string {
 /** Convert inline markdown (bold, italic, code, links) */
 function inlineMarkdown(text: string): string {
   let s = esc(text);
-  // Inline code
-  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  // Inline code is lifted out first so no later substitution (bold, italic,
+  // links, sup/sub, wikilinks) can rewrite a literal `^`, `*` or `[[` inside it.
+  const code: string[] = [];
+  s = s.replace(/`([^`]+)`/g, (_m, c: string) => {
+    code.push(`<code>${c}</code>`);
+    return `\u0000${code.length - 1}\u0000`;
+  });
   // Bold
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   // Italic
   s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  // Links
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-  return s;
+  // Links — only web/mail schemes and in-page anchors become <a>. Vault
+  // bodies can come from imported, untrusted files and this page auto-opens
+  // in a browser, so a `javascript:` or `data:` URL is rendered as text.
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m: string, text: string, url: string) =>
+    safeHref(url) ? `<a href="${url.trim()}">${text}</a>` : `${text} (${url.trim()})`,
+  );
+  // Wikilinks: [[nodes/x]] and [[nodes/x|label]] — the vault's own edges. A
+  // target is a vault-relative id; one carrying a scheme is not a wikilink.
+  s = s.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m: string, target: string, label?: string) => {
+    const t = target.trim();
+    const shown = label?.trim() || t;
+    return isVaultRelative(t) ? `<a class="wikilink" href="${t}">${shown}</a>` : shown;
+  });
+  // Pandoc-style superscript / subscript: 10^9^, H~2~O.
+  s = s.replace(/\^([^\s^]+)\^/g, "<sup>$1</sup>");
+  s = s.replace(/~([^\s~]+)~/g, "<sub>$1</sub>");
+  return s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => code[Number(i)]);
+}
+
+/** Whitespace, quotes, and C0/C1 controls — browsers strip leading controls before reading a scheme. */
+const UNSAFE_URL_CHAR = /[\s\u0000-\u001f\u007f-\u009f"'<>]/;
+
+/**
+ * A link a vault page may follow: `http(s)`, `ftp`, `mailto`, the vault's own
+ * `contextnest://` scheme, an in-page `#anchor`, or a relative path (no scheme,
+ * no protocol-relative `//`). `javascript:`, `data:` and friends are not links.
+ */
+function safeHref(url: string): boolean {
+  const u = url.trim();
+  if (!u || UNSAFE_URL_CHAR.test(u)) return false;
+  if (/^(?:https?:|ftp:|mailto:|contextnest:)/i.test(u)) return true;
+  return !/^[a-z][a-z0-9+.-]*:/i.test(u) && !u.startsWith("//");
+}
+
+/** A wikilink target: no scheme, no protocol-relative `//`, no control/quote characters. */
+function isVaultRelative(target: string): boolean {
+  return target.length > 0 && !/^[a-z][a-z0-9+.-]*:/i.test(target) && !target.startsWith("//") && !UNSAFE_URL_CHAR.test(target);
+}
+
+/** Split a GFM table row on pipes that are not escaped as `\|` (and unescape `\\`). */
+function splitCells(row: string): string[] {
+  const cells: string[] = [];
+  let cur = "";
+  const trimmed = row.trim().replace(/^\|/, "").replace(/\|$/, "");
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === "\\" && (trimmed[i + 1] === "|" || trimmed[i + 1] === "\\")) {
+      cur += trimmed[i + 1];
+      i++;
+    } else if (ch === "|") {
+      cells.push(cur.trim());
+      cur = "";
+    } else cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
 }
 
 /** Render frontmatter as an HTML metadata panel */
@@ -339,6 +403,12 @@ body {
   color: inherit;
   font-size: 0.85rem;
 }
+.content p .anchor {
+  opacity: 0.35;
+  text-decoration: none;
+  font-size: 0.8em;
+}
+.content p:hover .anchor { opacity: 1; }
 .content blockquote {
   border-left: 3px solid var(--secondary);
   padding: 0.5rem 1rem;

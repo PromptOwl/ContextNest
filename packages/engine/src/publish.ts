@@ -16,6 +16,7 @@ import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
+import { assertPdfSidecarIntact } from "./pdf-nodes.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -52,6 +53,8 @@ export async function publishDocument(
   if (isRejected(node)) {
     throw new RejectedDocumentError(docId);
   }
+  // A pdf node seals pdf.sha256 into the chain; the bytes must be there.
+  await assertPdfSidecarIntact(storage, docId, node);
 
   const versionManager = new VersionManager(storage);
 
@@ -213,6 +216,7 @@ export async function publishDocuments(
     try {
       let node = await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
+      await assertPdfSidecarIntact(storage, docId, node);
 
       // Importer metadata rides along with the publish write below rather than
       // costing its own pass over the vault. Applied before the version bump so

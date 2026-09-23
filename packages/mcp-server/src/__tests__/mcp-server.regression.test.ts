@@ -3,7 +3,7 @@
  *
  * Unlike mcp-server.test.ts (which re-implements handler logic against the engine
  * layer), this suite spawns the *real built server* (dist/index.js) and drives it
- * through a genuine MCP SDK Client over stdio. It exercises every one of the 19
+ * through a genuine MCP SDK Client over stdio. It exercises every one of the 20
  * registered tools across their meaningful use cases and asserts both the tool
  * responses AND the internal vault files the server writes to disk
  * (context.yaml, per-folder INDEX.md, .versions/.../history.yaml, checkpoint
@@ -47,6 +47,7 @@ const EXPECTED_TOOLS = [
   "context_init",
   "context_packs",
   "context_import",
+  "context_import_pdf",
   "context_nests",
   "context_skill",
   "context_skill_install",
@@ -204,6 +205,7 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
     ["context_query", ["query", "hops", "full", "include_drafts"]],
     ["context_resolve", ["selector", "max_tokens", "hops"]],
     ["context_import", ["documents", "ids"]],
+    ["context_import_pdf", ["bytes_base64", "id", "title", "folder", "tags", "publish"]],
   ])("%s advertises its declared inputs", async (name, expected) => {
     const { tools } = await client.listTools();
     const tool = tools.find((t) => t.name === name);
@@ -308,7 +310,7 @@ describe("[regression] MCP server e2e — read tools", () => {
   it("document_format describes node types and status values", async () => {
     const { json } = await callJson(client, "document_format");
     expect(json.frontmatter_fields.type.values).toEqual(
-      expect.arrayContaining(["document", "skill", "source", "snippet", "glossary", "persona", "prompt", "tool", "reference"]),
+      expect.arrayContaining(["document", "skill", "source", "snippet", "glossary", "persona", "prompt", "tool", "reference", "pdf"]),
     );
     expect(json.frontmatter_fields.status.values).toEqual(
       expect.arrayContaining(["draft", "pending_review", "approved", "published", "rejected"]),
@@ -1011,5 +1013,44 @@ describe("[regression] MCP server e2e — misnamed parameters cannot silently dr
 
     const { json } = await callJson(client, "read_document", { uri: "nodes/good-source" });
     expect(json.frontmatter.source).toEqual(source);
+  });
+});
+
+// ─── context_import_pdf (CU-wdqcq02pmg) ──────────────────────────────────────
+
+describe("[regression] MCP server e2e — context_import_pdf", () => {
+  let vault: string;
+  let client: Client;
+  const PDF = fileURLToPath(new URL("../../../../fixtures/pdf/report.pdf", import.meta.url));
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("imports a PDF over the wire: node + sidecar on disk, verify clean", async () => {
+    const bytes = await readFile(PDF);
+    const { json, isError } = await callJson(client, "context_import_pdf", {
+      bytes_base64: bytes.toString("base64"),
+      folder: "reports",
+    });
+    expect(isError).toBe(false);
+    expect(json.created).toBe(true);
+    expect(json.id).toBe("nodes/reports/quarterly-report");
+    expect(json.text_layer).toBe(true);
+    expect(json.pdf.pages).toBe(2);
+    expect(await readFile(join(vault, json.pdf.file))).toEqual(bytes);
+
+    const got = await callJson(client, "context_get", { id: json.id });
+    expect(got.json.frontmatter.type).toBe("pdf");
+    expect(got.json.body).toContain("Revenue grew 12 percent.");
+
+    const verify = await callJson(client, "context_verify", {});
+    expect(verify.json.valid).toBe(true);
   });
 });
