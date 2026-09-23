@@ -232,4 +232,26 @@ describe("GraphQueryEngine — --hops follows wikilink edges", () => {
     expect(ids).toContain("nodes/b");
     expect(ids).not.toContain("nodes/lonely");
   });
+
+  it("NestBench §6.4 control: a pinned contextnest:// link is reached at the same hop as a [[wikilink]]", async () => {
+    await addDoc(
+      "nodes/source",
+      "Source",
+      "Wiki [[Target A]] and URI [b](contextnest://nodes/target-b@1#top).",
+    );
+    await addDoc("nodes/target-a", "Target A", "# A");
+    await addDoc("nodes/target-b", "Target B", "# B");
+    await storage.regenerateIndex();
+
+    // hops:0 is not asserted here: in a 3-node vault both targets are hubs and
+    // edges TO a hub are free (graph-traverser.ts), which is orthogonal to the
+    // link form. Before the fix target-b was missing at EVERY hop count.
+    const engine = new GraphQueryEngine(storage);
+    for (const hops of [1, 2, 3]) {
+      const r = await engine.query("nodes/source", { hops });
+      expect(new Set(r.documents.map((d) => d.id))).toEqual(
+        new Set(["nodes/source", "nodes/target-a", "nodes/target-b"]),
+      );
+    }
+  });
 });

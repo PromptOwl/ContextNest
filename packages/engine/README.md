@@ -110,7 +110,8 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `filterDocuments` | The one type / status / tag filter, for surfaces that filter a list they already hold |
 | `setVaultDescription` | Set or clear a registry alias's description |
 | `parseStewards` / `serializeStewards` | Canonical `stewards.yaml` marshalling (format only) |
-| `traverseWikiGraph` | `[[wikilink]]` seed resolution and hop traversal |
+| `traverseWikiGraph` | Body-link seed resolution and hop traversal — follows `[[wikilinks]]` and `contextnest://` links (pinned `@N` / `#anchor` forms included) alike |
+| `extractLinkedIds` | Every node a body links to, both link forms, resolved to ids |
 
 Errors all carry a `code`: `InvalidSelectorError`, `CorruptHistoryError`,
 `VersionArtifactExistsError`, and the rest are exported from the package root.

@@ -4,49 +4,18 @@
  */
 
 import type { ContextNode, RelationshipEdge } from "./types.js";
-import { codeMask, stripInlineCode } from "./markdown-mask.js";
+import { codeMask } from "./markdown-mask.js";
 import {
   buildWikiTitleIndex,
+  contextLinkTarget,
+  extractContextLinks,
   extractWikiLinks,
   resolveWikiTarget,
 } from "./wiki-graph.js";
 
-// Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
-// Reference definitions are deliberately not matched — they were not links
-// in the AST either.
-//
-// Only ONE `\s*` before the destination: two of them separated by an optional
-// `<` would leave the split between them ambiguous and backtrack quadratically
-// over a long run of spaces (CodeQL js/polynomial-redos). Markdown does not
-// allow whitespace between `<` and the destination anyway.
-//
-// The link text excludes `[` as well as `]` and is length-bounded, for the same
-// reason the rule-4 check in parser.ts is bounded: otherwise a line of many `[`
-// with no closing bracket rescans to the end from every one of them. Unescaped
-// `[` is not valid inline link text, so nothing real is lost.
-const CONTEXT_LINK =
-  /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
-
-/** Extract all contextnest:// link targets from a markdown body */
-export function extractContextLinks(body: string): string[] {
-  // Split on CRLF as well as LF: `.` does not match `\r` in a JS regex, so a
-  // stray carriage return would defeat every end-anchored pattern below.
-  const lines = body.split(/\r?\n/);
-  const mask = codeMask(lines);
-  const links: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) continue;
-    const line = stripInlineCode(lines[i]);
-    CONTEXT_LINK.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = CONTEXT_LINK.exec(line)) !== null) {
-      links.push(match[1] ?? match[2]);
-    }
-  }
-
-  return links;
-}
+// `extractContextLinks` lives in wiki-graph.ts (the link graph follows these
+// links too); re-exported here, its long-standing home.
+export { extractContextLinks };
 
 /** Extract all #tag references from a markdown body */
 export function extractTags(body: string): string[] {
@@ -124,23 +93,10 @@ export function buildRelationshipsWithStats(
     // Extract reference edges from inline links
     const links = extractContextLinks(doc.body);
     for (const link of links) {
-      // Extract path from URI, stripping anchor and checkpoint
-      let target = link.replace("contextnest://", "");
-      // Remove anchor
-      const anchorIdx = target.indexOf("#");
-      if (anchorIdx !== -1) target = target.slice(0, anchorIdx);
-      // Remove checkpoint pin
-      const pinIdx = target.indexOf("@");
-      if (pinIdx !== -1) target = target.slice(0, pinIdx);
-      // Remove trailing slash
-      if (target.endsWith("/")) target = target.slice(0, -1);
-
-      // If it looks like a cross-namespace link (contains authority), keep full URI
-      const to = target.includes("://")
-        ? link
-        : target;
-
-      add({ from: doc.id, to, type: "reference" });
+      // Path with anchor, checkpoint pin and trailing slash stripped; a
+      // cross-namespace link keeps its full URI. Same helper the body-link
+      // traversal in wiki-graph.ts uses, so both agree on the target.
+      add({ from: doc.id, to: contextLinkTarget(link), type: "reference" });
     }
 
     // Extract reference edges from [[wikilinks]]
