@@ -51,7 +51,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove } = await import("../remote.js");
+const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, planVaultFix } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -212,5 +212,33 @@ describe("remoteUpdate / remoteMove", () => {
     expect(calls).toEqual([{ op: "context_move", input: { id: "nodes/a", folder: "archive" } }]);
     expect(plain()).toContain("nodes/a → nodes/archive/a");
     expect(closed).toBe(opened);
+  });
+});
+
+describe("planVaultFix", () => {
+  const nests = [
+    { id: "a1", name: "Strategy" },
+    { id: "b2", name: "Partner: Chameleon Collective!" },
+    { id: "c3", name: "Strategy" },
+    { id: "d4", name: "???" },
+  ];
+
+  it("derives per-nest URLs from the registered /mcp URL and slugs unique aliases", () => {
+    const adds = planVaultFix("https://cn.example.com/base/mcp", nests, [{ alias: "strategy", url: "https://x/other" }]);
+    expect(adds?.map((a) => [a.alias, a.url])).toEqual([
+      ["strategy-2", "https://cn.example.com/base/nests/a1/mcp"],
+      ["partner-chameleon-collective", "https://cn.example.com/base/nests/b2/mcp"],
+      ["strategy-3", "https://cn.example.com/base/nests/c3/mcp"],
+      ["nest-d4", "https://cn.example.com/base/nests/d4/mcp"],
+    ]);
+  });
+
+  it("skips nests that are already registered by URL", () => {
+    const adds = planVaultFix("https://s/mcp/", nests.slice(0, 2), [{ alias: "mine", url: "https://s/nests/a1/mcp" }]);
+    expect(adds?.map((a) => a.alias)).toEqual(["partner-chameleon-collective"]);
+  });
+
+  it("returns null when the URL is not a …/mcp endpoint", () => {
+    expect(planVaultFix("https://s/api", nests, [])).toBeNull();
   });
 });
