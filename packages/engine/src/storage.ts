@@ -821,16 +821,24 @@ export class NestStorage {
    * Parallelizes reads for performance. Missing documents are silently skipped.
    */
   async readDocuments(ids: string[]): Promise<Map<string, ContextNode>> {
+    // Reads run in parallel, but the map is filled afterwards in `ids` order:
+    // inserting as each read settles made result order depend on filesystem
+    // timing, so the same query could return the same set in a different order.
+    const docs = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          return await this.readDocument(id);
+        } catch {
+          // Skip missing documents (may have been deleted since index was built)
+          return null;
+        }
+      }),
+    );
     const results = new Map<string, ContextNode>();
-    const reads = ids.map(async (id) => {
-      try {
-        const doc = await this.readDocument(id);
-        results.set(id, doc);
-      } catch {
-        // Skip missing documents (may have been deleted since index was built)
-      }
+    ids.forEach((id, i) => {
+      const doc = docs[i];
+      if (doc) results.set(id, doc);
     });
-    await Promise.all(reads);
     return results;
   }
 

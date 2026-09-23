@@ -1154,6 +1154,39 @@ describe("[regression] ctx push", () => {
     }
   });
 
+  it("includes the folder for a folder-nested document, so a catalog-conformant nest can keep it out of the root", async () => {
+    // "cli flattens every single write" (Misha, #engineering, 2026-09-18):
+    // a document that lives under nodes/<folder>/<slug> locally must not be
+    // pushed as bare title+content — the receiving nest has no way to place
+    // it back under its folder without the folder segment riding along.
+    runCtx(tmp, ["add", "nodes/subteam/nested-doc", "--title", "Nested Doc"]);
+    const server = await startMockEngine((body) => ({
+      published: body.documents.length,
+      context_md_updated: Boolean(body.context_md),
+      node_ids: body.documents.map((_: unknown, i: number) => `node-${i}`),
+    }));
+    try {
+      await runCtxAsync(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+
+      const body = server.lastBody() as {
+        documents: Array<{ title: string; folder?: string }>;
+      };
+      const nested = body.documents.find((d) => d.title === "Nested Doc");
+      expect(nested?.folder).toBe("subteam");
+      // A root-level document must not gain a spurious folder.
+      const root = body.documents.find((d) => d.title === "Pushable");
+      expect(root?.folder).toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
   it("exits non-zero when a required connection option is missing", () => {
     const res = runCtxResult(tmp, ["push", "--nest", "n", "--key", "k"]);
     expect(res.status).not.toBe(0);
