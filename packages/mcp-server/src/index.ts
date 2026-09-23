@@ -490,7 +490,7 @@ tool(
           required: false,
           type: "string",
           default: "document",
-          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -501,6 +501,10 @@ tool(
             tool: "Tool documentation",
             reference: "External references",
             skill: "Reusable agent skill with trigger, inputs, steps, and guard rails (requires skill block)",
+            agent: "Agent definition, as stored by other tools (no type-specific rules)",
+            artifact: "Generated output, as stored by other tools (no type-specific rules)",
+            table: "Tabular data, as stored by other tools (no type-specific rules)",
+            pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
           },
         },
         tags: {
@@ -548,6 +552,19 @@ tool(
             guard_rails: { required: false, type: "string[]", description: "Constraints or safety rules for execution" },
           },
         },
+        pdf: {
+          required: "Only when type is 'pdf'; must NOT be present on other types. Written by context_import_pdf — never by hand",
+          fields: {
+            file: { required: true, type: "string", description: "Vault-relative sidecar path — always <node id>.pdf, beside the .md" },
+            sha256: { required: true, type: "string", format: "sha256:<64 lowercase hex chars> of the sidecar bytes" },
+            bytes: { required: true, type: "integer" },
+            pages: { required: true, type: "integer" },
+            text_layer: { required: true, type: "boolean", description: "false for a scanned PDF — the body is then empty" },
+            extractor: { required: true, type: "string" },
+            extractor_version: { required: true, type: "string" },
+            extracted_at: { required: true, type: "string", format: "ISO 8601" },
+          },
+        },
       },
       validation_rules: [
         { rule: 1, description: "Valid YAML frontmatter between --- delimiters" },
@@ -555,7 +572,7 @@ tool(
         { rule: 3, description: "Body must be valid GitHub Flavored Markdown (spec 0.29-gfm)" },
         { rule: 4, description: "Context links must use valid contextnest:// URIs" },
         { rule: 5, description: "Tags must match pattern: ^#?[a-zA-Z][a-zA-Z0-9_-]*$" },
-        { rule: 6, description: "type must be one of the 8 defined node types" },
+        { rule: 6, description: `type must be one of the ${NODE_TYPES.length} defined node types: ${NODE_TYPES.join(", ")}` },
         { rule: 7, description: "status must be one of: draft, pending_review, approved, published, rejected (aliases normalized; unknown → draft)" },
         { rule: 8, description: "checksum format: sha256:<64 lowercase hex chars>" },
         { rule: 9, description: "source block MUST be present when type is 'source'" },
@@ -565,6 +582,11 @@ tool(
         { rule: 13, description: "source.depends_on entries must be valid contextnest:// URIs" },
         { rule: 16, description: "source.cache_ttl must be a positive integer if present" },
         { rule: 17, description: "source block must NOT be present on non-source types" },
+        { rule: 25, description: "pdf block MUST be present when type is 'pdf'" },
+        { rule: 26, description: "pdf.file must be the node's own sidecar: <node id>.pdf" },
+        { rule: 27, description: "pdf.sha256 format: sha256:<64 lowercase hex chars>" },
+        { rule: 28, description: "pdf.bytes and pdf.pages are non-negative integers; pdf.text_layer is a boolean" },
+        { rule: 29, description: "pdf block must NOT be present on non-pdf types" },
       ],
       uri_scheme: {
         format: "contextnest://<path>",
@@ -1106,7 +1128,13 @@ tool(
       }
       doc.frontmatter.updated_at = new Date().toISOString();
 
-      // Update body if provided
+      // Update body if provided. A pdf node's body is its extracted text —
+      // same refusal as context_update: change the PDF, not the text.
+      if (resolvedBody.body !== undefined && doc.frontmatter.type === "pdf") {
+        return validationError(
+          `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. Use context_import_pdf with this id to import a new version.`,
+        );
+      }
       if (resolvedBody.body !== undefined) {
         doc.body = `\n${resolvedBody.body}\n`;
       }

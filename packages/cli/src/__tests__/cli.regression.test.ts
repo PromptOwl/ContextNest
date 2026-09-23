@@ -1643,6 +1643,7 @@ describe("[regression] file safety — command coverage", () => {
     "init", "add", "update", "delete", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
+    "import pdf",
     "import jats", "import pubmed", "enrich pubtator",
   ];
 
@@ -1887,6 +1888,60 @@ describe("[regression] caller attribution — --agent / --session / --client", (
       "sess-cli-1",
     ]);
     expect(out).toBeDefined();
+  });
+});
+
+// ─── import pdf (CU-wdqcq02pmg) ──────────────────────────────────────────────
+
+describe("[regression] ctx import pdf", () => {
+  const PDF_FIXTURES = join(here, "..", "..", "..", "..", "fixtures", "pdf");
+  const fixture = (name: string) => join(PDF_FIXTURES, name);
+
+  it("imports a text PDF as a type: pdf node with its sidecar, and verify passes", () => {
+    initVault(tmp);
+    const out = runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--folder", "reports", "--tags", "finance"]);
+    expect(out).toMatch(/nodes\/reports\/quarterly-report/);
+    const md = readFileSync(join(tmp, "nodes", "reports", "quarterly-report.md"), "utf-8");
+    expect(md).toMatch(/^type: pdf$/m);
+    expect(md).toMatch(/file: nodes\/reports\/quarterly-report\.pdf/);
+    expect(md).toContain("Revenue grew 12 percent.");
+    expect(md).toContain("#finance");
+    expect(readFileSync(join(tmp, "nodes", "reports", "quarterly-report.pdf"))).toEqual(
+      readFileSync(fixture("report.pdf")),
+    );
+    const verify = runCtxResult(tmp, ["verify"]);
+    expect(verify.status).toBe(0);
+  });
+
+  it("--id versions an existing pdf node; ctx verify catches a swapped sidecar", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--id", "nodes/q3"]);
+    const out = runCtx(tmp, ["import", "pdf", fixture("report-v2.pdf"), "--id", "nodes/q3"]);
+    expect(out).toMatch(/v2/);
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toContain("Revenue grew 14 percent.");
+
+    writeFileSync(join(tmp, "nodes", "q3.pdf"), readFileSync(fixture("scanned.pdf")));
+    const verify = runCtxResult(tmp, ["verify", "--json"]);
+    expect(verify.status).toBe(1);
+    const report = JSON.parse(verify.stdout);
+    expect(report.errors.map((e: { type: string }) => e.type)).toContain("sidecar_drift");
+  });
+
+  it("imports several files in one call and reports a scanned PDF's missing text layer", () => {
+    initVault(tmp);
+    const out = runCtx(tmp, ["import", "pdf", fixture("report.pdf"), fixture("scanned.pdf")]);
+    expect(out).toMatch(/quarterly-report/);
+    expect(out).toMatch(/scanned/);
+    expect(out).toMatch(/no text layer/i);
+    expect(existsSync(join(tmp, "nodes", "scanned.pdf"))).toBe(true);
+  });
+
+  it("fails cleanly on a file that is not a PDF", () => {
+    initVault(tmp);
+    writeFileSync(join(tmp, "notes.txt"), "plain text");
+    const res = runCtxResult(tmp, ["import", "pdf", join(tmp, "notes.txt")]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr + res.stdout).toMatch(/%PDF-/);
   });
 });
 

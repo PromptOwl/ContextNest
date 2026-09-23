@@ -228,7 +228,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   {
     title: "Import & enrich",
     commands: [
-      ["import", "Bring external formats in as markdown twins (jats, pubmed)"],
+      ["import", "Bring external files in as nodes (pdf, jats, pubmed)"],
       ["enrich", "Add curated annotations to imported nodes (pubtator)"],
     ],
   },
@@ -424,6 +424,7 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift stage",
   "drift approve",
   "drift reject",
+  "import pdf",
   "import jats",
   "import pubmed",
   "enrich pubtator",
@@ -1920,7 +1921,7 @@ program
 
 program
   .command("verify")
-  .description("Verify integrity of all hash chains")
+  .description("Verify integrity of all hash chains and PDF sidecars")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2008,6 +2009,19 @@ program
         }
       } else if (!opts.json) {
         console.log(chalk.green(`✓ Checkpoint chain`));
+      }
+    }
+
+    // PDF nodes: every binary must still hash to what its frontmatter (or,
+    // for an archived prior binary, its file name) records.
+    const sidecarErrors = await storage.verifyPdfSidecars();
+    if (sidecarErrors.length > 0) {
+      totalErrors += sidecarErrors.length;
+      allReportErrors.push(...sidecarErrors);
+      if (!opts.json) {
+        for (const err of sidecarErrors) {
+          console.log(chalk.red(`✗ ${err.document}: ${err.type} — expected ${err.expected}, found ${err.actual}`));
+        }
       }
     }
 
@@ -2425,6 +2439,89 @@ program
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
   });
 
+// ─── ctx import ───────────────────────────────────────────────────────────────
+
+const importCmd = program
+  .command("import")
+  .description("Import external files as vault nodes (pdf, jats, pubmed)");
+
+interface PdfImportView {
+  id: string;
+  version: number;
+  created: boolean;
+  unchanged: boolean;
+  status: string;
+  checkpoint: number | null;
+  text_layer: boolean;
+  pdf: { file: string; pages: number; bytes: number; sha256: string };
+}
+
+importCmd
+  .command("pdf <files...>")
+  .description(
+    "Import PDFs as type: pdf nodes — the extracted text becomes the body, the PDF is kept beside it (<id>.pdf) and bound by SHA-256. Re-import with --id to add a new version.",
+  )
+  .option("--folder <folder>", 'Folder under nodes/ (e.g. "reports/2026")')
+  .option("--tags <tags>", "Tags (comma- or space-separated)")
+  .option("--id <id>", "Node id — an existing pdf node gets a new version (one file only)")
+  .option("--title <title>", "Title (default: the PDF's own title, else the file name; one file only)")
+  .option("--no-publish", "Leave the import as a draft instead of publishing it")
+  .option("-m, --message <note>", "Version note")
+  .option("--json", "Output as JSON")
+  .action(async (files: string[], opts) => {
+    if (files.length > 1 && (opts.id || opts.title)) {
+      throw new ContextNestError("--id and --title apply to a single file; import the files one at a time.", "VALIDATION_FAILED");
+    }
+    const storage = getStorage();
+    const tags = opts.tags ? parseTagsOption(opts.tags) : undefined;
+    const results: Array<PdfImportView & { file: string }> = [];
+    const failed: Array<{ file: string; error: string }> = [];
+    for (const file of files) {
+      try {
+        const bytes = await readFile(file);
+        const res = await cliApi().run<PdfImportView>(
+          "context_import_pdf",
+          {
+            bytes_base64: bytes.toString("base64"),
+            filename: pathMod.basename(file),
+            ...(opts.id ? { id: opts.id } : {}),
+            ...(opts.title ? { title: opts.title } : {}),
+            ...(opts.folder ? { folder: opts.folder } : {}),
+            ...(tags ? { tags } : {}),
+            ...(opts.publish === false ? { publish: false } : {}),
+            ...(opts.message ? { note: opts.message } : {}),
+          },
+          opContext(storage, "cli@contextnest.local"),
+        );
+        results.push({ ...res, file });
+        if (opts.json) continue;
+        const pages = `${res.pdf.pages} page${res.pdf.pages === 1 ? "" : "s"}`;
+        if (res.unchanged) {
+          console.log(chalk.dim(`Unchanged ${res.id} — same PDF as v${res.version}`));
+        } else if (res.created) {
+          console.log(chalk.green(`Imported ${file} → ${res.id} v${res.version} (${pages}, ${res.status})`));
+        } else {
+          console.log(chalk.green(`Updated ${res.id} → v${res.version} from ${file} (${pages}, ${res.status})`));
+        }
+        if (!res.text_layer) {
+          console.log(
+            chalk.yellow(
+              "  ⚠ no text layer — a scanned PDF; the node body is empty (OCR is not supported). The PDF itself is stored.",
+            ),
+          );
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failed.push({ file, error: message });
+        if (!opts.json) console.error(chalk.red(`✗ ${file}: ${message}`));
+      }
+    }
+    if (opts.json) {
+      console.log(JSON.stringify({ imported: results, failed }, null, 2));
+    }
+    if (failed.length > 0) process.exit(1);
+  });
+
 // ─── ctx search ───────────────────────────────────────────────────────────────
 
 program
@@ -2549,11 +2646,7 @@ cpCmd
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
   });
 
-// ─── ctx import / ctx enrich ─────────────────────────────────────────────────
-
-const importCmd = program
-  .command("import")
-  .description("Bring external formats into the vault as markdown twins");
+// ─── ctx import jats|pubmed / ctx enrich ─────────────────────────────────────
 
 function printImportSummary(r: {
   published: Array<{ id: string; version: number }>;

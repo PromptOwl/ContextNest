@@ -25,6 +25,17 @@ export function sha256(input: string): string {
 }
 
 /**
+ * SHA-256 of raw bytes, in the same `sha256:<hex>` format.
+ *
+ * For binaries (a pdf node's sidecar, §1.11): hashed exactly as stored, with
+ * none of the text normalization `computeContentHash` applies — a PDF is not
+ * text, and "normalizing" its line endings would change the document.
+ */
+export function sha256Bytes(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+/**
  * Compute content_hash for a version entry (§8.2).
  * - Keyframe: SHA-256 of the full snapshot file content
  * - Diff: SHA-256 of the diff string

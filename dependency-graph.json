@@ -106,6 +106,16 @@
           ]
         },
         {
+          "name": "unpdf",
+          "version": "1.7.0",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "zod",
           "version": "3.25.76",
           "license": "MIT",
@@ -1102,13 +1112,14 @@
         "js-yaml",
         "minisearch",
         "toposort",
+        "unpdf",
         "zod",
         "zod-to-json-schema"
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 98,
-      "minimalTotal": 98,
+      "total": 99,
+      "minimalTotal": 99,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
@@ -1163,6 +1174,16 @@
         {
           "name": "toposort",
           "version": "2.0.2",
+          "license": "MIT",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "unpdf",
+          "version": "1.7.0",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -2400,6 +2421,16 @@
         {
           "name": "toposort",
           "version": "2.0.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "unpdf",
+          "version": "1.7.0",
           "license": "MIT",
           "depth": 2,
           "optional": false,

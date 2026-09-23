@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 98 | 11 | 98 |
+| `@promptowl/contextnest-engine` | 99 | 11 | 99 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,7 +48,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 99 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -59,6 +59,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
 | `toposort` | 2.0.2 | MIT |
+| `unpdf` | 1.7.0 | MIT |
 | `zod` | 3.25.76 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 | `@hono/node-server` | 1.19.14 | MIT |
@@ -164,6 +165,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
 | `toposort` | 2.0.2 | MIT | yes | Dependency ordering for `source` node graphs. |
+| `unpdf` | 1.7.0 | MIT | yes | Text extraction for `type: pdf` nodes (pdf.js built for serverless runtimes; pure JS, no native deps). Loaded lazily — only when a PDF is imported. |
 | `zod` | 3.25.76 | MIT | yes | Runtime validation of frontmatter and operation inputs (spec §13 rules 1–17). |
 | `zod-to-json-schema` | 3.25.2 | ISC | yes | Turns the Zod operation catalog into the JSON Schema the MCP tools publish. |
 
@@ -279,7 +281,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 99 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -306,6 +308,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
 | `toposort` | 2.0.2 | MIT |
+| `unpdf` | 1.7.0 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 | `accepts` | 2.0.0 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
