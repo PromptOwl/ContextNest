@@ -111,6 +111,13 @@ function nestCachePath(baseAlias: string): string {
  * every session start — doesn't cost a round trip each time. The cache is a
  * convenience: unreadable or unwritable, it is simply skipped.
  */
+/**
+ * How long a failed nest-list probe is remembered. The plugin lists vaults on
+ * every prompt; without this, an offline server costs a full timeout (or three,
+ * for connect + listTools + nest_index on a slow one) on each of them.
+ */
+export const NEST_PROBE_BACKOFF_MS = 60_000;
+
 export async function serverNests(
   baseAlias: string,
   spec: RemoteNestSpec,
@@ -119,29 +126,46 @@ export async function serverNests(
 ): Promise<IndexedNest[] | null> {
   if (spec.transport !== "http") return null;
   const file = nestCachePath(baseAlias);
-  if (!opts.fresh) {
+  const write = (entry: object) => {
     try {
-      const cached = JSON.parse(fs.readFileSync(file, "utf-8")) as {
-        at: number;
-        url: string;
-        nests: IndexedNest[] | null;
-      };
-      if (cached.url === spec.url && Date.now() - cached.at < NEST_INDEX_TTL_MS) return cached.nests;
+      fs.mkdirSync(pathMod.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: spec.url, ...entry }));
+    } catch {
+      // best-effort
+    }
+  };
+  if (!opts.fresh) {
+    let cached: { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean } | undefined;
+    try {
+      cached = JSON.parse(fs.readFileSync(file, "utf-8"));
     } catch {
       // no cache yet, or unreadable — ask the server
+    }
+    if (cached?.url === spec.url) {
+      const age = Date.now() - cached.at;
+      // A failed probe only short-circuits the next probes, not a caller that
+      // already holds a live connection (that is proof the server is back).
+      if (cached.failed && !conn && age < NEST_PROBE_BACKOFF_MS) {
+        throw new ContextNestError(
+          `Remote "${baseAlias}" was unreachable less than ${NEST_PROBE_BACKOFF_MS / 1000}s ago — not retrying yet.`,
+          "REMOTE_UNREACHABLE",
+        );
+      }
+      if (!cached.failed && age < NEST_INDEX_TTL_MS) return cached.nests ?? null;
     }
   }
   const fetchNests = async (c: RemoteNestConnection) =>
     (await c.toolNames()).has("nest_index")
       ? ((await c.run<{ nests?: IndexedNest[] }>("nest_index", {})).nests ?? [])
       : null;
-  const nests = conn ? await fetchNests(conn) : await withRemote({ alias: baseAlias, spec }, fetchNests);
+  let nests: IndexedNest[] | null;
   try {
-    fs.mkdirSync(pathMod.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: spec.url, nests }));
-  } catch {
-    // best-effort
+    nests = conn ? await fetchNests(conn) : await withRemote({ alias: baseAlias, spec }, fetchNests);
+  } catch (err) {
+    if (!conn) write({ failed: true });
+    throw err;
   }
+  write({ nests });
   return nests;
 }
 
@@ -774,10 +798,12 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
   );
   const rows: VaultRow[] = [];
   vaults.forEach((v, i) => {
-    rows.push(v);
     const nests = probes[i];
-    if (!nests) return;
-    if (!v.description) v.description = `All ${nests.length} nest(s) on this server — reads span every nest`;
+    if (!nests) {
+      rows.push(v);
+      return;
+    }
+    rows.push({ ...v, description: v.description || `All ${nests.length} nest(s) on this server — reads span every nest` });
     const labels = nestLabels(nests);
     for (const n of nests) {
       rows.push({

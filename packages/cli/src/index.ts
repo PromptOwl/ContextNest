@@ -2360,7 +2360,7 @@ program
   .command("update <path>")
   .description("Update a document's frontmatter and/or body, then auto-publish")
   .option("--title <title>", "New title")
-  .option("--tags <tags>", "New tags (comma- or space-separated, replaces existing)")
+  .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
@@ -2449,6 +2449,8 @@ program
   .action(async (path, folder) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (!remote) {
+      // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
+      // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
       // ponytail: remote-only — the engine has no move op yet (a local move must
       // rename the file, its history and every [[link]]). Add it upstream first.
       throw new ContextNestError(
