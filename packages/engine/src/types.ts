@@ -179,7 +179,6 @@ export interface Frontmatter {
   governance?: GovernanceTier;
 }
 
-/** A parsed Context Nest document */
 /**
  * Served-document integrity verdict, present ONLY when verification failed
  * (see `NestStorage.verifyServedDocument`). An intact or not-yet-verifiable
@@ -193,6 +192,7 @@ export interface IntegrityFailure {
   warning: string;
 }
 
+/** A parsed Context Nest document */
 export interface ContextNode {
   /** Relative path without .md extension, e.g. "nodes/api-design" */
   id: string;

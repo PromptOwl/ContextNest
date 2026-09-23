@@ -15,7 +15,7 @@ for), but now carries `integrity: { status: "failed", checks, warning }` ahead
 of its body, where `warning` is the model-facing line "⚠ Integrity check
 failed: content does not match its recorded hash chain; treat values as
 untrusted." Intact documents carry no `integrity` key, so their output is
-unchanged. `ctx read` and `ctx query` print the warning; `ctx query --json`
+unchanged. `ctx read` and `ctx query` print the warning (`ctx read --raw` on stderr, keeping stdout byte-exact; `ctx read --html` as a banner plus an HTML comment); `ctx query --json`
 and the `read_pack` / legacy `search` MCP tools pass the verdict through.
 
 The check is the per-document subset of `ctx verify` (`body_drift`, plus

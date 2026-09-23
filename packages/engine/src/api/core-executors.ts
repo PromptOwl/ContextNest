@@ -325,12 +325,15 @@ const get: OperationExecutor = async (ctx, input: any) => {
   // reading one is not the same as republishing it.
   if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
   // Served, never refused: a document that fails verification is still the one
-  // asked for. The verdict tells the agent not to trust its values. Skipped
-  // when verify_checksum already swapped in the last-approved content — that
-  // body is the canonical one, and pendingChange carries the drift signal.
-  const integrity = node.pendingChange
-    ? undefined
-    : await ctx.storage.verifyServedDocument(node);
+  // asked for. The verdict tells the agent not to trust its values.
+  //
+  // Runs on the verify_checksum path too. There, a drifted live file is
+  // replaced by the last-approved keyframe (+ pendingChange); the verdict then
+  // checks what is actually served: the body check runs on the keyframe's own
+  // bytes (clean unless the keyframe itself was altered), and the chain check
+  // still catches a corrupted history behind it. With no keyframe to fall back
+  // to, the drifted live node is served and body_drift is reported.
+  const integrity = await ctx.storage.verifyServedDocument(node);
   return {
     id: node.id,
     frontmatter: node.frontmatter,

@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -152,6 +152,46 @@ describe("served documents carry an integrity verdict when verification fails", 
     const verdict = await storage.verifyServedDocument(node);
     expect(verdict?.status).toBe("failed");
     expect(verdict?.checks).toContain("content_hash_mismatch");
+  });
+
+  it("verify_checksum + drift: serves the approved keyframe unflagged when its chain is intact", async () => {
+    await tamperBody("nodes/pricing", "$500", "$5");
+    const api = createEngineApi();
+    const got = await api.run<Record<string, any>>(
+      "context_get",
+      { id: "nodes/pricing", verify_checksum: true },
+      ctx,
+    );
+    expect(got.body).toContain("$500"); // canonical content, not the drifted bytes
+    expect(got.pendingChange).toBeDefined();
+    expect(got).not.toHaveProperty("integrity");
+  });
+
+  it("verify_checksum + drift still runs the chain check on what it serves", async () => {
+    await tamperBody("nodes/pricing", "$500", "$5");
+    const history = await storage.readHistory("nodes/pricing");
+    const kf = history!.versions.find((v) => v.keyframe)!;
+    const keyframe = join(vaultPath, "nodes", ".versions", "pricing", `v${kf.version}.md`);
+    await writeFile(keyframe, (await readFile(keyframe, "utf-8")).replace("$500", "$50"), "utf-8");
+
+    const api = createEngineApi();
+    const got = await api.run<Record<string, any>>(
+      "context_get",
+      { id: "nodes/pricing", verify_checksum: true },
+      ctx,
+    );
+    expect(got.pendingChange).toBeDefined();
+    expect(got.integrity?.status).toBe("failed");
+    expect(got.integrity?.checks).toContain("content_hash_mismatch");
+  });
+
+  it("a history that exists but cannot be read is flagged unreadable_history", async () => {
+    const historyFile = join(vaultPath, "nodes", ".versions", "pricing", "history.yaml");
+    await rm(historyFile);
+    await mkdir(historyFile); // present but unreadable as a file (EISDIR)
+    const node = await storage.readDocument("nodes/pricing");
+    const verdict = await storage.verifyServedDocument(node);
+    expect(verdict?.checks).toEqual(["unreadable_history"]);
   });
 
   it("caches the chain verdict per history version instead of re-hashing every read", async () => {

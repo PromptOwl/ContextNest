@@ -64,7 +64,7 @@ import {
   HARNESSES,
   SELECTOR_GRAMMAR,
 } from "@promptowl/contextnest-engine";
-import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
+import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
   remoteTarget,
   remoteList,
@@ -1270,7 +1270,7 @@ program
       frontmatter: ContextNode["frontmatter"];
       body: string;
       raw?: string;
-      integrity?: { status: string; warning: string };
+      integrity?: IntegrityFailure;
     }>(
       "context_get",
       { id, include_raw: true, allow_rejected: true },
@@ -1282,9 +1282,13 @@ program
       rawContent: got.raw ?? "",
       frontmatter: got.frontmatter,
       body: got.body,
+      ...(got.integrity ? { integrity: got.integrity } : {}),
     };
 
     if (opts.raw) {
+      // stdout stays the exact stored bytes; the verdict goes to stderr so a
+      // script piping --raw still sees it without corrupting the payload.
+      if (got.integrity) console.error(chalk.red(got.integrity.warning));
       console.log(doc.rawContent);
       return;
     }
