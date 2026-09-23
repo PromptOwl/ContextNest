@@ -1957,7 +1957,7 @@ describe("[regression] import pubmed + enrich pubtator", () => {
             : jats;
           send("application/xml", `<pmc-articleset>${body.replace(/^<\?xml[^>]*>/, "")}</pmc-articleset>`);
         } else if (url.includes("/publications/export/biocjson")) {
-          send("application/json", bioc.replace('"pmid": 30056182', '"pmid": 30056182'));
+          send("application/json", bioc);
         } else {
           res.writeHead(404);
           res.end("no");
