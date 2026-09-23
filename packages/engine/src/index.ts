@@ -156,6 +156,8 @@ export {
   HASH_CHAIN_EVENT_TYPES,
   TAG_PATTERN,
   TITLE_MAX_LENGTH,
+  TAG_RULE,
+  describeInvalidTag,
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
   CLIENT_METADATA_RESERVED_KEYS,
@@ -387,6 +389,7 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 export {
+  slugify,
   slugifyImportPath,
   isVersionArtifactPath,
   sanitizeImportedFrontmatter,
@@ -437,3 +440,19 @@ export {
 export type { PdfExtraction } from "./importers/pdf.js";
 export { readPdfBinary, readPdfMeta, pdfSidecarPath } from "./pdf-nodes.js";
 export type { ReadPdfBinaryOptions } from "./pdf-nodes.js";
+
+// ─── Importers ───────────────────────────────────────────────────────────────
+export {
+  jatsToDocument,
+  linkCitations,
+  buildCitationIndex,
+  splitJatsArticles,
+  JATS_IMPORTER_VERSION,
+} from "./importers/jats.js";
+export type {
+  JatsImportOptions,
+  JatsImportResult,
+  JatsPaperMeta,
+  JatsRef,
+  CitationIndex,
+} from "./importers/jats.js";

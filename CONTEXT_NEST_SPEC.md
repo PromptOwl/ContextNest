@@ -4,6 +4,7 @@
 **Author**: ContextNest — PromptOwl, LLC
 **Compatible with**: Obsidian, PromptOwl, any markdown editor
 **File Extension**: `.md` (standard markdown)
+**License**: Apache-2.0 (see [LICENSE-SPEC](LICENSE-SPEC)) — this specification only; the reference implementation in this repository is AGPL-3.0
 
 ---
 
@@ -1189,6 +1190,19 @@ Each edge in the `relationships` list carries a `type` field:
 
 The `reference` type is the default. The `depends_on` type is automatically generated when a source node declares dependencies. A single pair of nodes may have both edge types if the source body also contains an inline link to its dependency (which is the recommended pattern per §1.9.4).
 
+### 5.1.1 Graph Traversal (hops)
+
+A query MAY expand the documents a selector matches by walking `relationships` edges in either direction, up to a budget of `hops`. Each step costs hops according to the direction of travel:
+
+| Step | Cost |
+|------|------|
+| Along an edge with an explicit `priority` | the `priority` value |
+| Along `depends_on`, from a source to its dependency | 0 |
+| To a document listed in `hubs` | 0 |
+| Anything else, including backwards along `depends_on` and away from a hub | 1 |
+
+With `hops: 0` the result is therefore the selected documents plus what is reachable at zero cost: their source dependencies and any hub they link to. Walking away from a hub is never free, so selecting a hub does not pull in the documents that link to it. When a traversal reaches fewer documents than the implementation's minimum, it MAY retry with a larger budget; `hopsUsed` reports the deepest hop actually reached. Results are returned in a deterministic order: repeating the same query against the same index returns the same documents in the same order. A query that must return exactly the selector's matches, with no expansion, uses full mode (`--full`).
+
 ### 5.2 External Dependencies
 
 The `external_dependencies` section declares all external services required by the nest's source nodes. It is derived automatically from the `source.transport`, `source.server`, and `source.tools` fields across all published source nodes, cross-referenced with the `servers` registry in `.context/config.yaml` (§11.1).
@@ -1209,7 +1223,7 @@ For tools that support versioning, version history is stored in `.versions/{docu
 
 Version history uses a **keyframe + diff model** for efficiency:
 
-- **Keyframe versions** (version 1, and every `keyframe_interval` versions thereafter, default 10): stored as a full Markdown snapshot file (`v1.md`, `v10.md`, ...).
+- **Keyframe versions** (version 1, and every version *n* where (*n* − 1) is a multiple of `keyframe_interval`, default 10, i.e. versions 1, 11, 21, ...): stored as a full Markdown snapshot file (`v1.md`, `v11.md`, ...). An implementation also writes a keyframe whenever the previous version cannot be reconstructed, so a diff is never recorded against unknown content.
 - **All other versions**: stored as a unified diff from the previous version, recorded inline in `history.yaml`.
 - **Reconstruction**: apply diffs forward from the nearest keyframe to reach any target version.
 
@@ -1220,7 +1234,7 @@ my-context-nest/
 │   └── .versions/
 │       └── api-design/
 │           ├── v1.md              # Keyframe snapshot of version 1
-│           ├── v10.md             # Keyframe snapshot of version 10
+│           ├── v11.md             # Keyframe snapshot of version 11
 │           └── history.yaml       # Version metadata + inline diffs
 ├── sources/
 │   ├── current-sprint-tickets.md  # Current version (always latest)
@@ -1295,7 +1309,7 @@ versions:
     note: "WIP rate limiting section"
     content_hash: sha256:c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
     chain_hash:   sha256:2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6
-  - version: 10
+  - version: 11
     keyframe: true
     edited_by: jane.smith@example.com
     edited_at: 2024-03-01T10:00:00Z
@@ -1421,6 +1435,8 @@ For each version entry in `history.yaml`:
 
 Format: `sha256:<64-character lowercase hex>`.
 
+Before hashing, content is normalized: a leading UTF-8 byte-order mark is removed and CRLF and lone CR line endings become LF. This keeps hashes stable when a sync tool or editor rewrites line endings, and every implementation MUST apply the same normalization to produce matching hashes. The normalization applies to `content_hash` inputs and to the frontmatter `checksum`; `chain_hash` and `checkpoint_hash` inputs are built from already-normalized values.
+
 #### chain_hash
 
 ```
@@ -1495,6 +1511,7 @@ contextnest:genesis:v1
 - Implementations MUST compute and append `checkpoint_hash` when writing new checkpoint entries.
 - Implementations MUST populate `document_chain_hashes` by reading the `chain_hash` of each document's recorded version from its `history.yaml` at write time.
 - A verifier MUST confirm that each value in `document_chain_hashes` matches the `chain_hash` stored in the corresponding document's `history.yaml` at the recorded version. A mismatch indicates that a document's history was rewritten after the checkpoint was created, and MUST be reported as `cross_chain_mismatch`.
+- **Exception: delete and recreate.** When a document is deleted and a new document is later created at the same path, its new history restarts at version 1 and no longer matches what older checkpoints sealed. A verifier MUST NOT report `cross_chain_mismatch` for an entry whose `edited_at` is later than the checkpoint's `at`, **provided** the entry's own `chain_hash` recomputes correctly from its fields and the preceding entry. An entry that is later than the checkpoint but does not recompute is a tamper (for example, a rewritten hash with a forward-dated timestamp) and MUST be reported.
 - Implementations MAY verify the checkpoint chain on read; failures MUST be surfaced to the caller.
 
 ### 8.4 Verification
@@ -1919,7 +1936,7 @@ The following components are intended to be released as open source:
 
 | Component | License | Description |
 |-----------|---------|-------------|
-| Specification (this document) | CC-BY-4.0 | Open protocol specification |
+| Specification (this document) | Apache-2.0 | Open protocol specification |
 | Context Engine (`@promptowl/context-engine`) | AGPL-3.0 | Reference implementation of selectors, versioning, storage, and source node resolution |
 | MCP Server (`@contextnest/mcp-server`) | AGPL-3.0 | Model Context Protocol server for vault access, including source dependency resolution and hydration relay |
 | CLI (`contextnest-cli`) | AGPL-3.0 | Command-line tools for vault operations |
@@ -1966,4 +1983,4 @@ The following components remain proprietary:
 
 ---
 
-*ContextNest is a product of PromptOwl, LLC This specification covers components intended for open release under CC-BY-4.0. Proprietary components are identified in §15.*
+*ContextNest is a product of PromptOwl, LLC This specification is released under Apache-2.0. Other open components are licensed as listed in §15; proprietary components are identified there too.*

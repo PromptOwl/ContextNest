@@ -104,6 +104,7 @@ import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
+import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
   configureSafety,
   openWriteScope,
@@ -223,6 +224,13 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["validate", "Check documents against the Context Nest spec"],
       ["drift", "Review edits made outside the CLI (suggestion workflow)"],
       ["index", "Regenerate context.yaml and INDEX.md"],
+    ],
+  },
+  {
+    title: "Import & enrich",
+    commands: [
+      ["import", "Bring external formats in as markdown twins (jats, pubmed)"],
+      ["enrich", "Add curated annotations to imported nodes (pubtator)"],
     ],
   },
   {
@@ -418,6 +426,9 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift approve",
   "drift reject",
   "import pdf",
+  "import jats",
+  "import pubmed",
+  "enrich pubtator",
 ]);
 
 /**
@@ -2636,6 +2647,171 @@ cpCmd
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
   });
 
+// ─── ctx import / ctx enrich ─────────────────────────────────────────────────
+
+const importCmd = program
+  .command("import")
+  .description("Bring external formats into the vault as markdown twins");
+
+function printImportSummary(r: {
+  published: Array<{ id: string; version: number }>;
+  skipped: string[];
+  failed: Array<{ id?: string; title?: string; error: string }>;
+  relinked?: string[];
+  checkpoint: number | null;
+  warnings: string[];
+}, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(r, null, 2));
+  } else {
+    for (const p of r.published) {
+      const tag = r.relinked?.includes(p.id) ? chalk.dim(" (citations re-linked)") : "";
+      console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}${tag}`);
+    }
+    for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
+    for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? f.title ?? "?"}: ${f.error}`);
+    for (const w of r.warnings) console.log(chalk.yellow(`  ! ${w}`));
+    const n = r.published.length;
+    console.log(
+      chalk.green(`Published ${n} document(s)`) +
+        (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +
+        (r.failed.length ? chalk.red(`, failed ${r.failed.length}`) : ""),
+    );
+    if (r.checkpoint !== null) console.log(`  Checkpoint: ${r.checkpoint}`);
+  }
+  if (r.failed.length > 0) process.exitCode = 1;
+}
+
+importCmd
+  .command("jats <paths...>")
+  .description("Import JATS XML articles (PubMed Central, publisher deposits) as markdown twins")
+  .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
+  .option("--keep-xml", "Also store each original under assets/jats/")
+  .option("--no-relink", "Do not update existing papers whose references now resolve")
+  // No local --force: the global one (see the root command) republishes unchanged twins.
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (paths: string[], opts) => {
+    const storage = getStorage();
+    const sources = await collectJatsFiles(paths);
+    if (sources.length === 0) {
+      console.log(chalk.yellow("No .xml / .nxml files found."));
+      return;
+    }
+    await confirmOrExit(
+      `Import ${sources.length} JATS file(s) into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+    );
+    const r = await importJats({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      sources,
+      folder: opts.folder,
+      keepXml: opts.keepXml,
+      relink: opts.relink,
+      force: isForce(),
+    });
+    printImportSummary(r, opts.json);
+  });
+
+importCmd
+  .command("pubmed")
+  .description("Search PubMed Central (open-access) and import the hits as markdown twins")
+  .requiredOption("--term <query>", 'PubMed query, e.g. "fecal microbiota transplantation[mh] AND open access[filter]"')
+  .option("--max <n>", "Maximum articles to fetch", "25")
+  .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
+  .option("--keep-xml", "Also store each original under assets/jats/")
+  .option("--no-relink", "Do not update existing papers whose references now resolve")
+  .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY) — raises the rate limit from 3/s to 10/s")
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const max = Math.max(1, parseInt(opts.max, 10) || 25);
+    const apiKey = opts.apiKey ?? process.env.NCBI_API_KEY;
+    await confirmOrExit(
+      `Fetch up to ${max} open-access PMC article(s) for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+    );
+    const fetched = await fetchPmcSources({
+      term: opts.term,
+      max,
+      apiKey,
+      onProgress: (done, total, pmcid) => {
+        if (process.stdout.isTTY) process.stdout.write(`\rFetching ${done}/${total} ${pmcid}…`);
+      },
+    });
+    if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+    console.log(chalk.dim(`${fetched.total} match(es) in PMC; fetched ${fetched.sources.length}`));
+    for (const f of fetched.failed) console.log(chalk.yellow(`  ! ${f}`));
+    if (fetched.sources.length === 0) {
+      console.log(chalk.yellow("Nothing to import."));
+      if (fetched.failed.length) process.exitCode = 1;
+      return;
+    }
+    const r = await importJats({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      sources: fetched.sources,
+      folder: opts.folder,
+      keepXml: opts.keepXml,
+      relink: opts.relink,
+      force: isForce(),
+    });
+    printImportSummary(r, opts.json);
+  });
+
+const enrichCmd = program
+  .command("enrich")
+  .description("Add curated annotations to imported nodes");
+
+enrichCmd
+  .command("pubtator [ids...]")
+  .description("Attach NCBI PubTator 3 entities and relations (MeSH-normalised) to imported papers")
+  .option("--folder <folder>", "Folder holding the paper twins", "nodes/papers")
+  // No local --force: the global one (see the root command) re-fetches enriched papers.
+  .option("--tag-limit <n>", "Most-mentioned disease/chemical entities to promote to #mesh- tags", "12")
+  .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY)")
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (ids: string[], opts) => {
+    const storage = getStorage();
+    await confirmOrExit(
+      `Fetch PubTator annotations for ${ids.length ? `${ids.length} paper(s)` : `every paper under ${opts.folder}`} in ${realRootPath() ?? storage.root} and republish them?`,
+    );
+    const r = await enrichPubTator({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      folder: opts.folder,
+      // Raw: enrichPubTator resolves short ids against the papers folder itself.
+      ids,
+      force: isForce(),
+      // `--tag-limit 0` is a real request (no #mesh- tags), not a missing value.
+      tagLimit: Number.isNaN(parseInt(opts.tagLimit, 10)) ? 12 : Math.max(0, parseInt(opts.tagLimit, 10)),
+      apiKey: opts.apiKey ?? process.env.NCBI_API_KEY,
+      onProgress: (msg) => {
+        if (!opts.json) console.error(chalk.dim(`  ${msg}`));
+      },
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      for (const p of r.enriched) console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}`);
+      for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
+      for (const u of r.unresolved) console.log(chalk.yellow(`  ? ${u}`));
+      for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? "?"}: ${f.error}`);
+      for (const w of r.warnings ?? []) console.log(chalk.yellow(`  ! ${w}`));
+      console.log(
+        chalk.green(`Enriched ${r.enriched.length} document(s)`) +
+          (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +
+          (r.unresolved.length ? chalk.yellow(`, unresolved ${r.unresolved.length}`) : ""),
+      );
+      if (r.checkpoint !== null) console.log(`  Checkpoint: ${r.checkpoint}`);
+    }
+    if (r.failed.length > 0) process.exitCode = 1;
+  });
+
 // ─── ctx welcome ──────────────────────────────────────────────────────────────
 
 program
@@ -3068,7 +3244,7 @@ drift
     console.log(`  archived_at: ${chalk.dim(result.archivedAt)}`);
     console.log(
       chalk.dim(
-        `\nNote: canonical file on disk still has the drifted bytes. To restore last-approved content, run:\n  ctx read-version ${id} <last-version> > ${id}.md`,
+        `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
       ),
     );
   });

@@ -109,7 +109,7 @@ Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retri
 
 ## Releasing
 
-Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together.
+Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together. `CONTEXT_NEST_SPEC.md` is the one exception in the repo: Apache-2.0, per `LICENSE-SPEC`.
 
 ## Specification
 

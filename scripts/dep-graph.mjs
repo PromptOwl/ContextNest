@@ -60,6 +60,7 @@ const RATIONALE = {
   chalk: "Terminal colour. Optional — see the minimal install profile below.",
   commander: "Command, argument and help parsing for `ctx`.",
   diff: "Unified diffs for the keyframe+diff version model and drift suggestions.",
+  "fast-xml-parser": "Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set.",
   "js-yaml": "Reads and writes YAML frontmatter, `context.yaml`, packs and history files.",
   minisearch: "In-memory full-text index behind `ctx search` and the fast selector path.",
   toposort: "Dependency ordering for `source` node graphs.",

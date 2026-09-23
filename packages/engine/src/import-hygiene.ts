@@ -18,7 +18,7 @@ import type { ContextNode, Frontmatter, NodeType, PdfMeta } from "./types.js";
 const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES);
 
 /** Same rule as `buildDraftNode`'s slug: one dash per non-alphanumeric run. */
-function slugify(input: string): string {
+export function slugify(input: string): string {
   return input
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")

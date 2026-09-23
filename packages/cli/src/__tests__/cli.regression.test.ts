@@ -1644,6 +1644,7 @@ describe("[regression] file safety — command coverage", () => {
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
     "import pdf",
+    "import jats", "import pubmed", "enrich pubtator",
   ];
 
   it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {
@@ -1941,5 +1942,170 @@ describe("[regression] ctx import pdf", () => {
     const res = runCtxResult(tmp, ["import", "pdf", join(tmp, "notes.txt")]);
     expect(res.status).not.toBe(0);
     expect(res.stderr + res.stdout).toMatch(/%PDF-/);
+  });
+});
+
+// ─── ctx import jats — markdown twins that render and retrieve ───────────────
+
+describe("[regression] import jats", () => {
+  // CU-wdqcq02c6w: JATS XML → markdown twin. The twin has to come back out
+  // through the surfaces an agent uses: `query` by the NLM-derived tags,
+  // `read --html` with anchors/tables/sup rendered, and a second import must
+  // not cut a version for unchanged XML.
+  const fixture = join(here, "..", "..", "..", "engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+
+  it("imports, is idempotent, and the twin is queryable by evidence-tier tags", () => {
+    initVault(tmp);
+    mkdirSync(join(tmp, "in"));
+    writeFileSync(join(tmp, "in", "paper.xml"), readFileSync(fixture));
+    writeFileSync(join(tmp, "in", "paper-copy.xml"), readFileSync(fixture));
+
+    const first = runCtxResult(tmp, ["import", "jats", join(tmp, "in"), "-y"]);
+    expect(first.status).toBe(0);
+    expect(first.stdout).toContain("nodes/papers/pmid-99900001");
+    expect(first.stdout).toMatch(/Published 1 document\(s\), skipped 1/);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+
+    const second = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "-y"]);
+    expect(second.status).toBe(0);
+    expect(second.stdout).toMatch(/Published 0 document\(s\), skipped 1/);
+    // The GLOBAL --force republishes an unchanged twin (a local --force would be shadowed by it).
+    const forced = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "--force"]);
+    expect(forced.status).toBe(0);
+    expect(forced.stdout).toMatch(/pmid-99900001 v2/);
+
+    const srma = JSON.parse(runCtx(tmp, ["query", "#pubtype-srma", "--json"]));
+    expect(srma.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
+    const year = JSON.parse(runCtx(tmp, ["query", "#year-2024 #paper", "--json"]));
+    expect(year.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
+    const other = JSON.parse(runCtx(tmp, ["query", "#year-1999", "--json"]));
+    expect(other.documents).toHaveLength(0);
+
+    expect(runCtx(tmp, ["validate"])).not.toMatch(/invalid/i);
+  });
+
+  it("renders anchors, tables, sup/sub and LaTeX through read --html", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "jats", fixture, "-y"]);
+    const out = join(tmp, "paper.html");
+    const res = runCtxResult(tmp, ["read", "nodes/papers/pmid-99900001", "--html", "--out", out]);
+    expect(res.status).toBe(0);
+    const html = readFileSync(out, "utf-8");
+    expect(html).toContain('<p id="p_1_1">');
+    expect(html).toContain("10<sup>9</sup>");
+    expect(html).toContain("<td>Serum HIV | HBV</td>");
+    expect(html).toContain("$p = \\frac{k}{n}$");
+    expect(html).toContain('<h2 id="references">References</h2>');
+  });
+
+  it("is additive (no TTY consent needed) and honours --dry-run", () => {
+    initVault(tmp);
+    // Import creates, never destroys: off a TTY the command line is consent,
+    // same as `ctx add`. --dry-run runs the whole flow in the sandbox.
+    const dry = runCtxResult(tmp, ["import", "jats", fixture, "--dry-run"]);
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toMatch(/Published 1 document\(s\)/);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(false);
+
+    const real = runCtxResult(tmp, ["import", "jats", fixture]);
+    expect(real.status).toBe(0);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+  });
+});
+
+// ─── ctx import pubmed / ctx enrich pubtator — end to end against an NCBI stub ─
+
+describe("[regression] import pubmed + enrich pubtator", () => {
+  // The CLI argument surface (--term, --max, --tag-limit, --api-key fallback
+  // via NCBI_API_KEY) is exercised through the built binary; NCBI itself is a
+  // local stub selected with CONTEXTNEST_EUTILS_BASE / CONTEXTNEST_PUBTATOR_BASE.
+  const fixture = join(here, "..", "..", "..", "engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+  const bioc = readFileSync(join(here, "fixtures", "pubtator-30056182.json"), "utf-8");
+
+  function startNcbiStub(): Promise<{ url: string; requests: string[]; close: () => Promise<void> }> {
+    return new Promise((resolve) => {
+      const requests: string[] = [];
+      const jats = readFileSync(fixture, "utf-8");
+      const server: Server = createServer((req, res) => {
+        const url = req.url ?? "";
+        requests.push(url);
+        const send = (type: string, body: string) => {
+          res.writeHead(200, { "Content-Type": type });
+          res.end(body);
+        };
+        if (url.includes("/esearch.fcgi")) {
+          const pmc = url.includes("db=pmc");
+          // pmc: two hits; pubmed (PMID lookup): one.
+          send("application/json", JSON.stringify({ esearchresult: pmc ? { idlist: ["9990001", "9990002"], count: "2" } : { idlist: ["30056182"], count: "1" } }));
+        } else if (url.includes("/efetch.fcgi")) {
+          const id = /id=(\d+)/.exec(url)?.[1] ?? "0";
+          // Second article: different DOI + no PMID so enrich has to resolve it.
+          const body = id === "9990002"
+            ? jats.replace('<article-id pub-id-type="pmid">99900001</article-id>', "").replace("10.9999/jsg.2024.001", "10.9999/jsg.2024.002")
+            : jats;
+          send("application/xml", `<pmc-articleset>${body.replace(/^<\?xml[^>]*>/, "")}</pmc-articleset>`);
+        } else if (url.includes("/publications/export/biocjson")) {
+          send("application/json", bioc);
+        } else {
+          res.writeHead(404);
+          res.end("no");
+        }
+      });
+      server.listen(0, () => {
+        const port = (server.address() as AddressInfo).port;
+        resolve({
+          url: `http://localhost:${port}`,
+          requests,
+          close: () => new Promise((r) => server.close(() => r())),
+        });
+      });
+    });
+  }
+
+  it("fetches --max articles, imports them, then enriches with --tag-limit and the NCBI_API_KEY fallback", async () => {
+    initVault(tmp);
+    const stub = await startNcbiStub();
+    const env = {
+      ...ENV,
+      CONTEXTNEST_EUTILS_BASE: stub.url,
+      CONTEXTNEST_PUBTATOR_BASE: stub.url,
+      NCBI_API_KEY: "test-key-123",
+    } as NodeJS.ProcessEnv;
+    const run = (args: string[]) =>
+      execFileAsync("node", [distPath, ...args], { cwd: tmp, env, encoding: "utf-8" });
+    try {
+      const imp = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
+      expect(imp.stdout).toMatch(/2 match\(es\) in PMC; fetched 2/);
+      expect(imp.stdout).toMatch(/Published 2 document\(s\)/);
+      expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+      expect(existsSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"))).toBe(true);
+      const esearch = stub.requests.find((u) => u.includes("esearch") && u.includes("db=pmc"))!;
+      expect(esearch).toContain("retmax=2");
+      expect(esearch).toContain("api_key=test-key-123");
+
+      // Unchanged → skipped; the global --force republishes.
+      const again = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
+      expect(again.stdout).toMatch(/Published 0 document\(s\), skipped 2/);
+      const forced = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--force"]);
+      expect(forced.stdout).toMatch(/pmid-99900001 v2/);
+
+      // The stub only knows PMID 30056182: the DOI-only paper resolves to it
+      // and is enriched; the paper carrying PMID 99900001 is reported, not lost.
+      // --tag-limit 0 means "no #mesh- tags", not "use the default".
+      const zero = await run(["enrich", "pubtator", "--tag-limit", "0", "-y"]);
+      expect(zero.stdout).toMatch(/Enriched 1 document\(s\)/);
+      expect(readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8")).not.toContain("#mesh-");
+
+      const enr = await run(["enrich", "pubtator", "--tag-limit", "1", "--force", "-y"]);
+      expect(enr.stdout).toMatch(/Enriched 1 document\(s\)/);
+      expect(enr.stdout).toMatch(/pmid-99900001 \(PubTator has no record for PMID 99900001\)/);
+      const twin = readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8");
+      expect(twin).toContain("pmid: '30056182'");
+      expect((twin.match(/#mesh-/g) ?? []).length).toBe(1);
+      // The PMID lookup for the PMID-less paper went to the stub (PMCID first, DOI as fallback).
+      expect(stub.requests.some((u) => u.includes("db=pubmed") && /%5B(pmcid|doi)%5D/.test(u))).toBe(true);
+    } finally {
+      await stub.close();
+    }
   });
 });

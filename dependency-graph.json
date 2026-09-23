@@ -66,6 +66,16 @@
           ]
         },
         {
+          "name": "fast-xml-parser",
+          "version": "4.5.7",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "js-yaml",
           "version": "4.3.2",
           "license": "MIT",
@@ -291,6 +301,16 @@
           "via": [
             "@modelcontextprotocol/sdk",
             "body-parser"
+          ]
+        },
+        {
+          "name": "strnum",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -1088,6 +1108,7 @@
       "required": [
         "@modelcontextprotocol/sdk",
         "diff",
+        "fast-xml-parser",
         "js-yaml",
         "minisearch",
         "toposort",
@@ -1097,8 +1118,8 @@
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 97,
-      "minimalTotal": 97,
+      "total": 98,
+      "minimalTotal": 98,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
@@ -1114,6 +1135,16 @@
           "name": "diff",
           "version": "9.0.0",
           "license": "BSD-3-Clause",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "fast-xml-parser",
+          "version": "4.5.7",
+          "license": "MIT",
           "depth": 1,
           "optional": false,
           "via": [
@@ -1346,6 +1377,16 @@
           "via": [
             "@modelcontextprotocol/sdk",
             "body-parser"
+          ]
+        },
+        {
+          "name": "strnum",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -2297,6 +2338,16 @@
           ]
         },
         {
+          "name": "fast-xml-parser",
+          "version": "4.5.7",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "hono",
           "version": "4.12.16",
           "license": "MIT",
@@ -2768,6 +2819,16 @@
             "finalhandler",
             "http-errors",
             "send"
+          ]
+        },
+        {
+          "name": "strnum",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
