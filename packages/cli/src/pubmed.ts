@@ -34,7 +34,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function nfetch(url: string, opts: NcbiOptions): Promise<Response> {
+async function nfetch(url: string, opts: NcbiOptions, allow: number[] = []): Promise<Response> {
   const f = opts.fetchImpl ?? fetch;
   const gap = opts.minIntervalMs ?? (opts.apiKey ? 110 : 400);
   let attempt = 0;
@@ -48,7 +48,7 @@ async function nfetch(url: string, opts: NcbiOptions): Promise<Response> {
       await sleep(1000 * attempt);
       continue;
     }
-    if (!res.ok) throw new Error(`NCBI ${res.status} ${res.statusText}: ${url}`);
+    if (!res.ok && !allow.includes(res.status)) throw new Error(`NCBI ${res.status} ${res.statusText}: ${url}`);
     return res;
   }
 }
@@ -218,7 +218,10 @@ export async function pubtatorFetch(
     const u = new URL(`${PUBTATOR}/publications/export/biocjson`);
     u.searchParams.set("pmids", batch.join(","));
     const url = u.toString();
-    const res = await nfetch(url, opts);
+    // PubTator answers 400 when it has no record for any PMID in the batch
+    // (e.g. papers too new to be annotated) — an empty result, not a failure.
+    const res = await nfetch(url, opts, [400]);
+    if (res.status === 400) continue;
     const text = await res.text();
     // PubTator streams one JSON document per line for some batches and a
     // {"PubTator3": [...]} envelope for others; accept both.

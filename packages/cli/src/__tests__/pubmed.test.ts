@@ -126,4 +126,13 @@ describe("NCBI clients (fetch injected)", () => {
     expect([...map.keys()].sort()).toEqual(["5", "6"]);
     expect(map.get("5")?.entities[0]).toEqual({ id: "MESH:D1", type: "Disease", count: 1 });
   });
+
+  it("pubtatorFetch reads a 400 as 'no record for any PMID in the batch', not a failure", async () => {
+    // Live behaviour: a batch of PMIDs PubTator has not annotated yet (fresh
+    // papers) answers 400 {"detail":"Could not retrieve publications"}.
+    const fetchImpl = (async () =>
+      new Response('{"detail":"Could not retrieve publications"}', { status: 400 })) as unknown as typeof fetch;
+    const map = await pubtatorFetch(["42769844"], { fetchImpl, minIntervalMs: 0 });
+    expect(map.size).toBe(0);
+  });
 });

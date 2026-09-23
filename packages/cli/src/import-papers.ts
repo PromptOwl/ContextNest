@@ -223,7 +223,9 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
     const freshDois = new Set(fresh.map((r) => r.meta.doi?.toLowerCase()).filter(Boolean));
     const freshPmids = new Set(fresh.map((r) => r.meta.pmid).filter(Boolean));
     for (const d of existing) {
-      if (freshIds.has(d.id)) continue;
+      // context_import writes staged files before publish refuses a rejected
+      // id, so a rejected paper must never be staged.
+      if (freshIds.has(d.id) || d.frontmatter.status === "rejected") continue;
       const refs = metadataOf(d).refs;
       const cites = Array.isArray(refs)
         ? (refs as Array<{ doi?: string; pmid?: string }>).some(
@@ -399,6 +401,10 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
   const byPmid = new Map<string, ContextNode>();
   for (const p of papers) {
     const meta = metadataOf(p);
+    if (p.frontmatter.status === "rejected") {
+      skipped.push(`${p.id} (rejected by a steward)`);
+      continue;
+    }
     if (!opts.force && meta.pubtator) {
       skipped.push(`${p.id} (already enriched)`);
       continue;

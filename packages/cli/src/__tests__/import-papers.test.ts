@@ -133,6 +133,22 @@ describe("importJats", () => {
     expect(after.frontmatter.status).toBe("rejected");
   });
 
+  it("does not relink a rejected paper when a paper it cites arrives", async () => {
+    // context_import writes staged files before publish refuses a rejected id,
+    // so the relink pass must not stage one at all.
+    await importJats({ storage, api, ctx, sources: [{ name: "a.xml", xml }] });
+    const id = "nodes/papers/pmid-99900001";
+    const doc = (await storage.discoverDocuments()).find((d) => d.id === id)!;
+    const rejected = doc.rawContent.replace("status: published", "status: rejected");
+    await storage.writeDocument(id, rejected);
+
+    const r = await importJats({ storage, api, ctx, sources: [{ name: "cited.xml", xml: citedXml }] });
+    expect(r.relinked).toEqual([]);
+    expect(r.failed).toEqual([]);
+    const after = (await storage.discoverDocuments({ includeRetired: true })).find((d) => d.id === id)!;
+    expect(after.rawContent).toBe(rejected);
+  });
+
   it("reports a malformed file without aborting the batch", async () => {
     const r = await importJats({
       storage,
@@ -226,6 +242,21 @@ describe("enrichPubTator", () => {
     expect(r.failed).toEqual([
       { id: expect.stringMatching(/^nodes\/papers\/doi-/), error: expect.stringMatching(/already claimed by nodes\/papers\/doi-/) },
     ]);
+  });
+
+  it("leaves a rejected paper untouched", async () => {
+    await importJats({ storage, api, ctx, sources: [{ name: "cited.xml", xml: citedXml }] });
+    const id = "nodes/papers/doi-10-1016-j-cgh-2018-07-026";
+    const doc = (await storage.discoverDocuments()).find((d) => d.id === id)!;
+    const rejected = doc.rawContent.replace("status: published", "status: rejected");
+    await storage.writeDocument(id, rejected);
+
+    const r = await enrichPubTator({ storage, api, ctx, fetchImpl, minIntervalMs: 0 });
+    expect(r.enriched).toEqual([]);
+    expect(r.failed).toEqual([]);
+    expect(r.skipped).toEqual([`${id} (rejected by a steward)`]);
+    const after = (await storage.discoverDocuments({ includeRetired: true })).find((d) => d.id === id)!;
+    expect(after.rawContent).toBe(rejected);
   });
 
   it("reports papers with no resolvable PMID instead of failing", async () => {

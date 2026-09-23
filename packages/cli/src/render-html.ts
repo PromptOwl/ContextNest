@@ -32,7 +32,7 @@ function markdownToHtml(md: string): string {
   function flushTable() {
     if (!inTable) return;
     inTable = false;
-    const rows = tableRows.filter((r) => !r.match(/^\s*\|[\s:-]+\|\s*$/)); // skip separator
+    const rows = tableRows.filter((r) => !r.match(/^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/)); // skip separator
     if (rows.length === 0) return;
     let t = "<table>\n<thead>\n<tr>";
     const headerCells = splitCells(rows[0]);
@@ -169,6 +169,9 @@ function inlineMarkdown(text: string): string {
   return s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => code[Number(i)]);
 }
 
+/** Whitespace, quotes, and C0/C1 controls — browsers strip leading controls before reading a scheme. */
+const UNSAFE_URL_CHAR = /[\s\u0000-\u001f\u007f-\u009f"'<>]/;
+
 /**
  * A link a vault page may follow: `http(s)`, `ftp`, `mailto`, the vault's own
  * `contextnest://` scheme, an in-page `#anchor`, or a relative path (no scheme,
@@ -176,14 +179,14 @@ function inlineMarkdown(text: string): string {
  */
 function safeHref(url: string): boolean {
   const u = url.trim();
-  if (!u || /[\s"'<>]/.test(u)) return false;
+  if (!u || UNSAFE_URL_CHAR.test(u)) return false;
   if (/^(?:https?:|ftp:|mailto:|contextnest:)/i.test(u)) return true;
   return !/^[a-z][a-z0-9+.-]*:/i.test(u) && !u.startsWith("//");
 }
 
 /** A wikilink target: no scheme, no protocol-relative `//`, no control/quote characters. */
 function isVaultRelative(target: string): boolean {
-  return target.length > 0 && !/^[a-z][a-z0-9+.-]*:/i.test(target) && !target.startsWith("//") && !/[\s"'<>]/.test(target);
+  return target.length > 0 && !/^[a-z][a-z0-9+.-]*:/i.test(target) && !target.startsWith("//") && !UNSAFE_URL_CHAR.test(target);
 }
 
 /** Split a GFM table row on pipes that are not escaped as `\|` (and unescape `\\`). */

@@ -42,6 +42,9 @@ describe("render-html — importer constructs", () => {
     expect(bs).toContain("<td>C:\\path | x</td>");
     expect(html).toContain("<td><strong>Negative</strong></td>");
     expect(html).toContain("<th>Threshold</th>");
+    // The `| --- | --- |` delimiter row is syntax, not a data row.
+    expect(html).not.toContain("<td>---</td>");
+    expect(renderDocumentHtml(node("| a | b |\n|:--|--:|\n| 1 | 2 |\n"))).not.toContain(":--");
   });
 
   it("refuses javascript:/data: schemes in links and wikilinks (page auto-opens in a browser)", () => {
@@ -61,6 +64,13 @@ describe("render-html — importer constructs", () => {
     expect(html).not.toContain('href="//evil');
     expect(html).toContain("bad (javascript:alert(1))");
     expect(html).toContain("wiki");
+  });
+
+  it("refuses a scheme hidden behind a control character (browsers strip leading C0)", () => {
+    // `&#1;javascript:` in JATS decodes to U+0001, which the scheme check
+    // would otherwise read as a relative path.
+    const html = renderDocumentHtml(node("[x](\u0001javascript:location=name) [[\u0001javascript:location=name]]\n"));
+    expect(html).not.toMatch(/href="[^"]*javascript:/);
   });
 
   it("keeps relative and contextnest:// links clickable (pre-existing vault content)", () => {

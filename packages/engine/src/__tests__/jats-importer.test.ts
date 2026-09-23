@@ -116,6 +116,20 @@ describe("jatsToDocument — body", () => {
     expect(lines).toContain("$$\\hat{p} = \\frac{\\sum k_i}{\\sum n_i}$$");
   });
 
+  it("strips the LaTeX document wrapper PMC puts around <tex-math>", () => {
+    const wrap = (m: string) =>
+      "\\documentclass[12pt]{minimal}\n\\usepackage{amsmath}\n\\usepackage{wasysym}\n" +
+      `\\begin{document}${m}\\end{document}`;
+    const pmc = xml
+      .replace("<tex-math>p = \\frac{k}{n}</tex-math>", `<tex-math>${wrap("$p = \\frac{k}{n}$")}</tex-math>`)
+      .replace("<tex-math>\\hat{p}", `<tex-math>${wrap("$$\\hat{p}").replace("\\end{document}", "")}`)
+      .replace("\\frac{\\sum k_i}{\\sum n_i}</tex-math>", "\\frac{\\sum k_i}{\\sum n_i}$$\\end{document}</tex-math>");
+    const out = jatsToDocument(pmc).content;
+    expect(out).toContain("modelled as $p = \\frac{k}{n}$ and pooled by ^p_2_1");
+    expect(out).toContain("\n$$\\hat{p} = \\frac{\\sum k_i}{\\sum n_i}$$\n");
+    expect(out).not.toContain("documentclass");
+  });
+
   it("emits a markdown table with an escaped pipe and a caption line", () => {
     expect(lines).toContain("**Table 1.** Donor screening panel");
     expect(lines).toContain("| Test | Threshold |");
@@ -215,6 +229,13 @@ describe("jatsToDocument — untrusted input", () => {
     expect(r.warnings).toContain('duplicate paragraph id "p_1_1"; anchor kept on the first only');
     const anchors = r.content.split("\n").filter((l) => l.endsWith(" ^p_1_1"));
     expect(anchors).toHaveLength(1);
+  });
+
+  it("rejects truncated XML instead of publishing a hollow twin over the real one", () => {
+    // A cut-off download still carries the <article-id>s, so without this the
+    // stub would overwrite the good twin under the same PMID.
+    const truncated = xml.slice(0, xml.indexOf("<body>") + 200);
+    expect(() => jatsToDocument(truncated)).toThrow(/not well-formed/);
   });
 });
 

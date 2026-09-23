@@ -24,7 +24,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { XMLParser } from "fast-xml-parser";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { parseDocument, serializeDocument } from "../parser.js";
 import { TAG_PATTERN } from "../schemas.js";
 import { normalizeFolder } from "../storage.js";
@@ -223,13 +223,13 @@ function inline(n: XNode | string): string {
     }
     case "inline-formula": {
       const tex = find(n, "tex-math");
-      if (tex) return `$${squash(itertext(tex))}$`;
+      if (tex) return `$${texOf(tex)}$`;
       return squash(inner());
     }
     case "disp-formula": {
       // Display math inside a paragraph: keep the LaTeX inline.
       const tex = find(n, "tex-math");
-      if (tex) return `$$${squash(itertext(tex))}$$`;
+      if (tex) return `$$${texOf(tex)}$$`;
       return squash(inner());
     }
     case "ext-link":
@@ -267,6 +267,18 @@ function inline(n: XNode | string): string {
   }
 }
 
+/**
+ * The formula inside `<tex-math>`. PMC wraps most of them in a standalone
+ * document (`\documentclass…\begin{document}$$x$$\end{document}`); keep only
+ * the math, without its own delimiters, so the caller's `$`/`$$` are the only ones.
+ */
+function texOf(tex: XNode): string {
+  let s = squash(itertext(tex));
+  const doc = s.match(/\\begin\{document\}([\s\S]*?)\\end\{document\}/);
+  if (doc) s = doc[1].trim();
+  return s.replace(/^\$\$?([\s\S]*?)\$?\$$/, "$1").replace(/^\\\[([\s\S]*)\\\]$/, "$1").trim();
+}
+
 /** Schemes a twin may link to. Matches the renderer's allowlist. */
 const SAFE_LINK = /^(?:https?:|ftp:|mailto:)/i;
 
@@ -282,7 +294,7 @@ function wrapIfText(s: string, mark: string): string {
 /** `<alternatives>` holds the same content several ways; prefer TeX, then text. */
 function inlineAlternatives(n: XNode): string {
   const tex = find(n, "tex-math");
-  if (tex) return `$${squash(itertext(tex))}$`;
+  if (tex) return `$${texOf(tex)}$`;
   const first = n.children.find(isNode);
   return first ? inline(first) : "";
 }
@@ -415,7 +427,7 @@ function renderFigure(fig: XNode, st: RenderState): void {
 
 function renderDispFormula(f: XNode, st: RenderState): void {
   const tex = find(f, "tex-math");
-  const text = tex ? `$$${squash(itertext(tex))}$$` : squash(f.children.map(inline).join(""));
+  const text = tex ? `$$${texOf(tex)}$$` : squash(f.children.map(inline).join(""));
   if (!text) return;
   pushBlank(st);
   st.lines.push(text);
@@ -733,6 +745,13 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   const normalized = xml.replace(/\r\n?/g, "\n");
   const sha256 = createHash("sha256").update(normalized).digest("hex");
   const warnings: string[] = [];
+
+  // The parser is lenient: truncated XML parses to a partial tree that still
+  // names the paper, and would publish a hollow twin over the real one.
+  const valid = XMLValidator.validate(normalized);
+  if (valid !== true) {
+    throw new Error(`JATS import: XML is not well-formed (line ${valid.err.line}: ${valid.err.msg})`);
+  }
 
   const roots = toTree(parser.parse(normalized) as Ordered);
   const article =
