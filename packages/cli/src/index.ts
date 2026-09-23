@@ -195,7 +195,6 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["read", "Show a document (add --html to open it in the browser)"],
       ["update", "Edit a document, then auto-publish a new version"],
       ["delete", "Remove a document and its version history"],
-      ["import", "Import files as nodes (pdf: extracted text + the PDF itself)"],
     ],
   },
   {
@@ -229,7 +228,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   {
     title: "Import & enrich",
     commands: [
-      ["import", "Bring external formats in as markdown twins (jats, pubmed)"],
+      ["import", "Bring external files in as nodes (pdf, jats, pubmed)"],
       ["enrich", "Add curated annotations to imported nodes (pubtator)"],
     ],
   },
@@ -2444,7 +2443,7 @@ program
 
 const importCmd = program
   .command("import")
-  .description("Import external files as vault nodes");
+  .description("Import external files as vault nodes (pdf, jats, pubmed)");
 
 interface PdfImportView {
   id: string;
@@ -2647,11 +2646,7 @@ cpCmd
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
   });
 
-// ─── ctx import / ctx enrich ─────────────────────────────────────────────────
-
-const importCmd = program
-  .command("import")
-  .description("Bring external formats into the vault as markdown twins");
+// ─── ctx import jats|pubmed / ctx enrich ─────────────────────────────────────
 
 function printImportSummary(r: {
   published: Array<{ id: string; version: number }>;
