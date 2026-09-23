@@ -20,6 +20,8 @@ export interface DocListView {
   type?: string;
   status?: string;
   tags?: string[];
+  /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
+  vault?: string;
 }
 
 /**
@@ -38,6 +40,7 @@ export function listJsonEntry(d: DocListView) {
     type: d.type || "document",
     status: d.status || "draft",
     tags: d.tags,
+    ...(d.vault ? { vault: d.vault } : {}),
   };
 }
 
@@ -47,6 +50,8 @@ export interface QueryDocView {
   title: string;
   body?: string;
   source?: unknown;
+  /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
+  vault?: string;
 }
 
 /** The full `ctx query --json` payload shape. */
@@ -59,12 +64,18 @@ export function queryJsonPayload(p: {
   nodesTraversed?: number;
 }) {
   return {
-    documents: p.documents.map((d) => ({ id: d.id, title: d.title, body: d.body })),
+    documents: p.documents.map((d) => ({
+      id: d.id,
+      title: d.title,
+      body: d.body,
+      ...(d.vault ? { vault: d.vault } : {}),
+    })),
     sourceNodes: p.sourceNodes.map((d) => ({
       id: d.id,
       title: d.title,
       source: d.source,
       body: d.body,
+      ...(d.vault ? { vault: d.vault } : {}),
     })),
     traceCount: p.traceCount,
     mode: p.mode,
@@ -81,6 +92,8 @@ export interface SearchHitView {
   type?: string;
   /** BM25 relevance score; absent from a remote nest running an older engine. */
   score?: number;
+  /** Server-level remote only: the `--vault <server>/<nest>` holding this hit. */
+  vault?: string;
 }
 
 /** One entry of `ctx search --json`. */
@@ -91,6 +104,7 @@ export function searchJsonEntry(d: SearchHitView) {
     description: d.description,
     type: d.type || "document",
     ...(typeof d.score === "number" ? { score: d.score } : {}),
+    ...(d.vault ? { vault: d.vault } : {}),
   };
 }
 
@@ -139,7 +153,7 @@ export function printSearchResults(
     ),
   );
   for (const doc of results) {
-    console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+    console.log(`  ${chalk.cyan(doc.vault ? `${doc.vault}:${doc.id}` : doc.id)}: ${doc.title}`);
   }
   if (more > 0) console.log(chalk.dim(`\n${footer}`));
 }

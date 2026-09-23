@@ -15,6 +15,8 @@ their own slices — concurrent writes are safe, the vault serializes them, but 
 node belongs to exactly one curator).
 
 - **Given a scope: stay inside it.** Pass `--vault <alias>` to every command.
+  A node cited as `<server>/<nest>:id` is edited with `--vault <server>/<nest>`
+  — every write names its nest; a bare server alias can only be searched.
   If you were given node ids, touch only those nodes; your sweep confirms and
   fixes them, it does not expand the set.
 - **Evidence outside your scope** — the fact in another nest, or in nodes not
@@ -103,6 +105,11 @@ the minimal edit:
 In any of those cases: **stop and ask.** Present the change-set — the ids, what
 each would become, and which rung triggered the escalation — and wait. Do not
 begin a rename or a restructure on your own authority.
+
+Once the user approves: refile a node with `ctx move <id> <folder> --vault
+<alias>` (its id changes; history and links follow). That works on a remote
+Community nest only, and a rename (`ctx update --title`) does not work on a
+remote nest at all — ask the user to do those in the app.
 
 ## 5. Report
 

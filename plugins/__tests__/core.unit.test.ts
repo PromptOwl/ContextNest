@@ -11,6 +11,7 @@ import { run as retrieve } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
 import {
   run as captureGate,
+  captureReason,
   captureSignal,
   CHANGE_REASON,
   isSubstantive,
@@ -360,11 +361,11 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
     });
 
     it("a malformed alias is skipped → default unpinned, cannot mask a valid layer", () => {
-      for (const bad of ["my vault", "a/b", "..", "work!"]) {
+      for (const bad of ["my vault", "a/b/c", "/b", "..", "work!"]) {
         expect(getConfig({}, tempSettings({ vault: bad })).vault).toBe("");
       }
       // Junk project value must not hide a valid alias in the user file.
-      const both = tempSettings({ vault: "a/b" }, { vault: "home" });
+      const both = tempSettings({ vault: "a/b/c" }, { vault: "home" });
       expect(getConfig({}, both).vault).toBe("home");
     });
 
@@ -1496,5 +1497,87 @@ describe("makeExec", () => {
     const exec = makeExec({ ctxCommand: process.execPath });
     const res = exec(["-e", "process.exit(3)"]);
     expect(res.status).toBe(3);
+  });
+});
+
+
+// One server alias (`cn`, a Community server's all-nests /mcp) stands for every
+// nest behind it; `ctx vault list` adds a `cn/<nest>` row per nest.
+describe("server-level alias with <server>/<nest> rows", () => {
+  const rows = [
+    { alias: "cn", kind: "remote", description: "All 2 nest(s)" },
+    { alias: "cn/strategy", kind: "remote", parent: "cn", description: "GTM strategy" },
+    { alias: "cn/chameleon", kind: "remote", parent: "cn", description: "Partner: Chameleon" },
+  ];
+
+  it("auto-retrieval searches the server row once, not each nest row", () => {
+    expect(vaultTargets(cfg({}), fakeExec([["vault list", rows]]))).toEqual(["cn"]);
+  });
+
+  it("a <server>/<nest> pin is honoured", () => {
+    const ex = fakeExec([["vault list", rows]]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "cn/chameleon" }), ex)).toEqual(["cn/chameleon"]);
+  });
+
+  it("retrieval cites each hit by the nest it came from", () => {
+    const ex = fakeExec([
+      ["vault list", rows],
+      ["search", [{ id: "nodes/p", title: "Partner pricing", vault: "cn/chameleon" }]],
+    ]);
+    const out = retrieve({ input: { prompt: "partner pricing tiers" }, env: { CLAUDE_PROJECT_DIR: SANDBOX_DIR }, exec: ex });
+    expect(additional(out)).toContain("cn/chameleon:nodes/p");
+  });
+
+  it("the sweep parses --vault <server>/<nest> and reads each hit in its own nest", () => {
+    expect(parseUpdates("ctx update nodes/x --vault cn/chameleon --tags a")).toEqual([
+      { id: "nodes/x", vault: "cn/chameleon" },
+    ]);
+    const reads: string[] = [];
+    const exec = (args: string[]) => {
+      const key = args.join(" ");
+      if (key.startsWith("list --tag")) return { status: 0, stdout: "[]", stderr: "" };
+      if (key.startsWith("search"))
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { id: "nodes/x", vault: "cn/chameleon" }, // the node just written: excluded
+            { id: "nodes/y", vault: "cn/strategy" },
+          ]),
+          stderr: "",
+        };
+      if (key.startsWith("read")) {
+        reads.push(key);
+        return { status: 0, stdout: "we use redis", stderr: "" };
+      }
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", "cn/chameleon", ["cn"]);
+    expect(found).toEqual([{ ref: "cn/strategy:nodes/y", term: "redis", stale: false }]);
+    expect(reads).toEqual(["read nodes/y --raw --vault cn/strategy"]);
+  });
+
+  it("sweepTargets skips nest rows (the server row covers them)", () => {
+    const { targets } = sweepTargets(fakeExec([["vault list", rows]]), "cn/chameleon", {});
+    // The server row already searches cn/chameleon — no second pass for it.
+    expect(targets).toEqual(["cn"]);
+  });
+});
+
+describe("unclear_nest setting", () => {
+  it("defaults to ask; accepts default; ignores garbage", () => {
+    expect(cfg({}).unclearNest).toBe("ask");
+    expect(cfg({ CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST: "default" }).unclearNest).toBe("default");
+    expect(cfg({ CONTEXTNEST_UNCLEAR_NEST: "Default " }).unclearNest).toBe("default");
+    expect(cfg({ CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST: "guess" }).unclearNest).toBe("ask");
+  });
+
+  it("travels in the capture directive", () => {
+    expect(captureReason("propose")).toMatch(/asks the user which nest/);
+    expect(captureReason("propose", "default")).toMatch(/pinned vault, else the registry default/);
+  });
+
+  it("a <server>/<nest> pin passes the alias-shape check", () => {
+    expect(cfg({ CONTEXTNEST_VAULT_ALIAS: "cn/chameleon" }).vault).toBe("cn/chameleon");
+    expect(cfg({ CONTEXTNEST_VAULT_ALIAS: "a/b/c" }).vault).toBe("");
   });
 });

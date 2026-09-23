@@ -77,6 +77,8 @@ import {
   remoteUpdate,
   remotePublish,
   remoteDelete,
+  remoteMove,
+  expandServerVaults,
   folderFromId,
 } from "./remote.js";
 import {
@@ -2439,6 +2441,24 @@ program
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
   });
 
+// ─── ctx move ─────────────────────────────────────────────────────────────────
+
+program
+  .command("move <path> <folder>")
+  .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
+  .action(async (path, folder) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (!remote) {
+      // ponytail: remote-only — the engine has no move op yet (a local move must
+      // rename the file, its history and every [[link]]). Add it upstream first.
+      throw new ContextNestError(
+        "ctx move works against a remote Community nest only (--vault <alias>); a local vault has no move operation yet.",
+        "NOT_IMPLEMENTED",
+      );
+    }
+    await remoteMove(remote, path, folder);
+  });
+
 // ─── ctx import ───────────────────────────────────────────────────────────────
 
 const importCmd = program
@@ -3252,10 +3272,10 @@ const vaultCmd = program
 
 vaultCmd
   .command("list")
-  .description("List registered vaults")
+  .description("List registered vaults (and each nest behind a server-level remote, as <alias>/<nest>)")
   .option("--json", "Output as JSON")
-  .action((opts) => {
-    const vaults = listVaults();
+  .action(async (opts) => {
+    const vaults = await expandServerVaults(listVaults());
     if (opts.json) {
       console.log(JSON.stringify(vaults, null, 2));
       return;
@@ -3270,6 +3290,10 @@ vaultCmd
     console.log(chalk.bold("\nRegistered vaults:\n"));
     for (const v of vaults) {
       const marker = v.isDefault ? chalk.green(" *") : "  ";
+      if (v.parent) {
+        console.log(`     ${chalk.cyan(v.alias)}${v.description ? `  ${chalk.dim(v.description)}` : ""}`);
+        continue;
+      }
       if (v.kind === "remote") {
         const endpoint = v.url ?? [v.command, ...(v.args ?? [])].join(" ");
         console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[remote:${v.transport}]`)}`);
