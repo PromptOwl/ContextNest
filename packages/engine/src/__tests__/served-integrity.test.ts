@@ -287,6 +287,36 @@ describe("served documents carry an integrity verdict when verification fails", 
     expect(installed.notes.startsWith(INTEGRITY_WARNING)).toBe(true);
   });
 
+  it("rejected skill whose approved fallback fails its chain: the integrity warning leads notes", async () => {
+    const skillDoc = doc("nodes/ship", "Ship", "\nRun the ship script.\n");
+    skillDoc.frontmatter.type = "skill";
+    skillDoc.frontmatter.skill = { trigger: "When shipping" };
+    await storage.writeDocument("nodes/ship", serializeDocument(skillDoc));
+    await publishDocument(storage, "nodes/ship", { editedBy: "test@local", note: "t" });
+
+    const live = join(vaultPath, "nodes", "ship.md");
+    await writeFile(
+      live,
+      (await readFile(live, "utf-8")).replace("status: published", "status: rejected"),
+      "utf-8",
+    );
+    const history = await storage.readHistory("nodes/ship");
+    const kf = history!.versions.find((v) => v.keyframe)!;
+    const keyframe = join(vaultPath, "nodes", ".versions", "ship", `v${kf.version}.md`);
+    await writeFile(keyframe, (await readFile(keyframe, "utf-8")).replace("ship script", "evil script"), "utf-8");
+
+    const fresh = new NestStorage(vaultPath);
+    const installed = await createEngineApi().run<Record<string, any>>(
+      "context_skill_install",
+      { id: "nodes/ship" },
+      { ...ctx, storage: fresh, versions: new VersionManager(fresh) },
+    );
+    expect(installed.served_version).toBe(kf.version);
+    expect(installed.integrity?.checks).toContain("content_hash_mismatch");
+    expect(installed.notes.startsWith(INTEGRITY_WARNING)).toBe(true);
+    expect(installed.notes).toContain("is rejected");
+  });
+
   it("caches the chain verdict per history version instead of re-hashing every read", async () => {
     const spy = vi.spyOn(storage, "readKeyframe");
     const node = await storage.readDocument("nodes/intact");

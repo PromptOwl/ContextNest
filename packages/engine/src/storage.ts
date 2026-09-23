@@ -756,6 +756,12 @@ export class NestStorage {
       checks.add("body_drift");
     }
 
+    // Deliberately NOT readHistory(): the cache is keyed on the raw bytes,
+    // which readHistory does not expose. The failure mapping mirrors it —
+    // ENOENT = no history (unverified, not failed); any other read error, a
+    // YAML error or a schema failure (readHistory's CorruptHistoryError cases)
+    // = unreadable_history, which is also what verifyVaultIntegrity reports.
+    // Keep the two in step if readHistory gains a new failure case.
     let historyText: string | null = null;
     try {
       historyText = await readFile(this.historyPath(doc.id), "utf-8");

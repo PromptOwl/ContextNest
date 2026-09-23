@@ -26,6 +26,7 @@ import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
 import { isVaultRoot } from "./registry.js";
+import { mapInBatches } from "./concurrency.js";
 
 /**
  * Stamp `integrity` on each served document that fails verification (and
@@ -38,13 +39,14 @@ export async function annotateIntegrity<T extends ContextNode>(
   storage: NestStorage,
   docs: T[],
 ): Promise<T[]> {
-  await Promise.all(
-    docs.map(async (doc) => {
-      const verdict = await storage.verifyServedDocument(doc);
-      if (verdict) doc.integrity = verdict;
-      else delete doc.integrity;
-    }),
-  );
+  // Batched like every other vault-wide scan: one history read per document
+  // (plus keyframe/diff reads on a cache miss) must not open a file handle per
+  // document at once on a wide `context_list full` / full-mode query.
+  await mapInBatches(docs, async (doc) => {
+    const verdict = await storage.verifyServedDocument(doc);
+    if (verdict) doc.integrity = verdict;
+    else delete doc.integrity;
+  });
   return docs;
 }
 

@@ -2294,6 +2294,7 @@ program
         for (const doc of sources) {
           const src = doc.source as { transport?: string; server?: string } | undefined;
           console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+          if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
           console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
         }
       }

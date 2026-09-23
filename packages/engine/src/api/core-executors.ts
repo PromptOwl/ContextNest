@@ -869,10 +869,14 @@ const skillInstall: OperationExecutor = async (ctx, input: any) => {
     ? { ...manifest, integrity, notes: `${integrity.warning} ${manifest.notes}` }
     : manifest;
   if (servedVersion === null) return flagged;
+  // The integrity warning stays FIRST even on the rejected fallback: it is
+  // the caveat that must not be lost if only the first sentence is shown.
   return {
     ...flagged,
     served_version: servedVersion,
-    notes: `${rejectedNote(doc.id, servedVersion)} ${flagged.notes}`,
+    notes: integrity
+      ? `${integrity.warning} ${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`
+      : `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
   };
 };
 
