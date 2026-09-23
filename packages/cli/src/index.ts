@@ -2446,11 +2446,11 @@ program
 program
   .command("move <path> <folder>")
   .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
+  // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
+  // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
   .action(async (path, folder) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (!remote) {
-      // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
-      // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
       // ponytail: remote-only — the engine has no move op yet (a local move must
       // rename the file, its history and every [[link]]). Add it upstream first.
       throw new ContextNestError(

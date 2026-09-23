@@ -785,8 +785,8 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
       const spec = registry.remotes?.[v.alias];
       if (v.kind !== "remote" || spec?.transport !== "http") return null;
       try {
-        // ponytail: an unreachable server costs up to 5s per listing (no failure
-        // cache); cache "unreachable" briefly if that shows up in practice.
+        // An unreachable server costs one probe timeout, then is skipped for
+        // NEST_PROBE_BACKOFF_MS (serverNests remembers the failure).
         return await serverNests(v.alias, {
           ...spec,
           timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS),
