@@ -68,6 +68,13 @@ export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
  */
 export const VALID_CAPTURE_MODES = ["off", "propose", "auto"];
 
+/**
+ * What capture does when no nest's description clearly fits a new node:
+ * `ask` the user (default — a wrong guess can land in a partner's nest), or
+ * write to the `default` vault (the pin, else the registry default).
+ */
+export const VALID_UNCLEAR_NEST = ["ask", "default"];
+
 /** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
 export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
 export const FALSY_VALUES = ["false", "0", "no", "off"];
@@ -81,7 +88,9 @@ export const FALSY_VALUES = ["false", "0", "no", "off"];
  * validates *shape*; whether the alias is actually registered is checked by
  * the /contextnest:config command, which can consult the registry.
  */
-export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+// An optional `/<nest>` suffix addresses one nest behind a server-level
+// remote (`ctx vault list` shows those as `<server>/<nest>` rows).
+export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)?$/;
 
 /**
  * Read a settings override file. Missing or malformed files are silently
@@ -179,8 +188,8 @@ export function getConfig(env = process.env, opts = {}) {
     },
   );
 
-  // Accept the unpin sentinel "" or a shape-valid alias; a malformed alias
-  // ("my vault", "a/b", "..") is skipped so it can't reach ctx as a bad
+  // Accept the unpin sentinel "" or a shape-valid alias (`<alias>` or
+  // `<server>/<nest>`); a malformed one ("my vault", "a/b/c", "..") is skipped so it can't reach ctx as a bad
   // --vault arg. Registry membership is verified by the config command.
   const rawVault = pick(
     "vault",
@@ -216,6 +225,15 @@ export function getConfig(env = process.env, opts = {}) {
         : TRUTHY_VALUES.includes(rawAuto)
           ? "propose"
           : "off"),
+    unclearNest:
+      pick(
+        "unclear_nest",
+        ["CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST", "CONTEXTNEST_UNCLEAR_NEST"],
+        {
+          normalize: (s) => s.trim().toLowerCase(),
+          accept: (s) => VALID_UNCLEAR_NEST.includes(s),
+        },
+      ) || "ask",
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,
@@ -330,6 +348,11 @@ export function listVaults(exec) {
   return Array.isArray(vaults) ? vaults : [];
 }
 
+/** Registry rows to SEARCH: everything but the `<server>/<nest>` rows its server row covers. */
+export function searchableVaults(vaults) {
+  return vaults.filter((v) => !v.parent);
+}
+
 /**
  * True when `alias` names a vault that is registered AND present on disk.
  * `getConfig` only checks the alias *shape*; this is the registry check.
@@ -426,16 +449,25 @@ export function cwdVault(exec, vaults = []) {
  *  - Pinned alias, NOT registered (stale/removed pin) → ignore the pin and
  *    behave as unpinned, rather than passing ctx a bad --vault that resolves to
  *    nothing. session-start surfaces a warning so this isn't silent.
- *  - Unpinned → the vault in the working directory FIRST, then registered
- *    vaults in registry order, capped at MAX_FANOUT_VAULTS in total.
+ *  - Unpinned → the vault in the working directory FIRST, then the registry
+ *    DEFAULT (`ctx vault default`), then the remaining registered vaults in
+ *    registry order, capped at MAX_FANOUT_VAULTS in total.
  *      · The cwd vault is targeted as `null` (no --vault, ctx resolves it
  *        locally) and its hits are cited without an alias prefix. When that
  *        same directory is also registered it is targeted by its alias
  *        instead — once, still first — so a hit keeps a citable `alias:id`
  *        and is never listed twice.
+ *      · The default vault is the one the user chose to stand for "my
+ *        vault" when nothing more specific applies, so it is always a
+ *        target, wherever it sits in the registry. Before this it competed
+ *        for the MAX_FANOUT_VAULTS slots in plain registry order and lost to
+ *        whichever demo vaults happened to be registered earlier — the real
+ *        brain was never searched while its demos filled every prompt.
  *      · Registry entries whose path is missing (`exists: false`) or lives
  *        under os.tmpdir() (scratch vaults agents create) are skipped. A cwd
- *        vault or a pin is a deliberate choice and is never filtered.
+ *        vault, the default vault, or a pin is a deliberate choice and is
+ *        exempt from the tmp filter; a default missing on disk is still
+ *        skipped.
  *  - Unpinned + nothing eligible + no cwd vault → a single null target, i.e.
  *    let ctx resolve the local/default vault with no --vault flag.
  *
@@ -444,17 +476,30 @@ export function cwdVault(exec, vaults = []) {
  * @returns {(string|null)[]} list of alias targets (null = ctx default resolution)
  */
 export function vaultTargets(config, exec) {
-  const present = listVaults(exec).filter((v) => v.exists !== false);
-  if (isVaultRegistered(config.vault, present)) return [config.vault];
+  const listed = listVaults(exec).filter((v) => v.exists !== false);
+  if (isVaultRegistered(config.vault, listed)) return [config.vault];
+  // `<server>/<nest>` rows are for choosing a nest to WRITE to. Searching the
+  // server row already spans every one of its nests in one call (each hit
+  // names its nest), so fanning out over them too would search twice — and
+  // blow MAX_FANOUT_VAULTS on a server with dozens of partner nests.
+  const present = searchableVaults(listed);
 
   const local = cwdVault(exec, present);
   const targets = [];
-  if (local) targets.push(local.alias);
+  const taken = new Set();
+  const take = (alias) => {
+    if (taken.has(alias)) return;
+    taken.add(alias);
+    targets.push(alias);
+  };
+  if (local) take(local.alias);
+  const preferred = present.find((v) => v.isDefault === true);
+  if (preferred) take(preferred.alias);
   for (const v of present) {
     if (targets.length >= MAX_FANOUT_VAULTS) break;
-    if (local && v.alias === local.alias) continue;
+    if (taken.has(v.alias)) continue;
     if (isTmpVaultPath(v.path)) continue;
-    targets.push(v.alias);
+    take(v.alias);
   }
   return targets.length === 0 ? [null] : targets;
 }

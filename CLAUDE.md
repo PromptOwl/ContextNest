@@ -69,9 +69,9 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-38 tools over stdio, in three groups:
+39 tools over stdio, in three groups:
 
-- **Catalog-driven** (19, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_skill`, `context_skill_install`. **Add new tools here, not by hand.**
+- **Catalog-driven** (20, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`. **Add new tools here, not by hand.**
 - **Hand-written, still current** (8): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`.
 - **Deprecated** (11, backward-compatible for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`. Additive parity fixes are allowed here — `list_documents` takes `path` (the `folder` filter of `context_list`), `create_document`/`update_document` take `description` and accept `content` as an alias for `body` — but nothing already accepted may change meaning.
 
@@ -85,7 +85,7 @@ Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate
 
 Each `core/*.js` module exports a **pure** `run({ input, env, exec })` returning the hook-output object (or `null` to do nothing), plus a thin IO shell guarded by `isMain(import.meta.url)`. Tests call `run()` with a fake `exec` — no subprocess. Zero runtime deps, plain Node ESM.
 
-Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `CAPTURE_MODE` (`off`/`propose`/`auto`, default `propose`), `VAULT` (pinned alias), `CTX_COMMAND` (default `ctx`). `AUTO_CAPTURE` is deprecated but still read (`true`→`propose`, `false`→`off`); an explicit `CAPTURE_MODE` wins at any layer.
+Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `CAPTURE_MODE` (`off`/`propose`/`auto`, default `propose`), `UNCLEAR_NEST` (`ask`/`default`, default `ask` — what capture does when no nest clearly fits a new note), `VAULT` (pinned alias; may be `<server>/<nest>`), `CTX_COMMAND` (default `ctx`). `AUTO_CAPTURE` is deprecated but still read (`true`→`propose`, `false`→`off`); an explicit `CAPTURE_MODE` wins at any layer.
 
 **Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
 
@@ -95,7 +95,9 @@ Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retri
 
 ## Key Concepts
 
-**Node types**: `document`, `snippet`, `glossary`, `persona`, `prompt`, `source`, `tool`, `reference`, `skill`
+**Node types**: `document`, `snippet`, `glossary`, `persona`, `prompt`, `source`, `tool`, `reference`, `skill`, `agent`, `artifact`, `table`, `pdf`
+
+**PDF nodes** (spec §1.11): body = extracted text (`<!-- page N -->` markers), the PDF is a binary sidecar `<id>.pdf` beside the `.md`, bound by `pdf.sha256` in frontmatter (so it rides the version chain). Created only by `context_import_pdf` / `ctx import pdf` (`importers/pdf.ts`, unpdf); body edits are refused; prior binaries are archived as `.versions/<doc>/<sha256-hex>.pdf`; `verifyPdfSidecars` reports `sidecar_drift`/`sidecar_missing`; delete removes the sidecar.
 
 **Statuses**: `draft`, `pending_review`, `approved`, `published`, `rejected`. Parse-time aliasing normalizes legacy/foreign values (case-insensitive; unknown → `draft`); disk always stores canonical values, re-canonicalized on round-trip through `serializeDocument` or `ctx index`.
 
@@ -107,7 +109,7 @@ Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retri
 
 ## Releasing
 
-Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together.
+Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together. `CONTEXT_NEST_SPEC.md` is the one exception in the repo: Apache-2.0, per `LICENSE-SPEC`.
 
 ## Specification
 

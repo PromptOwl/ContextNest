@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-engine",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -57,9 +57,11 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "diff": "^9.0.0",
+    "fast-xml-parser": "^4.5.7",
     "js-yaml": "^4.3.2",
     "minisearch": "^7.0.0",
     "toposort": "^2.0.2",
+    "unpdf": "1.7.0",
     "zod": "^3.24.0",
     "zod-to-json-schema": "^3.25.2"
   },

@@ -1,4 +1,5 @@
 import chalk from "./color.js";
+import { TAG_PATTERN, TAG_RULE } from "@promptowl/contextnest-engine";
 
 /**
  * Shared view shapes and formatting for commands that run against BOTH a
@@ -19,6 +20,8 @@ export interface DocListView {
   type?: string;
   status?: string;
   tags?: string[];
+  /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
+  vault?: string;
 }
 
 /**
@@ -37,6 +40,7 @@ export function listJsonEntry(d: DocListView) {
     type: d.type || "document",
     status: d.status || "draft",
     tags: d.tags,
+    ...(d.vault ? { vault: d.vault } : {}),
   };
 }
 
@@ -46,6 +50,8 @@ export interface QueryDocView {
   title: string;
   body?: string;
   source?: unknown;
+  /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
+  vault?: string;
 }
 
 /** The full `ctx query --json` payload shape. */
@@ -58,12 +64,18 @@ export function queryJsonPayload(p: {
   nodesTraversed?: number;
 }) {
   return {
-    documents: p.documents.map((d) => ({ id: d.id, title: d.title, body: d.body })),
+    documents: p.documents.map((d) => ({
+      id: d.id,
+      title: d.title,
+      body: d.body,
+      ...(d.vault ? { vault: d.vault } : {}),
+    })),
     sourceNodes: p.sourceNodes.map((d) => ({
       id: d.id,
       title: d.title,
       source: d.source,
       body: d.body,
+      ...(d.vault ? { vault: d.vault } : {}),
     })),
     traceCount: p.traceCount,
     mode: p.mode,
@@ -80,6 +92,8 @@ export interface SearchHitView {
   type?: string;
   /** BM25 relevance score; absent from a remote nest running an older engine. */
   score?: number;
+  /** Server-level remote only: the `--vault <server>/<nest>` holding this hit. */
+  vault?: string;
 }
 
 /** One entry of `ctx search --json`. */
@@ -90,6 +104,7 @@ export function searchJsonEntry(d: SearchHitView) {
     description: d.description,
     type: d.type || "document",
     ...(typeof d.score === "number" ? { score: d.score } : {}),
+    ...(d.vault ? { vault: d.vault } : {}),
   };
 }
 
@@ -138,7 +153,7 @@ export function printSearchResults(
     ),
   );
   for (const doc of results) {
-    console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+    console.log(`  ${chalk.cyan(doc.vault ? `${doc.vault}:${doc.id}` : doc.id)}: ${doc.title}`);
   }
   if (more > 0) console.log(chalk.dim(`\n${footer}`));
 }
@@ -154,8 +169,18 @@ export function titleFromId(id: string): string {
 
 /** Parse a --tags option: comma/space separated, each tag #-prefixed. */
 export function parseTagsOption(tags: string): string[] {
-  return tags
+  const parsed = tags
     .split(/[,\s]+/)
     .filter((t: string) => t.length > 0)
     .map((t: string) => (t.startsWith("#") ? t : `#${t}`));
+  // Fail here, with the offending tag named, rather than deep in the engine with a bare
+  // "Invalid" — the spec requires a letter first (dates and versions like 2026-09-17 or
+  // 1.23.0 are not tags; prefix them: #d2026-09-17, #v1-23-0).
+  const bad = parsed.filter((t) => !TAG_PATTERN.test(t));
+  if (bad.length > 0) {
+    throw new Error(
+      `${bad.length === 1 ? "Invalid tag" : "Invalid tags"} ${bad.map((t) => JSON.stringify(t)).join(", ")} — ${TAG_RULE}`,
+    );
+  }
+  return parsed;
 }

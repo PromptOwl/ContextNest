@@ -2,7 +2,7 @@
   "packages": [
     {
       "name": "@promptowl/contextnest-cli",
-      "version": "2.6.0",
+      "version": "2.7.0",
       "required": [
         "commander"
       ],
@@ -37,7 +37,7 @@
       "bundled": [
         {
           "name": "@promptowl/contextnest-engine",
-          "version": "2.6.0",
+          "version": "2.7.0",
           "license": "AGPL-3.0",
           "depth": 1,
           "optional": false,
@@ -59,6 +59,16 @@
           "name": "diff",
           "version": "9.0.0",
           "license": "BSD-3-Clause",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "fast-xml-parser",
+          "version": "4.5.7",
+          "license": "MIT",
           "depth": 2,
           "optional": false,
           "via": [
@@ -88,6 +98,16 @@
         {
           "name": "toposort",
           "version": "2.0.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "unpdf",
+          "version": "1.7.0",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -281,6 +301,16 @@
           "via": [
             "@modelcontextprotocol/sdk",
             "body-parser"
+          ]
+        },
+        {
+          "name": "strnum",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -1074,20 +1104,22 @@
     },
     {
       "name": "@promptowl/contextnest-engine",
-      "version": "2.6.0",
+      "version": "2.7.0",
       "required": [
         "@modelcontextprotocol/sdk",
         "diff",
+        "fast-xml-parser",
         "js-yaml",
         "minisearch",
         "toposort",
+        "unpdf",
         "zod",
         "zod-to-json-schema"
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 96,
-      "minimalTotal": 96,
+      "total": 99,
+      "minimalTotal": 99,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
@@ -1103,6 +1135,16 @@
           "name": "diff",
           "version": "9.0.0",
           "license": "BSD-3-Clause",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "fast-xml-parser",
+          "version": "4.5.7",
+          "license": "MIT",
           "depth": 1,
           "optional": false,
           "via": [
@@ -1132,6 +1174,16 @@
         {
           "name": "toposort",
           "version": "2.0.2",
+          "license": "MIT",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "unpdf",
+          "version": "1.7.0",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -1325,6 +1377,16 @@
           "via": [
             "@modelcontextprotocol/sdk",
             "body-parser"
+          ]
+        },
+        {
+          "name": "strnum",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -2119,7 +2181,7 @@
     },
     {
       "name": "@promptowl/contextnest-mcp-server",
-      "version": "2.4.0",
+      "version": "2.5.0",
       "required": [],
       "optional": [],
       "maxDepth": 0,
@@ -2140,7 +2202,7 @@
         },
         {
           "name": "@promptowl/contextnest-engine",
-          "version": "2.6.0",
+          "version": "2.7.0",
           "license": "AGPL-3.0",
           "depth": 1,
           "optional": false,
@@ -2276,6 +2338,16 @@
           ]
         },
         {
+          "name": "fast-xml-parser",
+          "version": "4.5.7",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "hono",
           "version": "4.12.16",
           "license": "MIT",
@@ -2349,6 +2421,16 @@
         {
           "name": "toposort",
           "version": "2.0.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "unpdf",
+          "version": "1.7.0",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -2737,6 +2819,16 @@
             "finalhandler",
             "http-errors",
             "send"
+          ]
+        },
+        {
+          "name": "strnum",
+          "version": "1.1.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {

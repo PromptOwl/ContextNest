@@ -13,6 +13,7 @@ export type {
   SuggestionSource,
   HashChainEventType,
   SourceMeta,
+  PdfMeta,
   SkillInput,
   SkillMeta,
   Frontmatter,
@@ -149,10 +150,14 @@ export {
   STATUS_ALIASES,
   TRANSPORTS,
   sourceMetaSchema,
+  pdfMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
   HASH_CHAIN_EVENT_TYPES,
   TAG_PATTERN,
+  TITLE_MAX_LENGTH,
+  TAG_RULE,
+  describeInvalidTag,
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
   CLIENT_METADATA_RESERVED_KEYS,
@@ -312,6 +317,7 @@ export { VersionManager } from "./versioning.js";
 export {
   normalizeForHash,
   sha256,
+  sha256Bytes,
   computeContentHash,
   computeChainHash,
   computeCheckpointHash,
@@ -383,6 +389,7 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 export {
+  slugify,
   slugifyImportPath,
   isVersionArtifactPath,
   sanitizeImportedFrontmatter,
@@ -419,3 +426,33 @@ export type {
   InstallManifest,
 } from "./skills.js";
 export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";
+
+// PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
+export {
+  extractPdf,
+  isPdf,
+  pdfExtractorVersion,
+  PDF_IMPORTER_VERSION,
+  PDF_EXTRACTOR,
+  UNPDF_VERSION,
+  DEFAULT_PDF_MAX_BYTES,
+} from "./importers/pdf.js";
+export type { PdfExtraction } from "./importers/pdf.js";
+export { readPdfBinary, readPdfMeta, pdfSidecarPath } from "./pdf-nodes.js";
+export type { ReadPdfBinaryOptions } from "./pdf-nodes.js";
+
+// ─── Importers ───────────────────────────────────────────────────────────────
+export {
+  jatsToDocument,
+  linkCitations,
+  buildCitationIndex,
+  splitJatsArticles,
+  JATS_IMPORTER_VERSION,
+} from "./importers/jats.js";
+export type {
+  JatsImportOptions,
+  JatsImportResult,
+  JatsPaperMeta,
+  JatsRef,
+  CitationIndex,
+} from "./importers/jats.js";
