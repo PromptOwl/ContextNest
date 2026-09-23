@@ -17,15 +17,13 @@ import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
-  TAG_PATTERN,
   frontmatterSchema,
   sourceMetaSchema,
+  tagSchema as tag,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
-
-const tag = z.string().regex(TAG_PATTERN);
 
 /** A node as returned in list/query summaries (body optional/trimmed). */
 const nodeSummary = z.object({
