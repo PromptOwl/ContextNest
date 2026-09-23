@@ -188,8 +188,8 @@ export function getConfig(env = process.env, opts = {}) {
     },
   );
 
-  // Accept the unpin sentinel "" or a shape-valid alias; a malformed alias
-  // ("my vault", "a/b", "..") is skipped so it can't reach ctx as a bad
+  // Accept the unpin sentinel "" or a shape-valid alias (`<alias>` or
+  // `<server>/<nest>`); a malformed one ("my vault", "a/b/c", "..") is skipped so it can't reach ctx as a bad
   // --vault arg. Registry membership is verified by the config command.
   const rawVault = pick(
     "vault",

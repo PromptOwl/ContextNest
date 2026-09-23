@@ -190,6 +190,10 @@ async function withRemote<T>(
     return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) });
   } catch (err) {
     // A write through a server-level alias with no nest named: say how to name one.
+    // Coupled to contextnest-community's wording — the SDK's zod refusal of a
+    // missing required `nest` ("invalid_type" … "nest" … "Required") or its own
+    // "requires a `nest` argument". If that wording changes this stops firing
+    // and the raw server error shows instead; the unit test pins the shape.
     if (
       !target.nest &&
       err instanceof ContextNestError &&
@@ -301,7 +305,8 @@ export async function remoteQuery(
     });
 
     out.documents = await labelFanout(target, conn, out.documents);
-    const sourceNodes = out.source_nodes ?? [];
+    // Source nodes can come from a different nest than the matches — label them too.
+    const sourceNodes = await labelFanout(target, conn, out.source_nodes ?? []);
     if (opts.json) {
       // Field selection shared with the local branch (doc-views.ts).
       console.log(
@@ -327,7 +332,7 @@ export async function remoteQuery(
     if (sourceNodes.length > 0) {
       console.log(chalk.bold("\nSource Nodes (hydration order):"));
       for (const doc of sourceNodes) {
-        console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+        console.log(`  ${chalk.magenta(doc.vault ? `${doc.vault}:${doc.id}` : doc.id)}: ${doc.title}`);
       }
     }
     console.log(
@@ -743,20 +748,29 @@ const LIST_PROBE_TIMEOUT_MS = 5_000;
  */
 export async function expandServerVaults(vaults: VaultListEntry[]): Promise<VaultRow[]> {
   const registry = readRegistry();
+  // Probe every server at once: a dead one then costs one timeout per listing,
+  // not one per dead server.
+  const probes = await Promise.all(
+    vaults.map(async (v): Promise<IndexedNest[] | null> => {
+      const spec = registry.remotes?.[v.alias];
+      if (v.kind !== "remote" || spec?.transport !== "http") return null;
+      try {
+        // ponytail: an unreachable server costs up to 5s per listing (no failure
+        // cache); cache "unreachable" briefly if that shows up in practice.
+        return await serverNests(v.alias, {
+          ...spec,
+          timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS),
+        });
+      } catch {
+        return null;
+      }
+    }),
+  );
   const rows: VaultRow[] = [];
-  for (const v of vaults) {
+  vaults.forEach((v, i) => {
     rows.push(v);
-    const spec = registry.remotes?.[v.alias];
-    if (v.kind !== "remote" || spec?.transport !== "http") continue;
-    let nests: IndexedNest[] | null = null;
-    try {
-      // ponytail: an unreachable server costs up to 5s per listing (no failure
-      // cache); cache "unreachable" briefly if that shows up in practice.
-      nests = await serverNests(v.alias, { ...spec, timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS) });
-    } catch {
-      continue;
-    }
-    if (!nests) continue;
+    const nests = probes[i];
+    if (!nests) return;
     if (!v.description) v.description = `All ${nests.length} nest(s) on this server — reads span every nest`;
     const labels = nestLabels(nests);
     for (const n of nests) {
@@ -771,6 +785,6 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
         nest: { id: n.id, name: n.name },
       });
     }
-  }
+  });
   return rows;
 }

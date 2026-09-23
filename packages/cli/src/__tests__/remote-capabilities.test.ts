@@ -52,7 +52,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, nestLabels } = await import("../remote.js");
+const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, remoteQuery, nestLabels, serverNests, expandServerVaults, NEST_INDEX_TTL_MS } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -280,6 +280,77 @@ describe("<server>/<nest> targets", () => {
         "INTERNAL",
       ),
     };
+    const err = await remoteDelete(server, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("--vault cn/<nest>");
+  });
+
+  it("labels query source nodes with their nest too, not just the matches", async () => {
+    advertised = new Set(["nest_index", "context_query"]);
+    replies = {
+      nest_index: { nests },
+      context_query: {
+        documents: [{ id: "nodes/m", title: "M", nest: { id: "id-strategy-000", name: "Strategy" } }],
+        source_nodes: [{ id: "nodes/s", title: "S", nest: { id: "id-chameleon-00", name: "Chameleon Collective" } }],
+      },
+    };
+    await remoteQuery(server, "#x", { json: true });
+    const out = JSON.parse(plain());
+    expect(out.documents[0].vault).toBe("cn/strategy");
+    expect(out.sourceNodes[0].vault).toBe("cn/chameleon-collective");
+  });
+
+  it("serverNests caches the nest list for NEST_INDEX_TTL_MS and refetches after, or when asked fresh", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    const fetches = () => calls.filter((c) => c.op === "nest_index").length;
+    expect(await serverNests("cn", server.spec)).toEqual(nests);
+    expect(await serverNests("cn", server.spec)).toEqual(nests);
+    expect(fetches()).toBe(1); // second call served from ~/.contextnest/cache
+    await serverNests("cn", server.spec, undefined, { fresh: true });
+    expect(fetches()).toBe(2);
+    const now = Date.now;
+    Date.now = () => now() + NEST_INDEX_TTL_MS + 1;
+    try {
+      await serverNests("cn", server.spec);
+    } finally {
+      Date.now = now;
+    }
+    expect(fetches()).toBe(3); // expired
+  });
+
+  it("serverNests returns null for a single-nest endpoint (no nest_index)", async () => {
+    advertised = new Set(["context_list"]);
+    expect(await serverNests("one", { transport: "http", url: "https://x/nests/1/mcp" } as RemoteNestSpec)).toBeNull();
+  });
+
+  it("vault list: a <server>/<nest> row per nest after its server; others untouched; dead servers skipped", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(
+      join(dir, "config.yaml"),
+      "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n  one:\n    transport: http\n    url: https://one.example/nests/1/mcp\n",
+    );
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests: [{ ...nests[0], description: "GTM strategy" }, nests[1]] } };
+    const rows = await expandServerVaults([
+      { alias: "cn", kind: "remote", transport: "http", url: "https://cn.example/mcp", isDefault: true },
+      { alias: "one", kind: "remote", transport: "http", url: "https://one.example/nests/1/mcp", isDefault: false },
+    ]);
+    // `one` answers with nest_index too (same fake) — it would expand the same way,
+    // so prove the shape on `cn` and that local/stdio rows are never probed.
+    expect(rows.slice(0, 3)).toMatchObject([
+      { alias: "cn", description: expect.stringMatching(/All 2 nest/) },
+      { alias: "cn/strategy", parent: "cn", description: "GTM strategy", nest: { id: "id-strategy-000" } },
+      { alias: "cn/chameleon-collective", parent: "cn", description: "Chameleon Collective" },
+    ]);
+    advertised = new Set(); // every server now "unreachable"/single-nest
+    const plainRows = await expandServerVaults([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
+    expect(plainRows).toEqual([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
+  });
+
+  it("the nest-less-write rewrite also matches the server's own prose refusal", async () => {
+    advertised = new Set(["context_delete"]);
+    replies = { context_delete: new ContextNestError("This tool requires a `nest` argument. Use nest_index to see available nests.", "INTERNAL") };
     const err = await remoteDelete(server, "nodes/a").catch((e) => e);
     expect((err as Error).message).toContain("--vault cn/<nest>");
   });

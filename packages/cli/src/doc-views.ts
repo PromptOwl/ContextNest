@@ -74,6 +74,7 @@ export function queryJsonPayload(p: {
       title: d.title,
       source: d.source,
       body: d.body,
+      ...(d.vault ? { vault: d.vault } : {}),
     })),
     traceCount: p.traceCount,
     mode: p.mode,
