@@ -1558,7 +1558,8 @@ describe("server-level alias with <server>/<nest> rows", () => {
 
   it("sweepTargets skips nest rows (the server row covers them)", () => {
     const { targets } = sweepTargets(fakeExec([["vault list", rows]]), "cn/chameleon", {});
-    expect(targets).toEqual(["cn", "cn/chameleon"]);
+    // The server row already searches cn/chameleon — no second pass for it.
+    expect(targets).toEqual(["cn"]);
   });
 });
 

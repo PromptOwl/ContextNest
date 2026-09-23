@@ -149,11 +149,17 @@ export async function serverNests(
 async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnection): Promise<string> {
   const base = target.alias.slice(0, target.alias.indexOf("/"));
   const wanted = target.nest!;
+  // Exact label or id first. A plain name only counts when exactly one nest
+  // carries it: two nests can share a name (unique per owner only), and
+  // picking whichever the server lists first is how a write lands in the
+  // wrong partner's nest. An ambiguous name falls through to the "Available:"
+  // error, which lists the disambiguated labels.
   const find = (nests: IndexedNest[]) => {
     const labels = nestLabels(nests);
-    return nests.find(
-      (n) => labels.get(n.id) === wanted || n.id === wanted || n.name.toLowerCase() === wanted.toLowerCase(),
-    );
+    const exact = nests.find((n) => labels.get(n.id) === wanted || n.id === wanted);
+    if (exact) return exact;
+    const named = nests.filter((n) => n.name.toLowerCase() === wanted.toLowerCase());
+    return named.length === 1 ? named[0] : undefined;
   };
   let nests = await serverNests(base, target.spec, conn);
   // A nest created or shared since the cache was written: ask once more, fresh.

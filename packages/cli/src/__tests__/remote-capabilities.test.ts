@@ -261,6 +261,21 @@ describe("<server>/<nest> targets", () => {
     expect(calls.some((c) => c.op === "context_delete")).toBe(false);
   });
 
+  it("refuses a nest name two nests share, instead of picking the first", async () => {
+    const twins = [
+      { id: "aaaaaaaa-1", name: "Strategy" },
+      { id: "bbbbbbbb-2", name: "Strategy" },
+    ];
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests: twins }, context_delete: { id: "nodes/a", deleted: true } };
+    const err = await remoteDelete({ ...server, alias: "cn/Strategy", nest: "Strategy" }, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("cn/strategy-aaaaaaaa");
+    expect(calls.some((c) => c.op === "context_delete")).toBe(false);
+    // The disambiguated label still works.
+    await remoteDelete({ ...server, alias: "cn/strategy-bbbbbbbb", nest: "strategy-bbbbbbbb" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: "bbbbbbbb-2" } });
+  });
+
   it("labels fan-out hits with the --vault that addresses their nest", async () => {
     advertised = new Set(["nest_index", "context_list"]);
     replies = {

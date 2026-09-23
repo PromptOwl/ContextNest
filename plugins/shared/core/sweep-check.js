@@ -309,8 +309,11 @@ export function sweepTargets(exec, writtenAlias, env) {
   const capped = registered.length > cap;
   const targets = new Set(registered.slice(0, cap));
   // The written vault is always examined (it may be an unregistered local
-  // vault, in which case writtenAlias is null and ctx resolves it).
-  targets.add(writtenAlias);
+  // vault, in which case writtenAlias is null and ctx resolves it) — unless it
+  // is a `<server>/<nest>` whose server is already a target: the server row
+  // searches that nest too, so a second pass would only repeat the round trips.
+  const server = writtenAlias?.includes("/") ? writtenAlias.slice(0, writtenAlias.indexOf("/")) : null;
+  if (!server || !targets.has(server)) targets.add(writtenAlias);
   return { targets: [...targets], capped };
 }
 
