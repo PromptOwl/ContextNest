@@ -579,12 +579,35 @@ describe("[regression] remote nests — unsupported options fail loudly", () => 
     expect(res.stderr + res.stdout).toMatch(/not supported/i);
   });
 
-  it("ctx update --status on a remote errors clearly instead of diverging", () => {
+  it("ctx move reaches the remote's context_move (the OSS server has none: a clear refusal, nothing moved)", () => {
+    const res = run(cwd, ["move", "nodes/api-design", "archive", "--vault", "farnest", "--yes"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/context_move/);
+    expect(existsSync(join(serverVault, "nodes", "api-design.md"))).toBe(true);
+  });
+
+  it("ctx move on a local vault refuses: the engine has no move operation yet", () => {
+    const res = run(cwd, ["move", "nodes/api-design", "archive"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/remote Community nest only/);
+  });
+
+  it("ctx update --title on a remote errors clearly instead of diverging", () => {
+    // A Community nest reads `title` as the node SELECTOR, so a rename sent
+    // alongside `id` would be silently ignored there — refused on every remote.
+    const res = run(cwd, [
+      "update", "nodes/api-design", "--title", "Renamed", "--vault", "farnest",
+    ]);
+    expect(res.status).toBe(1);
+    expect(res.stderr + res.stdout).toMatch(/--title is not supported/);
+  });
+
+  it("ctx update --status on a remote reaches the nest", () => {
     const res = run(cwd, [
       "update", "nodes/api-design", "--status", "draft", "--vault", "farnest",
     ]);
-    expect(res.status).toBe(1);
-    expect(res.stderr + res.stdout).toMatch(/--body/);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Status: draft/);
   });
 
   it("ctx update with no flags on a remote reports nothing to update", () => {

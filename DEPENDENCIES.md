@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 96 | 11 | 96 |
+| `@promptowl/contextnest-engine` | 99 | 11 | 99 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,16 +48,18 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
-| `@promptowl/contextnest-engine` | 2.6.0 | AGPL-3.0 |
+| `@promptowl/contextnest-engine` | 2.5.0 | AGPL-3.0 |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
 | `diff` | 9.0.0 | BSD-3-Clause |
+| `fast-xml-parser` | 4.5.7 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
 | `toposort` | 2.0.2 | MIT |
+| `unpdf` | 1.7.0 | MIT |
 | `zod` | 3.25.76 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 | `@hono/node-server` | 1.19.14 | MIT |
@@ -76,6 +78,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
+| `strnum` | 1.1.2 | MIT |
 | `accepts` | 2.0.0 | MIT |
 | `body-parser` | 2.2.2 | MIT |
 | `content-disposition` | 1.0.1 | MIT |
@@ -158,9 +161,11 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | --- | --- | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
+| `fast-xml-parser` | 4.5.7 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
 | `toposort` | 2.0.2 | MIT | yes | Dependency ordering for `source` node graphs. |
+| `unpdf` | 1.7.0 | MIT | yes | Text extraction for `type: pdf` nodes (pdf.js built for serverless runtimes; pure JS, no native deps). Loaded lazily — only when a PDF is imported. |
 | `zod` | 3.25.76 | MIT | yes | Runtime validation of frontmatter and operation inputs (spec §13 rules 1–17). |
 | `zod-to-json-schema` | 3.25.2 | ISC | yes | Turns the Zod operation catalog into the JSON Schema the MCP tools publish. |
 
@@ -184,6 +189,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause | 2 | `@modelcontextprotocol/sdk` |
 | `pkce-challenge` | 5.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `raw-body` | 3.0.2 | MIT | 2 | `@modelcontextprotocol/sdk`, `body-parser` |
+| `strnum` | 1.1.2 | MIT | 2 | `fast-xml-parser` |
 | `accepts` | 2.0.0 | MIT | 3 | `express` |
 | `body-parser` | 2.2.2 | MIT | 3 | `express` |
 | `content-disposition` | 1.0.1 | MIT | 3 | `express` |
@@ -275,12 +281,12 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 97 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
-| `@promptowl/contextnest-engine` | 2.6.0 | AGPL-3.0 |
+| `@promptowl/contextnest-engine` | 2.5.0 | AGPL-3.0 |
 | `zod` | 3.25.76 | MIT |
 | `@hono/node-server` | 1.19.14 | MIT |
 | `ajv` | 8.18.0 | MIT |
@@ -293,6 +299,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT |
 | `express` | 5.2.1 | MIT |
 | `express-rate-limit` | 8.4.1 | MIT |
+| `fast-xml-parser` | 4.5.7 | MIT |
 | `hono` | 4.12.16 | MIT |
 | `jose` | 6.1.3 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
@@ -301,6 +308,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
 | `toposort` | 2.0.2 | MIT |
+| `unpdf` | 1.7.0 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 | `accepts` | 2.0.0 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
@@ -336,6 +344,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `serve-static` | 2.2.1 | MIT |
 | `shebang-command` | 2.0.0 | MIT |
 | `statuses` | 2.0.2 | MIT |
+| `strnum` | 1.1.2 | MIT |
 | `type-is` | 2.0.1 | MIT |
 | `vary` | 1.1.2 | MIT |
 | `which` | 2.0.2 | ISC |

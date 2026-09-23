@@ -13,12 +13,12 @@
  */
 
 import { NODE_TYPES, TAG_PATTERN } from "./schemas.js";
-import type { ContextNode, Frontmatter, NodeType } from "./types.js";
+import type { ContextNode, Frontmatter, NodeType, PdfMeta } from "./types.js";
 
 const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES);
 
 /** Same rule as `buildDraftNode`'s slug: one dash per non-alphanumeric run. */
-function slugify(input: string): string {
+export function slugify(input: string): string {
   return input
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -340,6 +340,19 @@ export function sanitizeImportedFrontmatter(
   const title = fm.title;
   if (typeof title !== "string" || title.trim() === "") {
     patch.title = firstHeading(node.body) ?? fallbackTitle;
+  }
+
+  // A pdf node's sidecar is `<id>.pdf` (§13 rule 26). When the import lands
+  // the node under a different id (slugified, or `-2` on a collision), the
+  // block would still name the OLD path — invalid, and in the collision case
+  // the path of ANOTHER node's binary. Re-point it at the node's own path.
+  // The bytes themselves do not travel through `files` (text only), so say so.
+  const pdf = fm.pdf as Record<string, unknown> | undefined;
+  if (fm.type === "pdf" && pdf && typeof pdf === "object" && pdf.file !== `${node.id}.pdf`) {
+    patch.pdf = { ...(pdf as unknown as PdfMeta), file: `${node.id}.pdf` };
+    warnings.push(
+      `${label}: pdf.file re-pointed from "${String(pdf.file)}" to "${node.id}.pdf" — copy the PDF itself there; binaries do not travel through an import of files`,
+    );
   }
 
   const type = fm.type;

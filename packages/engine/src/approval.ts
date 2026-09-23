@@ -50,6 +50,7 @@ import type {
   VersionEntry,
 } from "./types.js";
 import type { NestStorage } from "./storage.js";
+import { settlePdfForCommit } from "./pdf-nodes.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -269,6 +270,7 @@ async function rollbackDocumentImpl(
     documentId: input.documentId,
     newRawContent: targetContent,
     actor: input.actor,
+    restoring: true,
     note: input.reason
       ? `rollback to v${input.targetVersion}: ${input.reason}`
       : `rollback to v${input.targetVersion}`,
@@ -395,6 +397,8 @@ interface CommitInput {
   newRawContent: string;
   actor: string;
   note?: string;
+  /** True for a rollback — see `settlePdfForCommit`. */
+  restoring?: boolean;
 }
 
 async function commitNewVersion(
@@ -417,6 +421,12 @@ async function commitNewVersion(
       updated_at: updatedAt,
     },
   };
+
+  // A pdf node's text and binary move together: refuse an edit that would
+  // split them, and bring the sidecar in line with the version being sealed.
+  await settlePdfForCommit(input.storage, input.documentId, node, {
+    restoring: input.restoring ?? false,
+  });
 
   // Recompute body checksum on the body-as-it-will-be-serialized so the
   // checksum stored in frontmatter matches what later drift detection

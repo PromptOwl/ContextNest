@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "contextnest",
   "displayName": "Context Nest",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
   "author": { "name": "PromptOwl" },
   "homepage": "https://github.com/promptowl/contextnest",
@@ -27,6 +27,12 @@
       "title": "Auto-capture knowledge (deprecated)",
       "description": "Deprecated — use capture_mode. Kept so existing installs keep working: true maps to propose, false maps to off. capture_mode wins when both are set.",
       "default": true
+    },
+    "unclear_nest": {
+      "type": "string",
+      "title": "When the nest for a new note is unclear",
+      "description": "ask (default) — capture asks which nest before writing; default — it writes to the pinned vault, else the registry default. Matters when one server alias spans several nests (e.g. partner nests).",
+      "default": "ask"
     },
     "vault": {
       "type": "string",

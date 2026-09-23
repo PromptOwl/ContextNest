@@ -77,6 +77,9 @@ import {
   remoteUpdate,
   remotePublish,
   remoteDelete,
+  remoteMove,
+  expandServerVaults,
+  folderFromId,
 } from "./remote.js";
 import {
   listJsonEntry,
@@ -103,6 +106,7 @@ import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { renderDocumentHtml } from "./render-html.js";
+import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
   configureSafety,
   openWriteScope,
@@ -221,6 +225,13 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["validate", "Check documents against the Context Nest spec"],
       ["drift", "Review edits made outside the CLI (suggestion workflow)"],
       ["index", "Regenerate context.yaml and INDEX.md"],
+    ],
+  },
+  {
+    title: "Import & enrich",
+    commands: [
+      ["import", "Bring external files in as nodes (pdf, jats, pubmed)"],
+      ["enrich", "Add curated annotations to imported nodes (pubtator)"],
     ],
   },
   {
@@ -415,6 +426,10 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift stage",
   "drift approve",
   "drift reject",
+  "import pdf",
+  "import jats",
+  "import pubmed",
+  "enrich pubtator",
 ]);
 
 /**
@@ -1908,7 +1923,7 @@ program
 
 program
   .command("verify")
-  .description("Verify integrity of all hash chains")
+  .description("Verify integrity of all hash chains and PDF sidecars")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -1996,6 +2011,19 @@ program
         }
       } else if (!opts.json) {
         console.log(chalk.green(`✓ Checkpoint chain`));
+      }
+    }
+
+    // PDF nodes: every binary must still hash to what its frontmatter (or,
+    // for an archived prior binary, its file name) records.
+    const sidecarErrors = await storage.verifyPdfSidecars();
+    if (sidecarErrors.length > 0) {
+      totalErrors += sidecarErrors.length;
+      allReportErrors.push(...sidecarErrors);
+      if (!opts.json) {
+        for (const err of sidecarErrors) {
+          console.log(chalk.red(`✗ ${err.document}: ${err.type} — expected ${err.expected}, found ${err.actual}`));
+        }
       }
     }
 
@@ -2413,6 +2441,107 @@ program
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
   });
 
+// ─── ctx move ─────────────────────────────────────────────────────────────────
+
+program
+  .command("move <path> <folder>")
+  .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
+  .action(async (path, folder) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (!remote) {
+      // ponytail: remote-only — the engine has no move op yet (a local move must
+      // rename the file, its history and every [[link]]). Add it upstream first.
+      throw new ContextNestError(
+        "ctx move works against a remote Community nest only (--vault <alias>); a local vault has no move operation yet.",
+        "NOT_IMPLEMENTED",
+      );
+    }
+    await remoteMove(remote, path, folder);
+  });
+
+// ─── ctx import ───────────────────────────────────────────────────────────────
+
+const importCmd = program
+  .command("import")
+  .description("Import external files as vault nodes (pdf, jats, pubmed)");
+
+interface PdfImportView {
+  id: string;
+  version: number;
+  created: boolean;
+  unchanged: boolean;
+  status: string;
+  checkpoint: number | null;
+  text_layer: boolean;
+  pdf: { file: string; pages: number; bytes: number; sha256: string };
+}
+
+importCmd
+  .command("pdf <files...>")
+  .description(
+    "Import PDFs as type: pdf nodes — the extracted text becomes the body, the PDF is kept beside it (<id>.pdf) and bound by SHA-256. Re-import with --id to add a new version.",
+  )
+  .option("--folder <folder>", 'Folder under nodes/ (e.g. "reports/2026")')
+  .option("--tags <tags>", "Tags (comma- or space-separated)")
+  .option("--id <id>", "Node id — an existing pdf node gets a new version (one file only)")
+  .option("--title <title>", "Title (default: the PDF's own title, else the file name; one file only)")
+  .option("--no-publish", "Leave the import as a draft instead of publishing it")
+  .option("-m, --message <note>", "Version note")
+  .option("--json", "Output as JSON")
+  .action(async (files: string[], opts) => {
+    if (files.length > 1 && (opts.id || opts.title)) {
+      throw new ContextNestError("--id and --title apply to a single file; import the files one at a time.", "VALIDATION_FAILED");
+    }
+    const storage = getStorage();
+    const tags = opts.tags ? parseTagsOption(opts.tags) : undefined;
+    const results: Array<PdfImportView & { file: string }> = [];
+    const failed: Array<{ file: string; error: string }> = [];
+    for (const file of files) {
+      try {
+        const bytes = await readFile(file);
+        const res = await cliApi().run<PdfImportView>(
+          "context_import_pdf",
+          {
+            bytes_base64: bytes.toString("base64"),
+            filename: pathMod.basename(file),
+            ...(opts.id ? { id: opts.id } : {}),
+            ...(opts.title ? { title: opts.title } : {}),
+            ...(opts.folder ? { folder: opts.folder } : {}),
+            ...(tags ? { tags } : {}),
+            ...(opts.publish === false ? { publish: false } : {}),
+            ...(opts.message ? { note: opts.message } : {}),
+          },
+          opContext(storage, "cli@contextnest.local"),
+        );
+        results.push({ ...res, file });
+        if (opts.json) continue;
+        const pages = `${res.pdf.pages} page${res.pdf.pages === 1 ? "" : "s"}`;
+        if (res.unchanged) {
+          console.log(chalk.dim(`Unchanged ${res.id} — same PDF as v${res.version}`));
+        } else if (res.created) {
+          console.log(chalk.green(`Imported ${file} → ${res.id} v${res.version} (${pages}, ${res.status})`));
+        } else {
+          console.log(chalk.green(`Updated ${res.id} → v${res.version} from ${file} (${pages}, ${res.status})`));
+        }
+        if (!res.text_layer) {
+          console.log(
+            chalk.yellow(
+              "  ⚠ no text layer — a scanned PDF; the node body is empty (OCR is not supported). The PDF itself is stored.",
+            ),
+          );
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failed.push({ file, error: message });
+        if (!opts.json) console.error(chalk.red(`✗ ${file}: ${message}`));
+      }
+    }
+    if (opts.json) {
+      console.log(JSON.stringify({ imported: results, failed }, null, 2));
+    }
+    if (failed.length > 0) process.exit(1);
+  });
+
 // ─── ctx search ───────────────────────────────────────────────────────────────
 
 program
@@ -2537,6 +2666,167 @@ cpCmd
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
   });
 
+// ─── ctx import jats|pubmed / ctx enrich ─────────────────────────────────────
+
+function printImportSummary(r: {
+  published: Array<{ id: string; version: number }>;
+  skipped: string[];
+  failed: Array<{ id?: string; title?: string; error: string }>;
+  relinked?: string[];
+  checkpoint: number | null;
+  warnings: string[];
+}, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(r, null, 2));
+  } else {
+    for (const p of r.published) {
+      const tag = r.relinked?.includes(p.id) ? chalk.dim(" (citations re-linked)") : "";
+      console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}${tag}`);
+    }
+    for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
+    for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? f.title ?? "?"}: ${f.error}`);
+    for (const w of r.warnings) console.log(chalk.yellow(`  ! ${w}`));
+    const n = r.published.length;
+    console.log(
+      chalk.green(`Published ${n} document(s)`) +
+        (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +
+        (r.failed.length ? chalk.red(`, failed ${r.failed.length}`) : ""),
+    );
+    if (r.checkpoint !== null) console.log(`  Checkpoint: ${r.checkpoint}`);
+  }
+  if (r.failed.length > 0) process.exitCode = 1;
+}
+
+importCmd
+  .command("jats <paths...>")
+  .description("Import JATS XML articles (PubMed Central, publisher deposits) as markdown twins")
+  .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
+  .option("--keep-xml", "Also store each original under assets/jats/")
+  .option("--no-relink", "Do not update existing papers whose references now resolve")
+  // No local --force: the global one (see the root command) republishes unchanged twins.
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (paths: string[], opts) => {
+    const storage = getStorage();
+    const sources = await collectJatsFiles(paths);
+    if (sources.length === 0) {
+      console.log(chalk.yellow("No .xml / .nxml files found."));
+      return;
+    }
+    await confirmOrExit(
+      `Import ${sources.length} JATS file(s) into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+    );
+    const r = await importJats({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      sources,
+      folder: opts.folder,
+      keepXml: opts.keepXml,
+      relink: opts.relink,
+      force: isForce(),
+    });
+    printImportSummary(r, opts.json);
+  });
+
+importCmd
+  .command("pubmed")
+  .description("Search PubMed Central (open-access) and import the hits as markdown twins")
+  .requiredOption("--term <query>", 'PubMed query, e.g. "fecal microbiota transplantation[mh] AND open access[filter]"')
+  .option("--max <n>", "Maximum articles to fetch", "25")
+  .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
+  .option("--keep-xml", "Also store each original under assets/jats/")
+  .option("--no-relink", "Do not update existing papers whose references now resolve")
+  .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY) — raises the rate limit from 3/s to 10/s")
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const max = Math.max(1, parseInt(opts.max, 10) || 25);
+    const apiKey = opts.apiKey ?? process.env.NCBI_API_KEY;
+    await confirmOrExit(
+      `Fetch up to ${max} open-access PMC article(s) for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+    );
+    const fetched = await fetchPmcSources({
+      term: opts.term,
+      max,
+      apiKey,
+      onProgress: (done, total, pmcid) => {
+        if (process.stdout.isTTY) process.stdout.write(`\rFetching ${done}/${total} ${pmcid}…`);
+      },
+    });
+    if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+    console.log(chalk.dim(`${fetched.total} match(es) in PMC; fetched ${fetched.sources.length}`));
+    for (const f of fetched.failed) console.log(chalk.yellow(`  ! ${f}`));
+    if (fetched.sources.length === 0) {
+      console.log(chalk.yellow("Nothing to import."));
+      if (fetched.failed.length) process.exitCode = 1;
+      return;
+    }
+    const r = await importJats({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      sources: fetched.sources,
+      folder: opts.folder,
+      keepXml: opts.keepXml,
+      relink: opts.relink,
+      force: isForce(),
+    });
+    printImportSummary(r, opts.json);
+  });
+
+const enrichCmd = program
+  .command("enrich")
+  .description("Add curated annotations to imported nodes");
+
+enrichCmd
+  .command("pubtator [ids...]")
+  .description("Attach NCBI PubTator 3 entities and relations (MeSH-normalised) to imported papers")
+  .option("--folder <folder>", "Folder holding the paper twins", "nodes/papers")
+  // No local --force: the global one (see the root command) re-fetches enriched papers.
+  .option("--tag-limit <n>", "Most-mentioned disease/chemical entities to promote to #mesh- tags", "12")
+  .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY)")
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (ids: string[], opts) => {
+    const storage = getStorage();
+    await confirmOrExit(
+      `Fetch PubTator annotations for ${ids.length ? `${ids.length} paper(s)` : `every paper under ${opts.folder}`} in ${realRootPath() ?? storage.root} and republish them?`,
+    );
+    const r = await enrichPubTator({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      folder: opts.folder,
+      // Raw: enrichPubTator resolves short ids against the papers folder itself.
+      ids,
+      force: isForce(),
+      // `--tag-limit 0` is a real request (no #mesh- tags), not a missing value.
+      tagLimit: Number.isNaN(parseInt(opts.tagLimit, 10)) ? 12 : Math.max(0, parseInt(opts.tagLimit, 10)),
+      apiKey: opts.apiKey ?? process.env.NCBI_API_KEY,
+      onProgress: (msg) => {
+        if (!opts.json) console.error(chalk.dim(`  ${msg}`));
+      },
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      for (const p of r.enriched) console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}`);
+      for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
+      for (const u of r.unresolved) console.log(chalk.yellow(`  ? ${u}`));
+      for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? "?"}: ${f.error}`);
+      for (const w of r.warnings ?? []) console.log(chalk.yellow(`  ! ${w}`));
+      console.log(
+        chalk.green(`Enriched ${r.enriched.length} document(s)`) +
+          (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +
+          (r.unresolved.length ? chalk.yellow(`, unresolved ${r.unresolved.length}`) : ""),
+      );
+      if (r.checkpoint !== null) console.log(`  Checkpoint: ${r.checkpoint}`);
+    }
+    if (r.failed.length > 0) process.exitCode = 1;
+  });
+
 // ─── ctx welcome ──────────────────────────────────────────────────────────────
 
 program
@@ -2653,13 +2943,20 @@ program
     // Read CONTEXT.md
     const contextMd = await storage.readContextMd();
 
-    // Build payload
-    const documents = filtered.map((doc) => ({
-      title: doc.frontmatter.title || doc.id,
-      content: doc.body || "",
-      type: doc.frontmatter.type || "document",
-      tags: (doc.frontmatter.tags || []).map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
-    }));
+    // Build payload. Folder rides alongside title/content the same way
+    // `remoteAdd` sends it: the id itself is never sent (the receiving nest
+    // mints its own from the title), so without `folder` every document
+    // lands flat at the nest root regardless of where it lived locally.
+    const documents = filtered.map((doc) => {
+      const folder = folderFromId(doc.id);
+      return {
+        title: doc.frontmatter.title || doc.id,
+        content: doc.body || "",
+        type: doc.frontmatter.type || "document",
+        tags: (doc.frontmatter.tags || []).map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
+        ...(folder ? { folder } : {}),
+      };
+    });
 
     const serverUrl = opts.server.replace(/\/$/, "");
     const url = `${serverUrl}/nests/${opts.nest}/publish`;
@@ -2962,7 +3259,7 @@ drift
     console.log(`  archived_at: ${chalk.dim(result.archivedAt)}`);
     console.log(
       chalk.dim(
-        `\nNote: canonical file on disk still has the drifted bytes. To restore last-approved content, run:\n  ctx read-version ${id} <last-version> > ${id}.md`,
+        `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
       ),
     );
   });
@@ -2975,10 +3272,10 @@ const vaultCmd = program
 
 vaultCmd
   .command("list")
-  .description("List registered vaults")
+  .description("List registered vaults (and each nest behind a server-level remote, as <alias>/<nest>)")
   .option("--json", "Output as JSON")
-  .action((opts) => {
-    const vaults = listVaults();
+  .action(async (opts) => {
+    const vaults = await expandServerVaults(listVaults());
     if (opts.json) {
       console.log(JSON.stringify(vaults, null, 2));
       return;
@@ -2993,6 +3290,10 @@ vaultCmd
     console.log(chalk.bold("\nRegistered vaults:\n"));
     for (const v of vaults) {
       const marker = v.isDefault ? chalk.green(" *") : "  ";
+      if (v.parent) {
+        console.log(`     ${chalk.cyan(v.alias)}${v.description ? `  ${chalk.dim(v.description)}` : ""}`);
+        continue;
+      }
       if (v.kind === "remote") {
         const endpoint = v.url ?? [v.command, ...(v.args ?? [])].join(" ");
         console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[remote:${v.transport}]`)}`);

@@ -21,6 +21,9 @@ export const NODE_TYPES = [
   "agent",
   "artifact",
   "table",
+  // A PDF document: the body is the text extracted from it, and the required
+  // `pdf:` block binds the binary sidecar beside the .md by SHA-256 (§1.11).
+  "pdf",
 ] as const;
 
 export const STATUSES = [
@@ -150,15 +153,33 @@ export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
 // still matches.
 export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_:-]*$/;
 
+/** Longest `title` a document may carry (§1.4, §13 rule 2). */
+export const TITLE_MAX_LENGTH = 200;
+
+/** The tag rule in words a person can act on — `TAG_PATTERN.source` is not that. */
+export const TAG_RULE =
+  'tags start with a letter and contain only letters, digits, "_", ":" or "-" (e.g. #api, #q3-close, #v2)';
+
+/** One message for every surface that rejects a tag: names the value AND the rule. */
+export const describeInvalidTag = (value: unknown): string =>
+  `invalid tag ${JSON.stringify(value)} — ${TAG_RULE}`;
+
 /** Checksum pattern (§13 rule 8) */
 export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 /** contextnest:// URI pattern */
 export const CONTEXT_NEST_URI_PATTERN = /^contextnest:\/\//;
 
-const tagSchema = z
-  .string()
-  .regex(TAG_PATTERN, `Tag must match pattern: ${TAG_PATTERN.source}`);
+// errorMap, not `.refine()`: a refine becomes a ZodEffects and zod-to-json-schema
+// drops the `pattern` from the published MCP tool schema. The errorMap sees the
+// value (`ctx.data`), so the message still names the offending tag.
+export const tagSchema = z
+  .string({
+    errorMap: (issue, ctx) => ({
+      message: issue.code === "invalid_string" ? describeInvalidTag(ctx.data) : ctx.defaultError,
+    }),
+  })
+  .regex(TAG_PATTERN);
 
 const skillInputSchema = z.object({
   name: z.string().min(1),
@@ -203,9 +224,44 @@ export const sourceMetaSchema = z.object({
   cache_ttl: z.number().int().positive().optional(), // Rule 16
 });
 
+/**
+ * The `pdf` block (§1.11) — present iff `type: pdf`.
+ *
+ * It is what makes the binary part of the governed record: `sha256` names the
+ * exact bytes of the sidecar at `file`, and because the block sits in
+ * frontmatter it is inside every version's content_hash, so the PDF is bound
+ * into the version chain without any change to the chain itself.
+ *
+ * Non-strict for the same reason as {@link sourceMetaSchema}: this parses
+ * files already on disk. `file` is only shape-checked here (relative, `.pdf`,
+ * no `..`); that it names the node's OWN sidecar (`<id>.pdf`) needs the node id
+ * and is checked in `validateDocument` (§13 rule 26).
+ */
+export const pdfMetaSchema = z.object({
+  file: z
+    .string()
+    .min(1)
+    .refine(
+      (f) =>
+        f.toLowerCase().endsWith(".pdf") &&
+        !f.startsWith("/") &&
+        !f.includes("\\") &&
+        !/^[a-zA-Z]:/.test(f) &&
+        !f.split("/").some((seg) => seg === ".." || seg === "."),
+      "pdf.file must be a vault-relative path ending in .pdf (forward slashes, no `..`)",
+    ),
+  sha256: z.string().regex(CHECKSUM_PATTERN, "pdf.sha256 must match sha256:<64 hex chars>"),
+  bytes: z.number().int().min(0),
+  pages: z.number().int().min(0),
+  text_layer: z.boolean(),
+  extractor: z.string().min(1),
+  extractor_version: z.string().min(1),
+  extracted_at: z.string().min(1),
+});
+
 export const frontmatterSchema = z
   .object({
-    title: z.string().min(1).max(200),                    // Rule 2
+    title: z.string().min(1).max(TITLE_MAX_LENGTH),       // Rule 2
     description: z.string().min(1).max(500).optional(),
     type: z.enum(NODE_TYPES).optional(),                   // Rule 6
     tags: z.array(tagSchema).optional(),                   // Rule 5
@@ -219,6 +275,7 @@ export const frontmatterSchema = z
     metadata: z.record(z.unknown()).optional(),
     source: sourceMetaSchema.optional(),
     skill: skillMetaSchema.optional(),
+    pdf: pdfMetaSchema.optional(),
     zone: z
       .string()
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
@@ -256,6 +313,23 @@ export const frontmatterSchema = z
         code: z.ZodIssueCode.custom,
         message: "Skill block must not be present when type is not 'skill'",
         path: ["skill"],
+      });
+    }
+    // Rule 25: pdf block MUST be present when type is "pdf"
+    if (data.type === "pdf" && !data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block is required when type is 'pdf' (§13 rule 25)",
+        path: ["pdf"],
+      });
+    }
+    // Rule 29: pdf block MUST NOT be present on non-pdf types. An untyped
+    // node defaults to `document`, so it may not carry one either.
+    if (data.type !== "pdf" && data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block must not be present when type is not 'pdf' (§13 rule 29)",
+        path: ["pdf"],
       });
     }
   });

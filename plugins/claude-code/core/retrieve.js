@@ -78,25 +78,54 @@ function searchVault(exec, query, alias) {
     id: h.id,
     title: h.title,
     type: h.type,
-    vault: alias || null,
+    // A server-level alias searches every nest; each hit names the
+    // `<server>/<nest>` it lives in, which is what it must be cited and edited as.
+    vault: h.vault || alias || null,
   }));
 }
 
-/** Fan search across the resolved vault targets, capped to MAX_HITS total. */
+/**
+ * Fan search across the resolved vault targets, capped to MAX_HITS total.
+ *
+ * The MAX_HITS slots are handed out round-robin across the targets (first
+ * hit of each, then second hit of each, …) and the survivors are emitted
+ * grouped in target order, so the primary vault (cwd/default) still leads
+ * the block but a secondary vault with a long hit list can no longer fill
+ * every slot before the next target is even searched. Previously the first
+ * target's hits were taken until the cap was reached, which on an unranked
+ * or stopword-heavy search meant one demo vault's alphabetical head crowded
+ * out every other vault on every prompt.
+ */
 function searchAll(exec, config, query) {
   const targets = vaultTargets(config, exec);
-  const out = [];
+  const perTarget = [];
   const seen = new Set();
   for (const alias of targets) {
+    const hits = [];
     for (const hit of searchVault(exec, query, alias)) {
-      const key = `${alias || ""}::${hit.id}`;
+      const key = `${hit.vault || ""}::${hit.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push(hit);
-      if (out.length >= MAX_HITS * targets.length) break;
+      hits.push(hit);
+      if (hits.length >= MAX_HITS) break;
     }
+    perTarget.push(hits);
   }
-  return out.slice(0, MAX_HITS);
+
+  const kept = perTarget.map(() => []);
+  let total = 0;
+  for (let round = 0; total < MAX_HITS; round++) {
+    let progressed = false;
+    for (let t = 0; t < perTarget.length && total < MAX_HITS; t++) {
+      const hit = perTarget[t][round];
+      if (!hit) continue;
+      kept[t].push(hit);
+      total++;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  return kept.flat();
 }
 
 /** Format the cheap-search injection block, or null when there are no hits. */

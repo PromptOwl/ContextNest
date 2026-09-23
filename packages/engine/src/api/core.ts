@@ -17,15 +17,14 @@ import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
-  TAG_PATTERN,
   frontmatterSchema,
+  pdfMetaSchema,
   sourceMetaSchema,
+  tagSchema as tag,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
-
-const tag = z.string().regex(TAG_PATTERN);
 
 /** A node as returned in list/query summaries (body optional/trimmed). */
 const nodeSummary = z.object({
@@ -43,6 +42,10 @@ const nodeSummary = z.object({
   // Source nodes carry their `source` block so agents can hydrate them
   // (spec §1.9, §5). Present only for type:"source".
   source: z.record(z.unknown()).optional(),
+  // PDF nodes carry their `pdf` block (spec §1.11) so a listing can show the
+  // page count / scan warning and link the binary without a second read.
+  // Present only for type:"pdf".
+  pdf: pdfMetaSchema.optional(),
 });
 
 /** A fully-loaded document. */
@@ -346,7 +349,12 @@ const createOp: OperationDescriptor = {
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
       .string()
@@ -485,7 +493,7 @@ const updateOp: OperationDescriptor = {
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node. Nothing converts to or from `pdf`: pdf nodes come only from context_import_pdf.",
       ),
     source: sourceMetaSchema
       .strict()
@@ -689,6 +697,8 @@ const verifyError = z.object({
     "checkpoint_hash_mismatch",
     "body_drift",
     "unreadable_history",
+    "sidecar_drift",
+    "sidecar_missing",
   ]),
   document: z.string().optional(),
   version: z.number().int().optional(),
@@ -700,7 +710,8 @@ const verifyError = z.object({
 const verifyOp: OperationDescriptor = {
   name: "context_verify",
   namespace: "core",
-  description: "Verify every document and checkpoint hash chain in the vault.",
+  description:
+    "Verify every document and checkpoint hash chain in the vault, and re-hash every pdf node's binary against the sha256 its frontmatter records.",
   input: z.object({ ...clientField }),
   output: z.object({ valid: z.boolean(), errors: z.array(verifyError) }),
   errors: ["VALIDATION_FAILED"],
@@ -838,7 +849,12 @@ const importDoc = z
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
     metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
@@ -976,6 +992,86 @@ const importOp: OperationDescriptor = {
 };
 
 
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/**
+ * Import a PDF as a `type: pdf` node (spec §1.11): the binary is stored as a
+ * sidecar beside the node, bound by SHA-256 in the `pdf:` block, and the body
+ * is the text extracted from it. The ONLY way a pdf node comes to exist — the
+ * block records bytes, and no other op carries any.
+ */
+const importPdfOp: OperationDescriptor = {
+  name: "context_import_pdf",
+  namespace: "core",
+  description:
+    "Import a PDF as a `type: pdf` node: the PDF is stored beside the node as a binary sidecar bound by SHA-256, and the node body is its extracted text (one `<!-- page N -->` marker per page; empty for a scanned PDF with no text layer, flagged `text_layer: false`). Pass `id` of an existing pdf node to add a new version — the previous binary is kept in version history; identical bytes are a no-op. The extracted text is read-only: to change it, import a new PDF.",
+  input: z.object({
+    bytes_base64: z.string().min(1).describe("The PDF file, base64-encoded"),
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Node id. An existing pdf node gets a new version; a free id creates the node there. Default: derived from the title under nodes/ (+ folder).",
+      ),
+    title: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe(
+        "Node title. Default: the PDF's own /Title, else the filename, else \"Untitled PDF\". A new version keeps the existing title unless one is given.",
+      ),
+    filename: z
+      .string()
+      .optional()
+      .describe("Original file name — used for the title when neither `title` nor the PDF's metadata gives one. Never read from disk."),
+    folder: z
+      .string()
+      .optional()
+      .describe('Folder path under nodes/ (e.g. "gtm/decks"); segments are slugified. Ignored when `id` is given.'),
+    tags: z.array(tag).optional().describe("Tags (replace the existing ones on a new version)"),
+    description: z.string().optional().describe("One-line summary stored in frontmatter"),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish the import (default true). Pass false to leave it a draft — governed surfaces use this when a write must clear review first.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    version: z.number().int().min(1),
+    created: z.boolean().describe("True when this call created the node, false for a new version (or no-op)"),
+    unchanged: z
+      .boolean()
+      .describe("True when the bytes matched the node's current PDF, so nothing was written"),
+    status: z.enum(STATUSES),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null for a draft / no-op"),
+    pdf: pdfMetaSchema.describe("The node's pdf block — sidecar path, sha256, size, pages, extractor"),
+    text_layer: z
+      .boolean()
+      .describe("False for a scanned PDF: no text was extracted and the body is empty"),
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "REJECTED_DOCUMENT",
+    // The publish refuses a sidecar that does not hash to pdf.sha256.
+    "INTEGRITY_ERROR",
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
+
 // ─── context_skill / context_skill_install ───────────────────────────────────
 
 const skillOp: OperationDescriptor = {
@@ -1096,6 +1192,7 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   packsOp,
   nestsOp,
   importOp,
+  importPdfOp,
   skillOp,
   skillInstallOp,
 ];
