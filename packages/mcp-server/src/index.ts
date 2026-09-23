@@ -666,12 +666,14 @@ tool(
               documents: result.documents.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               source_nodes: result.sourceNodes.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
                 source: d.frontmatter.source,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {
@@ -718,6 +720,7 @@ tool(
                 title: d.frontmatter.title,
                 description: d.frontmatter.description,
                 type: d.frontmatter.type || "document",
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {

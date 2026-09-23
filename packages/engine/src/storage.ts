@@ -21,7 +21,9 @@ import { globFiles } from "./glob.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
+  INTEGRITY_WARNING,
   detectDrift,
+  sha256,
   sha256Bytes,
   verifyDocumentChain,
   verifyCheckpointChain,
@@ -41,6 +43,7 @@ import type {
   ContextYaml,
   PendingChange,
   VerificationReport,
+  IntegrityFailure,
 } from "./types.js";
 import {
   ContextNestError,
@@ -274,6 +277,18 @@ export class NestStorage {
 
   /** Disambiguates concurrent `writeFileDurable` temp files. See that method. */
   private tmpWriteCounter = 0;
+
+  /**
+   * Per-document history verdicts for the serve path, keyed by doc id and
+   * stamped with the digest of the history.yaml bytes they were computed from.
+   * A new version rewrites history.yaml, so the stamp changes and the chain is
+   * re-verified; an unchanged history is not re-hashed on every read. See
+   * `verifyServedDocument`.
+   */
+  private historyVerdicts = new Map<
+    string,
+    { digest: string; errors: VerificationReport["errors"] }
+  >();
 
   /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
@@ -631,34 +646,7 @@ export class NestStorage {
     const checkpointHistory = await this.readCheckpointHistory();
 
     for (const [docId, history] of allHistories) {
-      // Pre-load keyframe bytes so the (synchronous) verifyDocumentChain
-      // callback can re-hash them. Without this the keyframe content check is
-      // skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
-      // left intact — goes undetected. Keyframe files are small; the reads are
-      // cheap, and the chain check below still works when one is missing.
-      //
-      // Non-keyframe entries hash their change log, which now lives in a
-      // v{N}.diff file rather than inline on the entry — pre-load those too, or
-      // a tampered diff file goes unchecked exactly the way a tampered keyframe
-      // used to.
-      const keyframeContent = new Map<number, string>();
-      const diffContent = new Map<number, string>();
-      for (const entry of history.versions) {
-        if (entry.keyframe) {
-          const content = await this.readKeyframe(docId, entry.version);
-          if (content !== null) keyframeContent.set(entry.version, content);
-        } else {
-          const diff = await this.readDiff(docId, entry.version);
-          if (diff !== null) diffContent.set(entry.version, diff);
-        }
-      }
-      const report = verifyDocumentChain(
-        docId,
-        history,
-        (version) => keyframeContent.get(version) ?? null,
-        (version) => diffContent.get(version) ?? null,
-      );
-      if (!report.valid) errors.push(...report.errors);
+      errors.push(...(await this.verifyHistoryChain(docId, history)));
     }
 
     if (checkpointHistory) {
@@ -685,6 +673,108 @@ export class NestStorage {
     }
 
     return { valid: errors.length === 0, errors };
+  }
+
+  /**
+   * Verify one document's version chain (§8.4 steps 2-3), re-hashing its
+   * keyframe and diff files. Returns the errors; empty means intact.
+   *
+   * Keyframe bytes are pre-loaded so the (synchronous) verifyDocumentChain
+   * callback can re-hash them. Without this the keyframe content check is
+   * skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
+   * left intact — goes undetected. Keyframe files are small; the reads are
+   * cheap, and the chain check still works when one is missing.
+   *
+   * Non-keyframe entries hash their change log, which now lives in a
+   * v{N}.diff file rather than inline on the entry — pre-load those too, or
+   * a tampered diff file goes unchecked exactly the way a tampered keyframe
+   * used to.
+   */
+  async verifyHistoryChain(
+    docId: string,
+    history: DocumentHistory,
+  ): Promise<VerificationReport["errors"]> {
+    const keyframeContent = new Map<number, string>();
+    const diffContent = new Map<number, string>();
+    for (const entry of history.versions) {
+      if (entry.keyframe) {
+        const content = await this.readKeyframe(docId, entry.version);
+        if (content !== null) keyframeContent.set(entry.version, content);
+      } else {
+        const diff = await this.readDiff(docId, entry.version);
+        if (diff !== null) diffContent.set(entry.version, diff);
+      }
+    }
+    const report = verifyDocumentChain(
+      docId,
+      history,
+      (version) => keyframeContent.get(version) ?? null,
+      (version) => diffContent.get(version) ?? null,
+    );
+    return report.errors;
+  }
+
+  /**
+   * Integrity verdict for ONE document about to be served to an agent: the
+   * per-document subset of `verifyVaultIntegrity` — `body_drift` (live body vs
+   * its frontmatter checksum), and `content_hash_mismatch` /
+   * `chain_hash_mismatch` / `unreadable_history` in its own version chain.
+   *
+   * Returns `undefined` when nothing failed — including a document with no
+   * checksum or no history yet, which is unverified rather than tampered.
+   * Never throws for an integrity problem: a failing document is still served
+   * (it is the document asked about); the verdict rides along so the agent is
+   * told not to trust its values.
+   *
+   * Cost: the drift check hashes the body already in memory. The chain check
+   * reads history.yaml and is cached against the digest of its bytes, so the
+   * keyframe/diff re-hash runs once per document version, not once per read.
+   * Limitation: a keyframe/diff file tampered AFTER its version was verified
+   * in this process is caught by `ctx verify`, not here, until history.yaml
+   * next changes. Checkpoint cross-chain checks stay vault-level (`ctx verify`).
+   */
+  async verifyServedDocument(doc: ContextNode): Promise<IntegrityFailure | undefined> {
+    const checks = new Set<string>();
+
+    // rawContent is empty on synthesized nodes (e.g. a CLI rebuild of a get
+    // payload); no bytes means nothing to compare, not a mismatch.
+    if (doc.rawContent && detectDrift(doc.rawContent, doc.frontmatter.checksum).drifted) {
+      checks.add("body_drift");
+    }
+
+    let historyText: string | null = null;
+    try {
+      historyText = await readFile(this.historyPath(doc.id), "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") checks.add("unreadable_history");
+    }
+    if (historyText !== null) {
+      const digest = sha256(historyText);
+      let cached = this.historyVerdicts.get(doc.id);
+      if (!cached || cached.digest !== digest) {
+        let errors: VerificationReport["errors"];
+        const parsed = (() => {
+          try {
+            return documentHistorySchema.safeParse(yaml.load(historyText!));
+          } catch {
+            return null;
+          }
+        })();
+        if (!parsed || !parsed.success) {
+          errors = [
+            { type: "unreadable_history", document: doc.id, expected: null, actual: "unparseable" },
+          ];
+        } else {
+          errors = await this.verifyHistoryChain(doc.id, parsed.data as DocumentHistory);
+        }
+        cached = { digest, errors };
+        this.historyVerdicts.set(doc.id, cached);
+      }
+      for (const e of cached.errors) checks.add(e.type);
+    }
+
+    if (checks.size === 0) return undefined;
+    return { status: "failed", checks: [...checks], warning: INTEGRITY_WARNING };
   }
 
   /**

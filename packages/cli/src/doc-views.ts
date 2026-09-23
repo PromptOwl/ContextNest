@@ -50,6 +50,8 @@ export interface QueryDocView {
   title: string;
   body?: string;
   source?: unknown;
+  /** Present only when the served document failed integrity verification. */
+  integrity?: unknown;
   /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
   vault?: string;
 }
@@ -67,6 +69,7 @@ export function queryJsonPayload(p: {
     documents: p.documents.map((d) => ({
       id: d.id,
       title: d.title,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
       body: d.body,
       ...(d.vault ? { vault: d.vault } : {}),
     })),
@@ -74,6 +77,7 @@ export function queryJsonPayload(p: {
       id: d.id,
       title: d.title,
       source: d.source,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
       body: d.body,
       ...(d.vault ? { vault: d.vault } : {}),
     })),

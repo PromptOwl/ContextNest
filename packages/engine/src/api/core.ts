@@ -26,6 +26,17 @@ import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
+/**
+ * Present on a served node ONLY when it failed integrity verification (live
+ * body vs its checksum, or its own version chain). The node is still served;
+ * `warning` is the line an agent must heed before repeating any value from it.
+ */
+const integrityVerdict = z.object({
+  status: z.literal("failed"),
+  checks: z.array(z.string()),
+  warning: z.string(),
+});
+
 /** A node as returned in list/query summaries (body optional/trimmed). */
 const nodeSummary = z.object({
   id: z.string(),
@@ -46,12 +57,14 @@ const nodeSummary = z.object({
   // page count / scan warning and link the binary without a second read.
   // Present only for type:"pdf".
   pdf: pdfMetaSchema.optional(),
+  integrity: integrityVerdict.optional(),
 });
 
 /** A fully-loaded document. */
 const documentPayload = z.object({
   id: z.string(),
   frontmatter: frontmatterSchema,
+  integrity: integrityVerdict.optional(),
   body: z.string(),
   /** Exact stored bytes, frontmatter block included. Only with `include_raw`. */
   raw: z.string().optional(),

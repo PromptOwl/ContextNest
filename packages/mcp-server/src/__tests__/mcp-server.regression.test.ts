@@ -754,6 +754,21 @@ describe("[regression] MCP server e2e — integrity failure", () => {
     const tampered = await callJson(client, "verify_integrity");
     expect(tampered.json.valid).toBe(false);
   });
+
+  it("context_get still serves the tampered document, flagged with the integrity warning (NestBench T10)", async () => {
+    // Runs after the tamper above: nodes/sealed no longer matches its checksum.
+    const { json } = await callJson(client, "context_get", { id: "nodes/sealed" });
+    expect(json.body).toContain("tampered out of band");
+    expect(json.integrity?.status).toBe("failed");
+    expect(json.integrity?.checks).toContain("body_drift");
+    expect(json.integrity?.warning).toMatch(/^⚠ Integrity check failed/);
+  });
+
+  it("an intact document is served with no integrity key", async () => {
+    await callJson(client, "create_document", { path: "nodes/clean", title: "Clean", body: "fine" });
+    const { json } = await callJson(client, "context_get", { id: "nodes/clean" });
+    expect(json).not.toHaveProperty("integrity");
+  });
 });
 
 // ─── selector operators ──────────────────────────────────────────────────────

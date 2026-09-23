@@ -18,6 +18,7 @@ export type {
   SkillMeta,
   Frontmatter,
   ContextNode,
+  IntegrityFailure,
   PendingChange,
   SuggestionMeta,
   HashChainEvent,
@@ -326,6 +327,8 @@ export {
   verifyCheckpointChain,
   detectDrift,
   verifyRemoteDelta,
+  INTEGRITY_WARNING,
+  withIntegrityWarning,
 } from "./integrity.js";
 export type {
   DriftReport,
@@ -381,7 +384,7 @@ export type { InjectorOptions } from "./injection.js";
 
 // Graph traversal
 export { GraphTraverser } from "./graph-traverser.js";
-export { GraphQueryEngine } from "./graph-query-engine.js";
+export { GraphQueryEngine, annotateIntegrity } from "./graph-query-engine.js";
 export type { GraphQueryOptions } from "./graph-query-engine.js";
 export { evaluateFromIndex } from "./selector/index-evaluator.js";
 export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";

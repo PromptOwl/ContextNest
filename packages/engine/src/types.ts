@@ -180,6 +180,19 @@ export interface Frontmatter {
 }
 
 /** A parsed Context Nest document */
+/**
+ * Served-document integrity verdict, present ONLY when verification failed
+ * (see `NestStorage.verifyServedDocument`). An intact or not-yet-verifiable
+ * document carries no verdict, so its wire output is unchanged.
+ */
+export interface IntegrityFailure {
+  status: "failed";
+  /** Which checks failed — `VerificationReport` error types, e.g. `body_drift`. */
+  checks: string[];
+  /** One-line, model-facing warning (`INTEGRITY_WARNING`). */
+  warning: string;
+}
+
 export interface ContextNode {
   /** Relative path without .md extension, e.g. "nodes/api-design" */
   id: string;
@@ -191,6 +204,11 @@ export interface ContextNode {
   body: string;
   /** Full raw file content */
   rawContent: string;
+  /**
+   * Set by the serve paths (graph query, context_get) when this document
+   * failed integrity verification. Absent otherwise. Never serialized to disk.
+   */
+  integrity?: IntegrityFailure;
   /**
    * The `status` the author actually wrote, before normalization, or `null`
    * when the frontmatter carried no `status:` key at all.

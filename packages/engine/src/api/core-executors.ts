@@ -15,6 +15,7 @@ import type {
   ClientMetadata,
   ContextNode,
   Frontmatter,
+  IntegrityFailure,
   PdfMeta,
   SkillMeta,
   SourceMeta,
@@ -91,6 +92,9 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     ...(node.frontmatter.type === "pdf" && node.frontmatter.pdf
       ? { pdf: node.frontmatter.pdf }
       : {}),
+    // Before the body, so an agent reading the payload top-down meets the
+    // warning first. Present only when verification failed.
+    ...(node.integrity ? { integrity: node.integrity } : {}),
     ...(includeBody ? { body: node.body } : {}),
     ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
@@ -256,7 +260,12 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
     client: input.client,
   });
   const budget = input.max_tokens ?? 8000;
-  const documents: Array<{ id: string; frontmatter: Frontmatter; body: string }> = [];
+  const documents: Array<{
+    id: string;
+    frontmatter: Frontmatter;
+    integrity?: IntegrityFailure;
+    body: string;
+  }> = [];
   let tokens = 0;
   let truncated = false;
   for (const d of result.documents) {
@@ -266,7 +275,12 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
       break;
     }
     tokens += cost;
-    documents.push({ id: d.id, frontmatter: d.frontmatter, body: d.body });
+    documents.push({
+      id: d.id,
+      frontmatter: d.frontmatter,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
+      body: d.body,
+    });
   }
   return { documents, tokens_used: tokens, truncated };
 };
@@ -310,9 +324,17 @@ const get: OperationExecutor = async (ctx, input: any) => {
   // Surfaces that let a steward see and revive a retired document opt out —
   // reading one is not the same as republishing it.
   if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  // Served, never refused: a document that fails verification is still the one
+  // asked for. The verdict tells the agent not to trust its values. Skipped
+  // when verify_checksum already swapped in the last-approved content — that
+  // body is the canonical one, and pendingChange carries the drift signal.
+  const integrity = node.pendingChange
+    ? undefined
+    : await ctx.storage.verifyServedDocument(node);
   return {
     id: node.id,
     frontmatter: node.frontmatter,
+    ...(integrity ? { integrity } : {}),
     body: node.body,
     ...(input.include_raw ? { raw: node.rawContent } : {}),
     ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),

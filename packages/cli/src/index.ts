@@ -1270,6 +1270,7 @@ program
       frontmatter: ContextNode["frontmatter"];
       body: string;
       raw?: string;
+      integrity?: { status: string; warning: string };
     }>(
       "context_get",
       { id, include_raw: true, allow_rejected: true },
@@ -1353,6 +1354,9 @@ program
     }
 
     console.log(chalk.dim("─".repeat(60)));
+    // Served, but flagged: an agent reading `ctx read` output meets the warning
+    // before any value from a body that fails verification.
+    if (got.integrity) console.log(chalk.red(got.integrity.warning) + "\n");
     console.log(doc.body.trim());
   });
 
@@ -2217,7 +2221,13 @@ program
 
     // Local query — graph-aware traversal
     const storage = getStorage();
-    type Doc = { id: string; title: string; body?: string; source?: unknown };
+    type Doc = {
+      id: string;
+      title: string;
+      body?: string;
+      source?: unknown;
+      integrity?: { status: string; warning: string };
+    };
     const result = await cliApi().run<{
       documents: Doc[];
       source_nodes?: Doc[];
@@ -2243,12 +2253,14 @@ program
               id: d.id,
               title: d.title,
               body: d.body,
+              integrity: d.integrity,
             })),
             sourceNodes: (result.source_nodes ?? []).map((d) => ({
               id: d.id,
               title: d.title,
               source: d.source,
               body: d.body,
+              integrity: d.integrity,
             })),
             traceCount: result.trace_count ?? 0,
             mode: result.traversal?.mode,
@@ -2263,6 +2275,7 @@ program
       console.log(chalk.bold("Documents:"));
       for (const doc of result.documents) {
         console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+        if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
       }
       const sources = result.source_nodes ?? [];
       if (sources.length > 0) {
