@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { describeInvalidTag, TAG_RULE } from "../schemas.js";
+import { describeInvalidTag, TAG_PATTERN, TAG_RULE } from "../schemas.js";
 import { CORE_OPERATIONS } from "../api/core.js";
+import { inputJsonSchema } from "../api/index.js";
 
 describe("tag validation errors name the offending tag and the rule", () => {
   const update = CORE_OPERATIONS.find((o) => o.name === "context_update")!;
@@ -23,6 +24,11 @@ describe("tag validation errors name the offending tag and the rule", () => {
     const r = create.input.safeParse({ path: "nodes/x", title: "x", tags: ["v1.23.0"] });
     expect(r.success).toBe(false);
     expect(r.success ? "" : r.error.issues[0].message).toContain('invalid tag "v1.23.0"');
+  });
+
+  it("published JSON Schema keeps the tag pattern (a .refine() would drop it)", () => {
+    const schema = inputJsonSchema(update) as { properties: { tags: { items: { pattern?: string } } } };
+    expect(schema.properties.tags.items.pattern).toBe(TAG_PATTERN.source);
   });
 
   it("still accepts every previously valid shape", () => {

@@ -164,9 +164,16 @@ export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 /** contextnest:// URI pattern */
 export const CONTEXT_NEST_URI_PATTERN = /^contextnest:\/\//;
 
-const tagSchema = z
-  .string()
-  .refine((v) => TAG_PATTERN.test(v), (v) => ({ message: describeInvalidTag(v) }));
+// errorMap, not `.refine()`: a refine becomes a ZodEffects and zod-to-json-schema
+// drops the `pattern` from the published MCP tool schema. The errorMap sees the
+// value (`ctx.data`), so the message still names the offending tag.
+export const tagSchema = z
+  .string({
+    errorMap: (issue, ctx) => ({
+      message: issue.code === "invalid_string" ? describeInvalidTag(ctx.data) : ctx.defaultError,
+    }),
+  })
+  .regex(TAG_PATTERN);
 
 const skillInputSchema = z.object({
   name: z.string().min(1),
