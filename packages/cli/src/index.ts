@@ -2097,7 +2097,12 @@ program
     // count is the hint that a link's title does not match any published doc.
     console.log(
       `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
-        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved)`,
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
+        (stats.unresolvedContextLinks
+          ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
+            (stats.unresolvedContextLinks === 1 ? "" : "s")
+          : "") +
+        ")",
     );
 
     // Generate INDEX.md for each folder

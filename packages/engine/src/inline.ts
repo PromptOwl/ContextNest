@@ -56,6 +56,13 @@ export interface RelationshipStats {
   fromWikilinks: number;
   /** `[[wikilinks]]` whose target matched no published document. */
   unresolvedWikilinks: number;
+  /**
+   * Local `contextnest://` links whose target is no published document — a
+   * dangling node link, or a tag / folder / search URI (those address a set,
+   * not a node, so they are never an edge). Cross-namespace links are not
+   * counted: they name a node in another nest and still produce an edge.
+   */
+  unresolvedContextLinks: number;
 }
 
 /**
@@ -70,13 +77,27 @@ export interface RelationshipStats {
  * `[[Title|alias]]`, `[[Title#anchor]]` and `[[nodes/id]]` all resolve
  * through the same `wiki-graph` helpers the query side uses. A target that
  * matches nothing produces no edge and is counted in `unresolvedWikilinks`.
+ *
+ * `contextnest://` links follow the same rule as the body-link traversal
+ * (`resolveContextLink`): a local link only becomes an edge when its target
+ * (pin/anchor stripped) is a published document; otherwise it is counted in
+ * `unresolvedContextLinks`. So context.yaml, backlinks and `traverseWikiGraph`
+ * agree on which edges exist, not only on where they point. The one
+ * deliberate exception is a cross-namespace link (with an authority), which
+ * names a node in another nest: it keeps its full URI as the edge target,
+ * because the local index cannot say whether it resolves.
  */
 export function buildRelationshipsWithStats(
   documents: ContextNode[],
 ): { edges: RelationshipEdge[]; stats: RelationshipStats } {
   const edges: RelationshipEdge[] = [];
   const seen = new Set<string>();
-  const stats: RelationshipStats = { edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 };
+  const stats: RelationshipStats = {
+    edges: 0,
+    fromWikilinks: 0,
+    unresolvedWikilinks: 0,
+    unresolvedContextLinks: 0,
+  };
 
   /** Push unless an identical (from, to, type) edge is already present. */
   const add = (edge: RelationshipEdge): boolean => {
@@ -96,7 +117,16 @@ export function buildRelationshipsWithStats(
       // Path with anchor, checkpoint pin and trailing slash stripped; a
       // cross-namespace link keeps its full URI. Same helper the body-link
       // traversal in wiki-graph.ts uses, so both agree on the target.
-      add({ from: doc.id, to: contextLinkTarget(link), type: "reference" });
+      const to = contextLinkTarget(link);
+      if (!to.includes("://")) {
+        // Local: an edge only to a real node, exactly as resolveContextLink.
+        if (!index.ids.has(to)) {
+          stats.unresolvedContextLinks++;
+          continue;
+        }
+        if (to === doc.id) continue;
+      }
+      add({ from: doc.id, to, type: "reference" });
     }
 
     // Extract reference edges from [[wikilinks]]

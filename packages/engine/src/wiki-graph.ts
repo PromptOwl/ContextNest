@@ -21,8 +21,9 @@
  * NOT the same as `GraphTraverser` (graph-traverser.ts). That does
  * priority-weighted BFS over the STRUCTURED, typed relationship edges declared
  * in `context.yaml`. This traverses the UNTYPED free-text link graph scraped
- * from document bodies — `[[Title]]` wikilinks and `contextnest://` links alike. Different edge source, different cost model —
- * kept separate on purpose; neither supersedes the other.
+ * from document bodies — `[[Title]]` wikilinks and `contextnest://` links
+ * alike. Different edge source, different cost model — kept separate on
+ * purpose; neither supersedes the other.
  */
 
 import { codeMask, stripInlineCode } from "./markdown-mask.js";
@@ -197,8 +198,10 @@ export function resolveContextLink(uri: string, index: WikiTitleIndex): string |
  * Every node a body links to, resolved to ids: `[[wikilinks]]` AND
  * `contextnest://` links. The spec (§1.7) defines `contextnest://` as THE link
  * form and `[[..]]` as the wiki convenience, so a link graph that only follows
- * one of them silently drops edges. Dangling targets are omitted; order is
- * first-seen, de-duplicated. Code spans and fences are skipped for both forms.
+ * one of them silently drops edges. Dangling targets are omitted; the result
+ * is de-duplicated, wikilink targets first, then `contextnest://` targets (each
+ * group in body order) — a set, not document order. Code spans and fences are
+ * skipped for both forms. Two linear passes over the body, one per link form.
  */
 export function extractLinkedIds(body: string, index: WikiTitleIndex): string[] {
   const out = new Set<string>();
