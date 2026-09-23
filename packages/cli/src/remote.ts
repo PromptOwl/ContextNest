@@ -105,19 +105,19 @@ function nestCachePath(baseAlias: string): string {
 }
 
 /**
- * The nests behind a server-level alias, or null when the alias is an
- * ordinary single-nest endpoint (it advertises no `nest_index`). Cached per
- * alias for NEST_INDEX_TTL_MS so `ctx vault list` — which the plugin runs at
- * every session start — doesn't cost a round trip each time. The cache is a
- * convenience: unreadable or unwritable, it is simply skipped.
- */
-/**
  * How long a failed nest-list probe is remembered. The plugin lists vaults on
  * every prompt; without this, an offline server costs a full timeout (or three,
  * for connect + listTools + nest_index on a slow one) on each of them.
  */
 export const NEST_PROBE_BACKOFF_MS = 60_000;
 
+/**
+ * The nests behind a server-level alias, or null when the alias is an
+ * ordinary single-nest endpoint (it advertises no `nest_index`). Cached per
+ * alias for NEST_INDEX_TTL_MS so `ctx vault list` — which the plugin runs at
+ * every session start — doesn't cost a round trip each time. The cache is a
+ * convenience: unreadable or unwritable, it is simply skipped.
+ */
 export async function serverNests(
   baseAlias: string,
   spec: RemoteNestSpec,
