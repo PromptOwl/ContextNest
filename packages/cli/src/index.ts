@@ -1397,6 +1397,7 @@ skillCmd
       content: string;
       relative_path: string;
       base: "project_root" | "home";
+      integrity?: IntegrityFailure;
     }>("context_skill", {
       id: normalizeDocumentId(path),
       harness: opts.harness,
@@ -1404,6 +1405,7 @@ skillCmd
       ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
     });
 
+    if (rendered.integrity) console.error(chalk.red(rendered.integrity.warning));
     console.log(chalk.dim(`# ${pathMod.join(resolveInstallBase(rendered.base), rendered.relative_path)}`));
     console.log(rendered.content);
   });
@@ -1851,11 +1853,16 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const { content } = await cliApi().run<{ content: string }>(
+    const { content, integrity } = await cliApi().run<{
+      content: string;
+      integrity?: IntegrityFailure;
+    }>(
       "context_reconstruct",
       { id: normalizeDocumentId(path), version: parseInt(version, 10) },
       opContext(storage, "cli@contextnest.local"),
     );
+    // stderr, like `read --raw`: stdout stays the reconstructed bytes.
+    if (integrity) console.error(chalk.red(integrity.warning));
     console.log(content);
   });
 

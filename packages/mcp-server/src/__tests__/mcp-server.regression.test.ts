@@ -764,6 +764,22 @@ describe("[regression] MCP server e2e — integrity failure", () => {
     expect(json.integrity?.warning).toMatch(/^⚠ Integrity check failed/);
   });
 
+  it("context_list full flags the tampered body; read_version flags a broken chain in its text", async () => {
+    const { json } = await callJson(client, "context_list", { full: true });
+    const sealed = json.documents.find((d: any) => d.id === "nodes/sealed");
+    expect(sealed.integrity?.status).toBe("failed");
+
+    // A doc whose keyframe is altered before anything read it in this server.
+    await callJson(client, "create_document", { path: "nodes/chained", title: "Chained", body: "v1 bytes" });
+    const versionsDir = join(vault, "nodes", ".versions", "chained");
+    const keyframe = (await readdir(versionsDir)).find((f) => /^v\d+\.md$/.test(f))!;
+    const kfPath = join(versionsDir, keyframe);
+    await writeFile(kfPath, (await readFile(kfPath, "utf-8")).replace("v1 bytes", "forged"), "utf-8");
+    const version = Number(keyframe.slice(1, -3));
+    const { text } = await callText(client, "read_version", { path: "nodes/chained", version });
+    expect(text).toMatch(/^⚠ Integrity check failed/);
+  });
+
   it("an intact document is served with no integrity key", async () => {
     await callJson(client, "create_document", { path: "nodes/clean", title: "Clean", body: "fine" });
     const { json } = await callJson(client, "context_get", { id: "nodes/clean" });

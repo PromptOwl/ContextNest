@@ -39,6 +39,7 @@ import {
   applyTypedBlocks,
   sourceMetaSchema,
   NODE_TYPES,
+  withIntegrityWarning,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -793,12 +794,20 @@ tool(
     const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
+    // Plain-text tool, so the verdict can only travel as text: a tampered
+    // version chain puts the warning line ahead of the content (additive —
+    // intact output is byte-identical). Chain only; the live body is not what
+    // this serves. No live node to check against → no verdict.
+    const live = await storage.readDocument(id).catch(() => null);
+    const integrity = live
+      ? await storage.verifyServedDocument(live, { checkBody: false })
+      : undefined;
 
     return {
       content: [
         {
           type: "text" as const,
-          text: content,
+          text: withIntegrityWarning(content, integrity),
         },
       ],
     };

@@ -26,3 +26,12 @@ repeat reads. New exports: `NestStorage.verifyServedDocument`,
 `NestStorage.verifyHistoryChain`, `annotateIntegrity` (stamp verdicts on
 documents a consumer loaded itself), `withIntegrityWarning` (prepend the line
 in markdown assembly) and `INTEGRITY_WARNING`.
+
+Every other surface that hands a body to an agent carries the verdict too:
+`context_list` with `full: true` (summary mode is unchanged and verifies
+nothing), `context_reconstruct` and the legacy `read_version` (chain check
+only — a past version is rebuilt from the history, so the live body's drift
+does not apply; `read_version` is plain text, so the warning line leads it),
+and `context_skill` / `context_skill_install` (a tampered skill is flagged
+before it is run or installed; the warning also leads the install `notes`).
+`ctx reconstruct` and `ctx skill show` print the warning on stderr.

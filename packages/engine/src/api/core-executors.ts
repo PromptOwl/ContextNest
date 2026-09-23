@@ -31,6 +31,7 @@ import {
   parseDocument,
 } from "../parser.js";
 import { Resolver } from "../resolver.js";
+import { annotateIntegrity } from "../graph-query-engine.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -356,6 +357,9 @@ const list: OperationExecutor = async (ctx, input: any) => {
     ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
   });
   const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  // `full` serves bodies, so it gets the same integrity verdict as every other
+  // body-serving path. Summary mode (no body) stays cheap: nothing is hashed.
+  if (input.full === true) await annotateIntegrity(ctx.storage, kept);
   return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
 
@@ -695,10 +699,13 @@ const versions: OperationExecutor = async (ctx, input: any) => {
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // Surface DOCUMENT_NOT_FOUND for a bogus id/title (the descriptor advertises it).
-  await ctx.storage.readDocument(id);
+  const live = await ctx.storage.readDocument(id);
   try {
     const content = await ctx.versions.reconstructVersion(id, input.version);
-    return { id, version: input.version, content };
+    // A past version is rebuilt from the history, so only the chain speaks
+    // for it — the live body's drift says nothing about v{N}.
+    const integrity = await ctx.storage.verifyServedDocument(live, { checkBody: false });
+    return { id, version: input.version, ...(integrity ? { integrity } : {}), content };
   } catch (err) {
     // reconstructVersion codes its own failures (VERSION_NOT_FOUND,
     // RECONSTRUCTION_FAILED) — pass those through. Anything uncoded that leaks
@@ -788,8 +795,14 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
     servedVersion = approved.version;
   }
   const vaultName = config?.name;
+  // A skill is matched on and EXECUTED, so a tampered one matters most. Live
+  // node: full check; approved version rebuilt from history: chain only.
+  const integrity = await ctx.storage.verifyServedDocument(live, {
+    checkBody: servedVersion === null,
+  });
   return {
     doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    integrity,
     servedVersion,
     vaultName,
     serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
@@ -812,16 +825,15 @@ function asValidationError<T>(fn: () => T): T {
 }
 
 const skill: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope } =
+    await loadSkillNode(ctx, input);
   const rendered = asValidationError(() =>
     renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
   );
   return {
     name: rendered.name,
     description: rendered.description,
+    ...(integrity ? { integrity } : {}),
     content: rendered.content,
     relative_path: rendered.relativePath,
     base: rendered.base,
@@ -838,10 +850,8 @@ function rejectedNote(id: string, version: number): string {
 }
 
 const skillInstall: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope, mode } =
+    await loadSkillNode(ctx, input);
   const manifest = asValidationError(() =>
     buildInstallManifest(doc, {
       harness,
@@ -852,11 +862,17 @@ const skillInstall: OperationExecutor = async (ctx, input: any) => {
       mode,
     }),
   );
-  if (servedVersion === null) return manifest;
+  // The installed files are written verbatim; the verdict rides on the result
+  // (and leads `notes`, the text an installing agent relays) so whoever
+  // installs a tampered skill is told before it runs.
+  const flagged = integrity
+    ? { ...manifest, integrity, notes: `${integrity.warning} ${manifest.notes}` }
+    : manifest;
+  if (servedVersion === null) return flagged;
   return {
-    ...manifest,
+    ...flagged,
     served_version: servedVersion,
-    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
+    notes: `${rejectedNote(doc.id, servedVersion)} ${flagged.notes}`,
   };
 };
 

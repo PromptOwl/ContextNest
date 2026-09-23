@@ -733,12 +733,26 @@ export class NestStorage {
    * in this process is caught by `ctx verify`, not here, until history.yaml
    * next changes. Checkpoint cross-chain checks stay vault-level (`ctx verify`).
    */
-  async verifyServedDocument(doc: ContextNode): Promise<IntegrityFailure | undefined> {
+  async verifyServedDocument(
+    doc: ContextNode,
+    options: {
+      /**
+       * false = chain check only. For content served FROM the history (a
+       * reconstructed past version) rather than from the live file, whose
+       * body is not what is being served.
+       */
+      checkBody?: boolean;
+    } = {},
+  ): Promise<IntegrityFailure | undefined> {
     const checks = new Set<string>();
 
     // rawContent is empty on synthesized nodes (e.g. a CLI rebuild of a get
     // payload); no bytes means nothing to compare, not a mismatch.
-    if (doc.rawContent && detectDrift(doc.rawContent, doc.frontmatter.checksum).drifted) {
+    if (
+      options.checkBody !== false &&
+      doc.rawContent &&
+      detectDrift(doc.rawContent, doc.frontmatter.checksum).drifted
+    ) {
       checks.add("body_drift");
     }
 
@@ -1042,6 +1056,8 @@ export class NestStorage {
    * node, its binary sidecar (archived prior binaries go with `.versions/`).
    */
   async deleteDocument(id: string): Promise<void> {
+    // Drop the cached serve-path verdict with the document it describes.
+    this.historyVerdicts.delete(id);
     const filePath = join(this.root, `${id}.md`);
     // A pdf node owns the binary beside it (§1.11): find it BEFORE the .md —
     // the only record of it — is gone. Only the node's own `<id>.pdf` is ever

@@ -194,6 +194,99 @@ describe("served documents carry an integrity verdict when verification fails", 
     expect(verdict?.checks).toEqual(["unreadable_history"]);
   });
 
+  it("context_list full: flags the tampered body, leaves the intact one clean", async () => {
+    await tamperBody("nodes/pricing", "$500", "$5");
+    const api = createEngineApi();
+    const full = await api.run<{ documents: Array<Record<string, any>> }>(
+      "context_list",
+      { full: true },
+      ctx,
+    );
+    const byId = new Map(full.documents.map((d) => [d.id, d]));
+    expect(byId.get("nodes/pricing")?.body).toContain("$5 per seat");
+    expect(byId.get("nodes/pricing")?.integrity).toEqual({
+      status: "failed",
+      checks: ["body_drift"],
+      warning: INTEGRITY_WARNING,
+    });
+    expect(byId.get("nodes/intact")).not.toHaveProperty("integrity");
+  });
+
+  it("context_list summary mode stays cheap: no body, no verification", async () => {
+    await tamperBody("nodes/pricing", "$500", "$5");
+    const spy = vi.spyOn(storage, "verifyServedDocument");
+    const api = createEngineApi();
+    const summary = await api.run<{ documents: Array<Record<string, any>> }>(
+      "context_list",
+      {},
+      ctx,
+    );
+    expect(spy).not.toHaveBeenCalled();
+    for (const d of summary.documents) {
+      expect(d).not.toHaveProperty("body");
+      expect(d).not.toHaveProperty("integrity");
+    }
+    spy.mockRestore();
+  });
+
+  it("context_reconstruct flags a version rebuilt from a broken chain, not an intact one", async () => {
+    const api = createEngineApi();
+    const history = await storage.readHistory("nodes/pricing");
+    const kf = history!.versions.find((v) => v.keyframe)!;
+
+    const clean = await api.run<Record<string, any>>(
+      "context_reconstruct",
+      { id: "nodes/pricing", version: kf.version },
+      ctx,
+    );
+    expect(clean).not.toHaveProperty("integrity");
+
+    // Live-body drift alone says nothing about a past version: not flagged.
+    await tamperBody("nodes/pricing", "$500", "$5");
+    const driftOnly = await api.run<Record<string, any>>(
+      "context_reconstruct",
+      { id: "nodes/pricing", version: kf.version },
+      ctx,
+    );
+    expect(driftOnly).not.toHaveProperty("integrity");
+
+    const keyframe = join(vaultPath, "nodes", ".versions", "pricing", `v${kf.version}.md`);
+    await writeFile(keyframe, (await readFile(keyframe, "utf-8")).replace("$500", "$50"), "utf-8");
+    // Fresh storage: the verdict above is cached per history.yaml digest, and a
+    // keyframe altered AFTER that within the same process is the documented
+    // limit (ctx verify still catches it). A new process sees it immediately.
+    const fresh = new NestStorage(vaultPath);
+    const broken = await api.run<Record<string, any>>(
+      "context_reconstruct",
+      { id: "nodes/pricing", version: kf.version },
+      { ...ctx, storage: fresh, versions: new VersionManager(fresh) },
+    );
+    expect(broken.integrity?.checks).toContain("content_hash_mismatch");
+  });
+
+  it("context_skill / context_skill_install flag a tampered skill node", async () => {
+    const skillDoc = doc("nodes/deploy", "Deploy", "\nRun the safe deploy script.\n");
+    skillDoc.frontmatter.type = "skill";
+    skillDoc.frontmatter.skill = { trigger: "When deploying" };
+    await storage.writeDocument("nodes/deploy", serializeDocument(skillDoc));
+    await publishDocument(storage, "nodes/deploy", { editedBy: "test@local", note: "t" });
+
+    const api = createEngineApi();
+    const clean = await api.run<Record<string, any>>("context_skill", { id: "nodes/deploy" }, ctx);
+    expect(clean).not.toHaveProperty("integrity");
+
+    await tamperBody("nodes/deploy", "safe deploy script", "rm -rf deploy script");
+    const shown = await api.run<Record<string, any>>("context_skill", { id: "nodes/deploy" }, ctx);
+    expect(shown.integrity?.status).toBe("failed");
+    const installed = await api.run<Record<string, any>>(
+      "context_skill_install",
+      { id: "nodes/deploy" },
+      ctx,
+    );
+    expect(installed.integrity?.status).toBe("failed");
+    expect(installed.notes.startsWith(INTEGRITY_WARNING)).toBe(true);
+  });
+
   it("caches the chain verdict per history version instead of re-hashing every read", async () => {
     const spy = vi.spyOn(storage, "readKeyframe");
     const node = await storage.readDocument("nodes/intact");

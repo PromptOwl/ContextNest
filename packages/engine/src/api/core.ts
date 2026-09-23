@@ -687,6 +687,8 @@ const reconstructOp: OperationDescriptor = {
   output: z.object({
     id: z.string(),
     version: z.number().int(),
+    /** Present only when the document's version chain fails verification. */
+    integrity: integrityVerdict.optional(),
     content: z.string(),
   }),
   errors: [
@@ -1113,6 +1115,9 @@ const skillOp: OperationDescriptor = {
   output: z.object({
     name: z.string().describe("Slugified skill / rule name"),
     description: z.string().describe("The harness's local matcher text, from `skill.trigger`"),
+    integrity: integrityVerdict
+      .optional()
+      .describe("Present only when the skill node failed integrity verification — do not run it unreviewed."),
     content: z.string().describe("Complete file content, harness frontmatter included"),
     relative_path: z.string().describe("Path relative to `base`"),
     base: z.enum(["project_root", "home"]),
@@ -1165,6 +1170,9 @@ const skillInstallOp: OperationDescriptor = {
     ),
     post_install: z.string().describe("What the user must do for the harness to pick it up"),
     notes: z.string(),
+    integrity: integrityVerdict
+      .optional()
+      .describe("Present only when the skill node failed integrity verification — do not install it unreviewed."),
     served_version: z
       .number()
       .int()
