@@ -1118,8 +1118,8 @@
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 98,
-      "minimalTotal": 98,
+      "total": 99,
+      "minimalTotal": 99,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",

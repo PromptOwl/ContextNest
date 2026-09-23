@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 98 | 11 | 98 |
+| `@promptowl/contextnest-engine` | 99 | 11 | 99 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,7 +48,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 99 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -281,7 +281,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 99 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
