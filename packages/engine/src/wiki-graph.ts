@@ -20,12 +20,74 @@
  *
  * NOT the same as `GraphTraverser` (graph-traverser.ts). That does
  * priority-weighted BFS over the STRUCTURED, typed relationship edges declared
- * in `context.yaml`. This traverses the UNTYPED free-text `[[Title]]` link graph
- * scraped from document bodies. Different edge source, different cost model —
- * kept separate on purpose; neither supersedes the other.
+ * in `context.yaml`. This traverses the UNTYPED free-text link graph scraped
+ * from document bodies — `[[Title]]` wikilinks and `contextnest://` links
+ * alike. Different edge source, different cost model — kept separate on
+ * purpose; neither supersedes the other.
  */
 
 import { codeMask, stripInlineCode } from "./markdown-mask.js";
+
+// Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
+// Reference definitions are deliberately not matched — they were not links
+// in the AST either.
+//
+// Only ONE `\s*` before the destination: two of them separated by an optional
+// `<` would leave the split between them ambiguous and backtrack quadratically
+// over a long run of spaces (CodeQL js/polynomial-redos). Markdown does not
+// allow whitespace between `<` and the destination anyway.
+//
+// The link text excludes `[` as well as `]` and is length-bounded, for the same
+// reason the rule-4 check in parser.ts is bounded: otherwise a line of many `[`
+// with no closing bracket rescans to the end from every one of them. Unescaped
+// `[` is not valid inline link text, so nothing real is lost.
+//
+// Lives here rather than in `inline.ts` (which re-exports it) so the link graph
+// below can follow `contextnest://` links without an import cycle.
+const CONTEXT_LINK =
+  /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
+
+/** Extract all contextnest:// link targets from a markdown body */
+export function extractContextLinks(body: string): string[] {
+  // Split on CRLF as well as LF: `.` does not match `\r` in a JS regex, so a
+  // stray carriage return would defeat every end-anchored pattern below.
+  const lines = body.split(/\r?\n/);
+  const mask = codeMask(lines);
+  const links: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) continue;
+    const line = stripInlineCode(lines[i]);
+    CONTEXT_LINK.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = CONTEXT_LINK.exec(line)) !== null) {
+      links.push(match[1] ?? match[2]);
+    }
+  }
+
+  return links;
+}
+
+/**
+ * The target path of a `contextnest://` link, with the anchor (`#section`),
+ * checkpoint pin (`@N`) and any trailing slash stripped:
+ * `contextnest://nodes/foo@3#bar` → `nodes/foo`. The pin and anchor address a
+ * version / section OF the target, so the graph edge is to the node itself —
+ * the same edge a `[[nodes/foo]]` wikilink produces.
+ *
+ * A cross-namespace link (an authority component, i.e. a remaining `://`) is
+ * returned as the full original URI: it names a node in another nest, not a
+ * local id. Plain index scans, no regex — linear on any input.
+ */
+export function contextLinkTarget(uri: string): string {
+  let target = uri.startsWith("contextnest://") ? uri.slice("contextnest://".length) : uri;
+  const anchorIdx = target.indexOf("#");
+  if (anchorIdx !== -1) target = target.slice(0, anchorIdx);
+  const pinIdx = target.indexOf("@");
+  if (pinIdx !== -1) target = target.slice(0, pinIdx);
+  if (target.endsWith("/")) target = target.slice(0, -1);
+  return target.includes("://") ? uri : target;
+}
 
 /** Minimal doc shape these primitives need — id + title + body. */
 export interface WikiDocLike {
@@ -98,6 +160,9 @@ export function buildWikiTitleIndex(docs: WikiDocLike[]): WikiTitleIndex {
  */
 export function resolveWikiTarget(target: string, index: WikiTitleIndex): string | null {
   let t = target.trim();
+  // A `contextnest://` URI seed resolves by id only — it is an address, never
+  // a title — so a dangling URI is null rather than a title-lookup accident.
+  if (t.startsWith("contextnest://")) return resolveContextLink(t, index);
   const wrapped = t.match(/^\[\[([^[\]]+)\]\]$/);
   if (wrapped) t = wrapped[1].split("|")[0].trim();
   if (!t) return null;
@@ -117,6 +182,38 @@ export function resolveWikiTarget(target: string, index: WikiTitleIndex): string
     if (hit !== null) return hit;
   }
   return null;
+}
+
+/**
+ * Resolve a `contextnest://` link (pinned / anchored forms included) to a node
+ * id in the doc set, or null when it names no known node — a dangling link, a
+ * folder/tag/search URI, or a cross-namespace link.
+ */
+export function resolveContextLink(uri: string, index: WikiTitleIndex): string | null {
+  const target = contextLinkTarget(uri.trim());
+  return index.ids.has(target) ? target : null;
+}
+
+/**
+ * Every node a body links to, resolved to ids: `[[wikilinks]]` AND
+ * `contextnest://` links. The spec (§1.7) defines `contextnest://` as THE link
+ * form and `[[..]]` as the wiki convenience, so a link graph that only follows
+ * one of them silently drops edges. Dangling targets are omitted; the result
+ * is de-duplicated, wikilink targets first, then `contextnest://` targets (each
+ * group in body order) — a set, not document order. Code spans and fences are
+ * skipped for both forms. Two linear passes over the body, one per link form.
+ */
+export function extractLinkedIds(body: string, index: WikiTitleIndex): string[] {
+  const out = new Set<string>();
+  for (const target of extractWikiLinks(body)) {
+    const to = resolveWikiTarget(target, index);
+    if (to) out.add(to);
+  }
+  for (const uri of extractContextLinks(body)) {
+    const to = resolveContextLink(uri, index);
+    if (to) out.add(to);
+  }
+  return [...out];
 }
 
 /** One exact lookup: id, then exact title, then case-insensitive title. */
@@ -149,8 +246,10 @@ export interface WikiTraversalResult {
 }
 
 /**
- * Breadth-first traversal over the (undirected) wiki-link graph from seed ids.
- * Edges run both directions: A→B if A's body links [[B]], and the reverse.
+ * Breadth-first traversal over the (undirected) body-link graph from seed ids.
+ * Edges run both directions: A→B if A's body links [[B]] or
+ * `[text](contextnest://B)` (pinned `@N` / `#anchor` forms included), and the
+ * reverse. Both link forms produce the same edge — see `extractLinkedIds`.
  * UNGATED — every reachable node within `hops` is returned regardless of
  * status; the consumer is responsible for gating before/after.
  *
@@ -180,10 +279,7 @@ export function traverseWikiGraph(
     (adj.get(b) ?? adj.set(b, new Set()).get(b)!).add(a);
   };
   for (const doc of docs) {
-    for (const target of extractWikiLinks(doc.body)) {
-      const to = resolveWikiTarget(target, index);
-      if (to) link(doc.id, to);
-    }
+    for (const to of extractLinkedIds(doc.body, index)) link(doc.id, to);
   }
 
   const hops = Math.max(0, opts.hops | 0);

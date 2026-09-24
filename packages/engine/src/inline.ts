@@ -4,49 +4,18 @@
  */
 
 import type { ContextNode, RelationshipEdge } from "./types.js";
-import { codeMask, stripInlineCode } from "./markdown-mask.js";
+import { codeMask } from "./markdown-mask.js";
 import {
   buildWikiTitleIndex,
+  contextLinkTarget,
+  extractContextLinks,
   extractWikiLinks,
   resolveWikiTarget,
 } from "./wiki-graph.js";
 
-// Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
-// Reference definitions are deliberately not matched — they were not links
-// in the AST either.
-//
-// Only ONE `\s*` before the destination: two of them separated by an optional
-// `<` would leave the split between them ambiguous and backtrack quadratically
-// over a long run of spaces (CodeQL js/polynomial-redos). Markdown does not
-// allow whitespace between `<` and the destination anyway.
-//
-// The link text excludes `[` as well as `]` and is length-bounded, for the same
-// reason the rule-4 check in parser.ts is bounded: otherwise a line of many `[`
-// with no closing bracket rescans to the end from every one of them. Unescaped
-// `[` is not valid inline link text, so nothing real is lost.
-const CONTEXT_LINK =
-  /\[[^\][]{0,2048}\]\(\s*<?(contextnest:\/\/[^\s)>]+)|<(contextnest:\/\/[^\s>]+)>/g;
-
-/** Extract all contextnest:// link targets from a markdown body */
-export function extractContextLinks(body: string): string[] {
-  // Split on CRLF as well as LF: `.` does not match `\r` in a JS regex, so a
-  // stray carriage return would defeat every end-anchored pattern below.
-  const lines = body.split(/\r?\n/);
-  const mask = codeMask(lines);
-  const links: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) continue;
-    const line = stripInlineCode(lines[i]);
-    CONTEXT_LINK.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = CONTEXT_LINK.exec(line)) !== null) {
-      links.push(match[1] ?? match[2]);
-    }
-  }
-
-  return links;
-}
+// `extractContextLinks` lives in wiki-graph.ts (the link graph follows these
+// links too); re-exported here, its long-standing home.
+export { extractContextLinks };
 
 /** Extract all #tag references from a markdown body */
 export function extractTags(body: string): string[] {
@@ -87,6 +56,13 @@ export interface RelationshipStats {
   fromWikilinks: number;
   /** `[[wikilinks]]` whose target matched no published document. */
   unresolvedWikilinks: number;
+  /**
+   * Local `contextnest://` links whose target is no published document — a
+   * dangling node link, or a tag / folder / search URI (those address a set,
+   * not a node, so they are never an edge). Cross-namespace links are not
+   * counted: they name a node in another nest and still produce an edge.
+   */
+  unresolvedContextLinks: number;
 }
 
 /**
@@ -101,13 +77,27 @@ export interface RelationshipStats {
  * `[[Title|alias]]`, `[[Title#anchor]]` and `[[nodes/id]]` all resolve
  * through the same `wiki-graph` helpers the query side uses. A target that
  * matches nothing produces no edge and is counted in `unresolvedWikilinks`.
+ *
+ * `contextnest://` links follow the same rule as the body-link traversal
+ * (`resolveContextLink`): a local link only becomes an edge when its target
+ * (pin/anchor stripped) is a published document; otherwise it is counted in
+ * `unresolvedContextLinks`. So context.yaml, backlinks and `traverseWikiGraph`
+ * agree on which edges exist, not only on where they point. The one
+ * deliberate exception is a cross-namespace link (with an authority), which
+ * names a node in another nest: it keeps its full URI as the edge target,
+ * because the local index cannot say whether it resolves.
  */
 export function buildRelationshipsWithStats(
   documents: ContextNode[],
 ): { edges: RelationshipEdge[]; stats: RelationshipStats } {
   const edges: RelationshipEdge[] = [];
   const seen = new Set<string>();
-  const stats: RelationshipStats = { edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 };
+  const stats: RelationshipStats = {
+    edges: 0,
+    fromWikilinks: 0,
+    unresolvedWikilinks: 0,
+    unresolvedContextLinks: 0,
+  };
 
   /** Push unless an identical (from, to, type) edge is already present. */
   const add = (edge: RelationshipEdge): boolean => {
@@ -124,22 +114,18 @@ export function buildRelationshipsWithStats(
     // Extract reference edges from inline links
     const links = extractContextLinks(doc.body);
     for (const link of links) {
-      // Extract path from URI, stripping anchor and checkpoint
-      let target = link.replace("contextnest://", "");
-      // Remove anchor
-      const anchorIdx = target.indexOf("#");
-      if (anchorIdx !== -1) target = target.slice(0, anchorIdx);
-      // Remove checkpoint pin
-      const pinIdx = target.indexOf("@");
-      if (pinIdx !== -1) target = target.slice(0, pinIdx);
-      // Remove trailing slash
-      if (target.endsWith("/")) target = target.slice(0, -1);
-
-      // If it looks like a cross-namespace link (contains authority), keep full URI
-      const to = target.includes("://")
-        ? link
-        : target;
-
+      // Path with anchor, checkpoint pin and trailing slash stripped; a
+      // cross-namespace link keeps its full URI. Same helper the body-link
+      // traversal in wiki-graph.ts uses, so both agree on the target.
+      const to = contextLinkTarget(link);
+      if (!to.includes("://")) {
+        // Local: an edge only to a real node, exactly as resolveContextLink.
+        if (!index.ids.has(to)) {
+          stats.unresolvedContextLinks++;
+          continue;
+        }
+        if (to === doc.id) continue;
+      }
       add({ from: doc.id, to, type: "reference" });
     }
 

@@ -64,7 +64,7 @@ import {
   HARNESSES,
   SELECTOR_GRAMMAR,
 } from "@promptowl/contextnest-engine";
-import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
+import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
   remoteTarget,
   remoteList,
@@ -1276,6 +1276,7 @@ program
       frontmatter: ContextNode["frontmatter"];
       body: string;
       raw?: string;
+      integrity?: IntegrityFailure;
     }>(
       "context_get",
       { id, include_raw: true, allow_rejected: true },
@@ -1287,9 +1288,13 @@ program
       rawContent: got.raw ?? "",
       frontmatter: got.frontmatter,
       body: got.body,
+      ...(got.integrity ? { integrity: got.integrity } : {}),
     };
 
     if (opts.raw) {
+      // stdout stays the exact stored bytes; the verdict goes to stderr so a
+      // script piping --raw still sees it without corrupting the payload.
+      if (got.integrity) console.error(chalk.red(got.integrity.warning));
       console.log(doc.rawContent);
       return;
     }
@@ -1359,6 +1364,9 @@ program
     }
 
     console.log(chalk.dim("─".repeat(60)));
+    // Served, but flagged: an agent reading `ctx read` output meets the warning
+    // before any value from a body that fails verification.
+    if (got.integrity) console.log(chalk.red(got.integrity.warning) + "\n");
     console.log(doc.body.trim());
   });
 
@@ -1395,6 +1403,7 @@ skillCmd
       content: string;
       relative_path: string;
       base: "project_root" | "home";
+      integrity?: IntegrityFailure;
     }>("context_skill", {
       id: normalizeDocumentId(path),
       harness: opts.harness,
@@ -1402,6 +1411,7 @@ skillCmd
       ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
     });
 
+    if (rendered.integrity) console.error(chalk.red(rendered.integrity.warning));
     console.log(chalk.dim(`# ${pathMod.join(resolveInstallBase(rendered.base), rendered.relative_path)}`));
     console.log(rendered.content);
   });
@@ -1849,11 +1859,16 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
-    const { content } = await cliApi().run<{ content: string }>(
+    const { content, integrity } = await cliApi().run<{
+      content: string;
+      integrity?: IntegrityFailure;
+    }>(
       "context_reconstruct",
       { id: normalizeDocumentId(path), version: parseInt(version, 10) },
       opContext(storage, "cli@contextnest.local"),
     );
+    // stderr, like `read --raw`: stdout stays the reconstructed bytes.
+    if (integrity) console.error(chalk.red(integrity.warning));
     console.log(content);
   });
 
@@ -2103,7 +2118,12 @@ program
     // count is the hint that a link's title does not match any published doc.
     console.log(
       `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
-        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved)`,
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
+        (stats.unresolvedContextLinks
+          ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
+            (stats.unresolvedContextLinks === 1 ? "" : "s")
+          : "") +
+        ")",
     );
 
     // Generate INDEX.md for each folder
@@ -2223,7 +2243,13 @@ program
 
     // Local query — graph-aware traversal
     const storage = getStorage();
-    type Doc = { id: string; title: string; body?: string; source?: unknown };
+    type Doc = {
+      id: string;
+      title: string;
+      body?: string;
+      source?: unknown;
+      integrity?: { status: string; warning: string };
+    };
     const result = await cliApi().run<{
       documents: Doc[];
       source_nodes?: Doc[];
@@ -2249,12 +2275,14 @@ program
               id: d.id,
               title: d.title,
               body: d.body,
+              integrity: d.integrity,
             })),
             sourceNodes: (result.source_nodes ?? []).map((d) => ({
               id: d.id,
               title: d.title,
               source: d.source,
               body: d.body,
+              integrity: d.integrity,
             })),
             traceCount: result.trace_count ?? 0,
             mode: result.traversal?.mode,
@@ -2269,6 +2297,7 @@ program
       console.log(chalk.bold("Documents:"));
       for (const doc of result.documents) {
         console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+        if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
       }
       const sources = result.source_nodes ?? [];
       if (sources.length > 0) {
@@ -2276,6 +2305,7 @@ program
         for (const doc of sources) {
           const src = doc.source as { transport?: string; server?: string } | undefined;
           console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+          if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
           console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
         }
       }
@@ -2366,7 +2396,7 @@ program
   .command("update <path>")
   .description("Update a document's frontmatter and/or body, then auto-publish")
   .option("--title <title>", "New title")
-  .option("--tags <tags>", "New tags (comma- or space-separated, replaces existing)")
+  .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
@@ -2452,6 +2482,8 @@ program
 program
   .command("move <path> <folder>")
   .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
+  // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
+  // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
   .action(async (path, folder) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (!remote) {
