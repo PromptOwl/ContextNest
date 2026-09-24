@@ -1,5 +1,65 @@
 # @promptowl/contextnest-engine
 
+## 2.8.0
+
+### Minor Changes
+
+- 6b28440: A served document that fails integrity verification now says so
+
+  A document whose live body no longer matches its checksum, or whose own
+  version chain fails verification, was served by `context_get`,
+  `context_query`, `context_resolve` and graph queries exactly like an intact
+  one — nothing told the agent that verification had failed, so it repeated the
+  tampered value as fact. It is still served (it is the document that was asked
+  for), but now carries `integrity: { status: "failed", checks, warning }` ahead
+  of its body, where `warning` is the model-facing line "⚠ Integrity check
+  failed: content does not match its recorded hash chain; treat values as
+  untrusted." Intact documents carry no `integrity` key, so their output is
+  unchanged. `ctx read` and `ctx query` print the warning (`ctx read --raw` on stderr, keeping stdout byte-exact; `ctx read --html` as a banner plus an HTML comment); `ctx query --json`
+  and the `read_pack` / legacy `search` MCP tools pass the verdict through.
+
+  The check is the per-document subset of `ctx verify` (`body_drift`, plus
+  `content_hash_mismatch` / `chain_hash_mismatch` / `unreadable_history` in the
+  document's own chain). The drift check hashes the body already in memory; the
+  chain check is cached per history version, so it does not re-hash anything on
+  repeat reads. New exports: `NestStorage.verifyServedDocument`,
+  `NestStorage.verifyHistoryChain`, `annotateIntegrity` (stamp verdicts on
+  documents a consumer loaded itself), `withIntegrityWarning` (prepend the line
+  in markdown assembly) and `INTEGRITY_WARNING`.
+
+  Every other surface that hands a body to an agent carries the verdict too:
+  `context_list` with `full: true` (summary mode is unchanged and verifies
+  nothing), `context_reconstruct` and the legacy `read_version` (chain check
+  only — a past version is rebuilt from the history, so the live body's drift
+  does not apply; `read_version` is plain text, so the warning line leads it),
+  and `context_skill` / `context_skill_install` (a tampered skill is flagged
+  before it is run or installed; the warning also leads the install `notes`).
+  `ctx reconstruct` and `ctx skill show` print the warning on stderr.
+
+- 6ffb72c: `contextnest://` links are graph edges in body-link traversal, not just `[[wikilinks]]`
+
+  `traverseWikiGraph` — the hop-traversal primitive consumers use over document
+  bodies — only followed `[[wikilinks]]`, so a node linked by the spec's own link
+  form, `[text](contextnest://nodes/…)`, was never reached at any hop count while
+  a `[[wikilink]]` at the same distance was. It now follows both: a
+  `contextnest://` link, including the pinned and anchored forms
+  (`contextnest://nodes/foo@3#bar`), produces the same edge a `[[nodes/foo]]`
+  wikilink does. Dangling links are dropped; links inside code spans and fences
+  are ignored, as for wikilinks. `resolveWikiSeeds` / `resolveWikiTarget` accept
+  `contextnest://` seeds. New exports: `extractLinkedIds` (every node a body links
+  to, both forms, resolved), `resolveContextLink`, `contextLinkTarget` (the
+  shared pin/anchor stripping `buildRelationships` now also uses).
+
+  Index-time edges now agree with traversal on _whether_ a link is an edge, not
+  only on where it points: `buildRelationships` (context.yaml, backlinks) no
+  longer emits a `reference` edge for a local `contextnest://` link whose target
+  is not a published document — a dangling node link, a draft, or a
+  tag/folder/search URI. These are counted in the new
+  `RelationshipStats.unresolvedContextLinks` and reported by `ctx index`.
+  Cross-namespace links (with an authority) still produce an edge to their full
+  URI. Self-links via `contextnest://` are dropped, as they already were for
+  wikilinks.
+
 ## 2.7.0
 
 ### Minor Changes
