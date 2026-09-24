@@ -28,6 +28,8 @@ import fs from "node:fs";
 import pathMod from "node:path";
 import type { ContextNode, RemoteNestConnection, RemoteNestSpec, VaultListEntry } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
+import { parseRecipeManifest, manifestSources } from "./pull.js";
+import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -187,13 +189,13 @@ async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnectio
  */
 async function withRemote<T>(
   target: RemoteTarget,
-  fn: (conn: RemoteNestConnection) => Promise<T>,
+  fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
 ): Promise<T> {
   const conn = await connectRemoteNest(target.alias, target.spec);
   try {
     if (!target.nest) return await fn(conn);
     const nestId = await resolveTargetNest(target, conn);
-    return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) });
+    return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) }, nestId);
   } catch (err) {
     // A write through a server-level alias with no nest named: say how to name one.
     // Coupled to contextnest-community's wording — the SDK's zod refusal of a
@@ -407,6 +409,70 @@ export async function remoteRead(
     }
     console.log(chalk.dim("─".repeat(60)));
     console.log(doc.body.trim());
+  });
+}
+
+// ─── Pull (read side) ───────────────────────────────────────────────────────
+
+/** How many nodes one listing may return while looking for a recipe. */
+const RECIPE_LIST_LIMIT = 1000;
+
+/**
+ * Fetch a recipe and every node it names, over one connection, for `ctx pull`.
+ *
+ * The recipe is found by slug (`recipe-<id>`) anywhere in the nest. Each
+ * source's version is the one its body is: a governed nest serves the
+ * approved version, so `approved_version` wins over the newest one.
+ */
+export async function remoteFetchRecipe(target: RemoteTarget, recipeId: string): Promise<FetchedRecipe> {
+  return withRemote(target, async (conn, nestId) => {
+    const tools = await conn.toolNames();
+    const slug = `recipe-${recipeId}`;
+    const listed = await conn.run<{ documents: NodeSummary[] }>("context_list", { limit: RECIPE_LIST_LIMIT });
+    const hits = listed.documents.filter((d) => d.id === `nodes/${slug}` || d.id.endsWith(`/${slug}`));
+    if (hits.length === 0) {
+      throw new ContextNestError(
+        `No recipe "${recipeId}" in ${target.alias} — expected a node whose slug is ${slug}.`,
+        "DOCUMENT_NOT_FOUND",
+      );
+    }
+    if (hits.length > 1) {
+      throw new ContextNestError(
+        `Recipe "${recipeId}" is ambiguous in ${target.alias}: ${hits.map((h) => h.id).join(", ")}.`,
+        "VALIDATION_FAILED",
+      );
+    }
+
+    const fetchNode = async (id: string): Promise<SourceNode> => {
+      const doc = await conn.run<{ id: string; frontmatter: Record<string, any>; body: string }>("context_get", { id });
+      let version: number | null = null;
+      if (tools.has("context_versions")) {
+        const v = await conn.run<{ approved_version?: number | null; versions?: Array<{ version: number }> }>(
+          "context_versions",
+          { id },
+        );
+        const newest = (v.versions ?? []).reduce<number | null>(
+          (max, e) => (max === null || e.version > max ? e.version : max),
+          null,
+        );
+        version = v.approved_version ?? newest;
+      }
+      return {
+        id: doc.id ?? id,
+        title: doc.frontmatter.title,
+        ...(doc.frontmatter.description ? { description: doc.frontmatter.description } : {}),
+        ...(doc.frontmatter.type ? { type: doc.frontmatter.type } : {}),
+        ...(doc.frontmatter.tags ? { tags: doc.frontmatter.tags } : {}),
+        body: doc.body ?? "",
+        version,
+      };
+    };
+
+    const recipe = await fetchNode(hits[0].id);
+    const manifest = parseRecipeManifest(recipe.body);
+    const sources = new Map<string, SourceNode>();
+    for (const id of manifestSources(manifest)) sources.set(id, await fetchNode(id));
+    return { namespace: nestId ?? target.alias, recipe, manifest, sources };
   });
 }
 
