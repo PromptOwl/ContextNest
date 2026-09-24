@@ -57,6 +57,7 @@ ctx init --name "My Vault"
 | `analyst` | Research / Analysis | Research framework, source catalog, report templates |
 | `team` | General teams | How we work, onboarding, team FAQ |
 | `sales` | Sales teams | Objection handling, battlecards, product knowledge |
+| `org` | A whole organization, governance first | The Four Rulebooks, the Accountability Method, company facts, a `stewards.example.yaml` with two reviewers per domain |
 
 ## For AI Agents
 

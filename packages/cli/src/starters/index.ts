@@ -30,12 +30,21 @@ export interface StarterPack {
   content: string;
 }
 
+export interface StarterFile {
+  /** Path relative to the vault root, e.g. "stewards.example.yaml" */
+  path: string;
+  /** Raw file content, written as-is (never overwrites an existing file) */
+  content: string;
+}
+
 export interface Starter {
   id: string;
   name: string;
   description: string;
   nodes: StarterNode[];
   packs: StarterPack[];
+  /** Extra non-document files written at the vault root (config templates). */
+  files?: StarterFile[];
   getPrompt(): PostInitPrompt;
   /**
    * Maintenance directive written to .context/config.yaml at init time.
@@ -1141,6 +1150,274 @@ agent_instructions: >
   },
 };
 
+// ─── Org Starter ───────────────────────────────────────────────────────────────
+//
+// Governance-first starter for a whole organization. The other starters are
+// organized by role; this one lays down the Four Rulebooks (standards, skills,
+// playbooks, methodologies) plus strategy, and ships the Accountability Method
+// as the methodology every other node is filed by.
+
+const org: Starter = {
+  id: "org",
+  name: "Organization / Governed",
+  description: "Governance-first nest for a whole organization: the Four Rulebooks, stewards per domain, and the Accountability Method for filing and approving context",
+  nodes: [
+    {
+      path: "nodes/methodologies/accountability-method",
+      content: `---
+title: The Accountability Method
+type: document
+tags: [methodology, governance, accountability-method]
+priority: high
+status: published
+---
+
+# The Accountability Method
+
+How raw context becomes governed truth in this nest. Every node answers five
+questions, and each answer is something the nest already does.
+
+Influences: Tiago Forte's PARA (organize by actionability) and CODE (Capture,
+Organize, Distill, Express), from *Building a Second Brain*. This method answers
+a different question: who may declare this true, and can we prove what the agent saw.
+
+## The five questions
+
+| Question | What it decides | How the nest does it |
+|---|---|---|
+| **Authority** | Who may declare this true? | A steward per domain tag (see stewards.yaml). Standing truth always has one. |
+| **State** | Where is it in its life? | status: draft, pending_review, approved, published, or rejected to retire. Approval is the maturity gate. No maturity tags. |
+| **Scope** | What does this agent see for this task? | Tags and folders define the slice. Agents read a selector or a pack, not the whole nest. |
+| **Proof** | Can we show what the agent saw? | Every version is hash-chained. ctx verify and ctx reconstruct. |
+| **Delivery** | How does it load? | The Four Rulebooks: standards always loaded, skills on trigger, playbooks scoped, methodologies by phase. |
+
+## The flow
+
+**Capture → Propose → Approve → Publish → Prove.**
+
+1. **Capture.** Low friction, but a human says yes. Keep what is actionable, decision-bearing, or surprising.
+2. **Propose.** The capture becomes a draft node that meets the output contract below. Update an existing node instead of creating a twin.
+3. **Approve.** Standing truth goes to its steward. Nobody approves their own change.
+4. **Publish.** Only approved versions are served to agents as truth.
+5. **Prove.** Any answer traces back to the exact version it came from. Corrections come back as new proposals.
+
+## The filing rule
+
+Ask in order and stop at the first yes:
+
+1. **Is it standing truth?** Pricing, policy, positioning, company facts, standards. Route it to its steward and submit it for review, even if it has a deadline.
+2. **Is it active work with a finish line?** File it under nodes/<domain>/ with the domain tag. Tasks and due dates live in your task tracker.
+3. **Is it reference?** Research, signals, and sources go under nodes/resources/.
+4. **Is it finished or superseded?** Retire it with status: rejected. Deletion is a separate, deliberate act.
+
+Folders answer "who governs it." Tags answer "what is it."
+
+## Output contract for every new node
+
+- **title:** a claim, not a topic.
+- **type:** a real node type (document, snippet, glossary, persona, prompt, source, tool, reference, skill, agent, artifact, table, pdf).
+- **status:** draft until a steward approves it.
+- **tags:** exactly one domain tag that maps to a steward, plus topic tags. Domain tags are the ontology's buckets.
+- **links:** [[wikilinks]] in the prose are the ontology's edges.
+- **derived_from:** lineage back to the source it came from.
+- **anchors:** figures, quotes, and legal notices copied verbatim, never stripped.
+- **summary first:** one to three sentences, then takeaways, then the body.
+`,
+    },
+    {
+      path: "nodes/standards/agent-operating-rules",
+      content: `---
+title: Agent Operating Rules
+type: document
+tags: [standard, agents, governance]
+priority: high
+status: published
+---
+
+# Agent Operating Rules
+
+Always loaded. Every agent reading this nest follows these rules.
+
+1. **Prefer approved.** Answer from approved or published versions. If only a draft exists, say so.
+2. **Cite the node.** Name the node (and version when it matters) behind every factual claim.
+3. **Write drafts, not truth.** New or changed standing truth is proposed as a draft and submitted to its steward.
+4. **Never approve your own work.** Not yours, not your human's.
+5. **Update, don't twin.** Search for an existing node before creating one.
+6. **File by the method.** Follow [[The Accountability Method]] for type, tags, links, and lineage.
+7. **Never strip notices.** Confidentiality, NDA, and license text stays verbatim.
+`,
+    },
+    {
+      path: "nodes/standards/company-facts",
+      content: `---
+title: Company Facts
+type: document
+tags: [standard, company, prime-document]
+priority: high
+status: draft
+---
+
+# Company Facts
+
+_The facts every person and agent must get right. One steward owns this node,
+and changes go through review._
+
+| Fact | Value | Source |
+|---|---|---|
+| Legal name | | |
+| What we do (one sentence) | | |
+| Who we serve | | |
+| Products / services | | |
+| Current pricing (link the pricing node) | | |
+| Headquarters / regions | | |
+| Key terms we use (link the glossary) | | |
+`,
+    },
+    {
+      path: "nodes/strategy/strategy-overview",
+      content: `---
+title: Strategy Overview
+type: document
+tags: [strategy, prime-document]
+priority: high
+status: draft
+---
+
+# Strategy Overview
+
+_Leadership-owned. Where we are going and why, so agents and new hires reason
+from the same place._
+
+## Where we play
+
+## How we win
+
+## This year's priorities
+
+| Priority | Owner | Measure |
+|---|---|---|
+| | | |
+
+## Decisions log
+
+_Date, decision, why. Link the node that carries the detail._
+`,
+    },
+    {
+      path: "nodes/playbooks/org-onboarding",
+      content: `---
+title: Org Onboarding Playbook
+type: document
+tags: [playbook, onboarding, governance]
+priority: high
+status: published
+---
+
+# Org Onboarding Playbook
+
+How to stand this nest up for an organization. Order matters.
+
+1. **Paper first.** Seat count, hosted or self-hosted, and any data-handling agreements before anyone logs in.
+2. **Accounts, then sharing.** Every person needs an account with the same email they will use on the nest. Create accounts first, add people to teams, then share the nest with the team. A team with no nest shared sees nothing.
+3. **Stewards before content.** Copy stewards.example.yaml to stewards.yaml, put real emails in it, and give every domain tag at least two reviewers so nobody is stuck approving their own change.
+4. **Seed with drafts.** Fill [[Company Facts]] and [[Strategy Overview]] first. Distill websites, repos, and documents into drafts that follow [[The Accountability Method]].
+5. **Connect each person.** Point their agent (Claude plugin, MCP, or desktop) at this nest.
+6. **Run one full review cycle live.** Someone proposes a change, a steward approves it, an agent answers from the approved version, and ctx reconstruct shows what it saw.
+7. **Keep it running.** Capture stays on. Stewards clear their review queue weekly.
+`,
+    },
+    {
+      path: "nodes/skills/distill-capture",
+      content: `---
+title: Distill Capture
+type: skill
+tags: [skill, distill, capture]
+priority: high
+status: published
+skill:
+  trigger: "When the user shares a transcript, document, email, or other raw source to be kept in the nest"
+  output_format: markdown
+  guard_rails:
+    - "Every node written is status draft"
+    - "Standing truth is routed to its steward for review, even with a deadline"
+    - "Search for an existing node before creating one"
+    - "Never strip legal, confidentiality, or license notices"
+---
+
+# Distill Capture
+
+Turn one raw source into draft nodes filed by [[The Accountability Method]].
+
+1. **Confirm.** Ask the person whether this source should be kept. No yes, no write.
+2. **Search.** Find existing nodes on the same subject. Prefer updating one over creating a twin.
+3. **Route.** Apply the filing rule: standing truth to its steward first, then active work, then reference.
+4. **Distill.** Summary first (one to three sentences), then takeaways, then the body. Keep figures, quotes, and notices verbatim.
+5. **Shape.** One domain tag, topic tags, [[wikilinks]] to related nodes, derived_from pointing at the source.
+6. **Propose.** Write as draft and submit standing truth for review. Tell the person what was filed and who will review it.
+`,
+    },
+  ],
+  packs: [
+    {
+      id: "org-essentials",
+      content: `id: org-essentials
+label: Org Essentials
+description: The method, operating rules, and company facts every agent loads first
+includes:
+  - nodes/methodologies/accountability-method
+  - nodes/standards/agent-operating-rules
+  - nodes/standards/company-facts
+  - nodes/strategy/strategy-overview
+agent_instructions: >
+  Load these before answering questions about the organization. Answer from
+  approved versions, cite the node, and file anything new as a draft by the
+  Accountability Method.
+`,
+    },
+  ],
+  files: [
+    {
+      path: "stewards.example.yaml",
+      content: `# Stewards template for the org starter.
+# Copy to stewards.yaml and replace every example.com address with a real one
+# BEFORE syncing to a server: a steward email with no account becomes an
+# invited user with no password.
+#
+# Every domain tag gets at least two reviewers, so nobody is left approving
+# their own change.
+version: 1
+nest:
+  - email: owner@example.com
+    role: reviewer
+  - email: second-reviewer@example.com
+    role: reviewer
+tags:
+  "#standard":
+    - email: owner@example.com
+      role: reviewer
+    - email: second-reviewer@example.com
+      role: reviewer
+  "#strategy":
+    - email: owner@example.com
+      role: reviewer
+    - email: second-reviewer@example.com
+      role: reviewer
+  "#prime-document":
+    - email: owner@example.com
+      role: reviewer
+    - email: second-reviewer@example.com
+      role: reviewer
+`,
+    },
+  ],
+  getPrompt() {
+    return getPostInitPrompt(this.id, this.description);
+  },
+  getMaintenanceDirective() {
+    return getDefaultMaintenanceDirective();
+  },
+};
+
 // ─── Personal Starter ──────────────────────────────────────────────────────────
 
 const personal: Starter = {
@@ -1166,6 +1443,7 @@ export const starters = new Map<string, Starter>([
   ["analyst", analyst],
   ["team", team],
   ["sales", sales],
+  ["org", org],
 ]);
 
 export function getStarter(id: string): Starter | undefined {

@@ -965,6 +965,14 @@ async function applyStarter(
     await fs.promises.writeFile(packPath, pack.content, "utf-8");
   }
 
+  // Write starter root files (config templates) — never clobber an existing one
+  for (const file of starter.files ?? []) {
+    const filePath = pathMod.join(root, file.path);
+    if (fs.existsSync(filePath)) continue;
+    await fs.promises.mkdir(pathMod.dirname(filePath), { recursive: true });
+    await fs.promises.writeFile(filePath, file.content, "utf-8");
+  }
+
   // Publish all starter nodes
   for (const node of starter.nodes) {
     await publishDocument(storage, node.path, {
@@ -984,6 +992,9 @@ async function applyStarter(
   console.log(`  Created ${starter.packs.length} pack(s):`);
   for (const pack of starter.packs) {
     console.log(`    ${chalk.cyan("packs/" + pack.id + ".yml")}`);
+  }
+  for (const file of starter.files ?? []) {
+    console.log(`  Template: ${chalk.cyan(file.path)}`);
   }
 
   // Post-init prompt for AI agents
