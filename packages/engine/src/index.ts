@@ -295,6 +295,9 @@ export {
   buildWikiTitleIndex,
   resolveWikiSeeds,
   resolveWikiTarget,
+  resolveContextLink,
+  contextLinkTarget,
+  extractLinkedIds,
   traverseWikiGraph,
 } from "./wiki-graph.js";
 export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
