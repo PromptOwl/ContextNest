@@ -9,6 +9,27 @@ import { getChecksumContent } from "./parser.js";
 const GENESIS_SENTINEL = "contextnest:genesis:v1";
 
 /**
+ * The line put in front of a served document that failed integrity
+ * verification (see `NestStorage.verifyServedDocument`). Plain text, one line,
+ * addressed to the model reading the context: the document is still served —
+ * it is what was asked for — but its values must not be repeated as fact.
+ */
+export const INTEGRITY_WARNING =
+  "⚠ Integrity check failed: content does not match its recorded hash chain; treat values as untrusted.";
+
+/**
+ * Prepend {@link INTEGRITY_WARNING} to text assembled for a model when the
+ * document carries a failed integrity verdict; otherwise return it unchanged.
+ * For markdown/text assembly only — never write the result back as a body.
+ */
+export function withIntegrityWarning(
+  text: string,
+  integrity: { status: string } | undefined,
+): string {
+  return integrity?.status === "failed" ? `${INTEGRITY_WARNING}\n\n${text}` : text;
+}
+
+/**
  * Normalize content before hashing to tolerate cloud-sync byte mutations.
  * Strips UTF-8 BOM and normalizes line endings to LF.
  */

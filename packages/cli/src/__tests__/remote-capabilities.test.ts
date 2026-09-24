@@ -52,7 +52,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, remoteQuery, nestLabels, serverNests, expandServerVaults, NEST_INDEX_TTL_MS } = await import("../remote.js");
+const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, remoteQuery, nestLabels, serverNests, expandServerVaults, remoteRead, NEST_INDEX_TTL_MS, NEST_PROBE_BACKOFF_MS } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -368,5 +368,83 @@ describe("<server>/<nest> targets", () => {
     replies = { context_delete: new ContextNestError("This tool requires a `nest` argument. Use nest_index to see available nests.", "INTERNAL") };
     const err = await remoteDelete(server, "nodes/a").catch((e) => e);
     expect((err as Error).message).toContain("--vault cn/<nest>");
+  });
+
+  // QA ticket CU-wdqcq02qyd, area 8: an offline server must not cost a
+  // timeout on every prompt the plugin lists vaults for.
+  it("remembers a failed probe for NEST_PROBE_BACKOFF_MS instead of retrying every listing", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: new ContextNestError("connect ECONNREFUSED", "REMOTE_UNREACHABLE") };
+    const fetches = () => calls.filter((c) => c.op === "nest_index").length;
+    await expect(serverNests("cn", server.spec)).rejects.toThrow(/ECONNREFUSED/);
+    replies = { nest_index: { nests } }; // server is back, but the backoff holds
+    await expect(serverNests("cn", server.spec)).rejects.toThrow(/unreachable less than/);
+    expect(fetches()).toBe(1);
+    const now = Date.now;
+    Date.now = () => now() + NEST_PROBE_BACKOFF_MS + 1;
+    try {
+      expect(await serverNests("cn", server.spec)).toEqual(nests); // backoff over: probes again
+    } finally {
+      Date.now = now;
+    }
+    expect(fetches()).toBe(2);
+  });
+
+  it("a live connection ignores a remembered failure (the server is evidently back)", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: new ContextNestError("timeout", "REMOTE_UNREACHABLE") };
+    await expect(serverNests("cn", server.spec)).rejects.toThrow();
+    replies = { nest_index: { nests } };
+    const conn = { toolNames: async () => advertised, run: async () => replies.nest_index, close: async () => {} } as any;
+    expect(await serverNests("cn", server.spec, conn)).toEqual(nests);
+    expect(await serverNests("cn", server.spec)).toEqual(nests); // and the success replaced the marker
+  });
+
+  it("vault list leaves the caller's entries untouched", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(join(dir, "config.yaml"), "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n");
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    const input = [{ alias: "cn", kind: "remote" as const, transport: "http" as const, url: "https://cn.example/mcp", isDefault: true }];
+    const rows = await expandServerVaults(input);
+    expect(rows[0].description).toMatch(/All 2 nest/);
+    expect(input[0]).not.toHaveProperty("description");
+  });
+});
+
+// QA ticket CU-wdqcq02qyd, areas 5 and 7.
+describe("remote read --raw and empty --tags", () => {
+  it("read --raw rebuilds a valid frontmatter + body file when the nest sends no raw", async () => {
+    advertised = new Set(["context_get"]);
+    replies = {
+      context_get: {
+        id: "nodes/a",
+        frontmatter: { title: "A Doc", type: "document", tags: ["#x"], description: undefined },
+        body: "# A\n\nBody text.",
+      },
+    };
+    await remoteRead(target, "nodes/a", { raw: true });
+    const out = plain();
+    expect(out).toMatch(/^---\ntitle: A Doc\ntype: document\ntags:\n  - '#x'\n---\n/);
+    expect(out).toContain("Body text.");
+    const { parseDocument } = await import("@promptowl/contextnest-engine");
+    const round = parseDocument("nodes/a.md", out, "nodes/a");
+    expect(round.frontmatter.title).toBe("A Doc");
+    expect(round.body.trim()).toBe("# A\n\nBody text.");
+  });
+
+  it("read --raw prints the nest's own raw when it sends one", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: { id: "nodes/a", frontmatter: { title: "A" }, body: "b", raw: "---\ntitle: A\n---\nverbatim" } };
+    await remoteRead(target, "nodes/a", { raw: true });
+    expect(plain()).toBe("---\ntitle: A\n---\nverbatim");
+  });
+
+  it('--tags "" sends an empty set: it removes every tag (replace semantics, documented in --help)', async () => {
+    advertised = new Set(["context_update"]);
+    replies = { context_update: { id: "nodes/a", version: 2, status: "published" } };
+    await remoteUpdate(target, "nodes/a", { tags: "" });
+    expect(calls).toEqual([{ op: "context_update", input: { id: "nodes/a", tags: [] } }]);
   });
 });
