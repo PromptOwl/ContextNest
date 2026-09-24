@@ -363,6 +363,33 @@ describe("[regression] ctx read", () => {
     expect(out).toMatch(/title:\s*Read Me/);
   });
 
+  it("surfaces a failed integrity check on every view: terminal, --raw (stderr), --html (banner)", () => {
+    const file = join(tmp, "nodes", "readme.md");
+    writeFileSync(file, readFileSync(file, "utf-8").replace("Hello body", "Tampered body"), "utf-8");
+    const warning = /⚠ Integrity check failed/;
+
+    expect(runCtx(tmp, ["read", "nodes/readme"])).toMatch(warning);
+
+    // --raw: stdout is still exactly the stored bytes; the warning is on stderr.
+    const raw = runCtxResult(tmp, ["read", "nodes/readme", "--raw"]);
+    expect(raw.status).toBe(0);
+    expect(raw.stdout.trimEnd()).toBe(readFileSync(file, "utf-8").trimEnd());
+    expect(raw.stderr).toMatch(warning);
+
+    const out = join(tmp, "readme.html");
+    runCtx(tmp, ["read", "nodes/readme", "--html", "--out", out]);
+    const html = readFileSync(out, "utf-8");
+    expect(html).toMatch(/<!-- integrity: failed \(body_drift\) -->/);
+    expect(html).toMatch(/role="alert"[^>]*>⚠ Integrity check failed/);
+  });
+
+  it("an intact document prints no integrity warning on any view", () => {
+    expect(runCtx(tmp, ["read", "nodes/readme"])).not.toMatch(/Integrity check failed/);
+    expect(runCtxResult(tmp, ["read", "nodes/readme", "--raw"]).stderr).not.toMatch(
+      /Integrity check failed/,
+    );
+  });
+
   it("accepts a path with a trailing .md extension", () => {
     const out = runCtx(tmp, ["read", "nodes/readme.md", "--raw"]);
     expect(out).toMatch(/title:\s*Read Me/);
