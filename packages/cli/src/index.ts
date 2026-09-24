@@ -2360,7 +2360,7 @@ program
   .command("update <path>")
   .description("Update a document's frontmatter and/or body, then auto-publish")
   .option("--title <title>", "New title")
-  .option("--tags <tags>", "New tags (comma- or space-separated, replaces existing)")
+  .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .action(async (path, opts) => {
@@ -2446,6 +2446,8 @@ program
 program
   .command("move <path> <folder>")
   .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
+  // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
+  // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
   .action(async (path, folder) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (!remote) {
