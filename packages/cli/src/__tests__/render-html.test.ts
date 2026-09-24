@@ -94,3 +94,22 @@ describe("render-html — importer constructs", () => {
     expect(html).toContain("<p>$$\\hat{p} = 1$$</p>");
   });
 });
+
+describe("render-html — integrity verdict", () => {
+  it("puts a visible banner and a comment ahead of a document that failed verification", () => {
+    const n = node("Price is $5.\n");
+    n.integrity = {
+      status: "failed",
+      checks: ["body_drift"],
+      warning: "⚠ Integrity check failed: content does not match its recorded hash chain; treat values as untrusted.",
+    };
+    const html = renderDocumentHtml(n);
+    expect(html).toContain("<!-- integrity: failed (body_drift) -->");
+    expect(html).toMatch(/role="alert"[^>]*>⚠ Integrity check failed/);
+    expect(html.indexOf('role="alert"')).toBeLessThan(html.indexOf("Price is"));
+  });
+
+  it("renders no banner for an intact document", () => {
+    expect(renderDocumentHtml(node("fine\n"))).not.toContain('role="alert"');
+  });
+});

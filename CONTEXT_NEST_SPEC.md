@@ -235,34 +235,6 @@ The on-disk format always stores canonical values. Aliased values found on disk 
 
 **Legacy `superseded`.** Earlier drafts of this spec defined `superseded` as a fifth canonical value. It is no longer canonical. Implementations MUST treat a raw `status: superseded` value as an alias for `draft` per the table above.
 
-### 1.5.1 Status Lifecycle
-
-`status` is a five-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
-
-| Canonical | Meaning | Surfaces to retrieval? |
-|-----------|---------|-----------------------|
-| `draft` | Editable scratch state. Default for new documents. | Only when the caller passes an explicit `includeDrafts` opt-in. |
-| `pending_review` | Author submitted for review; reviewer has not yet signed off. | No — hidden from LLM, visible to stewards. |
-| `approved` | Reviewer signed off; awaiting publish ceremony. | No — hidden until promoted to `published`. |
-| `published` | Live, retrievable. | Yes — the only canonical status surfaced by default. |
-| `rejected` | Terminal hide. The steward retired the document. | No — implementations MUST refuse `publishDocument` on a rejected document to prevent silent resurrection. |
-
-**Aliases.** Implementations SHOULD accept synonyms from other systems and normalize them to canonical values at parse time. Lookup is case-insensitive. Unknown values fall back to `draft`. The reference implementation ships with:
-
-| Canonical | Aliases |
-|-----------|---------|
-| `rejected` | `cancelled`, `canceled`, `archived`, `abandoned`, `deprecated`, `removed` |
-| `draft` | `superseded`, `todo`, `pending`, `wip`, `new` |
-| `pending_review` | `review`, `in_review`, `in-review`, `under_review`, `under-review`, `submitted`, `needs_review`, `needs-review`, `awaiting_review`, `awaiting-review` |
-| `approved` | `ready`, `reviewed`, `accepted`, `signed_off`, `signed-off` |
-| `published` | `active`, `live`, `released`, `final`, `shipped` |
-
-The on-disk format always stores canonical values. Aliased values found on disk are auto-canonicalized the next time the document round-trips through a write or through the implementation's index-regeneration command (e.g. `ctx index`).
-
-**Transitions.** No state machine is enforced. Any status may transition to any other (subject to the `rejected → *` revival path requiring an explicit status change before content edits land). Metadata-only transitions (e.g. `published → rejected`) MUST NOT cut a new version; only content-publishing operations bump `version` and emit a checkpoint.
-
-**Legacy `superseded`.** Earlier drafts of this spec defined `superseded` as a fifth canonical value. It is no longer canonical. Implementations MUST treat a raw `status: superseded` value as an alias for `draft` per the table above.
-
 ### 1.6 Node Types
 
 Every document has a `type` that classifies its content:

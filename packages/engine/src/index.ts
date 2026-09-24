@@ -18,6 +18,7 @@ export type {
   SkillMeta,
   Frontmatter,
   ContextNode,
+  IntegrityFailure,
   PendingChange,
   SuggestionMeta,
   HashChainEvent,
@@ -295,6 +296,9 @@ export {
   buildWikiTitleIndex,
   resolveWikiSeeds,
   resolveWikiTarget,
+  resolveContextLink,
+  contextLinkTarget,
+  extractLinkedIds,
   traverseWikiGraph,
 } from "./wiki-graph.js";
 export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
@@ -326,6 +330,8 @@ export {
   verifyCheckpointChain,
   detectDrift,
   verifyRemoteDelta,
+  INTEGRITY_WARNING,
+  withIntegrityWarning,
 } from "./integrity.js";
 export type {
   DriftReport,
@@ -381,7 +387,7 @@ export type { InjectorOptions } from "./injection.js";
 
 // Graph traversal
 export { GraphTraverser } from "./graph-traverser.js";
-export { GraphQueryEngine } from "./graph-query-engine.js";
+export { GraphQueryEngine, annotateIntegrity } from "./graph-query-engine.js";
 export type { GraphQueryOptions } from "./graph-query-engine.js";
 export { evaluateFromIndex } from "./selector/index-evaluator.js";
 export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";

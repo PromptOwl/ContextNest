@@ -4,6 +4,8 @@ import {
   buildWikiTitleIndex,
   resolveWikiSeeds,
   traverseWikiGraph,
+  extractLinkedIds,
+  contextLinkTarget,
   type WikiDocLike,
 } from "../wiki-graph.js";
 
@@ -156,5 +158,121 @@ describe("traverseWikiGraph", () => {
     const r = traverseWikiGraph(["Alpha"], docs, { hops: 1 });
     expect(r.nodeIds).toEqual([]);
     expect(r.hopsUsed).toBe(0);
+  });
+});
+
+/**
+ * NestBench §6.4 control: `contextnest://` is the spec's own link form (§1.7),
+ * so the body-link graph must follow it exactly as it follows a `[[wikilink]]`.
+ * Before the fix, a URI-linked target was never reached at any hop count.
+ */
+describe("traverseWikiGraph — contextnest:// links are edges", () => {
+  const control: WikiDocLike[] = [
+    {
+      id: "nodes/source",
+      frontmatter: { title: "Source" },
+      body: "Wiki: [[Target A]]. URI: [target b](contextnest://nodes/target-b).",
+    },
+    { id: "nodes/target-a", frontmatter: { title: "Target A" }, body: "a" },
+    { id: "nodes/target-b", frontmatter: { title: "Target B" }, body: "b" },
+  ];
+
+  it("3-node control: the URI-linked target is reached at the same hop as the wikilinked one", () => {
+    expect(traverseWikiGraph(["nodes/source"], control, { hops: 0 }).nodeIds).toEqual([
+      "nodes/source",
+    ]);
+    for (const hops of [1, 2, 3]) {
+      const r = traverseWikiGraph(["nodes/source"], control, { hops });
+      expect(new Set(r.nodeIds)).toEqual(
+        new Set(["nodes/source", "nodes/target-a", "nodes/target-b"]),
+      );
+      expect(r.hopsUsed).toBe(1);
+    }
+  });
+
+  it("the URI edge is undirected, like a wikilink edge", () => {
+    const r = traverseWikiGraph(["nodes/target-b"], control, { hops: 1 });
+    expect(new Set(r.nodeIds)).toEqual(new Set(["nodes/target-b", "nodes/source"]));
+  });
+
+  it("pinned / anchored URIs (@N, #anchor, autolink) resolve to the node", () => {
+    const pinned: WikiDocLike[] = [
+      {
+        id: "nodes/s",
+        frontmatter: { title: "S" },
+        body: [
+          "[pinned](contextnest://nodes/foo@3#bar)",
+          "[anchored](contextnest://nodes/baz#setup)",
+          "<contextnest://nodes/qux@12>",
+        ].join("\n"),
+      },
+      { id: "nodes/foo", frontmatter: { title: "Foo" }, body: "" },
+      { id: "nodes/baz", frontmatter: { title: "Baz" }, body: "" },
+      { id: "nodes/qux", frontmatter: { title: "Qux" }, body: "" },
+    ];
+    const r = traverseWikiGraph(["nodes/s"], pinned, { hops: 1 });
+    expect(new Set(r.nodeIds)).toEqual(
+      new Set(["nodes/s", "nodes/foo", "nodes/baz", "nodes/qux"]),
+    );
+    expect(extractLinkedIds(pinned[0].body, buildWikiTitleIndex(pinned))).toEqual([
+      "nodes/foo",
+      "nodes/baz",
+      "nodes/qux",
+    ]);
+  });
+
+  it("a dangling URI is dropped without error", () => {
+    const dangling: WikiDocLike[] = [
+      {
+        id: "nodes/s",
+        frontmatter: { title: "S" },
+        body: "[gone](contextnest://nodes/missing@2#x) and [[Real]]",
+      },
+      { id: "nodes/real", frontmatter: { title: "Real" }, body: "" },
+    ];
+    const r = traverseWikiGraph(["nodes/s"], dangling, { hops: 3 });
+    expect(new Set(r.nodeIds)).toEqual(new Set(["nodes/s", "nodes/real"]));
+  });
+
+  it("a URI inside a code fence or inline code span is not a link", () => {
+    const code: WikiDocLike[] = [
+      {
+        id: "nodes/s",
+        frontmatter: { title: "S" },
+        body: [
+          "Example syntax: `[x](contextnest://nodes/inline)`",
+          "```md",
+          "[y](contextnest://nodes/fenced)",
+          "```",
+        ].join("\n"),
+      },
+      { id: "nodes/inline", frontmatter: { title: "Inline" }, body: "" },
+      { id: "nodes/fenced", frontmatter: { title: "Fenced" }, body: "" },
+    ];
+    const r = traverseWikiGraph(["nodes/s"], code, { hops: 2 });
+    expect(r.nodeIds).toEqual(["nodes/s"]);
+  });
+
+  it("a wikilink and a URI to the same node collapse to one neighbour", () => {
+    const index = buildWikiTitleIndex(control);
+    expect(
+      extractLinkedIds("[[Target B]] [b](contextnest://nodes/target-b@4)", index),
+    ).toEqual(["nodes/target-b"]);
+  });
+
+  it("resolveWikiSeeds accepts contextnest:// seeds (pin/anchor stripped, dangling dropped)", () => {
+    const index = buildWikiTitleIndex(control);
+    expect(
+      resolveWikiSeeds(
+        ["contextnest://nodes/target-b@2#sec", "contextnest://nodes/nope"],
+        index,
+      ),
+    ).toEqual(["nodes/target-b"]);
+  });
+
+  it("contextLinkTarget strips pin, anchor and trailing slash; keeps cross-namespace URIs", () => {
+    expect(contextLinkTarget("contextnest://nodes/foo@3#bar")).toBe("nodes/foo");
+    expect(contextLinkTarget("contextnest://nodes/foo/")).toBe("nodes/foo");
+    expect(contextLinkTarget("contextnest://acme://nodes/x")).toBe("contextnest://acme://nodes/x");
   });
 });

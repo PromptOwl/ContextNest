@@ -267,6 +267,14 @@ export function renderDocumentHtml(node: ContextNode, vaultName?: string): strin
   const bodyHtml = markdownToHtml(node.body.trim());
   const metaPanel = renderFrontmatterPanel(node);
   const vaultLabel = vaultName ? esc(vaultName) : "Context Nest";
+  // A document that failed integrity verification is still rendered, but the
+  // page says so first — as a visible banner and as a comment, so a tool that
+  // strips markup or scrapes the source still meets it.
+  const integrityBanner = node.integrity
+    ? `<!-- integrity: failed (${esc(node.integrity.checks.join(", "))}) -->\n` +
+      `<div role="alert" style="background:#FEF2F2;color:#991B1B;border-bottom:2px solid #DC2626;` +
+      `padding:12px 24px;font-weight:600">${esc(node.integrity.warning)}</div>\n`
+    : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -446,7 +454,7 @@ body {
 </style>
 </head>
 <body>
-<div class="header">
+${integrityBanner}<div class="header">
   <div class="vault-name">${vaultLabel}</div>
   <h1>${title}</h1>
   <div class="doc-path">${esc(node.id)}.md</div>

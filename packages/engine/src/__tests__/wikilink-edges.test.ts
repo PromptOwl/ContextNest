@@ -84,7 +84,7 @@ describe("buildRelationships — [[wikilinks]]", () => {
     const { edges, stats } = buildRelationshipsWithStats([a, b]);
     expect(refEdges(edges, "nodes/a")).toEqual(["nodes/b"]);
     expect(edges.some((e) => /missing/i.test(e.to))).toBe(false);
-    expect(stats).toEqual({ edges: 1, fromWikilinks: 1, unresolvedWikilinks: 1 });
+    expect(stats).toEqual({ edges: 1, fromWikilinks: 1, unresolvedWikilinks: 1, unresolvedContextLinks: 0 });
   });
 
   it("AC3: contextnest://nodes/b and [[B Title]] in the same doc dedupe to ONE edge", () => {
@@ -109,7 +109,7 @@ describe("buildRelationships — [[wikilinks]]", () => {
     const a = doc("nodes/a", "A Title", "I am [[A Title]] and [[nodes/a]].");
     const { edges, stats } = buildRelationshipsWithStats([a]);
     expect(edges).toEqual([]);
-    expect(stats).toEqual({ edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 });
+    expect(stats).toEqual({ edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0, unresolvedContextLinks: 0 });
   });
 
   it("AC4: buildBacklinks sees wikilink edges (engine backlinks API stays consistent)", () => {
@@ -157,7 +157,7 @@ describe("buildRelationships — [[wikilinks]]", () => {
     const c = doc("nodes/c", "C Title", "");
     const { edges, stats } = buildRelationshipsWithStats([a, b, c]);
     expect(edges).toEqual([]);
-    expect(stats).toEqual({ edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0 });
+    expect(stats).toEqual({ edges: 0, fromWikilinks: 0, unresolvedWikilinks: 0, unresolvedContextLinks: 0 });
 
     const plain = doc("nodes/a", "A", body + "\n\nBut a real [[B Title]] link counts.");
     expect(refEdges(buildRelationships([plain, b, c]), "nodes/a")).toEqual(["nodes/b"]);
@@ -185,7 +185,32 @@ describe("generateContextYaml — wikilink edges, hubs and stats", () => {
     const c = doc("nodes/c", "C", "");
     const { contextYaml, stats } = generateContextYamlWithStats([a, b, c], null, null);
     expect(contextYaml.relationships).toHaveLength(2);
-    expect(stats).toEqual({ edges: 2, fromWikilinks: 1, unresolvedWikilinks: 1 });
+    expect(stats).toEqual({ edges: 2, fromWikilinks: 1, unresolvedWikilinks: 1, unresolvedContextLinks: 0 });
+  });
+});
+
+describe("buildRelationships — contextnest:// links agree with traversal", () => {
+  it("drops dangling and non-node URIs (counted), keeps real and cross-namespace ones", () => {
+    const a = doc(
+      "nodes/a",
+      "A",
+      [
+        "[real](contextnest://nodes/b@2#x)",
+        "[gone](contextnest://nodes/missing)",
+        "[tag](contextnest://tag/eng) [folder](contextnest://nodes/) [s](contextnest://search/foo)",
+        "[self](contextnest://nodes/a#top)",
+        "[remote](contextnest://acme://nodes/z)",
+      ].join("\n"),
+    );
+    const b = doc("nodes/b", "B", "");
+    const { edges, stats } = buildRelationshipsWithStats([a, b]);
+    expect(refEdges(edges, "nodes/a").sort()).toEqual([
+      "contextnest://acme://nodes/z",
+      "nodes/b",
+    ]);
+    // missing, tag/eng, nodes (folder), search/foo
+    expect(stats.unresolvedContextLinks).toBe(4);
+    expect(buildBacklinks([a, b]).get("nodes/missing")).toBeUndefined();
   });
 });
 
@@ -231,5 +256,27 @@ describe("GraphQueryEngine — --hops follows wikilink edges", () => {
     expect(ids).toContain("nodes/a");
     expect(ids).toContain("nodes/b");
     expect(ids).not.toContain("nodes/lonely");
+  });
+
+  it("NestBench §6.4 control: a pinned contextnest:// link is reached at the same hop as a [[wikilink]]", async () => {
+    await addDoc(
+      "nodes/source",
+      "Source",
+      "Wiki [[Target A]] and URI [b](contextnest://nodes/target-b@1#top).",
+    );
+    await addDoc("nodes/target-a", "Target A", "# A");
+    await addDoc("nodes/target-b", "Target B", "# B");
+    await storage.regenerateIndex();
+
+    // hops:0 is not asserted here: in a 3-node vault both targets are hubs and
+    // edges TO a hub are free (graph-traverser.ts), which is orthogonal to the
+    // link form. Before the fix target-b was missing at EVERY hop count.
+    const engine = new GraphQueryEngine(storage);
+    for (const hops of [1, 2, 3]) {
+      const r = await engine.query("nodes/source", { hops });
+      expect(new Set(r.documents.map((d) => d.id))).toEqual(
+        new Set(["nodes/source", "nodes/target-a", "nodes/target-b"]),
+      );
+    }
   });
 });

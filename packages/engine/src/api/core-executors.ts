@@ -15,6 +15,7 @@ import type {
   ClientMetadata,
   ContextNode,
   Frontmatter,
+  IntegrityFailure,
   PdfMeta,
   SkillMeta,
   SourceMeta,
@@ -30,6 +31,7 @@ import {
   parseDocument,
 } from "../parser.js";
 import { Resolver } from "../resolver.js";
+import { annotateIntegrity } from "../graph-query-engine.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -91,6 +93,9 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     ...(node.frontmatter.type === "pdf" && node.frontmatter.pdf
       ? { pdf: node.frontmatter.pdf }
       : {}),
+    // Before the body, so an agent reading the payload top-down meets the
+    // warning first. Present only when verification failed.
+    ...(node.integrity ? { integrity: node.integrity } : {}),
     ...(includeBody ? { body: node.body } : {}),
     ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
@@ -256,7 +261,12 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
     client: input.client,
   });
   const budget = input.max_tokens ?? 8000;
-  const documents: Array<{ id: string; frontmatter: Frontmatter; body: string }> = [];
+  const documents: Array<{
+    id: string;
+    frontmatter: Frontmatter;
+    integrity?: IntegrityFailure;
+    body: string;
+  }> = [];
   let tokens = 0;
   let truncated = false;
   for (const d of result.documents) {
@@ -266,7 +276,12 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
       break;
     }
     tokens += cost;
-    documents.push({ id: d.id, frontmatter: d.frontmatter, body: d.body });
+    documents.push({
+      id: d.id,
+      frontmatter: d.frontmatter,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
+      body: d.body,
+    });
   }
   return { documents, tokens_used: tokens, truncated };
 };
@@ -310,9 +325,20 @@ const get: OperationExecutor = async (ctx, input: any) => {
   // Surfaces that let a steward see and revive a retired document opt out —
   // reading one is not the same as republishing it.
   if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  // Served, never refused: a document that fails verification is still the one
+  // asked for. The verdict tells the agent not to trust its values.
+  //
+  // Runs on the verify_checksum path too. There, a drifted live file is
+  // replaced by the last-approved keyframe (+ pendingChange); the verdict then
+  // checks what is actually served: the body check runs on the keyframe's own
+  // bytes (clean unless the keyframe itself was altered), and the chain check
+  // still catches a corrupted history behind it. With no keyframe to fall back
+  // to, the drifted live node is served and body_drift is reported.
+  const integrity = await ctx.storage.verifyServedDocument(node);
   return {
     id: node.id,
     frontmatter: node.frontmatter,
+    ...(integrity ? { integrity } : {}),
     body: node.body,
     ...(input.include_raw ? { raw: node.rawContent } : {}),
     ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
@@ -331,6 +357,9 @@ const list: OperationExecutor = async (ctx, input: any) => {
     ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
   });
   const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  // `full` serves bodies, so it gets the same integrity verdict as every other
+  // body-serving path. Summary mode (no body) stays cheap: nothing is hashed.
+  if (input.full === true) await annotateIntegrity(ctx.storage, kept);
   return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
 
@@ -670,10 +699,13 @@ const versions: OperationExecutor = async (ctx, input: any) => {
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // Surface DOCUMENT_NOT_FOUND for a bogus id/title (the descriptor advertises it).
-  await ctx.storage.readDocument(id);
+  const live = await ctx.storage.readDocument(id);
   try {
     const content = await ctx.versions.reconstructVersion(id, input.version);
-    return { id, version: input.version, content };
+    // A past version is rebuilt from the history, so only the chain speaks
+    // for it — the live body's drift says nothing about v{N}.
+    const integrity = await ctx.storage.verifyServedDocument(live, { checkBody: false });
+    return { id, version: input.version, ...(integrity ? { integrity } : {}), content };
   } catch (err) {
     // reconstructVersion codes its own failures (VERSION_NOT_FOUND,
     // RECONSTRUCTION_FAILED) — pass those through. Anything uncoded that leaks
@@ -763,8 +795,14 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
     servedVersion = approved.version;
   }
   const vaultName = config?.name;
+  // A skill is matched on and EXECUTED, so a tampered one matters most. Live
+  // node: full check; approved version rebuilt from history: chain only.
+  const integrity = await ctx.storage.verifyServedDocument(live, {
+    checkBody: servedVersion === null,
+  });
   return {
     doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    integrity,
     servedVersion,
     vaultName,
     serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
@@ -787,16 +825,15 @@ function asValidationError<T>(fn: () => T): T {
 }
 
 const skill: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope } =
+    await loadSkillNode(ctx, input);
   const rendered = asValidationError(() =>
     renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
   );
   return {
     name: rendered.name,
     description: rendered.description,
+    ...(integrity ? { integrity } : {}),
     content: rendered.content,
     relative_path: rendered.relativePath,
     base: rendered.base,
@@ -813,10 +850,8 @@ function rejectedNote(id: string, version: number): string {
 }
 
 const skillInstall: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope, mode } =
+    await loadSkillNode(ctx, input);
   const manifest = asValidationError(() =>
     buildInstallManifest(doc, {
       harness,
@@ -827,11 +862,21 @@ const skillInstall: OperationExecutor = async (ctx, input: any) => {
       mode,
     }),
   );
-  if (servedVersion === null) return manifest;
+  // The installed files are written verbatim; the verdict rides on the result
+  // (and leads `notes`, the text an installing agent relays) so whoever
+  // installs a tampered skill is told before it runs.
+  const flagged = integrity
+    ? { ...manifest, integrity, notes: `${integrity.warning} ${manifest.notes}` }
+    : manifest;
+  if (servedVersion === null) return flagged;
+  // The integrity warning stays FIRST even on the rejected fallback: it is
+  // the caveat that must not be lost if only the first sentence is shown.
   return {
-    ...manifest,
+    ...flagged,
     served_version: servedVersion,
-    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
+    notes: integrity
+      ? `${integrity.warning} ${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`
+      : `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
   };
 };
 
