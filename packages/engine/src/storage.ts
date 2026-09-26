@@ -346,8 +346,9 @@ export class NestStorage {
     );
     if (this.cryptoPinned && this.cryptoLoad) return this.cryptoLoad;
     if (!this.cryptoLoad || mtimeMs !== this.cryptoStamp.mtimeMs) {
+      // Verdicts computed under a different encryption state are stale.
+      if (this.cryptoLoad) this.historyVerdicts.clear();
       this.cryptoLoad = VaultCrypto.load(this.root, this.options.encryption);
-      this.historyVerdicts.clear();
     }
     this.cryptoStamp = { checkedAt: now, mtimeMs };
     return this.cryptoLoad;
