@@ -11,6 +11,7 @@ export type {
   FederationMode,
   GovernanceTier,
   SuggestionSource,
+  ReviewMode,
   HashChainEventType,
   SourceMeta,
   PdfMeta,
@@ -154,6 +155,7 @@ export {
   pdfMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
+  REVIEW_MODES,
   HASH_CHAIN_EVENT_TYPES,
   TAG_PATTERN,
   TITLE_MAX_LENGTH,
@@ -432,6 +434,29 @@ export type {
   InstallManifest,
 } from "./skills.js";
 export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";
+
+// Human review gate — see review.ts
+export {
+  REVIEW_HOLD_NOTE_PREFIX,
+  REVIEW_OFF_COMMAND,
+  readReviewMode,
+  setReviewMode,
+  isReviewHold,
+  listReviewHolds,
+  currentReviewProposal,
+  stageReviewHold,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  reviewHeldMessage,
+} from "./review.js";
+export type {
+  ReviewHold,
+  PendingReviewItem,
+  ReviewDecisionOptions,
+  ApproveReviewResult,
+  RejectReviewResult,
+} from "./review.js";
 
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
 export {

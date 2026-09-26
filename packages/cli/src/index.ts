@@ -63,6 +63,12 @@ import {
   isRejected,
   HARNESSES,
   SELECTOR_GRAMMAR,
+  readReviewMode,
+  setReviewMode,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  REVIEW_OFF_COMMAND,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -119,11 +125,14 @@ import {
   isDryRun,
   isForce,
   confirmOrExit,
+  canAskUser,
+  ask,
   ensureOverwritable,
   assertSafeEndpoint,
   assertNotRedirected,
   NO_REDIRECT,
 } from "./safety.js";
+import { resolveHeldWrite } from "./review-gate.js";
 import {
   asPendingConfirmation,
   pollUntilDecided,
@@ -188,6 +197,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
       ["doctor", "Check versions, the vault registry and the current directory for problems"],
+      ["config", "Vault settings (ctx config set review off)"],
     ],
   },
   {
@@ -196,6 +206,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["add", "Add a new document"],
       ["read", "Show a document (add --html to open it in the browser)"],
       ["update", "Edit a document, then auto-publish a new version"],
+      ["review", "List, approve or reject writes held for review"],
       ["delete", "Remove a document and its version history"],
     ],
   },
@@ -426,6 +437,9 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift stage",
   "drift approve",
   "drift reject",
+  "config set",
+  "review approve",
+  "review reject",
   "import pdf",
   "import jats",
   "import pubmed",
@@ -1141,8 +1155,21 @@ program
     }
 
     const storage = new NestStorage(root);
-    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription);
+    // Review gate: a NEW vault holds agent/tool writes for approval. A
+    // re-init keeps whatever the vault already had — including no key at all,
+    // so re-initializing an older vault never silently changes its automations.
+    const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
+    const priorReview = reinit ? await readReviewMode(storage).catch(() => undefined) : undefined;
+    const review = reinit ? priorReview : "on";
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
+    if (review === "on") {
+      console.log(
+        chalk.dim(
+          `  Review is on: agent and CLI writes wait for your approval (ctx review list). Turn off: ${REVIEW_OFF_COMMAND}`,
+        ),
+      );
+    }
 
     // Registration is performed AFTER the starter is applied (see registerVault
     // below) so an interruption mid-starter never leaves a registry alias
@@ -1475,6 +1502,7 @@ program
   .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
+  .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -1496,7 +1524,13 @@ program
       );
     }
 
-    await confirmOrExit(`Create ${id}.md in ${realRootPath() ?? storage.root} and publish v1?`);
+    const reviewMode = await readReviewMode(storage);
+    await confirmOrExit(
+      reviewMode === "on" && !opts.publish
+        ? `Create ${id}.md in ${realRootPath() ?? storage.root}?`
+        : `Create ${id}.md in ${realRootPath() ?? storage.root} and publish v1?`,
+    );
+    const hold = reviewMode === "on" && !opts.publish;
 
     const title = opts.title || titleFromId(id);
 
@@ -1537,6 +1571,7 @@ program
       id: string;
       version: number;
       checkpoint: number | null;
+      held_for_review?: boolean;
     }>(
       "context_create",
       {
@@ -1546,15 +1581,43 @@ program
         type: opts.type,
         ...(tagList ? { tags: tagList } : {}),
         ...(frontmatter.skill ?? {}),
+        ...(hold ? { review: true } : {}),
         note: "Created via CLI",
       },
       opContext(storage, "cli@contextnest.local"),
     );
 
+    if (result.held_for_review) {
+      await afterHold(storage, result.id);
+      return;
+    }
     console.log(chalk.green(`Created and published ${result.id}.md`));
     console.log(`  Version: ${result.version}`);
     console.log(`  Checkpoint: ${result.checkpoint}`);
   });
+
+/**
+ * A write was held by the review gate: ask at a terminal, otherwise print the
+ * one-line notice (review-gate.ts). [y] and [a] approve the held write.
+ */
+async function afterHold(storage: NestStorage, id: string): Promise<void> {
+  await resolveHeldWrite({
+    id,
+    interactive: canAskUser(),
+    prompt: ask,
+    publish: async () => {
+      const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
+      console.log(chalk.green(`Published ${r.id}`));
+      console.log(`  Version: ${r.version}`);
+      console.log(`  Checkpoint: ${r.checkpoint}`);
+    },
+    turnOff: async () => {
+      await setReviewMode(storage, "off");
+      console.log(chalk.yellow("Review turned off for this vault (ctx config set review on to undo)."));
+    },
+    print: (line) => console.log(chalk.yellow(line)),
+  });
+}
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 
@@ -2393,6 +2456,7 @@ program
   .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
+  .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -2410,23 +2474,39 @@ program
       `Rewrite ${normalizeDocumentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
     );
 
+    // The gate only concerns writes that would publish: a lifecycle transition
+    // (`--status draft|pending_review|approved|rejected`) never does.
+    const reviewMode = await readReviewMode(storage);
+    const hold =
+      reviewMode === "on" && !opts.publish && (status === undefined || status === "published");
+
     const result = await cliApi().run<{
       id: string;
       version: number;
       status: string;
       checkpoint: number | null;
+      held_for_review?: boolean;
+      suggestion_id?: string;
     }>(
       "context_update",
       {
         id: normalizeDocumentId(path),
         ...(opts.title !== undefined ? { title: opts.title } : {}),
-        ...(status !== undefined ? { status } : {}),
+        // A held write settles its own status (pending_review, or a staged
+        // edit); an explicit `published` would contradict the hold.
+        ...(status !== undefined && !hold ? { status } : {}),
+        ...(hold ? { review: true } : {}),
         ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
         ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
         note: "Updated via CLI",
       },
       opContext(storage, "cli@contextnest.local"),
     );
+
+    if (result.held_for_review) {
+      await afterHold(storage, result.id);
+      return;
+    }
 
     if (result.checkpoint === null) {
       const label =
@@ -3294,6 +3374,80 @@ drift
         `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
       ),
     );
+  });
+
+// ─── ctx config / ctx review — the human review gate (engine review.ts) ─────
+
+const configCmd = program.command("config").description("Vault settings in .context/config.yaml");
+
+configCmd
+  .command("get <key>")
+  .description("Print a setting (supported: review). `unset` = a vault from before the gate, which publishes.")
+  .action(async (key: string) => {
+    if (key !== "review") {
+      console.error(chalk.red(`Unknown setting "${key}". Supported: review`));
+      process.exit(1);
+    }
+    console.log((await readReviewMode(getStorage())) ?? "unset");
+  });
+
+configCmd
+  .command("set <key> <value>")
+  .description("Change a setting: `ctx config set review on|off` (on holds add/update writes for approval)")
+  .action(async (key: string, value: string) => {
+    const mode = value.trim().toLowerCase();
+    if (key !== "review" || (mode !== "on" && mode !== "off")) {
+      console.error(chalk.red("Usage: ctx config set review on|off"));
+      process.exit(1);
+    }
+    await setReviewMode(getStorage(), mode as "on" | "off");
+    console.log(chalk.green(`review: ${mode}`));
+  });
+
+const reviewCmd = program.command("review").description("List, approve or reject writes held for review");
+
+reviewCmd
+  .command("list", { isDefault: true })
+  .description("List what is waiting: new documents (pending_review) and held edits to published ones")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const items = await listPendingReview(getStorage());
+    if (opts.json) {
+      console.log(JSON.stringify(items, null, 2));
+      return;
+    }
+    if (items.length === 0) {
+      console.log("Nothing is waiting for review.");
+      return;
+    }
+    for (const item of items) {
+      console.log(`  ${item.kind === "edit" ? "edit" : "new "}  ${item.id}${item.stale ? chalk.red("  (stale)") : ""}`);
+    }
+    console.log(chalk.dim(`\nctx review approve <path> | ctx review reject <path> | turn off: ${REVIEW_OFF_COMMAND}`));
+  });
+
+reviewCmd
+  .command("approve <path>")
+  .description("Publish what is held for a document")
+  .action(async (path: string) => {
+    const storage = getStorage();
+    const id = normalizeDocumentId(path);
+    await confirmOrExit(`Publish what is held for review for ${id}?`);
+    const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
+    console.log(chalk.green(`Published ${r.id}`));
+    console.log(`  Version: ${r.version}`);
+    console.log(`  Checkpoint: ${r.checkpoint}`);
+  });
+
+reviewCmd
+  .command("reject <path>")
+  .description("Discard a held edit (archived; the published version stays), or retire a pending document")
+  .action(async (path: string) => {
+    const storage = getStorage();
+    const id = normalizeDocumentId(path);
+    await confirmOrExit(`Reject what is held for review for ${id}?`);
+    const r = await rejectReview(storage, id, { actor: "cli@contextnest.local" });
+    console.log(chalk.yellow(r.kind === "edit" ? `Discarded held edit for ${id}` : `Rejected ${id} (status: rejected)`));
   });
 
 // ─── ctx vault ───────────────────────────────────────────────────────────────

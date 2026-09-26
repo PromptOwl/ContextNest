@@ -52,6 +52,27 @@ export function isForce(): boolean {
   return flags.force === true;
 }
 
+/**
+ * True when a person can answer a prompt: stdin and stdout are TTYs, and
+ * nothing on the command line said not to ask (`--yes`, `--force`,
+ * `--dry-run`). Agents, CI and pipes are never interactive.
+ */
+export function canAskUser(): boolean {
+  if (flags.dryRun === true || flags.yes === true || flags.force === true) return false;
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+/** Ask one free-form question on the TTY and resolve with the raw answer. */
+export async function ask(question: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise<string>((resolve) => {
+    rl.question(`${question} `, (a) => {
+      rl.close();
+      resolve(a);
+    });
+  });
+}
+
 // ─── Vault snapshots ────────────────────────────────────────────────────────
 
 /**
