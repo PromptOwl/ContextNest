@@ -324,22 +324,32 @@ export class NestStorage {
   private cryptoLoad: Promise<VaultCrypto | null> | undefined;
   private cryptoStamp = { checkedAt: 0, mtimeMs: -1 as number };
   private cryptoPinned = false;
+  /** In-flight re-check, shared so a batch of parallel reads loads once. */
+  private cryptoRefresh: Promise<VaultCrypto | null> | undefined;
 
   /** The vault's encryption handle, or null for a plain (default) vault. */
   async getVaultCrypto(): Promise<VaultCrypto | null> {
-    if (this.cryptoPinned && this.cryptoLoad) return this.cryptoLoad;
-    const now = Date.now();
-    if (!this.cryptoLoad || now - this.cryptoStamp.checkedAt > 1000) {
-      const mtimeMs = await stat(VaultCrypto.configPath(this.root)).then(
-        (st) => st.mtimeMs,
-        () => -1,
-      );
-      if (!this.cryptoLoad || mtimeMs !== this.cryptoStamp.mtimeMs) {
-        this.cryptoLoad = VaultCrypto.load(this.root, this.options.encryption);
-        this.historyVerdicts.clear();
-      }
-      this.cryptoStamp = { checkedAt: now, mtimeMs };
+    if (this.cryptoLoad && (this.cryptoPinned || Date.now() - this.cryptoStamp.checkedAt <= 1000)) {
+      return this.cryptoLoad;
     }
+    this.cryptoRefresh ??= this.refreshVaultCrypto().finally(() => {
+      this.cryptoRefresh = undefined;
+    });
+    return this.cryptoRefresh;
+  }
+
+  private async refreshVaultCrypto(): Promise<VaultCrypto | null> {
+    const now = Date.now();
+    const mtimeMs = await stat(VaultCrypto.configPath(this.root)).then(
+      (st) => st.mtimeMs,
+      () => -1,
+    );
+    if (this.cryptoPinned && this.cryptoLoad) return this.cryptoLoad;
+    if (!this.cryptoLoad || mtimeMs !== this.cryptoStamp.mtimeMs) {
+      this.cryptoLoad = VaultCrypto.load(this.root, this.options.encryption);
+      this.historyVerdicts.clear();
+    }
+    this.cryptoStamp = { checkedAt: now, mtimeMs };
     return this.cryptoLoad;
   }
 
