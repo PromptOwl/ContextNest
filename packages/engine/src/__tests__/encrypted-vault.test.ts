@@ -112,6 +112,10 @@ describe("encrypted vault", () => {
     expect(await vm.reconstructVersion("nodes/plan", 2)).toContain(SECRET_V2);
     const history = await fresh.readHistory("nodes/plan");
     expect(history?.versions.map((v) => v.note)).toEqual(["first", "NOTE-TOKEN-second", undefined]);
+    // Every history read decrypts: nothing may mistake a sealed history for an
+    // unreadable one and restart the chain.
+    expect(history?.versions.some((v) => /Chain restarted/.test(v.note ?? ""))).toBe(false);
+    expect(history?.versions.map((v) => v.version)).toEqual([1, 2, 3]);
     expect((await fresh.discoverDocuments()).map((d) => d.id)).toEqual(["nodes/plan"]);
     expect((await fresh.verifyVaultIntegrity()).valid).toBe(true);
   });
@@ -265,5 +269,7 @@ describe("encrypted vault", () => {
     await seedHistory(storage);
     expect(await storage.isEncrypted()).toBe(false);
     expect((await filesContaining(root, SECRET)).length).toBeGreaterThan(0);
+    const h = await storage.readHistory("nodes/plan");
+    expect(h?.versions.map((v) => v.note)).toEqual(["first", "NOTE-TOKEN-second", undefined]);
   });
 });
