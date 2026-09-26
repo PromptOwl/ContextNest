@@ -105,6 +105,8 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { telemetryConsent } from "./telemetry/index.js";
+import { loadCloudToken } from "./credentials.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
@@ -1009,7 +1011,8 @@ async function applyStarter(
       tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
     })),
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: pkg.version,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
 }
@@ -1058,7 +1061,8 @@ This vault was initialized without a starter recipe. To help the user get starte
     starterDisplayName: null,
     nodes: [],
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: pkg.version,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
 }
@@ -2201,17 +2205,6 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
   }
 }
 
-async function loadCloudToken(): Promise<string | null> {
-  const homedir = (await import("node:os")).homedir();
-  const credPath = pathMod.join(homedir, ".promptowl", "credentials.json");
-  try {
-    const creds = JSON.parse(await fs.promises.readFile(credPath, "utf-8"));
-    return creds.access_token || null;
-  } catch {
-    return null;
-  }
-}
-
 // ─── ctx query ────────────────────────────────────────────────────────────────
 
 program
@@ -2884,7 +2877,8 @@ program
         tags: (d.frontmatter.tags || []).map((t: string) => t.replace(/^#/, "")),
       })),
       timestamp: new Date().toISOString(),
-      cliVersion: program.version() || "0.3.0",
+      cliVersion: pkg.version,
+      analytics: telemetryConsent(getVaultRoot()),
     });
 
     console.log(chalk.green(`Generated welcome page: .context/welcome.html`));
@@ -3686,6 +3680,7 @@ program
         ? `${report.plugin.version}  ${chalk.dim(report.plugin.path ?? "")}`
         : chalk.dim("not installed (no contextnest entry in installed_plugins.json)"),
     );
+    row("Privacy", `telemetry + welcome-page analytics ${report.privacy.telemetry ? chalk.yellow("on") : "off"} · credentials: ${report.privacy.credentials}`);
     console.log("");
   });
 

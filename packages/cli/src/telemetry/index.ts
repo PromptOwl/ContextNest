@@ -1,7 +1,9 @@
 /**
  * Lightweight, opt-in telemetry for Context Nest CLI.
  *
- * - Reads `.context/config.yaml` for `telemetry: true`.
+ * - Reads `.context/config.yaml` for `telemetry: true`. Absent = off.
+ * - DO_NOT_TRACK=1 or CONTEXTNEST_TELEMETRY=0 force it off, whatever the file says.
+ * - The same flag gates Google Analytics on .context/welcome.html.
  * - Never sends vault content — only metadata events.
  * - All network calls are fire-and-forget; never block the CLI or throw.
  * - Uses native `fetch` (Node 20+).
@@ -12,16 +14,37 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { TelemetryEvent, TelemetryPayload } from "./types.js";
+import { CLI_VERSION } from "../version.js";
 
 export type { TelemetryEvent, TelemetryPayload } from "./types.js";
 
-const CLI_VERSION = "0.3.0";
 const DEFAULT_ENDPOINT = "https://api.promptowl.ai/v1/telemetry";
 
 let enabled = false;
 let clientId: string | undefined;
 let endpoint: string = DEFAULT_ENDPOINT;
 const queue: TelemetryPayload[] = [];
+
+/** DO_NOT_TRACK (any value but ""/"0"/"false") or CONTEXTNEST_TELEMETRY=0|false|off. */
+export function telemetryEnvOptOut(env: NodeJS.ProcessEnv = process.env): boolean {
+  const dnt = (env.DO_NOT_TRACK ?? "").trim().toLowerCase();
+  const ct = (env.CONTEXTNEST_TELEMETRY ?? "").trim().toLowerCase();
+  return (dnt !== "" && dnt !== "0" && dnt !== "false") || ["0", "false", "off", "no"].includes(ct);
+}
+
+/**
+ * Has this vault opted in? `telemetry: true` in `.context/config.yaml` and no
+ * env opt-out. Never throws; anything unreadable is "no".
+ */
+export function telemetryConsent(vaultRoot: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (telemetryEnvOptOut(env)) return false;
+  try {
+    const configContent = fs.readFileSync(path.join(vaultRoot, ".context", "config.yaml"), "utf-8");
+    return /^telemetry:\s*true\s*$/m.test(configContent);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Initialize telemetry — reads config, caches enabled state.
@@ -31,15 +54,7 @@ export async function initTelemetry(vaultRoot: string): Promise<void> {
   try {
     if (clientId !== undefined) return;
 
-    const configPath = path.join(vaultRoot, ".context", "config.yaml");
-    if (!fs.existsSync(configPath)) {
-      enabled = false;
-      clientId = "";
-      return;
-    }
-
-    const configContent = fs.readFileSync(configPath, "utf-8");
-    if (!/^telemetry:\s*true\s*$/m.test(configContent)) {
+    if (!telemetryConsent(vaultRoot)) {
       enabled = false;
       clientId = "";
       return;

@@ -23,6 +23,8 @@ import {
   readRegistry,
 } from "@promptowl/contextnest-engine";
 import type { VaultListEntry } from "@promptowl/contextnest-engine";
+import { telemetryConsent } from "./telemetry/index.js";
+import { CredentialStore } from "./credentials.js";
 
 export const CLI_PACKAGE_NAME = "@promptowl/contextnest-cli";
 /** How long `npm view` gets before the doctor gives up and reports `null`. */
@@ -61,6 +63,8 @@ export interface DoctorReport {
     /** The manifest the version was read from, or null when none was readable. */
     path: string | null;
   };
+  /** Telemetry/analytics consent for the cwd vault, and where credentials are stored. */
+  privacy: { telemetry: boolean; credentials: string };
 }
 
 /** Skip the network entirely. Any non-empty value counts. */
@@ -327,5 +331,12 @@ export async function buildDoctorReport(opts: BuildDoctorReportOptions): Promise
     registry,
     cwd,
     plugin: readClaudePluginVersion(claudePluginManifestPath(env)),
+    privacy: {
+      telemetry: cwd.vault_path !== null && telemetryConsent(cwd.vault_path, env),
+      credentials: await new CredentialStore({ env })
+        .describe()
+        .then((d) => d.label)
+        .catch((err: Error) => `unknown (${err.message})`),
+    },
   };
 }
