@@ -63,6 +63,7 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import { currentReviewProposal, stageReviewHold } from "../review.js";
 import { TITLE_MAX_LENGTH } from "../schemas.js";
 import {
   isVersionArtifactPath,
@@ -466,17 +467,26 @@ const create: OperationExecutor = async (ctx, input: any) => {
       "VALIDATION_FAILED",
     );
   }
-  const node = buildDraftNode({ ...input, content });
+  // Held for review (review.ts): an unpublished node is simply written as
+  // pending_review. An explicit publish:true wins — the flag is the caller's
+  // per-call override (`ctx add --publish`).
+  const hold = input.review === true && input.publish !== true;
+  const node = buildDraftNode({
+    ...input,
+    content,
+    ...(hold && input.status === undefined ? { status: "pending_review" } : {}),
+  });
   // A rejected node cannot be published — publish refuses one by design. Left
   // to fall through, the write below lands and publish then throws, stranding a
   // file on disk with no version and no history, and making the caller's retry
   // fail with DOCUMENT_ALREADY_EXISTS for a create it believes never happened.
   // Refuse before anything is written.
-  const publish = node.frontmatter.status === "rejected" ? false : input.publish !== false;
+  const publish = node.frontmatter.status === "rejected" || hold ? false : input.publish !== false;
   // Publish assigns the version (spec §6), so a published node must go to disk
   // WITHOUT one — pre-setting it makes the first published version 2 and leaves
   // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
-  if (!publish) node.frontmatter.version = 1;
+  // A held node is left unversioned instead, so approving it publishes v1.
+  if (!publish && !hold) node.frontmatter.version = 1;
   const createdStatus = node.frontmatter.status;
   assertValid(node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
@@ -493,6 +503,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
       version: node.frontmatter.version ?? 1,
       status: createdStatus,
       checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
     };
   }
   const result = await publishAndIndex(ctx, node.id, input.note, input.client);
@@ -519,7 +530,15 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // one that would escape the vault root.
   const id: string = input.id;
   assertSafeDocumentId(id);
-  const existing = await ctx.storage.readDocument(id);
+  const live = await ctx.storage.readDocument(id);
+  // Held for review (review.ts). An edit to a PUBLISHED node must not touch
+  // the canonical file — it is staged as a suggestion instead — and it builds
+  // on the node's current held proposal, if any, so a second held edit carries
+  // the first rather than silently dropping it on approval.
+  const hold = input.review === true && input.publish !== true;
+  const holdAsSuggestion = hold && isPublished(live);
+  const proposal = holdAsSuggestion ? await currentReviewProposal(ctx.storage, id) : null;
+  const existing = proposal ? parseDocument(live.filePath, proposal.proposedRaw, id) : live;
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
   // rejects (no version/checksum/history). Reviving one — moving it to some
@@ -552,6 +571,11 @@ const update: OperationExecutor = async (ctx, input: any) => {
     frontmatter.title = input.title;
   }
   if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  // An unpublished node held for review is marked as such (a staged edit to a
+  // published node keeps its status: the proposal is what approval publishes).
+  else if (hold && !holdAsSuggestion && frontmatter.status !== "rejected") {
+    frontmatter.status = "pending_review";
+  }
   // An empty string CLEARS the description, the same convention `metadata`
   // uses for null: over a JSON wire an absent key cannot be told apart from
   // "leave this alone", so without it a caller has no way to remove one.
@@ -608,7 +632,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // mutated and its checksum dropped. The derived default already lands here;
   // this makes it true of the explicit flag too.
   const publish =
-    frontmatter.status === "rejected"
+    frontmatter.status === "rejected" || hold
       ? false
       : (input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status)));
   // Only an unpublished write may carry a caller-assigned version: publish
@@ -617,6 +641,30 @@ const update: OperationExecutor = async (ctx, input: any) => {
   if (!publish && input.version !== undefined) frontmatter.version = input.version;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
+  if (holdAsSuggestion && frontmatter.status !== "rejected") {
+    const staged = await stageReviewHold(ctx.storage, {
+      documentId: id,
+      proposedRawContent: serializeDocument(node),
+      actor: ctx.actor ?? "engine",
+      ...(live.frontmatter.zone ? { zone: live.frontmatter.zone } : {}),
+      docTier: live.frontmatter.governance ?? "standard",
+      ...(input.note ? { note: input.note } : {}),
+      supersedes: proposal ? [proposal.suggestionId] : [],
+    });
+    if (staged) {
+      return {
+        id,
+        version: live.frontmatter.version ?? 1,
+        status: "pending_review",
+        checkpoint: null,
+        held_for_review: true,
+        suggestion_id: staged.suggestionId,
+      };
+    }
+    // No version history to diff against (a hand-marked "published" file that
+    // was never sealed): fall back to an in-place pending write.
+    node.frontmatter.status = "pending_review";
+  }
   await ctx.storage.writeDocument(id, serializeDocument(node));
   if (!publish) {
     await ctx.storage.regenerateIndex();
@@ -625,6 +673,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
       version: frontmatter.version ?? 1,
       status: frontmatter.status ?? "draft",
       checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
     };
   }
   const result = await publishAndIndex(ctx, id, input.note, input.client);

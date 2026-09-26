@@ -38,6 +38,12 @@ import {
   ContextNestError,
   applyTypedBlocks,
   sourceMetaSchema,
+  readReviewMode,
+  setReviewMode,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  reviewHeldMessage,
   NODE_TYPES,
   withIntegrityWarning,
 } from "@promptowl/contextnest-engine";
@@ -296,11 +302,94 @@ function inputShape(op: OperationDescriptor): Record<string, z.ZodTypeAny> {
   return schema.shape as Record<string, z.ZodTypeAny>;
 }
 
+// ─── Human review gate (engine review.ts) ─────────────────────────────────────
+//
+// With `review: on` in the vault's config, an agent's create/update is held for
+// a human instead of published. The engine never decides this on its own — a
+// surface asks for it with `review: true` — so the gate lives here, at the one
+// place every MCP write passes through. A vault without the key predates the
+// gate and publishes exactly as before.
+
+/** The vault's review setting, read per call so `ctx config set` applies live. */
+async function vaultReviewMode(): Promise<"on" | "off" | undefined> {
+  try {
+    return await readReviewMode(storage);
+  } catch {
+    // An unreadable config is not this gate's to report; the write surfaces it.
+    return undefined;
+  }
+}
+
+/**
+ * Whether a catalog write would publish unless the gate steps in. An explicit
+ * `publish` or `review` is the caller's per-call choice and is honoured (the
+ * CLI's `--publish` equivalent). A lifecycle transition (`status` other than
+ * published) never publishes, so it is not gated.
+ */
+function wouldPublish(opName: string, args: Record<string, unknown>): boolean {
+  if (args.publish !== undefined || args.review !== undefined) return false;
+  if (opName === "context_create") return true;
+  return args.status === undefined || args.status === "published";
+}
+
+async function runGatedWrite(opName: string, args: Record<string, unknown>) {
+  let input = args;
+  if ((await vaultReviewMode()) === "on" && wouldPublish(opName, args)) {
+    // A held write settles its own status; an explicit `published` would
+    // contradict the hold.
+    const { status: _status, ...rest } = args;
+    input = { ...(args.status === "published" ? rest : args), review: true };
+  }
+  try {
+    const result = (await api.run(opName, withClientDefaults(input), opCtx())) as Record<string, unknown>;
+    if (result && result.held_for_review === true) {
+      return toolResult({ ...result, review: reviewHeldMessage(String(result.id)) });
+    }
+    return toolResult(result);
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
+const GATED_OPS = new Set(["context_create", "context_update"]);
+
 for (const op of listOperations("core")) {
   tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
-    runOp(op.name, args),
+    GATED_OPS.has(op.name) ? runGatedWrite(op.name, args) : runOp(op.name, args),
   );
 }
+
+// ─── Tool: context_review ────────────────────────────────────────────────────
+//
+// Hand-written rather than a catalog op on purpose: the review setting is a
+// local vault's UX preference, and a catalog op would appear on every surface
+// that binds the catalog — including hosted servers with governance of their
+// own, where an agent toggling the gate must not be possible.
+
+tool(
+  "context_review",
+  "Human review gate. When review is on, context_create/context_update hold writes for the user (the result carries `held_for_review` and a `review` note to relay). Actions: `list` — what is waiting; `approve` / `reject` — decide a node's held write (needs `id`; only when the user says so); `off` / `on` — turn the gate off or on (only when the user asks, e.g. \"turn off review\").",
+  {
+    action: z.enum(["list", "approve", "reject", "off", "on"]).describe("What to do"),
+    id: z.string().optional().describe("Node id, for approve / reject"),
+  },
+  async ({ action, id }) => {
+    try {
+      if (action === "list") return toolResult(await listPendingReview(storage));
+      if (action === "on" || action === "off") {
+        await setReviewMode(storage, action);
+        return toolResult({ review: action });
+      }
+      if (!id) return validationError(`\`id\` is required for action "${action}".`);
+      // Verbatim, like context_update (a flat vault's ids have no nodes/
+      // prefix); the engine refuses an id that escapes the vault.
+      const decide = action === "approve" ? approveReview : rejectReview;
+      return toolResult(await decide(storage, id, { actor: "mcp@contextnest.local" }));
+    } catch (err) {
+      return toolError(err);
+    }
+  },
+);
 
 /** Description for a deprecated legacy alias, steering agents to the canonical name. */
 function deprecated(canonical: string, description: string): string {

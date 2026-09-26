@@ -69,10 +69,10 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-39 tools over stdio, in three groups:
+40 tools over stdio, in three groups:
 
 - **Catalog-driven** (20, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`. **Add new tools here, not by hand.**
-- **Hand-written, still current** (8): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`.
+- **Hand-written, still current** (9): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`, `context_review` (review gate — hand-written on purpose so hosted catalog bindings cannot toggle it).
 - **Deprecated** (11, backward-compatible for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`. Additive parity fixes are allowed here — `list_documents` takes `path` (the `folder` filter of `context_list`), `create_document`/`update_document` take `description` and accept `content` as an alias for `body` — but nothing already accepted may change meaning.
 
 Every tool is registered through the local `tool()` helper, NOT `server.tool()`. `server.tool()` takes a raw shape and wraps it in a non-strict `z.object()`, which STRIPS unknown keys while the JSON Schema it publishes claims `additionalProperties: false`: a client that misnames a parameter gets a success response for a write that silently dropped its text. `tool()` goes through `registerTool` with a `.strict()` ZodObject so the advertised contract is the enforced one. `EngineApi.run()` refuses unknown keys for the same reason, one layer down.

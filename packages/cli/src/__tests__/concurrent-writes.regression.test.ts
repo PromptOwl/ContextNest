@@ -44,6 +44,7 @@ function ctl(args: string[]): string {
 beforeAll(() => {
   vaultDir = mkdtempSync(join(tmpdir(), "cn-conc-vault-"));
   ctl(["init", "--name", "conc", "--description", "concurrency regression"]);
+  ctl(["config", "set", "review", "off"]); // this suite measures publish seals
   for (let i = 1; i <= WRITERS; i++) {
     ctl(["add", `nodes/n${i}`, "--title", `N${i}`, "--tags", "t", "--body", `value is Redis (${i})`]);
   }

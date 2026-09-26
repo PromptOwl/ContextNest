@@ -389,6 +389,12 @@ const createOp: OperationDescriptor = {
       .describe(
         "Publish on create (default true). Pass false to leave the node a draft — governed surfaces use this when a write must clear review before becoming retrievable.",
       ),
+    review: z
+      .boolean()
+      .optional()
+      .describe(
+        "Hold the new node for human review: it is written with status pending_review and is not retrievable until approved (context_publish / `ctx review approve`). Ignored when publish is explicitly true. Write surfaces set this from the vault's `review` setting.",
+      ),
     note: z
       .string()
       .optional()
@@ -426,12 +432,16 @@ const createOp: OperationDescriptor = {
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
-    status: z.enum(STATUSES).describe("Resulting status — draft when publish:false"),
+    status: z.enum(STATUSES).describe("Resulting status — draft when publish:false, pending_review when held for review"),
     checkpoint: z
       .number()
       .int()
       .nullable()
       .describe("Checkpoint sealing the publish, or null when created as a draft"),
+    held_for_review: z
+      .boolean()
+      .optional()
+      .describe("True when the write was held for human review instead of published"),
   }),
   errors: [
     "VALIDATION_FAILED",
@@ -490,6 +500,12 @@ const updateOp: OperationDescriptor = {
       .describe(
         "Publish the edit (default true). Defaults to FALSE when `status` names a non-published lifecycle value — those are metadata transitions, not content releases. An explicit value always wins.",
       ),
+    review: z
+      .boolean()
+      .optional()
+      .describe(
+        "Hold the edit for human review instead of publishing it. An edit to a PUBLISHED node is staged under _suggestions/ (the published version keeps serving; a later held edit builds on it and supersedes it); any other node is written in place with status pending_review. Approve with `ctx review approve` or the context_review tool. Ignored when publish is explicitly true. Write surfaces set this from the vault's `review` setting.",
+      ),
     version: z
       .number()
       .int()
@@ -530,12 +546,22 @@ const updateOp: OperationDescriptor = {
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
-    status: z.enum(STATUSES).describe("Resulting status — `published` unless the edit stayed a draft"),
+    status: z
+      .enum(STATUSES)
+      .describe("Resulting status — `published` unless the edit stayed a draft; `pending_review` when held for review"),
     checkpoint: z
       .number()
       .int()
       .nullable()
       .describe("Checkpoint sealing the publish, or null when the edit did not publish"),
+    held_for_review: z
+      .boolean()
+      .optional()
+      .describe("True when the edit was held for human review instead of published"),
+    suggestion_id: z
+      .string()
+      .optional()
+      .describe("The staged hold's id, when an edit to a published node was held for review"),
   }),
   errors: [
     "VALIDATION_FAILED",

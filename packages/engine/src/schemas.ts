@@ -102,6 +102,9 @@ export const TRANSPORTS = ["mcp", "rest", "cli", "function"] as const;
 export const GOVERNANCE_TIERS = ["primary", "standard"] as const;
 
 /** Suggestion source enum (bridge-function-spec Story 3.1, Story 1.3) */
+/** Values of the vault-level `review` setting in `.context/config.yaml`. */
+export const REVIEW_MODES = ["on", "off"] as const;
+
 export const SUGGESTION_SOURCES = [
   "out-of-band-edit",
   "remote-push",
@@ -373,6 +376,16 @@ export const nestConfigSchema = z.object({
     .optional(),
   agent_maintenance_directive: z.string().optional(),
   agent_tools: z.array(z.string()).optional(),
+  // Human review gate for agent/tool writes (see review.ts). `ctx init` writes
+  // `on`; a vault WITHOUT the key keeps the pre-gate publish-by-default
+  // behaviour so existing automations are not silently changed. YAML 1.1
+  // readers (PyYAML, …) round-trip `on`/`off` as booleans, so accept those too.
+  review: z
+    .preprocess(
+      (v) => (v === true ? "on" : v === false ? "off" : typeof v === "string" ? v.toLowerCase() : v),
+      z.enum(REVIEW_MODES),
+    )
+    .optional(),
 });
 
 export const packSchema = z.object({

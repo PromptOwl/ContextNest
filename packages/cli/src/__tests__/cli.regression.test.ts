@@ -98,12 +98,19 @@ function runCtxResult(
   };
 }
 
+// New vaults hold add/update for review; these suites exercise the publish
+// path, so they turn the gate off (review-gate.regression.test.ts covers it).
+function reviewOff(cwd: string): void {
+  execFileSync("node", [distPath, "config", "set", "review", "off"], { cwd, env: ENV, stdio: "ignore" });
+}
+
 function initVault(cwd: string): void {
   execFileSync(
     "node",
     [distPath, "init", "--name", "regression-vault", "--layout", "structured"],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  reviewOff(cwd);
 }
 
 /** Init a vault from a named starter recipe (scaffolds nodes + packs). */
@@ -113,6 +120,7 @@ function initStarter(cwd: string, recipe: string): void {
     [distPath, "init", "--name", "starter-vault", "--starter", recipe],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  reviewOff(cwd);
 }
 
 interface MockServer {
