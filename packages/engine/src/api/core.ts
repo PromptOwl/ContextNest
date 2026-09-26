@@ -17,6 +17,8 @@ import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
+  WRITABLE_STATUSES,
+  FORGET_REASON_CODES,
   frontmatterSchema,
   pdfMetaSchema,
   sourceMetaSchema,
@@ -394,7 +396,7 @@ const createOp: OperationDescriptor = {
       .optional()
       .describe("Version-history note recorded against the publish (audit trail)."),
     status: z
-      .enum(STATUSES)
+      .enum(WRITABLE_STATUSES)
       .optional()
       .describe(
         "Initial lifecycle status (default draft). Only meaningful with publish:false — publishing sets `published` regardless.",
@@ -437,6 +439,7 @@ const createOp: OperationDescriptor = {
     "VALIDATION_FAILED",
     "INVALID_DOCUMENT_ID",
     "DOCUMENT_ALREADY_EXISTS",
+    "FORGOTTEN_DOCUMENT",
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["create_document"],
@@ -475,10 +478,10 @@ const updateOp: OperationDescriptor = {
         "Frontmatter metadata to merge into frontmatter.metadata. A null value clears that key.",
       ),
     status: z
-      .enum(STATUSES)
+      .enum(WRITABLE_STATUSES)
       .optional()
       .describe(
-        "New lifecycle status. Canonical values only — normalize aliases with `normalizeStatus` before calling.",
+        "New lifecycle status. Canonical values only — normalize aliases with `normalizeStatus` before calling. Not `forgotten`: that is set only by context_forget, which erases the content.",
       ),
     note: z
       .string()
@@ -542,6 +545,7 @@ const updateOp: OperationDescriptor = {
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
+    "FORGOTTEN_DOCUMENT",
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
@@ -574,6 +578,7 @@ const publishOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
     "REJECTED_DOCUMENT",
+    "FORGOTTEN_DOCUMENT",
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["publish_document"],
@@ -584,12 +589,34 @@ const publishOp: OperationDescriptor = {
 const deleteOp: OperationDescriptor = {
   name: "context_delete",
   namespace: "core",
-  description: "Delete a node and its version history from the vault.",
-  input: nodeSelector,
+  description:
+    "Delete a node and its version history from the vault. Leaves a tombstone record (hashes only) so the deletion cannot be silently undone: a later publish at that path, or an import of a pre-delete copy, is refused. Pass `purge: true` to delete without a tombstone (the path may then be reused). To erase content while keeping the audit trail verifiable, use context_forget instead.",
+  input: z.object({
+    ...nodeSelectorShape,
+    reason_code: z
+      .enum(FORGET_REASON_CODES)
+      .optional()
+      .describe("Reason recorded on the tombstone (default user_request). A closed code, never free text."),
+    requested_by: z
+      .string()
+      .optional()
+      .describe("Who asked for the deletion (an identity, recorded on the tombstone)."),
+    purge: z
+      .boolean()
+      .optional()
+      .describe(
+        "Delete WITHOUT a tombstone record (default false): nothing will refuse a republish of this path or a re-import of its old content. For re-creating a node under the same name — not for erasure.",
+      ),
+    ...clientField,
+  }),
   output: z.object({
     id: z.string(),
     title: z.string().describe("Title of the deleted node, read before removal"),
     deleted: z.literal(true),
+    tombstoned: z
+      .boolean()
+      .optional()
+      .describe("True when a tombstone record now refuses the node's resurrection; false for a purge"),
   }),
   errors: [
     "VALIDATION_FAILED",
@@ -632,6 +659,17 @@ const versionEntryOut = z.object({
     .describe(
       "Caller metadata the write carried — agent, session_id, custom keys. Absent for versions written before the caller sent any.",
     ),
+  tombstone: z
+    .boolean()
+    .optional()
+    .describe("True when this version was forgotten: its content is erased, its hashes kept (§6.3)"),
+  forgotten_at: z.string().optional(),
+  forgotten_by: z.string().optional(),
+  reason_code: z.enum(FORGET_REASON_CODES).optional(),
+  forget_stub: z
+    .boolean()
+    .optional()
+    .describe("True for the empty-stub version a node-level forget sealed"),
 });
 
 const versionsOp: OperationDescriptor = {
@@ -694,6 +732,7 @@ const reconstructOp: OperationDescriptor = {
   errors: [
     "VALIDATION_FAILED",
     "VERSION_NOT_FOUND",
+    "VERSION_FORGOTTEN",
     "RECONSTRUCTION_FAILED",
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
@@ -714,6 +753,8 @@ const verifyError = z.object({
     "unreadable_history",
     "sidecar_drift",
     "sidecar_missing",
+    "forgotten_content_present",
+    "unrecorded_tombstone",
   ]),
   document: z.string().optional(),
   version: z.number().int().optional(),
@@ -728,9 +769,88 @@ const verifyOp: OperationDescriptor = {
   description:
     "Verify every document and checkpoint hash chain in the vault, and re-hash every pdf node's binary against the sha256 its frontmatter records.",
   input: z.object({ ...clientField }),
-  output: z.object({ valid: z.boolean(), errors: z.array(verifyError) }),
+  output: z.object({
+    valid: z.boolean(),
+    errors: z.array(verifyError),
+    tombstoned: z
+      .array(z.object({ document: z.string(), version: z.number().int() }))
+      .optional()
+      .describe("Versions verified hash-only because they were forgotten (§6.3.2). Not errors."),
+  }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["verify_integrity"],
+};
+
+// ─── context_forget ──────────────────────────────────────────────────────────
+
+const forgetOp: OperationDescriptor = {
+  name: "context_forget",
+  namespace: "core",
+  description:
+    "Forget a node (right to be forgotten, spec §6.3). Erases the content of every version from history while keeping its hashes, so `context_verify` still passes, and replaces the node with an empty `status: forgotten` stub that every URI for the path — floating or pinned — resolves to. Records an audit event (who, when, reason code, which versions — never the content) and refuses any later attempt to republish or re-import the forgotten content. Irreversible.",
+  input: z.object({
+    ...nodeSelectorShape,
+    reason_code: z
+      .enum(FORGET_REASON_CODES)
+      .describe("Why (closed set, §6.3.1) — never free text: the reason for forgetting is not stored in the nest"),
+    requested_by: z
+      .string()
+      .optional()
+      .describe("Who asked for it — data subject, steward, regulator (an identity, not a reason)"),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    versions: z.array(z.number().int()).describe("Version numbers whose content was erased"),
+    stub_version: z
+      .number()
+      .int()
+      .describe("The version the empty `status: forgotten` stub was sealed as"),
+    checkpoint: z.number().int().describe("The checkpoint the forget cut"),
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "FORGOTTEN_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
+
+// ─── context_forget_log ──────────────────────────────────────────────────────
+
+const forgetLogOp: OperationDescriptor = {
+  name: "context_forget_log",
+  namespace: "core",
+  description:
+    "The forget audit trail (spec §6.3): every recorded forget and tombstoned delete — who, when, which reason code, which versions — optionally for one node. Never carries forgotten content.",
+  input: z.object({
+    id: z.string().optional().describe("Only events for this node id"),
+    ...clientField,
+  }),
+  output: z.object({
+    events: z.array(
+      z.object({
+        event_id: z.string(),
+        document_id: z.string(),
+        scope: z.enum(["node", "versions"]),
+        mode: z.enum(["forget", "delete"]),
+        versions: z.array(z.number().int()),
+        reason_code: z.enum(FORGET_REASON_CODES),
+        forgotten_by: z.string(),
+        forgotten_at: z.string(),
+        requested_by: z.string().optional(),
+        stub_version: z.number().int().optional(),
+        checkpoint: z.number().int().optional(),
+        erased_hashes: z
+          .number()
+          .int()
+          .describe("How many content hashes the record holds for anti-resurrection"),
+      }),
+    ),
+  }),
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
 };
 
 // ─── context_init ────────────────────────────────────────────────────────────
@@ -1209,6 +1329,8 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   versionsOp,
   reconstructOp,
   verifyOp,
+  forgetOp,
+  forgetLogOp,
   initOp,
   packsOp,
   nestsOp,

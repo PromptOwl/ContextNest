@@ -34,6 +34,10 @@ export type NodeType =
  *                     docs to prevent silent resurrection. Stewards revive
  *                     by setting status back to draft/pending_review/
  *                     approved/published.
+ *   forgotten       → erased by the forget protocol (§6.3). The live file is
+ *                     an empty stub; every version's content is gone from
+ *                     `.versions/`, only its hashes remain. Set only by
+ *                     `forgetDocument`, never by a write, and never revived.
  *
  * Aliases (e.g. `cancelled` → `rejected`, `superseded` → `draft`,
  * `review` → `pending_review`, `active` → `published`) are normalized to
@@ -45,7 +49,12 @@ export type Status =
   | "pending_review"
   | "approved"
   | "published"
-  | "rejected";
+  | "rejected"
+  | "forgotten";
+
+/** Closed set of forget reason codes (§6.3.1). Keep in lockstep with
+ *  `FORGET_REASON_CODES` in schemas.ts. */
+export type ForgetReasonCode = "user_request" | "legal" | "retention_expiry" | "error";
 
 /** Source transport protocol (§1.9.1) */
 export type Transport = "mcp" | "rest" | "cli" | "function";
@@ -95,7 +104,8 @@ export type HashChainEventType =
   | "platform_admin.toggle_changed"
   | "platform_admin.session_opened"
   | "platform_admin.session_closed"
-  | "agent.zone_scope_assigned";
+  | "agent.zone_scope_assigned"
+  | "document.forgotten";
 
 /** Source metadata block — present only on type: source nodes (§1.9.1) */
 export interface SourceMeta {
@@ -381,6 +391,17 @@ export interface VersionEntry {
    * annotation on the entry, not as sealed evidence.
    */
   client?: ClientMetadata;
+  /**
+   * Forget protocol (§6.3.2): this version's keyframe/diff was erased. The
+   * hashes are kept unchanged so the chain still verifies; verification
+   * treats the entry as hash-only.
+   */
+  tombstone?: boolean;
+  forgotten_at?: string;
+  forgotten_by?: string;
+  reason_code?: ForgetReasonCode;
+  /** The empty-stub version a node-level forget sealed. */
+  forget_stub?: boolean;
 }
 
 /** Document history file (§6.2) */
@@ -674,11 +695,23 @@ export interface VerificationReport {
       // to the sha256 its frontmatter records (§8.4).
       | "sidecar_drift"
       // A pdf node's declared sidecar is not on disk.
-      | "sidecar_missing";
+      | "sidecar_missing"
+      // Forget protocol (§6.3): content a forget erased is back on disk — an
+      // artifact for a tombstoned version, a recorded forget whose entry is
+      // no longer tombstoned, or a forgotten stub with a body.
+      | "forgotten_content_present"
+      // A tombstone (or forgotten stub) no forget event accounts for.
+      | "unrecorded_tombstone";
     document?: string;
     version?: number;
     checkpoint?: number;
     expected: string | null;
     actual: string;
   }>;
+  /**
+   * Versions verified hash-only because the forget protocol erased their
+   * content (§6.3.2). Not errors: the chain proves they existed, not what
+   * they said. Present only when there are some.
+   */
+  tombstoned?: Array<{ document: string; version: number }>;
 }

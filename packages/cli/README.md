@@ -96,7 +96,8 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
 - `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
 - `ctx update <path>` — Update a document
-- `ctx delete <path>` — Delete a document
+- `ctx delete <path>` — Delete a document (leaves a tombstone that refuses its resurrection; `--purge` for none)
+- `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
 - `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
 - `ctx publish <path>` — Publish (bump version, create checkpoint)
 - `ctx publish --all` — Publish every unpublished document in one batch, with a live counter. Seals one checkpoint and regenerates the index once, instead of once per document
@@ -116,7 +117,8 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx history <path>` — Show version history
 - `ctx history <path> --diff` — Include each version's unified diff from the one before
 - `ctx reconstruct <path> <version>` — Reconstruct a specific version. A version the history does not contain is now refused rather than answered with a neighbouring version's content
-- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it)
+- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it; forgotten versions verify hash-only)
+- `ctx forget-log [path]` — The forget audit trail (never the forgotten content)
 
 ### File Safety
 
@@ -309,7 +311,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **39 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
+For direct AI agent access via the Model Context Protocol — **41 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -328,7 +330,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 39 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 41 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 

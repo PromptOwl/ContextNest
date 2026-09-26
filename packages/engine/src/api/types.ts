@@ -50,6 +50,10 @@ export const ERROR_CODES = [
   "UNAUTHORIZED_ACTION",
   "REJECTED_DOCUMENT",
   "SUPERSEDED_DOCUMENT",
+  // forget protocol (§6.3): a write into forgotten content, or a read of an
+  // erased version
+  "FORGOTTEN_DOCUMENT",
+  "VERSION_FORGOTTEN",
   "CONFIG_ERROR",
   // vault write lock (vault-lock.ts) — retryable: a concurrent writer held
   // the lock past the acquire timeout; the operation was not performed

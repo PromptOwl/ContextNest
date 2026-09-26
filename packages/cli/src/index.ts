@@ -61,6 +61,7 @@ import {
   normalizeDocumentId,
   isPublished,
   isRejected,
+  FORGET_REASON_CODES,
   HARNESSES,
   SELECTOR_GRAMMAR,
 } from "@promptowl/contextnest-engine";
@@ -419,6 +420,7 @@ const VAULT_WRITE_COMMANDS = new Set([
   "add",
   "update",
   "delete",
+  "forget",
   "publish",
   "index",
   "welcome",
@@ -1324,6 +1326,20 @@ program
       return;
     }
 
+    // Forget protocol (§6.3.3): the stub is a record that something was
+    // deliberately erased, not content — say so rather than print a title
+    // over an empty body.
+    if (doc.frontmatter.status === "forgotten") {
+      console.log(chalk.bold.underline(doc.frontmatter.title));
+      console.log();
+      console.log(
+        chalk.yellow(
+          `forgotten — ${id}'s content was erased (hashes kept). See \`ctx forget-log ${id}\`.`,
+        ),
+      );
+      return;
+    }
+
     // Terminal output
     console.log(chalk.bold.underline(doc.frontmatter.title));
     console.log();
@@ -1820,6 +1836,11 @@ program
         chain_hash: string;
         diff?: string;
         client?: ClientMetadata;
+        tombstone?: boolean;
+        forgotten_at?: string;
+        forgotten_by?: string;
+        reason_code?: string;
+        forget_stub?: boolean;
       }>;
     }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
@@ -1834,10 +1855,20 @@ program
     }
     console.log(chalk.bold(`Version history for ${id}:\n`));
     for (const entry of history.versions) {
-      const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
+      const keyframe = entry.keyframe && !entry.tombstone ? chalk.blue(" [keyframe]") : "";
       const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
-      console.log(`  v${entry.version}${keyframe}${published}`);
+      const forgotten = entry.tombstone
+        ? chalk.red(" [forgotten]")
+        : entry.forget_stub
+          ? chalk.red(" [forget stub]")
+          : "";
+      console.log(`  v${entry.version}${keyframe}${published}${forgotten}`);
       console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
+      if (entry.tombstone) {
+        console.log(
+          `    Forgotten: ${entry.forgotten_at ?? "?"} by ${entry.forgotten_by ?? "?"} (${entry.reason_code ?? "?"}) — content erased, hashes kept`,
+        );
+      }
       if (entry.note) console.log(`    Note: ${entry.note}`);
       // Who was CALLING, as distinct from `By:` above, which is the authoring
       // identity. Rendered only when the write carried attribution.
@@ -2029,6 +2060,32 @@ program
       }
     }
 
+    // Forget protocol (§6.3): erased content stays erased, and every
+    // tombstone is accounted for by a recorded forget. Tombstoned versions
+    // themselves verify hash-only — they are not errors.
+    const tombstoneErrors = await storage.verifyTombstones(allHistories);
+    if (tombstoneErrors.length > 0) {
+      totalErrors += tombstoneErrors.length;
+      allReportErrors.push(...tombstoneErrors);
+      if (!opts.json) {
+        for (const err of tombstoneErrors) {
+          const at = err.version !== undefined ? ` v${err.version}` : "";
+          console.log(chalk.red(`✗ ${err.document}${at}: ${err.type} — ${err.actual}`));
+        }
+      }
+    }
+    const tombstoned: Array<{ document: string; version: number }> = [];
+    for (const [docId, history] of allHistories) {
+      for (const entry of history.versions) {
+        if (entry.tombstone) tombstoned.push({ document: docId, version: entry.version });
+      }
+    }
+    if (tombstoned.length > 0 && !opts.json) {
+      console.log(
+        chalk.dim(`  ${tombstoned.length} forgotten version(s) verified hash-only (content erased by ctx forget)`),
+      );
+    }
+
     // PDF nodes: every binary must still hash to what its frontmatter (or,
     // for an archived prior binary, its file name) records.
     const sidecarErrors = await storage.verifyPdfSidecars();
@@ -2043,7 +2100,17 @@ program
     }
 
     if (opts.json) {
-      console.log(JSON.stringify({ valid: totalErrors === 0, errors: allReportErrors }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            valid: totalErrors === 0,
+            errors: allReportErrors,
+            ...(tombstoned.length > 0 ? { tombstoned } : {}),
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       console.log(
         totalErrors === 0
@@ -2328,7 +2395,7 @@ program
   .command("list")
   .description("List all documents with optional filters")
   .option("-t, --type <type>", "Filter by node type")
-  .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
+  .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected|forgotten; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
@@ -2451,8 +2518,21 @@ program
 
 program
   .command("delete <path>")
-  .description("Delete a document and its version history")
-  .action(async (path) => {
+  .description(
+    "Delete a document and its version history, leaving a tombstone that refuses its resurrection (--purge: no tombstone)",
+  )
+  .option(
+    "--reason <code>",
+    `Reason recorded on the tombstone: ${FORGET_REASON_CODES.join(" | ")}`,
+    parseForgetReason,
+    "user_request",
+  )
+  .option("--requested-by <who>", "Who asked for the deletion (recorded on the tombstone)")
+  .option(
+    "--purge",
+    "Delete WITHOUT a tombstone: the path and its old content may be published or imported again",
+  )
+  .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteDelete(remote, path);
@@ -2460,15 +2540,138 @@ program
     }
     const storage = getStorage();
     await confirmOrExit(
-      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.`,
+      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
+        (opts.purge ? " --purge leaves no tombstone: nothing will stop the old content coming back." : ""),
       { destructive: true },
     );
-    const result = await cliApi().run<{ id: string; title: string }>(
+    const result = await cliApi().run<{ id: string; title: string; tombstoned?: boolean }>(
       "context_delete",
-      { id: normalizeDocumentId(path) },
+      {
+        id: normalizeDocumentId(path),
+        reason_code: opts.reason,
+        ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
+        ...(opts.purge ? { purge: true } : {}),
+      },
       opContext(storage, "cli@contextnest.local"),
     );
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
+    if (result.tombstoned) {
+      console.log(
+        chalk.dim("  Tombstone recorded — republishing this path or re-importing its old content is refused. See `ctx forget-log`."),
+      );
+    }
+  });
+
+// ─── ctx forget ───────────────────────────────────────────────────────────────
+
+function parseForgetReason(raw: string): string {
+  if (!(FORGET_REASON_CODES as readonly string[]).includes(raw)) {
+    throw new InvalidArgumentError(`Expected one of: ${FORGET_REASON_CODES.join(", ")}.`);
+  }
+  return raw;
+}
+
+program
+  .command("forget <path>")
+  .description(
+    "Forget a document (right to be forgotten, spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes",
+  )
+  .requiredOption(
+    "--reason <code>",
+    `Why — a closed code, never free text: ${FORGET_REASON_CODES.join(" | ")}`,
+    parseForgetReason,
+  )
+  .option("--requested-by <who>", "Who asked for it (data subject, steward, regulator)")
+  .option("-a, --author <email>", "Actor recorded as forgotten_by", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .addHelpText(
+    "after",
+    `
+The file is replaced by an empty stub (status: forgotten) that every
+contextnest:// URI for the path — floating or pinned @N — resolves to, and
+every version's keyframe/diff is erased. The forget is recorded (who, when,
+reason code, which versions — never the content; see \`ctx forget-log\`) and
+any later publish or import of the forgotten content is refused. Irreversible.
+
+Example:
+  $ ctx forget nodes/jane-notes --reason user_request --requested-by jane@example.com
+`,
+  )
+  .action(async (path, opts) => {
+    const storage = getStorage();
+    const id = normalizeDocumentId(path);
+    await confirmOrExit(
+      `Forget ${id}? Its content is erased from history for good (hashes are kept, so verify still passes). This cannot be undone.`,
+      { destructive: true },
+    );
+    const result = await cliApi().run<{
+      id: string;
+      versions: number[];
+      stub_version: number;
+      checkpoint: number;
+    }>(
+      "context_forget",
+      {
+        id,
+        reason_code: opts.reason,
+        ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
+      },
+      opContext(storage, opts.author),
+    );
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    const which = result.versions.length ? `v${result.versions.join(", v")}` : "no recorded versions";
+    console.log(chalk.green(`Forgot ${result.id} (${which} erased)`));
+    console.log(`  Stub: v${result.stub_version} (status: forgotten)  Checkpoint: ${result.checkpoint}`);
+    console.log(chalk.dim("  Hashes kept; `ctx verify` still passes. Audit: `ctx forget-log`."));
+  });
+
+// ─── ctx forget-log ───────────────────────────────────────────────────────────
+
+program
+  .command("forget-log [path]")
+  .description("Show the forget audit trail — who forgot or tombstone-deleted what, when, and why (never the content)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    const storage = getStorage();
+    const { events } = await cliApi().run<{
+      events: Array<{
+        document_id: string;
+        scope: "node" | "versions";
+        mode: "forget" | "delete";
+        versions: number[];
+        reason_code: string;
+        forgotten_by: string;
+        forgotten_at: string;
+        requested_by?: string;
+        stub_version?: number;
+      }>;
+    }>(
+      "context_forget_log",
+      path ? { id: normalizeDocumentId(path) } : {},
+      opContext(storage, "cli@contextnest.local"),
+    );
+    if (opts.json) {
+      console.log(JSON.stringify({ events }, null, 2));
+      return;
+    }
+    if (events.length === 0) {
+      console.log(chalk.yellow("No forget events recorded."));
+      return;
+    }
+    console.log(chalk.bold(`${events.length} forget event(s):\n`));
+    for (const e of events) {
+      const what = e.mode === "delete" ? "deleted (tombstoned)" : "forgotten";
+      console.log(`  ${chalk.cyan(e.document_id)} — ${what}`);
+      console.log(`    By: ${e.forgotten_by} at ${e.forgotten_at}  Reason: ${e.reason_code}`);
+      if (e.requested_by) console.log(`    Requested by: ${e.requested_by}`);
+      if (e.versions.length) {
+        const stub = e.stub_version !== undefined ? `; stub v${e.stub_version}` : "";
+        console.log(`    Erased: v${e.versions.join(", v")}${stub}`);
+      }
+    }
   });
 
 // ─── ctx move ─────────────────────────────────────────────────────────────────
@@ -2963,9 +3166,13 @@ program
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
 
-    const filtered = opts.includeDrafts
-      ? docs
-      : docs.filter((d) => d.frontmatter.status === "published" || d.frontmatter.status === undefined);
+    // A forgotten stub (§6.3) never leaves the vault as a document: it carries
+    // no content, and pushing it would re-create the node remotely as a draft.
+    const filtered = (
+      opts.includeDrafts
+        ? docs
+        : docs.filter((d) => d.frontmatter.status === "published" || d.frontmatter.status === undefined)
+    ).filter((d) => d.frontmatter.status !== "forgotten");
 
     if (filtered.length === 0) {
       console.log(chalk.yellow("No documents to push. Use --include-drafts to include draft documents."));

@@ -195,7 +195,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `description` | string | — | Brief document summary (1-500 characters) |
 | `type` | NodeType | `"document"` | Content classification (see §1.6) |
 | `tags` | string[] | `[]` | Tags with `#` prefix: `["#api", "#guide"]` |
-| `status` | Status | `"draft"` | One of `draft`, `pending_review`, `approved`, `published`, `rejected` (see §1.5.1) |
+| `status` | Status | `"draft"` | One of `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (see §1.5.1; `forgotten` is set only by a forget, §6.3) |
 | `version` | integer | `1` | Version number (>= 1) |
 | `author` | string | — | Author identifier (e.g., email address) |
 | `created_at` | ISO 8601 | file creation time | Creation timestamp |
@@ -209,7 +209,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 
 ### 1.5.1 Status Lifecycle
 
-`status` is a five-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
+`status` is a six-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
 
 | Canonical | Meaning | Surfaces to retrieval? |
 |-----------|---------|-----------------------|
@@ -218,6 +218,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `approved` | Reviewer signed off; awaiting publish ceremony. | No — hidden until promoted to `published`. |
 | `published` | Live, retrievable. | Yes — the only canonical status surfaced by default. |
 | `rejected` | Terminal hide. The steward retired the document. | No — implementations MUST refuse `publishDocument` on a rejected document to prevent silent resurrection. |
+| `forgotten` | Erased by the forget protocol (§6.3). The file is an empty stub; only hashes remain. | No — excluded from every retrieval path; selectors return it only for an explicit `status:forgotten`. Set only by a forget, never by a write. |
 
 **Aliases.** Implementations SHOULD accept synonyms from other systems and normalize them to canonical values at parse time. Lookup is case-insensitive. Unknown values fall back to `draft`. The reference implementation ships with:
 
@@ -232,6 +233,8 @@ Maintained by @jane.smith with oversight from @team:engineering.
 The on-disk format always stores canonical values. Aliased values found on disk are auto-canonicalized the next time the document round-trips through a write or through the implementation's index-regeneration command (e.g. `ctx index`).
 
 **Transitions.** No state machine is enforced. Any status may transition to any other (subject to the `rejected → *` revival path requiring an explicit status change before content edits land). Metadata-only transitions (e.g. `published → rejected`) MUST NOT cut a new version; only content-publishing operations bump `version` and emit a checkpoint.
+
+**`forgotten` and older readers.** `forgotten` has no aliases. An implementation that predates it normalizes the unknown value to `draft`, which keeps the empty stub out of default retrieval: the failure mode of an old reader is a hidden empty draft, not resurrected content.
 
 **Legacy `superseded`.** Earlier drafts of this spec defined `superseded` as a fifth canonical value. It is no longer canonical. Implementations MUST treat a raw `status: superseded` value as an alias for `draft` per the table above.
 
@@ -1319,6 +1322,40 @@ versions:
     chain_hash:   sha256:b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3
 ```
 
+### 6.3 Forget
+
+A **forget** erases a document's content while leaving its hash chain verifiable. This is the right to be forgotten for an append-only, hash-chained history: deleting a version would break every chain hash after it, and deleting only the live file would leave the content in keyframes and diffs.
+
+**Operation.** `forget` takes a document path and a `reason_code` from a closed set: `user_request`, `legal`, `retention_expiry`, `error`. It never takes free text. The reason for forgetting is not itself stored in the nest. It MAY take a `requested_by` identity.
+
+**Tombstones.** For every version entry of the document, the implementation MUST delete the stored content (the `v{N}.md` keyframe, the `v{N}.diff` change log or inline `diff`, the free-text `note`, archived binaries, staged suggestions) and MUST keep `content_hash` and `chain_hash` unchanged. The entry gains `tombstone: true`, `forgotten_at`, `forgotten_by` and `reason_code`. `chain_hash[n]` is computed from `content_hash[n]`, not from the content, so every later entry and every checkpoint binding still verifies.
+
+**Stub.** The live file is replaced by a stub that carries `title`, `type`, `tags`, `created_at`, `updated_at`, `version`, `checksum` (plus any block its `type` requires, and access-scoping keys), with `status: forgotten` and an empty body. The stub is sealed as a new **keyframe** version marked `forget_stub: true`, and the forget cuts a checkpoint, as a publish does (§7.1). The forgotten document is not published, so it drops out of that checkpoint's maps. Rebuild (§7.3) likewise removes the document from the running maps when it replays a `forget_stub` entry.
+
+**Resolution.** Any `contextnest://` URI for a forgotten path resolves to the stub (`status: forgotten`, empty body), not to null. This applies to floating URIs and pinned `@N` URIs, including a checkpoint that names a now-forgotten version. Consumers MUST NOT treat the stub as content. Reconstructing a forgotten version MUST fail with a distinct error (reference implementation: `VERSION_FORGOTTEN`), never with a neighbouring version's content. Existing checkpoints are not rewritten.
+
+**Audit event.** Every forget appends a `document.forgotten` event to `.versions/chain_events.yaml`. The event records `actor`, `timestamp`, `document_id`, and in `action_metadata` the `reason_code`, `requested_by`, the erased `versions`, the `stub_version` and `checkpoint`, and, as hashes only, the erased content: `content_hashes` (each erased entry's chained hash), `body_hashes` (the body checksum of each erased revision) and `pdf_hashes`. It MUST NOT contain forgotten content.
+
+**Anti-resurrection.** The forget record travels with the nest, because `chain_events.yaml` is part of the directory (§6.2 export). Implementations MUST refuse:
+
+- to publish, create or update a document with `status: forgotten`;
+- to publish or create a document at a path a forget retired, even after the stub was deleted. Content that is meant to exist again is published under a new path, which gives it a new identity and a new chain;
+- to publish, or import, a body whose checksum matches a recorded `body_hash`. Bodies shorter than 16 characters (trimmed) are never recorded, so trivial text does not collide;
+- to import a version artifact, archived binary or `history.yaml` that restores a recorded `content_hash` (an un-tombstoned entry), under any path.
+
+An importing implementation MUST honor tombstones carried by the incoming nest. It merges the incoming forget events into its own log, never overwriting that log, and re-applies them to any pre-forget copy it already holds.
+
+**Delete.** Deleting a document SHOULD leave the same record, with `mode: delete`, so that a deletion cannot be undone silently. Unlike a forget, a delete also removes the history. An implementation MAY offer an explicit purge that records nothing. The reference implementation provides it as `ctx delete --purge`.
+
+**Verification** of a tombstoned entry is hash-only: the chain check runs, the content check is skipped, and the entry is reported as tombstoned rather than as `content_hash_mismatch`. See §8.4 for the forget-specific checks.
+
+**Not yet implemented** in the reference implementation. These parts of the forget protocol proposed to the Open Memory Protocol are deferred:
+
+- **Version-range forget.** Forgetting a range of a document's versions requires re-keyframing the first retained version so that no diff context line from the range survives.
+- **Lineage flags.** Documents whose `derived_from` names a forgotten one would be flagged `review_required`.
+- **Lifespan keys.** `expires_at` would trigger an automatic forget, and `retain_until` would block a non-`legal` forget until its date.
+- **Legal redaction.** Under reason `legal`, `edited_by` would be replaced with its hash.
+
 ---
 
 ## 7. Nest Checkpoints
@@ -1524,7 +1561,10 @@ Implementations MAY expose a verification command or API that:
 4. Reads `.versions/context_history.yaml` and for each checkpoint entry, confirms that each value in `document_chain_hashes` matches the `chain_hash` of the corresponding version in the document's `history.yaml`.
 5. Re-computes the `checkpoint_hash` sequence (incorporating `canonical_chain_hashes`) and compares each value to the stored entry.
 6. For every `type: pdf` node, re-hashes the sidecar at `pdf.file` and compares it to `pdf.sha256`, and re-hashes each archived binary under `.versions/<doc>/` against the hash in its file name (§1.11.3).
-7. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, `checkpoint_hash_mismatch`, `sidecar_drift`, or `sidecar_missing`).
+7. For the forget protocol (§6.3), treats a `tombstone: true` entry as hash-only: its content check is skipped and its chain check runs. The implementation also reports:
+   - `forgotten_content_present` when erased content is back on disk. That is a keyframe, diff or inline diff for a tombstoned entry; an un-tombstoned entry whose `content_hash` a recorded forget erased; a stub with a body; or a live document at a forgotten path, or with a forgotten body.
+   - `unrecorded_tombstone` when a tombstone, a `forget_stub` entry or a `status: forgotten` document is not accounted for by any recorded forget.
+8. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, `checkpoint_hash_mismatch`, `sidecar_drift`, `sidecar_missing`, `forgotten_content_present` or `unrecorded_tombstone`), plus the list of versions it verified hash-only.
 
 Verification is idempotent and read-only. A clean verification result produces no file changes.
 
@@ -1864,7 +1904,7 @@ A valid Context Nest document:
 4. Context links use valid `contextnest://` URIs
 5. Tags match the allowed pattern: `^#?[a-zA-Z][a-zA-Z0-9_-]*$`
 6. If `type` is present, it MUST be one of the 13 defined node types (§1.6)
-7. If `status` is present, it MUST be one of: `draft`, `pending_review`, `approved`, `published`, `rejected` (after alias normalization, §1.5.1)
+7. If `status` is present, it MUST be one of: `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (after alias normalization, §1.5.1)
 8. If `checksum` is present, it MUST match the pattern `sha256:<64 hex chars>`
 
 ### 13.1 Source Node Validation
@@ -1969,6 +2009,10 @@ The following components remain proprietary:
 ---
 
 ## 17. Changelog
+
+### 1.2 — draft
+
+- **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and a tombstone record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
 
 ### 1.1 — 2026-09
 

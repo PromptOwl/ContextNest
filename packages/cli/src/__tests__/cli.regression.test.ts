@@ -780,6 +780,74 @@ describe("[regression] ctx delete", () => {
   });
 });
 
+// ─── forget protocol (spec §6.3) ─────────────────────────────────────────────
+
+describe("[regression] ctx forget", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "Jane's record says GUAVA-ALPHA at intake."]);
+    runCtx(tmp, ["update", "nodes/jane", "--body", "Jane's record says GUAVA-BETA after review."]);
+    runCtx(tmp, ["update", "nodes/jane", "--body", "Jane's record, current revision."]);
+  });
+
+  const grepVault = (needle: string): string[] => {
+    const hits: string[] = [];
+    const walk = (d: string) => {
+      for (const name of readdirSync(d)) {
+        const p = join(d, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (readFileSync(p, "utf-8").includes(needle)) hits.push(p);
+      }
+    };
+    walk(tmp);
+    return hits;
+  };
+
+  it("refuses without --yes and without a closed reason code", () => {
+    expect(runCtxResult(tmp, ["forget", "nodes/jane", "--reason", "user_request"]).status).toBe(1);
+    const bad = runCtxResult(tmp, ["forget", "nodes/jane", "--reason", "she asked", "--yes"]);
+    expect(bad.status).not.toBe(0);
+    expect(grepVault("GUAVA-ALPHA")).not.toEqual([]);
+  });
+
+  it("node forget erases the content, leaves a stub, and verify still passes", () => {
+    const out = runCtx(tmp, [
+      "forget", "nodes/jane", "--reason", "user_request", "--requested-by", "jane@example.com", "--yes",
+    ]);
+    expect(out).toMatch(/Forgot nodes\/jane/);
+    expect(grepVault("GUAVA")).toEqual([]);
+    expect(runCtx(tmp, ["read", "nodes/jane"])).toMatch(/forgotten/);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+    expect(runCtxResult(tmp, ["reconstruct", "nodes/jane", "1"]).status).not.toBe(0);
+
+    const log = JSON.parse(runCtx(tmp, ["forget-log", "nodes/jane", "--json"]));
+    expect(log.events).toHaveLength(1);
+    expect(log.events[0]).toMatchObject({ scope: "node", reason_code: "user_request", requested_by: "jane@example.com" });
+
+    const history = JSON.parse(runCtx(tmp, ["history", "nodes/jane", "--json"]));
+    expect(history.versions.filter((v: { tombstone?: boolean }) => v.tombstone)).toHaveLength(3);
+
+    // Not in default listings; listed on request.
+    expect(runCtx(tmp, ["list", "--json"])).not.toContain("nodes/jane");
+    expect(runCtx(tmp, ["list", "--status", "forgotten", "--json"])).toContain("nodes/jane");
+    // Cannot be edited back into existence.
+    expect(runCtxResult(tmp, ["update", "nodes/jane", "--body", "again"]).status).not.toBe(0);
+  });
+
+  it("delete leaves a tombstone that refuses republishing the path; --purge does not", () => {
+    runCtx(tmp, ["delete", "nodes/jane", "--yes"]);
+    expect(existsSync(join(tmp, "nodes", "jane.md"))).toBe(false);
+    expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events[0]).toMatchObject({ mode: "delete" });
+    const again = runCtxResult(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "a brand new body"]);
+    expect(again.status).not.toBe(0);
+
+    runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
+    runCtx(tmp, ["delete", "nodes/scratch", "--purge", "--yes"]);
+    runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+  });
+});
+
 // ─── verify (integrity) ───────────────────────────────────────────────────────
 
 describe("[regression] ctx verify", () => {
@@ -1667,7 +1735,7 @@ describe("[regression] file safety — command coverage", () => {
   // --dry-run sandbox and action log with no other symptom, so assert every
   // listed name still resolves to a real command.
   const CLASSIFIED = [
-    "init", "add", "update", "delete", "publish", "index", "welcome",
+    "init", "add", "update", "delete", "forget", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
     "import pdf",

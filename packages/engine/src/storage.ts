@@ -32,6 +32,12 @@ import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
+import {
+  buildTombstoneIndex,
+  forgettableBodyHash,
+  isPathForgotten,
+  type TombstoneIndex,
+} from "./tombstones.js";
 import type {
   ContextNode,
   NestConfig,
@@ -645,8 +651,12 @@ export class NestStorage {
     });
     const checkpointHistory = await this.readCheckpointHistory();
 
+    const tombstoned: NonNullable<VerificationReport["tombstoned"]> = [];
     for (const [docId, history] of allHistories) {
       errors.push(...(await this.verifyHistoryChain(docId, history)));
+      for (const entry of history.versions) {
+        if (entry.tombstone) tombstoned.push({ document: docId, version: entry.version });
+      }
     }
 
     if (checkpointHistory) {
@@ -660,6 +670,9 @@ export class NestStorage {
     // Integrity check must verify every doc on disk, including retired ones.
     const liveDocs = await this.discoverDocuments({ includeRetired: true });
     errors.push(...(await this.verifyPdfSidecars(liveDocs)));
+    // Forget protocol (§6.3): erased content must stay erased, and every
+    // tombstone must be accounted for by a recorded forget.
+    errors.push(...(await this.verifyTombstones(allHistories, liveDocs)));
     for (const doc of liveDocs) {
       const drift = await this.detectDocumentDrift(doc.id);
       if (drift && drift.drifted) {
@@ -672,7 +685,140 @@ export class NestStorage {
       }
     }
 
-    return { valid: errors.length === 0, errors };
+    return {
+      valid: errors.length === 0,
+      errors,
+      ...(tombstoned.length > 0 ? { tombstoned } : {}),
+    };
+  }
+
+  /**
+   * Forget-protocol checks (§6.3) over every history and live document:
+   *
+   *   - `forgotten_content_present` — an artifact (or inline diff) still on
+   *     disk for a tombstoned version; a NON-tombstoned entry whose
+   *     content_hash a recorded forget erased (a pre-forget history restored
+   *     over the tombstones); a forgotten stub that carries a body; a live
+   *     document at a forgotten path, or whose body matches an erased one.
+   *   - `unrecorded_tombstone` — a tombstone, forget stub or
+   *     `status: forgotten` node that no recorded forget accounts for. A
+   *     tombstone is hash-only by design, so without this an entry could be
+   *     "forgotten" by hand to hide a tampered version.
+   *
+   * Read-only, like the rest of verification.
+   */
+  async verifyTombstones(
+    histories: Map<string, DocumentHistory>,
+    docs?: ContextNode[],
+  ): Promise<VerificationReport["errors"]> {
+    const errors: VerificationReport["errors"] = [];
+    const index = await this.readTombstones();
+
+    for (const [docId, history] of histories) {
+      for (const entry of history.versions) {
+        if (entry.tombstone) {
+          const leftovers: string[] = [];
+          if (entry.diff) leftovers.push("inline diff");
+          if ((await this.readKeyframe(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.md`);
+          if ((await this.readDiff(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.diff`);
+          if (leftovers.length > 0) {
+            errors.push({
+              type: "forgotten_content_present",
+              document: docId,
+              version: entry.version,
+              expected: null,
+              actual: `erased version still has ${leftovers.join(", ")}`,
+            });
+          }
+          if (!index.contentHashes.has(entry.content_hash)) {
+            errors.push({
+              type: "unrecorded_tombstone",
+              document: docId,
+              version: entry.version,
+              expected: "a document.forgotten event recording this content_hash",
+              actual: entry.content_hash,
+            });
+          }
+        } else if (index.contentHashes.has(entry.content_hash)) {
+          errors.push({
+            type: "forgotten_content_present",
+            document: docId,
+            version: entry.version,
+            expected: "tombstone",
+            actual: `version recorded as forgotten is no longer tombstoned (${entry.content_hash})`,
+          });
+        }
+        if (entry.forget_stub && !isPathForgotten(index, docId)) {
+          errors.push({
+            type: "unrecorded_tombstone",
+            document: docId,
+            version: entry.version,
+            expected: "a node-level document.forgotten event",
+            actual: "forget_stub",
+          });
+        }
+      }
+    }
+
+    for (const doc of docs ?? (await this.discoverDocuments({ includeRetired: true }))) {
+      if (doc.frontmatter.status !== "forgotten") {
+        if (index.records.length === 0) continue;
+        // A live document back at a path a forget or tombstoned delete retired,
+        // or carrying an erased revision's body anywhere: restored content.
+        const bodyHash = forgettableBodyHash(doc.rawContent);
+        if (isPathForgotten(index, doc.id) || (bodyHash && index.bodyHashes.has(bodyHash))) {
+          errors.push({
+            type: "forgotten_content_present",
+            document: doc.id,
+            expected: "no live content for forgotten material",
+            actual: isPathForgotten(index, doc.id)
+              ? "a live document holds a forgotten path"
+              : "the body matches a forgotten revision",
+          });
+        }
+        continue;
+      }
+      if (doc.body.trim() !== "") {
+        errors.push({
+          type: "forgotten_content_present",
+          document: doc.id,
+          expected: "empty body",
+          actual: `forgotten stub carries ${doc.body.trim().length} characters of body`,
+        });
+      }
+      if (!isPathForgotten(index, doc.id)) {
+        errors.push({
+          type: "unrecorded_tombstone",
+          document: doc.id,
+          expected: "a node-level document.forgotten event",
+          actual: "status: forgotten",
+        });
+      }
+    }
+    return errors;
+  }
+
+  /**
+   * Every forget recorded in this vault's chain-event log, indexed for the
+   * anti-resurrection checks (see tombstones.ts). Empty when nothing was ever
+   * forgotten.
+   */
+  async readTombstones(): Promise<TombstoneIndex> {
+    let events: unknown[];
+    try {
+      events = await this.readChainEventLog();
+    } catch (err) {
+      // Every publish consults this, so an unparseable log must not lock the
+      // vault. The per-node records (forgotten stubs, tombstoned history
+      // entries) still refuse what they cover; the log-only checks lapse
+      // until it is repaired — say so rather than fail silently.
+      console.warn(
+        `[forget] .versions/chain_events.yaml is unreadable (${err instanceof Error ? err.message : String(err)}); ` +
+          "vault-wide anti-resurrection checks are degraded until it is repaired",
+      );
+      events = [];
+    }
+    return buildTombstoneIndex(events);
   }
 
   /**
@@ -981,6 +1127,9 @@ export class NestStorage {
     for (const doc of nodes) {
       const pdf = doc.frontmatter.pdf;
       if (doc.frontmatter.type !== "pdf" || !pdf || typeof pdf.file !== "string") continue;
+      // A forgotten pdf node's binaries were erased with the rest of its
+      // content (§6.3); the stub keeps the block only as a record of hashes.
+      if (doc.frontmatter.status === "forgotten") continue;
       let bytes: Buffer | null = null;
       try {
         bytes = await this.readVaultBinary(pdf.file);
@@ -1557,6 +1706,70 @@ export class NestStorage {
       diff,
       options.overwrite ?? false,
     );
+  }
+
+  /**
+   * Erase a version's stored content — its `v{N}.md` keyframe and/or
+   * `v{N}.diff` change log (§6.3.2). The ONE path allowed to remove a sealed
+   * artifact: the forget protocol, which keeps the entry's hashes so the
+   * chain still verifies. `only` narrows it to one of the two files (a
+   * re-keyed version keeps its new keyframe and loses its diff). Returns the
+   * file names removed.
+   */
+  async removeVersionArtifacts(
+    docId: string,
+    version: number,
+    only?: "keyframe" | "diff",
+  ): Promise<string[]> {
+    const removed: string[] = [];
+    const names =
+      only === "keyframe"
+        ? [`v${version}.md`]
+        : only === "diff"
+          ? [`v${version}.diff`]
+          : [`v${version}.md`, `v${version}.diff`];
+    for (const name of names) {
+      try {
+        await unlink(join(this.versionsDir(docId), name));
+        removed.push(name);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Erase archived pdf binaries (`.versions/<doc>/<sha256-hex>.pdf`) for a
+   * forget (§6.3). With `hashes`, only those (`sha256:<hex>`); without, all.
+   * Returns the hashes removed.
+   */
+  async removeArchivedPdfs(docId: string, hashes?: ReadonlySet<string>): Promise<string[]> {
+    let names: string[];
+    try {
+      names = (await readdir(this.versionsDir(docId))).filter((n) => /^[a-f0-9]{64}\.pdf$/.test(n));
+    } catch {
+      return [];
+    }
+    const removed: string[] = [];
+    for (const name of names) {
+      const hash = `sha256:${name.slice(0, 64)}`;
+      if (hashes && !hashes.has(hash)) continue;
+      await unlink(join(this.versionsDir(docId), name)).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+      removed.push(hash);
+    }
+    return removed;
+  }
+
+  /**
+   * Erase every staged suggestion for a document (`_suggestions/<doc>/`) —
+   * their patches carry the document's content, so a node-level forget takes
+   * them too (§6.3).
+   */
+  async removeSuggestions(docId: string): Promise<void> {
+    await rm(this.suggestionDir(docId), { recursive: true, force: true });
   }
 
   /**

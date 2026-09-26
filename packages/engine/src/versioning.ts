@@ -13,7 +13,11 @@ import type {
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
 import { NestStorage } from "./storage.js";
-import { ContextNestError, CorruptHistoryError } from "./errors.js";
+import {
+  ContextNestError,
+  CorruptHistoryError,
+  ForgottenVersionError,
+} from "./errors.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
@@ -122,6 +126,14 @@ export class VersionManager {
       /** Caller metadata recorded on the entry (§9.4). Never hashed — see
        *  `VersionEntry.client`. */
       client?: ClientMetadata;
+      /**
+       * Store this version as a full keyframe even off the keyframe interval.
+       * The forget protocol's stub uses it (§6.3.3): a diff against the
+       * erased content would carry that content's lines as `-` context.
+       */
+      keyframe?: boolean;
+      /** Mark the entry as the empty stub a node-level forget sealed. */
+      forgetStub?: boolean;
     } = {},
   ): Promise<VersionEntry> {
     // Resilient read: an unreadable history is moved aside and treated as
@@ -135,6 +147,7 @@ export class VersionManager {
 
     const currentVersion = node.frontmatter.version || 1;
     let isKeyframe =
+      options.keyframe === true ||
       history.versions.length === 0 ||
       currentVersion % history.keyframe_interval === 1 ||
       currentVersion === 1;
@@ -220,6 +233,7 @@ export class VersionManager {
       ...(note ? { note } : {}),
       content_hash: contentHash,
       chain_hash: chainHash,
+      ...(options.forgetStub ? { forget_stub: true } : {}),
       // AFTER the hashes: `client` is an annotation on the entry, deliberately
       // outside `computeChainHash`'s inputs so every history recorded before
       // this field existed still verifies byte-for-byte.
@@ -259,18 +273,23 @@ export class VersionManager {
     // there are no diffs to replay, so it returns the keyframe's content as
     // though it were the version requested — a silently wrong answer in the one
     // place that must never give one. Refuse instead.
-    if (!history.versions.some((entry) => entry.version === targetVersion)) {
+    const target = history.versions.find((entry) => entry.version === targetVersion);
+    if (!target) {
       throw new ContextNestError(
         `Version ${targetVersion} not found for ${docId}`,
         "VERSION_NOT_FOUND",
         "§6",
       );
     }
+    // Forget protocol (§6.3.2): the version existed, but its content was
+    // erased on purpose. Say so — never fall back to a neighbouring keyframe.
+    if (target.tombstone) throw new ForgottenVersionError(docId, targetVersion);
 
-    // Find the nearest keyframe at or before target version
+    // Find the nearest keyframe at or before target version. A tombstoned
+    // keyframe has no file left, so it cannot anchor a replay.
     let keyframeVersion = -1;
     for (const entry of history.versions) {
-      if (entry.keyframe && entry.version <= targetVersion) {
+      if (entry.keyframe && !entry.tombstone && entry.version <= targetVersion) {
         keyframeVersion = entry.version;
       }
     }
@@ -297,6 +316,11 @@ export class VersionManager {
     for (const entry of history.versions) {
       if (entry.version <= keyframeVersion) continue;
       if (entry.version > targetVersion) break;
+      // A forgotten version between the anchor and the target means the diff
+      // chain runs through erased content. The forget protocol re-keyframes
+      // the first retained version after a range precisely so this cannot
+      // happen; reaching it means the history was altered afterwards.
+      if (entry.tombstone) throw new ForgottenVersionError(docId, entry.version);
 
       if (entry.keyframe) {
         // This is another keyframe — read it directly

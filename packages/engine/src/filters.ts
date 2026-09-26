@@ -58,9 +58,12 @@ export function filterDocuments(
       (d) => normalizeStatus(d.frontmatter.status ?? "draft") === wanted,
     );
   } else if (!filters.includeRetired) {
-    // No status asked for: keep retired documents out of ordinary retrieval,
-    // the way every surface's default listing does.
-    out = out.filter((d) => d.frontmatter.status !== "rejected");
+    // No status asked for: keep retired documents — and forgotten stubs
+    // (§6.3.3) — out of ordinary retrieval, the way every surface's default
+    // listing does.
+    out = out.filter(
+      (d) => d.frontmatter.status !== "rejected" && d.frontmatter.status !== "forgotten",
+    );
   }
 
   if (filters.tag) {

@@ -32,6 +32,38 @@ export const STATUSES = [
   "approved",
   "published",
   "rejected",
+  // The sixth status (§6.3, the forget protocol): the node was erased and only
+  // its hashes remain. Set ONLY by the forget operation — never by an author,
+  // so it is absent from WRITABLE_STATUSES and from STATUS_ALIASES. A reader
+  // that predates it normalizes the value to `draft` (unknown → draft), which
+  // keeps the empty stub out of default retrieval.
+  "forgotten",
+] as const;
+
+/**
+ * Statuses a caller may SET through create/update. Everything in STATUSES
+ * except `forgotten`: stamping that on a node by hand would hide it without
+ * erasing anything, which is exactly the fake-forget the protocol exists to
+ * rule out. Use the forget operation instead.
+ */
+export const WRITABLE_STATUSES = [
+  "draft",
+  "pending_review",
+  "approved",
+  "published",
+  "rejected",
+] as const;
+
+/**
+ * Closed set of reasons a forget may cite (§6.3.1). Deliberately not free
+ * text: the reason for forgetting is not itself stored in the nest, so a
+ * code is all the audit trail carries.
+ */
+export const FORGET_REASON_CODES = [
+  "user_request",
+  "legal",
+  "retention_expiry",
+  "error",
 ] as const;
 
 /**
@@ -142,6 +174,9 @@ export const HASH_CHAIN_EVENT_TYPES = [
   "platform_admin.session_opened",
   "platform_admin.session_closed",
   "agent.zone_scope_assigned",
+  // Forget protocol (§6.3): who forgot what range of which node, when, and
+  // under which reason code — hashes only, never the forgotten content.
+  "document.forgotten",
 ] as const;
 
 /** Zone ID pattern: lowercase letter start, then alphanumeric / hyphen / underscore */
@@ -479,6 +514,14 @@ export const versionEntrySchema = z.object({
   // historyOrRepair answers by quarantining the file and restarting the chain
   // — a whole chain lost over an annotation that is not even hashed.
   client: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  // Forget protocol (§6.3.2). A tombstoned entry has had its keyframe/diff
+  // erased; its hashes stay so the chain still verifies (hash-only).
+  tombstone: z.boolean().optional(),
+  forgotten_at: z.string().optional(),
+  forgotten_by: z.string().optional(),
+  reason_code: z.enum(FORGET_REASON_CODES).optional(),
+  // The version a node-level forget sealed: the empty stub.
+  forget_stub: z.boolean().optional(),
 });
 
 export const documentHistorySchema = z.object({
