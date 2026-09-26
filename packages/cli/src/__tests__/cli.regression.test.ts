@@ -22,6 +22,8 @@ import {
   appendFileSync,
   existsSync,
   rmSync,
+  readdirSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
