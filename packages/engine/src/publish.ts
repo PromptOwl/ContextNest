@@ -17,6 +17,7 @@ import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
 import { assertPdfSidecarIntact } from "./pdf-nodes.js";
+import { assertNotForgotten } from "./forget.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -53,6 +54,9 @@ export async function publishDocument(
   if (isRejected(node)) {
     throw new RejectedDocumentError(docId);
   }
+  // Same guard for the forget protocol (§6.3.4): a forgotten stub, a path a
+  // forget or tombstoned delete retired, or content matching erased content.
+  await assertNotForgotten(storage, node);
   // A pdf node seals pdf.sha256 into the chain; the bytes must be there.
   await assertPdfSidecarIntact(storage, docId, node);
 
@@ -212,10 +216,14 @@ export async function publishDocuments(
     }
   }
 
+  // One read of the forget registry for the whole batch.
+  const tombstones = await storage.readTombstones();
+
   const publishOne = async (docId: string): Promise<void> => {
     try {
       let node = await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
+      await assertNotForgotten(storage, node, tombstones);
       await assertPdfSidecarIntact(storage, docId, node);
 
       // Importer metadata rides along with the publish write below rather than

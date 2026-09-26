@@ -30,7 +30,7 @@ Read: `context_get` · `context_query` · `context_resolve` · `context_list` ·
 `context_search` · `context_overview` · `context_packs` · `context_init`
 Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
 `context_delete` · `context_import` (bulk create+publish, one checkpoint) · `context_import_pdf` (a PDF → a `type: pdf` node + bound binary sidecar)
-History/audit: `context_versions` · `context_reconstruct` · `context_verify`
+History/audit: `context_versions` · `context_reconstruct` · `context_verify` · `context_forget` (erase a node, keep its hashes — spec §6.3) · `context_forget_log`
 Registry: `context_nests` (list every registered nest)
 Skills: `context_skill`, `context_skill_install` (render/install a vault-hosted skill)
 

@@ -271,6 +271,7 @@ export function verifyDocumentChain(
   readDiff?: (version: number) => string | null,
 ): VerificationReport {
   const errors: VerificationReport["errors"] = [];
+  const tombstoned: NonNullable<VerificationReport["tombstoned"]> = [];
 
   let previousChainHash: string | null = null;
 
@@ -278,7 +279,15 @@ export function verifyDocumentChain(
     // Step 2: Re-compute content_hash (skip silently if keyframe file
     // missing — chain_hash check below still runs using stored content_hash).
     let actualContent: string | null;
-    if (entry.keyframe) {
+    if (entry.tombstone) {
+      // Forget protocol (§6.3.2): the content was erased on purpose, so there
+      // is nothing to re-hash. The entry is verified hash-only — the chain
+      // check below still runs on its stored content_hash, which is what
+      // keeps every later entry verifiable. Content that should be gone but
+      // is still on disk is reported by `verifyTombstones`, not here.
+      actualContent = null;
+      tombstoned.push({ document: docId, version: entry.version });
+    } else if (entry.keyframe) {
       actualContent = readKeyframe(entry.version);
     } else {
       // Externalized change log wins; inline patch is the legacy fallback.
@@ -332,7 +341,11 @@ export function verifyDocumentChain(
     previousChainHash = entry.chain_hash;
   }
 
-  return { valid: errors.length === 0, errors };
+  return {
+    valid: errors.length === 0,
+    errors,
+    ...(tombstoned.length > 0 ? { tombstoned } : {}),
+  };
 }
 
 /**

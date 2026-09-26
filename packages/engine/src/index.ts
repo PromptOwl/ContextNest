@@ -7,6 +7,7 @@
 export type {
   NodeType,
   Status,
+  ForgetReasonCode,
   Transport,
   FederationMode,
   GovernanceTier,
@@ -73,6 +74,8 @@ export {
   RejectedDocumentError,
   CorruptHistoryError,
   VersionArtifactExistsError,
+  ForgottenDocumentError,
+  ForgottenVersionError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
@@ -148,6 +151,8 @@ export {
   hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
+  WRITABLE_STATUSES,
+  FORGET_REASON_CODES,
   STATUS_ALIASES,
   TRANSPORTS,
   sourceMetaSchema,
@@ -185,6 +190,7 @@ export {
   isApproved,
   isPublished,
   isRejected,
+  isForgotten,
   isRetrievable,
   /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
   isSuperseded,
@@ -264,7 +270,7 @@ export type { DocumentFilters } from "./filters.js";
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";
 
 // Resolver
-export { Resolver } from "./resolver.js";
+export { Resolver, forgottenView } from "./resolver.js";
 export type { ResolverOptions } from "./resolver.js";
 
 // Inline extraction
@@ -368,6 +374,30 @@ export type {
   BulkPublishOptions,
   BulkPublishResult,
 } from "./publish.js";
+
+// Forget protocol (§6.3) — erasure that keeps verification intact
+export {
+  forgetDocument,
+  forgetLog,
+  deleteDocumentWithTombstone,
+  assertNotForgotten,
+  applyImportedTombstones,
+} from "./forget.js";
+export type {
+  ForgetOptions,
+  ForgetResult,
+  DeleteOptions,
+  DeleteResult,
+} from "./forget.js";
+export {
+  FORGET_EVENT_TYPE,
+  MIN_FORGETTABLE_BODY_LENGTH,
+  buildTombstoneIndex,
+  importVerdict,
+  isPathForgotten,
+  forgettableBodyHash,
+} from "./tombstones.js";
+export type { TombstoneIndex, TombstoneRecord } from "./tombstones.js";
 
 // Source graph
 export {
