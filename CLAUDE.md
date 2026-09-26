@@ -59,6 +59,7 @@ Standalone core implementing `CONTEXT_NEST_SPEC.md`. Notable modules beyond the 
 | `suggestions.ts` / `approval.ts` / `rbac.ts` / `stewards.ts` | Drift suggestions, approval workflow, role scoping |
 | `hygienist.ts` / `index-generator.ts` / `index-md-generator.ts` | Vault health checks; `context.yaml` and `INDEX.md` regeneration |
 | `agent-configs.ts` | Generates CLAUDE.md / agent config blocks into a target project |
+| `encryption/` | Opt-in encrypted vaults (`docs/encrypted-vaults.md`). `NestStorage` is the only caller: every sensitive read/write goes through its `readText`/`sealText` helpers. Never read or write a vault content file with raw `fs` outside storage, or you will get ciphertext, or write plaintext into an encrypted vault |
 
 **Vault resolution** (`resolveVaultPath()`, highest precedence first) — a frequent source of "wrong vault" bugs:
 `--vault <alias>` → `CONTEXTNEST_VAULT` (alias) → `CONTEXTNEST_VAULT_PATH` (abs path) → positional arg → local `.context/config.yaml` found by walking up cwd → registry `default:` → cwd.

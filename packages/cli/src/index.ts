@@ -32,7 +32,6 @@ import {
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
-  verifyDocumentChain,
   verifyCheckpointChain,
   topologicalSortSources,
   detectCycles,
@@ -63,6 +62,10 @@ import {
   isRejected,
   HARNESSES,
   SELECTOR_GRAMMAR,
+  encryptVault,
+  decryptVault,
+  setDefaultVaultKeyStore,
+  type EncryptVaultResult,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -105,6 +108,9 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { telemetryConsent } from "./telemetry/index.js";
+import { loadCloudToken } from "./credentials.js";
+import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
@@ -136,6 +142,10 @@ import {
 function collectClientPair(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
+
+// Encrypted-vault KEKs live in the same secure credential store as the login
+// (OS keychain / encrypted file), with the engine's interim file as fallback.
+setDefaultVaultKeyStore(new CliVaultKeyStore());
 
 const program = new Command();
 
@@ -1009,7 +1019,8 @@ async function applyStarter(
       tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
     })),
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: pkg.version,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
 }
@@ -1058,9 +1069,37 @@ This vault was initialized without a starter recipe. To help the user get starte
     starterDisplayName: null,
     nodes: [],
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: pkg.version,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
+}
+
+// Loud on purpose: this is the only time the recovery passphrase exists
+// anywhere outside the user's head.
+function printEncryptionEnabled(result: EncryptVaultResult): void {
+  const bar = chalk.yellow("━".repeat(72));
+  console.log(`\n${bar}`);
+  console.log(chalk.bold.yellow("  ENCRYPTED VAULT — LOSING THE KEY MEANS LOSING THE DATA"));
+  console.log(bar);
+  console.log(`  Note bodies and version history are sealed with AES-256-GCM.`);
+  console.log(`  Front matter (title, tags, type, status) stays plaintext so the vault can be indexed.`);
+  console.log(`  Key stored in: ${result.keyStore}`);
+  if (result.passphrase) {
+    console.log(`\n  Recovery passphrase — the ONLY way back in if this machine's key is lost:\n`);
+    console.log(`      ${chalk.bold(result.passphrase)}\n`);
+    console.log(`  Write it down and keep it offline. It is shown once. Nobody can recover it for you.`);
+    console.log(chalk.dim(`  Unlock elsewhere: CONTEXTNEST_VAULT_PASSPHRASE="<passphrase>" ctx <command>`));
+  }
+  if (result.keyStore.startsWith("interim-file")) {
+    console.log(
+      chalk.yellow(
+        "\n  Note: no OS keychain (or CONTEXTNEST_CREDENTIALS_KEY) is available, so the key is in a 0600 file under ~/.contextnest/keys.\n" +
+          "  That protects a vault folder that leaves this machine (sync, copy, backup) — not a stolen disk.",
+      ),
+    );
+  }
+  console.log(`${bar}\n`);
 }
 
 // ─── ctx init ──────────────────────────────────────────────────────────────────
@@ -1080,6 +1119,10 @@ program
     "Register the vault even when it lives under the OS temp dir (skipped there by default)",
   )
   .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
+  .option(
+    "--encrypted",
+    "Encrypt note content at rest (AES-256-GCM). Front matter stays plaintext. Losing the key AND the recovery passphrase loses the data",
+  )
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -1143,6 +1186,16 @@ program
     const storage = new NestStorage(root);
     await storage.init(opts.name, opts.layout as LayoutMode, registerDescription);
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
+
+    // Before any content (starter nodes included) is written, so nothing ever
+    // lands on disk in plaintext.
+    if (opts.encrypted) {
+      if (isDryRun()) {
+        console.log(chalk.dim("  Dry run — would enable encryption (no key is created)."));
+      } else {
+        printEncryptionEnabled(await encryptVault(storage));
+      }
+    }
 
     // Registration is performed AFTER the starter is applied (see registerVault
     // below) so an interruption mid-starter never leaves a registry alias
@@ -1300,6 +1353,14 @@ program
 
       // `--out` is the one place the CLI writes to an arbitrary path the user
       // named, so it gets the strictest guard: never clobber without consent.
+      // An encrypted vault never gets a plaintext render dropped inside it
+      // behind the user's back: the default path is a cache, so it takes --out.
+      if (!opts.out && (await storage.isEncrypted())) {
+        throw new ContextNestError(
+          "This vault is encrypted: `ctx read --html` would write the decrypted document to disk. Pass --out <file> to choose where the plaintext goes.",
+          "ENCRYPTED_VAULT",
+        );
+      }
       const outPath = opts.out
         ? pathMod.resolve(opts.out)
         : pathMod.join(getVaultRoot(), ".context", `read-${id.replace(/\//g, "-")}.html`);
@@ -1967,33 +2028,24 @@ program
     });
     const checkpointHistory = await storage.readCheckpointHistory();
 
+    // Encrypted vault without a usable key: content hashes cannot be checked,
+    // so this run can never pass. Chain linkage is still checked below.
+    const lock = await storage.encryptionLockState();
+    if (lock) {
+      totalErrors++;
+      allReportErrors.push({ type: "encrypted_key_required", expected: null, actual: lock });
+      if (!opts.json) console.log(chalk.red(`✗ Vault is ${lock}`));
+    }
+
     // Verify each document chain
     for (const [docId, history] of allHistories) {
-      // Synchronous reads — for CLI simplicity. Both are needed: a keyframe
-      // entry hashes its snapshot, a non-keyframe entry hashes its change log,
-      // and the change log lives in its own v{N}.diff file.
-      const readVersionFile = (version: number, ext: "md" | "diff") => {
-        try {
-          return fs.readFileSync(
-            pathMod.join(
-              storage.root,
-              pathMod.dirname(docId),
-              ".versions",
-              pathMod.basename(docId),
-              `v${version}.${ext}`,
-            ),
-            "utf-8",
-          );
-        } catch {
-          return null;
-        }
-      };
-      const report = verifyDocumentChain(
-        docId,
-        history,
-        (version) => readVersionFile(version, "md"),
-        (version) => readVersionFile(version, "diff"),
-      );
+      // Through storage, not raw file reads: in an encrypted vault the
+      // keyframe/diff bytes on disk are ciphertext, and the chain is defined
+      // over the plaintext. Locked, only the linkage can be checked.
+      const errors = lock
+        ? storage.verifyChainLinkage(docId, history)
+        : await storage.verifyHistoryChain(docId, history);
+      const report = { valid: errors.length === 0, errors };
 
       if (!report.valid) {
         totalErrors += report.errors.length;
@@ -2030,8 +2082,11 @@ program
     }
 
     // PDF nodes: every binary must still hash to what its frontmatter (or,
-    // for an archived prior binary, its file name) records.
-    const sidecarErrors = await storage.verifyPdfSidecars();
+    // for an archived prior binary, its file name) records. An encrypted vault
+    // also must not hold content in plaintext. Both need the key.
+    const sidecarErrors = lock
+      ? []
+      : [...(await storage.verifyPdfSidecars()), ...(await storage.findUnencryptedFiles())];
     if (sidecarErrors.length > 0) {
       totalErrors += sidecarErrors.length;
       allReportErrors.push(...sidecarErrors);
@@ -2198,17 +2253,6 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
     console.log(
       chalk.dim(`\n  ${result.metering.credits_used} credit(s) used, ${result.metering.remaining_today} remaining today (${result.metering.plan} plan)`),
     );
-  }
-}
-
-async function loadCloudToken(): Promise<string | null> {
-  const homedir = (await import("node:os")).homedir();
-  const credPath = pathMod.join(homedir, ".promptowl", "credentials.json");
-  try {
-    const creds = JSON.parse(await fs.promises.readFile(credPath, "utf-8"));
-    return creds.access_token || null;
-  } catch {
-    return null;
   }
 }
 
@@ -2884,7 +2928,8 @@ program
         tags: (d.frontmatter.tags || []).map((t: string) => t.replace(/^#/, "")),
       })),
       timestamp: new Date().toISOString(),
-      cliVersion: program.version() || "0.3.0",
+      cliVersion: pkg.version,
+      analytics: telemetryConsent(getVaultRoot()),
     });
 
     console.log(chalk.green(`Generated welcome page: .context/welcome.html`));
@@ -3300,7 +3345,59 @@ drift
 
 const vaultCmd = program
   .command("vault")
-  .description("Manage the central vault registry (alias → path)");
+  .description("Manage the central vault registry (alias → path) and vault encryption");
+
+vaultCmd
+  .command("encrypt")
+  .description("Encrypt this vault's note content at rest (AES-256-GCM); resumes an interrupted run")
+  .action(async () => {
+    const storage = getStorage();
+    const resuming = await storage.isEncrypted();
+    if (!resuming) {
+      console.error(
+        chalk.yellow(
+          "  Back up the vault first (copy the folder). Encryption rewrites every note, keyframe and diff in place;\n" +
+            "  each file is replaced atomically and an interrupted run resumes, but a backup is the only undo.\n" +
+            "  Plaintext already copied elsewhere (sync history, backups, git) is NOT affected.",
+        ),
+      );
+      await confirmOrExit(`Encrypt the vault at ${storage.root}?`, { destructive: true });
+    }
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan("Dry run — nothing was encrypted and no key was created."));
+      return;
+    }
+    const result = await encryptVault(storage);
+    await storage.regenerateIndex();
+    if (result.resumed) {
+      console.log(chalk.green(`  Vault already encrypted — sealed ${result.sealed} remaining plaintext file(s).`));
+    } else {
+      console.log(chalk.green(`  Encrypted ${result.sealed} file(s).`));
+      printEncryptionEnabled(result);
+    }
+  });
+
+vaultCmd
+  .command("decrypt")
+  .description("Decrypt this vault back to plain Markdown (needs the key or the recovery passphrase)")
+  .action(async () => {
+    const storage = getStorage();
+    if (!(await storage.isEncrypted())) {
+      console.log(chalk.dim("  This vault is not encrypted."));
+      return;
+    }
+    await confirmOrExit(
+      `Decrypt every note in ${storage.root} back to plaintext on disk and remove its encryption key?`,
+      { destructive: true },
+    );
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan("Dry run — nothing was decrypted."));
+      return;
+    }
+    const { decrypted } = await decryptVault(storage);
+    await storage.regenerateIndex();
+    console.log(chalk.green(`  Decrypted ${decrypted} file(s). The vault is plain Markdown again.`));
+  });
 
 vaultCmd
   .command("list")
@@ -3686,6 +3783,7 @@ program
         ? `${report.plugin.version}  ${chalk.dim(report.plugin.path ?? "")}`
         : chalk.dim("not installed (no contextnest entry in installed_plugins.json)"),
     );
+    row("Privacy", `telemetry + welcome-page analytics ${report.privacy.telemetry ? chalk.yellow("on") : "off"} · credentials: ${report.privacy.credentials}`);
     console.log("");
   });
 

@@ -41,6 +41,27 @@ its version and licence alongside the installed ones in
 **[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
 uploads the machine-readable graph as the `dependency-graph` build artifact.
 
+### What leaves your machine
+
+Nothing, unless you run a command that names a destination or opt in:
+
+| Trigger | Destination | Sent | Default |
+|---|---|---|---|
+| Telemetry | `api.promptowl.ai/v1/telemetry` | Random per-vault id, CLI version, OS, Node version, event name, timestamp. Never vault content. | Off. Opt in with `telemetry: true` in `.context/config.yaml`; `DO_NOT_TRACK=1` / `CONTEXTNEST_TELEMETRY=0` force off. |
+| Opening `.context/welcome.html` | Google Analytics | `vault_init` (starter, CLI version, doc count) + GA defaults (IP, user agent) | Off — same flag. Off = the page makes no network requests. |
+| `ctx push` | The `--server` you name | Published documents + your API key | Only when run |
+| `ctx query @org/pack` | `api.promptowl.ai` | Pack name + your PromptOwl token | Only when run |
+| Remote nests | The server you registered | Queries/writes + the bearer from your env var | Only for remotes you add |
+| `ctx import pubmed` / `enrich pubtator` | NCBI | Search terms / ids | Only when run |
+| `ctx doctor` | npm registry | Version lookup | `CONTEXTNEST_DOCTOR_OFFLINE=1` skips |
+
+Stored PromptOwl credentials live in the OS keyring (macOS Keychain, Windows Credential Manager,
+Linux Secret Service via `secret-tool`). With no keyring (headless/CI/Docker), set
+`CONTEXTNEST_CREDENTIALS_KEY` and they go to `~/.promptowl/credentials.enc.json` (AES-256-GCM,
+scrypt-derived key, mode 0600). Never plaintext: a legacy `~/.promptowl/credentials.json` is
+migrated on first read, then overwritten and deleted; with neither keyring nor key the CLI stops
+and says how to fix it. `PROMPTOWL_ACCESS_TOKEN` skips storage entirely.
+
 ## For the solo developer
 
 Your brain, cached for your agent.
@@ -60,6 +81,8 @@ Skill nodes codify team procedures (PR review, incident response, deployment che
 A safe shared brain.
 
 Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+
+Need content encrypted at rest? `ctx init --encrypted` (or `ctx vault encrypt` for an existing vault) seals note bodies and version history with AES-256-GCM while front matter stays indexable. Hash chains keep verifying over the plaintext. It is opt-in: default vaults stay plain Markdown. Read the [threat model and key handling](docs/encrypted-vaults.md) first, because **losing the key and the recovery passphrase means losing the data**.
 
 ## How is this different from...
 
@@ -502,6 +525,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx vault encrypt` | Encrypt the vault's content at rest in place (AES-256-GCM). Prints a one-time recovery passphrase; rerun to resume an interrupted run. See [encrypted vaults](docs/encrypted-vaults.md) |
+| `ctx vault decrypt` | Decrypt an encrypted vault back to plain Markdown |
 | `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
@@ -554,7 +579,7 @@ ctx query "#api + status:published"       # Intersection
 | `ctx history <path>` | Show version history |
 | `ctx history <path> --diff` | Include each version's unified diff from the one before |
 | `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
-| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped) |
+| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped). In an encrypted vault without its key it reports `encrypted_key_required` and never passes |
 
 Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
 errors, plain `Error: message` for the rest. Set `CONTEXTNEST_DEBUG=1` to get the

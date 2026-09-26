@@ -128,6 +128,10 @@ export class VersionManager {
     // absent, so this write restarts the chain rather than failing. See
     // historyOrRepair for why that is safe.
     const { history: readHistory } = await this.historyOrRepair(node.id);
+    // Decided BEFORE this version's own artifact is written below: counting
+    // the v{N}.md we are about to seal made every brand-new document's first
+    // entry claim "Chain restarted" (it saw its own keyframe as prior history).
+    const restartNote = await this.restartNoteFor(node.id, readHistory);
     const history = readHistory || {
       keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
       versions: [],
@@ -207,7 +211,7 @@ export class VersionManager {
     // history.yaml is legitimately absent. "No readable ledger, but sealed
     // artifacts above it" is a restart however the ledger came to be missing.
     const note =
-      [options.note, await this.restartNoteFor(node.id, readHistory)]
+      [options.note, restartNote]
         .filter(Boolean)
         .join(" — ") || undefined;
 

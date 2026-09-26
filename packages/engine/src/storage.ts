@@ -57,6 +57,19 @@ import {
   checkpointSchema,
   checkpointHistorySchema,
 } from "./schemas.js";
+import {
+  VaultCrypto,
+  VaultLockedError,
+  WrongVaultKeyError,
+  type VaultCryptoOptions,
+} from "./encryption/vault-crypto.js";
+import {
+  DecryptionFailedError,
+  isArmoredText,
+  isSealedBinary,
+  isSealedField,
+  type SealKind,
+} from "./encryption/envelope.js";
 
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
@@ -266,8 +279,258 @@ async function quarantine(path: string): Promise<string> {
   return dest;
 }
 
+/** Options for {@link NestStorage}. */
+export interface NestStorageOptions {
+  /**
+   * Key material for an encrypted vault (see `encryption/`). Omitted, the
+   * storage finds the key itself — `CONTEXTNEST_VAULT_KEY`, then the default
+   * key store. Ignored for a plain vault.
+   */
+  encryption?: VaultCryptoOptions;
+}
+
+/** Artifact kind a vault-relative path holds, for sealing on import. */
+function kindForVaultPath(relPath: string): { kind: SealKind; docId: string } | null {
+  const norm = relPath.replace(/\\/g, "/");
+  const version = /^(?:(.*)\/)?\.versions\/([^/]+)\/v\d+\.(md|diff)$/.exec(norm);
+  if (version) {
+    const docId = version[1] ? `${version[1]}/${version[2]}` : version[2];
+    return { kind: version[3] === "md" ? "keyframe" : "diff", docId };
+  }
+  if (norm.endsWith(".md") && !norm.split("/").some((seg) => seg.startsWith("."))) {
+    const base = norm.split("/").pop()!;
+    if (NON_DOCUMENT_BASENAMES.has(base) || norm === "CONTEXT.md") return null;
+    return { kind: "doc", docId: norm.slice(0, -3) };
+  }
+  return null;
+}
+
 export class NestStorage {
-  constructor(public readonly root: string) {}
+  constructor(
+    public readonly root: string,
+    private readonly options: NestStorageOptions = {},
+  ) {}
+
+  /**
+   * Encryption state: a VaultCrypto for an encrypted vault, null for a plain
+   * one. Loading reads `.context/encryption.yaml` only; the key itself is
+   * fetched on the first seal/open.
+   *
+   * Re-validated against the config file's mtime at most once per second, so
+   * a long-lived process (the MCP server) notices a `ctx vault encrypt` /
+   * `decrypt` run from another terminal instead of writing plaintext into a
+   * vault that just became encrypted (or ciphertext into one that stopped).
+   */
+  private cryptoLoad: Promise<VaultCrypto | null> | undefined;
+  private cryptoStamp = { checkedAt: 0, mtimeMs: -1 as number };
+  private cryptoPinned = false;
+  /** In-flight re-check, shared so a batch of parallel reads loads once. */
+  private cryptoRefresh: Promise<VaultCrypto | null> | undefined;
+
+  /** The vault's encryption handle, or null for a plain (default) vault. */
+  async getVaultCrypto(): Promise<VaultCrypto | null> {
+    if (this.cryptoLoad && (this.cryptoPinned || Date.now() - this.cryptoStamp.checkedAt <= 1000)) {
+      return this.cryptoLoad;
+    }
+    this.cryptoRefresh ??= this.refreshVaultCrypto().finally(() => {
+      this.cryptoRefresh = undefined;
+    });
+    return this.cryptoRefresh;
+  }
+
+  private async refreshVaultCrypto(): Promise<VaultCrypto | null> {
+    const now = Date.now();
+    const mtimeMs = await stat(VaultCrypto.configPath(this.root)).then(
+      (st) => st.mtimeMs,
+      () => -1,
+    );
+    if (this.cryptoPinned && this.cryptoLoad) return this.cryptoLoad;
+    if (!this.cryptoLoad || mtimeMs !== this.cryptoStamp.mtimeMs) {
+      // Verdicts computed under a different encryption state are stale.
+      if (this.cryptoLoad) this.historyVerdicts.clear();
+      this.cryptoLoad = VaultCrypto.load(this.root, this.options.encryption);
+    }
+    this.cryptoStamp = { checkedAt: now, mtimeMs };
+    return this.cryptoLoad;
+  }
+
+  /**
+   * Pin the encryption handle, bypassing the on-disk config — for the vault
+   * encrypt/decrypt operations only, which run under the vault lock and move
+   * the config themselves.
+   */
+  setVaultCrypto(crypto: VaultCrypto | null): void {
+    this.cryptoLoad = Promise.resolve(crypto);
+    this.cryptoPinned = true;
+    this.historyVerdicts.clear();
+  }
+
+  async isEncrypted(): Promise<boolean> {
+    return (await this.getVaultCrypto()) !== null;
+  }
+
+  /**
+   * Read a text artifact, decrypting in memory when it is sealed. A plaintext
+   * file inside an encrypted vault (an editor dropped it in, a migration was
+   * interrupted) still reads — `ctx verify` reports it as `unencrypted_file`
+   * and the next write through the engine seals it.
+   */
+  private async readText(absPath: string, kind: SealKind | SealKind[], what: string): Promise<string> {
+    const raw = await readFile(absPath, "utf-8");
+    return this.openText(raw, kind, what);
+  }
+
+  private async openText(raw: string, kind: SealKind | SealKind[], what: string): Promise<string> {
+    if (!isArmoredText(raw)) return raw;
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) {
+      throw new ContextNestError(
+        `${what} is encrypted, but this vault has no .context/encryption.yaml — the file came from an encrypted vault, or the config was deleted.`,
+        "VAULT_LOCKED",
+      );
+    }
+    return crypto.openText(raw, kind, what);
+  }
+
+  /**
+   * Seal text for disk when the vault is encrypted; identity otherwise.
+   * `docId` is unused while one vault key seals everything — it is the seam
+   * where per-document keys (crypto-shred for forget) plug in.
+   */
+  private async sealText(docId: string, kind: SealKind, plaintext: string): Promise<string> {
+    const crypto = await this.getVaultCrypto();
+    return crypto ? crypto.sealText(kind, plaintext) : plaintext;
+  }
+
+  private async sealBytes(docId: string, bytes: Uint8Array): Promise<Uint8Array> {
+    const crypto = await this.getVaultCrypto();
+    return crypto ? crypto.sealBytes(bytes) : bytes;
+  }
+
+  private async openBytes(bytes: Buffer, what: string): Promise<Buffer> {
+    if (!isSealedBinary(bytes)) return bytes;
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) throw new ContextNestError(`${what} is encrypted, but this vault has no encryption config.`, "VAULT_LOCKED");
+    return crypto.openBytes(bytes, what);
+  }
+
+  /** Seal the free-text fields of a history entry (`note`, legacy inline `diff`). */
+  private async sealEntry(docId: string, entry: VersionEntry): Promise<VersionEntry> {
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) return entry;
+    const out = { ...entry };
+    if (typeof out.note === "string" && !isSealedField(out.note)) out.note = await crypto.sealNote(out.note);
+    if (typeof out.diff === "string" && !isSealedField(out.diff)) out.diff = await crypto.sealNote(out.diff);
+    return out;
+  }
+
+  /**
+   * Open a history's sealed fields. Locked, they stay sealed rather than
+   * failing the read: nothing hashed lives in them (`note` is not a chain
+   * input), and leaving the ciphertext in place means a read-modify-write can
+   * never replace it with a placeholder.
+   */
+  private async openHistoryFields(docId: string, history: DocumentHistory): Promise<DocumentHistory> {
+    if (!history.versions.some((v) => isSealedField(v.note) || isSealedField(v.diff))) return history;
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) return history;
+    try {
+      await crypto.unlock();
+    } catch (err) {
+      if (err instanceof VaultLockedError || err instanceof WrongVaultKeyError) return history;
+      throw err;
+    }
+    // A field that will not open stays sealed: a tampered note is not a chain
+    // input, and a tampered legacy inline diff then re-hashes as ciphertext,
+    // which verify reports as a content_hash_mismatch rather than crashing.
+    const tryOpen = async (value: string, what: string): Promise<string> => {
+      try {
+        return await crypto.openNote(value, what);
+      } catch (err) {
+        if (err instanceof ContextNestError) return value;
+        throw err;
+      }
+    };
+    const versions = await Promise.all(
+      history.versions.map(async (v) => {
+        const out = { ...v };
+        if (isSealedField(out.note)) out.note = await tryOpen(out.note, `${docId} v${v.version} note`);
+        if (isSealedField(out.diff)) out.diff = await tryOpen(out.diff, `${docId} v${v.version} diff`);
+        return out;
+      }),
+    );
+    return { ...history, versions };
+  }
+
+  /**
+   * The key-less half of a chain check: `chain_hash` linkage over the stored
+   * `content_hash`es, with every content re-hash skipped (keyframes and diffs
+   * are ciphertext; a sealed legacy inline diff would hash as a false
+   * mismatch). Never a substitute for a full verify — callers pair it with an
+   * `encrypted_key_required` finding.
+   */
+  verifyChainLinkage(docId: string, history: DocumentHistory): VerificationReport["errors"] {
+    const stripped = { ...history, versions: history.versions.map(({ diff: _diff, ...v }) => v) };
+    return verifyDocumentChain(docId, stripped, () => null).errors;
+  }
+
+  /**
+   * Null when content can be verified; otherwise why not (encrypted vault, no
+   * key or the wrong one). Verification treats non-null as a hard failure.
+   */
+  async encryptionLockState(): Promise<string | null> {
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) return null;
+    try {
+      await crypto.unlock();
+      return null;
+    } catch (err) {
+      if (err instanceof VaultLockedError) return "encrypted, key required — content hashes cannot be checked without the vault key";
+      if (err instanceof WrongVaultKeyError) return `encrypted, key rejected — ${err.message}`;
+      throw err;
+    }
+  }
+
+  /**
+   * Sensitive files in an encrypted vault that are NOT sealed: documents,
+   * keyframes, diffs, suggestion files, context.yaml, pdf binaries. Empty for
+   * a plain vault. Reported by verify as `unencrypted_file`.
+   */
+  async findUnencryptedFiles(): Promise<VerificationReport["errors"]> {
+    if (!(await this.isEncrypted())) return [];
+    const files = await globFiles(
+      this.root,
+      [
+        "**/*.md",
+        "**/.versions/*/*.md",
+        "**/.versions/*/*.diff",
+        "**/.versions/*/*.pdf",
+        "**/_suggestions/**/*.patch",
+        "**/_suggestions/**/*.meta.yaml",
+        "**/*.pdf",
+        "context.yaml",
+      ],
+      ["**/node_modules/**", "**/.context/**", "CONTEXT.md", ...[...NON_DOCUMENT_BASENAMES].map((n) => `**/${n}`)],
+    );
+    const errors: VerificationReport["errors"] = [];
+    for (const file of [...new Set(files)].sort()) {
+      const abs = join(this.root, file);
+      let sealed: boolean;
+      if (file.endsWith(".pdf")) {
+        sealed = isSealedBinary(await readFile(abs));
+      } else {
+        const text = await readFile(abs, "utf-8");
+        // A root-level scaffold file (README-like, no front matter) is not a
+        // node and is not sealed; only files the engine would treat as content.
+        if (file.endsWith(".md") && !file.includes("/") && !text.startsWith("---")) continue;
+        sealed = isArmoredText(text);
+      }
+      if (!sealed) {
+        errors.push({ type: "unencrypted_file", document: file, expected: "sealed", actual: "plaintext" });
+      }
+    }
+    return errors;
+  }
 
   /**
    * In-process serialization chain for the checkpoint history
@@ -379,8 +642,8 @@ export class NestStorage {
 
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
-      const content = await readFile(filePath, "utf-8");
       const id = file.replace(/\.md$/, "");
+      const content = await this.readText(filePath, "doc", id);
       const node = parseDocument(filePath, content, id);
       // Root-level discovery (structured layout) globs *.md at the vault root so
       // a node can live anywhere. But a vault root commonly holds scaffold files
@@ -484,15 +747,16 @@ export class NestStorage {
     // nodes remain discoverable via list/search; they are addressed by their own
     // (root) id, not by a normalized `nodes/` slug.
     const filePath = join(this.root, `${id}.md`);
-    let liveContent: string;
+    let raw: string;
     try {
-      liveContent = await readFile(filePath, "utf-8");
+      raw = await readFile(filePath, "utf-8");
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         throw new DocumentNotFoundError(id);
       }
       throw err;
     }
+    const liveContent = await this.openText(raw, "doc", id);
 
     const liveNode = parseDocument(filePath, liveContent, id);
     if (!options.verifyChecksum) {
@@ -535,15 +799,16 @@ export class NestStorage {
     id: string,
   ): Promise<ReturnType<typeof detectDrift> | null> {
     const filePath = join(this.root, `${id}.md`);
-    let liveContent: string;
+    let raw: string;
     try {
-      liveContent = await readFile(filePath, "utf-8");
+      raw = await readFile(filePath, "utf-8");
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return null;
       }
       throw err;
     }
+    const liveContent = await this.openText(raw, "doc", id);
     const liveNode = parseDocument(filePath, liveContent, id);
     return detectDrift(liveContent, liveNode.frontmatter.checksum);
   }
@@ -633,6 +898,25 @@ export class NestStorage {
    */
   async verifyVaultIntegrity(): Promise<VerificationReport> {
     const errors: VerificationReport["errors"] = [];
+    // Encrypted and no usable key: the content hashes cannot be recomputed, so
+    // this can NEVER be a pass. Chain linkage (history.yaml is plaintext) and
+    // the checkpoint chain are still checked, and reported alongside.
+    const lock = await this.encryptionLockState();
+    if (lock) {
+      errors.push({ type: "encrypted_key_required", document: undefined, expected: null, actual: lock });
+      const histories = await this.findAllHistories((docId, reason) => {
+        errors.push({ type: "unreadable_history", document: docId, expected: null, actual: reason });
+      });
+      for (const [docId, history] of histories) {
+        errors.push(...this.verifyChainLinkage(docId, history));
+      }
+      const cps = await this.readCheckpointHistory();
+      if (cps) {
+        const report = verifyCheckpointChain(cps.checkpoints, histories);
+        if (!report.valid) errors.push(...report.errors);
+      }
+      return { valid: false, errors };
+    }
     // A history we cannot parse is an unverifiable document, not a clean one —
     // report it instead of letting the crawl skip it into a silent pass.
     const allHistories = await this.findAllHistories((docId, reason) => {
@@ -656,6 +940,8 @@ export class NestStorage {
       );
       if (!report.valid) errors.push(...report.errors);
     }
+
+    errors.push(...(await this.findUnencryptedFiles()));
 
     // Integrity check must verify every doc on disk, including retired ones.
     const liveDocs = await this.discoverDocuments({ includeRetired: true });
@@ -696,13 +982,30 @@ export class NestStorage {
   ): Promise<VerificationReport["errors"]> {
     const keyframeContent = new Map<number, string>();
     const diffContent = new Map<number, string>();
+    const cryptoErrors: VerificationReport["errors"] = [];
     for (const entry of history.versions) {
-      if (entry.keyframe) {
-        const content = await this.readKeyframe(docId, entry.version);
-        if (content !== null) keyframeContent.set(entry.version, content);
-      } else {
-        const diff = await this.readDiff(docId, entry.version);
-        if (diff !== null) diffContent.set(entry.version, diff);
+      try {
+        if (entry.keyframe) {
+          const content = await this.readKeyframe(docId, entry.version);
+          if (content !== null) keyframeContent.set(entry.version, content);
+        } else {
+          const diff = await this.readDiff(docId, entry.version);
+          if (diff !== null) diffContent.set(entry.version, diff);
+        }
+      } catch (err) {
+        // A sealed artifact that fails GCM authentication was tampered with (or
+        // sealed under another key): a finding for that version, and never a
+        // silent skip — the artifact is also withheld from the chain check, so
+        // it cannot count as verified.
+        if (!(err instanceof ContextNestError)) throw err;
+        if (err instanceof VaultLockedError || err instanceof WrongVaultKeyError) throw err;
+        cryptoErrors.push({
+          type: "decryption_failed",
+          document: docId,
+          version: entry.version,
+          expected: entry.content_hash,
+          actual: err.message,
+        });
       }
     }
     const report = verifyDocumentChain(
@@ -711,7 +1014,7 @@ export class NestStorage {
       (version) => keyframeContent.get(version) ?? null,
       (version) => diffContent.get(version) ?? null,
     );
-    return report.errors;
+    return [...cryptoErrors, ...report.errors];
   }
 
   /**
@@ -834,8 +1137,9 @@ export class NestStorage {
   ): Promise<void> {
     const filePath = join(this.root, `${id}.md`);
     await mkdir(dirname(filePath), { recursive: true });
+    const onDisk = await this.sealText(id, "doc", content);
     try {
-      await writeFile(filePath, content, {
+      await writeFile(filePath, onDisk, {
         encoding: "utf-8",
         ...(options.exclusive ? { flag: "wx" } : {}),
       });
@@ -864,7 +1168,28 @@ export class NestStorage {
   async writeVaultFile(relPath: string, content: string): Promise<void> {
     const filePath = this.vaultFilePath(relPath);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, content, "utf-8");
+    // Encrypted vault: an import lands sealed like any other write. Verbatim
+    // still holds for the PLAINTEXT — it is what gets sealed, byte for byte, so
+    // every hash the source recorded keeps verifying.
+    let onDisk = content;
+    if ((await this.isEncrypted()) && !isArmoredText(content)) {
+      const target = kindForVaultPath(relPath);
+      if (target) {
+        onDisk = await this.sealText(target.docId, target.kind, content);
+      } else if (/(^|\/)\.versions\/[^/]+\/history\.yaml$/.test(relPath.replace(/\\/g, "/"))) {
+        const norm = relPath.replace(/\\/g, "/");
+        const m = /^(?:(.*)\/)?\.versions\/([^/]+)\/history\.yaml$/.exec(norm)!;
+        const docId = m[1] ? `${m[1]}/${m[2]}` : m[2];
+        const parsed = documentHistorySchema.safeParse(yaml.load(content));
+        if (parsed.success) {
+          const history = parsed.data as DocumentHistory;
+          const versions: VersionEntry[] = [];
+          for (const v of history.versions) versions.push(await this.sealEntry(docId, v));
+          onDisk = yaml.dump({ ...history, versions }, { lineWidth: -1, noRefs: true });
+        }
+      }
+    }
+    await writeFile(filePath, onDisk, "utf-8");
   }
 
   /**
@@ -899,12 +1224,16 @@ export class NestStorage {
   async writeVaultBinary(relPath: string, bytes: Uint8Array): Promise<void> {
     const filePath = this.vaultFilePath(relPath);
     await mkdir(dirname(filePath), { recursive: true });
-    await this.writeFileDurable(filePath, bytes);
+    const docId = relPath.replace(/\\/g, "/").replace(/\.[^./]+$/, "");
+    await this.writeFileDurable(filePath, await this.sealBytes(docId, bytes));
   }
 
-  /** Read a vault file's raw bytes. Same path guard as {@link writeVaultBinary}. */
+  /**
+   * Read a vault file's bytes — decrypted in memory for a sealed sidecar in an
+   * encrypted vault. Same path guard as {@link writeVaultBinary}.
+   */
   async readVaultBinary(relPath: string): Promise<Buffer> {
-    return readFile(this.vaultFilePath(relPath));
+    return this.openBytes(await readFile(this.vaultFilePath(relPath)), relPath);
   }
 
   /**
@@ -947,7 +1276,7 @@ export class NestStorage {
     } catch {
       // Not archived yet.
     }
-    await this.writeFileDurable(path, bytes);
+    await this.writeFileDurable(path, await this.sealBytes(docId, bytes));
     return path;
   }
 
@@ -959,7 +1288,8 @@ export class NestStorage {
     const hex = sha256.replace(/^sha256:/, "");
     if (!/^[a-f0-9]{64}$/.test(hex)) return null;
     try {
-      return await readFile(join(this.versionsDir(docId), `${hex}.pdf`));
+      const raw = await readFile(join(this.versionsDir(docId), `${hex}.pdf`));
+      return await this.openBytes(raw, `${docId} archived pdf ${hex}`);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw err;
@@ -1019,7 +1349,9 @@ export class NestStorage {
         const expected = `sha256:${name.slice(0, 64)}`;
         let actual: string;
         try {
-          actual = sha256Bytes(await readFile(join(this.versionsDir(doc.id), name)));
+          actual = sha256Bytes(
+            await this.openBytes(await readFile(join(this.versionsDir(doc.id), name)), `${doc.id} archived ${name}`),
+          );
         } catch (err) {
           // One unreadable entry is a finding about that entry, not a reason
           // to abandon verifying the rest of the vault.
@@ -1072,7 +1404,7 @@ export class NestStorage {
     // delete another node's binary.
     let sidecar: string | null = null;
     try {
-      const raw = await readFile(filePath, "utf-8");
+      const raw = await this.readText(filePath, "doc", id);
       const fm = parseDocument(filePath, raw, id).frontmatter;
       if (fm.type === "pdf" && fm.pdf?.file === `${id}.pdf`) sidecar = fm.pdf.file;
     } catch {
@@ -1161,15 +1493,20 @@ export class NestStorage {
    */
   async readContextYaml(): Promise<ContextYaml | null> {
     try {
-      const content = await readFile(
+      const raw = await readFile(
         join(this.root, "context.yaml"),
         "utf-8",
       );
+      const content = await this.openText(raw, "index", "context.yaml");
       return yaml.load(content) as ContextYaml;
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return null;
       }
+      // An index that will not open (sealed under a key this vault does not
+      // hold) is just stale: report "no index" so the caller regenerates it,
+      // exactly as for a missing file.
+      if (err instanceof DecryptionFailedError) return null;
       throw err;
     }
   }
@@ -1183,7 +1520,7 @@ export class NestStorage {
       noRefs: true,
       sortKeys: false,
     });
-    await writeFile(join(this.root, "context.yaml"), content, "utf-8");
+    await writeFile(join(this.root, "context.yaml"), await this.sealText("", "index", content), "utf-8");
   }
 
   /**
@@ -1229,7 +1566,7 @@ export class NestStorage {
         `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
       );
     }
-    return result.data as DocumentHistory;
+    return this.openHistoryFields(docId, result.data as DocumentHistory);
   }
 
   /**
@@ -1332,7 +1669,9 @@ export class NestStorage {
    * the file for appending. Anything else here is a latent break in append.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
-    const { versions, ...rest } = history;
+    const { versions: plainVersions, ...rest } = history;
+    const versions: VersionEntry[] = [];
+    for (const v of plainVersions) versions.push(await this.sealEntry(docId, v));
     await mkdir(dirname(this.historyPath(docId)), { recursive: true });
     const content = yaml.dump(
       { ...rest, versions },
@@ -1374,7 +1713,7 @@ export class NestStorage {
     // One list item, indented to sit under `versions:`. Indenting a whole YAML
     // document by a fixed amount keeps it valid, including multi-line scalars.
     const block = yaml
-      .dump([entry], { lineWidth: -1, noRefs: true })
+      .dump([await this.sealEntry(docId, entry)], { lineWidth: -1, noRefs: true })
       .split("\n")
       .map((line) => (line.length > 0 ? `  ${line}` : line))
       .join("\n");
@@ -1433,11 +1772,15 @@ export class NestStorage {
       docName,
       `v${version}.md`,
     );
+    let raw: string;
     try {
-      return await readFile(keyframePath, "utf-8");
+      raw = await readFile(keyframePath, "utf-8");
     } catch {
       return null;
     }
+    // Decryption errors propagate on purpose: a keyframe that cannot be opened
+    // must never read as "no keyframe" — that is how a verify passes silently.
+    return this.openText(raw, "keyframe", `${docId} v${version} keyframe`);
   }
 
   /**
@@ -1462,6 +1805,7 @@ export class NestStorage {
     const dir = join(this.root, docDir, ".versions", docName);
     await mkdir(dir, { recursive: true });
     const path = join(dir, fileName);
+    content = await this.sealText(docId, fileName.endsWith(".diff") ? "diff" : "keyframe", content);
 
     if (overwrite) {
       await this.writeFileDurable(path, content);
@@ -1527,11 +1871,13 @@ export class NestStorage {
       docName,
       `v${version}.diff`,
     );
+    let raw: string;
     try {
-      return await readFile(diffPath, "utf-8");
+      raw = await readFile(diffPath, "utf-8");
     } catch {
       return null;
     }
+    return this.openText(raw, "diff", `${docId} v${version} diff`);
   }
 
   /**
@@ -1582,7 +1928,7 @@ export class NestStorage {
     const dir = this.suggestionDir(docId);
     await mkdir(dir, { recursive: true });
     const path = join(dir, `${suggestionId}.patch`);
-    await writeFile(path, patch, "utf-8");
+    await writeFile(path, await this.sealText(docId, "suggestion", patch), "utf-8");
     return path;
   }
 
@@ -1596,7 +1942,7 @@ export class NestStorage {
     await mkdir(dir, { recursive: true });
     const path = join(dir, `${suggestionId}.meta.yaml`);
     const content = yaml.dump(meta, { lineWidth: -1, noRefs: true });
-    await writeFile(path, content, "utf-8");
+    await writeFile(path, await this.sealText(docId, "suggestion", content), "utf-8");
     return path;
   }
 
@@ -1605,14 +1951,16 @@ export class NestStorage {
     docId: string,
     suggestionId: string,
   ): Promise<string | null> {
+    let raw: string;
     try {
-      return await readFile(
+      raw = await readFile(
         join(this.suggestionDir(docId), `${suggestionId}.patch`),
         "utf-8",
       );
     } catch {
       return null;
     }
+    return this.openText(raw, "suggestion", `${docId} suggestion ${suggestionId}`);
   }
 
   /** Read a staged suggestion's parsed meta, or null when absent. */
@@ -1620,12 +1968,18 @@ export class NestStorage {
     docId: string,
     suggestionId: string,
   ): Promise<unknown | null> {
+    let raw: string;
     try {
-      const raw = await readFile(
+      raw = await readFile(
         join(this.suggestionDir(docId), `${suggestionId}.meta.yaml`),
         "utf-8",
       );
-      return yaml.load(raw);
+    } catch {
+      return null;
+    }
+    const text = await this.openText(raw, "suggestion", `${docId} suggestion ${suggestionId} meta`);
+    try {
+      return yaml.load(text);
     } catch {
       return null;
     }
@@ -2141,7 +2495,9 @@ export class NestStorage {
       }
       const result = documentHistorySchema.safeParse(entry.raw);
       if (result.success) {
-        histories.set(entry.docId, result.data as DocumentHistory);
+        // Sealed free-text fields are opened when the key is at hand, so a
+        // legacy inline `diff` re-hashes as its plaintext during verify.
+        histories.set(entry.docId, await this.openHistoryFields(entry.docId, result.data as DocumentHistory));
       } else {
         onUnreadable?.(entry.docId, `history.yaml failed schema validation`);
       }
