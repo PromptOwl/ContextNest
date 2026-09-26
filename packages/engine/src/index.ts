@@ -253,7 +253,11 @@ export type {
   ReadDocumentOptions,
   CheckpointChainState,
   FolderEntry,
+  NestStorageOptions,
 } from "./storage.js";
+
+// Encrypted vaults (opt-in; default vaults stay plain Markdown)
+export * from "./encryption/index.js";
 
 // Document filtering — shared by context_list and by surfaces that filter a
 // document list they already hold.
