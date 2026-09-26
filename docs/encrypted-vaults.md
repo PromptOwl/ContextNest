@@ -93,11 +93,18 @@ KEK  (key-encryption key)   OS key store, or CONTEXTNEST_VAULT_KEY. Never inside
   containers and headless MCP) → the key store → `CONTEXTNEST_VAULT_PASSPHRASE`
   (the recovery passphrase).
 - **Key store:** the engine codes against a small `VaultKeyStore` interface.
-  The OS-keychain credential store (separate work) registers itself through
-  `setDefaultVaultKeyStore()`. **Until it lands, the default is an interim
-  0600 file under `~/.contextnest/keys/`.** That protects a vault folder that
-  leaves the machine, but not a stolen disk, and the CLI says so when it
-  creates the key.
+  The CLI registers its secure credential store (the same one the PromptOwl
+  login uses) through `setDefaultVaultKeyStore()`. That store is the OS
+  keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service),
+  or the AES-256-GCM file store when `CONTEXTNEST_CREDENTIALS_KEY` is set.
+  Where neither is available, the CLI falls back to an **interim 0600 file
+  under `~/.contextnest/keys/`**. That protects a vault folder that leaves the
+  machine, but not a stolen disk, and the CLI says so when it creates the key.
+- **MCP server (v1 limitation):** the MCP server package does not yet share
+  the CLI's credential store. It unlocks from `CONTEXTNEST_VAULT_KEY`, the
+  interim file store, or `CONTEXTNEST_VAULT_PASSPHRASE` in its environment.
+  Moving the credential store into the engine so the MCP server finds
+  keychain-held keys is a follow-up.
 
 Stop long-running MCP servers and agents before `vault encrypt` / `decrypt`.
 A running engine does re-check `.context/encryption.yaml` every second, but a
@@ -157,4 +164,6 @@ push a vault whose content must never leave the machine. Requiring an explicit
   per-document seam (`sealText(docId, …)`), so this needs no format change.
 - Push: an explicit `--decrypt-for-push` opt-in, and optionally end-to-end
   encrypted hosted nests.
-- Wire the OS-keychain credential store in as the default key store.
+- Move the credential store into the engine so the MCP server reads
+  keychain-held vault keys too, and give it a `delete` so `vault decrypt` can
+  remove the key from the keychain.

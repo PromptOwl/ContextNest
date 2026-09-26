@@ -64,6 +64,7 @@ import {
   SELECTOR_GRAMMAR,
   encryptVault,
   decryptVault,
+  setDefaultVaultKeyStore,
   type EncryptVaultResult,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
@@ -109,6 +110,7 @@ import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
+import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
@@ -140,6 +142,10 @@ import {
 function collectClientPair(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
+
+// Encrypted-vault KEKs live in the same secure credential store as the login
+// (OS keychain / encrypted file), with the engine's interim file as fallback.
+setDefaultVaultKeyStore(new CliVaultKeyStore());
 
 const program = new Command();
 
@@ -1088,7 +1094,7 @@ function printEncryptionEnabled(result: EncryptVaultResult): void {
   if (result.keyStore.startsWith("interim-file")) {
     console.log(
       chalk.yellow(
-        "\n  Note: the key is in a 0600 file under ~/.contextnest/keys until OS-keychain support lands.\n" +
+        "\n  Note: no OS keychain (or CONTEXTNEST_CREDENTIALS_KEY) is available, so the key is in a 0600 file under ~/.contextnest/keys.\n" +
           "  That protects a vault folder that leaves this machine (sync, copy, backup) — not a stolen disk.",
       ),
     );
