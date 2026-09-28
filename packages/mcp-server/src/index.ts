@@ -1251,8 +1251,8 @@ tool(
       const id = normalizeDocumentId(path);
 
       // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
-      // id, and leaves a tombstone so the deletion cannot be silently undone
-      // (§6.3.4) — a legacy name must not be a way around that.
+      // id, and appends an audit-only record (§6.3.4). Additive: the path
+      // stays reusable, so legacy callers see the same behaviour as before.
       const result = await deleteDocumentWithTombstone(storage, id, {
         reasonCode: "user_request",
         deletedBy: "mcp@contextnest.local",

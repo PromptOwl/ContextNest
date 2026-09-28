@@ -534,7 +534,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
 | `ctx update <path>` | Update a document's title, tags, or body (auto-publishes) |
-| `ctx delete <path>` | Delete a document and its version history, leaving a tombstone that refuses its resurrection (`--reason`, `--requested-by`; `--purge` for no tombstone) |
+| `ctx delete <path>` | Delete a document and its version history, recorded in `ctx forget-log` (`--reason`, `--requested-by`; `--purge` for no record) |
 | `ctx forget <path> --reason <code>` | Forget a document (right to be forgotten, spec §6.3): erase every version's content, keep the hashes so `ctx verify` still passes; leaves an empty `status: forgotten` stub. `--reason` is `user_request`, `legal`, `retention_expiry` or `error` |
 | `ctx read <path>` | Read and display a document in the terminal |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
@@ -577,7 +577,7 @@ ctx query "#api + status:published"       # Intersection
 | `ctx history <path> --diff` | Include each version's unified diff from the one before |
 | `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
 | `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped). Forgotten versions verify hash-only; erased content found back on disk is reported |
-| `ctx forget-log [path]` | The forget audit trail — who forgot or tombstone-deleted what, when, and under which reason code (never the content) |
+| `ctx forget-log [path]` | The forget audit trail — who forgot or deleted what, when, and under which reason code (never the content) |
 
 Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
 errors, plain `Error: message` for the rest. Set `CONTEXTNEST_DEBUG=1` to get the
@@ -731,7 +731,7 @@ cloud:
 | `context_create` | Create a node — own `id`, `publish: false`, initial `status`, `note`, full `skill` block |
 | `context_update` | Update a node — rename, set `status`, stamp a `version`, clear metadata with `null` |
 | `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
-| `context_delete` | Delete a node and its history, leaving a tombstone (`purge: true` for none); returns the deleted node's `title` |
+| `context_delete` | Delete a node and its history, recorded in the forget audit log (`purge: true` for none); returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
 | `context_import_pdf` | Import a PDF as a `type: pdf` node — extracted text as the body, the PDF kept beside it and bound by SHA-256; pass `id` to version an existing one |
 

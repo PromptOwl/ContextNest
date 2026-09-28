@@ -20,9 +20,9 @@
  * (tombstones.ts) can refuse a pre-forget copy wherever it turns up. The
  * reason is a closed code; free text never enters the record.
  *
- * `ctx delete` goes through the same record (`deleteDocumentWithTombstone`):
- * the node is removed outright, but a tombstone stays behind so the deletion
- * cannot be silently undone.
+ * `ctx delete` goes through the same log (`deleteDocumentWithTombstone`): the
+ * node is removed outright and an audit-only record says who deleted it, when
+ * and why. It refuses nothing — the path and content stay reusable.
  *
  * Not implemented here (spec §6.3.2 range forget, §6.3.4 lineage flags,
  * §6.3.5 retention keys): see CONTEXT_NEST_SPEC.md §6.3 "Not yet implemented".
@@ -312,12 +312,7 @@ export interface DeleteOptions {
   /** Actor performing the delete; recorded on the event. */
   deletedBy: string;
   requestedBy?: string;
-  /**
-   * Remove the node and leave NO tombstone record: its path and content may
-   * be published again, and nothing refuses a pre-delete copy. The explicit
-   * escape hatch (`ctx delete --purge`) for re-creating a node under the same
-   * name — not for erasure.
-   */
+  /** Remove the node and leave NO audit record (`ctx delete --purge`). */
   purge?: boolean;
 }
 
@@ -331,10 +326,9 @@ export interface DeleteResult {
 
 /**
  * Delete a node — file, history, pdf sidecar — and, unless `purge` is set,
- * leave a tombstone record so the deletion cannot be silently undone (§6.3.4):
- * a later publish at that path, or an import of a pre-delete copy under any
- * path, is refused exactly as for a forgotten node. The record carries the
- * deleted versions' hashes only; their content goes with the files.
+ * leave an audit-only record (§6.3.4): who, when, why, and the deleted
+ * versions' content hashes. It refuses nothing, so the path can be re-created
+ * and a renamed copy keeps verifying.
  *
  * Unlike `forgetDocument` this removes the node's history, so the chain
  * evidence of its versions survives only in the record and in the checkpoints
@@ -358,9 +352,9 @@ export async function deleteDocumentWithTombstone(
 
   const history = await storage.readHistory(docId).catch(() => null);
   const entries = (history?.versions ?? []).filter((e) => !e.tombstone);
-  const { bodyHashes, pdfHashes } = await collectErasedHashes(storage, node, entries);
 
-  await storage.deleteDocument(docId);
+  // Record first, delete second: a crash in between leaves a record for a
+  // node still present — never a deletion nothing accounts for.
   const event = await record(storage, {
     docId,
     mode: "delete",
@@ -371,9 +365,11 @@ export async function deleteDocumentWithTombstone(
     requestedBy: options.requestedBy,
     ...(entries.length > 0 ? { resultingHash: entries[entries.length - 1].chain_hash } : {}),
     contentHashes: entries.map((e) => e.content_hash),
-    bodyHashes,
-    pdfHashes,
+    // Audit-only: no body/pdf hashes, so nothing vault-wide is refused.
+    bodyHashes: [],
+    pdfHashes: [],
   });
+  await storage.deleteDocument(docId);
   return { id: docId, title, tombstoned: true, event };
 }
 
@@ -396,7 +392,7 @@ export async function forgetLog(
 
 /**
  * Refuse a write that would put forgotten content back (§6.3.4): a forgotten
- * stub, a path a forget or tombstoned delete retired (even after the stub was
+ * stub, a path a forget retired (even after the stub was
  * deleted and the file re-created), or a body whose checksum matches erased
  * content anywhere in the vault. A forgotten path is never un-forgotten;
  * content genuinely meant to exist again is published under a new path — a
@@ -426,8 +422,8 @@ export async function assertNotForgotten(
 
 /**
  * Honor forgets that arrived with an import (§6.3.4 "exports carry
- * tombstones"): record each incoming forget event this vault has not seen, and
- * re-apply it to any local copy the vault already holds — a pre-forget copy
+ * tombstones"): record each incoming event this vault has not seen, and
+ * re-apply a forget (never a delete) to any local copy the vault already holds — a pre-forget copy
  * here MUST NOT outlive a forget made elsewhere. Returns the ids brought in line.
  */
 export async function applyImportedTombstones(
@@ -451,6 +447,8 @@ export async function applyImportedTombstones(
       known.add(rec.event_id);
     }
     addTombstone(index, rec);
+    // A delete record is audit-only: an import never deletes a local doc.
+    if (rec.mode === "delete") continue;
 
     let node: ContextNode;
     try {
@@ -460,10 +458,7 @@ export async function applyImportedTombstones(
     }
     const history = await storage.readHistory(rec.document_id).catch(() => null);
     try {
-      if (rec.mode === "delete") {
-        // Deleted where the export came from: delete the local copy too.
-        await storage.deleteDocument(rec.document_id);
-      } else if (isForgotten(node)) {
+      if (isForgotten(node)) {
         // The stub is here already; make sure nothing erased lingers.
         for (const e of history?.versions ?? []) {
           if (e.tombstone) await storage.removeVersionArtifacts(rec.document_id, e.version);

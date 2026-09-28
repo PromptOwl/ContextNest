@@ -591,22 +591,22 @@ const deleteOp: OperationDescriptor = {
   name: "context_delete",
   namespace: "core",
   description:
-    "Delete a node and its version history from the vault. Leaves a tombstone record (hashes only) so the deletion cannot be silently undone: a later publish at that path, or an import of a pre-delete copy, is refused. Pass `purge: true` to delete without a tombstone (the path may then be reused). To erase content while keeping the audit trail verifiable, use context_forget instead.",
+    "Delete a node and its version history from the vault. Records who deleted it, when and why in the forget audit log (hashes only, never content); the path stays reusable. Pass `purge: true` to delete without that record. To erase content while keeping the audit trail verifiable, use context_forget instead.",
   input: z.object({
     ...nodeSelectorShape,
     reason_code: z
       .enum(FORGET_REASON_CODES)
       .optional()
-      .describe("Reason recorded on the tombstone (default user_request). A closed code, never free text."),
+      .describe("Reason recorded in the audit log (default user_request). A closed code, never free text."),
     requested_by: z
       .string()
       .optional()
-      .describe("Who asked for the deletion (an identity, recorded on the tombstone)."),
+      .describe("Who asked for the deletion (an identity, recorded in the audit log)."),
     purge: z
       .boolean()
       .optional()
       .describe(
-        "Delete WITHOUT a tombstone record (default false): nothing will refuse a republish of this path or a re-import of its old content. For re-creating a node under the same name — not for erasure.",
+        "Delete WITHOUT an audit record (default false).",
       ),
     ...clientField,
   }),
@@ -617,7 +617,7 @@ const deleteOp: OperationDescriptor = {
     tombstoned: z
       .boolean()
       .optional()
-      .describe("True when a tombstone record now refuses the node's resurrection; false for a purge"),
+      .describe("True when the deletion was recorded in the audit log; false for a purge"),
   }),
   errors: [
     "VALIDATION_FAILED",
@@ -825,7 +825,7 @@ const forgetLogOp: OperationDescriptor = {
   name: "context_forget_log",
   namespace: "core",
   description:
-    "The forget audit trail (spec §6.3): every recorded forget and tombstoned delete — who, when, which reason code, which versions — optionally for one node. Never carries forgotten content.",
+    "The forget audit trail (spec §6.3): every recorded forget and delete — who, when, which reason code, which versions — optionally for one node. Never carries forgotten content.",
   input: z.object({
     id: z.string().optional().describe("Only events for this node id"),
     ...clientField,

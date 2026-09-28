@@ -1,6 +1,6 @@
 /**
  * The forget protocol (spec §6.3): node forget, the audit trail,
- * anti-resurrection, and tombstoned delete.
+ * anti-resurrection, and audit-only delete.
  *
  * The property under test throughout is the OMP procurement sentence:
  * "`forget` leaves `verify` passing" — while the forgotten content is gone from
@@ -405,7 +405,7 @@ describe("forget protocol — anti-resurrection (§6.3.4)", () => {
   });
 });
 
-describe("forget protocol — delete leaves a tombstone", () => {
+describe("forget protocol — delete leaves an audit-only record", () => {
   let ctx: OperationContext;
   let dir: string;
   let storage: NestStorage;
@@ -417,13 +417,9 @@ describe("forget protocol — delete leaves a tombstone", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("context_delete removes the node and records a tombstone that refuses resurrection", async () => {
-    const { id } = await api.run<{ id: string }>(
-      "context_create",
-      { title: "Doomed", content: "The launch date is KIWI-DAY, keep it quiet." },
-      ctx,
-    );
-    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+  it("context_delete removes the node, logs it, and refuses nothing", async () => {
+    const content = "The launch date is KIWI-DAY, keep it quiet.";
+    const { id } = await api.run<{ id: string }>("context_create", { title: "Doomed", content }, ctx);
     const out = await api.run<{ deleted: boolean; tombstoned: boolean }>("context_delete", { id }, ctx);
     expect(out).toMatchObject({ deleted: true, tombstoned: true });
     expect(existsSync(join(dir, `${id}.md`))).toBe(false);
@@ -431,23 +427,38 @@ describe("forget protocol — delete leaves a tombstone", () => {
     await expect(api.run("context_get", { id }, ctx)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
 
     const [event] = await forgetLog(storage, id);
-    expect(event).toMatchObject({ scope: "node", mode: "delete", reason_code: "user_request" });
+    expect(event).toMatchObject({ scope: "node", mode: "delete", reason_code: "user_request", body_hashes: [] });
     expect(await readFile(join(dir, ".versions", "chain_events.yaml"), "utf-8")).not.toContain("KIWI-DAY");
 
-    // Re-creating the path and publishing is refused…
-    await writeFile(join(dir, `${id}.md`), raw);
-    await expect(publishDocument(storage, id, { editedBy: "x" })).rejects.toMatchObject({
-      code: "FORGOTTEN_DOCUMENT",
-    });
-    await rm(join(dir, `${id}.md`));
-    // …and so is importing the old content under another name.
-    const res = await api.run<{ failed: unknown[] }>(
-      "context_import",
-      { files: [{ path: "nodes/sneaky.md", content: raw }] },
-      ctx,
-    );
-    expect(res.failed).toHaveLength(1);
+    // The path can be re-created and published again.
+    const again = await api.run<{ id: string }>("context_create", { title: "Doomed", content }, ctx);
+    expect(again.id).toBe(id);
     expect((await storage.verifyVaultIntegrity()).valid).toBe(true);
+  });
+
+  it("a rename done as create-new then delete-old keeps the new node verifying", async () => {
+    const content = "Shared body that survives the rename intact.";
+    const { id: oldId } = await api.run<{ id: string }>("context_create", { title: "Old Name", content }, ctx);
+    const { id: newId } = await api.run<{ id: string }>("context_create", { title: "New Name", content }, ctx);
+    await api.run("context_delete", { id: oldId }, ctx);
+    expect((await storage.verifyVaultIntegrity()).valid).toBe(true);
+    await expect(publishDocument(storage, newId, { editedBy: "x" })).resolves.toBeDefined();
+  });
+
+  it("an imported delete record never deletes a local document", async () => {
+    const other = await makeContext();
+    try {
+      const { id } = await api.run<{ id: string }>("context_create", { title: "Readme", content: "remote readme body text" }, other.ctx);
+      await api.run("context_delete", { id }, other.ctx);
+      const log = await readFile(join(other.dir, ".versions", "chain_events.yaml"), "utf-8");
+
+      await api.run("context_create", { title: "Readme", content: "a completely unrelated local body" }, ctx);
+      await api.run("context_import", { files: [{ path: ".versions/chain_events.yaml", content: log }] }, ctx);
+      expect((await storage.readDocument(id)).body).toContain("unrelated local body");
+      expect(await forgetLog(storage, id)).toHaveLength(1);
+    } finally {
+      await rm(other.dir, { recursive: true, force: true });
+    }
   });
 
   it("purge deletes without a tombstone, so the path can be reused", async () => {

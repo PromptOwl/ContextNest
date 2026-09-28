@@ -42,14 +42,16 @@ tombstones. `ctx verify` reports `forgotten_content_present` (erased content
 back on disk) and `unrecorded_tombstone` (a tombstone or `forgotten` status no
 recorded forget accounts for).
 
-**`ctx delete` now leaves a tombstone.** `context_delete` (and the legacy
-`delete_document` tool) still removes the file and its history, but it also
-records a `document.forgotten` event with `mode: delete`, so republishing the
-path or re-importing the deleted content is refused the same way. The new
-`reason_code` / `requested_by` inputs (`--reason`, `--requested-by`) go on the
-record. `purge: true` (`ctx delete --purge`) is the escape hatch: it deletes
-with no tombstone, so the path and its old content can come back. Use it when
-re-creating a node under the same name.
+**`ctx delete` is now logged.** `context_delete` (and the legacy
+`delete_document` tool) removes the file and its history exactly as before,
+and also appends an audit-only `document.forgotten` event with `mode: delete`
+(who, when, reason code, the deleted versions' content hashes), visible in
+`ctx forget-log`. It refuses nothing: the path can be re-created and a
+renamed copy of the content keeps verifying, and an import never deletes local
+documents because of it. The new `reason_code` / `requested_by` inputs
+(`--reason`, `--requested-by`) go on the record; `purge: true`
+(`ctx delete --purge`) deletes without one. To erase content and refuse its
+return, use `ctx forget`.
 
 Not in this release: version-range forget (§6.3.2 re-keyframing), lineage
 `review_required` flags (§6.3.4) and the `expires_at` / `retain_until` lifespan

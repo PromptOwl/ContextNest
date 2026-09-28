@@ -763,7 +763,7 @@ export class NestStorage {
     for (const doc of docs ?? (await this.discoverDocuments({ includeRetired: true }))) {
       if (doc.frontmatter.status !== "forgotten") {
         if (index.records.length === 0) continue;
-        // A live document back at a path a forget or tombstoned delete retired,
+        // A live document back at a path a forget retired,
         // or carrying an erased revision's body anywhere: restored content.
         const bodyHash = forgettableBodyHash(doc.rawContent);
         if (isPathForgotten(index, doc.id) || (bodyHash && index.bodyHashes.has(bodyHash))) {

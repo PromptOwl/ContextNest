@@ -2517,29 +2517,32 @@ program
 program
   .command("delete <path>")
   .description(
-    "Delete a document and its version history, leaving a tombstone that refuses its resurrection (--purge: no tombstone)",
+    "Delete a document and its version history, recording who deleted it and why in `ctx forget-log` (--purge: no record)",
   )
   .option(
     "--reason <code>",
-    `Reason recorded on the tombstone: ${FORGET_REASON_CODES.join(" | ")}`,
+    `Reason recorded in the audit log: ${FORGET_REASON_CODES.join(" | ")}`,
     parseForgetReason,
     "user_request",
   )
-  .option("--requested-by <who>", "Who asked for the deletion (recorded on the tombstone)")
+  .option("--requested-by <who>", "Who asked for the deletion (recorded in the audit log)")
   .option(
     "--purge",
-    "Delete WITHOUT a tombstone: the path and its old content may be published or imported again",
+    "Delete WITHOUT an audit record",
   )
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
+      if (opts.purge || opts.requestedBy || opts.reason !== "user_request") {
+        console.log(chalk.yellow("  --reason/--requested-by/--purge apply to local vaults only; the remote nest records its own delete."));
+      }
       await remoteDelete(remote, path);
       return;
     }
     const storage = getStorage();
     await confirmOrExit(
       `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
-        (opts.purge ? " --purge leaves no tombstone: nothing will stop the old content coming back." : ""),
+        (opts.purge ? " --purge leaves no audit record." : ""),
       { destructive: true },
     );
     const result = await cliApi().run<{ id: string; title: string; tombstoned?: boolean }>(
@@ -2555,7 +2558,7 @@ program
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
     if (result.tombstoned) {
       console.log(
-        chalk.dim("  Tombstone recorded — republishing this path or re-importing its old content is refused. See `ctx forget-log`."),
+        chalk.dim("  Recorded in `ctx forget-log`. To erase content from history instead, use `ctx forget`."),
       );
     }
   });
@@ -2596,6 +2599,9 @@ Example:
 `,
   )
   .action(async (path, opts) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError(`ctx forget works against a local vault only for now.`, "NOT_IMPLEMENTED");
+    }
     const storage = getStorage();
     const id = normalizeDocumentId(path);
     await confirmOrExit(
@@ -2630,9 +2636,12 @@ Example:
 
 program
   .command("forget-log [path]")
-  .description("Show the forget audit trail — who forgot or tombstone-deleted what, when, and why (never the content)")
+  .description("Show the forget audit trail — who forgot or deleted what, when, and why (never the content)")
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError(`ctx forget-log works against a local vault only for now.`, "NOT_IMPLEMENTED");
+    }
     const storage = getStorage();
     const { events } = await cliApi().run<{
       events: Array<{
@@ -2661,7 +2670,7 @@ program
     }
     console.log(chalk.bold(`${events.length} forget event(s):\n`));
     for (const e of events) {
-      const what = e.mode === "delete" ? "deleted (tombstoned)" : "forgotten";
+      const what = e.mode === "delete" ? "deleted" : "forgotten";
       console.log(`  ${chalk.cyan(e.document_id)} — ${what}`);
       console.log(`    By: ${e.forgotten_by} at ${e.forgotten_at}  Reason: ${e.reason_code}`);
       if (e.requested_by) console.log(`    Requested by: ${e.requested_by}`);

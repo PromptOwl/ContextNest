@@ -6,7 +6,7 @@
  * `document.forgotten` event in `.versions/chain_events.yaml` carrying WHICH
  * content was erased — as hashes only: the chained `content_hash` of every
  * erased version, the body checksum of every erased revision, and the sha256
- * of every erased PDF binary. A tombstoned `ctx delete` records the same.
+ * of every erased PDF binary. `ctx delete` records an audit-only event.
  *
  * The vault-level record is what anti-resurrection runs on. It survives
  * `ctx delete` of the stub, travels with the vault when it is copied or
@@ -42,8 +42,8 @@ export interface TombstoneRecord {
   scope: "node" | "versions";
   /**
    * `forget` (the default): content erased, hashes kept in the node's
-   * history. `delete`: the node was removed outright (`ctx delete`), and this
-   * record is all that is left — enough to refuse its resurrection.
+   * history. `delete`: the node was removed outright (`ctx delete`); an
+   * audit-only record (who / when / why) that refuses nothing.
    */
   mode: "forget" | "delete";
   /** Every version number erased by this forget. */
@@ -145,6 +145,9 @@ export function addTombstone(index: TombstoneIndex, rec: TombstoneRecord): void 
   const list = index.byDocument.get(rec.document_id) ?? [];
   list.push(rec);
   index.byDocument.set(rec.document_id, list);
+  // A delete record is audit-only: it neither retires the path nor refuses
+  // its content, so a renamed or re-created node is never blocked by it.
+  if (rec.mode === "delete") return;
   for (const h of rec.content_hashes) index.contentHashes.add(h);
   for (const h of rec.body_hashes) index.bodyHashes.add(h);
   for (const h of rec.pdf_hashes) index.pdfHashes.add(h);
@@ -152,7 +155,7 @@ export function addTombstone(index: TombstoneIndex, rec: TombstoneRecord): void 
 
 /** True when a node-level forget retired this path. */
 export function isPathForgotten(index: TombstoneIndex, docId: string): boolean {
-  return (index.byDocument.get(docId) ?? []).some((r) => r.scope === "node");
+  return (index.byDocument.get(docId) ?? []).some((r) => r.scope === "node" && r.mode === "forget");
 }
 
 /**

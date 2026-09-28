@@ -125,7 +125,7 @@ them over the legacy tools below.
 | `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |
 | `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
 | `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |
-| `context_delete` | Delete a node and its version history, leaving a tombstone so the deletion cannot be silently undone (`purge: true` for none); returns the deleted node's `title` |
+| `context_delete` | Delete a node and its version history, recorded in the forget audit log (`purge: true` for none); returns the deleted node's `title` |
 | `context_import_pdf` | Import a PDF (`bytes_base64`) as a `type: pdf` node: extracted text as the body (`<!-- page N -->` markers; empty + `text_layer: false` for a scan), the PDF stored beside it and bound by SHA-256. Pass `id` of an existing pdf node for a new version — the old binary is kept in history |
 | `context_import` | Bulk create-and-publish. Takes `documents` (title + content) and/or `ids` (files already in the vault, published as-is) — a mixed batch seals **one** checkpoint and regenerates the index **once** |
 

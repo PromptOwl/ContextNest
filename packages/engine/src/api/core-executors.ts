@@ -491,7 +491,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
   const createdStatus = node.frontmatter.status;
   assertValid(node);
   // Refused BEFORE the write, for the same stranded-file reason as rejected:
-  // a path a forget (or tombstoned delete) retired, or a body matching erased
+  // a path a forget retired, or a body matching erased
   // content, never takes content again (§6.3.4).
   await assertNotForgotten(ctx.storage, node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
@@ -670,8 +670,8 @@ const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // Reads the title BEFORE removing the file (callers report what they
   // deleted) and throws DOCUMENT_NOT_FOUND when the id doesn't exist. Unless
-  // `purge` is set, leaves a tombstone record so the deletion cannot be
-  // silently undone by a republish or a re-import (§6.3.4).
+  // `purge` is set, leaves an audit-only record of who deleted it and why
+  // (§6.3.4) — it refuses nothing; use forget to erase.
   const result = await deleteDocumentWithTombstone(ctx.storage, id, {
     reasonCode: input.reason_code ?? "user_request",
     deletedBy: ctx.actor ?? "engine",
@@ -1068,7 +1068,6 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
           error: `unreadable chain-event log: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
-      written++;
       return false;
     });
     for (const rec of buildTombstoneIndex(incomingEvents).records) addTombstone(tombstones, rec);
@@ -1191,7 +1190,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // An empty call is a caller bug, not an empty result — but a batch where every
   // document failed to stage is a legitimate (fully-failed) result, and a
   // `discover` over a folder with nothing new in it is simply done.
-  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0) {
+  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0 && incomingEvents.length === 0) {
     throw new ContextNestError(
       "context_import requires documents[], ids[], files[] or discover",
       "VALIDATION_FAILED",

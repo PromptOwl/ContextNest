@@ -836,12 +836,11 @@ describe("[regression] ctx forget", () => {
     expect(runCtxResult(tmp, ["update", "nodes/jane", "--body", "again"]).status).not.toBe(0);
   });
 
-  it("delete leaves a tombstone that refuses republishing the path; --purge does not", () => {
+  it("delete is logged but the path stays reusable; --purge logs nothing", () => {
     runCtx(tmp, ["delete", "nodes/jane", "--yes"]);
     expect(existsSync(join(tmp, "nodes", "jane.md"))).toBe(false);
     expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events[0]).toMatchObject({ mode: "delete" });
-    const again = runCtxResult(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "a brand new body"]);
-    expect(again.status).not.toBe(0);
+    runCtx(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "a brand new body"]);
 
     runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
     runCtx(tmp, ["delete", "nodes/scratch", "--purge", "--yes"]);

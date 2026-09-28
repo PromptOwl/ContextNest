@@ -1345,7 +1345,7 @@ A **forget** erases a document's content while leaving its hash chain verifiable
 
 An importing implementation MUST honor tombstones carried by the incoming nest. It merges the incoming forget events into its own log, never overwriting that log, and re-applies them to any pre-forget copy it already holds.
 
-**Delete.** Deleting a document SHOULD leave the same record, with `mode: delete`, so that a deletion cannot be undone silently. Unlike a forget, a delete also removes the history. An implementation MAY offer an explicit purge that records nothing. The reference implementation provides it as `ctx delete --purge`.
+**Delete.** Deleting a document SHOULD append an audit record of the same shape with `mode: delete` (actor, time, reason code, the deleted entries' `content_hashes`). A delete record is audit-only: it MUST NOT retire the path, refuse any content or cause an importing implementation to delete a local document. Anti-resurrection applies to forgets only. Unlike a forget, a delete also removes the history. An implementation MAY offer an explicit purge that records nothing. The reference implementation provides it as `ctx delete --purge`.
 
 **Verification** of a tombstoned entry is hash-only: the chain check runs, the content check is skipped, and the entry is reported as tombstoned rather than as `content_hash_mismatch`. See §8.4 for the forget-specific checks.
 
@@ -2012,7 +2012,7 @@ The following components remain proprietary:
 
 ### 1.2 — draft
 
-- **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and a tombstone record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
+- **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and an audit-only record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
 
 ### 1.1 — 2026-09
 

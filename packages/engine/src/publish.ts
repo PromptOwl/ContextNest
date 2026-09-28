@@ -55,7 +55,7 @@ export async function publishDocument(
     throw new RejectedDocumentError(docId);
   }
   // Same guard for the forget protocol (§6.3.4): a forgotten stub, a path a
-  // forget or tombstoned delete retired, or content matching erased content.
+  // forget retired, or content matching erased content.
   await assertNotForgotten(storage, node);
   // A pdf node seals pdf.sha256 into the chain; the bytes must be there.
   await assertPdfSidecarIntact(storage, docId, node);
