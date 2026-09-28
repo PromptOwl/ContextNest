@@ -207,7 +207,7 @@ function startGatedEngine(pollSequence: Array<Record<string, unknown>>): Promise
             JSON.stringify({
               status: "pending_confirmation",
               pending_id: "pid1",
-              confirm_url: "https://ui.example/confirm/pid1",
+              confirm_url: `/nests/${nest}/pending-pushes/pid1/confirm`,
               poll_url: `/nests/${nest}/pending-pushes/pid1`,
               message: "This nest requires confirmation before the push is applied.",
               expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
@@ -1279,7 +1279,7 @@ describe("[regression] ctx push", () => {
         "--yes",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).toMatch(/Pushed 1 document/);
       expect(server.pollCount()).toBeGreaterThanOrEqual(1);
     } finally {
@@ -1317,7 +1317,7 @@ describe("[regression] ctx push", () => {
         "--no-wait",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).not.toMatch(/Pushed/);
       expect(server.pollCount()).toBe(0);
     } finally {

@@ -3043,7 +3043,9 @@ program
       const pending = asPendingConfirmation(res.status, payload);
       if (pending) {
         console.log(chalk.yellow(pending.message || "This nest requires confirmation before the push is applied."));
-        console.log(chalk.cyan(`Confirm in the UI: ${pending.confirm_url}`));
+        // confirm_url is the reviewer's API endpoint, not a page; send the
+        // person to the nest view, which shows the held write to confirm.
+        console.log(chalk.cyan(`Confirm in the UI: ${serverUrl}/nest/${encodeURIComponent(opts.nest)}`));
 
         // --no-wait → commander sets opts.wait = false.
         if (opts.wait === false) {
