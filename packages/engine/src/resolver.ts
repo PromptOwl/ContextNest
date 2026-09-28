@@ -155,13 +155,12 @@ export class Resolver {
     if (!checkpoint) return [];
 
     const version = checkpoint.document_versions[uri.path];
-    if (version === undefined) return [];
-
     const doc = this.documents.get(uri.path);
-    // A node forgotten since checkpoint N: the checkpoint still names its
-    // version, but that version's content is gone. Pinned or floating, a
-    // forgotten node resolves to `forgotten` (§6.3.3, §6.3.4 checkpoints).
+    // Pinned or floating, a forgotten node resolves to `forgotten` (§6.3.3) —
+    // whether checkpoint N still names its erased version or, from the
+    // forget's own checkpoint on, no longer names it at all.
     if (doc && isForgotten(doc)) return [forgottenView(doc, version)];
+    if (version === undefined) return [];
 
     if (!this.reconstructVersion) return [];
 

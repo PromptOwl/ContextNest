@@ -83,7 +83,7 @@ export interface ForgetResult {
   versions: number[];
   /** The version the empty stub was sealed as. */
   stubVersion: number;
-  /** The checkpoint the forget cut. */
+  /** The checkpoint the forget cut (0 on a replay — the import cuts one for the batch). */
   checkpoint: number;
   /** The recorded event, or null on a replay. */
   event: HashChainEvent | null;
@@ -232,7 +232,10 @@ async function forgetNode(
 
   // A forget is a content-publishing operation (§6.3.4): it cuts a checkpoint.
   // The forgotten node is no longer published, so it drops out of the map.
-  const checkpoint = await new CheckpointManager(storage).createCheckpointFromVault(docId);
+  // A replay skips it: `applyImportedTombstones` cuts one for the whole batch.
+  const checkpoint = options.replay
+    ? null
+    : await new CheckpointManager(storage).createCheckpointFromVault(docId);
 
   const event = options.replay
     ? null
@@ -246,7 +249,7 @@ async function forgetNode(
         requestedBy: options.requestedBy,
         resultingHash: sealed.chain_hash,
         stubVersion: sealed.version,
-        checkpoint: checkpoint.checkpoint,
+        checkpoint: checkpoint?.checkpoint,
         contentHashes: erased.map((e) => e.content_hash),
         bodyHashes,
         pdfHashes,
@@ -256,7 +259,7 @@ async function forgetNode(
     id: docId,
     versions: erased.map((e) => e.version),
     stubVersion: sealed.version,
-    checkpoint: checkpoint.checkpoint,
+    checkpoint: checkpoint?.checkpoint ?? 0,
     event,
   };
 }
@@ -479,6 +482,10 @@ export async function applyImportedTombstones(
         "§6.3.4",
       );
     }
+  }
+  // One checkpoint for every forget this import re-applied, not one each.
+  if (applied.length > 0) {
+    await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","));
   }
   return applied;
 }

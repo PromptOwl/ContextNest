@@ -844,6 +844,7 @@ describe("[regression] ctx forget", () => {
 
     runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
     runCtx(tmp, ["delete", "nodes/scratch", "--purge", "--yes"]);
+    expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events).toHaveLength(1);
     runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
     expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
   });

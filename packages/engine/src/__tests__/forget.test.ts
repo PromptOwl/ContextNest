@@ -25,6 +25,7 @@ import { filterDocuments } from "../filters.js";
 import { normalizeStatus } from "../parser.js";
 import { forgetDocument, forgetLog } from "../forget.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { textPdf, textPdfV2, toBase64 } from "./fixtures/pdf-fixtures.js";
 
 const api = createEngineApi();
 
@@ -171,8 +172,13 @@ describe("forget protocol — node forget (§6.3.3)", () => {
     const cp2 = (await storage.readCheckpointHistory())!.checkpoints[1];
     expect(cp2.document_versions[id]).toBe(2);
 
-    await forgetDocument(storage, id, { reasonCode: "user_request", forgottenBy: "s@example.com" });
+    const { checkpoint } = await forgetDocument(storage, id, { reasonCode: "user_request", forgottenBy: "s@example.com" });
     const resolver = await resolverFor(storage);
+
+    // The forget's own checkpoint no longer names the node — still the stub, not nothing.
+    const atForget = await resolver.resolve(parseUri(`contextnest://${id}@${checkpoint}`));
+    expect(atForget).toHaveLength(1);
+    expect(atForget[0].frontmatter.status).toBe("forgotten");
 
     const floating = await resolver.resolve(parseUri(`contextnest://${id}`));
     expect(floating).toHaveLength(1);
@@ -387,6 +393,65 @@ describe("forget protocol — anti-resurrection (§6.3.4)", () => {
     } finally {
       await rm(other.dir, { recursive: true, force: true });
     }
+  });
+
+  it("replaying imported forgets cuts one checkpoint for the batch", async () => {
+    const other = await makeContext();
+    try {
+      // The receiving vault holds pre-forget copies of TWO nodes…
+      for (const [p, content] of preForget) await other.storage.writeVaultFile(p, content);
+      const second = await api.run<{ id: string }>("context_create", { title: "Second", content: "second doomed body text" }, other.ctx);
+      // …the source vault forgets both (it gets the same second node first).
+      for (const [p, content] of await allFiles(other.dir)) {
+        if (p.startsWith("nodes/second") || p.startsWith("nodes/.versions/second/")) await storage.writeVaultFile(p, content);
+      }
+      await forgetDocument(storage, second.id, { reasonCode: "legal", forgottenBy: "dpo@example.com" });
+      const before = (await other.storage.readCheckpointHistory())!.checkpoints.length;
+
+      // Only the log travels: both forgets are re-applied locally.
+      const log = await readFile(join(dir, ".versions", "chain_events.yaml"), "utf-8");
+      await api.run("context_import", { files: [{ path: ".versions/chain_events.yaml", content: log }] }, other.ctx);
+
+      expect((await other.storage.readDocument(id)).frontmatter.status).toBe("forgotten");
+      expect((await other.storage.readDocument(second.id)).frontmatter.status).toBe("forgotten");
+      expect(await filesContaining(other.dir, "MANGO-CORP")).toEqual([]);
+      expect((await other.storage.readCheckpointHistory())!.checkpoints.length).toBe(before + 1);
+      expect((await other.storage.verifyVaultIntegrity()).errors).toEqual([]);
+    } finally {
+      await rm(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("documents[] import refuses a retired path or erased body, even as a staged draft", async () => {
+    await api.run("context_delete", { id }, ctx); // the stub goes; the path stays retired
+    const body = preForget.get(`${id}.md`)!.split("---").slice(2).join("---").trim();
+    const res = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      {
+        documents: [
+          { title: "Secret Plan", content: "brand new text at the retired path" },
+          { title: "Innocent Name", content: body },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed).toHaveLength(2);
+    expect(existsSync(join(dir, `${id}.md`))).toBe(false);
+    expect(await filesContaining(dir, "MANGO-CORP")).toEqual([]);
+  });
+
+  it("context_import_pdf refuses a retired path and an erased binary", async () => {
+    const bytes_base64 = toBase64(textPdf());
+    const { id: pdfId } = await api.run<{ id: string }>("context_import_pdf", { bytes_base64, title: "Contract" }, ctx);
+    await forgetDocument(storage, pdfId, { reasonCode: "legal", forgottenBy: "dpo@example.com" });
+    await api.run("context_delete", { id: pdfId }, ctx);
+    await expect(
+      api.run("context_import_pdf", { bytes_base64: toBase64(textPdfV2()), title: "Contract" }, ctx),
+    ).rejects.toMatchObject({ code: "FORGOTTEN_DOCUMENT" });
+    await expect(
+      api.run("context_import_pdf", { bytes_base64, title: "Fresh Name" }, ctx),
+    ).rejects.toMatchObject({ code: "FORGOTTEN_DOCUMENT" });
   });
 
   it("a copied vault carries its tombstones (export is the directory)", async () => {

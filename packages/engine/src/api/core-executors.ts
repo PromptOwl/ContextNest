@@ -38,7 +38,7 @@ import {
   applyImportedTombstones,
   assertNotForgotten,
 } from "../forget.js";
-import { addTombstone, buildTombstoneIndex, importVerdict } from "../tombstones.js";
+import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
@@ -1048,7 +1048,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // log is not landed verbatim (it would overwrite this vault's audit trail);
   // its forget records are merged in, checked against, and re-applied to any
   // pre-forget copy this vault already holds.
-  const tombstones = incoming.length > 0 ? await ctx.storage.readTombstones() : null;
+  const tombstones =
+    incoming.length > 0 || (input.documents?.length ?? 0) > 0 ? await ctx.storage.readTombstones() : null;
   const incomingEvents: unknown[] = [];
   if (tombstones) {
     incoming = incoming.filter((f) => {
@@ -1119,6 +1120,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
+      // Same guard as context_create (§6.3.4): a retired path or erased body
+      // must not land even as a draft (`publish: false` returns before Stage 3).
+      await assertNotForgotten(ctx.storage, node, tombstones!);
       await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
       batch.push(node.id);
       titleById.set(node.id, doc.title);
@@ -1426,6 +1430,16 @@ async function importPdfLocked(
     }
   }
   assertSafeDocumentId(id);
+
+  // Anti-resurrection (§6.3.4): a path a forget retired (stub since deleted)
+  // or a binary a forget erased never comes back through a PDF import.
+  const tombstones = await ctx.storage.readTombstones();
+  if (!existing && isPathForgotten(tombstones, id)) {
+    throw new ForgottenDocumentError(id, "was forgotten — its path cannot take content again; import under a new path");
+  }
+  if (tombstones.pdfHashes.has(extraction.sha256)) {
+    throw new ForgottenDocumentError(id, "carries a PDF binary a forget erased");
+  }
 
   if (existing) {
     if (existing.frontmatter.type !== "pdf") {
