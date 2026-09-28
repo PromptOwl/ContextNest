@@ -27,6 +27,7 @@ import {
   serializeDocument,
   parseDocument,
   publishDocument,
+  deleteDocumentWithTombstone,
   stageSuggestion,
   listSuggestions,
   approveSuggestion,
@@ -1338,10 +1339,13 @@ tool(
     lockedHandler(async () => {
       const id = normalizeDocumentId(path);
 
-      // Verify the document exists before deleting
-      const doc = await storage.readDocument(id);
-
-      await storage.deleteDocument(id);
+      // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
+      // id, and appends an audit-only record (§6.3.4). Additive: the path
+      // stays reusable, so legacy callers see the same behaviour as before.
+      const result = await deleteDocumentWithTombstone(storage, id, {
+        reasonCode: "user_request",
+        deletedBy: "mcp@contextnest.local",
+      });
       await regenerateIndex();
 
       return {
@@ -1349,7 +1353,7 @@ tool(
           {
             type: "text" as const,
             text: JSON.stringify(
-              { id, title: doc.frontmatter.title, message: "Document deleted successfully" },
+              { id, title: result.title, message: "Document deleted successfully" },
               null,
               2,
             ),
