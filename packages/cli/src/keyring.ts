@@ -173,7 +173,13 @@ public static class CnCred {
   static extern bool CredWriteW(ref CREDENTIAL cred, int flags);
   [DllImport("advapi32.dll")] static extern void CredFree(IntPtr cred);
   public static string Read(string target) {
-    IntPtr p; if (!CredReadW(target, 1, 0, out p)) return null;
+    IntPtr p;
+    if (!CredReadW(target, 1, 0, out p)) {
+      // Only ERROR_NOT_FOUND (1168) is "no credential"; any other failure throws (→ non-zero exit, stderr).
+      int err = Marshal.GetLastWin32Error();
+      if (err == 1168) return null;
+      throw new System.ComponentModel.Win32Exception(err);
+    }
     try {
       CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
       byte[] b = new byte[c.CredentialBlobSize];

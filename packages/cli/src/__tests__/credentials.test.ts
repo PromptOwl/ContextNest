@@ -83,6 +83,15 @@ describe("credential store", () => {
     await expect(loadCloudToken({ home, env: {}, keyring: null })).rejects.toThrow(/not set/);
   });
 
+  it("a corrupt encrypted file errors on read and is not overwritten on write", async () => {
+    mkdirSync(join(home, ".promptowl"), { recursive: true });
+    writeFileSync(enc(), '{"v":1,"entr');
+    const opts = { home, env: { CONTEXTNEST_CREDENTIALS_KEY: KEY }, keyring: null };
+    await expect(loadCloudToken(opts)).rejects.toThrow(/corrupt/);
+    await expect(new CredentialStore(opts).set(PROMPTOWL_ACCOUNT, "x")).rejects.toThrow(/corrupt/);
+    expect(readFileSync(enc(), "utf-8")).toBe('{"v":1,"entr');
+  });
+
   it("never falls back to plaintext: no keyring and no key is an error, file left in place", async () => {
     writeLegacy();
     await expect(loadCloudToken({ home, env: {}, keyring: memoryKeyring(false) })).rejects.toThrow(

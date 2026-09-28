@@ -145,12 +145,22 @@ export class CredentialStore {
     return scryptSync(pass, Buffer.from(salt, "base64"), 32, { N, r, p, maxmem: 256 * N * r });
   }
 
+  /** Null only when the file is absent. Unreadable or corrupt throws: never "nothing stored", never overwritten. */
   private readFile(): EncFile | null {
+    let raw: string;
     try {
-      return JSON.parse(fs.readFileSync(this.encryptedPath, "utf-8")) as EncFile;
-    } catch {
-      return null;
+      raw = fs.readFileSync(this.encryptedPath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new CredentialStoreError(`Could not read ${this.encryptedPath}: ${(err as Error).message}`);
     }
+    try {
+      const file = JSON.parse(raw) as EncFile;
+      if (file && typeof file.entries === "object" && file.kdf) return file;
+    } catch {
+      // fall through
+    }
+    throw new CredentialStoreError(`${this.encryptedPath} is corrupt; move it aside and store the credential again.`);
   }
 
   private decryptOrThrow(key: Buffer, account: string, e: EncEntry): string {
