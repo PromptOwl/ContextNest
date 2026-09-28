@@ -481,6 +481,8 @@ a checkpoint until it is approved.
   caller that passes `publish: true` (or `review: false`), calls `context_publish`,
   or uses `context_review approve` still publishes. The tool descriptions tell
   agents to do that only when the user says so.
+- Imports (`ctx import`, `context_import`, `context_import_pdf`) are not gated:
+  they are deliberate bulk loads and publish as before.
 
 | Command | Effect |
 |---|---|

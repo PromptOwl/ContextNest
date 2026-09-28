@@ -1169,8 +1169,10 @@ program
     // Review gate: a NEW vault holds agent/tool writes for approval. A
     // re-init keeps whatever the vault already had — including no key at all,
     // so re-initializing an older vault never silently changes its automations.
+    // A config that will not parse tells us nothing either way: fail safe to
+    // `on` rather than rewrite it without the key (which means "publish").
     const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
-    const priorReview = reinit ? await readReviewMode(storage).catch(() => undefined) : undefined;
+    const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
     const review = reinit ? priorReview : "on";
     await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));

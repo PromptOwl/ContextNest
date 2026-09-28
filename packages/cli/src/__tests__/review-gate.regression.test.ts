@@ -85,4 +85,11 @@ describe("[regression] review gate — CLI", () => {
     expect(ctx(tmp, ["config", "get", "review"]).trim()).toBe("unset");
     expect(ctx(tmp, ["add", "nodes/old", "--title", "Old"])).toMatch(/Created and published/);
   });
+
+  it("re-init over a config that will not parse fails safe to review on", () => {
+    const cfg = join(tmp, ".context", "config.yaml");
+    writeFileSync(cfg, readFileSync(cfg, "utf-8").replace(/^review:.*$/m, "review: maybe"));
+    ctx(tmp, ["init", "--name", "review-vault", "--layout", "structured", "--yes"]);
+    expect(ctx(tmp, ["config", "get", "review"]).trim()).toBe("on");
+  });
 });
