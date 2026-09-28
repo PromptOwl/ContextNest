@@ -17,6 +17,7 @@
  * v1 writes into a LOCAL vault only; `ctx push` sends it on to a hosted nest.
  */
 
+import { createHash } from "node:crypto";
 import pathMod from "node:path";
 import {
   ContextNestError,
@@ -26,6 +27,7 @@ import {
   parseDocument,
   serializeDocument,
   validateDocument,
+  withVaultLock,
 } from "@promptowl/contextnest-engine";
 import type { ContextNode, Frontmatter, NestStorage } from "@promptowl/contextnest-engine";
 
@@ -86,7 +88,7 @@ function list(value: unknown, where: string): unknown[] {
 /** A vault-relative path the pull may write: no absolute path, no `..`. */
 function safeRelPath(value: string, where: string): string {
   const normalized = pathMod.posix.normalize(value.replace(/\\/g, "/"));
-  if (pathMod.posix.isAbsolute(normalized) || normalized.startsWith("..") || normalized.split("/").includes("..")) {
+  if (pathMod.posix.isAbsolute(normalized) || normalized.split("/").includes("..")) {
     throw invalid(`${where} "${value}" must stay inside the vault`);
   }
   return normalized;
@@ -141,8 +143,11 @@ export function parseRecipeManifest(body: string): RecipeManifest {
     const extract = entry.extract ?? "yaml";
     if (extract !== "yaml") throw invalid(`files[${i}].extract must be "yaml"`);
     const to = safeRelPath(str(entry.to, `files[${i}].to`), `files[${i}].to`);
-    if (to.startsWith(".context/") || to.startsWith(".versions/")) {
-      throw invalid(`files[${i}].to "${to}" may not write into ${to.split("/")[0]}/`);
+    // A template is YAML. No dot-segment keeps a recipe out of .git/hooks,
+    // .claude/, .vscode/ and .context/ (places that run code or hold vault
+    // state); no nodes/ or packs/ keeps it from writing past governance.
+    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || /^(nodes|packs)\//.test(to)) {
+      throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/ and dot-folders`);
     }
     return { from: normalizeDocumentId(str(entry.from, `files[${i}].from`)), to, extract: "yaml" as const };
   });
@@ -261,6 +266,12 @@ interface PulledFrom {
   id?: string;
   version?: number | null;
   recipe?: string;
+  /** sha256 of the body as pulled — tells an untouched copy from a local edit. */
+  body_sha256?: string;
+}
+
+function bodyHash(body: string): string {
+  return createHash("sha256").update(body.replace(/\r\n/g, "\n").trim()).digest("hex");
 }
 
 function pulledFrom(node: ContextNode): PulledFrom | undefined {
@@ -292,6 +303,7 @@ function buildDocument(
         id: source.id,
         version: source.version,
         recipe: fetched.manifest.id,
+        body_sha256: bodyHash(source.body),
       },
     },
     ...(opts.skill
@@ -375,6 +387,17 @@ export async function planPull(
       steps.push({ ...base, action: "up-to-date", localVersion });
       return;
     }
+    // Upstream moved. Overwrite only the untouched draft this pull wrote: a
+    // published copy has its own version chain, an edited one has local work.
+    if (local.frontmatter.status !== "draft" || origin.body_sha256 !== bodyHash(local.body)) {
+      steps.push({
+        ...base,
+        action: "conflict",
+        localVersion,
+        note: `${to} was edited or published since it was pulled — left untouched (upstream is v${src.version})`,
+      });
+      return;
+    }
     steps.push(
       opts.update
         ? { ...base, action: "update", localVersion, content: buildDocument(fetched, src, to, { extraTags, skill: kind === "skill" }) }
@@ -416,6 +439,10 @@ export async function planPull(
 
 /** Write every create/update step. Returns the steps that were written. */
 export async function applyPull(storage: NestStorage, steps: PullStep[]): Promise<PullStep[]> {
+  return withVaultLock(storage.root, () => applyPullLocked(storage, steps));
+}
+
+async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise<PullStep[]> {
   const written: PullStep[] = [];
   for (const step of steps) {
     if ((step.action !== "create" && step.action !== "update") || step.content === undefined) continue;

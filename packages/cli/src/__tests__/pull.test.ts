@@ -174,7 +174,13 @@ describe("parseRecipeManifest", () => {
     const bad = (yaml: string) => () => parseRecipeManifest("```yaml recipe\n" + yaml + "\n```\n");
     expect(bad("id: x\nincludes:\n  - from: nodes/a\n    to: ../../etc/passwd")).toThrow(/inside the vault/);
     expect(bad("id: x\nincludes:\n  - from: nodes/a\n    to: packs/sneaky")).toThrow(/under nodes\//);
-    expect(bad("id: x\nfiles:\n  - from: nodes/a\n    to: .context/config.yaml")).toThrow(/may not write into/);
+    // Template files: YAML only, never a dot-folder (code-running config) or a governed folder.
+    for (const to of [".context/config.yaml", ".git/hooks/pre-commit", ".claude/settings.yaml", "nodes/x.yaml", "packs/x.yml", "run.sh"]) {
+      expect(bad(`id: x\nfiles:\n  - from: nodes/a\n    to: ${to}`)).toThrow(/must be a \.yaml\/\.yml path/);
+    }
+    expect(parseRecipeManifest("```yaml recipe\nid: x\nfiles:\n  - from: nodes/a\n    to: config/stewards.yml\n```\n").files[0].to).toBe(
+      "config/stewards.yml",
+    );
     expect(bad("id: x\npack:\n  id: ../x\n  include: []")).toThrow(/plain file name/);
   });
 
@@ -256,6 +262,7 @@ describe("pull — fresh vault", () => {
       id: "nodes/org/spine/method",
       version: 2,
       recipe: "test",
+      body_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(method.body).toContain("Five questions.");
     expect(doc("nodes/standards/facts").frontmatter.tags).toEqual(["#template", "#prime-document"]);
@@ -339,6 +346,25 @@ describe("pull — re-pull", () => {
     const after = doc("nodes/methodologies/method");
     expect(after.body).toContain("Six questions now.");
     expect((after.frontmatter.metadata as any).pulled_from.version).toBe(3);
+  });
+
+  it("never overwrites a pulled document that was edited or published locally, even with --update", async () => {
+    await pullOnce();
+    const path = join(root, "nodes/methodologies/method.md");
+    const pulled = readFileSync(path, "utf-8");
+    nodes["nodes/org/spine/method"].versions = [1, 2, 3];
+    nodes["nodes/org/spine/method"].body = "# The Method\n\nSix questions now.\n";
+
+    writeFileSync(path, pulled.replace("Five questions.", "Five questions, plus my notes."));
+    let step = (await pullOnce(true)).find((s) => s.to === "nodes/methodologies/method")!;
+    expect(step.action).toBe("conflict");
+    expect(step.note).toContain("edited or published");
+    expect(doc("nodes/methodologies/method").body).toContain("plus my notes");
+
+    writeFileSync(path, pulled.replace("status: draft", "status: published"));
+    step = (await pullOnce(true)).find((s) => s.to === "nodes/methodologies/method")!;
+    expect(step.action).toBe("conflict");
+    expect(doc("nodes/methodologies/method").body).toContain("Five questions.");
   });
 
   it("does not treat a missing file as something to overwrite later", async () => {

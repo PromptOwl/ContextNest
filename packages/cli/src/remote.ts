@@ -438,8 +438,11 @@ export async function remoteRead(
 
 // ─── Pull (read side) ───────────────────────────────────────────────────────
 
-/** How many nodes one listing may return while looking for a recipe. */
-const RECIPE_LIST_LIMIT = 1000;
+/**
+ * How many nodes one listing may return while looking for a recipe. Explicit
+ * because a Community-hosted nest caps a listing with no `limit` at 50.
+ */
+const RECIPE_LIST_LIMIT = 10_000;
 
 /**
  * Fetch a recipe and every node it names, over one connection, for `ctx pull`.
@@ -456,7 +459,8 @@ export async function remoteFetchRecipe(target: RemoteTarget, recipeId: string):
     const hits = listed.documents.filter((d) => d.id === `nodes/${slug}` || d.id.endsWith(`/${slug}`));
     if (hits.length === 0) {
       throw new ContextNestError(
-        `No recipe "${recipeId}" in ${target.alias} — expected a node whose slug is ${slug}.`,
+        `No recipe "${recipeId}" in ${target.alias} — expected a node whose slug is ${slug}.` +
+          (listed.documents.length >= RECIPE_LIST_LIMIT ? ` (only the first ${RECIPE_LIST_LIMIT} nodes were searched)` : ""),
         "DOCUMENT_NOT_FOUND",
       );
     }

@@ -304,7 +304,7 @@ ctx pull <remote-alias> --recipe org-essentials --update    # take newer upstrea
 ```
 
 - Every pulled document lands as a **draft** with `derived_from: contextnest://<nest>/<id>` and `metadata.pulled_from` recording the upstream version. Review it, then `ctx publish`.
-- A later pull skips what is current, reports newer upstream versions (applied only with `--update`), and **never overwrites** a document or file it did not pull.
+- A later pull skips what is current, reports newer upstream versions (applied only with `--update`), and **never overwrites** a document or file it did not pull, nor a pulled one you have since edited or published.
 - Skills land as `type: skill`. Install one with `ctx skill install <path> --mode loader --write`.
 - Pulls write into a **local vault** for now; use `ctx push` to send the result to a hosted nest.
 
@@ -317,7 +317,7 @@ includes:
 skills:
   - from: nodes/org/skills/distill-capture             # lands at nodes/skills/<slug> unless `to` is set
 files:
-  - from: nodes/org/templates/stewards-example         # first ```yaml block in the node
+  - from: nodes/org/templates/stewards-example         # first ```yaml block in the node; `to` must be .yaml/.yml, outside nodes/, packs/ and dot-folders
     to: stewards.example.yaml
 pack:
   id: org-essentials
