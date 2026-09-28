@@ -280,6 +280,15 @@ function pulledFrom(node: ContextNode): PulledFrom | undefined {
   return raw && typeof raw === "object" ? (raw as PulledFrom) : undefined;
 }
 
+/**
+ * Still the draft a pull wrote, byte-for-byte in body. Only such a copy may be
+ * overwritten: a published one has its own version chain, an edited one has
+ * local work.
+ */
+function untouched(local: ContextNode): boolean {
+  return local.frontmatter.status === "draft" && pulledFrom(local)?.body_sha256 === bodyHash(local.body);
+}
+
 export function sourceUri(namespace: string, id: string): string {
   return `contextnest://${namespace}/${id}`;
 }
@@ -387,9 +396,7 @@ export async function planPull(
       steps.push({ ...base, action: "up-to-date", localVersion });
       return;
     }
-    // Upstream moved. Overwrite only the untouched draft this pull wrote: a
-    // published copy has its own version chain, an edited one has local work.
-    if (local.frontmatter.status !== "draft" || origin.body_sha256 !== bodyHash(local.body)) {
+    if (!untouched(local)) {
       steps.push({
         ...base,
         action: "conflict",
@@ -437,7 +444,13 @@ export async function planPull(
   return steps;
 }
 
-/** Write every create/update step. Returns the steps that were written. */
+/**
+ * Write every create/update step. Returns the steps that were written.
+ *
+ * The plan was made before the lock (and before any confirm prompt), so each
+ * document is re-checked here: one that appeared or changed since planning
+ * is turned into a conflict in place, never overwritten.
+ */
 export async function applyPull(storage: NestStorage, steps: PullStep[]): Promise<PullStep[]> {
   return withVaultLock(storage.root, () => applyPullLocked(storage, steps));
 }
@@ -447,7 +460,22 @@ async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise
   for (const step of steps) {
     if ((step.action !== "create" && step.action !== "update") || step.content === undefined) continue;
     if (step.kind === "document" || step.kind === "skill") {
-      await storage.writeDocument(step.to, step.content, { exclusive: step.action === "create" });
+      const changed = () =>
+        Object.assign(step, { action: "conflict", content: undefined, note: `${step.to} changed while the pull ran — left untouched` });
+      if (step.action === "update") {
+        const local = await readLocal(storage, step.to);
+        if (!local || pulledFrom(local)?.id !== step.from || !untouched(local)) {
+          changed();
+          continue;
+        }
+      }
+      try {
+        await storage.writeDocument(step.to, step.content, { exclusive: step.action === "create" });
+      } catch (err) {
+        if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) throw err;
+        changed();
+        continue;
+      }
     } else {
       // Re-checked at write time: a file that appeared since planning is kept.
       if (await storage.hasVaultFile(step.to)) continue;

@@ -3377,7 +3377,6 @@ Example:
     const storage = getStorage();
     const steps = await planPull(storage, fetched, { update: opts.update });
     const pending = steps.filter((s) => s.action === "create" || s.action === "update");
-    const conflicts = steps.filter((s) => s.action === "conflict");
 
     const report = (written: PullStep[]) => ({
       recipe: fetched.manifest.id,
@@ -3414,6 +3413,8 @@ Example:
       });
     }
     const written = await applyPull(storage, steps);
+    // After apply: a document that changed while the pull ran becomes a conflict there.
+    const conflicts = steps.filter((s) => s.action === "conflict");
 
     if (opts.json) {
       console.log(JSON.stringify(report(written), null, 2));

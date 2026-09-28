@@ -367,6 +367,32 @@ describe("pull — re-pull", () => {
     expect(doc("nodes/methodologies/method").body).toContain("Five questions.");
   });
 
+  it("re-checks documents at write time: an edit or a new file after planning is kept", async () => {
+    await pullOnce();
+    const path = join(root, "nodes/methodologies/method.md");
+    nodes["nodes/org/spine/method"].versions = [1, 2, 3];
+    nodes["nodes/org/spine/method"].body = "# The Method\n\nSix questions now.\n";
+
+    const steps = await planPull(storage, await remoteFetchRecipe(target, "test"), { update: true });
+    expect(steps.find((s) => s.to === "nodes/methodologies/method")!.action).toBe("update");
+    // Someone edits the draft while the pull waits at its confirm prompt.
+    writeFileSync(path, readFileSync(path, "utf-8").replace("Five questions.", "Five questions, edited meanwhile."));
+    const written = await applyPull(storage, steps);
+
+    const step = steps.find((s) => s.to === "nodes/methodologies/method")!;
+    expect(step.action).toBe("conflict");
+    expect(written).not.toContain(step);
+    expect(doc("nodes/methodologies/method").body).toContain("edited meanwhile");
+
+    // A create whose target appeared after planning is a conflict too, not a crash mid-apply.
+    rmSync(join(root, "nodes/standards/facts.md"));
+    const again = await planPull(storage, await remoteFetchRecipe(target, "test"));
+    writeFileSync(join(root, "nodes/standards/facts.md"), "---\ntitle: Mine\n---\n\nmine\n");
+    await applyPull(storage, again);
+    expect(again.find((s) => s.to === "nodes/standards/facts")!.action).toBe("conflict");
+    expect(doc("nodes/standards/facts").body).toContain("mine");
+  });
+
   it("does not treat a missing file as something to overwrite later", async () => {
     await pullOnce();
     rmSync(join(root, "stewards.example.yaml"));
