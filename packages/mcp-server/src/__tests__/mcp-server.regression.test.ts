@@ -44,6 +44,8 @@ const EXPECTED_TOOLS = [
   "context_versions",
   "context_reconstruct",
   "context_verify",
+  "context_forget",
+  "context_forget_log",
   "context_init",
   "context_packs",
   "context_import",

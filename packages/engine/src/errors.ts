@@ -314,3 +314,40 @@ export class ChainBreakError extends ContextNestError {
     this.name = "ChainBreakError";
   }
 }
+
+/**
+ * Raised when an operation would write content into a node the forget
+ * protocol erased (§6.3.4 anti-resurrection): publishing or editing a
+ * forgotten stub, publishing at a path a forget retired, publishing or
+ * importing content whose hash matches forgotten content, or forgetting a node
+ * that already is. A forgotten path is never revived — publish the content
+ * under a new path (a new identity) if it is genuinely meant to exist again.
+ */
+export class ForgottenDocumentError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    detail = "was forgotten — its content was erased and it cannot be republished",
+  ) {
+    super(`Document "${documentId}" ${detail}`, "FORGOTTEN_DOCUMENT", "§6.3");
+    this.name = "ForgottenDocumentError";
+  }
+}
+
+/**
+ * Raised when a caller asks to reconstruct a version whose content the forget
+ * protocol erased (§6.3.2). Distinct from VERSION_NOT_FOUND: the version
+ * existed — the chain still proves it — but what it said is gone on purpose.
+ */
+export class ForgottenVersionError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    public readonly version: number,
+  ) {
+    super(
+      `Version ${version} of ${documentId} was forgotten — its content was erased (hashes retained)`,
+      "VERSION_FORGOTTEN",
+      "§6.3",
+    );
+    this.name = "ForgottenVersionError";
+  }
+}

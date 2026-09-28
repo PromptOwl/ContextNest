@@ -472,10 +472,13 @@ export class CheckpointManager {
     // replaced by its correct recomputation rather than re-sealed.
     const recomputed = new Map<
       string,
-      Map<number, { hash: string; publishedAt: string }>
+      Map<number, { hash: string; publishedAt: string; forgotten: boolean }>
     >();
     for (const [docId, history] of allHistories) {
-      const perVersion = new Map<number, { hash: string; publishedAt: string }>();
+      const perVersion = new Map<
+        number,
+        { hash: string; publishedAt: string; forgotten: boolean }
+      >();
       let prevChainHash: string | null = null;
       for (const entry of history.versions) {
         const hash = computeChainHash(
@@ -488,7 +491,13 @@ export class CheckpointManager {
         prevChainHash = hash;
         // Only published versions seed checkpoints; keep the first occurrence.
         if (entry.published_at && !perVersion.has(entry.version)) {
-          perVersion.set(entry.version, { hash, publishedAt: entry.published_at });
+          perVersion.set(entry.version, {
+            hash,
+            publishedAt: entry.published_at,
+            // A node-level forget's stub (§6.3.3) is sealed like a publish —
+            // it cuts a checkpoint — but the node leaves the published set.
+            forgotten: entry.forget_stub === true,
+          });
         }
       }
       recomputed.set(docId, perVersion);
@@ -500,11 +509,12 @@ export class CheckpointManager {
       version: number;
       publishedAt: string;
       chainHash: string;
+      forgotten: boolean;
     }> = [];
 
     for (const [docId, perVersion] of recomputed) {
-      for (const [version, { hash, publishedAt }] of perVersion) {
-        tuples.push({ docId, version, publishedAt, chainHash: hash });
+      for (const [version, { hash, publishedAt, forgotten }] of perVersion) {
+        tuples.push({ docId, version, publishedAt, chainHash: hash, forgotten });
       }
     }
 
@@ -525,8 +535,14 @@ export class CheckpointManager {
 
     for (let i = 0; i < tuples.length; i++) {
       const tuple = tuples[i];
-      runningVersions[tuple.docId] = tuple.version;
-      runningChainHashes[tuple.docId] = tuple.chainHash;
+      if (tuple.forgotten) {
+        // The live seal leaves a forgotten node out of the map; so does this.
+        delete runningVersions[tuple.docId];
+        delete runningChainHashes[tuple.docId];
+      } else {
+        runningVersions[tuple.docId] = tuple.version;
+        runningChainHashes[tuple.docId] = tuple.chainHash;
+      }
 
       const checkpointNumber = i + 1;
       const documentVersions = { ...runningVersions };
