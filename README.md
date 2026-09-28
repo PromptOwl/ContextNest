@@ -41,6 +41,27 @@ its version and licence alongside the installed ones in
 **[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
 uploads the machine-readable graph as the `dependency-graph` build artifact.
 
+### What leaves your machine
+
+Nothing, unless you run a command that names a destination or opt in:
+
+| Trigger | Destination | Sent | Default |
+|---|---|---|---|
+| Telemetry | `api.promptowl.ai/v1/telemetry` | Random per-vault id, CLI version, OS, Node version, event name, timestamp. Never vault content. | Off. Opt in with `telemetry: true` in `.context/config.yaml`; `DO_NOT_TRACK=1` / `CONTEXTNEST_TELEMETRY=0` force off. |
+| Opening `.context/welcome.html` | Google Analytics | `vault_init` (starter, CLI version, doc count) + GA defaults (IP, user agent) | Off — same flag. Off = the page makes no network requests. |
+| `ctx push` | The `--server` you name | Published documents + your API key | Only when run |
+| `ctx query @org/pack` | `api.promptowl.ai` | Pack name + your PromptOwl token | Only when run |
+| Remote nests | The server you registered | Queries/writes + the bearer from your env var | Only for remotes you add |
+| `ctx import pubmed` / `enrich pubtator` | NCBI | Search terms / ids | Only when run |
+| `ctx doctor` | npm registry | Version lookup | `CONTEXTNEST_DOCTOR_OFFLINE=1` skips |
+
+Stored PromptOwl credentials live in the OS keyring (macOS Keychain, Windows Credential Manager,
+Linux Secret Service via `secret-tool`). With no keyring (headless/CI/Docker), set
+`CONTEXTNEST_CREDENTIALS_KEY` and they go to `~/.promptowl/credentials.enc.json` (AES-256-GCM,
+scrypt-derived key, mode 0600). Never plaintext: a legacy `~/.promptowl/credentials.json` is
+migrated on first read, then overwritten and deleted; with neither keyring nor key the CLI stops
+and says how to fix it. `PROMPTOWL_ACCESS_TOKEN` skips storage entirely.
+
 ## For the solo developer
 
 Your brain, cached for your agent.
