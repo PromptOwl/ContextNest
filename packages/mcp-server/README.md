@@ -8,7 +8,7 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **38 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **39 tools** over stdio transport.
 
 > **New in 2.2.1** — `context_folders` lists the vault's folders and their
 > document counts without opening a document, and `context_list` takes a
@@ -124,7 +124,55 @@ them over the legacy tools below.
 | `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
 | `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |
 | `context_delete` | Delete a node and its version history; returns the deleted node's `title` |
+| `context_import_pdf` | Import a PDF (`bytes_base64`) as a `type: pdf` node: extracted text as the body (`<!-- page N -->` markers; empty + `text_layer: false` for a scan), the PDF stored beside it and bound by SHA-256. Pass `id` of an existing pdf node for a new version — the old binary is kept in history |
 | `context_import` | Bulk create-and-publish. Takes `documents` (title + content) and/or `ids` (files already in the vault, published as-is) — a mixed batch seals **one** checkpoint and regenerates the index **once** |
+
+#### `client` — attributing a call
+
+Every tool above takes an optional `client` object naming the calling agent and
+its session, plus any custom scalar keys:
+
+```jsonc
+context_create({
+  title: "API Design",
+  content: "…",
+  client: { agent: "claude-code", session_id: "s-9f2" }
+})
+```
+
+A write that publishes records it on the version-history entry it seals, so
+`context_versions` can answer *which agent wrote v7, in which session*; a graph
+read stamps it on the access traces it emits.
+
+**Every field is optional** — `client` itself, and `agent`/`session_id` within
+it. Send none, one, or all.
+
+**You usually do not need to send it.** The server fills both fields from what
+the connection already tells it: `agent` from the `clientInfo.name` in your
+`initialize` handshake, and `session_id` from a per-process id — over stdio one
+server process is one client connection, so every call sharing that id really
+did come from one session. Anything you send wins, merged **per key**: supply
+just `agent` and you keep it while still getting a session id.
+
+| Env var | Effect |
+|---------|--------|
+| `CONTEXTNEST_NO_ATTRIBUTION=1` | Server derives nothing; nothing is recorded unless a caller sends its own `client` |
+| `CONTEXTNEST_AGENT` | Overrides the `agent` the handshake reports |
+| `CONTEXTNEST_SESSION_ID` | Overrides the per-process session id |
+
+Precedence per key: **caller > env > connection.** With attribution off and no
+caller value, the `client` key is left off the record entirely rather than
+written as `{}` — "not attributed" and "attributed to nobody" are different
+claims, and history should only make the first. The opt-out matters because
+what gets derived lands in an append-only history: an operator who does not
+want their client's name recorded in a vault needs to say so before the first
+write, not scrub it after.
+
+It is a label, never an identity claim — `clientInfo.name` is your self-report,
+the server authenticates neither, and it never authorizes from either — and it
+is not an input to any hash chain. Note that `client` describes the CALL;
+`metadata` on `context_create` / `context_update` is frontmatter and describes
+the DOCUMENT. See spec §9.4.
 
 ### Vault tools
 

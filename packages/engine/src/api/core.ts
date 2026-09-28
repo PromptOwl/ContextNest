@@ -13,17 +13,29 @@
  * source for both the on-disk format and the wire contract.
  */
 import { z } from "zod";
+import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
-  TAG_PATTERN,
   frontmatterSchema,
+  pdfMetaSchema,
   sourceMetaSchema,
+  tagSchema as tag,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
+import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
-const tag = z.string().regex(TAG_PATTERN);
+/**
+ * Present on a served node ONLY when it failed integrity verification (live
+ * body vs its checksum, or its own version chain). The node is still served;
+ * `warning` is the line an agent must heed before repeating any value from it.
+ */
+const integrityVerdict = z.object({
+  status: z.literal("failed"),
+  checks: z.array(z.string()),
+  warning: z.string(),
+});
 
 /** A node as returned in list/query summaries (body optional/trimmed). */
 const nodeSummary = z.object({
@@ -41,12 +53,18 @@ const nodeSummary = z.object({
   // Source nodes carry their `source` block so agents can hydrate them
   // (spec §1.9, §5). Present only for type:"source".
   source: z.record(z.unknown()).optional(),
+  // PDF nodes carry their `pdf` block (spec §1.11) so a listing can show the
+  // page count / scan warning and link the binary without a second read.
+  // Present only for type:"pdf".
+  pdf: pdfMetaSchema.optional(),
+  integrity: integrityVerdict.optional(),
 });
 
 /** A fully-loaded document. */
 const documentPayload = z.object({
   id: z.string(),
   frontmatter: frontmatterSchema,
+  integrity: integrityVerdict.optional(),
   body: z.string(),
   /** Exact stored bytes, frontmatter block included. Only with `include_raw`. */
   raw: z.string().optional(),
@@ -81,7 +99,7 @@ const nodeSelectorShape = {
  * what to send. `resolveId` raises the same VALIDATION_FAILED at execution
  * time, which every transport surfaces identically.
  */
-const nodeSelector = z.object(nodeSelectorShape);
+const nodeSelector = z.object({ ...nodeSelectorShape, ...clientField });
 
 // ─── context_search ──────────────────────────────────────────────────────────
 
@@ -93,9 +111,14 @@ const searchOp: OperationDescriptor = {
   input: z.object({
     query: z.string().min(1).describe("Search terms"),
     limit: z.number().int().positive().optional().describe("Max results"),
+    ...clientField,
   }),
   output: z.object({
+    // Best hit first: documents matching every query term, then partial
+    // matches, each tier by descending BM25 `score`.
     results: z.array(nodeSummary.extend({ score: z.number().optional() })),
+    // Matches before `limit` was applied, so a caller can say "N more".
+    total: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["search"],
@@ -113,7 +136,7 @@ const queryOp: OperationDescriptor = {
   name: "context_query",
   namespace: "core",
   description:
-    "Run a selector query with graph traversal. Supports #tag, type:X, [[Title]], scope:X, combined with +AND, |OR, -NOT.",
+    `Run a selector query with graph traversal. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     query: z.string().min(1).describe("Selector query expression"),
     hops: z
@@ -132,6 +155,7 @@ const queryOp: OperationDescriptor = {
       .describe(
         "Include unpublished documents (default: published only). For authoring surfaces, where the point is to find the draft you are working on.",
       ),
+    ...clientField,
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -153,7 +177,7 @@ const resolveOp: OperationDescriptor = {
   name: "context_resolve",
   namespace: "core",
   description:
-    "Full context resolution — run a selector and return complete node content within a token budget.",
+    `Full context resolution — run a selector and return complete node content within a token budget. Grammar: ${SELECTOR_GRAMMAR}`,
   input: z.object({
     selector: z.string().min(1).describe("Selector query string"),
     max_tokens: z
@@ -168,6 +192,7 @@ const resolveOp: OperationDescriptor = {
       .min(0)
       .optional()
       .describe("Graph traversal depth (default: 2)"),
+    ...clientField,
   }),
   output: z.object({
     documents: z.array(documentPayload),
@@ -205,6 +230,7 @@ const getOp: OperationDescriptor = {
       .describe(
         "Return a rejected node instead of refusing. Reading one is not the same as republishing it — surfaces that let a steward see and revive retired documents set this.",
       ),
+    ...clientField,
   }),
   output: documentPayload,
   errors: [
@@ -265,6 +291,7 @@ const listOp: OperationDescriptor = {
       .describe(
         "Return each node's full frontmatter and body instead of a summary. For callers that go on to render or gate the documents themselves and would otherwise have to read them all again.",
       ),
+    ...clientField,
   }),
   output: z.object({
     documents: z.array(nodeSummary),
@@ -296,6 +323,7 @@ const foldersOp: OperationDescriptor = {
       .describe(
         "Include nested folders (default true). Pass false for the immediate children only.",
       ),
+    ...clientField,
   }),
   output: z.object({
     folders: z.array(
@@ -334,7 +362,12 @@ const createOp: OperationDescriptor = {
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
       .string()
@@ -388,6 +421,7 @@ const createOp: OperationDescriptor = {
       .describe(
         'Source block (required for type:source): how an agent fetches the live data this node stands for.',
       ),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -472,7 +506,7 @@ const updateOp: OperationDescriptor = {
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node. Nothing converts to or from `pdf`: pdf nodes come only from context_import_pdf.",
       ),
     source: sourceMetaSchema
       .strict()
@@ -491,6 +525,7 @@ const updateOp: OperationDescriptor = {
       .describe("New skill output format"),
     inputs: z.array(z.record(z.unknown())).optional().describe("New skill input parameters"),
     guard_rails: z.array(z.string()).optional().describe("New skill execution constraints"),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -525,6 +560,7 @@ const publishOp: OperationDescriptor = {
       .string()
       .optional()
       .describe("Version-history note recorded against the publish (audit trail)."),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -590,6 +626,12 @@ const versionEntryOut = z.object({
   /** Only present when the caller passes `include_diff`. Absent for a keyframe
    *  (a full snapshot has no patch) and for v1. */
   diff: z.string().optional().describe("Unified diff from the previous version"),
+  /** Caller metadata recorded with the write that sealed this version (§9.4). */
+  client: clientMetadataSchema
+    .optional()
+    .describe(
+      "Caller metadata the write carried — agent, session_id, custom keys. Absent for versions written before the caller sent any.",
+    ),
 });
 
 const versionsOp: OperationDescriptor = {
@@ -606,6 +648,7 @@ const versionsOp: OperationDescriptor = {
       .boolean()
       .optional()
       .describe("Attach each version's change log (unified diff from the previous version)"),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
@@ -639,10 +682,13 @@ const reconstructOp: OperationDescriptor = {
   input: z.object({
     ...nodeSelectorShape,
     version: z.number().int().positive().describe("Version number to reconstruct"),
+    ...clientField,
   }),
   output: z.object({
     id: z.string(),
     version: z.number().int(),
+    /** Present only when the document's version chain fails verification. */
+    integrity: integrityVerdict.optional(),
     content: z.string(),
   }),
   errors: [
@@ -666,6 +712,8 @@ const verifyError = z.object({
     "checkpoint_hash_mismatch",
     "body_drift",
     "unreadable_history",
+    "sidecar_drift",
+    "sidecar_missing",
   ]),
   document: z.string().optional(),
   version: z.number().int().optional(),
@@ -677,8 +725,9 @@ const verifyError = z.object({
 const verifyOp: OperationDescriptor = {
   name: "context_verify",
   namespace: "core",
-  description: "Verify every document and checkpoint hash chain in the vault.",
-  input: z.object({}),
+  description:
+    "Verify every document and checkpoint hash chain in the vault, and re-hash every pdf node's binary against the sha256 its frontmatter records.",
+  input: z.object({ ...clientField }),
   output: z.object({ valid: z.boolean(), errors: z.array(verifyError) }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["verify_integrity"],
@@ -699,6 +748,7 @@ const initOp: OperationDescriptor = {
         "Also list every node. Off by default: the counts and tags below answer most opening questions, and a large vault's node list dwarfs them.",
       ),
     limit: z.number().int().positive().optional().describe("Max nodes to list, with include_nodes"),
+    ...clientField,
   }),
   output: z.object({
     context_md: z.string().nullable().describe("The vault's operating instructions, if it has any"),
@@ -747,7 +797,7 @@ const packsOp: OperationDescriptor = {
   name: "context_packs",
   namespace: "core",
   description: "List the context packs defined in the vault.",
-  input: z.object({}),
+  input: z.object({ ...clientField }),
   output: z.object({ packs: z.array(packSummary) }),
   errors: ["VALIDATION_FAILED"],
 };
@@ -784,7 +834,7 @@ const nestsOp: OperationDescriptor = {
   namespace: "core",
   description:
     "List every nest registered in the central registry — local vaults and remote MCP endpoints alike — with its alias, kind, endpoint, description, and whether it is the default. Use this to discover which nests exist before targeting one.",
-  input: z.object({}),
+  input: z.object({ ...clientField }),
   output: z.object({ nests: z.array(nestSummary) }),
   errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
 };
@@ -814,7 +864,12 @@ const importDoc = z
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
     metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
@@ -856,7 +911,7 @@ const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in verbatim, and/or `discover` to let the engine find and publish everything already in the vault. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
   // Every input is optional and validated in the executor rather than through
   // a refined union: `.refine()` produces a ZodEffects, which degrades to a
   // useless JSON Schema through zod-to-json-schema — and MCP publishes
@@ -876,7 +931,13 @@ const importOp: OperationDescriptor = {
       .array(importFile)
       .optional()
       .describe(
-        "Files from an existing vault, written in verbatim at their own relative paths. Unlike `documents` nothing is synthesized: the source's frontmatter is preserved, and non-document files (`.versions/<doc>/history.yaml`) travel too, which is what lets an imported version chain still reconstruct.",
+        "Files from an existing vault, written in at their own relative paths. Unlike `documents` nothing is synthesized — but a path is slugified so the node has an addressable id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), a name already taken lands as `<name>-2` unless `overwrite` is set, and frontmatter is repaired where it would otherwise fail validation; a file that is already valid is written byte for byte. Non-document files (`.versions/<doc>/history.yaml`) travel too and move with their document if it is renamed, which is what lets an imported version chain still reconstruct.",
+      ),
+    overwrite: z
+      .boolean()
+      .optional()
+      .describe(
+        "With `files`: replace a path that is already in the vault instead of landing the incoming file beside it as `<name>-2` (default false). Set true to re-run the same batch idempotently, or to use `files` as an update path. Two incoming files that slugify alike are still kept apart.",
       ),
     publish: z
       .boolean()
@@ -900,6 +961,7 @@ const importOp: OperationDescriptor = {
       .describe(
         "With `discover`: stamped as `author` on every imported document. The importing user, not the vault's own `author:` — which names someone who need not exist on this host.",
       ),
+    ...clientField,
   }),
   output: z.object({
     published: z.array(z.object({ id: z.string(), version: z.number().int().min(1) })),
@@ -916,6 +978,13 @@ const importOp: OperationDescriptor = {
     checkpoint: z.number().int().nullable(),
     /** `files` only: how many were written in. */
     written: z.number().int().optional(),
+    /**
+     * Repairs the import made to files it did not author — a path slugified,
+     * a missing title derived, a `type` outside the spec coerced to
+     * `document`, a tag that fails the tag rule dropped. One line each;
+     * present only when something was repaired.
+     */
+    warnings: z.array(z.string()).optional(),
     /**
      * `discover` only: every document the scan took responsibility for,
      * published or held back. Carries what a governance layer needs to record
@@ -937,6 +1006,86 @@ const importOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
 };
 
+
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/**
+ * Import a PDF as a `type: pdf` node (spec §1.11): the binary is stored as a
+ * sidecar beside the node, bound by SHA-256 in the `pdf:` block, and the body
+ * is the text extracted from it. The ONLY way a pdf node comes to exist — the
+ * block records bytes, and no other op carries any.
+ */
+const importPdfOp: OperationDescriptor = {
+  name: "context_import_pdf",
+  namespace: "core",
+  description:
+    "Import a PDF as a `type: pdf` node: the PDF is stored beside the node as a binary sidecar bound by SHA-256, and the node body is its extracted text (one `<!-- page N -->` marker per page; empty for a scanned PDF with no text layer, flagged `text_layer: false`). Pass `id` of an existing pdf node to add a new version — the previous binary is kept in version history; identical bytes are a no-op. The extracted text is read-only: to change it, import a new PDF.",
+  input: z.object({
+    bytes_base64: z.string().min(1).describe("The PDF file, base64-encoded"),
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Node id. An existing pdf node gets a new version; a free id creates the node there. Default: derived from the title under nodes/ (+ folder).",
+      ),
+    title: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe(
+        "Node title. Default: the PDF's own /Title, else the filename, else \"Untitled PDF\". A new version keeps the existing title unless one is given.",
+      ),
+    filename: z
+      .string()
+      .optional()
+      .describe("Original file name — used for the title when neither `title` nor the PDF's metadata gives one. Never read from disk."),
+    folder: z
+      .string()
+      .optional()
+      .describe('Folder path under nodes/ (e.g. "gtm/decks"); segments are slugified. Ignored when `id` is given.'),
+    tags: z.array(tag).optional().describe("Tags (replace the existing ones on a new version)"),
+    description: z.string().optional().describe("One-line summary stored in frontmatter"),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish the import (default true). Pass false to leave it a draft — governed surfaces use this when a write must clear review first.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    version: z.number().int().min(1),
+    created: z.boolean().describe("True when this call created the node, false for a new version (or no-op)"),
+    unchanged: z
+      .boolean()
+      .describe("True when the bytes matched the node's current PDF, so nothing was written"),
+    status: z.enum(STATUSES),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null for a draft / no-op"),
+    pdf: pdfMetaSchema.describe("The node's pdf block — sidecar path, sha256, size, pages, extractor"),
+    text_layer: z
+      .boolean()
+      .describe("False for a scanned PDF: no text was extracted and the body is empty"),
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "REJECTED_DOCUMENT",
+    // The publish refuses a sidecar that does not hash to pdf.sha256.
+    "INTEGRITY_ERROR",
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
 
 // ─── context_skill / context_skill_install ───────────────────────────────────
 
@@ -961,10 +1110,14 @@ const skillOp: OperationDescriptor = {
       .enum(INSTALL_SCOPES)
       .optional()
       .describe("`user` (home directory, default) or `project` (repo root). Decides the path only."),
+    ...clientField,
   }),
   output: z.object({
     name: z.string().describe("Slugified skill / rule name"),
     description: z.string().describe("The harness's local matcher text, from `skill.trigger`"),
+    integrity: integrityVerdict
+      .optional()
+      .describe("Present only when the skill node failed integrity verification — do not run it unreviewed."),
     content: z.string().describe("Complete file content, harness frontmatter included"),
     relative_path: z.string().describe("Path relative to `base`"),
     base: z.enum(["project_root", "home"]),
@@ -1005,6 +1158,7 @@ const skillInstallOp: OperationDescriptor = {
       .describe(
         "`loader` (default) fetches the procedure at runtime and never drifts. `full` embeds an offline snapshot that will.",
       ),
+    ...clientField,
   }),
   output: z.object({
     files: z.array(
@@ -1016,6 +1170,9 @@ const skillInstallOp: OperationDescriptor = {
     ),
     post_install: z.string().describe("What the user must do for the harness to pick it up"),
     notes: z.string(),
+    integrity: integrityVerdict
+      .optional()
+      .describe("Present only when the skill node failed integrity verification — do not install it unreviewed."),
     served_version: z
       .number()
       .int()
@@ -1056,6 +1213,7 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   packsOp,
   nestsOp,
   importOp,
+  importPdfOp,
   skillOp,
   skillInstallOp,
 ];

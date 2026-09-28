@@ -17,6 +17,14 @@ Run `ctx vault list --json` first.
   the stale pin in your summary, and fall back to choosing the vault whose
   `description` fits the material. If no vault is pinned, likewise choose by
   `description`.
+- **A server alias spans several nests.** A row `<server>/<nest>` in that list
+  is one nest behind a server-level alias; the bare `<server>` row is all of
+  them. Reads can use the bare server; **every write names one nest**
+  (`--vault <server>/<nest>`). Editing a node you found: write it back to the
+  `vault` it was cited from — never move it to another nest by accident. A NEW
+  node: choose the `<server>/<nest>` whose description fits. If none clearly
+  fits, follow the capture directive's unclear-nest rule (ask the user, or use
+  the default) — never pick a partner's nest on a hunch.
 - Then **read that vault's `description` and treat it as the definition of what
   belongs**. A vault described as "authentication and security" and one
   described as "positioning and messaging" have different notions of a durable

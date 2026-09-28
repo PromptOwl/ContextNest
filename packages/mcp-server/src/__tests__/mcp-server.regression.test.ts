@@ -3,7 +3,7 @@
  *
  * Unlike mcp-server.test.ts (which re-implements handler logic against the engine
  * layer), this suite spawns the *real built server* (dist/index.js) and drives it
- * through a genuine MCP SDK Client over stdio. It exercises every one of the 19
+ * through a genuine MCP SDK Client over stdio. It exercises every one of the 20
  * registered tools across their meaningful use cases and asserts both the tool
  * responses AND the internal vault files the server writes to disk
  * (context.yaml, per-folder INDEX.md, .versions/.../history.yaml, checkpoint
@@ -47,6 +47,7 @@ const EXPECTED_TOOLS = [
   "context_init",
   "context_packs",
   "context_import",
+  "context_import_pdf",
   "context_nests",
   "context_skill",
   "context_skill_install",
@@ -204,6 +205,7 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
     ["context_query", ["query", "hops", "full", "include_drafts"]],
     ["context_resolve", ["selector", "max_tokens", "hops"]],
     ["context_import", ["documents", "ids"]],
+    ["context_import_pdf", ["bytes_base64", "id", "title", "folder", "tags", "publish"]],
   ])("%s advertises its declared inputs", async (name, expected) => {
     const { tools } = await client.listTools();
     const tool = tools.find((t) => t.name === name);
@@ -308,7 +310,7 @@ describe("[regression] MCP server e2e — read tools", () => {
   it("document_format describes node types and status values", async () => {
     const { json } = await callJson(client, "document_format");
     expect(json.frontmatter_fields.type.values).toEqual(
-      expect.arrayContaining(["document", "skill", "source", "snippet", "glossary", "persona", "prompt", "tool", "reference"]),
+      expect.arrayContaining(["document", "skill", "source", "snippet", "glossary", "persona", "prompt", "tool", "reference", "pdf"]),
     );
     expect(json.frontmatter_fields.status.values).toEqual(
       expect.arrayContaining(["draft", "pending_review", "approved", "published", "rejected"]),
@@ -752,6 +754,37 @@ describe("[regression] MCP server e2e — integrity failure", () => {
     const tampered = await callJson(client, "verify_integrity");
     expect(tampered.json.valid).toBe(false);
   });
+
+  it("context_get still serves the tampered document, flagged with the integrity warning (NestBench T10)", async () => {
+    // Runs after the tamper above: nodes/sealed no longer matches its checksum.
+    const { json } = await callJson(client, "context_get", { id: "nodes/sealed" });
+    expect(json.body).toContain("tampered out of band");
+    expect(json.integrity?.status).toBe("failed");
+    expect(json.integrity?.checks).toContain("body_drift");
+    expect(json.integrity?.warning).toMatch(/^⚠ Integrity check failed/);
+  });
+
+  it("context_list full flags the tampered body; read_version flags a broken chain in its text", async () => {
+    const { json } = await callJson(client, "context_list", { full: true });
+    const sealed = json.documents.find((d: any) => d.id === "nodes/sealed");
+    expect(sealed.integrity?.status).toBe("failed");
+
+    // A doc whose keyframe is altered before anything read it in this server.
+    await callJson(client, "create_document", { path: "nodes/chained", title: "Chained", body: "v1 bytes" });
+    const versionsDir = join(vault, "nodes", ".versions", "chained");
+    const keyframe = (await readdir(versionsDir)).find((f) => /^v\d+\.md$/.test(f))!;
+    const kfPath = join(versionsDir, keyframe);
+    await writeFile(kfPath, (await readFile(kfPath, "utf-8")).replace("v1 bytes", "forged"), "utf-8");
+    const version = Number(keyframe.slice(1, -3));
+    const { text } = await callText(client, "read_version", { path: "nodes/chained", version });
+    expect(text).toMatch(/^⚠ Integrity check failed/);
+  });
+
+  it("an intact document is served with no integrity key", async () => {
+    await callJson(client, "create_document", { path: "nodes/clean", title: "Clean", body: "fine" });
+    const { json } = await callJson(client, "context_get", { id: "nodes/clean" });
+    expect(json).not.toHaveProperty("integrity");
+  });
 });
 
 // ─── selector operators ──────────────────────────────────────────────────────
@@ -1011,5 +1044,44 @@ describe("[regression] MCP server e2e — misnamed parameters cannot silently dr
 
     const { json } = await callJson(client, "read_document", { uri: "nodes/good-source" });
     expect(json.frontmatter.source).toEqual(source);
+  });
+});
+
+// ─── context_import_pdf (CU-wdqcq02pmg) ──────────────────────────────────────
+
+describe("[regression] MCP server e2e — context_import_pdf", () => {
+  let vault: string;
+  let client: Client;
+  const PDF = fileURLToPath(new URL("../../../../fixtures/pdf/report.pdf", import.meta.url));
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("imports a PDF over the wire: node + sidecar on disk, verify clean", async () => {
+    const bytes = await readFile(PDF);
+    const { json, isError } = await callJson(client, "context_import_pdf", {
+      bytes_base64: bytes.toString("base64"),
+      folder: "reports",
+    });
+    expect(isError).toBe(false);
+    expect(json.created).toBe(true);
+    expect(json.id).toBe("nodes/reports/quarterly-report");
+    expect(json.text_layer).toBe(true);
+    expect(json.pdf.pages).toBe(2);
+    expect(await readFile(join(vault, json.pdf.file))).toEqual(bytes);
+
+    const got = await callJson(client, "context_get", { id: json.id });
+    expect(got.json.frontmatter.type).toBe("pdf");
+    expect(got.json.body).toContain("Revenue grew 12 percent.");
+
+    const verify = await callJson(client, "context_verify", {});
+    expect(verify.json.valid).toBe(true);
   });
 });

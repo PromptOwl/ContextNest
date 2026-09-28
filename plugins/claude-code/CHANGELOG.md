@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.6.0
+
+One registered server stands for every nest behind it.
+
+- **`<server>/<nest>` targets.** A Community server's all-nests endpoint is
+  registered once. `ctx vault list` (CLI with nest rows) lists each nest as
+  `<server>/<nest>` with its own description. The pinned vault may name one.
+- **Retrieval spans the server in one call.** Auto-retrieval searches the
+  server row, not each nest row, so dozens of partner nests don't exhaust the
+  fan-out cap. Each hit is cited as `<server>/<nest>:id`, the vault an edit
+  must target.
+- **Writes land in the right nest.** Capture and the curator edit a node in
+  the nest it was cited from. A new node goes to the nest whose description
+  fits.
+- **New setting: `unclear_nest`** (`ask` | `default`, default `ask`). It decides
+  what capture does when no nest clearly fits a new note: ask which nest, or
+  write to the pinned vault, else the registry default. It is shown in the
+  session overview and carried in every capture directive.
+- **The sweep-check follows nests.** It parses `--vault <server>/<nest>`,
+  reads each straggler in its own nest, and cites it there.
+
+## 0.5.5
+
+The curator knows how to refile on a remote nest.
+
+- **`ctx move` is in the curator's toolkit.** After the user approves a
+  restructure, the curator moves a node with `ctx move <id> <folder> --vault
+  <alias>` (needs a CLI with `ctx move`; remote Community nests only). It is told that a rename
+  (`ctx update --title`) is not available on a remote nest and to hand that
+  back to the user. `ctx update --tags` now works on remote nests, and
+  replaces the set there as it does locally, so the existing retag guidance holds.
+
+## 0.5.4
+
+The registry default vault is always searched, and no single vault can
+monopolize the auto-retrieval block.
+
+- **The default vault is always a target.** `vaultTargets()` fanned out across
+  the registry in registration order, capped at five, and never looked at
+  which entry was the default. With a handful of demo vaults registered
+  before the real one, the default was sliced off and never searched — every
+  prompt was answered with six nodes from the first demo vault instead.
+  Targets now resolve as: pinned alias (if registered) → the cwd vault →
+  the registry **default** → the rest of the registry, capped at five in
+  total. The default is a deliberate choice like the cwd vault and a pin, so
+  it is exempt from the tmp filter (a default missing on disk is still
+  skipped), and it counts once when it is also the cwd vault.
+- **Hit slots are shared round-robin.** `searchAll()` took the first target's
+  hits until `MAX_HITS` was reached before the next target was even
+  consulted. On a stopword-heavy query against an older, unranked CLI that
+  meant one vault's alphabetical head filled the whole block. The six slots
+  are now handed out one hit per vault per round, and the survivors are
+  listed grouped in target order — the primary vault still leads, but every
+  vault with hits is represented.
+
+## 0.5.3
+
+Keep the sweep-check whole now that `ctx search` caps its output.
+
+- **The sweep no longer under-reports.** `ctx search` returns 10 hits by
+  default since CLI 2.5.0, so the sweep-check's full-text channel saw at most
+  ten candidates while still reporting `truncated: false`. It now passes an
+  explicit `--limit` covering the whole scan budget.
+- The retrieval prompt and the curator agent describe the new ranked, capped
+  search, so the agent knows to raise `--limit` itself.
+
+## 0.5.2
+
+Auto-retrieval searches the vault you are standing in first, and stops
+injecting nodes from vaults you never meant to search.
+
+- **The working-directory vault is searched first.** `vaultTargets()` fanned
+  out across the first five registry entries, in registry order, and never
+  looked at the vault in the working directory once the registry was
+  non-empty. A session inside an unregistered vault got every prompt answered
+  with six nodes from a demo vault instead. Targets now resolve as: pinned
+  alias (if registered) → the vault `ctx vault which` finds from the cwd → the
+  registry, capped at five in total. The cwd vault is searched with no
+  `--vault` flag, so ctx resolves it locally and its hits are cited as a bare
+  `id`. When that same directory is also registered, it is searched once, by
+  its alias, still first — a hit keeps a citable `alias:id` and is never
+  listed twice.
+- **Missing and scratch vaults are skipped.** Registry entries whose path is
+  gone (`exists: false`) or lives under the OS temp directory — the throwaway
+  vaults agents `ctx init` while testing — are no longer fanned out to. A cwd
+  vault or a pin is a deliberate choice and is never filtered.
+- **SessionStart names the working-directory vault** and whether it is
+  registered, so "which vault is this session using?" is answered up front.
+- Needs a CLI that knows `ctx vault which --json` (any release after
+  2.3.0); an older CLI simply behaves as before, minus the cwd-first step.
+
 ## 0.5.1
 
 Retrieval worked on paper and returned nothing on Windows, and returned too

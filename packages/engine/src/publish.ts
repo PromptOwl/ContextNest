@@ -3,7 +3,12 @@
  * Ties together versioning, integrity, checkpoints, and index regeneration.
  */
 
-import type { ContextNode, Frontmatter, VersionEntry } from "./types.js";
+import type {
+  ClientMetadata,
+  ContextNode,
+  Frontmatter,
+  VersionEntry,
+} from "./types.js";
 import { NestStorage, assertSafeDocumentId } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
@@ -11,10 +16,16 @@ import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
+import { assertPdfSidecarIntact } from "./pdf-nodes.js";
 
 export interface PublishOptions {
   editedBy: string;
   note?: string;
+  /**
+   * Caller metadata recorded on the version entry this publish seals (§9.4) —
+   * which agent, in which session. Not hashed; see `VersionEntry.client`.
+   */
+  client?: ClientMetadata;
 }
 
 export interface PublishResult {
@@ -42,6 +53,8 @@ export async function publishDocument(
   if (isRejected(node)) {
     throw new RejectedDocumentError(docId);
   }
+  // A pdf node seals pdf.sha256 into the chain; the bytes must be there.
+  await assertPdfSidecarIntact(storage, docId, node);
 
   const versionManager = new VersionManager(storage);
 
@@ -101,6 +114,7 @@ export async function publishDocument(
   const versionEntry = await versionManager.createVersion(node, options.editedBy, {
     note: options.note,
     publishedAt,
+    client: options.client,
   });
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
@@ -202,6 +216,7 @@ export async function publishDocuments(
     try {
       let node = await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
+      await assertPdfSidecarIntact(storage, docId, node);
 
       // Importer metadata rides along with the publish write below rather than
       // costing its own pass over the vault. Applied before the version bump so
@@ -237,6 +252,7 @@ export async function publishDocuments(
       const versionEntry = await versionManager.createVersion(node, options.editedBy, {
         note: options.note,
         publishedAt: new Date().toISOString(),
+        client: options.client,
       });
       published.push({
         id: docId,

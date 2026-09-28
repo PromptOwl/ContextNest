@@ -72,7 +72,7 @@ const BACKGROUND = [
 ].join(" ");
 
 /** What the model is told to do when the previous turn produced possible new knowledge. */
-export function captureReason(mode) {
+export function captureReason(mode, unclearNest = "ask") {
   const posture =
     mode === "auto"
       ? "to persist anything genuinely worth keeping from that turn."
@@ -84,6 +84,9 @@ export function captureReason(mode) {
     "If the material genuinely belongs in more than one nest, it writes one node",
     "per nest and links the rest to the first (`[[wikilink]]`/vault:id) — never a",
     "duplicated body.",
+    unclearNest === "default"
+      ? "When no nest's description clearly fits a NEW node, it writes to the pinned vault, else the registry default — and names that nest in its summary."
+      : "When no nest's description clearly fits a NEW node, it asks the user which nest before writing — never guesses (a wrong guess can land in a partner's nest).",
     BACKGROUND,
     LADDER,
     "If nothing clears the ladder, it says nothing at all.",
@@ -185,10 +188,10 @@ function minTurns(env) {
 /**
  * Decide whether to gate, and as what.
  *
- * @param {{transcript:{lines:string[], userTurns:number}, ledger:object, env:NodeJS.ProcessEnv, captureMode:string}} ctx
+ * @param {{transcript:{lines:string[], userTurns:number}, ledger:object, env:NodeJS.ProcessEnv, captureMode:string, unclearNest?:string}} ctx
  * @returns {{gate:boolean, kind?:"capture"|"change", reason?:string, explicit?:boolean}}
  */
-export function captureSignal({ transcript, ledger, env, captureMode }) {
+export function captureSignal({ transcript, ledger, env, captureMode, unclearNest }) {
   const { lines, userTurns } = transcript;
   const asked = lastUserMessage(lines);
 
@@ -199,7 +202,7 @@ export function captureSignal({ transcript, ledger, env, captureMode }) {
     return { gate: true, kind: "change", reason: CHANGE_REASON, explicit: true };
   }
   if (explicitCaptureIntent(asked)) {
-    return { gate: true, kind: "capture", reason: captureReason(captureMode), explicit: true };
+    return { gate: true, kind: "capture", reason: captureReason(captureMode, unclearNest), explicit: true };
   }
 
   const always = /^(1|true|yes|on)$/i.test(env.CONTEXTNEST_CAPTURE_ALWAYS || "");
@@ -207,7 +210,7 @@ export function captureSignal({ transcript, ledger, env, captureMode }) {
     if (!isSubstantive(lines)) return { gate: false };
     if (inCooldown(ledger, userTurns, minTurns(env))) return { gate: false };
   }
-  return { gate: true, kind: "capture", reason: captureReason(captureMode), explicit: false };
+  return { gate: true, kind: "capture", reason: captureReason(captureMode, unclearNest), explicit: false };
 }
 
 /**
@@ -233,6 +236,7 @@ export function run({ input, env, readTranscript: readT = readTranscript, ledger
     ledger,
     env,
     captureMode: config.captureMode,
+    unclearNest: config.unclearNest,
   });
   if (!signal.gate) return null;
 

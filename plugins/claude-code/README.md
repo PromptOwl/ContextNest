@@ -50,8 +50,24 @@ On enable you'll be prompted for the settings below (all optional):
 | --- | --- | --- |
 | **Retrieval effort** | `search` | `off` · `search` (cheap) · `query` (graph) · `agent` (full reasoning) |
 | **Capture behaviour** | `propose` | `off` (never on its own) · `propose` (propose, write once you agree) · `auto` (write unattended) |
-| **Pinned vault** | _(empty)_ | A registered vault alias. Empty → the agents pick the relevant vault(s) automatically |
+| **When the nest for a new note is unclear** | `ask` | `ask` (capture asks which nest) · `default` (write to the pinned vault, else the registry default) |
+| **Pinned vault** | _(empty)_ | A registered vault alias, or `<server>/<nest>`. Empty → the agents pick the relevant vault(s) automatically |
 | **ctx binary** | `ctx` | Override the CLI command |
+
+## One server, many nests
+
+Register a Community server's all-nests endpoint once:
+
+```text
+ctx vault add contextnest --url https://<server>/mcp --bearer-env CONTEXTNEST_API_KEY
+```
+
+`ctx vault list` then shows a `contextnest/<nest>` row for every nest your key
+can reach, with each nest's description. Nests shared with you later appear on
+their own. The plugin searches `contextnest` (every nest, in one call) and
+cites each hit as `contextnest/<nest>:<id>`. Edits go back to that nest, and a
+new note goes to the nest whose description fits. When none clearly fits, the
+**unclear nest** setting decides: ask you (default), or use the default vault.
 
 ## Changing settings later
 
@@ -72,7 +88,7 @@ scripting.
 
 Changes are written to a settings override file and take effect on the next
 prompt — no restart or re-enable needed. You can also edit the files directly
-(keys: `retrieval_mode`, `capture_mode`, `vault`, `ctx_command`):
+(keys: `retrieval_mode`, `capture_mode`, `unclear_nest`, `vault`, `ctx_command`):
 
 | Scope | File | Precedence |
 | --- | --- | --- |

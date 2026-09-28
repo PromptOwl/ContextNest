@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,8 +73,10 @@ describe("ctx vault — central registry", () => {
   it("vault add / list / remove round-trip", () => {
     const a = join(tmp, "a");
     mkdirSync(a, { recursive: true });
-    // init auto-registers the vault under a directory-derived alias ("a").
-    run(["init", "--name", "Standalone"], a);
+    // init registers the vault under a directory-derived alias ("a"). The
+    // sandbox lives under the OS temp dir, where init no longer auto-registers,
+    // so ask for it explicitly.
+    run(["init", "--name", "Standalone", "--register"], a);
     expect(run(["vault", "list"], tmp)).toContain("a");
 
     run(["vault", "add", "work", a, "--description", "Work vault"], tmp);
@@ -101,6 +103,25 @@ describe("ctx vault — central registry", () => {
     const which = run(["vault", "which"], outside, { CONTEXTNEST_VAULT: "alpha" });
     expect(which).toContain("source: env-alias");
     expect(which).toContain("alias: alpha");
+  });
+
+  it("vault which --json reports the resolved vault as a machine-readable object [CU-wdqcq01c5v]", () => {
+    const a = join(tmp, "a");
+    mkdirSync(a, { recursive: true });
+    run(["init", "--name", "A", "--vault", "alpha"], a);
+
+    // Inside the vault: resolved by the cwd walk-up.
+    const local = JSON.parse(run(["vault", "which", "--json"], a));
+    expect(local.kind).toBe("local");
+    expect(local.source).toBe("local");
+    expect(realpathSync(local.path)).toBe(realpathSync(a));
+    expect(local.alias).toBeUndefined();
+
+    // Outside, by flag: same shape, with the alias that was used.
+    const outside = join(tmp, "outside");
+    mkdirSync(outside, { recursive: true });
+    const flagged = JSON.parse(run(["vault", "which", "--json", "--vault", "alpha"], outside));
+    expect(flagged).toMatchObject({ kind: "local", source: "flag", alias: "alpha" });
   });
 
   it("surfaces a clear error for an unknown --vault alias", () => {

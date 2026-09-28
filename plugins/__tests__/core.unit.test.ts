@@ -11,6 +11,7 @@ import { run as retrieve } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
 import {
   run as captureGate,
+  captureReason,
   captureSignal,
   CHANGE_REASON,
   isSubstantive,
@@ -50,6 +51,9 @@ import {
   VALID_RETRIEVAL_MODES,
   makeExec,
   winQuote,
+  MAX_FANOUT_VAULTS,
+  MAX_HITS,
+  MAX_LIST_SCAN,
 } from "../shared/core/lib.js";
 
 /** Transcript stub in the shape the gate's reader returns. */
@@ -100,17 +104,29 @@ function additional(out: any): string | undefined {
 }
 
 // getConfig() reads real override files when the caller doesn't inject
-// cwd/homedir (sessionStart never does). Point the home and project dirs at an
-// empty temp dir so a developer's own ~/.contextnest/plugin-settings.json can't
-// leak into these assertions. os.homedir() reads $HOME on POSIX and
-// %USERPROFILE% on Windows — setting only HOME leaves Windows unisolated, where
-// a real pinned vault turns eight of these into failures.
+// cwd/homedir (sessionStart never does). Point the home dir at an empty temp
+// dir so a developer's own ~/.contextnest/plugin-settings.json can't leak into
+// these assertions. os.homedir() reads $HOME on POSIX and %USERPROFILE% on
+// Windows — setting only HOME leaves Windows unisolated, where a real pinned
+// vault turns eight of these into failures.
+//
+// Mutating process.env.CLAUDE_PROJECT_DIR does NOT isolate the project dir the
+// same way: getConfig(env, opts) resolves cwd as
+// `opts.cwd || env.CLAUDE_PROJECT_DIR || process.cwd()`, reading it off the
+// `env` PARAMETER, not off the process-global. Every call below passes its own
+// literal env object (to test one key in isolation), so the mutation here is
+// invisible to them and they fall through to the real process.cwd() — a
+// developer's actual checkout, .claude/contextnest.local.json included. Use
+// `cfg()`/`startSession()` below, which inject SANDBOX_DIR through that same
+// `env.CLAUDE_PROJECT_DIR` channel a real Claude Code hook invocation would
+// populate, instead of calling getConfig()/sessionStart() directly.
+let SANDBOX_DIR: string;
 const realEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR };
 beforeAll(() => {
-  const empty = mkdtempSync(join(tmpdir(), "cn-no-settings-"));
-  process.env.HOME = empty;
-  process.env.USERPROFILE = empty;
-  process.env.CLAUDE_PROJECT_DIR = empty;
+  SANDBOX_DIR = mkdtempSync(join(tmpdir(), "cn-no-settings-"));
+  process.env.HOME = SANDBOX_DIR;
+  process.env.USERPROFILE = SANDBOX_DIR;
+  process.env.CLAUDE_PROJECT_DIR = SANDBOX_DIR;
 });
 afterAll(() => {
   for (const [key, value] of Object.entries(realEnv)) {
@@ -119,13 +135,35 @@ afterAll(() => {
   }
 });
 
+/**
+ * getConfig(), sandboxed against SANDBOX_DIR — every bare call below goes
+ * through this, not the raw import, so a real .claude/contextnest.local.json
+ * on the developer's own machine can never leak into an assertion (see the
+ * note above). Calls that already sandbox their own cwd/homedir via
+ * `tempSettings()`'s `opts` (the "settings override files" suite) call
+ * getConfig() directly and don't need this.
+ */
+function cfg(env: Record<string, string | undefined> = {}) {
+  return getConfig({ ...env, CLAUDE_PROJECT_DIR: SANDBOX_DIR });
+}
+
+/**
+ * sessionStart(), sandboxed the same way. `run({env})` has no opts parameter
+ * of its own to inject through — it calls getConfig(env) with none — so the
+ * only isolation channel available is env.CLAUDE_PROJECT_DIR itself, same as
+ * a real Claude Code invocation would provide.
+ */
+function startSession(args: Parameters<typeof sessionStart>[0]) {
+  return sessionStart({ ...args, env: { ...args.env, CLAUDE_PROJECT_DIR: SANDBOX_DIR } });
+}
+
 describe("getConfig", () => {
   it("defaults and Claude userConfig precedence", () => {
-    expect(getConfig({}).retrievalMode).toBe("search");
-    expect(getConfig({}).autoCapture).toBe(true);
-    expect(getConfig({}).captureMode).toBe("propose");
-    expect(getConfig({}).vault).toBe("");
-    expect(getConfig({}).ctxCommand).toBe("ctx");
+    expect(cfg({}).retrievalMode).toBe("search");
+    expect(cfg({}).autoCapture).toBe(true);
+    expect(cfg({}).captureMode).toBe("propose");
+    expect(cfg({}).vault).toBe("");
+    expect(cfg({}).ctxCommand).toBe("ctx");
 
     const env = {
       CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE: "QUERY",
@@ -133,7 +171,7 @@ describe("getConfig", () => {
       CLAUDE_PLUGIN_OPTION_VAULT: "work",
       CLAUDE_PLUGIN_OPTION_CTX_COMMAND: "/bin/ctx",
     };
-    const c = getConfig(env);
+    const c = cfg(env);
     expect(c.retrievalMode).toBe("query");
     expect(c.autoCapture).toBe(false);
     expect(c.vault).toBe("work");
@@ -141,7 +179,7 @@ describe("getConfig", () => {
   });
 
   it("generic CONTEXTNEST_* fallbacks when no Claude option is set", () => {
-    const c = getConfig({ CONTEXTNEST_RETRIEVAL_MODE: "agent", CONTEXTNEST_VAULT_ALIAS: "p" });
+    const c = cfg({ CONTEXTNEST_RETRIEVAL_MODE: "agent", CONTEXTNEST_VAULT_ALIAS: "p" });
     expect(c.retrievalMode).toBe("agent");
     expect(c.vault).toBe("p");
   });
@@ -323,11 +361,11 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
     });
 
     it("a malformed alias is skipped → default unpinned, cannot mask a valid layer", () => {
-      for (const bad of ["my vault", "a/b", "..", "work!"]) {
+      for (const bad of ["my vault", "a/b/c", "/b", "..", "work!"]) {
         expect(getConfig({}, tempSettings({ vault: bad })).vault).toBe("");
       }
       // Junk project value must not hide a valid alias in the user file.
-      const both = tempSettings({ vault: "a/b" }, { vault: "home" });
+      const both = tempSettings({ vault: "a/b/c" }, { vault: "home" });
       expect(getConfig({}, both).vault).toBe("home");
     });
 
@@ -374,18 +412,154 @@ describe("lib helpers", () => {
 
   it("vaultTargets: a registered pin is honoured; unpinned fans out; empty registry → [null]", () => {
     const ex = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "b", exists: true }]]]);
-    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
-    expect(vaultTargets(getConfig({}), ex)).toEqual(["a", "b"]);
-    expect(vaultTargets(getConfig({}), fakeExec([["vault list", []]]))).toEqual([null]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
+    expect(vaultTargets(cfg({}), ex)).toEqual(["a", "b"]);
+    expect(vaultTargets(cfg({}), fakeExec([["vault list", []]]))).toEqual([null]);
   });
 
   it("vaultTargets: a stale pin (not registered) falls back to auto-select, not a bad --vault", () => {
     const twoVaults = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "b", exists: true }]]]);
     // "pin" isn't in the registry → behave as unpinned (fan out), never ["pin"].
-    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "pin" }), twoVaults)).toEqual(["a", "b"]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "pin" }), twoVaults)).toEqual(["a", "b"]);
     // Registered but path missing (exists:false) is also not usable → fall back.
     const missing = fakeExec([["vault list", [{ alias: "gone", exists: false }]]]);
-    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "gone" }), missing)).toEqual([null]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "gone" }), missing)).toEqual([null]);
+  });
+
+  // CU-wdqcq01c5v — the vault in the working directory used to be ignored
+  // whenever the registry was non-empty, and the fan-out happily hit demo/tmp
+  // vaults ahead of it.
+  it("vaultTargets: the cwd vault is searched first (as null), then the registry", () => {
+    const ex = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "crm", path: "/vaults/crm", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), ex)).toEqual([null, "demo", "crm"]);
+  });
+
+  it("vaultTargets: a cwd vault that is also registered is searched once, by alias, first", () => {
+    const ex = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "crm", path: "/vaults/crm", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/vaults/crm", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), ex)).toEqual(["crm", "demo"]);
+  });
+
+  it("vaultTargets: registry entries that are missing or live under os.tmpdir() are never targeted", () => {
+    const scratch = join(tmpdir(), "cn-scratch-vault");
+    const registry = [
+      { alias: "gone", path: "/vaults/gone", exists: false },
+      { alias: "scratch", path: scratch, exists: true },
+      { alias: "demo", path: "/vaults/demo", exists: true },
+    ];
+    // No cwd vault (ctx would fall back to the bare cwd) → only the real one.
+    const noCwd = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), noCwd)).toEqual(["demo"]);
+    // Nothing eligible and no cwd vault → let ctx resolve, as with an empty registry.
+    const nothing = fakeExec([
+      ["vault list", registry.slice(0, 2)],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), nothing)).toEqual([null]);
+    // A cwd vault that happens to live under tmp is a deliberate choice → kept.
+    const cwdInTmp = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: scratch, source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdInTmp)).toEqual(["scratch", "demo"]);
+  });
+
+  it("vaultTargets: the cwd vault counts against MAX_FANOUT_VAULTS", () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ alias: `v${i}`, path: `/vaults/v${i}`, exists: true }));
+    const ex = fakeExec([
+      ["vault list", many],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    const targets = vaultTargets(cfg({}), ex);
+    expect(targets).toHaveLength(MAX_FANOUT_VAULTS);
+    expect(targets[0]).toBeNull();
+    expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
+  });
+
+  // The registry default used to compete for the MAX_FANOUT_VAULTS slots in
+  // plain registry order. With a few demo vaults registered before it, the
+  // vault the user actually works in was sliced off and never searched, while
+  // the demos' nodes were injected into every prompt.
+  it("vaultTargets: the registry default is always targeted, even past the fan-out cap", () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ alias: `v${i}`, path: `/vaults/v${i}`, exists: true }));
+    const registry = many.map((v) => (v.alias === "v6" ? { ...v, isDefault: true } : v));
+    const ex = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    const targets = vaultTargets(cfg({}), ex);
+    expect(targets).toHaveLength(MAX_FANOUT_VAULTS);
+    expect(targets[0]).toBe("v6");
+    expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
+  });
+
+  it("vaultTargets: order is cwd vault, then the default, then the registry — each once", () => {
+    const registry = [
+      { alias: "demo", path: "/vaults/demo", exists: true },
+      { alias: "crm", path: "/vaults/crm", exists: true },
+      { alias: "brain", path: "/vaults/brain", exists: true, isDefault: true },
+    ];
+    // Unregistered cwd vault (null) leads; the default comes next, not "demo".
+    const cwdElsewhere = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdElsewhere)).toEqual([null, "brain", "demo", "crm"]);
+    // cwd IS the default → targeted once, by alias, first.
+    const cwdIsDefault = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/vaults/brain", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdIsDefault)).toEqual(["brain", "demo", "crm"]);
+    // cwd is some other registered vault → cwd, then default, then the rest.
+    const cwdIsCrm = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/vaults/crm", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdIsCrm)).toEqual(["crm", "brain", "demo"]);
+  });
+
+  it("vaultTargets: a default that is missing on disk is not targeted; one under tmp still is", () => {
+    const scratch = join(tmpdir(), "cn-default-scratch");
+    const gone = fakeExec([
+      ["vault list", [
+        { alias: "gone", path: "/vaults/gone", exists: false, isDefault: true },
+        { alias: "demo", path: "/vaults/demo", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), gone)).toEqual(["demo"]);
+    // Deliberately chosen as default → kept even though a plain tmp entry would be skipped.
+    const inTmp = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "scratch", path: scratch, exists: true, isDefault: true },
+      ]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), inTmp)).toEqual(["scratch", "demo"]);
+  });
+
+  it("vaultTargets: a registered pin still short-circuits, even with a cwd vault", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
   });
 
   it("isVaultRegistered: true only for a registered, present alias", () => {
@@ -442,6 +616,67 @@ describe("retrieve", () => {
     const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
     expect(additional(out)).toContain("work:nodes/w");
     expect(additional(out)).toContain("home:nodes/h");
+  });
+
+  it("search → the cwd vault's hits come first and are cited without an alias prefix", () => {
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) return json([{ alias: "demo", path: "/vaults/demo", exists: true }]);
+      if (k.includes("vault which")) return json({ kind: "local", path: "/work/notes", source: "local" });
+      if (k.includes("--vault demo")) return json([{ id: "nodes/gi", title: "Gastro", type: "document" }]);
+      if (k.startsWith("search")) return json([{ id: "nodes/local", title: "Local Note", type: "document" }]);
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const text = additional(out)!;
+    expect(text).toContain("- nodes/local — Local Note");
+    expect(text).toContain("- demo:nodes/gi — Gastro");
+    expect(text.indexOf("nodes/local")).toBeLessThan(text.indexOf("demo:nodes/gi"));
+  });
+
+  // One vault with a long hit list used to fill every slot before the next
+  // target was searched — on an unranked search that meant a demo vault's
+  // alphabetical head, every prompt, with the real vault never shown.
+  it("search → hit slots are shared round-robin across vaults, primary vault listed first", () => {
+    const many = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i) => ({ id: `nodes/${prefix}${i}`, title: `${prefix}${i}`, type: "document" }));
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) {
+        return json([{ alias: "demo", path: "/vaults/demo", exists: true }, { alias: "brain", path: "/vaults/brain", exists: true }]);
+      }
+      if (k.includes("--vault demo")) return json(many("d", 20));
+      if (k.includes("--vault brain")) return json(many("b", 20));
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const lines = additional(out)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines).toHaveLength(MAX_HITS);
+    expect(lines.map((l) => l.slice(2).split(" ")[0])).toEqual([
+      "demo:nodes/d0", "demo:nodes/d1", "demo:nodes/d2",
+      "brain:nodes/b0", "brain:nodes/b1", "brain:nodes/b2",
+    ]);
+  });
+
+  it("search → a vault with few hits gives its unused slots back to the others", () => {
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) {
+        return json([{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]);
+      }
+      if (k.includes("--vault a")) return json([{ id: "nodes/a0", title: "A0", type: "document" }]);
+      if (k.includes("--vault b")) {
+        return json(Array.from({ length: 10 }, (_, i) => ({ id: `nodes/b${i}`, title: `B${i}`, type: "document" })));
+      }
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const lines = additional(out)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines).toHaveLength(MAX_HITS);
+    expect(lines[0]).toContain("a:nodes/a0");
+    expect(lines.slice(1).map((l) => l.slice(2).split(" ")[0])).toEqual(
+      ["b0", "b1", "b2", "b3", "b4"].map((x) => `b:nodes/${x}`),
+    );
   });
 
   it("query → maps ids to tags via ctx list then injects graph documents", () => {
@@ -513,7 +748,7 @@ describe("retrieve", () => {
 
 describe("session-start", () => {
   it("warns when ctx is unavailable", () => {
-    const out = sessionStart({ input: {}, env: {}, exec: () => ({ status: 1, stdout: "", code: "ENOENT" }) });
+    const out = startSession({ input: {}, env: {}, exec: () => ({ status: 1, stdout: "", code: "ENOENT" }) });
     expect(additional(out)).toMatch(/not available/i);
   });
 
@@ -524,7 +759,7 @@ describe("session-start", () => {
         { alias: "home", description: "personal", exists: true },
       ]],
     ]);
-    const out = sessionStart({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec: ex });
+    const out = startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec: ex });
     const ctx = additional(out)!;
     expect(ctx).toContain("`work`");
     expect(ctx).toContain("default");
@@ -535,7 +770,7 @@ describe("session-start", () => {
     const ex = fakeExec([
       ["vault list", [{ alias: "work", exists: true }, { alias: "home", exists: true }]],
     ]);
-    const out = sessionStart({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "ghost" }, exec: ex });
+    const out = startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "ghost" }, exec: ex });
     const ctx = additional(out)!;
     expect(ctx).toMatch(/not a registered vault/i);
     expect(ctx).toContain("`ghost`");
@@ -544,8 +779,39 @@ describe("session-start", () => {
     expect(ctx).not.toContain("pinned");
   });
 
+  it("mentions a working-directory vault when one is detected", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/proj/notes", source: "local" }],
+    ]);
+    const out = startSession({ input: { cwd: "/proj/notes" }, env: {}, exec: ex });
+    const ctx = additional(out)!;
+    expect(ctx).toMatch(/working-directory vault/i);
+    expect(ctx).toContain("/proj/notes");
+    expect(ctx).toMatch(/not registered/i);
+  });
+
+  it("names the alias when the working-directory vault is registered", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/vaults/work", source: "local" }],
+    ]);
+    const ctx = additional(startSession({ input: {}, env: {}, exec: ex }))!;
+    expect(ctx).toMatch(/working-directory vault/i);
+    expect(ctx).toContain("`work`");
+    expect(ctx).not.toMatch(/not registered/i);
+  });
+
+  it("does not mention a working-directory vault when the cwd is not a vault", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "default", alias: "work" }],
+    ]);
+    expect(additional(startSession({ input: {}, env: {}, exec: ex }))).not.toMatch(/working-directory vault/i);
+  });
+
   it("notes local resolution when no vaults are registered", () => {
-    const out = sessionStart({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
+    const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
     expect(additional(out)).toMatch(/No vaults are registered/i);
   });
 });
@@ -733,10 +999,10 @@ describe("sweep-check", () => {
   it("findStragglers: confirms by read, spans nests, excludes only the written node in its own nest", () => {
     const exec = fakeExec([
       // eng: sibling still asserts redis; the written node does not any more.
-      ["search redis --json --vault eng", [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
       ["read nodes/sibling --raw --vault eng", "---\nt: x\n---\nCounters kept in Redis."],
       // mkt: fuzzy hit whose body does NOT contain the term → must be dropped.
-      ["search redis --json --vault mkt", [{ id: "nodes/fuzzy" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/fuzzy" }]],
       ["read nodes/fuzzy --raw --vault mkt", "---\nt: x\n---\nNothing relevant here."],
     ]);
     const { found, truncated } = findStragglers(exec, ["redis"], "nodes/written", "eng", ["eng", "mkt"]);
@@ -749,7 +1015,7 @@ describe("sweep-check", () => {
       // Tagged with the entity, body words the fact without the literal term.
       ["list --tag redis", [{ id: "nodes/brand" }]],
       ["read nodes/brand --raw --vault mkt", "---\nt: x\n---\nOur flagship in-memory engine."],
-      ["search redis --json --vault mkt", []],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, []],
     ]);
     const { found } = findStragglers(exec, ["redis"], "nodes/x", "eng", ["mkt"]);
     // Reported as stale: the node either asserts the fact in other words (needs
@@ -809,8 +1075,8 @@ describe("sweep-check", () => {
       ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
       ["history nodes/a --json --vault eng", history],
       ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
-      ["search redis --json --vault eng", [{ id: "nodes/a" }]],
-      ["search redis --json --vault mkt", [{ id: "nodes/pitch" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/a" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/pitch" }]],
       ["read nodes/pitch --raw --vault mkt", "---\nt: x\n---\nWe brag about Redis speed."],
     ]);
     const out = sweepCheck({
@@ -1231,5 +1497,87 @@ describe("makeExec", () => {
     const exec = makeExec({ ctxCommand: process.execPath });
     const res = exec(["-e", "process.exit(3)"]);
     expect(res.status).toBe(3);
+  });
+});
+
+
+// One server alias (`cn`, a Community server's all-nests /mcp) stands for every
+// nest behind it; `ctx vault list` adds a `cn/<nest>` row per nest.
+describe("server-level alias with <server>/<nest> rows", () => {
+  const rows = [
+    { alias: "cn", kind: "remote", description: "All 2 nest(s)" },
+    { alias: "cn/strategy", kind: "remote", parent: "cn", description: "GTM strategy" },
+    { alias: "cn/chameleon", kind: "remote", parent: "cn", description: "Partner: Chameleon" },
+  ];
+
+  it("auto-retrieval searches the server row once, not each nest row", () => {
+    expect(vaultTargets(cfg({}), fakeExec([["vault list", rows]]))).toEqual(["cn"]);
+  });
+
+  it("a <server>/<nest> pin is honoured", () => {
+    const ex = fakeExec([["vault list", rows]]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "cn/chameleon" }), ex)).toEqual(["cn/chameleon"]);
+  });
+
+  it("retrieval cites each hit by the nest it came from", () => {
+    const ex = fakeExec([
+      ["vault list", rows],
+      ["search", [{ id: "nodes/p", title: "Partner pricing", vault: "cn/chameleon" }]],
+    ]);
+    const out = retrieve({ input: { prompt: "partner pricing tiers" }, env: { CLAUDE_PROJECT_DIR: SANDBOX_DIR }, exec: ex });
+    expect(additional(out)).toContain("cn/chameleon:nodes/p");
+  });
+
+  it("the sweep parses --vault <server>/<nest> and reads each hit in its own nest", () => {
+    expect(parseUpdates("ctx update nodes/x --vault cn/chameleon --tags a")).toEqual([
+      { id: "nodes/x", vault: "cn/chameleon" },
+    ]);
+    const reads: string[] = [];
+    const exec = (args: string[]) => {
+      const key = args.join(" ");
+      if (key.startsWith("list --tag")) return { status: 0, stdout: "[]", stderr: "" };
+      if (key.startsWith("search"))
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { id: "nodes/x", vault: "cn/chameleon" }, // the node just written: excluded
+            { id: "nodes/y", vault: "cn/strategy" },
+          ]),
+          stderr: "",
+        };
+      if (key.startsWith("read")) {
+        reads.push(key);
+        return { status: 0, stdout: "we use redis", stderr: "" };
+      }
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", "cn/chameleon", ["cn"]);
+    expect(found).toEqual([{ ref: "cn/strategy:nodes/y", term: "redis", stale: false }]);
+    expect(reads).toEqual(["read nodes/y --raw --vault cn/strategy"]);
+  });
+
+  it("sweepTargets skips nest rows (the server row covers them)", () => {
+    const { targets } = sweepTargets(fakeExec([["vault list", rows]]), "cn/chameleon", {});
+    // The server row already searches cn/chameleon — no second pass for it.
+    expect(targets).toEqual(["cn"]);
+  });
+});
+
+describe("unclear_nest setting", () => {
+  it("defaults to ask; accepts default; ignores garbage", () => {
+    expect(cfg({}).unclearNest).toBe("ask");
+    expect(cfg({ CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST: "default" }).unclearNest).toBe("default");
+    expect(cfg({ CONTEXTNEST_UNCLEAR_NEST: "Default " }).unclearNest).toBe("default");
+    expect(cfg({ CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST: "guess" }).unclearNest).toBe("ask");
+  });
+
+  it("travels in the capture directive", () => {
+    expect(captureReason("propose")).toMatch(/asks the user which nest/);
+    expect(captureReason("propose", "default")).toMatch(/pinned vault, else the registry default/);
+  });
+
+  it("a <server>/<nest> pin passes the alias-shape check", () => {
+    expect(cfg({ CONTEXTNEST_VAULT_ALIAS: "cn/chameleon" }).vault).toBe("cn/chameleon");
+    expect(cfg({ CONTEXTNEST_VAULT_ALIAS: "a/b/c" }).vault).toBe("");
   });
 });

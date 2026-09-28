@@ -59,7 +59,7 @@ Skill nodes codify team procedures (PR review, incident response, deployment che
 
 A safe shared brain.
 
-Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **AGPL-licensed open standard — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
 
 ## How is this different from...
 
@@ -418,7 +418,10 @@ agent_instructions: |
 
 ### File safety
 
-No `ctx` command writes to your working directory without saying so.
+No `ctx` command writes to your working directory without saying so. And no
+command reads or indexes a directory that is not a vault: when nothing resolves
+a vault (no `--vault`, no local vault, no registry default), `ctx` refuses with
+`Error [NO_VAULT]` instead of treating your current folder as one.
 
 | Flag | Effect |
 |---|---|
@@ -432,8 +435,8 @@ stdout stay clean. Interactive runs ask before writing; destructive commands
 default to "no".
 
 **For scripts:** `ctx delete`, `ctx checkpoint rebuild`, `ctx drift approve`,
-`ctx vault remove` and `ctx push` refuse to run without `--yes` (or `--force`)
-when there is no TTY. Additive commands proceed as before — a non-interactive
+`ctx vault remove`, `ctx vault prune` and `ctx push` refuse to run without
+`--yes` (or `--force`) when there is no TTY. Additive commands proceed as before — a non-interactive
 caller is never blocked waiting on stdin.
 
 ### Choosing a vault
@@ -457,10 +460,20 @@ ctx vault add personal /path/to/personal-vault --description "Second brain"
 
 # Use a registered vault from any directory
 ctx list --vault work
-ctx vault list          # show all registered vaults (* = default)
+ctx vault list          # show all registered vaults (* = default, [missing] = gone from disk)
 ctx vault default work  # change the default
 ctx vault which         # show which vault resolves right now, and why
+ctx vault prune         # drop aliases whose vault no longer exists (--dry-run to preview)
+ctx doctor              # versions, registry health, current vault, plugin version
 ```
+
+`ctx init` registers the new vault automatically — except when the vault lives
+under the OS temp dir (`/tmp`, `%TEMP%`), where scratch vaults created by agents
+and test runs would otherwise pile up as `[missing]` aliases. It prints
+`Not registering: vault is under the temp dir (pass --register to force)`;
+`--register`, or an explicit `--vault <alias>` / `--set-default`, registers it
+anyway. When the default alias itself has gone missing, `ctx vault list` says so
+and points at `ctx vault prune`.
 
 A vault is resolved with this precedence (highest first):
 
@@ -486,14 +499,16 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault add <alias> [path]` | Register a vault (path defaults to the current vault) |
 | `ctx vault describe <alias> [description]` | Set a registry description; omit the text to clear it |
 | `ctx vault remove <alias>` | Unregister an alias |
+| `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
-| `ctx vault which` | Show the resolved vault and the reason |
+| `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
 
 | Command | Description |
 |---|---|
-| `ctx init` | Initialize a new vault (supports `--starter` recipes) |
+| `ctx init` | Initialize a new vault (supports `--starter` recipes; `--register` to register one created under the OS temp dir) |
 | `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
 | `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
@@ -555,11 +570,61 @@ full stack trace back.
 | `ctx checkpoint list` | List checkpoints |
 | `ctx checkpoint rebuild` | Rebuild checkpoint history |
 
+### Importing literature (JATS / PubMed Central)
+
+Scientific articles arrive as JATS XML — PubMed Central's `*.nxml`, publisher
+deposits, society corpora. `ctx import jats` turns each one into a **markdown
+twin**: a `reference` node whose body is the article (sections as headings,
+one paragraph per line, GFM tables, figure captions, LaTeX kept as `$…$`,
+numbered references) and whose frontmatter carries the graph NLM already
+curated, as query tags:
+
+| Tag | From |
+|---|---|
+| `#pubtype-review-article`, `#pubtype-srma` | `article-type`, `custom-meta document_type` |
+| `#year-2019`, `#journal-clin-gastroenterol-hepatol` | `pub-date`, `journal-id` |
+| `#fecal-microbiota-transplantation` | `<kwd>` keywords |
+| `#license-cc-by-nc-nd` | `<license>` / `<ali:license_ref>` |
+| `#status-retracted`, `#has-erratum` | `<related-article>` retraction / correction links |
+| `#mesh-d003015` | PubTator entities (after `ctx enrich pubtator`) |
+
+Every paragraph keeps its JATS id as a trailing block anchor (`… ^p_4_2`), so
+an agent can cite `nodes/papers/pmid-31013034#p_4_2` rather than a whole
+paper. `metadata` holds `doi` / `pmid` / `pmcid`, authors, `source_sha256`
+and the parsed reference list; references whose DOI or PMID name another
+paper in the vault become `[[wikilinks]]` (`metadata.cites`), and earlier
+papers are re-linked when the paper they cite arrives.
+
+```bash
+ctx import jats ./corpus/                 # every .xml / .nxml under the folder
+ctx import jats paper.nxml --keep-xml     # also store the original under assets/jats/
+ctx import pubmed --term "fecal microbiota transplantation[mh] AND open access[filter]" --max 50
+ctx enrich pubtator                       # NCBI entities + relations, MeSH-normalised
+ctx query "#fmt #pubtype-srma -#status-retracted"
+```
+
+Imports are idempotent: unchanged XML (same `source_sha256`) is skipped, a
+changed file cuts a new version, and a batch shares one checkpoint. A file
+holding several `<article>`s (a `pmc-articleset` dump) is imported article by
+article. The twin is *derived*: a re-import (`--force`, or changed XML)
+regenerates its body, tags and NLM metadata from the XML and carries over
+only enrichment (`metadata.entities` / `relations` / `pubtator`, `#mesh-`
+tags, a resolved `pmid`/`pmcid`) — hand edits to a twin do not survive. `import
+pubmed` and `enrich pubtator` call NCBI's public services (3 requests/s; set
+`NCBI_API_KEY` or `--api-key` for 10/s). Only the PMC open-access subset is
+fetchable; each twin records its licence.
+
+| Command | Description |
+|---|---|
+| `ctx import jats <paths...> [--folder nodes/papers] [--keep-xml] [--no-relink]` | Import JATS files or folders as markdown twins (the global `--force` republishes unchanged twins) |
+| `ctx import pubmed --term <query> [--max 25] [--api-key]` | Search PMC (open access) and import the hits |
+| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations and `#mesh-` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
+
 ---
 
 ## MCP Server
 
-The MCP server exposes vault operations as 38 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 39 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -643,6 +708,14 @@ cloud:
 | `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
 | `context_delete` | Delete a node and its history; returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
+| `context_import_pdf` | Import a PDF as a `type: pdf` node — extracted text as the body, the PDF kept beside it and bound by SHA-256; pass `id` to version an existing one |
+
+Every tool above also takes an optional `client` object — `{ agent, session_id, …custom }` —
+naming the agent and session behind the call. A write that publishes records it on the
+version-history entry it seals (so `context_versions` shows which agent wrote which version);
+a graph read stamps it on the access traces it emits. It is a label, not an identity claim:
+it is never authenticated, never used to authorize, and never an input to a hash chain. See
+spec §9.4.
 
 **Vault tools:**
 
@@ -707,12 +780,12 @@ ctx verify                         # 8. Verify integrity
 
 ## License
 
-All packages are licensed under **AGPL-3.0**:
+The repository is **AGPL-3.0** ([LICENSE](LICENSE)), except the specification, which is **Apache-2.0** ([LICENSE-SPEC](LICENSE-SPEC)):
 
 - **CLI** ([@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli)): **AGPL-3.0**
 - **Engine** ([@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine)): **AGPL-3.0**
 - **MCP Server** ([@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)): **AGPL-3.0**
-- **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard
+- **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard, implementable without AGPL obligations
 
 AGPL-3.0 ensures all improvements stay open source. You are free to use, modify, and distribute Context Nest, but modifications to the source must be shared under the same license. Commercial licensing is available from [PromptOwl](https://promptowl.ai) for organizations that need to embed or redistribute without AGPL obligations.
 

@@ -8,9 +8,14 @@
  */
 
 import type { ContextYaml, NestConfig, Pack } from "./types.js";
+import { TAG_PATTERN } from "./schemas.js";
+import { SELECTOR_GRAMMAR } from "./selector/grammar.js";
 
 const SECTION_BEGIN = "<!-- BEGIN CONTEXT NEST (auto-generated, do not edit this section) -->";
 const SECTION_END = "<!-- END CONTEXT NEST -->";
+
+/** How many tags the "Vault Overview" block lists before summarizing the rest. */
+const MAX_OVERVIEW_TAGS = 40;
 
 /**
  * Fallback maintenance directive used when `config.agent_maintenance_directive`
@@ -163,9 +168,12 @@ function buildCoreInstructions(input: AgentConfigInput): string {
   lines.push('ctx query "#topic"              # By tag');
   lines.push('ctx query "type:document"        # By type');
   lines.push('ctx query "pack:pack-name"       # Load a pack');
+  lines.push('ctx query "nodes/<id>"           # One node by id');
   lines.push('ctx query "#tag" --hops 3        # Deeper graph traversal');
   lines.push('ctx query "#tag" --full           # Load everything (large vaults)');
   lines.push("```");
+  lines.push("");
+  lines.push(`Selector grammar: \`${SELECTOR_GRAMMAR}\``);
   lines.push("");
 
   // Maintenance directive — read from config, fall back to default
@@ -207,12 +215,27 @@ function buildCoreInstructions(input: AgentConfigInput): string {
   lines.push(`- **${published}** published documents, **${drafts}** drafts`);
   lines.push(`- **${contextYaml.relationships.length}** relationship edges`);
 
-  const tags = new Set<string>();
+  // Top tags by document count, capped. A real vault carries hundreds of tags
+  // (~700 on one founder vault), and listing every one of them turned this
+  // orientation block into the bulk of the agent's system prompt. Tags that
+  // fail the spec's tag rule (spaces, punctuation — usually a hashtag list
+  // pasted into one YAML entry) are left out: they cannot be queried, so
+  // advertising them only teaches the agent a selector that will never match.
+  const tagCounts = new Map<string, number>();
   for (const doc of contextYaml.documents) {
-    for (const tag of doc.tags) tags.add(tag);
+    for (const tag of new Set(doc.tags)) {
+      if (!TAG_PATTERN.test(tag)) continue;
+      tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+    }
   }
-  if (tags.size > 0) {
-    lines.push(`- Tags: ${[...tags].sort().map((t) => `\`#${t}\``).join(", ")}`);
+  if (tagCounts.size > 0) {
+    const ranked = [...tagCounts.entries()]
+      .sort(([a, ca], [b, cb]) => cb - ca || a.localeCompare(b))
+      .map(([tag]) => tag);
+    const shown = ranked.slice(0, MAX_OVERVIEW_TAGS);
+    const rest = ranked.length - shown.length;
+    const more = rest > 0 ? ` … and ${rest} more (run ctx list --json for all)` : "";
+    lines.push(`- Tags: ${shown.map((t) => `\`#${t}\``).join(", ")}${more}`);
   }
   lines.push("");
 

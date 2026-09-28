@@ -63,7 +63,9 @@ beforeAll(() => {
   ]) {
     const dir = join(workspace, alias);
     mkdirSync(dir, { recursive: true });
-    ctl(dir, ["init", "--name", alias, "--description", desc]);
+    // --register: the workspace is under the OS temp dir, where init no longer
+    // auto-registers a vault.
+    ctl(dir, ["init", "--name", alias, "--description", desc, "--register"]);
   }
   const eng = join(workspace, "eng");
   const mkt = join(workspace, "mkt");

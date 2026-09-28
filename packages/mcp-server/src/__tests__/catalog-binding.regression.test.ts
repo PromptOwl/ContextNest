@@ -65,14 +65,25 @@ async function freshVault(): Promise<string> {
   return dir;
 }
 
-async function connect(vaultPath: string): Promise<Client> {
+async function connect(
+  vaultPath: string,
+  extraEnv: Record<string, string> = {},
+): Promise<Client> {
   // Override applied AFTER the copy — see the note in mcp-server.regression.
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
   delete env.CTX_NEST_HOME;
+  // A developer's ambient attribution would otherwise leak into the "derived
+  // from the handshake" assertions below.
+  delete env.CONTEXTNEST_AGENT;
+  delete env.CONTEXTNEST_SESSION_ID;
+  delete env.CONTEXTNEST_NO_ATTRIBUTION;
   env.CONTEXTNEST_VAULT_PATH = vaultPath;
+  // Last, so a test's own override beats both the inherited environment and
+  // the vault path set just above.
+  Object.assign(env, extraEnv);
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [SERVER_ENTRY],
@@ -382,6 +393,97 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
     expect(json.published.length).toBe(2);
     expect(json.failed.length).toBe(0);
   });
+
+  it("carries `client` metadata over the wire onto the version entry", async () => {
+    // The whole point of the field is cross-process attribution: an agent on
+    // the far side of stdio says who it is, and the vault's audit trail keeps
+    // it. Asserting it in-process would not prove the MCP tool schema accepts
+    // it — an unadvertised property is dropped before the executor sees it.
+    const meta = { agent: "regression-agent", session_id: "sess-catalog-1", attempt: 1 };
+    const created = await callJson(client, "context_create", {
+      title: "Attributed Write",
+      content: "body",
+      client: meta,
+    });
+    const versions = await callJson(client, "context_versions", {
+      id: created.id,
+      client: meta,
+    });
+    expect(getOperation("context_versions")!.output.safeParse(versions).success).toBe(true);
+    expect(versions.versions.at(-1)!.client).toEqual(meta);
+  });
+
+  it("fills agent + session_id from the MCP handshake when the caller sends none", async () => {
+    // Most agents will not know the field exists, and an audit trail that is
+    // empty by default is not much of one. The server knows the client's name
+    // from `initialize` and owns the stdio connection, so it can say both.
+    const created = await callJson(client, "context_create", {
+      title: "Server Attributed",
+      content: "body",
+    });
+    const versions = await callJson(client, "context_versions", { id: created.id });
+    const recorded = versions.versions.at(-1)!.client;
+    expect(recorded.agent).toBe("catalog-regression-test");
+    expect(recorded.session_id).toMatch(/^mcp-[0-9a-f-]{36}$/);
+  });
+
+  it("derives the same attribution for the deprecated write tools", async () => {
+    // create_document / update_document / publish_document call publishDocument
+    // directly, bypassing runOp. Without this, a client still on the legacy
+    // tools writes unattributed history while the catalog tools are attributed.
+    await callJson(client, "create_document", { path: "nodes/legacy-attributed", title: "Legacy" });
+    await callJson(client, "update_document", { path: "nodes/legacy-attributed", title: "Legacy v2" });
+    await callJson(client, "publish_document", { path: "nodes/legacy-attributed" });
+    const versions = await callJson(client, "context_versions", { id: "nodes/legacy-attributed" });
+    expect(versions.versions).toHaveLength(3);
+    for (const v of versions.versions) {
+      expect(v.client.agent).toBe("catalog-regression-test");
+      expect(v.client.session_id).toMatch(/^mcp-/);
+    }
+  });
+
+  it("lets a caller override the defaults per key, not all-or-nothing", async () => {
+    const created = await callJson(client, "context_create", {
+      title: "Partial Override",
+      content: "body",
+      client: { agent: "downstream-agent" },
+    });
+    const versions = await callJson(client, "context_versions", { id: created.id });
+    const recorded = versions.versions.at(-1)!.client;
+    // The caller's agent wins…
+    expect(recorded.agent).toBe("downstream-agent");
+    // …and the session it did not supply is still filled in, rather than lost.
+    expect(recorded.session_id).toMatch(/^mcp-/);
+  });
+
+  it("keeps one session id across every call on a connection", async () => {
+    const a = await callJson(client, "context_create", { title: "Same Session A", content: "x" });
+    const b = await callJson(client, "context_create", { title: "Same Session B", content: "y" });
+    const [va, vb] = await Promise.all([
+      callJson(client, "context_versions", { id: a.id }),
+      callJson(client, "context_versions", { id: b.id }),
+    ]);
+    expect(va.versions.at(-1)!.client.session_id).toBe(vb.versions.at(-1)!.client.session_id);
+  });
+
+  it("refuses malformed `client` metadata rather than writing an unvalidated one", async () => {
+    // The SDK validates tool arguments against the published schema before the
+    // handler runs, so this is rejected at the protocol layer rather than
+    // reaching the engine's own VALIDATION_FAILED. Either way the contract that
+    // matters holds: a non-scalar never lands in the audit trail.
+    const { text, isError } = await callText(client, "context_create", {
+      title: "Bad Attribution",
+      content: "body",
+      client: { agent: { nested: "not a scalar" } },
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/client/);
+
+    const listed = await callJson(client, "context_list", {});
+    expect(listed.documents.some((d: { title: string }) => d.title === "Bad Attribution")).toBe(
+      false,
+    );
+  });
 });
 
 // ─── Alias adapter edge cases ───────────────────────────────────────────────
@@ -515,5 +617,72 @@ describe("[regression] catalog binding — structured error contract", () => {
 
     const getErr = await callError(client, "context_get", { id: "nodes/retired-probe" });
     expect(getErr.code).toBe("REJECTED_DOCUMENT");
+  });
+});
+
+
+// ─── Attribution is optional ────────────────────────────────────────────────
+
+describe("[regression] catalog binding — attribution is optional", () => {
+  let vault: string;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+  });
+  afterAll(async () => {
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("records nothing when CONTEXTNEST_NO_ATTRIBUTION=1", async () => {
+    const client = await connect(vault, { CONTEXTNEST_NO_ATTRIBUTION: "1" });
+    try {
+      const created = await callJson(client, "context_create", {
+        title: "Opted Out",
+        content: "body",
+      });
+      const versions = await callJson(client, "context_versions", { id: created.id });
+      // Absent, not an empty object: "not attributed" and "attributed to
+      // nobody" are different claims, and history should only make the first.
+      expect(versions.versions.at(-1)).not.toHaveProperty("client");
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("still honours a caller's own client when the server adds none", async () => {
+    // Opting the SERVER out is not a gag order on the caller — a client that
+    // deliberately sends attribution has chosen to record it.
+    const client = await connect(vault, { CONTEXTNEST_NO_ATTRIBUTION: "1" });
+    try {
+      const created = await callJson(client, "context_create", {
+        title: "Caller Insisted",
+        content: "body",
+        client: { agent: "explicit-agent" },
+      });
+      const versions = await callJson(client, "context_versions", { id: created.id });
+      expect(versions.versions.at(-1)!.client).toEqual({ agent: "explicit-agent" });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("lets CONTEXTNEST_AGENT / CONTEXTNEST_SESSION_ID override what the connection reports", async () => {
+    const client = await connect(vault, {
+      CONTEXTNEST_AGENT: "operator-named",
+      CONTEXTNEST_SESSION_ID: "s-operator",
+    });
+    try {
+      const created = await callJson(client, "context_create", {
+        title: "Operator Named",
+        content: "body",
+      });
+      const versions = await callJson(client, "context_versions", { id: created.id });
+      expect(versions.versions.at(-1)!.client).toEqual({
+        agent: "operator-named",
+        session_id: "s-operator",
+      });
+    } finally {
+      await client.close();
+    }
   });
 });

@@ -126,7 +126,7 @@ export class GraphTraverser {
         const neighbor = edge.from;
         if (visited.has(neighbor)) continue;
 
-        const cost = this.edgeCost(edge);
+        const cost = this.reverseEdgeCost(edge);
         const newRemaining = remainingHops - cost;
 
         if (newRemaining >= 0) {
@@ -162,6 +162,22 @@ export class GraphTraverser {
     if (this.hubIds.has(edge.to)) return 0;
 
     // Default: reference edges cost 1
+    return 1;
+  }
+
+  /**
+   * Hop cost for walking an edge backwards (from `edge.to` to `edge.from`).
+   * The free rules above are about reaching a node cheaply, so they apply in
+   * the direction of travel: walking back from a hub is not free (otherwise a
+   * hub seed would pull in every document that links to it at zero cost), and
+   * walking back along depends_on (to a dependent, not a dependency) costs a hop.
+   * - Explicit priority: as given
+   * - Walking back TO a hub node: free
+   * - Everything else: cost 1
+   */
+  private reverseEdgeCost(edge: RelationshipEdge): number {
+    if (edge.priority !== undefined) return edge.priority;
+    if (this.hubIds.has(edge.from)) return 0;
     return 1;
   }
 }

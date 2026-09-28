@@ -21,6 +21,9 @@ export const NODE_TYPES = [
   "agent",
   "artifact",
   "table",
+  // A PDF document: the body is the text extracted from it, and the required
+  // `pdf:` block binds the binary sidecar beside the .md by SHA-256 (§1.11).
+  "pdf",
 ] as const;
 
 export const STATUSES = [
@@ -150,15 +153,33 @@ export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
 // still matches.
 export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_:-]*$/;
 
+/** Longest `title` a document may carry (§1.4, §13 rule 2). */
+export const TITLE_MAX_LENGTH = 200;
+
+/** The tag rule in words a person can act on — `TAG_PATTERN.source` is not that. */
+export const TAG_RULE =
+  'tags start with a letter and contain only letters, digits, "_", ":" or "-" (e.g. #api, #q3-close, #v2)';
+
+/** One message for every surface that rejects a tag: names the value AND the rule. */
+export const describeInvalidTag = (value: unknown): string =>
+  `invalid tag ${JSON.stringify(value)} — ${TAG_RULE}`;
+
 /** Checksum pattern (§13 rule 8) */
 export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 /** contextnest:// URI pattern */
 export const CONTEXT_NEST_URI_PATTERN = /^contextnest:\/\//;
 
-const tagSchema = z
-  .string()
-  .regex(TAG_PATTERN, `Tag must match pattern: ${TAG_PATTERN.source}`);
+// errorMap, not `.refine()`: a refine becomes a ZodEffects and zod-to-json-schema
+// drops the `pattern` from the published MCP tool schema. The errorMap sees the
+// value (`ctx.data`), so the message still names the offending tag.
+export const tagSchema = z
+  .string({
+    errorMap: (issue, ctx) => ({
+      message: issue.code === "invalid_string" ? describeInvalidTag(ctx.data) : ctx.defaultError,
+    }),
+  })
+  .regex(TAG_PATTERN);
 
 const skillInputSchema = z.object({
   name: z.string().min(1),
@@ -203,9 +224,44 @@ export const sourceMetaSchema = z.object({
   cache_ttl: z.number().int().positive().optional(), // Rule 16
 });
 
+/**
+ * The `pdf` block (§1.11) — present iff `type: pdf`.
+ *
+ * It is what makes the binary part of the governed record: `sha256` names the
+ * exact bytes of the sidecar at `file`, and because the block sits in
+ * frontmatter it is inside every version's content_hash, so the PDF is bound
+ * into the version chain without any change to the chain itself.
+ *
+ * Non-strict for the same reason as {@link sourceMetaSchema}: this parses
+ * files already on disk. `file` is only shape-checked here (relative, `.pdf`,
+ * no `..`); that it names the node's OWN sidecar (`<id>.pdf`) needs the node id
+ * and is checked in `validateDocument` (§13 rule 26).
+ */
+export const pdfMetaSchema = z.object({
+  file: z
+    .string()
+    .min(1)
+    .refine(
+      (f) =>
+        f.toLowerCase().endsWith(".pdf") &&
+        !f.startsWith("/") &&
+        !f.includes("\\") &&
+        !/^[a-zA-Z]:/.test(f) &&
+        !f.split("/").some((seg) => seg === ".." || seg === "."),
+      "pdf.file must be a vault-relative path ending in .pdf (forward slashes, no `..`)",
+    ),
+  sha256: z.string().regex(CHECKSUM_PATTERN, "pdf.sha256 must match sha256:<64 hex chars>"),
+  bytes: z.number().int().min(0),
+  pages: z.number().int().min(0),
+  text_layer: z.boolean(),
+  extractor: z.string().min(1),
+  extractor_version: z.string().min(1),
+  extracted_at: z.string().min(1),
+});
+
 export const frontmatterSchema = z
   .object({
-    title: z.string().min(1).max(200),                    // Rule 2
+    title: z.string().min(1).max(TITLE_MAX_LENGTH),       // Rule 2
     description: z.string().min(1).max(500).optional(),
     type: z.enum(NODE_TYPES).optional(),                   // Rule 6
     tags: z.array(tagSchema).optional(),                   // Rule 5
@@ -219,6 +275,7 @@ export const frontmatterSchema = z
     metadata: z.record(z.unknown()).optional(),
     source: sourceMetaSchema.optional(),
     skill: skillMetaSchema.optional(),
+    pdf: pdfMetaSchema.optional(),
     zone: z
       .string()
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
@@ -256,6 +313,23 @@ export const frontmatterSchema = z
         code: z.ZodIssueCode.custom,
         message: "Skill block must not be present when type is not 'skill'",
         path: ["skill"],
+      });
+    }
+    // Rule 25: pdf block MUST be present when type is "pdf"
+    if (data.type === "pdf" && !data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block is required when type is 'pdf' (§13 rule 25)",
+        path: ["pdf"],
+      });
+    }
+    // Rule 29: pdf block MUST NOT be present on non-pdf types. An untyped
+    // node defaults to `document`, so it may not carry one either.
+    if (data.type !== "pdf" && data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block must not be present when type is not 'pdf' (§13 rule 29)",
+        path: ["pdf"],
       });
     }
   });
@@ -317,6 +391,76 @@ export const packSchema = z.object({
   audiences: z.array(z.string()).optional(),
 });
 
+// ─── Client (caller) metadata (§9.4) ─────────────────────────────────────────
+
+/** Reserved keys of {@link clientMetadataSchema}; everything else is custom. */
+export const CLIENT_METADATA_RESERVED_KEYS = ["agent", "session_id"] as const;
+/** How many CUSTOM keys a caller may attach beyond the reserved two. */
+export const CLIENT_METADATA_MAX_CUSTOM_KEYS = 16;
+/** Longest string value accepted for any key. */
+export const CLIENT_METADATA_MAX_VALUE_LENGTH = 512;
+
+/**
+ * Caller metadata attached to an API call — the calling agent's name, its
+ * session id, and any custom keys it wants recorded alongside the action.
+ *
+ * Bounds are not decoration. This object is written into the append-only
+ * version history and into access traces, so an unbounded one lets any caller
+ * grow a vault's audit trail without limit. Values are scalars for the same
+ * reason: a nested payload has no natural size, and YAML-round-tripping one
+ * through history.yaml would make the entry unreadable.
+ */
+export const clientMetadataSchema = z
+  .object({
+    agent: z.string().min(1).max(CLIENT_METADATA_MAX_VALUE_LENGTH).optional(),
+    session_id: z.string().min(1).max(CLIENT_METADATA_MAX_VALUE_LENGTH).optional(),
+  })
+  .catchall(
+    z.union([
+      z.string().max(CLIENT_METADATA_MAX_VALUE_LENGTH),
+      z.number(),
+      z.boolean(),
+    ]),
+  )
+  .superRefine((value, ctx) => {
+    const reserved = new Set<string>(CLIENT_METADATA_RESERVED_KEYS);
+    const custom = Object.keys(value).filter((key) => !reserved.has(key));
+    if (custom.length > CLIENT_METADATA_MAX_CUSTOM_KEYS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `client metadata accepts at most ${CLIENT_METADATA_MAX_CUSTOM_KEYS} custom keys, got ${custom.length}`,
+      });
+    }
+    // Refuse a near-miss on a reserved key. `sessionId` is valid as a custom
+    // key and would be recorded — but NOT in the slot `context_versions` reads,
+    // so the write ends up silently un-attributed. That is the one failure an
+    // open catchall cannot catch on its own, and the caller cannot see it
+    // happen. Naming the intended key is cheaper than auditing the miss later.
+    for (const key of custom) {
+      // Key NAMES are bounded like values: they land in the same append-only
+      // trail, and an empty key is unreadable in history.yaml.
+      if (key.trim().length === 0 || key.length > CLIENT_METADATA_MAX_VALUE_LENGTH) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `client metadata keys must be non-empty and at most ${CLIENT_METADATA_MAX_VALUE_LENGTH} chars`,
+        });
+        continue;
+      }
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const collision = CLIENT_METADATA_RESERVED_KEYS.find(
+        (r) => r.replace(/[^a-z0-9]/g, "") === normalized,
+      );
+      if (collision) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `client metadata key "${key}" looks like the reserved key "${collision}" — use "${collision}" exactly, or rename it`,
+        });
+      }
+    }
+  });
+
 export const versionEntrySchema = z.object({
   version: z.number().int().min(1),
   keyframe: z.boolean().optional(),
@@ -327,6 +471,14 @@ export const versionEntrySchema = z.object({
   note: z.string().optional(),
   content_hash: z.string().regex(CHECKSUM_PATTERN),
   chain_hash: z.string().regex(CHECKSUM_PATTERN),
+  // Annotation, not chained evidence — see VersionEntry.client in types.ts.
+  // Lenient on READ, deliberately: the input bounds above are enforced when a
+  // caller sends the block, not when a history is loaded. Reusing them here
+  // would let a future tightening (or a hand-edited entry) fail
+  // documentHistorySchema, which storage raises as CorruptHistoryError and
+  // historyOrRepair answers by quarantining the file and restarting the chain
+  // — a whole chain lost over an annotation that is not even hashed.
+  client: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 
 export const documentHistorySchema = z.object({

@@ -6,6 +6,8 @@
  * users strip branding from files they edit, but terminal output is seen naturally.
  */
 
+import { SELECTOR_GRAMMAR } from "@promptowl/contextnest-engine";
+
 const BASE_CONTEXT = `
 [CONTEXT NEST VAULT INITIALIZED]
 
@@ -25,8 +27,8 @@ Vault structure:
 Frontmatter fields: title, type (document|snippet|glossary|persona|prompt|source|tool|reference),
   tags (["#topic"]), status (draft|published), version, author, description, derived_from
 
-Selectors: tag:#name, type:document, path:nodes/api-*, pack:pack-name, status:published
-  Combine with + (union) or & (intersection)
+Selectors: ${SELECTOR_GRAMMAR}
+  e.g. ctx query "#api + status:published"    ctx query "nodes/gtm/foo"
 `.trim();
 
 const CONTEXT_MD_GENERATION_INSTRUCTIONS = `

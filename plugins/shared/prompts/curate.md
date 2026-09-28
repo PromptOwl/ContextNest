@@ -15,6 +15,8 @@ their own slices — concurrent writes are safe, the vault serializes them, but 
 node belongs to exactly one curator).
 
 - **Given a scope: stay inside it.** Pass `--vault <alias>` to every command.
+  A node cited as `<server>/<nest>:id` is edited with `--vault <server>/<nest>`
+  — every write names its nest; a bare server alias can only be searched.
   If you were given node ids, touch only those nodes; your sweep confirms and
   fixes them, it does not expand the set.
 - **Evidence outside your scope** — the fact in another nest, or in nodes not
@@ -26,12 +28,13 @@ node belongs to exactly one curator).
 
 ## 2. Sweep before you touch anything
 
-`ctx search` is **ranked and published-only** — it cannot see drafts and does
-not promise completeness, so it is a starting point, never proof. The sweep:
+`ctx search` is **ranked, capped at 10 by default, and published-only** — it
+cannot see drafts and does not promise completeness, so it is a starting point,
+never proof. The sweep:
 
-1. `ctx search "<old value>" --json` — published candidates.
-2. `ctx search "<new value>" --json` — catches nodes already partly corrected,
-   which is how vaults end up self-contradictory.
+1. `ctx search "<old value>" --json --limit 0` — published candidates.
+2. `ctx search "<new value>" --json --limit 0` — catches nodes already partly
+   corrected, which is how vaults end up self-contradictory.
 3. `ctx list --json` and `ctx list --status draft --json` — the full inventory,
    including the drafts search cannot reach.
 4. `ctx read <id> --raw` on every candidate whose title, tags, or description
@@ -102,6 +105,11 @@ the minimal edit:
 In any of those cases: **stop and ask.** Present the change-set — the ids, what
 each would become, and which rung triggered the escalation — and wait. Do not
 begin a rename or a restructure on your own authority.
+
+Once the user approves: refile a node with `ctx move <id> <folder> --vault
+<alias>` (its id changes; history and links follow). That works on a remote
+Community nest only, and a rename (`ctx update --title`) does not work on a
+remote nest at all — ask the user to do those in the app.
 
 ## 5. Report
 

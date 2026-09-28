@@ -139,8 +139,14 @@ export function createEngineApi(options: CreateEngineApiOptions = {}): EngineApi
 
     const parsed = op.input.safeParse(input);
     if (!parsed.success) {
+      // Name the field: "tags[1]: invalid tag …" beats a bare "Invalid" when a caller
+      // sends twenty tags and one of them starts with a digit.
+      const where = (path: (string | number)[]) =>
+        path.length === 0
+          ? ""
+          : `${path.map((seg, i) => (typeof seg === "number" ? `[${seg}]` : i === 0 ? seg : `.${seg}`)).join("")}: `;
       throw new ContextNestError(
-        `Invalid input for ${op.name}: ${parsed.error.issues.map((i) => i.message).join("; ")}`,
+        `Invalid input for ${op.name}: ${parsed.error.issues.map((i) => `${where(i.path)}${i.message}`).join("; ")}`,
         "VALIDATION_FAILED",
       );
     }

@@ -11,23 +11,47 @@
  * existing surfaces (published-only search, index regeneration after publish,
  * status/tag normalization, document validation before write).
  */
-import type { ContextNode, Frontmatter, SkillMeta, SourceMeta } from "../types.js";
+import type {
+  ClientMetadata,
+  ContextNode,
+  Frontmatter,
+  IntegrityFailure,
+  PdfMeta,
+  SkillMeta,
+  SourceMeta,
+} from "../types.js";
 import {
   serializeDocument,
   validateDocument,
   normalizeTags,
   normalizeStatus,
   isRejected,
+  isPublished,
   explicitStatus,
   parseDocument,
 } from "../parser.js";
+import { Resolver } from "../resolver.js";
+import { annotateIntegrity } from "../graph-query-engine.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
-import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import {
+  ContextNestError,
+  DocumentNotFoundError,
+  RejectedDocumentError,
+} from "../errors.js";
+import { sha256Bytes } from "../integrity.js";
+import {
+  DEFAULT_PDF_MAX_BYTES,
+  PDF_EXTRACTOR,
+  extractPdf,
+  pdfExtractorVersion,
+  type PdfExtraction,
+} from "../importers/pdf.js";
+import { pdfSidecarPath } from "../pdf-nodes.js";
 import {
   buildInstallManifest,
   renderSkill,
@@ -39,7 +63,14 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import { TITLE_MAX_LENGTH } from "../schemas.js";
+import {
+  isVersionArtifactPath,
+  planImportPaths,
+  sanitizeImportedFrontmatter,
+} from "../import-hygiene.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
+import { isDeepStrictEqual } from "node:util";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
 const MAX_HOPS = 10;
@@ -59,6 +90,12 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     ...(node.frontmatter.type === "source" && node.frontmatter.source
       ? { source: node.frontmatter.source }
       : {}),
+    ...(node.frontmatter.type === "pdf" && node.frontmatter.pdf
+      ? { pdf: node.frontmatter.pdf }
+      : {}),
+    // Before the body, so an agent reading the payload top-down meets the
+    // warning first. Present only when verification failed.
+    ...(node.integrity ? { integrity: node.integrity } : {}),
     ...(includeBody ? { body: node.body } : {}),
     ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
@@ -180,10 +217,12 @@ async function publishAndIndex(
   ctx: OperationContext,
   id: string,
   note?: string,
+  client?: ClientMetadata,
 ): Promise<{ version: number; checkpoint: number }> {
   const res = await publishDocument(ctx.storage, id, {
     editedBy: ctx.actor ?? "engine",
     ...(note ? { note } : {}),
+    ...(client ? { client } : {}),
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
@@ -197,6 +236,9 @@ const query: OperationExecutor = async (ctx, input: any) => {
     hops: clampHops(input.hops),
     full: input.full ?? false,
     includeDrafts: input.include_drafts ?? false,
+    // Every access trace this query emits is stamped with the caller (§9.4),
+    // so provenance records which agent read the node, not just which node.
+    client: input.client,
   });
   return {
     documents: result.documents.map((d) => toSummary(d, true)),
@@ -216,9 +258,15 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
   const result = await ctx.query.query(input.selector, {
     hops: clampHops(input.hops),
     full: false,
+    client: input.client,
   });
   const budget = input.max_tokens ?? 8000;
-  const documents: Array<{ id: string; frontmatter: Frontmatter; body: string }> = [];
+  const documents: Array<{
+    id: string;
+    frontmatter: Frontmatter;
+    integrity?: IntegrityFailure;
+    body: string;
+  }> = [];
   let tokens = 0;
   let truncated = false;
   for (const d of result.documents) {
@@ -228,28 +276,43 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
       break;
     }
     tokens += cost;
-    documents.push({ id: d.id, frontmatter: d.frontmatter, body: d.body });
+    documents.push({
+      id: d.id,
+      frontmatter: d.frontmatter,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
+      body: d.body,
+    });
   }
   return { documents, tokens_used: tokens, truncated };
 };
 
 const search: OperationExecutor = async (ctx, input: any) => {
-  // Go through the engine's published-only, ranked full-text search (the
-  // `contextnest://search/…` resolver, which indexes title/description/body/tags
-  // and filters to published) instead of a hand-rolled substring scorer — never
-  // leaks unpublished content. `full: true` routes through the Resolver; graph
-  // mode would only match context.yaml metadata (no body).
-  // Slugify the query before embedding it in the URI. This string is re-lexed
-  // by the selector grammar, whose URI token terminates on whitespace/+/|/()
-  // (lexer.ts), and parseUri rejects '//'. Raw user text (spaces, a '/' from a
-  // pasted URL, '+') would truncate the token or throw INVALID_URI. Hyphens are
-  // lexer-safe URI path chars and MiniSearch tokenizes on them, so slugifying
-  // keeps recall while guaranteeing a single well-formed URI token.
-  const q = slugify(String(input.query));
-  if (!q) return { results: [] };
-  const result = await ctx.query.query(`contextnest://search/${q}`, { full: true });
-  const docs = input.limit ? result.documents.slice(0, input.limit) : result.documents;
-  return { results: docs.map((d) => toSummary(d)) };
+  // Go straight to the engine's ranked, published-only full-text index
+  // (Resolver.search: title/description/body/tags, MiniSearch) rather than
+  // through `ctx.query.query("contextnest://search/…")`. The selector route
+  // had two problems: the query had to be slugified into a single lexer-safe
+  // URI token, and the selector evaluator collapsed the hits into a Set and
+  // re-filtered the discovery list, so the score — and the order — were gone
+  // by the time results reached a caller. Here the raw text goes to
+  // MiniSearch as-is and every hit carries its score.
+  // discoverDocuments() drops rejected nodes and the resolver indexes only
+  // published ones; the isPublished filter is belt-and-braces so this
+  // surface can never leak unpublished content.
+  // Note for the selector route (`context_query`): the evaluator keeps the
+  // order of a search URI only when it is the LEFTMOST operand — set
+  // intersection/union walk the left side first, so
+  // `type:document + contextnest://search/foo` comes back in discovery order.
+  const query = String(input.query).trim();
+  if (!query) return { results: [], total: 0 };
+  const docs = await ctx.storage.discoverDocuments();
+  const hits = new Resolver({ documents: docs })
+    .search(query)
+    .filter((h) => isPublished(h.document));
+  const kept = input.limit ? hits.slice(0, input.limit) : hits;
+  return {
+    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    total: hits.length,
+  };
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
@@ -262,9 +325,20 @@ const get: OperationExecutor = async (ctx, input: any) => {
   // Surfaces that let a steward see and revive a retired document opt out —
   // reading one is not the same as republishing it.
   if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  // Served, never refused: a document that fails verification is still the one
+  // asked for. The verdict tells the agent not to trust its values.
+  //
+  // Runs on the verify_checksum path too. There, a drifted live file is
+  // replaced by the last-approved keyframe (+ pendingChange); the verdict then
+  // checks what is actually served: the body check runs on the keyframe's own
+  // bytes (clean unless the keyframe itself was altered), and the chain check
+  // still catches a corrupted history behind it. With no keyframe to fall back
+  // to, the drifted live node is served and body_drift is reported.
+  const integrity = await ctx.storage.verifyServedDocument(node);
   return {
     id: node.id,
     frontmatter: node.frontmatter,
+    ...(integrity ? { integrity } : {}),
     body: node.body,
     ...(input.include_raw ? { raw: node.rawContent } : {}),
     ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
@@ -283,6 +357,9 @@ const list: OperationExecutor = async (ctx, input: any) => {
     ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
   });
   const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  // `full` serves bodies, so it gets the same integrity verdict as every other
+  // body-serving path. Summary mode (no body) stays cheap: nothing is hashed.
+  if (input.full === true) await annotateIntegrity(ctx.storage, kept);
   return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
 
@@ -418,7 +495,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
       checkpoint: null,
     };
   }
-  const result = await publishAndIndex(ctx, node.id, input.note);
+  const result = await publishAndIndex(ctx, node.id, input.note, input.client);
   return {
     id: node.id,
     version: result.version,
@@ -451,6 +528,19 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // of a document that stays rejected.
   if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
     throw new RejectedDocumentError(id);
+  }
+  // A pdf node's body is the text extracted from its binary; hand-editing it
+  // would leave the two disagreeing under one sealed version. The binary is the
+  // source of truth, so the way to change the text is a new PDF.
+  if (
+    existing.frontmatter.type === "pdf" &&
+    (resolveContentAlias(input) !== undefined || typeof input.append === "string")
+  ) {
+    throw new ContextNestError(
+      `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. ` +
+        "Import a new version of the PDF instead (context_import_pdf with this id / `ctx import pdf <file> --id <id>`).",
+      "VALIDATION_FAILED",
+    );
   }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
   // A rename leaves the id alone, so this is the id-free rule, not create's
@@ -537,7 +627,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
       checkpoint: null,
     };
   }
-  const result = await publishAndIndex(ctx, id, input.note);
+  const result = await publishAndIndex(ctx, id, input.note, input.client);
   return { id, version: result.version, status: "published", checkpoint: result.checkpoint };
 };
 
@@ -548,6 +638,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
   const result = await publishDocument(ctx.storage, id, {
     editedBy: ctx.actor ?? "engine",
     ...(input.note ? { note: input.note } : {}),
+    ...(input.client ? { client: input.client } : {}),
   });
   await ctx.storage.regenerateIndex();
   return {
@@ -595,6 +686,7 @@ const versions: OperationExecutor = async (ctx, input: any) => {
         note: v.note,
         content_hash: v.content_hash,
         chain_hash: v.chain_hash,
+        ...(v.client ? { client: v.client } : {}),
         ...(versionManager
           ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
           : {}),
@@ -607,10 +699,13 @@ const versions: OperationExecutor = async (ctx, input: any) => {
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // Surface DOCUMENT_NOT_FOUND for a bogus id/title (the descriptor advertises it).
-  await ctx.storage.readDocument(id);
+  const live = await ctx.storage.readDocument(id);
   try {
     const content = await ctx.versions.reconstructVersion(id, input.version);
-    return { id, version: input.version, content };
+    // A past version is rebuilt from the history, so only the chain speaks
+    // for it — the live body's drift says nothing about v{N}.
+    const integrity = await ctx.storage.verifyServedDocument(live, { checkBody: false });
+    return { id, version: input.version, ...(integrity ? { integrity } : {}), content };
   } catch (err) {
     // reconstructVersion codes its own failures (VERSION_NOT_FOUND,
     // RECONSTRUCTION_FAILED) — pass those through. Anything uncoded that leaks
@@ -700,8 +795,14 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
     servedVersion = approved.version;
   }
   const vaultName = config?.name;
+  // A skill is matched on and EXECUTED, so a tampered one matters most. Live
+  // node: full check; approved version rebuilt from history: chain only.
+  const integrity = await ctx.storage.verifyServedDocument(live, {
+    checkBody: servedVersion === null,
+  });
   return {
     doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    integrity,
     servedVersion,
     vaultName,
     serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
@@ -724,16 +825,15 @@ function asValidationError<T>(fn: () => T): T {
 }
 
 const skill: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope } =
+    await loadSkillNode(ctx, input);
   const rendered = asValidationError(() =>
     renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
   );
   return {
     name: rendered.name,
     description: rendered.description,
+    ...(integrity ? { integrity } : {}),
     content: rendered.content,
     relative_path: rendered.relativePath,
     base: rendered.base,
@@ -750,10 +850,8 @@ function rejectedNote(id: string, version: number): string {
 }
 
 const skillInstall: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope, mode } =
+    await loadSkillNode(ctx, input);
   const manifest = asValidationError(() =>
     buildInstallManifest(doc, {
       harness,
@@ -764,11 +862,21 @@ const skillInstall: OperationExecutor = async (ctx, input: any) => {
       mode,
     }),
   );
-  if (servedVersion === null) return manifest;
+  // The installed files are written verbatim; the verdict rides on the result
+  // (and leads `notes`, the text an installing agent relays) so whoever
+  // installs a tampered skill is told before it runs.
+  const flagged = integrity
+    ? { ...manifest, integrity, notes: `${integrity.warning} ${manifest.notes}` }
+    : manifest;
+  if (servedVersion === null) return flagged;
+  // The integrity warning stays FIRST even on the rejected fallback: it is
+  // the caveat that must not be lost if only the first sentence is shown.
   return {
-    ...manifest,
+    ...flagged,
     served_version: servedVersion,
-    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
+    notes: integrity
+      ? `${integrity.warning} ${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`
+      : `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
   };
 };
 
@@ -790,9 +898,65 @@ const packs: OperationExecutor = async (ctx) => {
 // Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
 const nests: OperationExecutor = () => ({ nests: listVaults() });
 
+/**
+ * Land one imported file at the path `planImportPaths` chose for it — the
+ * slugified id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), disambiguated
+ * against the rest of the batch and the vault. A markdown document that
+ * would not validate as it arrived — no title, a type outside the spec, tags
+ * with spaces — is repaired on the way in, each repair reported as a warning.
+ * A file that is already valid, and every non-document file (version
+ * histories, indexes), is written byte for byte: the source's frontmatter is
+ * its own.
+ *
+ * The title falls back to the ORIGINAL filename, human casing intact: after
+ * the rename only the slug survives, and `dr-smith` is a worse title than
+ * `Dr. Smith`.
+ */
+async function writeImportedFile(
+  ctx: OperationContext,
+  f: { raw: string; path: string; content?: string },
+  warnings: string[],
+): Promise<void> {
+  const { raw, path: relPath } = f;
+  let content = f.content ?? "";
+  const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
+  // A keyframe under `.versions/` is a whole document, so `v1.md` passes every
+  // test a live node passes — but its bytes are hashed into that version's
+  // `content_hash`. Repairing one would make `ctx verify` report a version the
+  // import itself rewrote as tampered. Sealed history travels verbatim.
+  if (
+    !isVersionArtifactPath(relPath) &&
+    /\.md$/i.test(lastSegment) &&
+    !lastSegment.startsWith(".")
+  ) {
+    const id = relPath.replace(/\.md$/i, "");
+    let node: ContextNode | undefined;
+    try {
+      node = parseDocument(`${id}.md`, content, id);
+    } catch {
+      // Unparseable frontmatter is the author's to fix; land it as it came so
+      // nothing is lost, and let validate report it.
+    }
+    if (node) {
+      const { patch, warnings: repairs } = sanitizeImportedFrontmatter(
+        node,
+        lastSegment.replace(/\.md$/i, ""),
+      );
+      warnings.push(...repairs);
+      if (Object.keys(patch).length > 0) {
+        content = serializeDocument({ ...node, frontmatter: { ...node.frontmatter, ...patch } });
+      }
+    }
+  }
+  await ctx.storage.writeVaultFile(relPath, content);
+}
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
+  // Every repair the import made to something it did not author — a renamed
+  // path, a coerced type, a dropped tag. Reported, never fatal.
+  const warnings: string[] = [];
 
   // Ids of documents already in the vault publish as-is — their paths ARE their
   // ids, and the caller owns their frontmatter. Nothing is rewritten here.
@@ -804,14 +968,31 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
   if (incoming.length > 0) {
-    await mapInBatches(incoming, async (f) => {
+    // Targets are settled for the WHOLE batch BEFORE the parallel write: two
+    // files whose names slugify alike must not race for one path, and a
+    // renamed document has to take its `.versions/` history with it — neither
+    // is decidable one file at a time. By default a file already in the vault
+    // is never overwritten; `overwrite` opts back into replacing it, which is
+    // what makes re-running the same batch idempotent instead of duplicating.
+    // A path the guard refuses (`../`) reads as absent here and fails at its
+    // own write below, so it is reported per file rather than sinking the batch.
+    const plan = (
+      await planImportPaths(
+        incoming.map((f) => String(f.path ?? "")),
+        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+      )
+    ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
+    await mapInBatches(plan, async (f) => {
       try {
-        await ctx.storage.writeVaultFile(f.path, f.content ?? "");
+        // Into the file's OWN warning list: `mapInBatches` finishes in
+        // whatever order the writes complete, and the report is per input file.
+        await writeImportedFile(ctx, f, f.warnings);
         written++;
       } catch (err) {
-        failed.push({ id: f.path, error: err instanceof Error ? err.message : String(err) });
+        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
       }
     });
+    for (const p of plan) warnings.push(...p.warnings);
   }
 
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
@@ -830,7 +1011,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // A staging call — files written, publishing deferred to the caller's final
   // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
   if (input.publish === false) {
-    return { published: [], failed, checkpoint: null, written };
+    return {
+      published: [],
+      failed,
+      checkpoint: null,
+      written,
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 2 (discover): the vault itself is the input. The scan, the metadata
@@ -839,6 +1026,11 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // ids back — that pass cost a second full round trip per document.
   let held: ContextNode[] = [];
   let scanned: ContextNode[] = [];
+  // Frontmatter repairs for the documents the scan owns, by id. A caller that
+  // wrote the files itself and only asks the engine to discover them gets the
+  // same hygiene as one that sent them through `files`: without it a note
+  // with no title or a `type: note` is published as-is and fails validate.
+  const repairs = new Map<string, Partial<Frontmatter>>();
   if (input.discover) {
     const exclude = new Set<string>(input.exclude_ids ?? []);
     // Ids the caller supplied itself, via `ids` or staged from `documents`.
@@ -849,6 +1041,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
       if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
+        doc,
+        doc.id.split("/").pop() ?? doc.id,
+      );
+      warnings.push(...repaired);
+      if (Object.keys(patch).length > 0) repairs.set(doc.id, patch);
       // Publishing is opt-in. Only a file that EXPLICITLY says it is published
       // or approved gets published; everything else is held as a draft for a
       // human to approve, including a file that states no status at all.
@@ -886,6 +1084,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       onProgress: ctx.onProgress,
+      ...(input.client ? { client: input.client } : {}),
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
@@ -900,6 +1099,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
             discovered.has(node.id)
               ? {
                   title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...repairs.get(node.id),
                   ...(input.author ? { author: input.author } : {}),
                 }
               : null
@@ -914,7 +1114,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   }
 
   if (!input.discover) {
-    return { published, failed, checkpoint, ...(incoming.length ? { written } : {}) };
+    return {
+      published,
+      failed,
+      checkpoint,
+      ...(incoming.length ? { written } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // Stage 3b: held documents never reach the publish write, so this is their
@@ -934,9 +1140,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // re-import of an already-stamped vault free.
   await mapInBatches(held, async (doc) => {
     const authored = explicitStatus(doc);
-    const stamp: Record<string, unknown> = {};
+    const stamp: Record<string, unknown> = { ...repairs.get(doc.id) };
 
-    const title = doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    const title = stamp.title ?? doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
     if (doc.frontmatter.title !== title) stamp.title = title;
     if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
     // Only when the author stated nothing — an explicit `pending_review` or
@@ -962,12 +1168,14 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const asRecord = (doc: ContextNode) => {
     const version = publishedVersion.get(doc.id);
     const own = Number(doc.frontmatter.version);
+    // Report what was written, repairs included, not what was found.
+    const frontmatter = { ...doc.frontmatter, ...repairs.get(doc.id) };
     return {
       id: doc.id,
-      title: doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      title: frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
       version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
       status: version !== undefined ? ("published" as const) : ("draft" as const),
-      tags: normalizeTags(doc.frontmatter.tags) ?? [],
+      tags: normalizeTags(frontmatter.tags) ?? [],
       content: doc.body ?? "",
     };
   };
@@ -976,9 +1184,328 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     failed,
     checkpoint,
     ...(incoming.length ? { written } : {}),
+    ...(warnings.length ? { warnings } : {}),
     documents: [...scanned, ...held].map(asRecord),
   };
 };
+
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/**
+ * Base64 (standard or URL-safe alphabet, optional padding), tested AFTER
+ * whitespace is stripped. The character class and the padding share no
+ * characters, so the match is linear — a class that also admitted `\s`
+ * followed by a trailing `\s*` backtracks quadratically on a long whitespace
+ * run ending in an invalid character.
+ */
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]*={0,2}$/;
+
+/** Decode the op's `bytes_base64`, refusing malformed input and anything over the cap. */
+function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
+  // Refuse an obviously oversized payload before allocating its decoded copy.
+  // Base64 is 4 chars per 3 bytes, so a payload within the cap is at most
+  // ceil(maxBytes * 4 / 3) chars. The ×1.1 is slack for the line breaks MIME
+  // encoders insert (76-char lines + CRLF ≈ 2.6% overhead, rounded up well
+  // past it), the +1024 for padding and small-file rounding. Only a coarse
+  // pre-filter: the exact byteLength check after decoding is the real limit.
+  if (b64.length > Math.ceil((maxBytes * 4) / 3) * 1.1 + 1024) {
+    throw new ContextNestError(
+      `PDF exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // Line-wrapped (MIME-style) base64 is common; the wrapping is not data.
+  const compact = b64.replace(/\s+/g, "");
+  if (!BASE64_PATTERN.test(compact)) {
+    throw new ContextNestError("bytes_base64 is not valid base64.", "VALIDATION_FAILED");
+  }
+  const bytes = new Uint8Array(Buffer.from(compact, "base64"));
+  if (bytes.byteLength === 0) {
+    throw new ContextNestError("bytes_base64 decoded to an empty file.", "VALIDATION_FAILED");
+  }
+  if (bytes.byteLength > maxBytes) {
+    throw new ContextNestError(
+      `PDF is ${bytes.byteLength} bytes, which exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return bytes;
+}
+
+/** Read a node, or null when there is none at that id. */
+async function readIfExists(ctx: OperationContext, id: string): Promise<ContextNode | null> {
+  try {
+    return await ctx.storage.readDocument(id);
+  } catch (err) {
+    if (err instanceof DocumentNotFoundError) return null;
+    throw err;
+  }
+}
+
+/** A file name without directory or `.pdf` extension, for a fallback title. */
+function filenameStem(name: unknown): string | undefined {
+  if (typeof name !== "string") return undefined;
+  const base = name.split(/[/\\]/).pop() ?? "";
+  const stem = base.replace(/\.pdf$/i, "").trim();
+  return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, TITLE_MAX_LENGTH) : undefined;
+}
+
+/**
+ * `context_import_pdf`. Decoding and text extraction run BEFORE the vault
+ * lock is taken: they touch no vault state, and parsing a large PDF is real
+ * work that would otherwise hold every other writer on the vault behind it
+ * (VAULT_LOCK_TIMEOUT for a concurrent `ctx update`). A bad PDF also fails
+ * here without ever queueing for the lock. Everything that reads or writes
+ * the vault runs under the lock, in {@link importPdfLocked}.
+ */
+const importPdf: OperationExecutor = async (ctx, input: any) => {
+  const maxBytes = ctx.limits?.pdfMaxBytes ?? DEFAULT_PDF_MAX_BYTES;
+  const bytes = decodePdfInput(String(input.bytes_base64), maxBytes);
+  // Extract BEFORE anything is written: a file that is not a PDF, or one pdf.js
+  // cannot read, fails here with nothing on disk.
+  const extraction = await extractPdf(bytes);
+  return withVaultLock(ctx.storage.root, () => importPdfLocked(ctx, input, bytes, extraction));
+};
+
+async function importPdfLocked(
+  ctx: OperationContext,
+  input: any,
+  bytes: Uint8Array,
+  extraction: PdfExtraction,
+) {
+  // ── Where it lands ──
+  // An explicit id is used as stored if a node is there (flat-layout ids carry
+  // no nodes/ prefix, and re-rooting would miss them), otherwise normalized
+  // the way context_create normalizes one.
+  let id: string;
+  let existing: ContextNode | null;
+  if (input.id) {
+    const raw = sanitizeId(String(input.id));
+    existing = await readIfExists(ctx, raw);
+    id = existing ? raw : normalizeDocumentId(raw);
+    if (!existing && id !== raw) existing = await readIfExists(ctx, id);
+  } else {
+    const title =
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF";
+    const slug =
+      slugify(String(title)) ||
+      slugify(filenameStem(input.filename) ?? "") ||
+      `pdf-${extraction.sha256.slice("sha256:".length, "sha256:".length + 12)}`;
+    const folderSegments = String(input.folder ?? "")
+      .split("/")
+      .map(slugify)
+      .filter(Boolean);
+    id = normalizeDocumentId(["nodes", ...folderSegments, slug].join("/"));
+    existing = await readIfExists(ctx, id);
+    if (existing) {
+      throw new ContextNestError(
+        `Document "${id}" already exists. Pass id: "${id}" to import this PDF as its next version, or a different title/folder.`,
+        "DOCUMENT_ALREADY_EXISTS",
+      );
+    }
+  }
+  assertSafeDocumentId(id);
+
+  if (existing) {
+    if (existing.frontmatter.type !== "pdf") {
+      throw new ContextNestError(
+        `${id} is a "${existing.frontmatter.type ?? "document"}" node, not a PDF; a PDF can only be imported as a new node or as a new version of a pdf node.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    if (isRejected(existing)) throw new RejectedDocumentError(id);
+  }
+
+  const sidecar = pdfSidecarPath(id);
+
+  // A new node must not land on a file already sitting at its sidecar path —
+  // that file is someone's, not this import's to overwrite (or, on a failed
+  // import, to delete).
+  if (!existing && (await ctx.storage.hasVaultFile(sidecar))) {
+    throw new ContextNestError(
+      `A file already exists at ${sidecar}, where this node's PDF would go. Move it, or import under another title/folder/id.`,
+      "DOCUMENT_ALREADY_EXISTS",
+    );
+  }
+
+  // Whatever is on disk at the sidecar path now — archived (content-addressed,
+  // so harmless) before it is replaced, and put back if this import fails.
+  // ALL bytes, not only ones matching the current frontmatter: after a
+  // rollback, or a hand swap, the file on disk may be a binary some other
+  // version records, and overwriting it unarchived would lose that version.
+  let priorOnDisk: Uint8Array | null = null;
+  if (existing) {
+    try {
+      priorOnDisk = await ctx.storage.readVaultBinary(sidecar);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+
+  const publish = input.publish !== false;
+  const existingPdf = existing?.frontmatter.pdf;
+  const sameBytes = existingPdf?.sha256 === extraction.sha256;
+
+  if (existing && existingPdf && sameBytes) {
+    // Same PDF as the current version. A missing or swapped sidecar is put
+    // back — these bytes hash to what the chain records, so that restores the
+    // record rather than rewriting it. Anything the caller ASKED for besides
+    // the bytes (publish a draft, a new title/tags/description) still happens
+    // below; with nothing asked for, this is a no-op.
+    if (!priorOnDisk || sha256Bytes(priorOnDisk) !== existingPdf.sha256) {
+      if (priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+    }
+    const fm = existing.frontmatter;
+    const wantsPublish = publish && fm.status !== "published";
+    const wantsTitle = input.title !== undefined && input.title !== fm.title;
+    // Tags are a set: the same tags in another order are not a change.
+    const wantsTags =
+      input.tags !== undefined &&
+      !isDeepStrictEqual(
+        [...(normalizeUniqueTags(input.tags) ?? [])].sort(),
+        [...new Set(fm.tags ?? [])].sort(),
+      );
+    const wantsDescription =
+      typeof input.description === "string" && input.description !== (fm.description ?? "");
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription) {
+      return {
+        id,
+        version: fm.version ?? 1,
+        created: false,
+        unchanged: true,
+        status: fm.status ?? "draft",
+        checkpoint: null,
+        pdf: existingPdf,
+        text_layer: existingPdf.text_layer,
+      };
+    }
+  }
+
+  // Same bytes keep the recorded block and text (re-extracting would only
+  // restamp extracted_at); new bytes get both fresh.
+  const pdf: PdfMeta =
+    sameBytes && existingPdf
+      ? existingPdf
+      : {
+          file: sidecar,
+          sha256: extraction.sha256,
+          bytes: extraction.bytes,
+          pages: extraction.pages,
+          text_layer: extraction.textLayer,
+          extractor: PDF_EXTRACTOR,
+          extractor_version: pdfExtractorVersion(),
+          extracted_at: new Date().toISOString(),
+        };
+  const now = new Date().toISOString();
+  const body =
+    sameBytes && existing ? existing.body : extraction.text ? `\n${extraction.text}` : "";
+  let frontmatter: Frontmatter;
+  if (existing) {
+    frontmatter = { ...existing.frontmatter };
+    if (input.title) {
+      assertUsableTitle(String(input.title));
+      frontmatter.title = input.title;
+    }
+    if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
+    if (typeof input.description === "string") {
+      if (input.description === "") delete frontmatter.description;
+      else frontmatter.description = input.description;
+    }
+    frontmatter.pdf = pdf;
+    frontmatter.updated_at = now;
+    // The checksum describes the published body, which this may replace.
+    if (!sameBytes) delete frontmatter.checksum;
+    if (!publish) frontmatter.status = "draft";
+  } else {
+    const title = String(
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF",
+    );
+    assertUsableTitle(title);
+    frontmatter = {
+      title,
+      type: "pdf",
+      ...(input.description ? { description: input.description } : {}),
+      ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
+      status: "draft",
+      created_at: now,
+      updated_at: now,
+      pdf,
+    };
+    // Publish assigns the version; a draft needs its own v1 (see context_create).
+    if (!publish) frontmatter.version = 1;
+  }
+  const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
+  assertValid(node);
+
+  // ── Write: archive what is on disk, sidecar, then the node, then publish ──
+  // The sidecar goes first so the node never points at a binary that is not
+  // there. On failure everything this call wrote is put back.
+  const replacing = !sameBytes;
+  if (replacing && priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+  // A failure AFTER publish sealed a version (say, at the checkpoint) must not
+  // be rolled back: the history already vouches for the new binary and text.
+  const sealedBefore = await ctx.storage.maxRecordedVersion(id);
+  let wroteSidecar = false;
+  let wroteNode = false;
+  try {
+    if (replacing) {
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+      wroteSidecar = true;
+    }
+    await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: !existing });
+    wroteNode = true;
+    if (!publish) {
+      await ctx.storage.regenerateIndex();
+      return {
+        id,
+        version: frontmatter.version ?? 1,
+        created: !existing,
+        unchanged: false,
+        status: frontmatter.status ?? "draft",
+        checkpoint: null,
+        pdf,
+        text_layer: pdf.text_layer,
+      };
+    }
+    const result = await publishAndIndex(
+      ctx,
+      id,
+      input.note ?? (!existing ? "Imported PDF" : replacing ? "New PDF version" : "PDF metadata update"),
+      input.client,
+    );
+    return {
+      id,
+      version: result.version,
+      created: !existing,
+      unchanged: false,
+      status: "published",
+      checkpoint: result.checkpoint,
+      pdf,
+      text_layer: pdf.text_layer,
+    };
+  } catch (err) {
+    const sealedAfter = await ctx.storage.maxRecordedVersion(id).catch(() => sealedBefore);
+    if (sealedAfter > sealedBefore) throw err;
+    if (existing) {
+      if (wroteNode) await ctx.storage.writeDocument(id, existing.rawContent).catch(() => undefined);
+      if (wroteSidecar) {
+        if (priorOnDisk) {
+          await ctx.storage.writeVaultBinary(sidecar, priorOnDisk).catch(() => undefined);
+        } else {
+          await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+        }
+      }
+    } else if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) {
+      // A create that lost the exclusive-write race must not delete the
+      // winner's files; otherwise the sidecar is this call's own (a file
+      // already at that path was refused above).
+      if (wroteNode) await ctx.storage.deleteDocument(id).catch(() => undefined);
+      if (wroteSidecar) await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+    }
+    throw err;
+  }
+}
 
 /**
  * Serialize a mutating executor on the vault's write lock. Every mutation
@@ -1011,6 +1538,8 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_packs: packs,
   context_nests: nests,
   context_import: locked(importDocs),
+  // Locks internally, AFTER extraction — see importPdf.
+  context_import_pdf: importPdf,
   context_skill: skill,
   context_skill_install: skillInstall,
 });

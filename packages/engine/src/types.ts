@@ -16,7 +16,8 @@ export type NodeType =
   | "skill"
   | "agent"
   | "artifact"
-  | "table";
+  | "table"
+  | "pdf";
 
 /** Document status (§1.5)
  *
@@ -128,6 +129,32 @@ export interface SkillMeta {
   guard_rails?: string[];
 }
 
+/**
+ * PDF metadata block — present only on type: pdf nodes (§1.11).
+ *
+ * Binds the node to the binary sidecar beside it. `sha256` is the hash of the
+ * sidecar's exact bytes; since the block is frontmatter, it is hashed into
+ * every version's content_hash, so the PDF is part of the version chain.
+ */
+export interface PdfMeta {
+  /** Vault-relative path of the sidecar — always `<node id>.pdf`, beside the `.md`. */
+  file: string;
+  /** SHA-256 of the sidecar bytes, `sha256:<64 hex>`. */
+  sha256: string;
+  /** Size of the sidecar in bytes. */
+  bytes: number;
+  /** Page count. */
+  pages: number;
+  /** False when no page yielded any text (a scanned PDF) — the body is then empty. */
+  text_layer: boolean;
+  /** Text extractor that produced the body, e.g. `unpdf`. */
+  extractor: string;
+  /** Importer + extractor version, so a re-extraction can be told apart. */
+  extractor_version: string;
+  /** ISO 8601 time the text was extracted. */
+  extracted_at: string;
+}
+
 /** YAML frontmatter for a Context Nest document (§1.3–1.5) */
 export interface Frontmatter {
   title: string;
@@ -144,10 +171,25 @@ export interface Frontmatter {
   metadata?: Record<string, unknown>;
   source?: SourceMeta;
   skill?: SkillMeta;
+  /** PDF block — present only on type: pdf nodes (§1.11). */
+  pdf?: PdfMeta;
   /** Zone ID (zone-classification-rbac-spec §2.1 Level 2 metadata override) */
   zone?: string;
   /** Governance tier (zone-classification-rbac-spec §1) */
   governance?: GovernanceTier;
+}
+
+/**
+ * Served-document integrity verdict, present ONLY when verification failed
+ * (see `NestStorage.verifyServedDocument`). An intact or not-yet-verifiable
+ * document carries no verdict, so its wire output is unchanged.
+ */
+export interface IntegrityFailure {
+  status: "failed";
+  /** Which checks failed — `VerificationReport` error types, e.g. `body_drift`. */
+  checks: string[];
+  /** One-line, model-facing warning (`INTEGRITY_WARNING`). */
+  warning: string;
 }
 
 /** A parsed Context Nest document */
@@ -162,6 +204,11 @@ export interface ContextNode {
   body: string;
   /** Full raw file content */
   rawContent: string;
+  /**
+   * Set by the serve paths (graph query, context_get) when this document
+   * failed integrity verification. Absent otherwise. Never serialized to disk.
+   */
+  integrity?: IntegrityFailure;
   /**
    * The `status` the author actually wrote, before normalization, or `null`
    * when the frontmatter carried no `status:` key at all.
@@ -324,6 +371,16 @@ export interface VersionEntry {
   note?: string;
   content_hash: string;
   chain_hash: string;
+  /**
+   * Caller metadata supplied with the write that produced this version (§9.4)
+   * — which agent, in which session, plus any custom keys.
+   *
+   * Deliberately NOT an input to `chain_hash` (§8.2): the chain covers the
+   * content and the authoring facts the spec names, and every history written
+   * before this field existed must keep verifying byte-for-byte. Treat it as an
+   * annotation on the entry, not as sealed evidence.
+   */
+  client?: ClientMetadata;
 }
 
 /** Document history file (§6.2) */
@@ -471,6 +528,31 @@ export interface VaultRegistry {
   remotes?: Record<string, RemoteNestSpec>;
 }
 
+/**
+ * Caller-supplied metadata attached to an API call (§9.4).
+ *
+ * `agent` and `session_id` are the two fields every caller is expected to send
+ * — they answer "which agent, in which session" for a read or a write. Any
+ * other key is custom, and travels verbatim.
+ *
+ * This is NOT identity: the engine never authenticates it, and never makes a
+ * decision from it. It is a label recorded alongside the action so an audit
+ * trail can attribute it. Authorization stays with the `RbacHook` and the
+ * `actor` on an operation context.
+ *
+ * Bounded by `clientMetadataSchema` (schemas.ts) — this is written into the
+ * append-only version history, so an unbounded payload would be a way to bloat
+ * a vault's audit trail.
+ */
+export interface ClientMetadata {
+  /** Name of the calling agent, e.g. "claude-code". */
+  agent?: string;
+  /** Identifier of the calling session, opaque to the engine. */
+  session_id?: string;
+  /** Custom keys, recorded verbatim. */
+  [key: string]: string | number | boolean | undefined;
+}
+
 /** Trace entry for document access (§9.2) */
 export interface AccessTrace {
   trace_type: "access";
@@ -480,6 +562,8 @@ export interface AccessTrace {
   author?: string;
   edited_at?: string;
   accessed_at: string;
+  /** Caller metadata supplied with the read that produced this trace (§9.4). */
+  client?: ClientMetadata;
 }
 
 /** Trace entry for source hydration (§9.3) */
@@ -585,7 +669,12 @@ export interface VerificationReport {
       | "cross_chain_mismatch"
       | "checkpoint_hash_mismatch"
       | "body_drift"
-      | "unreadable_history";
+      | "unreadable_history"
+      // A pdf node's sidecar (or an archived prior binary) no longer hashes
+      // to the sha256 its frontmatter records (§8.4).
+      | "sidecar_drift"
+      // A pdf node's declared sidecar is not on disk.
+      | "sidecar_missing";
     document?: string;
     version?: number;
     checkpoint?: number;

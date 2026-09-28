@@ -12,9 +12,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { homedir as osHomedir } from "node:os";
-import { join } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { homedir as osHomedir, tmpdir as osTmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 /** Windows needs shell-based spawning for npm's .cmd shims — see makeExec. */
 const WIN32 = process.platform === "win32";
@@ -68,6 +68,13 @@ export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
  */
 export const VALID_CAPTURE_MODES = ["off", "propose", "auto"];
 
+/**
+ * What capture does when no nest's description clearly fits a new node:
+ * `ask` the user (default — a wrong guess can land in a partner's nest), or
+ * write to the `default` vault (the pin, else the registry default).
+ */
+export const VALID_UNCLEAR_NEST = ["ask", "default"];
+
 /** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
 export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
 export const FALSY_VALUES = ["false", "0", "no", "off"];
@@ -81,7 +88,9 @@ export const FALSY_VALUES = ["false", "0", "no", "off"];
  * validates *shape*; whether the alias is actually registered is checked by
  * the /contextnest:config command, which can consult the registry.
  */
-export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
+// An optional `/<nest>` suffix addresses one nest behind a server-level
+// remote (`ctx vault list` shows those as `<server>/<nest>` rows).
+export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)?$/;
 
 /**
  * Read a settings override file. Missing or malformed files are silently
@@ -179,8 +188,8 @@ export function getConfig(env = process.env, opts = {}) {
     },
   );
 
-  // Accept the unpin sentinel "" or a shape-valid alias; a malformed alias
-  // ("my vault", "a/b", "..") is skipped so it can't reach ctx as a bad
+  // Accept the unpin sentinel "" or a shape-valid alias (`<alias>` or
+  // `<server>/<nest>`); a malformed one ("my vault", "a/b/c", "..") is skipped so it can't reach ctx as a bad
   // --vault arg. Registry membership is verified by the config command.
   const rawVault = pick(
     "vault",
@@ -216,6 +225,15 @@ export function getConfig(env = process.env, opts = {}) {
         : TRUTHY_VALUES.includes(rawAuto)
           ? "propose"
           : "off"),
+    unclearNest:
+      pick(
+        "unclear_nest",
+        ["CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST", "CONTEXTNEST_UNCLEAR_NEST"],
+        {
+          normalize: (s) => s.trim().toLowerCase(),
+          accept: (s) => VALID_UNCLEAR_NEST.includes(s),
+        },
+      ) || "ask",
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,
@@ -330,6 +348,11 @@ export function listVaults(exec) {
   return Array.isArray(vaults) ? vaults : [];
 }
 
+/** Registry rows to SEARCH: everything but the `<server>/<nest>` rows its server row covers. */
+export function searchableVaults(vaults) {
+  return vaults.filter((v) => !v.parent);
+}
+
 /**
  * True when `alias` names a vault that is registered AND present on disk.
  * `getConfig` only checks the alias *shape*; this is the registry check.
@@ -345,6 +368,80 @@ export function isVaultRegistered(alias, vaults) {
   return vaults.some((v) => v.alias === alias && v.exists !== false);
 }
 
+/** Best-effort canonical form of a path: realpath when it exists, else resolved. */
+function canonical(p) {
+  const abs = resolve(String(p));
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/**
+ * True when two paths name the same directory. Compared in both their given
+ * and realpath'd forms, so a symlinked temp dir (macOS `/var` → `/private/var`)
+ * or a path that doesn't exist yet still matches its twin.
+ */
+export function samePath(a, b) {
+  if (!a || !b) return false;
+  const forms = (p) => new Set([resolve(String(p)), canonical(p)]);
+  const fa = forms(a);
+  for (const f of forms(b)) if (fa.has(f)) return true;
+  return false;
+}
+
+/**
+ * True when `path` is `root` or lives under it. Both the given and the
+ * realpath'd forms of each side are compared (see samePath), so a symlinked
+ * temp dir still matches. Note: `path.relative` does not case-fold; on Windows
+ * the realpath step normalizes to on-disk casing when the path exists, and a
+ * not-yet-existing path is compared as given.
+ */
+function isUnder(path, root) {
+  const inside = (p, r) => {
+    const rel = relative(r, p);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+  for (const r of [resolve(String(root)), canonical(root)]) {
+    for (const p of [resolve(String(path)), canonical(path)]) {
+      if (inside(p, r)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a vault path lives under the OS temp directory. Agents create
+ * scratch vaults there (and `ctx init` registers them), and nobody wants a
+ * throwaway's nodes injected into every prompt of a real session.
+ * `tmp` is injectable for tests; defaults to os.tmpdir().
+ */
+export function isTmpVaultPath(path, tmp = osTmpdir()) {
+  if (!path || !tmp) return false;
+  return isUnder(path, tmp);
+}
+
+/**
+ * The vault ctx resolves from the working directory alone, via
+ * `ctx vault which --json` (exec already runs in the hook's cwd). Only a
+ * `source: "local"` resolution counts — i.e. a `.context/config.yaml` found by
+ * walking up from cwd. A registry default, an env override, or the bare-cwd
+ * fallback is NOT a cwd vault. Returns `{ path, alias }` where `alias` is the
+ * registered alias for that same path when there is one (else null), or null
+ * when the cwd is not inside a vault (or ctx is too old to know `--json`).
+ *
+ * @param {(args:string[]) => any} exec
+ * @param {{alias:string, path?:string, exists?:boolean}[]} vaults from listVaults()
+ */
+export function cwdVault(exec, vaults = []) {
+  const which = ctxJson(exec, ["vault", "which", "--json"], null);
+  if (!which || typeof which !== "object" || Array.isArray(which)) return null;
+  if (which.kind !== "local" || which.source !== "local" || !which.path) return null;
+  const match = vaults.find((v) => v.exists !== false && v.path && samePath(v.path, which.path));
+  return { path: which.path, alias: match ? match.alias : null };
+}
+
 /**
  * Decide which vault aliases the cheap (non-agent) tiers should search.
  *
@@ -352,19 +449,59 @@ export function isVaultRegistered(alias, vaults) {
  *  - Pinned alias, NOT registered (stale/removed pin) → ignore the pin and
  *    behave as unpinned, rather than passing ctx a bad --vault that resolves to
  *    nothing. session-start surfaces a warning so this isn't silent.
- *  - Unpinned + registry     → fan out across registered vaults (capped).
- *  - Unpinned + empty registry → a single null target, i.e. let ctx resolve the
- *                                 local/default vault with no --vault flag.
+ *  - Unpinned → the vault in the working directory FIRST, then the registry
+ *    DEFAULT (`ctx vault default`), then the remaining registered vaults in
+ *    registry order, capped at MAX_FANOUT_VAULTS in total.
+ *      · The cwd vault is targeted as `null` (no --vault, ctx resolves it
+ *        locally) and its hits are cited without an alias prefix. When that
+ *        same directory is also registered it is targeted by its alias
+ *        instead — once, still first — so a hit keeps a citable `alias:id`
+ *        and is never listed twice.
+ *      · The default vault is the one the user chose to stand for "my
+ *        vault" when nothing more specific applies, so it is always a
+ *        target, wherever it sits in the registry. Before this it competed
+ *        for the MAX_FANOUT_VAULTS slots in plain registry order and lost to
+ *        whichever demo vaults happened to be registered earlier — the real
+ *        brain was never searched while its demos filled every prompt.
+ *      · Registry entries whose path is missing (`exists: false`) or lives
+ *        under os.tmpdir() (scratch vaults agents create) are skipped. A cwd
+ *        vault, the default vault, or a pin is a deliberate choice and is
+ *        exempt from the tmp filter; a default missing on disk is still
+ *        skipped.
+ *  - Unpinned + nothing eligible + no cwd vault → a single null target, i.e.
+ *    let ctx resolve the local/default vault with no --vault flag.
  *
  * @param {ReturnType<typeof getConfig>} config
  * @param {(args:string[]) => any} exec
  * @returns {(string|null)[]} list of alias targets (null = ctx default resolution)
  */
 export function vaultTargets(config, exec) {
-  const vaults = listVaults(exec).filter((v) => v.exists !== false);
-  if (isVaultRegistered(config.vault, vaults)) return [config.vault];
-  if (vaults.length === 0) return [null];
-  return vaults.slice(0, MAX_FANOUT_VAULTS).map((v) => v.alias);
+  const listed = listVaults(exec).filter((v) => v.exists !== false);
+  if (isVaultRegistered(config.vault, listed)) return [config.vault];
+  // `<server>/<nest>` rows are for choosing a nest to WRITE to. Searching the
+  // server row already spans every one of its nests in one call (each hit
+  // names its nest), so fanning out over them too would search twice — and
+  // blow MAX_FANOUT_VAULTS on a server with dozens of partner nests.
+  const present = searchableVaults(listed);
+
+  const local = cwdVault(exec, present);
+  const targets = [];
+  const taken = new Set();
+  const take = (alias) => {
+    if (taken.has(alias)) return;
+    taken.add(alias);
+    targets.push(alias);
+  };
+  if (local) take(local.alias);
+  const preferred = present.find((v) => v.isDefault === true);
+  if (preferred) take(preferred.alias);
+  for (const v of present) {
+    if (targets.length >= MAX_FANOUT_VAULTS) break;
+    if (taken.has(v.alias)) continue;
+    if (isTmpVaultPath(v.path)) continue;
+    take(v.alias);
+  }
+  return targets.length === 0 ? [null] : targets;
 }
 
 /** Collapse internal whitespace and trim, for compact single-line context. */

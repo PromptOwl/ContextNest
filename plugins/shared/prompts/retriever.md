@@ -13,6 +13,10 @@ content — only report what `ctx` returns.
      removed or renamed) — ignore it and choose by `description` instead.
    - Otherwise (no pin) choose the vault(s) whose `description` best matches the
      user's topic. Prefer one; use two only when the topic clearly spans them.
+   - A `<server>/<nest>` row is one nest behind a server alias; the bare
+     `<server>` row searches ALL of its nests in one call. When the topic maps
+     to one nest, target it; when unsure, search the bare server — every hit
+     comes back with the `vault` (`<server>/<nest>`) to cite it as.
 
 2. **Find seed nodes.** Translate the topic into a selector:
    - Run `ctx search "<topic keywords>" --json` to discover relevant node ids.
@@ -25,8 +29,9 @@ content — only report what `ctx` returns.
    the selector or fall back to the top `ctx search` hits read via `ctx read <id>`.
 
 4. **Distill.** Return a compact summary of what the vault actually says, grouped
-   by topic. Cite every claim as `vault:id` (or just `id` for a single local
-   vault). Quote sparingly. Do **not** paste whole documents.
+   by topic. Cite every claim as `vault:id` — for a hit that carries a `vault`
+   field, that field (`<server>/<nest>:id`), since it is what an edit must
+   target (or just `id` for a single local vault). Quote sparingly. Do **not** paste whole documents.
 
 ## Output
 

@@ -9,6 +9,7 @@
  */
 
 import type {
+  ClientMetadata,
   ContextNode,
   ContextYaml,
   GraphQueryResult,
@@ -24,6 +25,30 @@ import { parseSelector } from "./selector/parser.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
+import { isVaultRoot } from "./registry.js";
+import { mapInBatches } from "./concurrency.js";
+
+/**
+ * Stamp `integrity` on each served document that fails verification (and
+ * clear a stale one on a document that now passes). Mutates and returns the
+ * same array. For consumers that assemble served documents themselves — e.g.
+ * a server that loads bodies outside `GraphQueryEngine.query` — so every
+ * serve path flags a tampered document the same way.
+ */
+export async function annotateIntegrity<T extends ContextNode>(
+  storage: NestStorage,
+  docs: T[],
+): Promise<T[]> {
+  // Batched like every other vault-wide scan: one history read per document
+  // (plus keyframe/diff reads on a cache miss) must not open a file handle per
+  // document at once on a wide `context_list full` / full-mode query.
+  await mapInBatches(docs, async (doc) => {
+    const verdict = await storage.verifyServedDocument(doc);
+    if (verdict) doc.integrity = verdict;
+    else delete doc.integrity;
+  });
+  return docs;
+}
 
 export interface GraphQueryOptions {
   /** Number of hops from seed nodes (default: 2) */
@@ -32,6 +57,12 @@ export interface GraphQueryOptions {
   full?: boolean;
   /** Include draft documents (default: false) */
   includeDrafts?: boolean;
+  /**
+   * Caller metadata (§9.4) — agent name, session id, custom keys — stamped on
+   * every access trace this query emits, so a §9.2 provenance record says which
+   * agent read the document, not just which document was read.
+   */
+  client?: ClientMetadata;
 }
 
 export class GraphQueryEngine {
@@ -49,6 +80,19 @@ export class GraphQueryEngine {
     selector: string,
     options: GraphQueryOptions = {},
   ): Promise<GraphQueryResult> {
+    const result = await this.run(selector, options);
+    // Every document this query serves carries an integrity verdict when it
+    // fails verification, so a tampered body reaches the agent flagged rather
+    // than as trusted fact. Per served doc, cached per version — not a vault
+    // re-hash per request.
+    await annotateIntegrity(this.storage, [...result.documents, ...result.sourceNodes]);
+    return result;
+  }
+
+  private async run(
+    selector: string,
+    options: GraphQueryOptions,
+  ): Promise<GraphQueryResult> {
     const { hops = 2, full = false, includeDrafts = false } = options;
 
     // Graph mode reads from context.yaml, which is published-only by design
@@ -58,8 +102,11 @@ export class GraphQueryEngine {
     if (!full && !includeDrafts) {
       let contextYaml = await this.storage.readContextYaml();
 
-      // Auto-generate context.yaml if missing
-      if (!contextYaml) {
+      // Auto-generate context.yaml if missing — but only inside a real vault.
+      // A storage rooted at an arbitrary directory (the CLI's bare-cwd
+      // fallback, a mistyped path) must not have a context.yaml written into
+      // it: that is how a folder of repos ends up "indexed" as documents.
+      if (!contextYaml && isVaultRoot(this.storage.root)) {
         console.error("[ctx] No context.yaml found. Auto-indexing vault...");
         contextYaml = await this.autoIndex();
       }
@@ -143,6 +190,7 @@ export class GraphQueryEngine {
         checkpoint: currentCheckpoint,
         author: doc.frontmatter.author,
         editedAt: doc.frontmatter.updated_at,
+        client: options.client,
       });
     }
 
@@ -199,6 +247,7 @@ export class GraphQueryEngine {
       resolver,
       packLoader,
       currentCheckpoint,
+      client: options.client,
     });
 
     const result = await injector.inject(selector);

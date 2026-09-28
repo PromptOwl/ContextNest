@@ -49,6 +49,21 @@ export interface OperationContext {
    * behaves identically.
    */
   readonly onProgress?: (done: number, total: number) => void;
+  /**
+   * Host-set ceilings for operations that take an upload. On the context, not
+   * in the input, because a limit a caller could raise by asking is not a
+   * limit — the host (CLI, MCP server, Community) decides it.
+   */
+  readonly limits?: OperationLimits;
+}
+
+/** See {@link OperationContext.limits}. */
+export interface OperationLimits {
+  /**
+   * Largest PDF `context_import_pdf` accepts, in bytes. Default
+   * `DEFAULT_PDF_MAX_BYTES` (50 MB).
+   */
+  readonly pdfMaxBytes?: number;
 }
 
 /**

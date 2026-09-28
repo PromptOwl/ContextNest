@@ -4,6 +4,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -38,6 +39,7 @@ import {
   applyTypedBlocks,
   sourceMetaSchema,
   NODE_TYPES,
+  withIntegrityWarning,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -143,6 +145,83 @@ function opCtx(): OperationContext {
   };
 }
 
+// ─── Caller attribution defaults (spec §9.4) ─────────────────────────────────
+//
+// A tool call carries a `client` block naming the calling agent and session.
+// Most callers will not populate it — an agent has no reason to know the field
+// exists — and an audit trail that is empty by default is not much of one. So
+// the server fills what it can from what the transport already knows.
+
+/**
+ * This server process's session id.
+ *
+ * Over stdio, one process IS one session: the client spawns us, talks, and we
+ * exit with it. MCP has no session identifier of its own to borrow, so minting
+ * one per process is the closest true statement we can make — every call
+ * carrying this id really did come from one uninterrupted client connection.
+ */
+const MCP_SESSION_ID = `mcp-${randomUUID()}`;
+
+/**
+ * Whether the server derives attribution at all.
+ *
+ * Set CONTEXTNEST_NO_ATTRIBUTION=1 to turn it off. This is a real opt-out, not
+ * a tidiness knob: what the server derives is written into an append-only
+ * version history, so an operator who does not want their MCP client's name
+ * recorded in a vault permanently needs a way to say so BEFORE the first write,
+ * not a way to scrub it after. A caller that sends its own `client` is still
+ * honoured — that is the caller's choice to record, not ours to strip.
+ */
+const ATTRIBUTION_ENABLED = process.env.CONTEXTNEST_NO_ATTRIBUTION !== "1";
+
+/**
+ * Attribution derived from the MCP `initialize` handshake, for calls that
+ * supply none of their own. `clientInfo.name` is the client's self-report, the
+ * same trust level as a caller-supplied `agent` — which is why neither is ever
+ * used to authorize.
+ *
+ * CONTEXTNEST_AGENT / CONTEXTNEST_SESSION_ID override what the connection
+ * reports, matching the CLI's env vars so an operator names the agent the same
+ * way on both surfaces. A caller's own value still beats both.
+ *
+ * Read per call rather than cached: the handshake completes after this module
+ * is evaluated, so a value captured at load time would always be undefined.
+ */
+function defaultClient(): Record<string, string> {
+  if (!ATTRIBUTION_ENABLED) return {};
+  const info = server.server.getClientVersion();
+  const agent = process.env.CONTEXTNEST_AGENT || info?.name;
+  return {
+    ...(agent ? { agent } : {}),
+    session_id: process.env.CONTEXTNEST_SESSION_ID || MCP_SESSION_ID,
+  };
+}
+
+/**
+ * Merge server defaults under whatever the caller sent. Per KEY, not per
+ * object: a caller that names its agent but no session still gets the session
+ * filled in, rather than losing it to an all-or-nothing choice.
+ */
+function withClientDefaults(input: Record<string, unknown>): Record<string, unknown> {
+  const supplied = input.client;
+  // A non-object `client` is the caller's error to hear about. Passing it
+  // through unchanged lets the catalog raise VALIDATION_FAILED, where spreading
+  // it into an object here would silently repair invalid input.
+  if (supplied !== undefined && (typeof supplied !== "object" || supplied === null || Array.isArray(supplied))) {
+    return input;
+  }
+  const merged = { ...defaultClient(), ...(supplied as Record<string, unknown> | undefined) };
+  // No defaults and nothing supplied: leave `client` OFF the input entirely
+  // rather than sending `{}`. An empty object would write an empty `client:`
+  // key into history, which reads as "attributed to nobody" instead of "not
+  // attributed" — and the field is optional precisely so absence stays sayable.
+  if (Object.keys(merged).length === 0) {
+    const { client: _client, ...rest } = input;
+    return rest;
+  }
+  return { ...input, client: merged };
+}
+
 function toolResult(payload: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
@@ -198,7 +277,7 @@ function validationError(message: string) {
 /** Run a catalog operation and package the outcome as a tool result. */
 async function runOp(name: string, input: Record<string, unknown>) {
   try {
-    return toolResult(await api.run(name, input, opCtx()));
+    return toolResult(await api.run(name, withClientDefaults(input), opCtx()));
   } catch (err) {
     return toolError(err);
   }
@@ -412,7 +491,7 @@ tool(
           required: false,
           type: "string",
           default: "document",
-          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -423,6 +502,10 @@ tool(
             tool: "Tool documentation",
             reference: "External references",
             skill: "Reusable agent skill with trigger, inputs, steps, and guard rails (requires skill block)",
+            agent: "Agent definition, as stored by other tools (no type-specific rules)",
+            artifact: "Generated output, as stored by other tools (no type-specific rules)",
+            table: "Tabular data, as stored by other tools (no type-specific rules)",
+            pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
           },
         },
         tags: {
@@ -470,6 +553,19 @@ tool(
             guard_rails: { required: false, type: "string[]", description: "Constraints or safety rules for execution" },
           },
         },
+        pdf: {
+          required: "Only when type is 'pdf'; must NOT be present on other types. Written by context_import_pdf — never by hand",
+          fields: {
+            file: { required: true, type: "string", description: "Vault-relative sidecar path — always <node id>.pdf, beside the .md" },
+            sha256: { required: true, type: "string", format: "sha256:<64 lowercase hex chars> of the sidecar bytes" },
+            bytes: { required: true, type: "integer" },
+            pages: { required: true, type: "integer" },
+            text_layer: { required: true, type: "boolean", description: "false for a scanned PDF — the body is then empty" },
+            extractor: { required: true, type: "string" },
+            extractor_version: { required: true, type: "string" },
+            extracted_at: { required: true, type: "string", format: "ISO 8601" },
+          },
+        },
       },
       validation_rules: [
         { rule: 1, description: "Valid YAML frontmatter between --- delimiters" },
@@ -477,7 +573,7 @@ tool(
         { rule: 3, description: "Body must be valid GitHub Flavored Markdown (spec 0.29-gfm)" },
         { rule: 4, description: "Context links must use valid contextnest:// URIs" },
         { rule: 5, description: "Tags must match pattern: ^#?[a-zA-Z][a-zA-Z0-9_-]*$" },
-        { rule: 6, description: "type must be one of the 8 defined node types" },
+        { rule: 6, description: `type must be one of the ${NODE_TYPES.length} defined node types: ${NODE_TYPES.join(", ")}` },
         { rule: 7, description: "status must be one of: draft, pending_review, approved, published, rejected (aliases normalized; unknown → draft)" },
         { rule: 8, description: "checksum format: sha256:<64 lowercase hex chars>" },
         { rule: 9, description: "source block MUST be present when type is 'source'" },
@@ -487,6 +583,11 @@ tool(
         { rule: 13, description: "source.depends_on entries must be valid contextnest:// URIs" },
         { rule: 16, description: "source.cache_ttl must be a positive integer if present" },
         { rule: 17, description: "source block must NOT be present on non-source types" },
+        { rule: 25, description: "pdf block MUST be present when type is 'pdf'" },
+        { rule: 26, description: "pdf.file must be the node's own sidecar: <node id>.pdf" },
+        { rule: 27, description: "pdf.sha256 format: sha256:<64 lowercase hex chars>" },
+        { rule: 28, description: "pdf.bytes and pdf.pages are non-negative integers; pdf.text_layer is a boolean" },
+        { rule: 29, description: "pdf block must NOT be present on non-pdf types" },
       ],
       uri_scheme: {
         format: "contextnest://<path>",
@@ -566,12 +667,14 @@ tool(
               documents: result.documents.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               source_nodes: result.sourceNodes.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
                 source: d.frontmatter.source,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {
@@ -618,6 +721,7 @@ tool(
                 title: d.frontmatter.title,
                 description: d.frontmatter.description,
                 type: d.frontmatter.type || "document",
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {
@@ -690,12 +794,20 @@ tool(
     const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
+    // Plain-text tool, so the verdict can only travel as text: a tampered
+    // version chain puts the warning line ahead of the content (additive —
+    // intact output is byte-identical). Chain only; the live body is not what
+    // this serves. No live node to check against → no verdict.
+    const live = await storage.readDocument(id).catch(() => null);
+    const integrity = live
+      ? await storage.verifyServedDocument(live, { checkBody: false })
+      : undefined;
 
     return {
       content: [
         {
           type: "text" as const,
-          text: content,
+          text: withIntegrityWarning(content, integrity),
         },
       ],
     };
@@ -859,6 +971,9 @@ tool(
         result = await publishDocument(storage, id, {
           editedBy: "mcp@contextnest.local",
           note: "Created via MCP server",
+          // Derived attribution only — the legacy tools take no `client` of
+          // their own (additive parity with the catalog tools, per CLAUDE.md).
+          client: defaultClient(),
         });
       } catch (err) {
         try {
@@ -1025,7 +1140,13 @@ tool(
       }
       doc.frontmatter.updated_at = new Date().toISOString();
 
-      // Update body if provided
+      // Update body if provided. A pdf node's body is its extracted text —
+      // same refusal as context_update: change the PDF, not the text.
+      if (resolvedBody.body !== undefined && doc.frontmatter.type === "pdf") {
+        return validationError(
+          `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. Use context_import_pdf with this id to import a new version.`,
+        );
+      }
       if (resolvedBody.body !== undefined) {
         doc.body = `\n${resolvedBody.body}\n`;
       }
@@ -1089,6 +1210,7 @@ tool(
       const result = await publishDocument(storage, id, {
         editedBy: "mcp@contextnest.local",
         note: "Updated via MCP server",
+        client: defaultClient(),
       });
 
       await regenerateIndex();
@@ -1168,6 +1290,7 @@ tool(
       const result = await publishDocument(storage, id, {
         editedBy: author,
         note,
+        client: defaultClient(),
       });
 
       await regenerateIndex();
