@@ -133,10 +133,10 @@ export const TRANSPORTS = ["mcp", "rest", "cli", "function"] as const;
 /** Governance tier enum (zone-classification-rbac-spec §1) */
 export const GOVERNANCE_TIERS = ["primary", "standard"] as const;
 
-/** Suggestion source enum (bridge-function-spec Story 3.1, Story 1.3) */
 /** Values of the vault-level `review` setting in `.context/config.yaml`. */
 export const REVIEW_MODES = ["on", "off"] as const;
 
+/** Suggestion source enum (bridge-function-spec Story 3.1, Story 1.3) */
 export const SUGGESTION_SOURCES = [
   "out-of-band-edit",
   "remote-push",

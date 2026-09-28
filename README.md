@@ -475,7 +475,12 @@ a checkpoint until it is approved.
 - Without a terminal (agents, CI) nothing blocks — one line:
   `Held for review: ctx review approve <path>   (turn off: ctx config set review off)`.
 - MCP results carry `held_for_review: true` and a sentence for the agent to relay
-  (the user can say "turn off review"; the `context_review` tool does it).
+  (the user can say "turn off review"; the `context_review` tool does it). The
+  deprecated `create_document` / `update_document` tools are gated the same way.
+- The gate guards against *unintended* publishes, not a hostile agent: an MCP
+  caller that passes `publish: true` (or `review: false`), calls `context_publish`,
+  or uses `context_review approve` still publishes. The tool descriptions tell
+  agents to do that only when the user says so.
 
 | Command | Effect |
 |---|---|

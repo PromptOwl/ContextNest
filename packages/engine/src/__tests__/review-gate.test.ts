@@ -111,3 +111,49 @@ describe("held writes", () => {
     expect(res.held_for_review).toBeUndefined();
   });
 });
+
+describe("review decisions are scoped to held writes", () => {
+  it("approveReview refuses a stale hold (the node was published past it)", async () => {
+    const { id } = await api.run<any>("context_create", { title: "Moving", content: "one" }, ctx);
+    await api.run<any>("context_update", { id, content: "held", review: true }, ctx);
+    // An ungated publish moves the chain head under the hold.
+    await api.run<any>("context_update", { id, content: "direct" }, ctx);
+    const [hold] = await listReviewHolds(storage, id);
+    expect(hold.stale).toBe(true);
+    await expect(approveReview(storage, id, { actor: "reviewer" })).rejects.toThrow(/stale/);
+    expect(await readFile(docPath(id), "utf-8")).toContain("direct");
+  });
+
+  it("approve and reject refuse a plain draft that was never held", async () => {
+    const { id } = await api.run<any>("context_create", { title: "Draft", content: "wip", publish: false }, ctx);
+    await expect(approveReview(storage, id, { actor: "reviewer" })).rejects.toThrow(/Nothing is pending review/);
+    await expect(rejectReview(storage, id, { actor: "reviewer" })).rejects.toThrow(/Nothing is pending review/);
+    expect(await readFile(docPath(id), "utf-8")).toMatch(/status: draft/);
+  });
+
+  it("setReviewMode refuses a directory that is not a vault, writing nothing", async () => {
+    const bare = await mkdtemp(join(tmpdir(), "contextnest-review-bare-"));
+    try {
+      await expect(setReviewMode(new NestStorage(bare), "off")).rejects.toThrow(/not a Context Nest vault/);
+      const { readdir } = await import("node:fs/promises");
+      expect(await readdir(bare)).toEqual([]);
+    } finally {
+      await rm(bare, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("an explicit published status under a hold", () => {
+  it("create: lands pending_review, not an unversioned 'published' node", async () => {
+    const res = await api.run<any>("context_create", { title: "Sneaky", content: "x", status: "published", review: true }, ctx);
+    expect(res).toMatchObject({ status: "pending_review", held_for_review: true });
+    expect(await readFile(docPath(res.id), "utf-8")).toMatch(/status: pending_review/);
+  });
+
+  it("update of an unpublished node: lands pending_review", async () => {
+    const { id } = await api.run<any>("context_create", { title: "Wip", content: "x", publish: false }, ctx);
+    const res = await api.run<any>("context_update", { id, content: "y", status: "published", review: true }, ctx);
+    expect(res).toMatchObject({ status: "pending_review", held_for_review: true });
+    expect(await storage.readHistory(id)).toBeNull();
+  });
+});

@@ -77,6 +77,16 @@ export async function setReviewMode(storage: NestStorage, mode: ReviewMode): Pro
   if (mode !== "on" && mode !== "off") {
     throw new ContextNestError(`review must be "on" or "off", got "${String(mode)}"`, "VALIDATION_FAILED");
   }
+  // Not a vault → refuse before the lock, which would scaffold .versions/ here.
+  if (!(await storage.readConfig())) {
+    throw new ConfigError(`No .context/config.yaml at ${storage.root} — not a Context Nest vault.`);
+  }
+  // Locked: a read-modify-write of config.yaml racing another writer of it
+  // would drop one side's change.
+  await withVaultLock(storage.root, () => writeReviewMode(storage, mode));
+}
+
+async function writeReviewMode(storage: NestStorage, mode: ReviewMode): Promise<void> {
   const path = configPath(storage);
   let raw: string;
   try {
@@ -318,6 +328,14 @@ export async function approveReview(
         "REJECTED_DOCUMENT",
       );
     }
+    // Only a held write: a plain draft was never submitted, so review is not
+    // the way to release it (`ctx publish` is).
+    if (node.frontmatter.status !== "pending_review") {
+      throw new ContextNestError(
+        `Nothing is pending review for ${id} (status: ${node.frontmatter.status ?? "draft"}).`,
+        "VALIDATION_FAILED",
+      );
+    }
     const result = await publishDocument(storage, id, {
       editedBy: opts.actor,
       note: opts.note ?? "Approved in review",
@@ -354,7 +372,8 @@ export async function rejectReview(
     }
 
     const node = await storage.readDocument(id);
-    if (isPublished(node) || isRejected(node)) {
+    // Only a held write — a plain draft is the author's, not review's to retire.
+    if (node.frontmatter.status !== "pending_review") {
       throw new ContextNestError(`Nothing is pending review for ${id}.`, "VALIDATION_FAILED");
     }
     node.frontmatter.status = "rejected";

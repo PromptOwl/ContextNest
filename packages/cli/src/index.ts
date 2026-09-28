@@ -209,7 +209,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
     commands: [
       ["add", "Add a new document"],
       ["read", "Show a document (add --html to open it in the browser)"],
-      ["update", "Edit a document, then auto-publish a new version"],
+      ["update", "Edit a document, then publish a new version (held instead when review is on)"],
       ["review", "List, approve or reject writes held for review"],
       ["delete", "Remove a document and its version history"],
     ],
@@ -2516,7 +2516,7 @@ program
 
 program
   .command("update <path>")
-  .description("Update a document's frontmatter and/or body, then auto-publish")
+  .description("Update a document's frontmatter and/or body, then publish (held for approval when review is on)")
   .option("--title <title>", "New title")
   .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
@@ -3608,6 +3608,18 @@ drift
 
 // ─── ctx config / ctx review — the human review gate (engine review.ts) ─────
 
+/**
+ * The review gate is a local vault's setting: a hosted nest governs its own
+ * writes, so `ctx config` / `ctx review` refuse a `<server>/<nest>` alias
+ * rather than silently acting on whatever local vault the cwd resolves to.
+ */
+function localGateStorage(command: string): NestStorage {
+  if (remoteTarget(selectedVaultAlias)) {
+    throw new ContextNestError(`ctx ${command} works against a local vault only.`, "NOT_IMPLEMENTED");
+  }
+  return getStorage();
+}
+
 const configCmd = program.command("config").description("Vault settings in .context/config.yaml");
 
 configCmd
@@ -3618,7 +3630,7 @@ configCmd
       console.error(chalk.red(`Unknown setting "${key}". Supported: review`));
       process.exit(1);
     }
-    console.log((await readReviewMode(getStorage())) ?? "unset");
+    console.log((await readReviewMode(localGateStorage("config"))) ?? "unset");
   });
 
 configCmd
@@ -3630,7 +3642,7 @@ configCmd
       console.error(chalk.red("Usage: ctx config set review on|off"));
       process.exit(1);
     }
-    await setReviewMode(getStorage(), mode as "on" | "off");
+    await setReviewMode(localGateStorage("config"), mode as "on" | "off");
     console.log(chalk.green(`review: ${mode}`));
   });
 
@@ -3641,7 +3653,7 @@ reviewCmd
   .description("List what is waiting: new documents (pending_review) and held edits to published ones")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
-    const items = await listPendingReview(getStorage());
+    const items = await listPendingReview(localGateStorage("review"));
     if (opts.json) {
       console.log(JSON.stringify(items, null, 2));
       return;
@@ -3660,7 +3672,7 @@ reviewCmd
   .command("approve <path>")
   .description("Publish what is held for a document")
   .action(async (path: string) => {
-    const storage = getStorage();
+    const storage = localGateStorage("review");
     const id = normalizeDocumentId(path);
     await confirmOrExit(`Publish what is held for review for ${id}?`);
     const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
@@ -3673,7 +3685,7 @@ reviewCmd
   .command("reject <path>")
   .description("Discard a held edit (archived; the published version stays), or retire a pending document")
   .action(async (path: string) => {
-    const storage = getStorage();
+    const storage = localGateStorage("review");
     const id = normalizeDocumentId(path);
     await confirmOrExit(`Reject what is held for review for ${id}?`);
     const r = await rejectReview(storage, id, { actor: "cli@contextnest.local" });

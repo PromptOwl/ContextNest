@@ -33,6 +33,7 @@ import {
   approveSuggestion,
   rejectSuggestion,
   isRejected,
+  isPublished,
   normalizeStatus,
   STATUS_ALIASES,
   normalizeDocumentId,
@@ -45,6 +46,8 @@ import {
   approveReview,
   rejectReview,
   reviewHeldMessage,
+  currentReviewProposal,
+  stageReviewHold,
   NODE_TYPES,
   withIntegrityWarning,
 } from "@promptowl/contextnest-engine";
@@ -324,8 +327,10 @@ async function vaultReviewMode(): Promise<"on" | "off" | undefined> {
 /**
  * Whether a catalog write would publish unless the gate steps in. An explicit
  * `publish` or `review` is the caller's per-call choice and is honoured (the
- * CLI's `--publish` equivalent). A lifecycle transition (`status` other than
- * published) never publishes, so it is not gated.
+ * CLI's `--publish` equivalent). An update naming a status other than
+ * published is a lifecycle transition that never publishes, so it is not
+ * gated. A create publishes whatever its `status` says (only `publish:false`
+ * stops it), so every create is gated.
  */
 function wouldPublish(opName: string, args: Record<string, unknown>): boolean {
   if (args.publish !== undefined || args.review !== undefined) return false;
@@ -1050,6 +1055,21 @@ tool(
         };
       }
 
+      // Review gate, same as context_create: held as pending_review, unversioned
+      // (approval publishes v1). The legacy tool must not be a way around it.
+      if ((await vaultReviewMode()) === "on") {
+        node.frontmatter.status = "pending_review";
+        await storage.writeDocument(id, serializeDocument(node));
+        await regenerateIndex();
+        return toolResult({
+          id,
+          frontmatter: node.frontmatter,
+          held_for_review: true,
+          message: "Document created and held for review (status: pending_review). Not published.",
+          review: reviewHeldMessage(id),
+        });
+      }
+
       const content = serializeDocument(node);
       await storage.writeDocument(id, content);
 
@@ -1167,13 +1187,23 @@ tool(
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
       if (!resolvedBody.ok) return validationError(resolvedBody.error);
       const id = normalizeDocumentId(path);
-      const doc = await storage.readDocument(id);
+      let doc = await storage.readDocument(id);
 
       // Normalize caller-supplied status to canonical before any guard or
       // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
       // collapse here so the disk store and downstream tools only ever see
       // canonical values.
       const normalizedStatus = status !== undefined ? normalizeStatus(status) : undefined;
+
+      // Review gate, same as context_update: a write that would publish is held.
+      // An edit to a published node builds on its current held proposal (so a
+      // second held edit carries the first) and is staged, never written in place.
+      const hold =
+        (normalizedStatus === undefined || normalizedStatus === "published") &&
+        (await vaultReviewMode()) === "on";
+      const holdAsSuggestion = hold && isPublished(doc);
+      const proposal = holdAsSuggestion ? await currentReviewProposal(storage, id) : null;
+      if (proposal) doc = parseDocument(doc.filePath, proposal.proposedRaw, id);
 
       // Refuse content edits on rejected docs unless the caller explicitly
       // names a new status (revive to draft/pending_review/approved/published,
@@ -1253,6 +1283,39 @@ tool(
           ],
           isError: true,
         };
+      }
+
+      if (hold) {
+        let suggestionId: string | undefined;
+        if (holdAsSuggestion) {
+          // The proposal keeps its published status: that is what approval publishes.
+          doc.frontmatter.status = "published";
+          const staged = await stageReviewHold(storage, {
+            documentId: id,
+            proposedRawContent: serializeDocument(doc),
+            actor: "mcp@contextnest.local",
+            ...(doc.frontmatter.zone ? { zone: doc.frontmatter.zone } : {}),
+            docTier: doc.frontmatter.governance ?? "standard",
+            supersedes: proposal ? [proposal.suggestionId] : [],
+          });
+          suggestionId = staged?.suggestionId;
+        }
+        // Not published yet, or published but never sealed (no history to
+        // diff against): held in place as pending_review.
+        if (!suggestionId) {
+          doc.frontmatter.status = "pending_review";
+          await storage.writeDocument(id, serializeDocument(doc));
+          await regenerateIndex();
+        }
+        return toolResult({
+          id,
+          held_for_review: true,
+          ...(suggestionId ? { suggestion_id: suggestionId } : { frontmatter: doc.frontmatter }),
+          message: suggestionId
+            ? "Edit held for review. The published version keeps serving until it is approved."
+            : "Document held for review (status: pending_review). Not published.",
+          review: reviewHeldMessage(id),
+        });
       }
 
       const content = serializeDocument(doc);

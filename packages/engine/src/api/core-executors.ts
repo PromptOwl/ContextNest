@@ -481,11 +481,15 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // Held for review (review.ts): an unpublished node is simply written as
   // pending_review. An explicit publish:true wins — the flag is the caller's
   // per-call override (`ctx add --publish`).
-  const hold = input.review === true && input.publish !== true;
+  // A create publishes whatever `status` it names, so any status is held — as
+  // pending_review, the one status approval releases (an explicit `published`
+  // left in would land marked published with no version). A rejected create
+  // never publishes, so there is nothing to hold.
+  const hold = input.review === true && input.publish !== true && input.status !== "rejected";
   const node = buildDraftNode({
     ...input,
     content,
-    ...(hold && input.status === undefined ? { status: "pending_review" } : {}),
+    ...(hold ? { status: "pending_review" } : {}),
   });
   // A rejected node cannot be published — publish refuses one by design. Left
   // to fall through, the write below lands and publish then throws, stranding a
@@ -587,10 +591,15 @@ const update: OperationExecutor = async (ctx, input: any) => {
     assertUsableTitle(String(input.title));
     frontmatter.title = input.title;
   }
-  if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  // Under a hold an explicit `published` is what the hold defers, not a status
+  // to write — applied, an unpublished node would read published, unversioned.
+  if (input.status && !(hold && input.status === "published")) {
+    frontmatter.status = input.status as Frontmatter["status"];
+  }
   // An unpublished node held for review is marked as such (a staged edit to a
   // published node keeps its status: the proposal is what approval publishes).
-  else if (hold && !holdAsSuggestion && frontmatter.status !== "rejected") {
+  // A rejected node stays rejected unless the caller asked to revive it.
+  else if (hold && !holdAsSuggestion && (input.status === "published" || frontmatter.status !== "rejected")) {
     frontmatter.status = "pending_review";
   }
   // An empty string CLEARS the description, the same convention `metadata`

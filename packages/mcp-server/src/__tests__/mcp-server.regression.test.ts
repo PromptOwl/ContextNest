@@ -1138,6 +1138,36 @@ describe("[regression] MCP server e2e — review gate", () => {
     expect(raw).not.toContain("edited");
   });
 
+  it("a create that names a status is still held — status alone never stops a create publishing", async () => {
+    const { json } = await callJson(client, "context_create", { title: "Named Status", content: "x", status: "draft" });
+    expect(json.held_for_review).toBe(true);
+    expect(json.status).toBe("pending_review");
+    expect(json.checkpoint).toBeNull();
+  });
+
+  it("the deprecated create_document is held too — the legacy tool is no way around the gate", async () => {
+    const { json, isError } = await callJson(client, "create_document", { path: "nodes/legacy-held", title: "Legacy Held" });
+    expect(isError).toBe(false);
+    expect(json.held_for_review).toBe(true);
+    expect(json.review).toMatch(/turn off review/);
+    const raw = await readFile(join(vault, "nodes", "legacy-held.md"), "utf-8");
+    expect(raw).toMatch(/status:\s*pending_review/);
+    expect(await new NestStorage(vault).readHistory("nodes/legacy-held")).toBeNull();
+  });
+
+  it("the deprecated update_document stages an edit to a published node and builds on the prior hold", async () => {
+    const { json } = await callJson(client, "update_document", { path: "nodes/held-note", body: "legacy edit" });
+    expect(json.held_for_review).toBe(true);
+    expect(typeof json.suggestion_id).toBe("string");
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toContain("agent-written");
+    // One hold per node: this one superseded context_update's.
+    const list = await callJson(client, "context_review", { action: "list" });
+    expect(list.json.filter((i: { id: string }) => i.id === "nodes/held-note")).toHaveLength(1);
+    await callJson(client, "context_review", { action: "approve", id: "nodes/held-note" });
+    expect(await readFile(join(vault, "nodes", "held-note.md"), "utf-8")).toContain("legacy edit");
+  });
+
   it("context_review off turns the gate off; the next write publishes", async () => {
     const off = await callJson(client, "context_review", { action: "off" });
     expect(off.json.review).toBe("off");
