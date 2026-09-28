@@ -1287,6 +1287,24 @@ describe("[regression] ctx push", () => {
     }
   });
 
+  it("a confirmed push that created fewer than it held reports the shortfall", async () => {
+    const server = await startGatedEngine([{ status: "applied", doc_count: 3, applied_node_count: 1 }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Pushed 1 document\b/);
+      expect(res.stdout).toMatch(/2 not created/);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("a gated push that is rejected exits non-zero and says nothing was applied", async () => {
     const server = await startGatedEngine([{ status: "rejected", decided_by: "steward@ex" }]);
     try {
