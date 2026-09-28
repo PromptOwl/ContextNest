@@ -20,12 +20,17 @@ One registered server stands for every nest behind it.
   session overview and carried in every capture directive.
 - **The sweep-check follows nests.** It parses `--vault <server>/<nest>`,
   reads each straggler in its own nest, and cites it there.
+
+## 0.5.5
+
+The curator knows how to refile on a remote nest.
+
 - **`ctx move` is in the curator's toolkit.** After the user approves a
-  restructure, the curator refiles a node with `ctx move <id> <folder> --vault
-  <alias>` (remote Community nests only). It is told that a rename
+  restructure, the curator moves a node with `ctx move <id> <folder> --vault
+  <alias>` (needs a CLI with `ctx move`; remote Community nests only). It is told that a rename
   (`ctx update --title`) is not available on a remote nest and to hand that
-  back to the user. `ctx update --tags` works on remote nests and replaces the
-  set there as it does locally, so the existing retag guidance holds.
+  back to the user. `ctx update --tags` now works on remote nests, and
+  replaces the set there as it does locally, so the existing retag guidance holds.
 
 ## 0.5.4
 

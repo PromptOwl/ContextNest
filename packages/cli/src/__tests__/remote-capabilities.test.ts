@@ -187,6 +187,29 @@ describe("remoteAdd — folder", () => {
   });
 });
 
+describe("remoteAdd — push-confirmation gate", () => {
+  it("reports a held create instead of failing, and does not claim it was created", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = new ContextNestError("This nest holds agent writes for review.", "PENDING_CONFIRMATION");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(remoteAdd(target, "nodes/thing", {})).resolves.toBeUndefined();
+
+    expect(plain()).toContain("holds agent writes for review");
+    expect(plain()).not.toContain("Created and published");
+    errSpy.mockRestore();
+  });
+
+  it("still throws any other create error", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = new ContextNestError("exists", "DOCUMENT_ALREADY_EXISTS");
+
+    const err = await remoteAdd(target, "nodes/thing", {}).catch((e) => e);
+
+    expect((err as ContextNestError).code).toBe("DOCUMENT_ALREADY_EXISTS");
+  });
+});
+
 // A remote nest must take the same edits a local vault does (Stacey's
 // partner-nest report: tags couldn't change, move didn't exist).
 describe("remoteUpdate / remoteMove", () => {

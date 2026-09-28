@@ -33,6 +33,7 @@ import { NO_REDIRECT, assertNotRedirected } from "./safety.js";
 export interface PendingConfirmation {
   status: "pending_confirmation";
   pending_id: string;
+  /** Reviewer's confirm API path (POST), not a page — the CLI links the nest view. */
   confirm_url: string;
   /** Path (starts with `/`) to poll, e.g. `/nests/:id/pending-pushes/:pid`. */
   poll_url: string;

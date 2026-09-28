@@ -207,7 +207,7 @@ function startGatedEngine(pollSequence: Array<Record<string, unknown>>): Promise
             JSON.stringify({
               status: "pending_confirmation",
               pending_id: "pid1",
-              confirm_url: "https://ui.example/confirm/pid1",
+              confirm_url: `/nests/${nest}/pending-pushes/pid1/confirm`,
               poll_url: `/nests/${nest}/pending-pushes/pid1`,
               message: "This nest requires confirmation before the push is applied.",
               expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
@@ -1181,6 +1181,30 @@ describe("[regression] ctx push", () => {
     }
   });
 
+  it("lists skipped and failed documents, and exits non-zero when any failed", async () => {
+    const server = await startMockEngine(() => ({
+      published: 0,
+      context_md_updated: false,
+      node_ids: [],
+      skipped: ["Pushable"],
+      failed: [{ title: "Broken", error: "invalid type" }],
+    }));
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toMatch(/Pushable \(already exists, not overwritten\)/);
+      expect(res.stderr).toMatch(/Broken: invalid type/);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("includes the folder for a folder-nested document, so a catalog-conformant nest can keep it out of the root", async () => {
     // "cli flattens every single write" (Misha, #engineering, 2026-09-18):
     // a document that lives under nodes/<folder>/<slug> locally must not be
@@ -1255,9 +1279,27 @@ describe("[regression] ctx push", () => {
         "--yes",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).toMatch(/Pushed 1 document/);
       expect(server.pollCount()).toBeGreaterThanOrEqual(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a confirmed push that created fewer than it held reports the shortfall", async () => {
+    const server = await startGatedEngine([{ status: "applied", doc_count: 3, applied_node_count: 1 }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Pushed 1 document\b/);
+      expect(res.stdout).toMatch(/2 not created/);
     } finally {
       await server.close();
     }
@@ -1293,7 +1335,7 @@ describe("[regression] ctx push", () => {
         "--no-wait",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).not.toMatch(/Pushed/);
       expect(server.pollCount()).toBe(0);
     } finally {
