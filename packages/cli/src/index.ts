@@ -2905,6 +2905,8 @@ function reportPushOutcome(outcome: TerminalOutcome): void {
     case "applied": {
       const n = outcome.result.applied_node_count ?? outcome.result.doc_count ?? 0;
       console.log(chalk.green(`Pushed ${n} document${n !== 1 ? "s" : ""}`));
+      const notCreated = (outcome.result.doc_count ?? n) - n;
+      if (notCreated > 0) console.log(chalk.yellow(`  ${notCreated} not created (already existed or failed — check the nest)`));
       if (outcome.result.decided_by) console.log(chalk.dim(`  confirmed by ${outcome.result.decided_by}`));
       return;
     }
@@ -3075,12 +3077,23 @@ program
         process.exit(1);
       }
 
-      const data = (payload ?? {}) as { published: number; context_md_updated: boolean; node_ids: string[] };
+      const data = (payload ?? {}) as {
+        published: number;
+        context_md_updated: boolean;
+        node_ids: string[];
+        skipped?: string[];
+        failed?: Array<{ title: string; error: string }>;
+      };
       console.log(chalk.green(`Pushed ${data.published} document${data.published !== 1 ? "s" : ""}`));
       if (data.context_md_updated) console.log(chalk.green("  CONTEXT.md updated"));
       for (const id of data.node_ids) {
         console.log(chalk.dim(`  + ${id}`));
       }
+      // The server never overwrites an existing document, and a bad row fails
+      // alone; both must show, and a failure must not exit 0.
+      for (const title of data.skipped ?? []) console.log(chalk.dim(`  = ${title} (already exists, not overwritten)`));
+      for (const f of data.failed ?? []) console.error(chalk.red(`  x ${f.title}: ${f.error}`));
+      if (data.failed?.length) process.exit(1);
     } catch (err: any) {
       console.error(chalk.red(`Push failed: ${err.message}`));
       process.exit(1);

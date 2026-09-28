@@ -1181,6 +1181,30 @@ describe("[regression] ctx push", () => {
     }
   });
 
+  it("lists skipped and failed documents, and exits non-zero when any failed", async () => {
+    const server = await startMockEngine(() => ({
+      published: 0,
+      context_md_updated: false,
+      node_ids: [],
+      skipped: ["Pushable"],
+      failed: [{ title: "Broken", error: "invalid type" }],
+    }));
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toMatch(/Pushable \(already exists, not overwritten\)/);
+      expect(res.stderr).toMatch(/Broken: invalid type/);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("includes the folder for a folder-nested document, so a catalog-conformant nest can keep it out of the root", async () => {
     // "cli flattens every single write" (Misha, #engineering, 2026-09-18):
     // a document that lives under nodes/<folder>/<slug> locally must not be
