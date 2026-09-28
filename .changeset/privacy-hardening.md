@@ -1,5 +1,5 @@
 ---
-"@promptowl/contextnest-cli": minor
+"@promptowl/contextnest-cli": major
 ---
 
 Privacy hardening.
@@ -16,5 +16,7 @@ Privacy hardening.
   an AES-256-GCM file (`~/.promptowl/credentials.enc.json`, 0600). The plaintext file is migrated
   on first read and securely deleted. **Breaking for headless users with a stored token:** with no
   keyring and no key, `ctx query @org/pack` now errors instead of reading plaintext — set
-  `CONTEXTNEST_CREDENTIALS_KEY` or `PROMPTOWL_ACCESS_TOKEN`.
+  `CONTEXTNEST_CREDENTIALS_KEY` or `PROMPTOWL_ACCESS_TOKEN`. A keyring read that fails for any
+  reason other than "not found" (locked Keychain, PowerShell blocked) errors rather than silently
+  querying anonymously.
 - `ctx doctor` shows a Privacy line (telemetry state, credential store).

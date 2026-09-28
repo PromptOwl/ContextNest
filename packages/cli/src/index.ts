@@ -7,11 +7,10 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
 import { homedir, tmpdir } from "node:os";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
-const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+import { CLI_VERSION } from "./version.js";
 import chalk from "./color.js";
 import {
   NestStorage,
@@ -146,7 +145,7 @@ const program = new Command();
 program
   .name("ctx")
   .description("Context Nest CLI — manage structured, versioned context vaults")
-  .version(pkg.version)
+  .version(CLI_VERSION)
   // Global selector: target a registered vault by alias from any directory.
   // When omitted, resolution falls back to env vars, the local vault, then the
   // registry default (see resolveVaultPath precedence in the engine).
@@ -1017,7 +1016,7 @@ async function applyStarter(
       tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
     })),
     timestamp: new Date().toISOString(),
-    cliVersion: pkg.version,
+    cliVersion: CLI_VERSION,
     analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
@@ -1067,7 +1066,7 @@ This vault was initialized without a starter recipe. To help the user get starte
     starterDisplayName: null,
     nodes: [],
     timestamp: new Date().toISOString(),
-    cliVersion: pkg.version,
+    cliVersion: CLI_VERSION,
     analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
@@ -2883,7 +2882,7 @@ program
         tags: (d.frontmatter.tags || []).map((t: string) => t.replace(/^#/, "")),
       })),
       timestamp: new Date().toISOString(),
-      cliVersion: pkg.version,
+      cliVersion: CLI_VERSION,
       analytics: telemetryConsent(getVaultRoot()),
     });
 
@@ -3763,7 +3762,7 @@ program
     // Diagnostics never fail: every probe degrades to null/"unknown" and the
     // exit code stays 0, so a script can always read the report.
     const report = await buildDoctorReport({
-      cliVersion: pkg.version,
+      cliVersion: CLI_VERSION,
       cliPath: fileURLToPath(import.meta.url),
     });
     if (opts.json) {

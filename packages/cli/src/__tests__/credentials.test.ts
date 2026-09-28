@@ -150,7 +150,23 @@ describe("OS keyrings keep the secret off argv (runner mocked)", () => {
       throw new Error("spawn ENOENT");
     };
     expect(await macKeychain(runner).available()).toBe(false);
-    expect(await windowsCredentialManager(runner).available()).toBe(false);
     expect(await linuxSecretService(runner, { DBUS_SESSION_BUS_ADDRESS: "x" }).available()).toBe(false);
+    // Windows is not probed (a PowerShell start + C# compile per call); the failure surfaces on use.
+    await expect(windowsCredentialManager(runner).get("acct")).rejects.toThrow(/powershell/);
+  });
+
+  it("Windows: availability costs no process spawn", async () => {
+    const { calls, runner } = record(() => ({ code: 0 }));
+    expect(await windowsCredentialManager(runner).available()).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("only 'not found' reads as no token; other read failures throw instead of going anonymous", async () => {
+    const mac = (code: number) => macKeychain(record(() => ({ code, stderr: "locked" })).runner);
+    expect(await mac(44).get("acct")).toBeNull();
+    await expect(mac(51).get("acct")).rejects.toThrow(/Keychain/);
+    const win = (code: number) => windowsCredentialManager(record(() => ({ code, stderr: "Add-Type blocked" })).runner);
+    expect(await win(3).get("acct")).toBeNull();
+    await expect(win(1).get("acct")).rejects.toThrow(/Add-Type blocked/);
   });
 });

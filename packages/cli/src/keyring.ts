@@ -97,8 +97,10 @@ export function macKeychain(runner: CommandRunner = defaultRunner): KeyringBacke
     async get(account) {
       const r = await tryRun(runner, SECURITY, ["find-generic-password", "-s", KEYRING_SERVICE, "-a", account, "-w"]);
       if (!r) throw new Error("macOS Keychain unavailable: could not run /usr/bin/security");
-      // 44 = errSecItemNotFound
-      if (r.code !== 0) return null;
+      // 44 = errSecItemNotFound. Anything else (locked keychain, denied
+      // prompt) is a failure, not "no token" — don't go anonymous silently.
+      if (r.code === 44) return null;
+      if (r.code !== 0) throw new Error(`Could not read the macOS Keychain: ${r.stderr.trim() || `security exited ${r.code}`}`);
       return decode(r.stdout.replace(/\r?\n$/, ""));
     },
     async set(account, secret) {
@@ -190,7 +192,7 @@ public static class CnCred {
 }`;
 
 /** Build the PowerShell script for one operation. The target is a constant-ish id, never a secret. */
-export function windowsScript(op: "probe" | "get" | "set", target: string): string {
+export function windowsScript(op: "get" | "set", target: string): string {
   const t = target.replace(/'/g, "''");
   return [
     "$ErrorActionPreference = 'Stop'",
@@ -198,7 +200,6 @@ export function windowsScript(op: "probe" | "get" | "set", target: string): stri
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
     `Add-Type -TypeDefinition @'\n${WIN_CS}\n'@`,
     `$target = '${t}'`,
-    op === "probe" ? "exit 0" : "",
     op === "get" ? "$v = [CnCred]::Read($target); if ($null -eq $v) { exit 3 }; [Console]::Out.Write($v)" : "",
     op === "set" ? "$s = [Console]::In.ReadToEnd(); if (-not [CnCred]::Write($target, 'contextnest', $s)) { exit 4 }" : "",
   ]
@@ -217,14 +218,19 @@ export function windowsCredentialManager(runner: CommandRunner = defaultRunner):
     );
   return {
     name: "Windows Credential Manager",
+    // Credential Manager and powershell.exe ship with every supported Windows.
+    // Probing would cost a PowerShell start + C# compile (~1s) on every
+    // `ctx doctor` and cloud query; a real failure surfaces in get/set instead.
     async available() {
-      const r = await ps(windowsScript("probe", target("__probe__")));
-      return r !== null && r.code === 0;
+      return true;
     },
     async get(account) {
       const r = await ps(windowsScript("get", target(account)));
       if (!r) throw new Error("Windows Credential Manager unavailable: could not run powershell.exe");
-      if (r.code !== 0) return null;
+      // exit 3 = not found. Anything else (e.g. Add-Type blocked by
+      // Constrained Language Mode) is a failure, not "no token".
+      if (r.code === 3) return null;
+      if (r.code !== 0) throw new Error(`Could not read Windows Credential Manager: ${r.stderr.trim() || `powershell exited ${r.code}`}`);
       return r.stdout;
     },
     async set(account, secret) {
