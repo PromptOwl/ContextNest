@@ -94,9 +94,16 @@ ctx add nodes/<slug> --type document --title "<headline>" --tags "<comma,separat
 `ctx update <id> --body` **replaces the whole body**, so read the node first
 (`ctx read <id> --raw`) and preserve everything you are not changing.
 
+A vault with review on (the default for new vaults) **holds** the write
+instead of publishing it: `ctx` prints `Held for review: ctx review approve
+<id>`, and the node is not retrievable until the user approves. Never approve
+or publish it yourself, and never pass `--publish` — the approval is the user's.
+
 ## 4. Report in one line, or not at all
 
 Report only what you actually proposed or wrote, one line each
-(`captured: vault:id — headline`). **If nothing cleared the ladder, output
+(`captured: vault:id — headline`). A held write is reported as
+`held for review: vault:id — headline · approve: ctx review approve <id>`, so
+the user knows it is waiting on them. **If nothing cleared the ladder, output
 nothing at all** — not "nothing to capture", not a summary of what you
 considered. Silence is the most common correct outcome.

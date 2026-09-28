@@ -1808,6 +1808,9 @@ description: "Technical documentation and decisions"
 defaults:
   status: draft
 
+# Human review gate for agent/tool writes (see below). Optional.
+review: 'on'
+
 # Folder configurations (Obsidian-compatible layout)
 folders:
   engineering:
@@ -1847,6 +1850,13 @@ sync:
 ```
 
 The `servers` block is the authoritative registry of external services available to source nodes. When a source node declares `source.server: jira`, the runtime resolves the connection URL from this registry. The `external_dependencies` section in `context.yaml` (§5) is auto-generated from the intersection of this registry and the servers actually referenced by published source nodes.
+
+The optional `review` key (`on` | `off`; YAML 1.1 booleans `true`/`false` are accepted as `on`/`off`) is the human review gate. It is read by write surfaces (CLI, MCP server), not enforced by the storage layer. When `on`, a write that would publish is **held** instead:
+
+- A node that is not yet published is written in place with `status: pending_review` and no version; approving it publishes v1.
+- An edit to a published node is staged as a suggestion under `_suggestions/` with `source: manual-suggestion` and a note beginning `review-hold`. The canonical file and hash chain are untouched, so the published version keeps serving. A later held edit to the same node builds on the earlier one and supersedes it.
+
+No version or checkpoint is created until the hold is approved; approval performs exactly the write and publish the hold deferred. A hold whose base is no longer the node's latest version is stale and MUST NOT be approved. A vault without the key predates the gate and publishes immediately.
 
 ### 11.2 syntax.yml (Optional)
 

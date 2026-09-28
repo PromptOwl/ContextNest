@@ -72,6 +72,12 @@ number) and note each node's current version from `ctx history <id> --json`.
 Report those numbers: with them the whole change-set can be unwound afterwards
 via `ctx reconstruct <id> <version>`. Without them it cannot.
 
+In a vault with review on (the default for new vaults) an update is **held**
+instead: `ctx` prints `Held for review: …`, no version is cut, and the old value
+keeps serving until the user approves. Do not approve, publish, or pass
+`--publish` yourself — report each such node as `held for review: vault:id`,
+and tell the user one `ctx review approve <id>` per node lands the correction.
+
 ### Editing
 
 `ctx update <id> --body` **replaces the entire body**. Every edit is therefore

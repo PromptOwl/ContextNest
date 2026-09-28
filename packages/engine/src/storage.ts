@@ -41,6 +41,7 @@ import {
 import type {
   ContextNode,
   NestConfig,
+  ReviewMode,
   DocumentHistory,
   VersionEntry,
   Checkpoint,
@@ -2370,6 +2371,7 @@ export class NestStorage {
     name: string,
     layout: LayoutMode = "structured",
     description?: string,
+    options: { review?: ReviewMode } = {},
   ): Promise<void> {
     await mkdir(this.root, { recursive: true });
 
@@ -2389,6 +2391,10 @@ export class NestStorage {
       name,
       ...(description?.trim() ? { description } : {}),
       defaults: { status: "draft" },
+      // Only when asked: `ctx init` passes `on` so new vaults hold agent
+      // writes for review. Embedders calling init() directly keep the
+      // pre-gate config (no key → publish by default).
+      ...(options.review ? { review: options.review } : {}),
     };
     await this.writeConfig(config);
 

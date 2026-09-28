@@ -65,6 +65,9 @@ export type FederationMode = "none" | "federated" | "scoped";
 /** Governance tier (zone-classification-rbac-spec §1, §2.2) */
 export type GovernanceTier = "primary" | "standard";
 
+/** Value of the vault-level `review` setting. */
+export type ReviewMode = "on" | "off";
+
 /** Origin of a staged suggestion (bridge-function-spec Story 3.1, Story 1.3) */
 export type SuggestionSource =
   | "out-of-band-edit"
@@ -480,6 +483,14 @@ export interface NestConfig {
    * written (back-compat). `ctx index` honors this; `ctx init` overwrites it.
    */
   agent_tools?: string[];
+  /**
+   * Human review gate for agent/tool writes (`review.ts`). `on` holds writes
+   * for a human to approve instead of publishing them; `off` publishes.
+   * `ctx init` writes `on`. ABSENT means a vault that predates the gate: it
+   * keeps publishing by default (existing automations are not changed);
+   * `ctx config set review on` opts it in.
+   */
+  review?: ReviewMode;
 }
 
 /**
