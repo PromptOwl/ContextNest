@@ -54,6 +54,9 @@ export const ERROR_CODES = [
   // vault write lock (vault-lock.ts) — retryable: a concurrent writer held
   // the lock past the acquire timeout; the operation was not performed
   "VAULT_LOCK_TIMEOUT",
+  // governed host (Community push-confirmation gate) — not a failure: the
+  // write was accepted and is held until a reviewer confirms it
+  "PENDING_CONFIRMATION",
   // operation-runtime codes
   "UNKNOWN_OPERATION",
   "NOT_IMPLEMENTED",
