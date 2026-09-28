@@ -587,7 +587,17 @@ export async function remoteAdd(
     if (opts.type) input.type = opts.type;
     if (tags) input.tags = tags;
 
-    const created = await conn.run<{ id: string; version: number }>("context_create", input);
+    let created: { id: string; version: number };
+    try {
+      created = await conn.run<{ id: string; version: number }>("context_create", input);
+    } catch (err) {
+      // A gated nest accepted the write but holds it for a reviewer; that is
+      // not a failure, so report it and exit 0 like `ctx push --no-wait`.
+      if (!(err instanceof ContextNestError && err.code === "PENDING_CONFIRMATION")) throw err;
+      console.log(chalk.yellow(err.message));
+      console.error(chalk.dim(`Held for a reviewer on "${target.alias}" — ${id} does not exist until confirmed.`));
+      return;
+    }
     console.log(chalk.green(`Created and published ${created.id}.md (remote: ${target.alias})`));
     console.log(`  Version: ${created.version}`);
   });

@@ -164,7 +164,11 @@ link and waits for the decision, exiting `0` once the push is applied and
 non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
 submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
 defaults to the server's window, else 15 minutes). Ungated nests apply
-immediately, exactly as before.
+immediately, exactly as before. A push that runs straight through lists any
+document it skipped (already exists — never overwritten) or failed, and exits
+non-zero if one failed. On such a nest, `ctx add` against the remote vault is
+held the same way: it prints the nest's message and exits `0`, and the document
+does not exist until a reviewer confirms it.
 
 ### Caller attribution
 
