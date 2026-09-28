@@ -441,6 +441,7 @@ const createOp: OperationDescriptor = {
     "DOCUMENT_ALREADY_EXISTS",
     "FORGOTTEN_DOCUMENT",
     "VAULT_LOCK_TIMEOUT",
+    "PENDING_CONFIRMATION",
   ],
   aliases: ["create_document"],
 };

@@ -7,11 +7,10 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
 import { homedir, tmpdir } from "node:os";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
-const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+import { CLI_VERSION } from "./version.js";
 import chalk from "./color.js";
 import {
   NestStorage,
@@ -81,7 +80,9 @@ import {
   remoteMove,
   expandServerVaults,
   folderFromId,
+  remoteFetchRecipe,
 } from "./remote.js";
+import { planPull, applyPull, type PullStep } from "./pull.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -106,6 +107,8 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { telemetryConsent } from "./telemetry/index.js";
+import { loadCloudToken } from "./credentials.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
@@ -143,7 +146,7 @@ const program = new Command();
 program
   .name("ctx")
   .description("Context Nest CLI — manage structured, versioned context vaults")
-  .version(pkg.version)
+  .version(CLI_VERSION)
   // Global selector: target a registered vault by alias from any directory.
   // When omitted, resolution falls back to env vars, the local vault, then the
   // registry default (see resolveVaultPath precedence in the engine).
@@ -237,7 +240,10 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   },
   {
     title: "Share",
-    commands: [["push", "Push the vault to a hosted ContextNest server"]],
+    commands: [
+      ["push", "Push the vault to a hosted ContextNest server"],
+      ["pull", "Pull a recipe from a remote nest into this vault, as drafts with lineage"],
+    ],
   },
 ];
 
@@ -432,6 +438,7 @@ const VAULT_WRITE_COMMANDS = new Set([
   "import jats",
   "import pubmed",
   "enrich pubtator",
+  "pull",
 ]);
 
 /**
@@ -1011,7 +1018,8 @@ async function applyStarter(
       tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
     })),
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: CLI_VERSION,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
 }
@@ -1060,7 +1068,8 @@ This vault was initialized without a starter recipe. To help the user get starte
     starterDisplayName: null,
     nodes: [],
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: CLI_VERSION,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
 }
@@ -2268,17 +2277,6 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
   }
 }
 
-async function loadCloudToken(): Promise<string | null> {
-  const homedir = (await import("node:os")).homedir();
-  const credPath = pathMod.join(homedir, ".promptowl", "credentials.json");
-  try {
-    const creds = JSON.parse(await fs.promises.readFile(credPath, "utf-8"));
-    return creds.access_token || null;
-  } catch {
-    return null;
-  }
-}
-
 // ─── ctx query ────────────────────────────────────────────────────────────────
 
 program
@@ -3087,7 +3085,8 @@ program
         tags: (d.frontmatter.tags || []).map((t: string) => t.replace(/^#/, "")),
       })),
       timestamp: new Date().toISOString(),
-      cliVersion: program.version() || "0.3.0",
+      cliVersion: CLI_VERSION,
+      analytics: telemetryConsent(getVaultRoot()),
     });
 
     console.log(chalk.green(`Generated welcome page: .context/welcome.html`));
@@ -3108,6 +3107,8 @@ function reportPushOutcome(outcome: TerminalOutcome): void {
     case "applied": {
       const n = outcome.result.applied_node_count ?? outcome.result.doc_count ?? 0;
       console.log(chalk.green(`Pushed ${n} document${n !== 1 ? "s" : ""}`));
+      const notCreated = (outcome.result.doc_count ?? n) - n;
+      if (notCreated > 0) console.log(chalk.yellow(`  ${notCreated} not created (already existed or failed — check the nest)`));
       if (outcome.result.decided_by) console.log(chalk.dim(`  confirmed by ${outcome.result.decided_by}`));
       return;
     }
@@ -3248,7 +3249,9 @@ program
       const pending = asPendingConfirmation(res.status, payload);
       if (pending) {
         console.log(chalk.yellow(pending.message || "This nest requires confirmation before the push is applied."));
-        console.log(chalk.cyan(`Confirm in the UI: ${pending.confirm_url}`));
+        // confirm_url is the reviewer's API endpoint, not a page; send the
+        // person to the nest view, which shows the held write to confirm.
+        console.log(chalk.cyan(`Confirm in the UI: ${serverUrl}/nest/${encodeURIComponent(opts.nest)}`));
 
         // --no-wait → commander sets opts.wait = false.
         if (opts.wait === false) {
@@ -3282,12 +3285,23 @@ program
         process.exit(1);
       }
 
-      const data = (payload ?? {}) as { published: number; context_md_updated: boolean; node_ids: string[] };
+      const data = (payload ?? {}) as {
+        published: number;
+        context_md_updated: boolean;
+        node_ids: string[];
+        skipped?: string[];
+        failed?: Array<{ title: string; error: string }>;
+      };
       console.log(chalk.green(`Pushed ${data.published} document${data.published !== 1 ? "s" : ""}`));
       if (data.context_md_updated) console.log(chalk.green("  CONTEXT.md updated"));
       for (const id of data.node_ids) {
         console.log(chalk.dim(`  + ${id}`));
       }
+      // The server never overwrites an existing document, and a bad row fails
+      // alone; both must show, and a failure must not exit 0.
+      for (const title of data.skipped ?? []) console.log(chalk.dim(`  = ${title} (already exists, not overwritten)`));
+      for (const f of data.failed ?? []) console.error(chalk.red(`  x ${f.title}: ${f.error}`));
+      if (data.failed?.length) process.exit(1);
     } catch (err: any) {
       console.error(chalk.red(`Push failed: ${err.message}`));
       process.exit(1);
@@ -3501,6 +3515,128 @@ drift
         `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
       ),
     );
+  });
+
+// ─── ctx pull ────────────────────────────────────────────────────────────────
+
+const PULL_MARKS: Record<PullStep["action"], string> = {
+  create: chalk.green("+ create  "),
+  update: chalk.green("↑ update  "),
+  "up-to-date": chalk.dim("= current "),
+  "update-available": chalk.yellow("↑ newer   "),
+  conflict: chalk.red("! conflict"),
+  exists: chalk.dim("· exists  "),
+};
+
+function pullStepLine(step: PullStep): string {
+  const from = step.from ? chalk.dim(` ← ${step.from}${step.upstreamVersion ? ` v${step.upstreamVersion}` : ""}`) : "";
+  let tail = "";
+  if (step.action === "update-available") {
+    tail = chalk.yellow(` (local v${step.localVersion ?? "?"} → upstream v${step.upstreamVersion}; rerun with --update)`);
+  } else if (step.note && (step.action === "conflict" || step.action === "exists")) {
+    tail = chalk.dim(` — ${step.note.split(" — ").pop()}`);
+  }
+  return `  ${PULL_MARKS[step.action]} ${chalk.cyan(step.to)}${from}${tail}`;
+}
+
+program
+  .command("pull <source>")
+  .description("Pull a recipe from a remote nest into the local vault (local vault only for now — then `ctx push`)")
+  .requiredOption("--recipe <id>", "Recipe to pull: the source nest's node whose slug is recipe-<id>")
+  .option("--update", "Overwrite documents this recipe pulled earlier when upstream has a newer version")
+  .option("--json", "Print the plan and result as JSON")
+  .addHelpText(
+    "after",
+    `
+<source> is a registered remote alias, or <server>/<nest> behind a server alias.
+
+Every pulled document lands as a draft with derived_from pointing at its source,
+so review it and \`ctx publish\` it. A later pull skips what is current, reports
+newer upstream versions (apply them with --update), and never overwrites a
+document or file it did not pull. --dry-run prints the plan and writes nothing.
+
+Example:
+  ctx pull promptowl/distillation-recipes --recipe org-essentials --dry-run`,
+  )
+  .action(async (source: string, opts: { recipe: string; update?: boolean; json?: boolean }) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError(
+        "ctx pull writes into a local vault for now — run it against a local vault, then `ctx push` to a hosted nest.",
+        "NOT_IMPLEMENTED",
+      );
+    }
+    const target = remoteTarget(source);
+    if (!target) {
+      throw new ContextNestError(
+        `"${source}" is a local vault — pull from a remote nest alias (\`ctx vault add\` registers one).`,
+        "CONFIG_ERROR",
+      );
+    }
+
+    const fetched = await remoteFetchRecipe(target, opts.recipe);
+    const storage = getStorage();
+    const steps = await planPull(storage, fetched, { update: opts.update });
+    const pending = steps.filter((s) => s.action === "create" || s.action === "update");
+
+    const report = (written: PullStep[]) => ({
+      recipe: fetched.manifest.id,
+      recipe_node: fetched.recipe.id,
+      recipe_version: fetched.recipe.version,
+      source: target.alias,
+      namespace: fetched.namespace,
+      dry_run: isDryRun(),
+      steps: steps.map(({ content: _content, ...rest }) => rest),
+      written: written.map((s) => s.to),
+    });
+
+    if (!opts.json) {
+      console.log(
+        chalk.bold(
+          `Recipe ${fetched.manifest.label ?? fetched.manifest.id}` +
+            `${fetched.recipe.version ? ` (v${fetched.recipe.version})` : ""} from ${target.alias}\n`,
+        ),
+      );
+      for (const step of steps) console.log(pullStepLine(step));
+      console.log("");
+    }
+
+    if (isDryRun()) {
+      if (opts.json) console.log(JSON.stringify(report([]), null, 2));
+      else console.log(chalk.yellow(`Dry run — ${pending.length} write(s) planned, nothing written.`));
+      return;
+    }
+
+    const updates = pending.filter((s) => s.action === "update");
+    if (updates.length > 0) {
+      await confirmOrExit(`Overwrite ${updates.length} pulled document(s) with newer upstream versions?`, {
+        destructive: true,
+      });
+    }
+    const written = await applyPull(storage, steps);
+    // After apply: a document that changed while the pull ran becomes a conflict there.
+    const conflicts = steps.filter((s) => s.action === "conflict");
+
+    if (opts.json) {
+      console.log(JSON.stringify(report(written), null, 2));
+      return;
+    }
+    console.log(chalk.green(`Wrote ${written.length} item(s).`));
+    if (conflicts.length > 0) {
+      console.log(chalk.red(`${conflicts.length} conflict(s) left untouched — those paths hold documents this recipe did not pull.`));
+    }
+    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill");
+    if (docs.length > 0) {
+      console.log(chalk.dim("Pulled documents are drafts. Review them, then publish: ctx publish <path>"));
+    }
+    for (const skill of written.filter((s) => s.kind === "skill")) {
+      console.log(chalk.dim(`Install the skill so it can't drift: ctx skill install ${skill.to} --mode loader --write`));
+    }
+    const files = written.filter((s) => s.kind === "file");
+    for (const file of files) {
+      if (file.to.endsWith(".example.yaml")) {
+        console.log(chalk.dim(`Template written: ${file.to} — fill it in and rename it before syncing.`));
+      }
+    }
   });
 
 // ─── ctx vault ───────────────────────────────────────────────────────────────
@@ -3833,7 +3969,7 @@ program
     // Diagnostics never fail: every probe degrades to null/"unknown" and the
     // exit code stays 0, so a script can always read the report.
     const report = await buildDoctorReport({
-      cliVersion: pkg.version,
+      cliVersion: CLI_VERSION,
       cliPath: fileURLToPath(import.meta.url),
     });
     if (opts.json) {
@@ -3893,6 +4029,7 @@ program
         ? `${report.plugin.version}  ${chalk.dim(report.plugin.path ?? "")}`
         : chalk.dim("not installed (no contextnest entry in installed_plugins.json)"),
     );
+    row("Privacy", `telemetry + welcome-page analytics ${report.privacy.telemetry ? chalk.yellow("on") : "off"} · credentials: ${report.privacy.credentials}`);
     console.log("");
   });
 

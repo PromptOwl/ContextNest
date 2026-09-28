@@ -166,7 +166,11 @@ link and waits for the decision, exiting `0` once the push is applied and
 non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
 submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
 defaults to the server's window, else 15 minutes). Ungated nests apply
-immediately, exactly as before.
+immediately, exactly as before. A push that runs straight through lists any
+document it skipped (already exists — never overwritten) or failed, and exits
+non-zero if one failed. On such a nest, `ctx add` against the remote vault is
+held the same way: it prints the nest's message and exits `0`, and the document
+does not exist until a reviewer confirms it.
 
 ### Caller attribution
 
@@ -293,6 +297,38 @@ Query context from cloud-hosted packs without downloading source files:
 
 ```bash
 ctx query @promptowl/executive-ai-strategy
+```
+
+## Recipes (`ctx pull`)
+
+A recipe is a node in a remote nest (slug `recipe-<id>`) whose body holds one fenced block that opens with ```` ```yaml recipe ````. It names the remote nodes to copy and where they land, the skills to bring in, the template files to write at the vault root, and the pack to generate. Because the recipe is a node, it is stewarded and versioned like everything it describes.
+
+```bash
+ctx pull <remote-alias> --recipe org-essentials --dry-run   # show the plan, write nothing
+ctx pull <remote-alias> --recipe org-essentials             # pull
+ctx pull <remote-alias> --recipe org-essentials --update    # take newer upstream versions
+```
+
+- Every pulled document lands as a **draft** with `derived_from: contextnest://<nest>/<id>` and `metadata.pulled_from` recording the upstream version. Review it, then `ctx publish`.
+- A later pull skips what is current, reports newer upstream versions (applied only with `--update`), and **never overwrites** a document or file it did not pull, nor a pulled one you have since edited or published.
+- Skills land as `type: skill`. Install one with `ctx skill install <path> --mode loader --write`.
+- Pulls write into a **local vault** for now; use `ctx push` to send the result to a hosted nest.
+
+```yaml recipe
+id: org-essentials
+includes:
+  - from: nodes/org/spine/the-accountability-method   # remote node id
+    to: nodes/methodologies/accountability-method      # local document id
+    tags: [prime-document]                             # optional, added to the source's tags
+skills:
+  - from: nodes/org/skills/distill-capture             # lands at nodes/skills/<slug> unless `to` is set
+files:
+  - from: nodes/org/templates/stewards-example         # first ```yaml block in the node; `to` must be .yaml/.yml, outside nodes/, packs/ and dot-folders
+    to: stewards.example.yaml
+pack:
+  id: org-essentials
+  include: [nodes/methodologies/accountability-method]
+  agent_instructions: Load these first.
 ```
 
 ## AI Agent Integration
