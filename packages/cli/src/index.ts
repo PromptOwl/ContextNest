@@ -1112,6 +1112,16 @@ function printEncryptionEnabled(result: EncryptVaultResult): void {
     console.log(`  Write it down and keep it offline. It is shown once. Nobody can recover it for you.`);
     console.log(chalk.dim(`  Unlock elsewhere: CONTEXTNEST_VAULT_PASSPHRASE="<passphrase>" ctx <command>`));
   }
+  if (!result.keyStore.startsWith("interim-file")) {
+    // The MCP server cannot read the CLI's credential store yet (v1 limitation,
+    // docs/encrypted-vaults.md) — without this line users first hear about it
+    // from a failing agent instead of at setup time.
+    console.log(
+      chalk.dim(
+        `  MCP server note: it cannot read this key store yet — set CONTEXTNEST_VAULT_KEY (or CONTEXTNEST_VAULT_PASSPHRASE) in its environment to unlock this vault.`,
+      ),
+    );
+  }
   if (result.keyStore.startsWith("interim-file")) {
     console.log(
       chalk.yellow(
