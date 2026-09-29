@@ -28,6 +28,10 @@ import {
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
+  ContextNestError,
+  assertVaultRoot,
+  isRefusedCwd,
+  generateContextYamlWithStats,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -111,8 +115,12 @@ import type {
   RbacHook,
   VaultRegistry,
   ClientMetadata,
+  VaultRegistry,
+  ClientMetadata,
 } from "@promptowl/contextnest-engine";
 import { getStarter, listStarters } from "./starters/index.js";
+import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
+import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
@@ -983,12 +991,407 @@ async function applyStarter(
     }
     await storage.writeConfig(initialConfig);
   }
+/** Engine primitives an operation runs against, for one vault. */
+function opContext(
+  storage: NestStorage,
+  actor: string,
+  onProgress?: (done: number, total: number) => void,
+): OperationContext {
+  return {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    rbac: permissiveRbac,
+    actor,
+    onProgress,
+  };
+}
+
+// Interactively prompt the user to pick a starter recipe using an arrow-key
+// navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
+// chosen recipe id, or null if the user skips. Callers MUST only invoke this
+// when attached to a TTY — otherwise it would block on stdin (AI agents, CI,
+// piped input). Falls back to a typed prompt when raw mode is unavailable.
+function promptStarterSelection(): Promise<string | null> {
+  const starters = listStarters();
+
+  // Some terminals (dumb terminals, certain CI shells) can't do raw-mode
+  // keypress capture. Fall back to typing a number/name there.
+  if (typeof process.stdin.setRawMode !== "function") {
+    return promptStarterByNumber(starters);
+  }
+
+  return new Promise((resolve) => {
+    const out = process.stdout;
+    let index = 0;
+
+    console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:"));
+    console.log(chalk.dim("  ↑/↓ to move · Enter to select · Esc to skip\n"));
+
+    const render = () => {
+      starters.forEach((s, i) => {
+        const selected = i === index;
+        const pointer = selected ? chalk.cyan("❯") : " ";
+        const line = `${s.id.padEnd(12)} ${s.name}`;
+        out.write(`  ${pointer} ${selected ? chalk.cyan.bold(line) : line}\n`);
+      });
+    };
+
+    const redraw = () => {
+      readline.moveCursor(out, 0, -starters.length);
+      readline.clearScreenDown(out);
+      render();
+    };
+
+    out.write("\x1B[?25l"); // hide cursor
+    render();
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1B[?25h"); // restore cursor
+    };
+
+    const onKey = (_str: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || key.name === "k") {
+        index = (index - 1 + starters.length) % starters.length;
+        redraw();
+      } else if (key.name === "down" || key.name === "j") {
+        index = (index + 1) % starters.length;
+        redraw();
+      } else if (key.name === "return" || key.name === "enter") {
+        cleanup();
+        out.write("\n");
+        resolve(starters[index].id);
+      } else if (key.name === "escape") {
+        cleanup();
+        out.write("\n");
+        resolve(null);
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        out.write("\n");
+        process.exit(130);
+      }
+    };
+
+    process.stdin.on("keypress", onKey);
+  });
+}
+
+// Fallback selector for terminals without raw-mode support: print a numbered
+// list and read a number or recipe name. Returns null on a blank line (skip).
+function promptStarterByNumber(starters: ReturnType<typeof listStarters>): Promise<string | null> {
+  console.log(chalk.bold("\n  Choose a starter recipe to populate your vault:\n"));
+  starters.forEach((s, i) => {
+    console.log(`    ${chalk.yellow(String(i + 1))}  ${chalk.cyan(s.id.padEnd(12))} ${s.name}`);
+    console.log(`       ${" ".repeat(12)} ${chalk.dim(s.description)}\n`);
+  });
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(
+        `  Select a starter ${chalk.dim(`[1-${starters.length}, name, or Enter to skip]`)}: `,
+        (answer) => {
+          const trimmed = answer.trim();
+          if (trimmed === "") {
+            rl.close();
+            resolve(null);
+            return;
+          }
+          const num = Number(trimmed);
+          if (Number.isInteger(num) && num >= 1 && num <= starters.length) {
+            rl.close();
+            resolve(starters[num - 1].id);
+            return;
+          }
+          const byName = starters.find((s) => s.id.toLowerCase() === trimmed.toLowerCase());
+          if (byName) {
+            rl.close();
+            resolve(byName.id);
+            return;
+          }
+          console.log(chalk.red(`  '${trimmed}' is not a valid choice — pick a number or recipe name.`));
+          ask();
+        },
+      );
+    };
+    ask();
+  });
+}
+
+// ─── Agentic dev tool selection ─────────────────────────────────────────────────
+
+// Interactively pick which agentic tools to write config for, using an arrow-key
+// navigable multi-select (↑/↓ to move, Space to toggle, Enter to confirm, Esc to
+// accept as-is). Detected tools start checked. Resolves to the selected tool ids.
+// Callers MUST only invoke this when attached to a TTY. Falls back to a numbered
+// prompt when raw mode is unavailable.
+function promptToolSelection(tools: AgentTool[]): Promise<string[]> {
+  if (typeof process.stdin.setRawMode !== "function") {
+    return promptToolsByNumber(tools);
+  }
+
+  return new Promise((resolve) => {
+    const out = process.stdout;
+    let index = 0;
+    const checked = new Set(tools.filter((t) => t.detected).map((t) => t.id));
+
+    console.log(chalk.bold("\n  Configure agentic dev tools for this vault:"));
+    console.log(chalk.dim("  Detected tools are pre-selected."));
+    console.log(chalk.dim("  ↑/↓ to move · Space to toggle · Enter to confirm · Esc to accept\n"));
+
+    const render = () => {
+      tools.forEach((t, i) => {
+        const active = i === index;
+        const pointer = active ? chalk.cyan("❯") : " ";
+        const box = checked.has(t.id) ? chalk.green("[x]") : "[ ]";
+        const label = `${t.name.padEnd(16)} ${chalk.dim(t.hint)}`;
+        out.write(`  ${pointer} ${box} ${active ? chalk.cyan.bold(t.name.padEnd(16)) + " " + chalk.dim(t.hint) : label}\n`);
+      });
+    };
+
+    const redraw = () => {
+      readline.moveCursor(out, 0, -tools.length);
+      readline.clearScreenDown(out);
+      render();
+    };
+
+    out.write("\x1B[?25l"); // hide cursor
+    render();
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const cleanup = () => {
+      process.stdin.removeListener("keypress", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1B[?25h"); // restore cursor
+    };
+
+    const finish = () => {
+      cleanup();
+      out.write("\n");
+      resolve(tools.filter((t) => checked.has(t.id)).map((t) => t.id));
+    };
+
+    const onKey = (_str: string, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || key.name === "k") {
+        index = (index - 1 + tools.length) % tools.length;
+        redraw();
+      } else if (key.name === "down" || key.name === "j") {
+        index = (index + 1) % tools.length;
+        redraw();
+      } else if (key.name === "space") {
+        const id = tools[index].id;
+        if (checked.has(id)) checked.delete(id);
+        else checked.add(id);
+        redraw();
+      } else if (key.name === "return" || key.name === "enter" || key.name === "escape") {
+        finish();
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        out.write("\n");
+        process.exit(130);
+      }
+    };
+
+    process.stdin.on("keypress", onKey);
+  });
+}
+
+// Fallback multi-select for terminals without raw-mode support: print a numbered
+// list with detected tools pre-checked, read comma-separated numbers to toggle,
+// and accept the current selection on a blank line.
+function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
+  const checked = new Set(tools.filter((t) => t.detected).map((t) => t.id));
+
+  console.log(chalk.bold("\n  Configure agentic dev tools for this vault:"));
+  console.log(chalk.dim("  Detected tools are pre-selected.\n"));
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      tools.forEach((t, i) => {
+        const box = checked.has(t.id) ? chalk.green("[x]") : "[ ]";
+        console.log(`    ${box} ${chalk.yellow(String(i + 1))}  ${t.name.padEnd(16)} ${chalk.dim(t.hint)}`);
+      });
+      rl.question(
+        `\n  Toggle tools ${chalk.dim("[comma-separated numbers, or Enter to accept]")}: `,
+        (answer) => {
+          const trimmed = answer.trim();
+          if (trimmed === "") {
+            rl.close();
+            resolve(tools.filter((t) => checked.has(t.id)).map((t) => t.id));
+            return;
+          }
+          const nums = trimmed.split(",").map((p) => Number(p.trim()));
+          if (nums.some((n) => !Number.isInteger(n) || n < 1 || n > tools.length)) {
+            console.log(chalk.red(`  Invalid selection — use numbers 1-${tools.length}.`));
+          } else {
+            for (const n of nums) {
+              const id = tools[n - 1].id;
+              if (checked.has(id)) checked.delete(id);
+              else checked.add(id);
+            }
+          }
+          console.log("");
+          ask();
+        },
+      );
+    };
+    ask();
+  });
+}
+
+// ─── Vault registration prompts (ctx init) ──────────────────────────────────────
+
+// ALIAS_PATTERN is imported from the engine (single source of truth) so the
+// interactive prompt validates the same way addVault() does.
+
+// Derive a sensible default alias from a directory name, sanitized to the
+// allowed alias characters.
+function slugifyAlias(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "vault";
+}
+
+/**
+ * True when `dir` resolves to the OS temp dir or somewhere below it. Both sides
+ * go through realpath: on macOS `os.tmpdir()` is a symlink (/var → /private/var)
+ * and on Windows it can be an 8.3 short name, so a plain prefix test would say
+ * "not under tmp" for a directory that is.
+ */
+function isUnderTempDir(dir: string): boolean {
+  // realpath needs the path to exist, and `ctx init` is routinely pointed at a
+  // directory it is about to create. Resolve the nearest existing ancestor and
+  // re-append the rest, so the symlink expansion still happens: a plain
+  // resolve() fallback yields /var/folders/... against a /private/var/folders/...
+  // base on macOS, and the check silently answers "not under tmp".
+  const real = (p: string): string => {
+    let cur = pathMod.resolve(p);
+    const tail: string[] = [];
+    for (;;) {
+      try {
+        return pathMod.join(fs.realpathSync.native(cur), ...tail.reverse());
+      } catch {
+        const parent = pathMod.dirname(cur);
+        if (parent === cur) return pathMod.resolve(p);
+        tail.push(pathMod.basename(cur));
+        cur = parent;
+      }
+    }
+  };
+  let base = real(tmpdir());
+  let target = real(dir);
+  if (process.platform === "win32") {
+    base = base.toLowerCase();
+    target = target.toLowerCase();
+  }
+  return target === base || target.startsWith(base + pathMod.sep);
+}
+
+// Pick a default alias for `root` that doesn't collide with a different vault
+// already in the registry. Re-running init in the same directory reuses the
+// existing alias (idempotent); a clash with a *different* path gets a numeric
+// suffix so we never silently overwrite someone else's alias.
+function defaultAliasFor(root: string, registry: VaultRegistry): string {
+  const resolvedRoot = pathMod.resolve(root);
+  const base = slugifyAlias(pathMod.basename(resolvedRoot));
+  // Use the registry map the caller already loaded — no extra read, no listVaults()
+  // stat/read per vault.
+  const taken = new Map(
+    Object.entries(registry.vaults).map(([alias, e]) => [alias, pathMod.resolve(e.path)]),
+  );
+  const free = (alias: string) => !taken.has(alias) || taken.get(alias) === resolvedRoot;
+  if (free(base)) return base;
+  let n = 2;
+  while (!free(`${base}-${n}`)) n++;
+  return `${base}-${n}`;
+}
+
+// Prompt for a free-text answer, returning the default when the user hits Enter.
+function promptText(question: string, defaultValue?: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const suffix = defaultValue ? chalk.dim(` [${defaultValue}]`) : "";
+  return new Promise((resolve) => {
+    rl.question(`  ${question}${suffix}: `, (answer) => {
+      rl.close();
+      resolve(answer.trim() || defaultValue || "");
+    });
+  });
+}
+
+// Prompt for a vault alias, re-asking until it matches ALIAS_PATTERN.
+function promptAlias(defaultAlias: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    const ask = () => {
+      rl.question(`  Vault alias ${chalk.dim(`[${defaultAlias}]`)}: `, (answer) => {
+        const alias = answer.trim() || defaultAlias;
+        if (ALIAS_PATTERN.test(alias)) {
+          rl.close();
+          resolve(alias);
+          return;
+        }
+        console.log(chalk.red("  Use only letters, digits, hyphens, or underscores."));
+        ask();
+      });
+    };
+    ask();
+  });
+}
+
+// Apply a starter recipe to a freshly-initialized vault: write + publish its
+// nodes/packs, persist its maintenance directive, regenerate the index, and
+// print the post-init summary + AI agent prompt.
+async function applyStarter(
+  storage: NestStorage,
+  root: string,
+  opts: { name: string; layout: string },
+  starter: NonNullable<ReturnType<typeof getStarter>>,
+  agentTools?: string[],
+): Promise<void> {
+  // Persist the starter's maintenance directive into config so
+  // `ctx index` can surface it into CLAUDE.md / GEMINI.md / etc. When the user
+  // picked which agentic tools to configure, persist that too so the upcoming
+  // regenerateIndex() — and future `ctx index` runs — only write those files.
+  const initialConfig = await storage.readConfig();
+  if (initialConfig) {
+    initialConfig.agent_maintenance_directive = starter.getMaintenanceDirective();
+    if (agentTools !== undefined) {
+      initialConfig.agent_tools = agentTools;
+    }
+    await storage.writeConfig(initialConfig);
+  }
 
   // Write starter nodes
   for (const node of starter.nodes) {
     await storage.writeDocument(node.path, node.content);
   }
+  // Write starter nodes
+  for (const node of starter.nodes) {
+    await storage.writeDocument(node.path, node.content);
+  }
 
+  // Write starter packs
+  for (const pack of starter.packs) {
+    const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
+    await fs.promises.mkdir(pathMod.dirname(packPath), { recursive: true });
+    await fs.promises.writeFile(packPath, pack.content, "utf-8");
+  }
   // Write starter packs
   for (const pack of starter.packs) {
     const packPath = pathMod.join(root, "packs", `${pack.id}.yml`);
@@ -1003,9 +1406,27 @@ async function applyStarter(
       note: `Created by ${starter.id} starter`,
     });
   }
+  // Publish all starter nodes
+  for (const node of starter.nodes) {
+    await publishDocument(storage, node.path, {
+      editedBy: "cli@contextnest.local",
+      note: `Created by ${starter.id} starter`,
+    });
+  }
 
   await regenerateIndex(storage);
+  await regenerateIndex(storage);
 
+  // Print results
+  console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
+  console.log(`  Created ${starter.nodes.length} documents:`);
+  for (const node of starter.nodes) {
+    console.log(`    ${chalk.cyan(node.path + ".md")}`);
+  }
+  console.log(`  Created ${starter.packs.length} pack(s):`);
+  for (const pack of starter.packs) {
+    console.log(`    ${chalk.cyan("packs/" + pack.id + ".yml")}`);
+  }
   // Print results
   console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
   console.log(`  Created ${starter.nodes.length} documents:`);
@@ -1024,7 +1445,15 @@ async function applyStarter(
   console.log(`${chalk.dim("─".repeat(60))}`);
   console.log(prompt.instructions);
   console.log(chalk.dim("─".repeat(60)));
+  // Post-init prompt for AI agents
+  const prompt = starter.getPrompt();
+  console.log(`\n${chalk.dim("─".repeat(60))}`);
+  console.log(chalk.dim(prompt.context));
+  console.log(`${chalk.dim("─".repeat(60))}`);
+  console.log(prompt.instructions);
+  console.log(chalk.dim("─".repeat(60)));
 
+  console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
   console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
 
   // Generate welcome HTML
@@ -1067,6 +1496,9 @@ async function printEmptyVaultGuidance(
   // Post-init instructions for AI assistants
   console.log(chalk.dim("─".repeat(60)));
   console.log(`[CONTEXT NEST VAULT INITIALIZED — EMPTY VAULT]
+  // Post-init instructions for AI assistants
+  console.log(chalk.dim("─".repeat(60)));
+  console.log(`[CONTEXT NEST VAULT INITIALIZED — EMPTY VAULT]
 
 This vault was initialized without a starter recipe. To help the user get started:
 1. Ask what this vault is for (engineering, strategy, research, team knowledge, etc.)
@@ -1079,6 +1511,8 @@ This vault was initialized without a starter recipe. To help the user get starte
 3. Run: ctx init --starter <recipe> (in the vault directory)
    Note: re-running init with --starter will add the starter content to the existing vault.
 4. After the starter is applied, generate a CONTEXT.md tailored to the user's needs.`);
+  console.log(chalk.dim("─".repeat(60)));
+  console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
   console.log(chalk.dim("─".repeat(60)));
   console.log(`\n  ${chalk.dim("Context Nest by PromptOwl — https://promptowl.ai")}\n`);
 
@@ -1359,7 +1793,35 @@ program
       await remoteRead(remote, path, opts);
       return;
     }
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteRead(remote, path, opts);
+      return;
+    }
     const storage = getStorage();
+    const id = normalizeDocumentId(path);
+    // allow_rejected: `ctx read` has always shown a retired document — reading
+    // one is not republishing it, and refusing would hide it from the person
+    // deciding whether to revive it.
+    const got = await cliApi().run<{
+      id: string;
+      frontmatter: ContextNode["frontmatter"];
+      body: string;
+      raw?: string;
+      integrity?: IntegrityFailure;
+    }>(
+      "context_get",
+      { id, include_raw: true, allow_rejected: true },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    const doc: ContextNode = {
+      id: got.id,
+      filePath: "",
+      rawContent: got.raw ?? "",
+      frontmatter: got.frontmatter,
+      body: got.body,
+      ...(got.integrity ? { integrity: got.integrity } : {}),
+    };
     const id = normalizeDocumentId(path);
     // allow_rejected: `ctx read` has always shown a retired document — reading
     // one is not republishing it, and refusing would hide it from the person
@@ -1385,6 +1847,9 @@ program
     };
 
     if (opts.raw) {
+      // stdout stays the exact stored bytes; the verdict goes to stderr so a
+      // script piping --raw still sees it without corrupting the payload.
+      if (got.integrity) console.error(chalk.red(got.integrity.warning));
       // stdout stays the exact stored bytes; the verdict goes to stderr so a
       // script piping --raw still sees it without corrupting the payload.
       if (got.integrity) console.error(chalk.red(got.integrity.warning));
@@ -1425,6 +1890,8 @@ program
       if (opts.out) {
         console.log(chalk.green(`Written to ${outPath}`));
       } else {
+        openInBrowser(outPath);
+        console.log(chalk.dim(`Opened in browser: ${outPath}`));
         openInBrowser(outPath);
         console.log(chalk.dim(`Opened in browser: ${outPath}`));
       }
@@ -1482,7 +1949,111 @@ program
     // Served, but flagged: an agent reading `ctx read` output meets the warning
     // before any value from a body that fails verification.
     if (got.integrity) console.log(chalk.red(got.integrity.warning) + "\n");
+    // Served, but flagged: an agent reading `ctx read` output meets the warning
+    // before any value from a body that fails verification.
+    if (got.integrity) console.log(chalk.red(got.integrity.warning) + "\n");
     console.log(doc.body.trim());
+  });
+
+// ─── ctx skill ─────────────────────────────────────────────────────────────────
+
+const HARNESS_CHOICES = HARNESSES.join(" | ");
+
+/** Resolve a manifest entry's `base` to a real directory on this machine. */
+function resolveInstallBase(base: "project_root" | "home"): string {
+  return base === "home" ? homedir() : process.cwd();
+}
+
+async function runSkillOp<T>(op: string, input: Record<string, unknown>): Promise<T> {
+  const storage = getStorage();
+  // cliApi(), not createEngineApi(): the skill ops are catalog calls like any
+  // other, so they carry this run's caller attribution too.
+  return cliApi().run<T>(op, input, opContext(storage, "cli@contextnest.local"));
+}
+
+const skillCmd = program
+  .command("skill")
+  .description("Render and install vault-hosted skills (type: skill nodes)");
+
+skillCmd
+  .command("show <path>", { isDefault: true })
+  .description("Render a skill node for an agent harness and print it")
+  .option(`--harness <name>`, `Target harness (${HARNESS_CHOICES})`, "claude-code")
+  .option("--server-alias <name>", "What your MCP client calls this server (default: vault name)")
+  .option("--scope <scope>", "user | project — decides the install path only", "user")
+  .action(async (path, opts) => {
+    const rendered = await runSkillOp<{
+      name: string;
+      description: string;
+      content: string;
+      relative_path: string;
+      base: "project_root" | "home";
+      integrity?: IntegrityFailure;
+    }>("context_skill", {
+      id: normalizeDocumentId(path),
+      harness: opts.harness,
+      scope: opts.scope,
+      ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
+    });
+
+    if (rendered.integrity) console.error(chalk.red(rendered.integrity.warning));
+    console.log(chalk.dim(`# ${pathMod.join(resolveInstallBase(rendered.base), rendered.relative_path)}`));
+    console.log(rendered.content);
+  });
+
+skillCmd
+  .command("install <path>")
+  .description("Build (and optionally write) the files that install a vault skill locally")
+  .option(`--harness <name>`, `Target harness (${HARNESS_CHOICES})`, "claude-code")
+  .option("--server-alias <name>", "What your MCP client calls this server (default: vault name)")
+  .option("--scope <scope>", "user (home directory) | project (cwd)", "user")
+  .option(
+    "--mode <mode>",
+    "loader — fetch the procedure at runtime, cannot drift; full — offline snapshot that will",
+    "loader",
+  )
+  .option("--write", "Actually write the files (otherwise they are only printed)")
+  .action(async (path, opts) => {
+    const manifest = await runSkillOp<{
+      files: { relative_path: string; base: "project_root" | "home"; content: string }[];
+      post_install: string;
+      notes: string;
+      skill: { name: string; source_path: string; version: number | null };
+    }>("context_skill_install", {
+      id: normalizeDocumentId(path),
+      harness: opts.harness,
+      scope: opts.scope,
+      mode: opts.mode,
+      ...(opts.serverAlias ? { server_alias: opts.serverAlias } : {}),
+    });
+
+    for (const file of manifest.files) {
+      const target = pathMod.join(resolveInstallBase(file.base), file.relative_path);
+
+      if (!opts.write) {
+        console.log(chalk.dim(`# ${target}`));
+        console.log(file.content);
+        continue;
+      }
+
+      // These land outside the vault, in the user's project or home directory,
+      // so they get the same never-clobber-without-consent guard as `read --out`.
+      await ensureOverwritable(target, "Skill file");
+      noteExternalWrite(target);
+      if (isDryRun()) continue;
+
+      await mkdir(pathMod.dirname(target), { recursive: true });
+      await writeFile(target, file.content, "utf-8");
+      console.log(chalk.green(`Written to ${target}`));
+    }
+
+    if (!opts.write) {
+      console.log();
+      console.log(chalk.dim("Re-run with --write to install these files."));
+    }
+    console.log();
+    console.log(chalk.dim(manifest.notes));
+    if (opts.write && !isDryRun()) console.log(chalk.yellow(manifest.post_install));
   });
 
 // ─── ctx skill ─────────────────────────────────────────────────────────────────
@@ -1594,10 +2165,16 @@ program
   .option("-t, --type <type>", "Node type", "document")
   .option("--title <title>", "Document title")
   .option("--tags <tags>", "Tags (comma- or space-separated)")
+  .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteAdd(remote, path, opts);
+      return;
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteAdd(remote, path, opts);
@@ -1725,8 +2302,13 @@ program
 
     if (path) {
       const id = normalizeDocumentId(path);
+      const id = normalizeDocumentId(path);
       docs = [await storage.readDocument(id)];
     } else {
+      // Validation is an audit path — retired docs still need to be
+      // checked for malformed frontmatter (storage.regenerateIndex,
+      // verifyVaultIntegrity, hygienist all use the same flag).
+      docs = await storage.discoverDocuments({ includeRetired: true });
       // Validation is an audit path — retired docs still need to be
       // checked for malformed frontmatter (storage.regenerateIndex,
       // verifyVaultIntegrity, hygienist all use the same flag).
@@ -1798,12 +2380,32 @@ function selectorHelp(cmd: "query" | "resolve"): string {
   ].join("\n");
 }
 
+/**
+ * Selector grammar block appended to `ctx query --help` / `ctx resolve --help`.
+ * The grammar line itself is the engine's SELECTOR_GRAMMAR — the same string
+ * the init banner, README and generated CLAUDE.md render — never a local copy.
+ */
+function selectorHelp(cmd: "query" | "resolve"): string {
+  return [
+    "",
+    "Selector grammar:",
+    `  ${SELECTOR_GRAMMAR}`,
+    "",
+    "Examples:",
+    `  ctx ${cmd} "#api + status:published"`,
+    `  ctx ${cmd} "nodes/gtm/foo"                 # one node by id`,
+    `  ctx ${cmd} "(#api | #v2) - #deprecated"`,
+    "",
+  ].join("\n");
+}
+
 // ─── ctx resolve ───────────────────────────────────────────────────────────────
 
 program
   .command("resolve <selector>")
   .description("Execute a selector query and list matching documents")
   .option("--json", "Output as JSON")
+  .addHelpText("after", selectorHelp("resolve"))
   .addHelpText("after", selectorHelp("resolve"))
   .action(async (selector, opts) => {
     const storage = getStorage();
@@ -1846,6 +2448,12 @@ program
             : status === "pending_review" ? chalk.magenta
             : status === "rejected" ? chalk.red
             : chalk.yellow;
+          const statusColor =
+            status === "published" ? chalk.green
+            : status === "approved" ? chalk.cyan
+            : status === "pending_review" ? chalk.magenta
+            : status === "rejected" ? chalk.red
+            : chalk.yellow;
           console.log(`  ${chalk.cyan(doc.id)} [${type}] ${statusColor(status)}`);
           console.log(`    ${doc.frontmatter.title}`);
         }
@@ -1858,10 +2466,18 @@ program
 program
   .command("publish [path]")
   .description("Publish a document, or every unpublished document with --all")
+  .command("publish [path]")
+  .description("Publish a document, or every unpublished document with --all")
   .option("-a, --author <email>", "Author email", "cli@contextnest.local")
   .option("-m, --message <note>", "Version note")
   .option("--all", "Publish every unpublished document in the vault, in one batch")
+  .option("--all", "Publish every unpublished document in the vault, in one batch")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remotePublish(remote, path, opts);
+      return;
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remotePublish(remote, path, opts);
@@ -1949,14 +2565,100 @@ async function publishAll(storage: NestStorage, author: string): Promise<void> {
   if (result.failed.length > 0) process.exitCode = 1;
 }
 
+    if (opts.all) {
+      if (path) {
+        console.error(chalk.red("Pass a path or --all, not both"));
+        process.exit(1);
+      }
+      await publishAll(storage, opts.author);
+      return;
+    }
+    if (!path) {
+      console.error(chalk.red("Missing path (or pass --all)"));
+      process.exit(1);
+    }
+
+    await confirmOrExit(`Publish ${normalizeDocumentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
+
+    const result = await cliApi().run<{
+      id: string;
+      version: number;
+      checkpoint: number;
+      chain_hash: string;
+    }>(
+      "context_publish",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.message ? { note: opts.message } : {}),
+      },
+      opContext(storage, opts.author),
+    );
+
+    console.log(chalk.green(`Published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
+    console.log(`  Chain hash: ${result.chain_hash}`);
+  });
+
+/**
+ * `ctx publish --all` — bulk-publish through the engine's `context_import`
+ * operation rather than looping `publishDocument`. The loop is O(N²): every
+ * publish seals its own checkpoint and every checkpoint re-scans the whole
+ * vault. The operation seals ONE checkpoint and regenerates the index once.
+ */
+async function publishAll(storage: NestStorage, author: string): Promise<void> {
+  const docs = await storage.discoverDocuments();
+  // Rejected docs are deliberately excluded — the engine refuses to republish
+  // them (silent resurrection guard), so including them only fills failed[].
+  const ids = docs.filter((d) => !isPublished(d) && !isRejected(d)).map((d) => d.id);
+  if (ids.length === 0) {
+    console.log(chalk.dim("Nothing to publish — every document is already published."));
+    return;
+  }
+
+  for (const id of ids) console.error(chalk.dim(`  ${id}`));
+  await confirmOrExit(`Publish the ${ids.length} document(s) above?`);
+
+  const ctx = opContext(storage, author, (done, total) => {
+    // Single rewritten line; fall back to plain lines when piped to a file.
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\rPublishing ${done}/${total}…`);
+    } else if (done === total) {
+      console.log(`Publishing ${done}/${total}`);
+    }
+  });
+
+  const result = await cliApi().run<{
+    published: { id: string; version: number }[];
+    failed: { id?: string; title?: string; error: string }[];
+    checkpoint: number | null;
+  }>("context_import", { ids }, ctx);
+
+  if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+  console.log(chalk.green(`Published ${result.published.length} document(s)`));
+  if (result.checkpoint !== null) console.log(`  Checkpoint: ${result.checkpoint}`);
+  for (const f of result.failed) {
+    console.log(chalk.yellow(`  failed ${f.id ?? f.title}: ${f.error}`));
+  }
+  // Same contract as `ctx validate` / `ctx verify`: a batch with failures exits
+  // non-zero so CI notices. exitCode, not exit(), so the summary still flushes.
+  if (result.failed.length > 0) process.exitCode = 1;
+}
+
 // ─── ctx history ───────────────────────────────────────────────────────────────
 
 program
   .command("history <path>")
   .description("Show version history for a document")
   .option("--diff", "Include each version's unified diff from the one before")
+  .option("--diff", "Include each version's unified diff from the one before")
   .option("--json", "Output as JSON")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteHistory(remote, path, opts);
+      return;
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteHistory(remote, path, opts);
@@ -1985,6 +2687,7 @@ program
       }>;
     }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
+    if (history.versions.length === 0) {
     if (history.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${id}`));
       return;
@@ -2025,6 +2728,16 @@ program
   .description("Reconstruct a specific version of a document")
   .action(async (path, version) => {
     const storage = getStorage();
+    const { content, integrity } = await cliApi().run<{
+      content: string;
+      integrity?: IntegrityFailure;
+    }>(
+      "context_reconstruct",
+      { id: normalizeDocumentId(path), version: parseInt(version, 10) },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    // stderr, like `read --raw`: stdout stays the reconstructed bytes.
+    if (integrity) console.error(chalk.red(integrity.warning));
     const { content, integrity } = await cliApi().run<{
       content: string;
       integrity?: IntegrityFailure;
@@ -2106,13 +2819,87 @@ program
     );
   });
 
+// ─── ctx info ─────────────────────────────────────────────────────────────────
+//
+// Named `info`, not `init`: `ctx init` CREATES a vault, while the operation
+// behind this one opens an existing vault (its instructions, config and what it
+// holds). Same word, opposite meaning — worth keeping apart on the CLI.
+
+program
+  .command("info")
+  .description("Show the vault's instructions, configuration and contents")
+  .option("--nodes", "Also list every node")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const out = await cliApi().run<{
+      context_md: string | null;
+      vault_path: string;
+      config: { name: string; description?: string; servers: string[] } | null;
+      total: number;
+      by_type: Record<string, number>;
+      by_status: Record<string, number>;
+      tags: string[];
+      nodes?: Array<{ id: string; title: string; type: string }>;
+    }>(
+      "context_init",
+      opts.nodes ? { include_nodes: true } : {},
+      opContext(storage, "cli@contextnest.local"),
+    );
+
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold(out.config?.name ?? "Vault"));
+    if (out.config?.description) console.log(chalk.dim(out.config.description));
+    console.log(chalk.dim(out.vault_path));
+    console.log();
+    console.log(`${chalk.bold(String(out.total))} node(s)`);
+    for (const [type, count] of Object.entries(out.by_type).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${chalk.cyan(type)}: ${count}`);
+    }
+    if (Object.keys(out.by_status).length) {
+      console.log(chalk.dim("status:"));
+      for (const [status, count] of Object.entries(out.by_status).sort((a, b) => b[1] - a[1])) {
+        console.log(`  ${status}: ${count}`);
+      }
+    }
+    if (out.tags.length) {
+      console.log(chalk.dim("tags:") + " " + out.tags.map((t) => chalk.cyan(t)).join(" "));
+    }
+    if (out.config?.servers.length) {
+      console.log(chalk.dim("servers:") + " " + out.config.servers.join(", "));
+    }
+    if (out.nodes) {
+      console.log();
+      for (const n of out.nodes) {
+        console.log(`  ${chalk.cyan(n.id)} [${n.type}]`);
+        console.log(`    ${n.title}`);
+      }
+    }
+    console.log();
+    console.log(
+      out.context_md
+        ? chalk.dim("CONTEXT.md:\n") + out.context_md
+        : chalk.yellow("No CONTEXT.md — run `ctx init` to scaffold one."),
+    );
+  });
+
 // ─── ctx verify ────────────────────────────────────────────────────────────────
 
 program
   .command("verify")
   .description("Verify integrity of all hash chains and PDF sidecars")
+  .description("Verify integrity of all hash chains and PDF sidecars")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteVerify(remote, opts);
+      return;
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteVerify(remote, opts);
@@ -2122,6 +2909,22 @@ program
 
     let totalErrors = 0;
     const allReportErrors: any[] = [];
+
+    // A history.yaml that cannot be parsed is skipped by the crawl, so nothing
+    // downstream would ever check that document — report it instead of passing.
+    const allHistories = await storage.findAllHistories((docId, reason) => {
+      totalErrors++;
+      allReportErrors.push({
+        type: "unreadable_history",
+        document: docId,
+        expected: null,
+        actual: reason,
+      });
+      if (!opts.json) {
+        console.log(chalk.red(`✗ ${docId}: history.yaml unreadable — ${reason}`));
+      }
+    });
+    const checkpointHistory = await storage.readCheckpointHistory();
 
     // A history.yaml that cannot be parsed is skipped by the crawl, so nothing
     // downstream would ever check that document — report it instead of passing.
@@ -2262,8 +3065,39 @@ program
 program
   .command("index")
   .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
+  .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
   .action(async () => {
     const storage = getStorage();
+    // Per-folder INDEX.md must list retired docs too so stewards can find
+    // them; context.yaml gets filtered to published-only below. Matches
+    // storage.regenerateIndex().
+    const docs = await storage.discoverDocuments({ includeRetired: true });
+
+    await confirmOrExit(
+      `Regenerate context.yaml and INDEX.md in ${realRootPath() ?? storage.root}? Documents whose status is written in a legacy form are rewritten in place.`,
+    );
+
+    // Status-canonicalization pass: rewrite any doc whose on-disk status
+    // differs from its parsed (normalized) status. Only `ctx index` does
+    // this — per-mutation calls to regenerateIndex stay cheap. After this
+    // pass disk values are guaranteed canonical until something else edits
+    // them out-of-band.
+    let normalized = 0;
+    for (const doc of docs) {
+      const onDisk = await storage.readDocument(doc.id);
+      const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
+      const canonical = doc.frontmatter.status;
+      if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
+        // Round-trip through serializeDocument — which itself normalizes —
+        // and write back. This rewrites any aliased value to canonical.
+        await storage.writeDocument(doc.id, serializeDocument(doc));
+        normalized++;
+      }
+    }
+    if (normalized > 0) {
+      console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
+    }
+
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published-only below. Matches
     // storage.regenerateIndex().
@@ -2299,6 +3133,10 @@ program
     // chain grows by one entry per published doc per checkpoint, and only its
     // newest entry reaches context.yaml.
     const latestCheckpoint = await storage.readLatestCheckpoint();
+    // Head only — same reason storage.regenerateIndex() takes it this way: the
+    // chain grows by one entry per published doc per checkpoint, and only its
+    // newest entry reaches context.yaml.
+    const latestCheckpoint = await storage.readLatestCheckpoint();
     const published = docs.filter((d) => d.frontmatter.status === "published");
 
     // Generate context.yaml
@@ -2307,8 +3145,25 @@ program
       config,
       latestCheckpoint,
     );
+    const { contextYaml, stats } = generateContextYamlWithStats(
+      published,
+      config,
+      latestCheckpoint,
+    );
     await storage.writeContextYaml(contextYaml);
     console.log(chalk.green("Generated context.yaml"));
+    // Where the graph came from. A vault authored with [[wikilinks]] used to
+    // index with zero edges and --hops silently did nothing; the unresolved
+    // count is the hint that a link's title does not match any published doc.
+    console.log(
+      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
+        (stats.unresolvedContextLinks
+          ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
+            (stats.unresolvedContextLinks === 1 ? "" : "s")
+          : "") +
+        ")",
+    );
     // Where the graph came from. A vault authored with [[wikilinks]] used to
     // index with zero edges and --hops silently did nothing; the unresolved
     // count is the hint that a link's title does not match any published doc.
@@ -2355,11 +3210,14 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
   const apiUrl = process.env.PROMPTOWL_API_URL || "https://api.promptowl.ai";
   // The override carries the user's cloud token — same plaintext rule as push.
   assertSafeEndpoint(apiUrl, "PROMPTOWL_API_URL");
+  // The override carries the user's cloud token — same plaintext rule as push.
+  assertSafeEndpoint(apiUrl, "PROMPTOWL_API_URL");
   const token = await loadCloudToken();
 
   console.log(chalk.dim(`  ☁ Fetching from PromptOwl cloud...`));
 
   const res = await fetch(`${apiUrl}/v1/packs/${org}/${packName}/inject`, {
+    ...NO_REDIRECT,
     ...NO_REDIRECT,
     method: "POST",
     headers: {
@@ -2368,6 +3226,7 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
     },
     body: JSON.stringify({ selector: `pack:${packName}`, format: "markdown" }),
   });
+  assertNotRedirected(res, "The cloud endpoint");
   assertNotRedirected(res, "The cloud endpoint");
 
   if (res.status === 429) {
@@ -2413,10 +3272,18 @@ program
   .option("--full", "Force full-load mode (load all documents)")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .addHelpText("after", selectorHelp("query"))
+  .option("--include-drafts", "Include draft documents (default: published only)", false)
+  .addHelpText("after", selectorHelp("query"))
   .action(async (selector, opts) => {
     // Cloud pack: @org/pack-name routes to PromptOwl API
     if (selector.startsWith("@")) {
       await queryFromCloud(selector, opts);
+      return;
+    }
+
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteQuery(remote, selector, opts);
       return;
     }
 
@@ -2450,25 +3317,60 @@ program
       },
       opContext(storage, "cli@contextnest.local"),
     );
+    type Doc = {
+      id: string;
+      title: string;
+      body?: string;
+      source?: unknown;
+      integrity?: { status: string; warning: string };
+    };
+    const result = await cliApi().run<{
+      documents: Doc[];
+      source_nodes?: Doc[];
+      trace_count?: number;
+      traversal?: { mode: string; hops_used: number; nodes_traversed: number };
+    }>(
+      "context_query",
+      {
+        query: selector,
+        ...(opts.hops !== undefined ? { hops: opts.hops } : {}),
+        ...(opts.full ? { full: true } : {}),
+        ...(opts.includeDrafts ? { include_drafts: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
 
     if (opts.json) {
+      // Field selection shared with the remote branch (doc-views.ts).
       // Field selection shared with the remote branch (doc-views.ts).
       console.log(
         JSON.stringify(
           queryJsonPayload({
+          queryJsonPayload({
             documents: result.documents.map((d) => ({
               id: d.id,
               title: d.title,
+              title: d.title,
               body: d.body,
               integrity: d.integrity,
+              integrity: d.integrity,
             })),
+            sourceNodes: (result.source_nodes ?? []).map((d) => ({
             sourceNodes: (result.source_nodes ?? []).map((d) => ({
               id: d.id,
               title: d.title,
               source: d.source,
+              title: d.title,
+              source: d.source,
               body: d.body,
               integrity: d.integrity,
+              integrity: d.integrity,
             })),
+            traceCount: result.trace_count ?? 0,
+            mode: result.traversal?.mode,
+            hopsUsed: result.traversal?.hops_used,
+            nodesTraversed: result.traversal?.nodes_traversed,
+          }),
             traceCount: result.trace_count ?? 0,
             mode: result.traversal?.mode,
             hopsUsed: result.traversal?.hops_used,
@@ -2483,7 +3385,11 @@ program
       for (const doc of result.documents) {
         console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
         if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
+        console.log(`  ${chalk.cyan(doc.id)}: ${doc.title}`);
+        if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
       }
+      const sources = result.source_nodes ?? [];
+      if (sources.length > 0) {
       const sources = result.source_nodes ?? [];
       if (sources.length > 0) {
         console.log(chalk.bold("\nSource Nodes (hydration order):"));
@@ -2492,8 +3398,31 @@ program
           console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
           if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
           console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
+        for (const doc of sources) {
+          const src = doc.source as { transport?: string; server?: string } | undefined;
+          console.log(`  ${chalk.magenta(doc.id)}: ${doc.title}`);
+          if (doc.integrity) console.log(`    ${chalk.red(doc.integrity.warning)}`);
+          console.log(`    Transport: ${src?.transport}, Server: ${src?.server || "n/a"}`);
         }
       }
+      const t = result.traversal;
+      console.log(
+        chalk.dim(`\n${t?.mode} mode | ${t?.hops_used} hops | ${t?.nodes_traversed} nodes`),
+      );
+    }
+  });
+
+/**
+ * Shared `--limit` parser. Commander hands "-5" over as the value, so validate
+ * here — once, ahead of both the local and the remote branch — rather than let
+ * a negative or fractional limit slip through as "everything".
+ */
+function parseLimit(v: string): number {
+  if (!/^\d+$/.test(v.trim())) {
+    throw new InvalidArgumentError("--limit must be 0 or a positive integer.");
+  }
+  return parseInt(v, 10);
+}
       const t = result.traversal;
       console.log(
         chalk.dim(`\n${t?.mode} mode | ${t?.hops_used} hops | ${t?.nodes_traversed} nodes`),
@@ -2522,6 +3451,7 @@ program
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected|forgotten; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
+  .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2529,7 +3459,32 @@ program
       await remoteList(remote, opts);
       return;
     }
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteList(remote, opts);
+      return;
+    }
     const storage = getStorage();
+    // Aliases collapse here; the operation owns the rest of the filtering,
+    // including hiding retired documents when no status was asked for.
+    const { documents } = await cliApi().run<{
+      documents: Array<{
+        id: string;
+        title: string;
+        type: string;
+        status: string;
+        tags?: string[];
+      }>;
+    }>(
+      "context_list",
+      {
+        ...(opts.type ? { type: opts.type } : {}),
+        ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
+        ...(opts.tag ? { tag: opts.tag } : {}),
+        ...(opts.limit ? { limit: opts.limit } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
     // Aliases collapse here; the operation owns the rest of the filtering,
     // including hiding retired documents when no status was asked for.
     const { documents } = await cliApi().run<{
@@ -2572,6 +3527,26 @@ program
       // A node imported or hand-written without a title still has to be named
       // in a listing — `undefined` is not a name.
       console.log(`    ${doc.title || "(untitled)"}`);
+      // Field selection shared with the remote branch (doc-views.ts).
+      console.log(JSON.stringify(documents.map(listJsonEntry), null, 2));
+      return;
+    }
+    if (documents.length === 0) {
+      console.log(chalk.yellow("No documents found."));
+      return;
+    }
+    console.log(chalk.bold(`${documents.length} document(s):\n`));
+    for (const doc of documents) {
+      const statusColor =
+        doc.status === "published" ? chalk.green
+        : doc.status === "approved" ? chalk.cyan
+        : doc.status === "pending_review" ? chalk.magenta
+        : doc.status === "rejected" ? chalk.red
+        : chalk.yellow;
+      console.log(`  ${chalk.cyan(doc.id)} [${doc.type}] ${statusColor(doc.status)}`);
+      // A node imported or hand-written without a title still has to be named
+      // in a listing — `undefined` is not a name.
+      console.log(`    ${doc.title || "(untitled)"}`);
     }
   });
 
@@ -2583,9 +3558,16 @@ program
   .option("--title <title>", "New title")
   .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
+  .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
+  .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteUpdate(remote, path, opts);
+      return;
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteUpdate(remote, path, opts);
@@ -2650,6 +3632,9 @@ program
       return;
     }
 
+    console.log(chalk.green(`Updated and published ${result.id}`));
+    console.log(`  Version: ${result.version}`);
+    console.log(`  Checkpoint: ${result.checkpoint}`);
     console.log(chalk.green(`Updated and published ${result.id}`));
     console.log(`  Version: ${result.version}`);
     console.log(`  Checkpoint: ${result.checkpoint}`);
@@ -2964,9 +3949,21 @@ packCmd
     const { packs } = await cliApi().run<{
       packs: Array<{ id: string; label: string; description?: string }>;
     }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
+    const { packs } = await cliApi().run<{
+      packs: Array<{ id: string; label: string; description?: string }>;
+    }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
 
     if (opts.json) {
       console.log(JSON.stringify(packs, null, 2));
+      return;
+    }
+    if (packs.length === 0) {
+      console.log(chalk.yellow("No packs found."));
+      return;
+    }
+    for (const pack of packs) {
+      console.log(`  ${chalk.cyan(`pack:${pack.id}`)} — ${pack.label}`);
+      if (pack.description) console.log(`    ${pack.description}`);
       return;
     }
     if (packs.length === 0) {
@@ -3046,9 +4043,174 @@ cpCmd
       `Rebuild checkpoint history in ${realRootPath() ?? storage.root}? The existing .versions/context_history.yaml is replaced.`,
       { destructive: true },
     );
+    await confirmOrExit(
+      `Rebuild checkpoint history in ${realRootPath() ?? storage.root}? The existing .versions/context_history.yaml is replaced.`,
+      { destructive: true },
+    );
     const cm = new CheckpointManager(storage);
     const history = await cm.rebuildCheckpointHistory();
     console.log(chalk.green(`Rebuilt ${history.checkpoints.length} checkpoints`));
+  });
+
+// ─── ctx import jats|pubmed / ctx enrich ─────────────────────────────────────
+
+function printImportSummary(r: {
+  published: Array<{ id: string; version: number }>;
+  skipped: string[];
+  failed: Array<{ id?: string; title?: string; error: string }>;
+  relinked?: string[];
+  checkpoint: number | null;
+  warnings: string[];
+}, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(r, null, 2));
+  } else {
+    for (const p of r.published) {
+      const tag = r.relinked?.includes(p.id) ? chalk.dim(" (citations re-linked)") : "";
+      console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}${tag}`);
+    }
+    for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
+    for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? f.title ?? "?"}: ${f.error}`);
+    for (const w of r.warnings) console.log(chalk.yellow(`  ! ${w}`));
+    const n = r.published.length;
+    console.log(
+      chalk.green(`Published ${n} document(s)`) +
+        (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +
+        (r.failed.length ? chalk.red(`, failed ${r.failed.length}`) : ""),
+    );
+    if (r.checkpoint !== null) console.log(`  Checkpoint: ${r.checkpoint}`);
+  }
+  if (r.failed.length > 0) process.exitCode = 1;
+}
+
+importCmd
+  .command("jats <paths...>")
+  .description("Import JATS XML articles (PubMed Central, publisher deposits) as markdown twins")
+  .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
+  .option("--keep-xml", "Also store each original under assets/jats/")
+  .option("--no-relink", "Do not update existing papers whose references now resolve")
+  // No local --force: the global one (see the root command) republishes unchanged twins.
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (paths: string[], opts) => {
+    const storage = getStorage();
+    const sources = await collectJatsFiles(paths);
+    if (sources.length === 0) {
+      console.log(chalk.yellow("No .xml / .nxml files found."));
+      return;
+    }
+    await confirmOrExit(
+      `Import ${sources.length} JATS file(s) into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+    );
+    const r = await importJats({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      sources,
+      folder: opts.folder,
+      keepXml: opts.keepXml,
+      relink: opts.relink,
+      force: isForce(),
+    });
+    printImportSummary(r, opts.json);
+  });
+
+importCmd
+  .command("pubmed")
+  .description("Search PubMed Central (open-access) and import the hits as markdown twins")
+  .requiredOption("--term <query>", 'PubMed query, e.g. "fecal microbiota transplantation[mh] AND open access[filter]"')
+  .option("--max <n>", "Maximum articles to fetch", "25")
+  .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
+  .option("--keep-xml", "Also store each original under assets/jats/")
+  .option("--no-relink", "Do not update existing papers whose references now resolve")
+  .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY) — raises the rate limit from 3/s to 10/s")
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const max = Math.max(1, parseInt(opts.max, 10) || 25);
+    const apiKey = opts.apiKey ?? process.env.NCBI_API_KEY;
+    await confirmOrExit(
+      `Fetch up to ${max} open-access PMC article(s) for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+    );
+    const fetched = await fetchPmcSources({
+      term: opts.term,
+      max,
+      apiKey,
+      onProgress: (done, total, pmcid) => {
+        if (process.stdout.isTTY) process.stdout.write(`\rFetching ${done}/${total} ${pmcid}…`);
+      },
+    });
+    if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+    console.log(chalk.dim(`${fetched.total} match(es) in PMC; fetched ${fetched.sources.length}`));
+    for (const f of fetched.failed) console.log(chalk.yellow(`  ! ${f}`));
+    if (fetched.sources.length === 0) {
+      console.log(chalk.yellow("Nothing to import."));
+      if (fetched.failed.length) process.exitCode = 1;
+      return;
+    }
+    const r = await importJats({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      sources: fetched.sources,
+      folder: opts.folder,
+      keepXml: opts.keepXml,
+      relink: opts.relink,
+      force: isForce(),
+    });
+    printImportSummary(r, opts.json);
+  });
+
+const enrichCmd = program
+  .command("enrich")
+  .description("Add curated annotations to imported nodes");
+
+enrichCmd
+  .command("pubtator [ids...]")
+  .description("Attach NCBI PubTator 3 entities and relations (MeSH-normalised) to imported papers")
+  .option("--folder <folder>", "Folder holding the paper twins", "nodes/papers")
+  // No local --force: the global one (see the root command) re-fetches enriched papers.
+  .option("--tag-limit <n>", "Most-mentioned disease/chemical entities to promote to #mesh- tags", "12")
+  .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY)")
+  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .action(async (ids: string[], opts) => {
+    const storage = getStorage();
+    await confirmOrExit(
+      `Fetch PubTator annotations for ${ids.length ? `${ids.length} paper(s)` : `every paper under ${opts.folder}`} in ${realRootPath() ?? storage.root} and republish them?`,
+    );
+    const r = await enrichPubTator({
+      storage,
+      api: cliApi(),
+      ctx: opContext(storage, opts.author),
+      folder: opts.folder,
+      // Raw: enrichPubTator resolves short ids against the papers folder itself.
+      ids,
+      force: isForce(),
+      // `--tag-limit 0` is a real request (no #mesh- tags), not a missing value.
+      tagLimit: Number.isNaN(parseInt(opts.tagLimit, 10)) ? 12 : Math.max(0, parseInt(opts.tagLimit, 10)),
+      apiKey: opts.apiKey ?? process.env.NCBI_API_KEY,
+      onProgress: (msg) => {
+        if (!opts.json) console.error(chalk.dim(`  ${msg}`));
+      },
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      for (const p of r.enriched) console.log(`  ${chalk.green("✓")} ${p.id} ${chalk.dim(`v${p.version}`)}`);
+      for (const sk of r.skipped) console.log(`  ${chalk.dim("–")} ${chalk.dim(sk)}`);
+      for (const u of r.unresolved) console.log(chalk.yellow(`  ? ${u}`));
+      for (const f of r.failed) console.log(`  ${chalk.red("✗")} ${f.id ?? "?"}: ${f.error}`);
+      for (const w of r.warnings ?? []) console.log(chalk.yellow(`  ! ${w}`));
+      console.log(
+        chalk.green(`Enriched ${r.enriched.length} document(s)`) +
+          (r.skipped.length ? chalk.dim(`, skipped ${r.skipped.length}`) : "") +
+          (r.unresolved.length ? chalk.yellow(`, unresolved ${r.unresolved.length}`) : ""),
+      );
+      if (r.checkpoint !== null) console.log(`  Checkpoint: ${r.checkpoint}`);
+    }
+    if (r.failed.length > 0) process.exitCode = 1;
   });
 
 // ─── ctx import jats|pubmed / ctx enrich ─────────────────────────────────────
@@ -3225,6 +4387,8 @@ program
 
     await confirmOrExit(`Rewrite .context/welcome.html in ${realRootPath() ?? getVaultRoot()}?`);
 
+    await confirmOrExit(`Rewrite .context/welcome.html in ${realRootPath() ?? getVaultRoot()}?`);
+
     const welcomePath = await generateWelcomeHtml({
       vaultPath: getVaultRoot(),
       vaultName: config?.name || "My Context Nest",
@@ -3244,6 +4408,8 @@ program
     console.log(chalk.green(`Generated welcome page: .context/welcome.html`));
     console.log(`  ${docs.length} documents across ${new Set(docs.map((d) => d.id.split("/")[0])).size} folders`);
 
+    // Don't open the sandbox copy — it is deleted the moment the run ends.
+    if (opts.open !== false && !isDryRun()) {
     // Don't open the sandbox copy — it is deleted the moment the run ends.
     if (opts.open !== false && !isDryRun()) {
       openInBrowser(welcomePath);
@@ -3286,7 +4452,9 @@ program
   .command("push")
   .description("Push the local vault to a hosted ContextNest server")
   .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
+  .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
   .requiredOption("--nest <id>", "Target nest ID")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .option(
@@ -3305,7 +4473,33 @@ program
       return n;
     },
   )
+  .option(
+    "--no-wait",
+    "For a nest that gates pushes: submit, print the confirmation URL, and exit without waiting for the decision",
+  )
+  .option(
+    "--timeout <sec>",
+    "Max seconds to wait for a gated push to be confirmed (default: the server's window, else 15m)",
+    (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error(chalk.red("--timeout must be a positive number of seconds."));
+        process.exit(1);
+      }
+      return n;
+    },
+  )
   .action(async (opts) => {
+    // A key on the command line is readable by anyone who can list processes,
+    // and lands in shell history. Accept it, but let the env var take over.
+    const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
+    if (!apiKey) {
+      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+      process.exit(1);
+    }
+    // Refuse to put documents and a bearer token on the wire in the clear.
+    assertSafeEndpoint(opts.server, "--server");
+
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
     const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
@@ -3349,9 +4543,38 @@ program
         ...(folder ? { folder } : {}),
       };
     });
+    // Build payload. Folder rides alongside title/content the same way
+    // `remoteAdd` sends it: the id itself is never sent (the receiving nest
+    // mints its own from the title), so without `folder` every document
+    // lands flat at the nest root regardless of where it lived locally.
+    const documents = filtered.map((doc) => {
+      const folder = folderFromId(doc.id);
+      return {
+        title: doc.frontmatter.title || doc.id,
+        content: doc.body || "",
+        type: doc.frontmatter.type || "document",
+        tags: (doc.frontmatter.tags || []).map((t: string) => (t.startsWith("#") ? t : `#${t}`)),
+        ...(folder ? { folder } : {}),
+      };
+    });
 
     const serverUrl = opts.server.replace(/\/$/, "");
     const url = `${serverUrl}/nests/${opts.nest}/publish`;
+
+    // Egress is the one action here that can't be undone by deleting a file,
+    // so show what leaves the machine before it leaves.
+    // stderr, like the action log: this is disclosure about the run, not the
+    // command's result, and stdout has to stay clean for redirection.
+    for (const doc of filtered) console.error(chalk.dim(`  ${doc.id}`));
+    await confirmOrExit(
+      `Send the ${documents.length} document(s) above${contextMd ? " and CONTEXT.md" : ""} to ${serverUrl}?`,
+      { destructive: true },
+    );
+
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan("Dry run — nothing was sent."));
+      return;
+    }
 
     // Egress is the one action here that can't be undone by deleting a file,
     // so show what leaves the machine before it leaves.
@@ -3376,9 +4599,11 @@ program
     try {
       const res = await fetch(url, {
         ...NO_REDIRECT,
+        ...NO_REDIRECT,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
@@ -3386,7 +4611,11 @@ program
       // A validated https:// server that answers 3xx would otherwise resend
       // every document body to an unvalidated destination.
       assertNotRedirected(res, "--server");
+      // A validated https:// server that answers 3xx would otherwise resend
+      // every document body to an unvalidated destination.
+      assertNotRedirected(res, "--server");
 
+      if (!res.ok && res.status !== 202) {
       if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
@@ -3513,6 +4742,7 @@ drift
   .action(async (path: string, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
     if (!history || history.versions.length === 0) {
@@ -3524,6 +4754,8 @@ drift
 
     const zone = node.frontmatter.zone;
     const docTier: GovernanceTier = node.frontmatter.governance ?? "standard";
+
+    await confirmOrExit(`Stage the drifted bytes of ${id} as a suggestion under _suggestions/?`);
 
     await confirmOrExit(`Stage the drifted bytes of ${id} as a suggestion under _suggestions/?`);
 
@@ -3564,6 +4796,7 @@ drift
   .action(async (path: string, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
+    const id = normalizeDocumentId(path);
     const metas = await listSuggestions(storage, id);
 
     if (opts.json) {
@@ -3597,8 +4830,14 @@ drift
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
+
+    await confirmOrExit(
+      `Approve ${suggestionId}? This rewrites the canonical bytes of ${id}, bumps its version and extends the hash chain.`,
+      { destructive: true },
+    );
 
     await confirmOrExit(
       `Approve ${suggestionId}? This rewrites the canonical bytes of ${id}, bumps its version and extends the hash chain.`,
@@ -3638,8 +4877,11 @@ drift
   .action(async (path: string, suggestionId: string, opts) => {
     const storage = getStorage();
     const id = normalizeDocumentId(path);
+    const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
+
+    await confirmOrExit(`Reject ${suggestionId} for ${id}? The suggestion is archived without merging.`);
 
     await confirmOrExit(`Reject ${suggestionId} for ${id}? The suggestion is archived without merging.`);
 
@@ -3664,6 +4906,7 @@ drift
     console.log(`  archived_at: ${chalk.dim(result.archivedAt)}`);
     console.log(
       chalk.dim(
+        `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
         `\nNote: canonical file on disk still has the drifted bytes. To restore the last approved version, run:\n  ctx reconstruct ${id} <last-version> > ${id}.md`,
       ),
     );
@@ -4324,6 +5567,24 @@ program
   });
 
 // Parse and run
+program.parseAsync().catch((err: unknown) => {
+  // No error path prints a raw stack trace: engine errors render with their
+  // code, everything else (YAML syntax errors, fs failures, genuine bugs) as a
+  // plain one-liner. Set CONTEXTNEST_DEBUG=1 to get the full stack back.
+  if (process.env.CONTEXTNEST_DEBUG) throw err;
+  const label = err instanceof ContextNestError ? `Error [${err.code}]` : "Error";
+  console.error(chalk.red(`${label}: ${(err as Error)?.message ?? String(err)}`));
+  if (!(err instanceof ContextNestError)) {
+    console.error(chalk.dim("Re-run with CONTEXTNEST_DEBUG=1 for the full stack trace."));
+  }
+  // Distinct exit code for "the remote exists but could not be reached", so
+  // scripted callers (plugin hooks) can skip an offline remote silently
+  // instead of treating it like a bad query.
+  if (err instanceof ContextNestError && err.code === "REMOTE_UNREACHABLE") {
+    process.exit(3);
+  }
+  process.exit(1);
+});
 program.parseAsync().catch((err: unknown) => {
   // No error path prints a raw stack trace: engine errors render with their
   // code, everything else (YAML syntax errors, fs failures, genuine bugs) as a

@@ -5,12 +5,17 @@
 
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
+  withVaultLock,
   withVaultLock,
   NestStorage,
   Resolver,
@@ -77,7 +82,34 @@ try {
   process.stderr.write(`contextnest-mcp: ${(err as Error).message}\n`);
   process.exit(1);
 }
+import {
+  createEngineApi,
+  listOperations,
+} from "@promptowl/contextnest-engine/api";
+import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
+import { resolveMcpVaultPath } from "./vault-resolution.js";
+
+/** Engine operation catalog — schemas and implementations for `context_*` tools. */
+const engineApi = createEngineApi();
+
+// Resolve at module load. A bad alias / non-path arg makes resolveVaultPath
+// throw; catch it here so the user gets a clean message on stderr instead of an
+// unhandled Node stack trace, then exit non-zero.
+let vaultPath: string;
+try {
+  vaultPath = resolveMcpVaultPath();
+} catch (err) {
+  process.stderr.write(`contextnest-mcp: ${(err as Error).message}\n`);
+  process.exit(1);
+}
 const storage = new NestStorage(vaultPath);
+
+// Read from package.json rather than hardcoding: this is the version MCP
+// clients and directories display, and a second copy drifts from the published
+// one. dist/index.js sits one level below the manifest.
+const { version } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
 
 // Read from package.json rather than hardcoding: this is the version MCP
 // clients and directories display, and a second copy drifts from the published
@@ -88,6 +120,39 @@ const { version } = JSON.parse(
 
 const server = new McpServer({
   name: "contextnest",
+  version,
+});
+
+/** Second argument every tool callback receives (request id, signal, auth, …). */
+type ToolCtx = Parameters<ToolCallback<z.ZodRawShape>>[1];
+
+/**
+ * Register a tool whose input schema REFUSES keys it does not declare.
+ *
+ * `server.tool(name, description, rawShape, cb)` wraps the shape in a plain
+ * `z.object()`, which STRIPS unknown keys — while the JSON Schema it publishes
+ * to clients says `additionalProperties: false`. An agent that misnames a
+ * parameter (`content` where the tool takes `body`) therefore gets a success
+ * response for a write that dropped its text, detectable only by reading the
+ * document back and comparing. `registerTool` takes a real ZodObject and
+ * carries `.strict()` through both validation and tools/list, so the mistake
+ * comes back as an input-validation error instead of silent data loss.
+ */
+function tool<Shape extends z.ZodRawShape>(
+  name: string,
+  description: string,
+  shape: Shape,
+  handler: (
+    args: z.output<z.ZodObject<Shape>>,
+    ctx: ToolCtx,
+  ) => CallToolResult | Promise<CallToolResult>,
+): void {
+  server.registerTool(
+    name,
+    { description, inputSchema: z.object(shape).strict() },
+    handler as ToolCallback<z.ZodObject<Shape, "strict">>,
+  );
+}
   version,
 });
 
@@ -405,6 +470,7 @@ function deprecated(canonical: string, description: string): string {
 // ─── Tool: vault_info ──────────────────────────────────────────────────────────
 
 tool("vault_info", deprecated("context_init", "It returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
+tool("vault_info", deprecated("context_init", "It returns this plus what the vault holds. Get vault identity (CONTEXT.md) and configuration summary"), {}, async () => {
   const contextMd = await storage.readContextMd();
   const config = await storage.readConfig();
 
@@ -424,6 +490,12 @@ tool("vault_info", deprecated("context_init", "It returns this plus what the vau
                   ? Object.keys(config.servers)
                   : [],
               }
+                name: config.name,
+                description: config.description,
+                servers: config.servers
+                  ? Object.keys(config.servers)
+                  : [],
+              }
               : null,
           },
           null,
@@ -437,12 +509,22 @@ tool("vault_info", deprecated("context_init", "It returns this plus what the vau
 // ─── Tool: resolve ─────────────────────────────────────────────────────────────
 
 tool(
+tool(
   "resolve",
   deprecated(
     "context_query",
     "This has always been a graph-traversal selector query. (context_resolve is a different operation — it returns full bodies within a token budget.) Execute a selector query to find matching documents using graph traversal",
   ),
+  deprecated(
+    "context_query",
+    "This has always been a graph-traversal selector query. (context_resolve is a different operation — it returns full bodies within a token budget.) Execute a selector query to find matching documents using graph traversal",
+  ),
   {
+    // Superset of the catalog shape: the legacy param was `selector`, the
+    // canonical one is `query`. Both are accepted for the migration window;
+    // the catalog op does the real validation.
+    selector: z.string().optional().describe("Legacy name for `query`"),
+    query: z.string().optional().describe("Selector query expression (e.g., '#engineering + type:document')"),
     // Superset of the catalog shape: the legacy param was `selector`, the
     // canonical one is `query`. Both are accepted for the migration window;
     // the catalog op does the real validation.
@@ -456,13 +538,41 @@ tool(
     if (hops !== undefined) input.hops = hops;
     if (full !== undefined) input.full = full;
     return runOp("context_query", input);
+  async ({ selector, query, hops, full }) => {
+    const input: Record<string, unknown> = { query: query ?? selector };
+    if (hops !== undefined) input.hops = hops;
+    if (full !== undefined) input.full = full;
+    return runOp("context_query", input);
   },
 );
 
 // ─── Tool: read_document (deprecated alias of context_get) ─────────────────────
+// ─── Tool: read_document (deprecated alias of context_get) ─────────────────────
 
 tool(
+tool(
   "read_document",
+  deprecated("context_get", "Read a single document by its contextnest:// URI or path"),
+  {
+    uri: z.string().optional().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')"),
+    id: z.string().optional().describe("Document id / path"),
+    title: z.string().optional().describe("Document title"),
+    include_raw: z.boolean().optional().describe("Also return the exact on-disk bytes as `raw`"),
+  },
+  async ({ uri, id, title, include_raw }) => {
+    const input: Record<string, unknown> = {};
+    if (id) input.id = id;
+    else if (uri) {
+      // The legacy param accepted a plain path in `uri`; the catalog op treats
+      // `uri` strictly, so route non-URIs through `id`. normalizeDocumentId
+      // keeps the legacy re-rooting of a bare slug into nodes/ — context_get
+      // deliberately does not re-root, but this alias always has.
+      if (uri.startsWith("contextnest://")) input.uri = uri;
+      else input.id = normalizeDocumentId(uri);
+    }
+    if (title) input.title = title;
+    if (include_raw !== undefined) input.include_raw = include_raw;
+    return runOp("context_get", input);
   deprecated("context_get", "Read a single document by its contextnest:// URI or path"),
   {
     uri: z.string().optional().describe("Document URI (e.g., 'contextnest://nodes/api-design') or path (e.g., 'nodes/api-design')"),
@@ -490,9 +600,17 @@ tool(
 // ─── Tool: list_documents ──────────────────────────────────────────────────────
 
 tool(
+tool(
   "list_documents",
   deprecated("context_list", "List all documents with optional filters"),
+  deprecated("context_list", "List all documents with optional filters"),
   {
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'List only documents under this folder, as an id prefix ("nodes/history"). Matches the folder itself and everything beneath it.',
+      ),
     path: z
       .string()
       .optional()
@@ -506,8 +624,19 @@ tool(
       .describe(
         "Filter by status. Canonical: draft | pending_review | approved | published | rejected. Aliases (cancelled, superseded, review, submitted, active, …) are normalized before matching.",
       ),
+    status: z
+      .string()
+      .optional()
+      .describe(
+        "Filter by status. Canonical: draft | pending_review | approved | published | rejected. Aliases (cancelled, superseded, review, submitted, active, …) are normalized before matching.",
+      ),
     tag: z.string().optional().describe("Filter by tag"),
   },
+  async ({ path, type, status, tag }) => {
+    // includeRetired so callers can list rejected docs; default filter
+    // (rejected hidden) still applies only when status filter is not set
+    // to "rejected" — match below handles both cases.
+    let docs = await storage.discoverDocuments({ includeRetired: true });
   async ({ path, type, status, tag }) => {
     // includeRetired so callers can list rejected docs; default filter
     // (rejected hidden) still applies only when status filter is not set
@@ -521,7 +650,21 @@ tool(
       const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
       docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
     }
+    if (path) {
+      // Segment boundary, not a bare startsWith: "nodes/his" must not match
+      // "nodes/history". A trailing slash or .md from a caller pasting a file
+      // path is tolerated rather than silently matching nothing.
+      const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
+      docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
+    }
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);
+    if (status) {
+      const wanted = normalizeStatus(status);
+      docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
+    } else {
+      // No explicit filter — preserve default retrieval semantics (hide rejected).
+      docs = docs.filter((d) => d.frontmatter.status !== "rejected");
+    }
     if (status) {
       const wanted = normalizeStatus(status);
       docs = docs.filter((d) => (d.frontmatter.status || "draft") === wanted);
@@ -558,6 +701,7 @@ tool(
 // ─── Tool: document_format ────────────────────────────────────────────────────
 
 tool(
+tool(
   "document_format",
   "Returns the markdown document format, supported frontmatter fields, validation rules, node types, and URI scheme. Call this before creating or updating documents to ensure correct structure.",
   {},
@@ -587,6 +731,7 @@ tool(
           type: "string",
           default: "document",
           values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -601,12 +746,29 @@ tool(
             artifact: "Generated output, as stored by other tools (no type-specific rules)",
             table: "Tabular data, as stored by other tools (no type-specific rules)",
             pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
+            agent: "Agent definition, as stored by other tools (no type-specific rules)",
+            artifact: "Generated output, as stored by other tools (no type-specific rules)",
+            table: "Tabular data, as stored by other tools (no type-specific rules)",
+            pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
           },
         },
         tags: {
           required: false,
           type: "string[]",
           constraints: "Each tag must match: ^#?[a-zA-Z][a-zA-Z0-9_-]*$ — the # prefix is added automatically if omitted",
+        },
+        status: {
+          required: false,
+          type: "string",
+          default: "draft",
+          values: ["draft", "pending_review", "approved", "published", "rejected"],
+          aliases: {
+            description:
+              "Aliases are accepted and normalized to canonical on read/write. Unknown values fall back to 'draft'.",
+            // Single source of truth — engine owns the alias map. Adding a
+            // new alias in schemas.ts surfaces here automatically.
+            map: STATUS_ALIASES,
+          },
         },
         status: {
           required: false,
@@ -661,6 +823,19 @@ tool(
             extracted_at: { required: true, type: "string", format: "ISO 8601" },
           },
         },
+        pdf: {
+          required: "Only when type is 'pdf'; must NOT be present on other types. Written by context_import_pdf — never by hand",
+          fields: {
+            file: { required: true, type: "string", description: "Vault-relative sidecar path — always <node id>.pdf, beside the .md" },
+            sha256: { required: true, type: "string", format: "sha256:<64 lowercase hex chars> of the sidecar bytes" },
+            bytes: { required: true, type: "integer" },
+            pages: { required: true, type: "integer" },
+            text_layer: { required: true, type: "boolean", description: "false for a scanned PDF — the body is then empty" },
+            extractor: { required: true, type: "string" },
+            extractor_version: { required: true, type: "string" },
+            extracted_at: { required: true, type: "string", format: "ISO 8601" },
+          },
+        },
       },
       validation_rules: [
         { rule: 1, description: "Valid YAML frontmatter between --- delimiters" },
@@ -668,6 +843,8 @@ tool(
         { rule: 3, description: "Body must be valid GitHub Flavored Markdown (spec 0.29-gfm)" },
         { rule: 4, description: "Context links must use valid contextnest:// URIs" },
         { rule: 5, description: "Tags must match pattern: ^#?[a-zA-Z][a-zA-Z0-9_-]*$" },
+        { rule: 6, description: `type must be one of the ${NODE_TYPES.length} defined node types: ${NODE_TYPES.join(", ")}` },
+        { rule: 7, description: "status must be one of: draft, pending_review, approved, published, rejected (aliases normalized; unknown → draft)" },
         { rule: 6, description: `type must be one of the ${NODE_TYPES.length} defined node types: ${NODE_TYPES.join(", ")}` },
         { rule: 7, description: "status must be one of: draft, pending_review, approved, published, rejected (aliases normalized; unknown → draft)" },
         { rule: 8, description: "checksum format: sha256:<64 lowercase hex chars>" },
@@ -678,6 +855,11 @@ tool(
         { rule: 13, description: "source.depends_on entries must be valid contextnest:// URIs" },
         { rule: 16, description: "source.cache_ttl must be a positive integer if present" },
         { rule: 17, description: "source block must NOT be present on non-source types" },
+        { rule: 25, description: "pdf block MUST be present when type is 'pdf'" },
+        { rule: 26, description: "pdf.file must be the node's own sidecar: <node id>.pdf" },
+        { rule: 27, description: "pdf.sha256 format: sha256:<64 lowercase hex chars>" },
+        { rule: 28, description: "pdf.bytes and pdf.pages are non-negative integers; pdf.text_layer is a boolean" },
+        { rule: 29, description: "pdf block must NOT be present on non-pdf types" },
         { rule: 25, description: "pdf block MUST be present when type is 'pdf'" },
         { rule: 26, description: "pdf.file must be the node's own sidecar: <node id>.pdf" },
         { rule: 27, description: "pdf.sha256 format: sha256:<64 lowercase hex chars>" },
@@ -716,6 +898,7 @@ tool(
 // ─── Tool: read_index ──────────────────────────────────────────────────────────
 
 tool("read_index", "Return the context.yaml index", {}, async () => {
+tool("read_index", "Return the context.yaml index", {}, async () => {
   const contextYaml = await storage.readContextYaml();
   return {
     content: [
@@ -731,6 +914,7 @@ tool("read_index", "Return the context.yaml index", {}, async () => {
 
 // ─── Tool: read_pack ───────────────────────────────────────────────────────────
 
+tool(
 tool(
   "read_pack",
   "Resolve and return a context pack using graph traversal",
@@ -763,12 +947,14 @@ tool(
                 id: d.id,
                 title: d.frontmatter.title,
                 ...(d.integrity ? { integrity: d.integrity } : {}),
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               source_nodes: result.sourceNodes.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
                 source: d.frontmatter.source,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
@@ -790,7 +976,9 @@ tool(
 // ─── Tool: search ──────────────────────────────────────────────────────────────
 
 tool(
+tool(
   "search",
+  deprecated("context_search", "Full-text search across vault documents with graph traversal"),
   deprecated("context_search", "Full-text search across vault documents with graph traversal"),
   {
     query: z.string().describe("Search query"),
@@ -817,6 +1005,7 @@ tool(
                 description: d.frontmatter.description,
                 type: d.frontmatter.type || "document",
                 ...(d.integrity ? { integrity: d.integrity } : {}),
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {
@@ -837,6 +1026,7 @@ tool(
 // ─── Tool: verify_integrity ────────────────────────────────────────────────────
 
 tool("verify_integrity", deprecated("context_verify", "Verify integrity of all hash chains in the vault"), {}, async () => {
+tool("verify_integrity", deprecated("context_verify", "Verify integrity of all hash chains in the vault"), {}, async () => {
   const report = await storage.verifyVaultIntegrity();
   return {
     content: [
@@ -850,6 +1040,7 @@ tool("verify_integrity", deprecated("context_verify", "Verify integrity of all h
 
 // ─── Tool: list_checkpoints ────────────────────────────────────────────────────
 
+tool(
 tool(
   "list_checkpoints",
   "List recent checkpoints",
@@ -879,7 +1070,9 @@ tool(
 // ─── Tool: read_version ────────────────────────────────────────────────────────
 
 tool(
+tool(
   "read_version",
+  deprecated("context_reconstruct", "Read a specific version of a document"),
   deprecated("context_reconstruct", "Read a specific version of a document"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
@@ -887,8 +1080,17 @@ tool(
   },
   async ({ path, version }) => {
     const id = normalizeDocumentId(path);
+    const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
+    // Plain-text tool, so the verdict can only travel as text: a tampered
+    // version chain puts the warning line ahead of the content (additive —
+    // intact output is byte-identical). Chain only; the live body is not what
+    // this serves. No live node to check against → no verdict.
+    const live = await storage.readDocument(id).catch(() => null);
+    const integrity = live
+      ? await storage.verifyServedDocument(live, { checkBody: false })
+      : undefined;
     // Plain-text tool, so the verdict can only travel as text: a tampered
     // version chain puts the warning line ahead of the content (additive —
     // intact output is byte-identical). Chain only; the live body is not what
@@ -902,6 +1104,7 @@ tool(
       content: [
         {
           type: "text" as const,
+          text: withIntegrityWarning(content, integrity),
           text: withIntegrityWarning(content, integrity),
         },
       ],
@@ -919,10 +1122,25 @@ tool(
 const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
   withVaultLock(storage.root, fn);
 
+/**
+ * The deprecated write tools below predate the operation catalog and call
+ * storage/publish directly, bypassing the catalog executors' vault lock. Any
+ * legacy client could therefore race a locked `context_update` and corrupt
+ * the checkpoint chain. Wrapping here keeps their wire output byte-identical
+ * while closing the gap; new tools go through the catalog and need nothing.
+ */
+const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
+  withVaultLock(storage.root, fn);
+
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
 tool(
+tool(
   "create_document",
+  deprecated(
+    "context_create",
+    "Create a new document in the vault with frontmatter and optional body content Kept for existing clients: it wraps the body in a heading and fills skill defaults, which context_create does not.",
+  ),
   deprecated(
     "context_create",
     "Create a new document in the vault with frontmatter and optional body content Kept for existing clients: it wraps the body in a heading and fills skill defaults, which context_create does not.",
@@ -933,7 +1151,13 @@ tool(
     type: z.enum(NODE_TYPES).optional().default("document").describe("Node type"),
     description: z
       .string()
+    type: z.enum(NODE_TYPES).optional().default("document").describe("Node type"),
+    description: z
+      .string()
       .optional()
+      .describe(
+        "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a document without one is markedly harder to find.",
+      ),
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a document without one is markedly harder to find.",
       ),
@@ -943,9 +1167,24 @@ tool(
       .string()
       .optional()
       .describe("Alias for `body` — pass one or the other, not both"),
+    body: z.string().optional().describe("Markdown body content"),
+    content: z
+      .string()
+      .optional()
+      .describe("Alias for `body` — pass one or the other, not both"),
     trigger: z.string().optional().describe("Skill trigger description (required when type is 'skill')"),
     tools_required: z.array(z.string()).optional().describe("Tools required for skill execution"),
     output_format: z.enum(["markdown", "json", "text", "code"]).optional().describe("Skill output format"),
+    // `.strict()` here, not on the export: the tool() helper's strictness stops
+    // at the top level, so an unknown key INSIDE the block is still stripped —
+    // a typo'd `server` would write a source block missing the field rule 12
+    // wants, silently. The base schema stays lenient for on-disk frontmatter.
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
+      ),
     // `.strict()` here, not on the export: the tool() helper's strictness stops
     // at the top level, so an unknown key INSIDE the block is still stripped —
     // a typo'd `server` would write a source block missing the field rule 12
@@ -978,7 +1217,38 @@ tool(
       // lands in the same place as one created via `ctx add` (single source of
       // truth — normalizeDocumentId in the engine).
       const id = normalizeDocumentId(path);
+  async ({
+    path,
+    title,
+    description,
+    type,
+    tags,
+    body,
+    content: bodyAlias,
+    trigger,
+    tools_required,
+    output_format,
+    source,
+  }) =>
+    lockedHandler(async () => {
+      const resolvedBody = resolveBodyAlias(body, bodyAlias);
+      if (!resolvedBody.ok) return validationError(resolvedBody.error);
 
+      // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
+      // lands in the same place as one created via `ctx add` (single source of
+      // truth — normalizeDocumentId in the engine).
+      const id = normalizeDocumentId(path);
+
+      // Check if document already exists
+      try {
+        await storage.readDocument(id);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: `Document "${id}" already exists` }) }],
+          isError: true,
+        };
+      } catch {
+        // Document doesn't exist, good to proceed
+      }
       // Check if document already exists
       try {
         await storage.readDocument(id);
@@ -1002,7 +1272,46 @@ tool(
         created_at: new Date().toISOString(),
         ...(tagList ? { tags: tagList } : {}),
       };
+      const tagList = tags ? tags.map((t) => (t.startsWith("#") ? t : `#${t}`)) : undefined;
+      // version omitted — publishDocument owns version assignment (spec §6:
+      // "version managed automatically by publish"). Pre-setting it caused
+      // create-with-publish to land on v=2 instead of v=1.
+      const frontmatter: Frontmatter = {
+        title,
+        type,
+        ...(description !== undefined ? { description } : {}),
+        status: "draft",
+        created_at: new Date().toISOString(),
+        ...(tagList ? { tags: tagList } : {}),
+      };
 
+      // Settle the typed blocks BEFORE anything is written. `source` and `skill`
+      // are required by one type and forbidden on the others, and until now this
+      // tool built a skill block but had no source equivalent — so a type:source
+      // node was written with no block, published fine, and then failed every
+      // update it was ever given, with no parameter able to supply the field.
+      try {
+        applyTypedBlocks(frontmatter, {
+          type,
+          ...(source !== undefined ? { source } : {}),
+          ...(trigger !== undefined ? { trigger } : {}),
+          ...(tools_required !== undefined ? { tools_required } : {}),
+          ...(output_format !== undefined ? { output_format } : {}),
+          defaultTrigger: `when asked to ${title.toLowerCase()}`,
+        });
+      } catch (err) {
+        return validationError(err instanceof Error ? err.message : String(err));
+      }
+      // Skill defaults this tool has always filled in and context_create does not.
+      if (frontmatter.skill) {
+        frontmatter.skill = {
+          inputs: [],
+          tools_required: [],
+          output_format: "markdown",
+          guard_rails: [],
+          ...frontmatter.skill,
+        };
+      }
       // Settle the typed blocks BEFORE anything is written. `source` and `skill`
       // are required by one type and forbidden on the others, and until now this
       // tool built a skill block but had no source equivalent — so a type:source
@@ -1072,7 +1381,29 @@ tool(
 
       const content = serializeDocument(node);
       await storage.writeDocument(id, content);
+      const content = serializeDocument(node);
+      await storage.writeDocument(id, content);
 
+      // Auto-publish: bump version, create version entry & checkpoint.
+      // If publish fails after writeDocument succeeded, roll back the file
+      // so the next create attempt isn't blocked by orphan state.
+      let result;
+      try {
+        result = await publishDocument(storage, id, {
+          editedBy: "mcp@contextnest.local",
+          note: "Created via MCP server",
+          // Derived attribution only — the legacy tools take no `client` of
+          // their own (additive parity with the catalog tools, per CLAUDE.md).
+          client: defaultClient(),
+        });
+      } catch (err) {
+        try {
+          await storage.deleteDocument(id);
+        } catch {
+          // best-effort cleanup; surface original publish error regardless
+        }
+        throw err;
+      }
       // Auto-publish: bump version, create version entry & checkpoint.
       // If publish fails after writeDocument succeeded, roll back the file
       // so the next create attempt isn't blocked by orphan state.
@@ -1095,7 +1426,28 @@ tool(
       }
 
       await regenerateIndex();
+      await regenerateIndex();
 
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id: result.node.id,
+                frontmatter: result.node.frontmatter,
+                version: result.node.frontmatter.version,
+                checkpoint: result.checkpointNumber,
+                chain_hash: result.versionEntry.chain_hash,
+                message: "Document created and published successfully",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }),
       return {
         content: [
           {
@@ -1121,7 +1473,12 @@ tool(
 // ─── Tool: update_document ─────────────────────────────────────────────────
 
 tool(
+tool(
   "update_document",
+  deprecated(
+    "context_update",
+    "Update an existing document's frontmatter fields and/or body content Kept for existing clients: it accepts status aliases and wraps the body, which context_update does not.",
+  ),
   deprecated(
     "context_update",
     "Update an existing document's frontmatter fields and/or body content Kept for existing clients: it accepts status aliases and wraps the body, which context_update does not.",
@@ -1135,6 +1492,12 @@ tool(
       .describe(
         "New one-line summary for frontmatter. An empty string removes it. Indexed for retrieval alongside title and tags.",
       ),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "New one-line summary for frontmatter. An empty string removes it. Indexed for retrieval alongside title and tags.",
+      ),
     tags: z.array(z.string()).optional().describe("New tags (replaces existing)"),
     status: z
       .string()
@@ -1142,7 +1505,38 @@ tool(
       .describe(
         "New status. Canonical: draft | pending_review | approved | published | rejected. Aliases like 'cancelled', 'superseded', 'active', 'archived', 'review', 'submitted', 'in_review' are accepted and normalized to canonical before storage. Unknown values fall back to 'draft'. 'rejected' retires the doc — no new published version is cut.",
       ),
+    status: z
+      .string()
+      .optional()
+      .describe(
+        "New status. Canonical: draft | pending_review | approved | published | rejected. Aliases like 'cancelled', 'superseded', 'active', 'archived', 'review', 'submitted', 'in_review' are accepted and normalized to canonical before storage. Unknown values fall back to 'draft'. 'rejected' retires the doc — no new published version is cut.",
+      ),
     body: z.string().optional().describe("New markdown body content"),
+    content: z
+      .string()
+      .optional()
+      .describe("Alias for `body` — pass one or the other, not both"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+      ),
+    source: sourceMetaSchema
+      .strict()
+      .optional()
+      .describe(
+        "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    trigger: z
+      .string()
+      .optional()
+      .describe("New skill trigger, for a node that is (or is becoming) type:skill"),
+    tools_required: z.array(z.string()).optional().describe("New tools a skill needs to run"),
+    output_format: z
+      .enum(["markdown", "json", "text", "code"])
+      .optional()
+      .describe("New skill output format"),
     content: z
       .string()
       .optional()
@@ -1259,7 +1653,48 @@ tool(
         return validationError(err instanceof Error ? err.message : String(err));
       }
       doc.frontmatter.updated_at = new Date().toISOString();
+      // Update frontmatter fields
+      if (title !== undefined) doc.frontmatter.title = title;
+      // An empty string CLEARS the description: over a JSON wire an absent key
+      // cannot be told apart from "leave this alone", so without the convention
+      // a caller has no way to remove one.
+      if (description !== undefined) {
+        if (description === "") delete doc.frontmatter.description;
+        else doc.frontmatter.description = description;
+      }
+      if (normalizedStatus !== undefined) doc.frontmatter.status = normalizedStatus;
+      if (tags !== undefined) {
+        doc.frontmatter.tags = tags.map((t) => (t.startsWith("#") ? t : `#${t}`));
+      }
+      // Settle the typed blocks against the node's POST-write type — the one
+      // passed in this call, or the one it already carries. Without this an
+      // existing type:source node has no way to gain the block rule 9 demands,
+      // and every update it is ever given fails validation.
+      const nextType = type ?? doc.frontmatter.type ?? "document";
+      if (type !== undefined) doc.frontmatter.type = nextType;
+      try {
+        applyTypedBlocks(doc.frontmatter, {
+          type: nextType,
+          ...(source !== undefined ? { source } : {}),
+          ...(trigger !== undefined ? { trigger } : {}),
+          ...(tools_required !== undefined ? { tools_required } : {}),
+          ...(output_format !== undefined ? { output_format } : {}),
+        });
+      } catch (err) {
+        return validationError(err instanceof Error ? err.message : String(err));
+      }
+      doc.frontmatter.updated_at = new Date().toISOString();
 
+      // Update body if provided. A pdf node's body is its extracted text —
+      // same refusal as context_update: change the PDF, not the text.
+      if (resolvedBody.body !== undefined && doc.frontmatter.type === "pdf") {
+        return validationError(
+          `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. Use context_import_pdf with this id to import a new version.`,
+        );
+      }
+      if (resolvedBody.body !== undefined) {
+        doc.body = `\n${resolvedBody.body}\n`;
+      }
       // Update body if provided. A pdf node's body is its extracted text —
       // same refusal as context_update: change the PDF, not the text.
       if (resolvedBody.body !== undefined && doc.frontmatter.type === "pdf") {
@@ -1358,7 +1793,53 @@ tool(
           ],
         };
       }
+      const content = serializeDocument(doc);
+      await storage.writeDocument(id, content);
 
+      // Metadata-only paths — any non-published status set is treated as
+      // a lifecycle transition, not a content release. Skip publishDocument
+      // entirely (rejected would throw REJECTED_DOCUMENT) and don't cut a
+      // new version. Only an explicit `published` or no-status update falls
+      // through to the publish flow below.
+      if (
+        normalizedStatus === "rejected" ||
+        normalizedStatus === "approved" ||
+        normalizedStatus === "pending_review" ||
+        normalizedStatus === "draft"
+      ) {
+        await regenerateIndex();
+        const message =
+          normalizedStatus === "rejected"
+            ? "Document retired (status: rejected). No new version cut."
+            : normalizedStatus === "pending_review"
+              ? "Document submitted for review (status: pending_review). No new version cut."
+              : normalizedStatus === "approved"
+                ? "Document marked approved. No new version cut — call publish_document to release."
+                : "Document reverted to draft. No new version cut.";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  id,
+                  frontmatter: doc.frontmatter,
+                  message,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      // Auto-publish: bump version, create version entry & checkpoint
+      const result = await publishDocument(storage, id, {
+        editedBy: "mcp@contextnest.local",
+        note: "Updated via MCP server",
+        client: defaultClient(),
+      });
       // Auto-publish: bump version, create version entry & checkpoint
       const result = await publishDocument(storage, id, {
         editedBy: "mcp@contextnest.local",
@@ -1367,7 +1848,28 @@ tool(
       });
 
       await regenerateIndex();
+      await regenerateIndex();
 
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id: result.node.id,
+                frontmatter: result.node.frontmatter,
+                version: result.node.frontmatter.version,
+                checkpoint: result.checkpointNumber,
+                chain_hash: result.versionEntry.chain_hash,
+                message: "Document updated and published successfully",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }),
       return {
         content: [
           {
@@ -1393,7 +1895,9 @@ tool(
 // ─── Tool: delete_document ─────────────────────────────────────────────────
 
 tool(
+tool(
   "delete_document",
+  deprecated("context_delete", "Delete a document and its version history from the vault"),
   deprecated("context_delete", "Delete a document and its version history from the vault"),
   {
     path: z.string().describe("Document path (e.g., 'nodes/api-design')"),
@@ -1429,7 +1933,12 @@ tool(
 // ─── Tool: publish_document ────────────────────────────────────────────────
 
 tool(
+tool(
   "publish_document",
+  deprecated(
+    "context_publish",
+    "Publish a document: bump version, compute checksum, create version entry and checkpoint",
+  ),
   deprecated(
     "context_publish",
     "Publish a document: bump version, compute checksum, create version entry and checkpoint",
@@ -1442,7 +1951,15 @@ tool(
   async ({ path, author, note }) =>
     lockedHandler(async () => {
       const id = normalizeDocumentId(path);
+  async ({ path, author, note }) =>
+    lockedHandler(async () => {
+      const id = normalizeDocumentId(path);
 
+      const result = await publishDocument(storage, id, {
+        editedBy: author,
+        note,
+        client: defaultClient(),
+      });
       const result = await publishDocument(storage, id, {
         editedBy: author,
         note,
@@ -1450,7 +1967,27 @@ tool(
       });
 
       await regenerateIndex();
+      await regenerateIndex();
 
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id,
+                version: result.node.frontmatter.version,
+                checkpoint: result.checkpointNumber,
+                chain_hash: result.versionEntry.chain_hash,
+                message: "Document published successfully",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }),
       return {
         content: [
           {
@@ -1475,6 +2012,7 @@ tool(
 // ─── Tool: stage_drift_suggestion ──────────────────────────────────────────
 
 tool(
+tool(
   "stage_drift_suggestion",
   "Capture an out-of-band edit (live file drifted from last-approved bytes) as a staged suggestion under _suggestions/. Does NOT modify the canonical document or hash chain. Pair with verify_integrity → approve_suggestion or reject_suggestion to resolve drift.",
   {
@@ -1483,6 +2021,7 @@ tool(
     note: z.string().optional().describe("Optional human note explaining the drift"),
   },
   async ({ path, actor, note }) => {
+    const id = normalizeDocumentId(path);
     const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const history = await storage.readHistory(id);
@@ -1544,10 +2083,12 @@ tool(
 // ─── Tool: list_suggestions ────────────────────────────────────────────────
 
 tool(
+tool(
   "list_suggestions",
   "List all staged suggestions for a document",
   { path: z.string().describe("Document path (e.g., 'nodes/api-design')") },
   async ({ path }) => {
+    const id = normalizeDocumentId(path);
     const id = normalizeDocumentId(path);
     const metas = await listSuggestions(storage, id);
     return {
@@ -1568,6 +2109,7 @@ tool(
 // ─── Tool: approve_suggestion ──────────────────────────────────────────────
 
 tool(
+tool(
   "approve_suggestion",
   "Approve a staged suggestion: applies the patch, bumps version, writes new canonical bytes, archives the suggestion under _archive/approved/. Refuses if the chain head moved since staging (caller must re-stage).",
   {
@@ -1577,6 +2119,7 @@ tool(
     comment: z.string().optional().describe("Optional approval comment recorded in the chain event"),
   },
   async ({ path, suggestion_id, actor, comment }) => {
+    const id = normalizeDocumentId(path);
     const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
@@ -1618,6 +2161,7 @@ tool(
 // ─── Tool: reject_suggestion ───────────────────────────────────────────────
 
 tool(
+tool(
   "reject_suggestion",
   "Reject a staged suggestion: archives the patch + meta under _archive/rejected/ and emits a chain event. Canonical document and hash chain head are untouched. Rejection reason is required for audit trail.",
   {
@@ -1627,6 +2171,7 @@ tool(
     actor: z.string().optional().describe("Actor identity recorded as rejector. Defaults to 'local-mcp'."),
   },
   async ({ path, suggestion_id, reason, actor }) => {
+    const id = normalizeDocumentId(path);
     const id = normalizeDocumentId(path);
     const node = await storage.readDocument(id);
     const zone = node.frontmatter.zone ?? "default";
