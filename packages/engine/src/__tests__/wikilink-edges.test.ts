@@ -27,6 +27,7 @@ import { publishDocument } from "../publish.js";
 import { serializeDocument } from "../parser.js";
 import {
   generateContextYaml,
+  HUB_MIN_DEGREE,
   generateContextYamlWithStats,
 } from "../index-generator.js";
 import {
@@ -168,11 +169,23 @@ describe("generateContextYaml — wikilink edges, hubs and stats", () => {
   it("emits the wikilink edge in relationships and feeds hubs", () => {
     const a = doc("nodes/a", "A", "[[B Title]]");
     const c = doc("nodes/c", "C", "[[b title]]");
+    const d = doc("nodes/d", "D", "[[B Title]]");
     const b = doc("nodes/b", "B Title", "");
-    const yaml = generateContextYaml([a, b, c], null, null);
+    const yaml = generateContextYaml([a, b, c, d], null, null);
     expect(yaml.relationships).toContainEqual({ from: "nodes/a", to: "nodes/b", type: "reference" });
     expect(yaml.relationships).toContainEqual({ from: "nodes/c", to: "nodes/b", type: "reference" });
-    expect(yaml.hubs[0]).toEqual({ id: "nodes/b", degree: 2 });
+    expect(yaml.hubs[0]).toEqual({ id: "nodes/b", degree: 3 });
+  });
+
+  it("does not make a hub out of a document linked fewer than HUB_MIN_DEGREE times", () => {
+    // In a small vault every linked node used to land in the top 10 and become a
+    // free-to-reach hub, so `--hops 0` from one doc returned the docs it links to.
+    const a = doc("nodes/a", "A", "[[B Title]]");
+    const c = doc("nodes/c", "C", "[[b title]]");
+    const b = doc("nodes/b", "B Title", "");
+    const yaml = generateContextYaml([a, b, c], null, null);
+    expect(HUB_MIN_DEGREE).toBe(3);
+    expect(yaml.hubs).toEqual([]);
   });
 
   it("exposes {edges, fromWikilinks, unresolvedWikilinks}", () => {
