@@ -329,7 +329,7 @@ export class VaultCrypto {
   async openNote(value: string, what: string): Promise<string> {
     const kid = fieldKid(value);
     if (!kid) throw new DecryptionFailedError(what);
-    return openField(await this.key(kid, what), value, what);
+    return openField(await this.key(kid, what), value, "note", what);
   }
 
   async sealBytes(bytes: Uint8Array): Promise<Buffer> {

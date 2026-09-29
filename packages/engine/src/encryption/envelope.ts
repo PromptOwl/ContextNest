@@ -211,10 +211,16 @@ export function sealField(key: Buffer, kid: string, kind: SealKind, plaintext: s
   return `${FIELD_PREFIX}${kind}:${kid}:${iv.toString("base64url")}:${tag.toString("base64url")}:${ct.toString("base64url")}`;
 }
 
-export function openField(key: Buffer, value: string, what: string): string {
+export function openField(key: Buffer, value: string, expectedKind: SealKind, what: string): string {
   const parts = value.slice(FIELD_PREFIX.length).split(":");
   if (parts.length !== 5) throw new DecryptionFailedError(what);
   const [kind, kid, iv, tag, ct] = parts;
+  if (kind !== expectedKind) {
+    throw new ContextNestError(
+      `${what} holds a "${kind}" ciphertext where a "${expectedKind}" was expected — refusing to substitute.`,
+      "DECRYPTION_FAILED",
+    );
+  }
   return gcmOpen(
     key,
     { iv: Buffer.from(iv, "base64url"), tag: Buffer.from(tag, "base64url"), ct: Buffer.from(ct, "base64url") },
@@ -233,6 +239,10 @@ export function isSealedBinary(bytes: Uint8Array): boolean {
 export function sealBinary(key: Buffer, kid: string, bytes: Uint8Array): Buffer {
   const { iv, tag, ct } = gcmSeal(key, Buffer.from(bytes), aadFor("binary", kid, ""));
   const kidBuf = Buffer.from(kid, "latin1");
+  if (kidBuf.length > 255) {
+    // The length prefix is one byte — a longer kid would wrap silently.
+    throw new ContextNestError(`Key id is too long to seal (${kidBuf.length} bytes, max 255).`, "INVALID_KEY");
+  }
   return Buffer.concat([BINARY_MAGIC, Buffer.from([kidBuf.length]), kidBuf, iv, tag, ct]);
 }
 
@@ -240,6 +250,8 @@ export function binaryKid(bytes: Uint8Array): string | null {
   if (!isSealedBinary(bytes)) return null;
   const buf = Buffer.from(bytes);
   const len = buf[BINARY_MAGIC.length];
+  // A truncated file must read as "not sealed", not as a garbled kid.
+  if (BINARY_MAGIC.length + 1 + len > buf.length) return null;
   return buf.subarray(BINARY_MAGIC.length + 1, BINARY_MAGIC.length + 1 + len).toString("latin1");
 }
 
@@ -266,8 +278,9 @@ export function wrapKey(kek: Buffer, key: Buffer, context: string): string {
 }
 
 export function unwrapKey(kek: Buffer, wrapped: string, context: string, what: string): Buffer {
-  const [iv, tag, ct] = wrapped.split(".").map((p) => Buffer.from(p ?? "", "base64url"));
-  if (!iv || !tag || !ct) throw new DecryptionFailedError(what);
+  const parts = wrapped.split(".");
+  if (parts.length !== 3) throw new DecryptionFailedError(what);
+  const [iv, tag, ct] = parts.map((p) => Buffer.from(p, "base64url"));
   const key = gcmOpen(kek, { iv, tag, ct }, Buffer.from(`contextnest:wrap:v1\n${context}`, "utf-8"), what);
   assertKey(key);
   return key;
@@ -285,13 +298,16 @@ export interface ScryptParams {
 export const DEFAULT_SCRYPT: ScryptParams = { N: 2 ** 17, r: 8, p: 1 };
 
 export function deriveFromPassphrase(passphrase: string, salt: Buffer, params: ScryptParams): Buffer {
-  if (passphrase.length < 12) {
+  // Normalize before the length check so the rule counts the same characters
+  // scrypt will actually see.
+  const normalized = passphrase.normalize("NFKC");
+  if (normalized.length < 12) {
     throw new ContextNestError(
       "Recovery passphrase must be at least 12 characters — it is the only thing standing between a stolen backup file and your vault key.",
       "WEAK_PASSPHRASE",
     );
   }
-  return scryptSync(passphrase.normalize("NFKC"), salt, KEY_BYTES, {
+  return scryptSync(normalized, salt, KEY_BYTES, {
     N: params.N,
     r: params.r,
     p: params.p,
