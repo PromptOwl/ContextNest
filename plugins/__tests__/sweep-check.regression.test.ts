@@ -66,6 +66,7 @@ beforeAll(() => {
     // --register: the workspace is under the OS temp dir, where init no longer
     // auto-registers a vault.
     ctl(dir, ["init", "--name", alias, "--description", desc, "--register"]);
+    ctl(dir, ["config", "set", "review", "off"]); // the sweep diffs published versions
   }
   const eng = join(workspace, "eng");
   const mkt = join(workspace, "mkt");
