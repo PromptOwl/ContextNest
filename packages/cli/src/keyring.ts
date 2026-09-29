@@ -105,7 +105,11 @@ export function macKeychain(runner: CommandRunner = defaultRunner): KeyringBacke
     },
     async set(account, secret) {
       // `security -i` reads commands from stdin — keeps the secret off argv.
-      const line = `add-generic-password -U -s ${KEYRING_SERVICE} -a ${account} -l ${KEYRING_SERVICE} -w ${encode(secret)}\n`;
+      // The account is quoted for security's tokenizer: every current caller
+      // passes a constant-shaped id, but this module is the "nothing leaks
+      // into the command line" boundary, so don't rely on that staying true.
+      const q = (s: string) => `"${s.replace(/[\\"]/g, (c) => `\\${c}`)}"`;
+      const line = `add-generic-password -U -s ${KEYRING_SERVICE} -a ${q(account)} -l ${KEYRING_SERVICE} -w ${encode(secret)}\n`;
       const r = await tryRun(runner, SECURITY, ["-i"], line);
       if (!r || r.code !== 0 || /error|failed/i.test(r.stderr)) {
         throw new Error(`Could not write to the macOS Keychain: ${r?.stderr.trim() || "security failed"}`);

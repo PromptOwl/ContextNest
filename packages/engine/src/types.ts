@@ -707,6 +707,14 @@ export interface VerificationReport {
       | "sidecar_drift"
       // A pdf node's declared sidecar is not on disk.
       | "sidecar_missing"
+      // Encrypted vault, no usable key: content hashes could not be checked.
+      // Always makes the report invalid — verification never passes silently.
+      | "encrypted_key_required"
+      // A sealed artifact failed AES-GCM authentication (tampered, or sealed
+      // under a key this vault does not hold).
+      | "decryption_failed"
+      // A content file in an encrypted vault is stored as plaintext.
+      | "unencrypted_file"
       // Forget protocol (§6.3): content a forget erased is back on disk — an
       // artifact for a tombstoned version, a recorded forget whose entry is
       // no longer tombstoned, or a forgotten stub with a body.

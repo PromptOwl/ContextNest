@@ -82,6 +82,8 @@ A safe shared brain.
 
 Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
 
+Need content encrypted at rest? `ctx init --encrypted` (or `ctx vault encrypt` for an existing vault) seals note bodies and version history with AES-256-GCM while front matter stays indexable. Hash chains keep verifying over the plaintext. It is opt-in: default vaults stay plain Markdown. Read the [threat model and key handling](docs/encrypted-vaults.md) first, because **losing the key and the recovery passphrase means losing the data**.
+
 ## How is this different from...
 
 | | Obsidian + LLM | RAG on docs | Wiki + Claude Projects | Notion AI / Glean | **Context Nest** |
@@ -561,6 +563,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx vault encrypt` | Encrypt the vault's content at rest in place (AES-256-GCM). Prints a one-time recovery passphrase; rerun to resume an interrupted run. See [encrypted vaults](docs/encrypted-vaults.md) |
+| `ctx vault decrypt` | Decrypt an encrypted vault back to plain Markdown |
 | `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
@@ -614,7 +618,7 @@ ctx query "#api + status:published"       # Intersection
 | `ctx history <path>` | Show version history |
 | `ctx history <path> --diff` | Include each version's unified diff from the one before |
 | `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
-| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped). Forgotten versions verify hash-only; erased content found back on disk is reported |
+| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped). In an encrypted vault without its key it reports `encrypted_key_required` and never passes |
 | `ctx forget-log [path]` | The forget audit trail — who forgot or deleted what, when, and under which reason code (never the content) |
 
 Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
