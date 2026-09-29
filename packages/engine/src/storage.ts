@@ -186,7 +186,7 @@ export function normalizeFolder(raw: string): string {
  * discovery and folder listing so the two can never disagree about which files
  * count — a folder holding only these is not a folder of documents.
  */
-const NON_DOCUMENT_BASENAMES = new Set([
+export const NON_DOCUMENT_BASENAMES = new Set([
   "INDEX.md",
   // Agent-config / scaffold files are not knowledge nodes.
   "CLAUDE.md",
@@ -194,6 +194,23 @@ const NON_DOCUMENT_BASENAMES = new Set([
   "AGENTS.md",
   "README.md",
 ]);
+
+/**
+ * Globs matching every file an encrypted vault seals. ONE list on purpose:
+ * migrate's `sensitiveFiles` (what gets sealed) and verify's
+ * `findUnencryptedFiles` (what must be sealed) both build on it, so a new
+ * sensitive artifact cannot be added to one and silently missed by the other.
+ */
+export const SENSITIVE_FILE_GLOBS = [
+  "**/*.md",
+  "**/.versions/*/*.md",
+  "**/.versions/*/*.diff",
+  "**/.versions/*/*.pdf",
+  "**/_suggestions/**/*.patch",
+  "**/_suggestions/**/*.meta.yaml",
+  "**/*.pdf",
+  "context.yaml",
+];
 
 const NON_DOCUMENT_FILES = [
   "**/node_modules/**",
@@ -507,16 +524,7 @@ export class NestStorage {
     if (!(await this.isEncrypted())) return [];
     const files = await globFiles(
       this.root,
-      [
-        "**/*.md",
-        "**/.versions/*/*.md",
-        "**/.versions/*/*.diff",
-        "**/.versions/*/*.pdf",
-        "**/_suggestions/**/*.patch",
-        "**/_suggestions/**/*.meta.yaml",
-        "**/*.pdf",
-        "context.yaml",
-      ],
+      SENSITIVE_FILE_GLOBS,
       ["**/node_modules/**", "**/.context/**", "CONTEXT.md", ...[...NON_DOCUMENT_BASENAMES].map((n) => `**/${n}`)],
     );
     const errors: VerificationReport["errors"] = [];

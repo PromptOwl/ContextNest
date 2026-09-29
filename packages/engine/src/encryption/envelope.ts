@@ -83,6 +83,10 @@ function assertKey(key: Buffer): void {
 
 export function gcmSeal(key: Buffer, plaintext: Buffer, aad: Buffer): Sealed {
   assertKey(key);
+  // Random 96-bit IVs are collision-safe to roughly 2^32 seals under one key.
+  // Every version, diff and note is a seal, so a vault would need billions of
+  // writes under a single DEK to approach that; key rotation (kid is already
+  // in the format) is the planned answer long before then.
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv(ALGORITHM, key, iv, { authTagLength: TAG_BYTES });
   cipher.setAAD(aad);
@@ -207,6 +211,10 @@ export function fieldKid(value: string): string | null {
 }
 
 export function sealField(key: Buffer, kid: string, kind: SealKind, plaintext: string): string {
+  if (kid.includes(":")) {
+    // The field format is colon-delimited; a kid with a colon would corrupt it.
+    throw new ContextNestError(`Key id may not contain ":" (got "${kid}").`, "INVALID_KEY");
+  }
   const { iv, tag, ct } = gcmSeal(key, Buffer.from(plaintext, "utf-8"), aadFor(kind, kid, ""));
   return `${FIELD_PREFIX}${kind}:${kid}:${iv.toString("base64url")}:${tag.toString("base64url")}:${ct.toString("base64url")}`;
 }

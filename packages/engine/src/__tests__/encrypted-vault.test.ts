@@ -262,6 +262,50 @@ describe("encrypted vault", () => {
     expect(isArmoredText(doc)).toBe(false);
   });
 
+  it("CRLF documents round-trip with the hash chain intact", async () => {
+    const root = await tempDir();
+    const storage = new NestStorage(root);
+    await storage.init("enc");
+    await encryptVault(storage, { scrypt: FAST });
+    await writeDraft(storage, "nodes/crlf", `\r\n# Plan\r\n\r\n${SECRET}\r\nline two\r\n`);
+    await publishDocument(storage, "nodes/crlf", { editedBy: "a@x", note: "crlf" });
+
+    const fresh = new NestStorage(root);
+    expect((await fresh.readDocument("nodes/crlf")).body).toContain(SECRET);
+    expect((await fresh.verifyVaultIntegrity()).valid).toBe(true);
+    expect(await filesContaining(root, SECRET)).toEqual([]);
+  });
+
+  it("sweeps orphaned .enc.tmp files left by an interrupted run", async () => {
+    const root = await tempDir();
+    const storage = new NestStorage(root);
+    await storage.init("enc");
+    await encryptVault(storage, { scrypt: FAST });
+    await seedHistory(storage);
+
+    // A crash between write and rename during a decrypt leaves a plaintext
+    // temp file beside the ciphertext; the next run must remove it.
+    await writeFile(join(root, "nodes", "plan.md.12345.enc.tmp"), `leaked ${SECRET}`);
+    await encryptVault(new NestStorage(root), { scrypt: FAST });
+    expect(await filesContaining(root, SECRET)).toEqual([]);
+  });
+
+  it("a stale key in one source does not mask a good key in the next", async () => {
+    const root = await tempDir();
+    const storage = new NestStorage(root);
+    await storage.init("enc");
+    await encryptVault(storage, { scrypt: FAST }); // good KEK now in the default store
+    await seedHistory(storage);
+
+    process.env[VAULT_KEY_ENV] = Buffer.alloc(32, 9).toString("base64"); // stale/wrong
+    try {
+      const fresh = new NestStorage(root);
+      expect((await fresh.readDocument("nodes/plan")).body).toContain(SECRET);
+    } finally {
+      delete process.env[VAULT_KEY_ENV];
+    }
+  });
+
   it("leaves default vaults plain", async () => {
     const root = await tempDir();
     const storage = new NestStorage(root);

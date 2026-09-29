@@ -22,14 +22,11 @@ import { join } from "node:path";
 import { globFiles } from "../glob.js";
 import { withVaultLock } from "../vault-lock.js";
 import { ContextNestError } from "../errors.js";
-import type { NestStorage } from "../storage.js";
+import { NON_DOCUMENT_BASENAMES, SENSITIVE_FILE_GLOBS, type NestStorage } from "../storage.js";
 import type { DocumentHistory } from "../types.js";
 import { type ScryptParams, type SealKind, isArmoredText, isSealedBinary } from "./envelope.js";
 import { kekAccount, type VaultKeyStore } from "./key-store.js";
 import { VaultCrypto, encodeKek } from "./vault-crypto.js";
-
-/** Basenames that are never content (mirrors storage's NON_DOCUMENT_BASENAMES). */
-const NON_CONTENT = new Set(["INDEX.md", "CLAUDE.md", "GEMINI.md", "AGENTS.md", "README.md"]);
 
 interface Target {
   rel: string;
@@ -38,20 +35,7 @@ interface Target {
 
 /** Every file an encrypted vault seals, with the kind it is sealed as. */
 async function sensitiveFiles(root: string): Promise<Target[]> {
-  const files = await globFiles(
-    root,
-    [
-      "**/*.md",
-      "**/.versions/*/*.md",
-      "**/.versions/*/*.diff",
-      "**/.versions/*/*.pdf",
-      "**/_suggestions/**/*.patch",
-      "**/_suggestions/**/*.meta.yaml",
-      "**/*.pdf",
-      "context.yaml",
-    ],
-    ["**/node_modules/**", "**/.context/**", "CONTEXT.md"],
-  );
+  const files = await globFiles(root, SENSITIVE_FILE_GLOBS, ["**/node_modules/**", "**/.context/**", "CONTEXT.md"]);
   const out: Target[] = [];
   for (const rel of [...new Set(files)].sort()) {
     const base = rel.split("/").pop()!;
@@ -60,21 +44,38 @@ async function sensitiveFiles(root: string): Promise<Target[]> {
     else if (/(^|\/)\.versions\/[^/]+\/v\d+\.diff$/.test(rel)) out.push({ rel, kind: "diff" });
     else if (rel.includes("_suggestions/")) out.push({ rel, kind: "suggestion" });
     else if (rel === "context.yaml") out.push({ rel, kind: "index" });
-    else if (rel.endsWith(".md") && !NON_CONTENT.has(base)) out.push({ rel, kind: "doc" });
+    else if (rel.endsWith(".md") && !NON_DOCUMENT_BASENAMES.has(base)) out.push({ rel, kind: "doc" });
   }
   return out;
 }
 
+/**
+ * A crash between write and rename leaves a `.enc.tmp` orphan — after an
+ * interrupted DECRYPT that orphan holds plaintext beside the ciphertext, and
+ * nothing else ever touches it. Both operations are resumable and run under
+ * the vault lock, so sweeping at the start of a run is safe.
+ */
+async function sweepTempFiles(root: string): Promise<void> {
+  const orphans = await globFiles(
+    root,
+    ["**/*.enc.tmp", "**/.versions/*/*.enc.tmp", "**/_suggestions/**/*.enc.tmp"],
+    ["**/node_modules/**"],
+  );
+  for (const rel of new Set(orphans)) {
+    await unlink(join(root, rel)).catch(() => {});
+  }
+}
+
 async function writeAtomic(path: string, content: string | Uint8Array): Promise<void> {
   const tmp = `${path}.${process.pid}.enc.tmp`;
-  const handle = await open(tmp, "w");
   try {
-    await handle.writeFile(content);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
+    const handle = await open(tmp, "w");
+    try {
+      await handle.writeFile(content);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await rename(tmp, path);
   } catch (err) {
     await unlink(tmp).catch(() => {});
@@ -107,6 +108,7 @@ export async function encryptVault(
   options: EncryptVaultOptions = {},
 ): Promise<EncryptVaultResult> {
   return withVaultLock(storage.root, async () => {
+    await sweepTempFiles(storage.root);
     let crypto = await VaultCrypto.load(storage.root, { keyStore: options.keyStore });
     let passphrase: string | null = null;
     const resumed = crypto !== null;
@@ -169,6 +171,7 @@ export async function decryptVault(
   options: { keyStore?: VaultKeyStore } = {},
 ): Promise<DecryptVaultResult> {
   return withVaultLock(storage.root, async () => {
+    await sweepTempFiles(storage.root);
     const crypto = await VaultCrypto.load(storage.root, { keyStore: options.keyStore });
     if (!crypto) {
       throw new ContextNestError("This vault is not encrypted.", "NOT_ENCRYPTED");

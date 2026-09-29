@@ -115,8 +115,11 @@ export class WrongVaultKeyError extends ContextNestError {
 export function frontmatterHeader(plaintext: string): string {
   const text = plaintext.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (!text.startsWith("---\n")) return "";
-  const end = text.indexOf("\n---", 3);
-  if (end === -1) return "";
+  // A line that is exactly `---`, matching the parser \u2014 `indexOf("\n---")`
+  // would also stop at `----` or `---foo` inside a multi-line YAML value.
+  const m = /\n---(?=\n|$)/.exec(text.slice(3));
+  if (!m) return "";
+  const end = m.index + 3;
   // Ends in "\n" (or is empty), so split/join keeps every line break.
   const inner = text
     .slice(4, end + 1)
@@ -147,6 +150,16 @@ export interface VaultCryptoOptions {
 export class VaultCrypto {
   private dek: Buffer | null = null;
   private unlockError: Error | null = null;
+  private unlockRetryAt = 0;
+
+  /**
+   * How long a failed unlock is remembered before the sources are retried.
+   * Long enough that a vault with a wrong key does not pay a key-store probe
+   * (or a scrypt derivation) on every read; short enough that a long-lived
+   * process (the MCP server) recovers soon after the key is fixed, without a
+   * restart.
+   */
+  private static readonly UNLOCK_RETRY_MS = 30_000;
 
   constructor(
     public readonly root: string,
@@ -252,32 +265,66 @@ export class VaultCrypto {
   /**
    * Unlock, trying in order: an explicit KEK, `CONTEXTNEST_VAULT_KEY`, the key
    * store, then the recovery passphrase in `CONTEXTNEST_VAULT_PASSPHRASE`.
-   * Throws VaultLockedError when none is available, WrongVaultKeyError when
-   * one is found but does not fit.
+   * A stale value in one source must not mask a good key in the next, so a
+   * mismatch falls through; the last mismatch is reported only when nothing
+   * fits. Throws VaultLockedError when no source is available at all.
+   *
+   * A failure is remembered for {@link UNLOCK_RETRY_MS} and then retried, so
+   * a long-lived process recovers once the key is fixed.
    */
   async unlock(): Promise<void> {
     if (this.dek) return;
-    if (this.unlockError) throw this.unlockError;
+    if (this.unlockError && Date.now() < this.unlockRetryAt) throw this.unlockError;
+    this.unlockError = null;
+    try {
+      await this.unlockFromSources();
+    } catch (err) {
+      this.unlockError = err as Error;
+      this.unlockRetryAt = Date.now() + VaultCrypto.UNLOCK_RETRY_MS;
+      throw err;
+    }
+  }
+
+  private async unlockFromSources(): Promise<void> {
     const { vault_id, dek } = this.config;
-    const attempt = (kek: Buffer, source: string): void => {
+    const attempt = (kek: Buffer, source: string): WrongVaultKeyError | null => {
       try {
         this.dek = unwrapKey(kek, dek.wrapped, `dek:${vault_id}:${dek.id}`, "vault data key");
+        return null;
       } catch (err) {
-        if (err instanceof DecryptionFailedError) {
-          this.unlockError = new WrongVaultKeyError(source);
-          throw this.unlockError;
-        }
+        if (err instanceof DecryptionFailedError) return new WrongVaultKeyError(source);
         throw err;
       }
     };
-    if (this.options.kek) return attempt(this.options.kek, "the supplied key");
+    // An explicit KEK is a deliberate caller choice — a mismatch fails hard
+    // instead of silently unlocking from some other source.
+    if (this.options.kek) {
+      const miss = attempt(this.options.kek, "the supplied key");
+      if (miss) throw miss;
+      return;
+    }
+    let mismatch: WrongVaultKeyError | null = null;
     const env = process.env[VAULT_KEY_ENV];
-    if (env) return attempt(decodeKek(env, VAULT_KEY_ENV), VAULT_KEY_ENV);
+    if (env) {
+      mismatch = attempt(decodeKek(env, VAULT_KEY_ENV), VAULT_KEY_ENV);
+      if (!mismatch) return;
+    }
     const stored = await this.keyStore.get(kekAccount(vault_id));
-    if (stored) return attempt(decodeKek(stored, this.keyStore.name), this.keyStore.name);
+    if (stored) {
+      const miss = attempt(decodeKek(stored, this.keyStore.name), this.keyStore.name);
+      if (!miss) return;
+      mismatch = miss;
+    }
     const passphrase = process.env[VAULT_PASSPHRASE_ENV];
-    if (passphrase) return this.unlockWithPassphrase(passphrase, VAULT_PASSPHRASE_ENV);
-    throw new VaultLockedError(this.root);
+    if (passphrase) {
+      try {
+        return this.unlockWithPassphrase(passphrase, VAULT_PASSPHRASE_ENV);
+      } catch (err) {
+        if (err instanceof WrongVaultKeyError) mismatch = err;
+        else throw err;
+      }
+    }
+    throw mismatch ?? new VaultLockedError(this.root);
   }
 
   /** Unlock from the recovery passphrase. */
@@ -287,10 +334,7 @@ export class VaultCrypto {
     try {
       this.dek = unwrapKey(key, recovery.wrapped, `recovery:${vault_id}:${dek.id}`, "vault data key");
     } catch (err) {
-      if (err instanceof DecryptionFailedError) {
-        this.unlockError = new WrongVaultKeyError(source);
-        throw this.unlockError;
-      }
+      if (err instanceof DecryptionFailedError) throw new WrongVaultKeyError(source);
       throw err;
     }
   }
