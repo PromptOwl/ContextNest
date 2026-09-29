@@ -44,6 +44,8 @@ const EXPECTED_TOOLS = [
   "context_versions",
   "context_reconstruct",
   "context_verify",
+  "context_forget",
+  "context_forget_log",
   "context_init",
   "context_packs",
   "context_import",
@@ -60,6 +62,7 @@ const EXPECTED_TOOLS = [
   "list_suggestions",
   "approve_suggestion",
   "reject_suggestion",
+  "context_review",
   // Legacy names — kept as deprecated aliases for the migration window.
   "vault_info",
   "resolve",
@@ -1083,5 +1086,93 @@ describe("[regression] MCP server e2e — context_import_pdf", () => {
 
     const verify = await callJson(client, "context_verify", {});
     expect(verify.json.valid).toBe(true);
+  });
+});
+
+// ─── Review gate ──────────────────────────────────────────────────────────────
+
+describe("[regression] MCP server e2e — review gate", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    // The fixture predates the gate (no key); turn it on the way `ctx init` does.
+    const cfg = join(vault, ".context", "config.yaml");
+    await writeFile(cfg, `${await readFile(cfg, "utf-8")}\nreview: 'on'\n`);
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("holds context_create and tells the agent the user can turn review off", async () => {
+    const { json, isError } = await callJson(client, "context_create", {
+      title: "Held Note",
+      content: "agent-written",
+    });
+    expect(isError).toBe(false);
+    expect(json.held_for_review).toBe(true);
+    expect(json.status).toBe("pending_review");
+    expect(json.checkpoint).toBeNull();
+    expect(json.review).toMatch(/pending review/);
+    expect(json.review).toMatch(/turn off review/);
+  });
+
+  it("context_review approve publishes the held node", async () => {
+    const { json } = await callJson(client, "context_review", { action: "approve", id: "nodes/held-note" });
+    expect(json.id).toBe("nodes/held-note");
+    expect(json.version).toBeGreaterThanOrEqual(1);
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toMatch(/status:\s*published/);
+  });
+
+  it("an edit to a published node is staged; the published body keeps serving", async () => {
+    const { json } = await callJson(client, "context_update", { id: "nodes/held-note", content: "edited" });
+    expect(json.held_for_review).toBe(true);
+    expect(typeof json.suggestion_id).toBe("string");
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toContain("agent-written");
+    expect(raw).not.toContain("edited");
+  });
+
+  it("a create that names a status is still held — status alone never stops a create publishing", async () => {
+    const { json } = await callJson(client, "context_create", { title: "Named Status", content: "x", status: "draft" });
+    expect(json.held_for_review).toBe(true);
+    expect(json.status).toBe("pending_review");
+    expect(json.checkpoint).toBeNull();
+  });
+
+  it("the deprecated create_document is held too — the legacy tool is no way around the gate", async () => {
+    const { json, isError } = await callJson(client, "create_document", { path: "nodes/legacy-held", title: "Legacy Held" });
+    expect(isError).toBe(false);
+    expect(json.held_for_review).toBe(true);
+    expect(json.review).toMatch(/turn off review/);
+    const raw = await readFile(join(vault, "nodes", "legacy-held.md"), "utf-8");
+    expect(raw).toMatch(/status:\s*pending_review/);
+    expect(await new NestStorage(vault).readHistory("nodes/legacy-held")).toBeNull();
+  });
+
+  it("the deprecated update_document stages an edit to a published node and builds on the prior hold", async () => {
+    const { json } = await callJson(client, "update_document", { path: "nodes/held-note", body: "legacy edit" });
+    expect(json.held_for_review).toBe(true);
+    expect(typeof json.suggestion_id).toBe("string");
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toContain("agent-written");
+    // One hold per node: this one superseded context_update's.
+    const list = await callJson(client, "context_review", { action: "list" });
+    expect(list.json.filter((i: { id: string }) => i.id === "nodes/held-note")).toHaveLength(1);
+    await callJson(client, "context_review", { action: "approve", id: "nodes/held-note" });
+    expect(await readFile(join(vault, "nodes", "held-note.md"), "utf-8")).toContain("legacy edit");
+  });
+
+  it("context_review off turns the gate off; the next write publishes", async () => {
+    const off = await callJson(client, "context_review", { action: "off" });
+    expect(off.json.review).toBe("off");
+    const { json } = await callJson(client, "context_create", { title: "After Off", content: "x" });
+    expect(json.held_for_review).toBeUndefined();
+    expect(json.status).toBe("published");
   });
 });

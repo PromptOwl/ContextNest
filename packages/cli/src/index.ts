@@ -7,11 +7,10 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
 import { homedir, tmpdir } from "node:os";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
-const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+import { CLI_VERSION } from "./version.js";
 import chalk from "./color.js";
 import {
   NestStorage,
@@ -32,7 +31,6 @@ import {
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
-  verifyDocumentChain,
   verifyCheckpointChain,
   topologicalSortSources,
   detectCycles,
@@ -61,8 +59,19 @@ import {
   normalizeDocumentId,
   isPublished,
   isRejected,
+  FORGET_REASON_CODES,
   HARNESSES,
   SELECTOR_GRAMMAR,
+  encryptVault,
+  decryptVault,
+  setDefaultVaultKeyStore,
+  type EncryptVaultResult,
+  readReviewMode,
+  setReviewMode,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  REVIEW_OFF_COMMAND,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -80,7 +89,9 @@ import {
   remoteMove,
   expandServerVaults,
   folderFromId,
+  remoteFetchRecipe,
 } from "./remote.js";
+import { planPull, applyPull, type PullStep } from "./pull.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -105,6 +116,9 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { telemetryConsent } from "./telemetry/index.js";
+import { loadCloudToken } from "./credentials.js";
+import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import {
@@ -119,11 +133,14 @@ import {
   isDryRun,
   isForce,
   confirmOrExit,
+  canAskUser,
+  ask,
   ensureOverwritable,
   assertSafeEndpoint,
   assertNotRedirected,
   NO_REDIRECT,
 } from "./safety.js";
+import { resolveHeldWrite } from "./review-gate.js";
 import {
   asPendingConfirmation,
   pollUntilDecided,
@@ -137,12 +154,16 @@ function collectClientPair(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+// Encrypted-vault KEKs live in the same secure credential store as the login
+// (OS keychain / encrypted file), with the engine's interim file as fallback.
+setDefaultVaultKeyStore(new CliVaultKeyStore());
+
 const program = new Command();
 
 program
   .name("ctx")
   .description("Context Nest CLI — manage structured, versioned context vaults")
-  .version(pkg.version)
+  .version(CLI_VERSION)
   // Global selector: target a registered vault by alias from any directory.
   // When omitted, resolution falls back to env vars, the local vault, then the
   // registry default (see resolveVaultPath precedence in the engine).
@@ -188,6 +209,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
       ["doctor", "Check versions, the vault registry and the current directory for problems"],
+      ["config", "Vault settings (ctx config set review off)"],
     ],
   },
   {
@@ -195,7 +217,8 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
     commands: [
       ["add", "Add a new document"],
       ["read", "Show a document (add --html to open it in the browser)"],
-      ["update", "Edit a document, then auto-publish a new version"],
+      ["update", "Edit a document, then publish a new version (held instead when review is on)"],
+      ["review", "List, approve or reject writes held for review"],
       ["delete", "Remove a document and its version history"],
     ],
   },
@@ -236,7 +259,10 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   },
   {
     title: "Share",
-    commands: [["push", "Push the vault to a hosted ContextNest server"]],
+    commands: [
+      ["push", "Push the vault to a hosted ContextNest server"],
+      ["pull", "Pull a recipe from a remote nest into this vault, as drafts with lineage"],
+    ],
   },
 ];
 
@@ -419,6 +445,7 @@ const VAULT_WRITE_COMMANDS = new Set([
   "add",
   "update",
   "delete",
+  "forget",
   "publish",
   "index",
   "welcome",
@@ -426,10 +453,14 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift stage",
   "drift approve",
   "drift reject",
+  "config set",
+  "review approve",
+  "review reject",
   "import pdf",
   "import jats",
   "import pubmed",
   "enrich pubtator",
+  "pull",
 ]);
 
 /**
@@ -1009,7 +1040,8 @@ async function applyStarter(
       tags: (n.content.match(/^tags:\s*\[(.+)\]$/m)?.[1] || "").split(",").map((t: string) => t.trim()).filter(Boolean),
     })),
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: CLI_VERSION,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
 }
@@ -1058,9 +1090,47 @@ This vault was initialized without a starter recipe. To help the user get starte
     starterDisplayName: null,
     nodes: [],
     timestamp: new Date().toISOString(),
-    cliVersion: program.version() || "0.3.0",
+    cliVersion: CLI_VERSION,
+    analytics: telemetryConsent(root),
   });
   console.log(`  ${chalk.dim(`Welcome page written to ${pathMod.relative(root, welcomePath)}`)}\n`);
+}
+
+// Loud on purpose: this is the only time the recovery passphrase exists
+// anywhere outside the user's head.
+function printEncryptionEnabled(result: EncryptVaultResult): void {
+  const bar = chalk.yellow("━".repeat(72));
+  console.log(`\n${bar}`);
+  console.log(chalk.bold.yellow("  ENCRYPTED VAULT — LOSING THE KEY MEANS LOSING THE DATA"));
+  console.log(bar);
+  console.log(`  Note bodies and version history are sealed with AES-256-GCM.`);
+  console.log(`  Front matter (title, tags, type, status) stays plaintext so the vault can be indexed.`);
+  console.log(`  Key stored in: ${result.keyStore}`);
+  if (result.passphrase) {
+    console.log(`\n  Recovery passphrase — the ONLY way back in if this machine's key is lost:\n`);
+    console.log(`      ${chalk.bold(result.passphrase)}\n`);
+    console.log(`  Write it down and keep it offline. It is shown once. Nobody can recover it for you.`);
+    console.log(chalk.dim(`  Unlock elsewhere: CONTEXTNEST_VAULT_PASSPHRASE="<passphrase>" ctx <command>`));
+  }
+  if (!result.keyStore.startsWith("interim-file")) {
+    // The MCP server cannot read the CLI's credential store yet (v1 limitation,
+    // docs/encrypted-vaults.md) — without this line users first hear about it
+    // from a failing agent instead of at setup time.
+    console.log(
+      chalk.dim(
+        `  MCP server note: it cannot read this key store yet — set CONTEXTNEST_VAULT_KEY (or CONTEXTNEST_VAULT_PASSPHRASE) in its environment to unlock this vault.`,
+      ),
+    );
+  }
+  if (result.keyStore.startsWith("interim-file")) {
+    console.log(
+      chalk.yellow(
+        "\n  Note: no OS keychain (or CONTEXTNEST_CREDENTIALS_KEY) is available, so the key is in a 0600 file under ~/.contextnest/keys.\n" +
+          "  That protects a vault folder that leaves this machine (sync, copy, backup) — not a stolen disk.",
+      ),
+    );
+  }
+  console.log(`${bar}\n`);
 }
 
 // ─── ctx init ──────────────────────────────────────────────────────────────────
@@ -1080,6 +1150,10 @@ program
     "Register the vault even when it lives under the OS temp dir (skipped there by default)",
   )
   .option("--description <text>", "Nest description (written to .context/config.yaml and the registry entry)")
+  .option(
+    "--encrypted",
+    "Encrypt note content at rest (AES-256-GCM). Front matter stays plaintext. Losing the key AND the recovery passphrase loses the data",
+  )
   .action(async (opts) => {
     // List starters and exit
     if (opts.listStarters) {
@@ -1141,8 +1215,33 @@ program
     }
 
     const storage = new NestStorage(root);
-    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription);
+    // Review gate: a NEW vault holds agent/tool writes for approval. A
+    // re-init keeps whatever the vault already had — including no key at all,
+    // so re-initializing an older vault never silently changes its automations.
+    // A config that will not parse tells us nothing either way: fail safe to
+    // `on` rather than rewrite it without the key (which means "publish").
+    const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
+    const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
+    const review = reinit ? priorReview : "on";
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
+    if (review === "on") {
+      console.log(
+        chalk.dim(
+          `  Review is on: agent and CLI writes wait for your approval (ctx review list). Turn off: ${REVIEW_OFF_COMMAND}`,
+        ),
+      );
+    }
+
+    // Before any content (starter nodes included) is written, so nothing ever
+    // lands on disk in plaintext.
+    if (opts.encrypted) {
+      if (isDryRun()) {
+        console.log(chalk.dim("  Dry run — would enable encryption (no key is created)."));
+      } else {
+        printEncryptionEnabled(await encryptVault(storage));
+      }
+    }
 
     // Registration is performed AFTER the starter is applied (see registerVault
     // below) so an interruption mid-starter never leaves a registry alias
@@ -1300,6 +1399,14 @@ program
 
       // `--out` is the one place the CLI writes to an arbitrary path the user
       // named, so it gets the strictest guard: never clobber without consent.
+      // An encrypted vault never gets a plaintext render dropped inside it
+      // behind the user's back: the default path is a cache, so it takes --out.
+      if (!opts.out && (await storage.isEncrypted())) {
+        throw new ContextNestError(
+          "This vault is encrypted: `ctx read --html` would write the decrypted document to disk. Pass --out <file> to choose where the plaintext goes.",
+          "ENCRYPTED_VAULT",
+        );
+      }
       const outPath = opts.out
         ? pathMod.resolve(opts.out)
         : pathMod.join(getVaultRoot(), ".context", `read-${id.replace(/\//g, "-")}.html`);
@@ -1321,6 +1428,20 @@ program
         openInBrowser(outPath);
         console.log(chalk.dim(`Opened in browser: ${outPath}`));
       }
+      return;
+    }
+
+    // Forget protocol (§6.3.3): the stub is a record that something was
+    // deliberately erased, not content — say so rather than print a title
+    // over an empty body.
+    if (doc.frontmatter.status === "forgotten") {
+      console.log(chalk.bold.underline(doc.frontmatter.title));
+      console.log();
+      console.log(
+        chalk.yellow(
+          `forgotten — ${id}'s content was erased (hashes kept). See \`ctx forget-log ${id}\`.`,
+        ),
+      );
       return;
     }
 
@@ -1475,6 +1596,7 @@ program
   .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
+  .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -1496,7 +1618,13 @@ program
       );
     }
 
-    await confirmOrExit(`Create ${id}.md in ${realRootPath() ?? storage.root} and publish v1?`);
+    const reviewMode = await readReviewMode(storage);
+    await confirmOrExit(
+      reviewMode === "on" && !opts.publish
+        ? `Create ${id}.md in ${realRootPath() ?? storage.root}?`
+        : `Create ${id}.md in ${realRootPath() ?? storage.root} and publish v1?`,
+    );
+    const hold = reviewMode === "on" && !opts.publish;
 
     const title = opts.title || titleFromId(id);
 
@@ -1537,6 +1665,7 @@ program
       id: string;
       version: number;
       checkpoint: number | null;
+      held_for_review?: boolean;
     }>(
       "context_create",
       {
@@ -1546,15 +1675,43 @@ program
         type: opts.type,
         ...(tagList ? { tags: tagList } : {}),
         ...(frontmatter.skill ?? {}),
+        ...(hold ? { review: true } : {}),
         note: "Created via CLI",
       },
       opContext(storage, "cli@contextnest.local"),
     );
 
+    if (result.held_for_review) {
+      await afterHold(storage, result.id);
+      return;
+    }
     console.log(chalk.green(`Created and published ${result.id}.md`));
     console.log(`  Version: ${result.version}`);
     console.log(`  Checkpoint: ${result.checkpoint}`);
   });
+
+/**
+ * A write was held by the review gate: ask at a terminal, otherwise print the
+ * one-line notice (review-gate.ts). [y] and [a] approve the held write.
+ */
+async function afterHold(storage: NestStorage, id: string): Promise<void> {
+  await resolveHeldWrite({
+    id,
+    interactive: canAskUser(),
+    prompt: ask,
+    publish: async () => {
+      const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
+      console.log(chalk.green(`Published ${r.id}`));
+      console.log(`  Version: ${r.version}`);
+      console.log(`  Checkpoint: ${r.checkpoint}`);
+    },
+    turnOff: async () => {
+      await setReviewMode(storage, "off");
+      console.log(chalk.yellow("Review turned off for this vault (ctx config set review on to undo)."));
+    },
+    print: (line) => console.log(chalk.yellow(line)),
+  });
+}
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 
@@ -1820,6 +1977,11 @@ program
         chain_hash: string;
         diff?: string;
         client?: ClientMetadata;
+        tombstone?: boolean;
+        forgotten_at?: string;
+        forgotten_by?: string;
+        reason_code?: string;
+        forget_stub?: boolean;
       }>;
     }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
 
@@ -1834,10 +1996,20 @@ program
     }
     console.log(chalk.bold(`Version history for ${id}:\n`));
     for (const entry of history.versions) {
-      const keyframe = entry.keyframe ? chalk.blue(" [keyframe]") : "";
+      const keyframe = entry.keyframe && !entry.tombstone ? chalk.blue(" [keyframe]") : "";
       const published = entry.published_at ? chalk.green(" published") : chalk.yellow(" draft");
-      console.log(`  v${entry.version}${keyframe}${published}`);
+      const forgotten = entry.tombstone
+        ? chalk.red(" [forgotten]")
+        : entry.forget_stub
+          ? chalk.red(" [forget stub]")
+          : "";
+      console.log(`  v${entry.version}${keyframe}${published}${forgotten}`);
       console.log(`    By: ${entry.edited_by} at ${entry.edited_at}`);
+      if (entry.tombstone) {
+        console.log(
+          `    Forgotten: ${entry.forgotten_at ?? "?"} by ${entry.forgotten_by ?? "?"} (${entry.reason_code ?? "?"}) — content erased, hashes kept`,
+        );
+      }
       if (entry.note) console.log(`    Note: ${entry.note}`);
       // Who was CALLING, as distinct from `By:` above, which is the authoring
       // identity. Rendered only when the write carried attribution.
@@ -1967,33 +2139,24 @@ program
     });
     const checkpointHistory = await storage.readCheckpointHistory();
 
+    // Encrypted vault without a usable key: content hashes cannot be checked,
+    // so this run can never pass. Chain linkage is still checked below.
+    const lock = await storage.encryptionLockState();
+    if (lock) {
+      totalErrors++;
+      allReportErrors.push({ type: "encrypted_key_required", expected: null, actual: lock });
+      if (!opts.json) console.log(chalk.red(`✗ Vault is ${lock}`));
+    }
+
     // Verify each document chain
     for (const [docId, history] of allHistories) {
-      // Synchronous reads — for CLI simplicity. Both are needed: a keyframe
-      // entry hashes its snapshot, a non-keyframe entry hashes its change log,
-      // and the change log lives in its own v{N}.diff file.
-      const readVersionFile = (version: number, ext: "md" | "diff") => {
-        try {
-          return fs.readFileSync(
-            pathMod.join(
-              storage.root,
-              pathMod.dirname(docId),
-              ".versions",
-              pathMod.basename(docId),
-              `v${version}.${ext}`,
-            ),
-            "utf-8",
-          );
-        } catch {
-          return null;
-        }
-      };
-      const report = verifyDocumentChain(
-        docId,
-        history,
-        (version) => readVersionFile(version, "md"),
-        (version) => readVersionFile(version, "diff"),
-      );
+      // Through storage, not raw file reads: in an encrypted vault the
+      // keyframe/diff bytes on disk are ciphertext, and the chain is defined
+      // over the plaintext. Locked, only the linkage can be checked.
+      const errors = lock
+        ? storage.verifyChainLinkage(docId, history)
+        : await storage.verifyHistoryChain(docId, history);
+      const report = { valid: errors.length === 0, errors };
 
       if (!report.valid) {
         totalErrors += report.errors.length;
@@ -2029,9 +2192,38 @@ program
       }
     }
 
+    // Forget protocol (§6.3): erased content stays erased, and every
+    // tombstone is accounted for by a recorded forget. Tombstoned versions
+    // themselves verify hash-only — they are not errors.
+    const tombstoneErrors = await storage.verifyTombstones(allHistories);
+    if (tombstoneErrors.length > 0) {
+      totalErrors += tombstoneErrors.length;
+      allReportErrors.push(...tombstoneErrors);
+      if (!opts.json) {
+        for (const err of tombstoneErrors) {
+          const at = err.version !== undefined ? ` v${err.version}` : "";
+          console.log(chalk.red(`✗ ${err.document}${at}: ${err.type} — ${err.actual}`));
+        }
+      }
+    }
+    const tombstoned: Array<{ document: string; version: number }> = [];
+    for (const [docId, history] of allHistories) {
+      for (const entry of history.versions) {
+        if (entry.tombstone) tombstoned.push({ document: docId, version: entry.version });
+      }
+    }
+    if (tombstoned.length > 0 && !opts.json) {
+      console.log(
+        chalk.dim(`  ${tombstoned.length} forgotten version(s) verified hash-only (content erased by ctx forget)`),
+      );
+    }
+
     // PDF nodes: every binary must still hash to what its frontmatter (or,
-    // for an archived prior binary, its file name) records.
-    const sidecarErrors = await storage.verifyPdfSidecars();
+    // for an archived prior binary, its file name) records. An encrypted vault
+    // also must not hold content in plaintext. Both need the key.
+    const sidecarErrors = lock
+      ? []
+      : [...(await storage.verifyPdfSidecars()), ...(await storage.findUnencryptedFiles())];
     if (sidecarErrors.length > 0) {
       totalErrors += sidecarErrors.length;
       allReportErrors.push(...sidecarErrors);
@@ -2043,7 +2235,17 @@ program
     }
 
     if (opts.json) {
-      console.log(JSON.stringify({ valid: totalErrors === 0, errors: allReportErrors }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            valid: totalErrors === 0,
+            errors: allReportErrors,
+            ...(tombstoned.length > 0 ? { tombstoned } : {}),
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       console.log(
         totalErrors === 0
@@ -2201,17 +2403,6 @@ async function queryFromCloud(selector: string, opts: { json?: boolean }): Promi
   }
 }
 
-async function loadCloudToken(): Promise<string | null> {
-  const homedir = (await import("node:os")).homedir();
-  const credPath = pathMod.join(homedir, ".promptowl", "credentials.json");
-  try {
-    const creds = JSON.parse(await fs.promises.readFile(credPath, "utf-8"));
-    return creds.access_token || null;
-  } catch {
-    return null;
-  }
-}
-
 // ─── ctx query ────────────────────────────────────────────────────────────────
 
 program
@@ -2328,7 +2519,7 @@ program
   .command("list")
   .description("List all documents with optional filters")
   .option("-t, --type <type>", "Filter by node type")
-  .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected; aliases accepted)")
+  .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected|forgotten; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--json", "Output as JSON")
@@ -2388,11 +2579,12 @@ program
 
 program
   .command("update <path>")
-  .description("Update a document's frontmatter and/or body, then auto-publish")
+  .description("Update a document's frontmatter and/or body, then publish (held for approval when review is on)")
   .option("--title <title>", "New title")
   .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
+  .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -2410,23 +2602,39 @@ program
       `Rewrite ${normalizeDocumentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
     );
 
+    // The gate only concerns writes that would publish: a lifecycle transition
+    // (`--status draft|pending_review|approved|rejected`) never does.
+    const reviewMode = await readReviewMode(storage);
+    const hold =
+      reviewMode === "on" && !opts.publish && (status === undefined || status === "published");
+
     const result = await cliApi().run<{
       id: string;
       version: number;
       status: string;
       checkpoint: number | null;
+      held_for_review?: boolean;
+      suggestion_id?: string;
     }>(
       "context_update",
       {
         id: normalizeDocumentId(path),
         ...(opts.title !== undefined ? { title: opts.title } : {}),
-        ...(status !== undefined ? { status } : {}),
+        // A held write settles its own status (pending_review, or a staged
+        // edit); an explicit `published` would contradict the hold.
+        ...(status !== undefined && !hold ? { status } : {}),
+        ...(hold ? { review: true } : {}),
         ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
         ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
         note: "Updated via CLI",
       },
       opContext(storage, "cli@contextnest.local"),
     );
+
+    if (result.held_for_review) {
+      await afterHold(storage, result.id);
+      return;
+    }
 
     if (result.checkpoint === null) {
       const label =
@@ -2451,24 +2659,169 @@ program
 
 program
   .command("delete <path>")
-  .description("Delete a document and its version history")
-  .action(async (path) => {
+  .description(
+    "Delete a document and its version history, recording who deleted it and why in `ctx forget-log` (--purge: no record)",
+  )
+  .option(
+    "--reason <code>",
+    `Reason recorded in the audit log: ${FORGET_REASON_CODES.join(" | ")}`,
+    parseForgetReason,
+    "user_request",
+  )
+  .option("--requested-by <who>", "Who asked for the deletion (recorded in the audit log)")
+  .option(
+    "--purge",
+    "Delete WITHOUT an audit record",
+  )
+  .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
+      if (opts.purge || opts.requestedBy || opts.reason !== "user_request") {
+        console.log(chalk.yellow("  --reason/--requested-by/--purge apply to local vaults only; the remote nest records its own delete."));
+      }
       await remoteDelete(remote, path);
       return;
     }
     const storage = getStorage();
     await confirmOrExit(
-      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.`,
+      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
+        (opts.purge ? " --purge leaves no audit record." : ""),
       { destructive: true },
     );
-    const result = await cliApi().run<{ id: string; title: string }>(
+    const result = await cliApi().run<{ id: string; title: string; tombstoned?: boolean }>(
       "context_delete",
-      { id: normalizeDocumentId(path) },
+      {
+        id: normalizeDocumentId(path),
+        reason_code: opts.reason,
+        ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
+        ...(opts.purge ? { purge: true } : {}),
+      },
       opContext(storage, "cli@contextnest.local"),
     );
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
+    if (result.tombstoned) {
+      console.log(
+        chalk.dim("  Recorded in `ctx forget-log`. To erase content from history instead, use `ctx forget`."),
+      );
+    }
+  });
+
+// ─── ctx forget ───────────────────────────────────────────────────────────────
+
+function parseForgetReason(raw: string): string {
+  if (!(FORGET_REASON_CODES as readonly string[]).includes(raw)) {
+    throw new InvalidArgumentError(`Expected one of: ${FORGET_REASON_CODES.join(", ")}.`);
+  }
+  return raw;
+}
+
+program
+  .command("forget <path>")
+  .description(
+    "Forget a document (right to be forgotten, spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes",
+  )
+  .requiredOption(
+    "--reason <code>",
+    `Why — a closed code, never free text: ${FORGET_REASON_CODES.join(" | ")}`,
+    parseForgetReason,
+  )
+  .option("--requested-by <who>", "Who asked for it (data subject, steward, regulator)")
+  .option("-a, --author <email>", "Actor recorded as forgotten_by", "cli@contextnest.local")
+  .option("--json", "Output as JSON")
+  .addHelpText(
+    "after",
+    `
+The file is replaced by an empty stub (status: forgotten) that every
+contextnest:// URI for the path — floating or pinned @N — resolves to, and
+every version's keyframe/diff is erased. The forget is recorded (who, when,
+reason code, which versions — never the content; see \`ctx forget-log\`) and
+any later publish or import of the forgotten content is refused. Irreversible.
+
+Example:
+  $ ctx forget nodes/jane-notes --reason user_request --requested-by jane@example.com
+`,
+  )
+  .action(async (path, opts) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError(`ctx forget works against a local vault only for now.`, "NOT_IMPLEMENTED");
+    }
+    const storage = getStorage();
+    const id = normalizeDocumentId(path);
+    await confirmOrExit(
+      `Forget ${id}? Its content is erased from history for good (hashes are kept, so verify still passes). This cannot be undone.`,
+      { destructive: true },
+    );
+    const result = await cliApi().run<{
+      id: string;
+      versions: number[];
+      stub_version: number;
+      checkpoint: number;
+    }>(
+      "context_forget",
+      {
+        id,
+        reason_code: opts.reason,
+        ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
+      },
+      opContext(storage, opts.author),
+    );
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    const which = result.versions.length ? `v${result.versions.join(", v")}` : "no recorded versions";
+    console.log(chalk.green(`Forgot ${result.id} (${which} erased)`));
+    console.log(`  Stub: v${result.stub_version} (status: forgotten)  Checkpoint: ${result.checkpoint}`);
+    console.log(chalk.dim("  Hashes kept; `ctx verify` still passes. Audit: `ctx forget-log`."));
+  });
+
+// ─── ctx forget-log ───────────────────────────────────────────────────────────
+
+program
+  .command("forget-log [path]")
+  .description("Show the forget audit trail — who forgot or deleted what, when, and why (never the content)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError(`ctx forget-log works against a local vault only for now.`, "NOT_IMPLEMENTED");
+    }
+    const storage = getStorage();
+    const { events } = await cliApi().run<{
+      events: Array<{
+        document_id: string;
+        scope: "node" | "versions";
+        mode: "forget" | "delete";
+        versions: number[];
+        reason_code: string;
+        forgotten_by: string;
+        forgotten_at: string;
+        requested_by?: string;
+        stub_version?: number;
+      }>;
+    }>(
+      "context_forget_log",
+      path ? { id: normalizeDocumentId(path) } : {},
+      opContext(storage, "cli@contextnest.local"),
+    );
+    if (opts.json) {
+      console.log(JSON.stringify({ events }, null, 2));
+      return;
+    }
+    if (events.length === 0) {
+      console.log(chalk.yellow("No forget events recorded."));
+      return;
+    }
+    console.log(chalk.bold(`${events.length} forget event(s):\n`));
+    for (const e of events) {
+      const what = e.mode === "delete" ? "deleted" : "forgotten";
+      console.log(`  ${chalk.cyan(e.document_id)} — ${what}`);
+      console.log(`    By: ${e.forgotten_by} at ${e.forgotten_at}  Reason: ${e.reason_code}`);
+      if (e.requested_by) console.log(`    Requested by: ${e.requested_by}`);
+      if (e.versions.length) {
+        const stub = e.stub_version !== undefined ? `; stub v${e.stub_version}` : "";
+        console.log(`    Erased: v${e.versions.join(", v")}${stub}`);
+      }
+    }
   });
 
 // ─── ctx move ─────────────────────────────────────────────────────────────────
@@ -2884,7 +3237,8 @@ program
         tags: (d.frontmatter.tags || []).map((t: string) => t.replace(/^#/, "")),
       })),
       timestamp: new Date().toISOString(),
-      cliVersion: program.version() || "0.3.0",
+      cliVersion: CLI_VERSION,
+      analytics: telemetryConsent(getVaultRoot()),
     });
 
     console.log(chalk.green(`Generated welcome page: .context/welcome.html`));
@@ -2905,6 +3259,8 @@ function reportPushOutcome(outcome: TerminalOutcome): void {
     case "applied": {
       const n = outcome.result.applied_node_count ?? outcome.result.doc_count ?? 0;
       console.log(chalk.green(`Pushed ${n} document${n !== 1 ? "s" : ""}`));
+      const notCreated = (outcome.result.doc_count ?? n) - n;
+      if (notCreated > 0) console.log(chalk.yellow(`  ${notCreated} not created (already existed or failed — check the nest)`));
       if (outcome.result.decided_by) console.log(chalk.dim(`  confirmed by ${outcome.result.decided_by}`));
       return;
     }
@@ -2963,9 +3319,13 @@ program
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
 
-    const filtered = opts.includeDrafts
-      ? docs
-      : docs.filter((d) => d.frontmatter.status === "published" || d.frontmatter.status === undefined);
+    // A forgotten stub (§6.3) never leaves the vault as a document: it carries
+    // no content, and pushing it would re-create the node remotely as a draft.
+    const filtered = (
+      opts.includeDrafts
+        ? docs
+        : docs.filter((d) => d.frontmatter.status === "published" || d.frontmatter.status === undefined)
+    ).filter((d) => d.frontmatter.status !== "forgotten");
 
     if (filtered.length === 0) {
       console.log(chalk.yellow("No documents to push. Use --include-drafts to include draft documents."));
@@ -3041,7 +3401,9 @@ program
       const pending = asPendingConfirmation(res.status, payload);
       if (pending) {
         console.log(chalk.yellow(pending.message || "This nest requires confirmation before the push is applied."));
-        console.log(chalk.cyan(`Confirm in the UI: ${pending.confirm_url}`));
+        // confirm_url is the reviewer's API endpoint, not a page; send the
+        // person to the nest view, which shows the held write to confirm.
+        console.log(chalk.cyan(`Confirm in the UI: ${serverUrl}/nest/${encodeURIComponent(opts.nest)}`));
 
         // --no-wait → commander sets opts.wait = false.
         if (opts.wait === false) {
@@ -3075,12 +3437,23 @@ program
         process.exit(1);
       }
 
-      const data = (payload ?? {}) as { published: number; context_md_updated: boolean; node_ids: string[] };
+      const data = (payload ?? {}) as {
+        published: number;
+        context_md_updated: boolean;
+        node_ids: string[];
+        skipped?: string[];
+        failed?: Array<{ title: string; error: string }>;
+      };
       console.log(chalk.green(`Pushed ${data.published} document${data.published !== 1 ? "s" : ""}`));
       if (data.context_md_updated) console.log(chalk.green("  CONTEXT.md updated"));
       for (const id of data.node_ids) {
         console.log(chalk.dim(`  + ${id}`));
       }
+      // The server never overwrites an existing document, and a bad row fails
+      // alone; both must show, and a failure must not exit 0.
+      for (const title of data.skipped ?? []) console.log(chalk.dim(`  = ${title} (already exists, not overwritten)`));
+      for (const f of data.failed ?? []) console.error(chalk.red(`  x ${f.title}: ${f.error}`));
+      if (data.failed?.length) process.exit(1);
     } catch (err: any) {
       console.error(chalk.red(`Push failed: ${err.message}`));
       process.exit(1);
@@ -3296,11 +3669,271 @@ drift
     );
   });
 
+// ─── ctx config / ctx review — the human review gate (engine review.ts) ─────
+
+/**
+ * The review gate is a local vault's setting: a hosted nest governs its own
+ * writes, so `ctx config` / `ctx review` refuse a `<server>/<nest>` alias
+ * rather than silently acting on whatever local vault the cwd resolves to.
+ */
+function localGateStorage(command: string): NestStorage {
+  if (remoteTarget(selectedVaultAlias)) {
+    throw new ContextNestError(`ctx ${command} works against a local vault only.`, "NOT_IMPLEMENTED");
+  }
+  return getStorage();
+}
+
+const configCmd = program.command("config").description("Vault settings in .context/config.yaml");
+
+configCmd
+  .command("get <key>")
+  .description("Print a setting (supported: review). `unset` = a vault from before the gate, which publishes.")
+  .action(async (key: string) => {
+    if (key !== "review") {
+      console.error(chalk.red(`Unknown setting "${key}". Supported: review`));
+      process.exit(1);
+    }
+    console.log((await readReviewMode(localGateStorage("config"))) ?? "unset");
+  });
+
+configCmd
+  .command("set <key> <value>")
+  .description("Change a setting: `ctx config set review on|off` (on holds add/update writes for approval)")
+  .action(async (key: string, value: string) => {
+    const mode = value.trim().toLowerCase();
+    if (key !== "review" || (mode !== "on" && mode !== "off")) {
+      console.error(chalk.red("Usage: ctx config set review on|off"));
+      process.exit(1);
+    }
+    await setReviewMode(localGateStorage("config"), mode as "on" | "off");
+    console.log(chalk.green(`review: ${mode}`));
+  });
+
+const reviewCmd = program.command("review").description("List, approve or reject writes held for review");
+
+reviewCmd
+  .command("list", { isDefault: true })
+  .description("List what is waiting: new documents (pending_review) and held edits to published ones")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const items = await listPendingReview(localGateStorage("review"));
+    if (opts.json) {
+      console.log(JSON.stringify(items, null, 2));
+      return;
+    }
+    if (items.length === 0) {
+      console.log("Nothing is waiting for review.");
+      return;
+    }
+    for (const item of items) {
+      console.log(`  ${item.kind === "edit" ? "edit" : "new "}  ${item.id}${item.stale ? chalk.red("  (stale)") : ""}`);
+    }
+    console.log(chalk.dim(`\nctx review approve <path> | ctx review reject <path> | turn off: ${REVIEW_OFF_COMMAND}`));
+  });
+
+reviewCmd
+  .command("approve <path>")
+  .description("Publish what is held for a document")
+  .action(async (path: string) => {
+    const storage = localGateStorage("review");
+    const id = normalizeDocumentId(path);
+    await confirmOrExit(`Publish what is held for review for ${id}?`);
+    const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
+    console.log(chalk.green(`Published ${r.id}`));
+    console.log(`  Version: ${r.version}`);
+    console.log(`  Checkpoint: ${r.checkpoint}`);
+  });
+
+reviewCmd
+  .command("reject <path>")
+  .description("Discard a held edit (archived; the published version stays), or retire a pending document")
+  .action(async (path: string) => {
+    const storage = localGateStorage("review");
+    const id = normalizeDocumentId(path);
+    await confirmOrExit(`Reject what is held for review for ${id}?`);
+    const r = await rejectReview(storage, id, { actor: "cli@contextnest.local" });
+    console.log(chalk.yellow(r.kind === "edit" ? `Discarded held edit for ${id}` : `Rejected ${id} (status: rejected)`));
+  });
+
+// ─── ctx pull ────────────────────────────────────────────────────────────────
+
+const PULL_MARKS: Record<PullStep["action"], string> = {
+  create: chalk.green("+ create  "),
+  update: chalk.green("↑ update  "),
+  "up-to-date": chalk.dim("= current "),
+  "update-available": chalk.yellow("↑ newer   "),
+  conflict: chalk.red("! conflict"),
+  exists: chalk.dim("· exists  "),
+};
+
+function pullStepLine(step: PullStep): string {
+  const from = step.from ? chalk.dim(` ← ${step.from}${step.upstreamVersion ? ` v${step.upstreamVersion}` : ""}`) : "";
+  let tail = "";
+  if (step.action === "update-available") {
+    tail = chalk.yellow(` (local v${step.localVersion ?? "?"} → upstream v${step.upstreamVersion}; rerun with --update)`);
+  } else if (step.note && (step.action === "conflict" || step.action === "exists")) {
+    tail = chalk.dim(` — ${step.note.split(" — ").pop()}`);
+  }
+  return `  ${PULL_MARKS[step.action]} ${chalk.cyan(step.to)}${from}${tail}`;
+}
+
+program
+  .command("pull <source>")
+  .description("Pull a recipe from a remote nest into the local vault (local vault only for now — then `ctx push`)")
+  .requiredOption("--recipe <id>", "Recipe to pull: the source nest's node whose slug is recipe-<id>")
+  .option("--update", "Overwrite documents this recipe pulled earlier when upstream has a newer version")
+  .option("--json", "Print the plan and result as JSON")
+  .addHelpText(
+    "after",
+    `
+<source> is a registered remote alias, or <server>/<nest> behind a server alias.
+
+Every pulled document lands as a draft with derived_from pointing at its source,
+so review it and \`ctx publish\` it. A later pull skips what is current, reports
+newer upstream versions (apply them with --update), and never overwrites a
+document or file it did not pull. --dry-run prints the plan and writes nothing.
+
+Example:
+  ctx pull promptowl/distillation-recipes --recipe org-essentials --dry-run`,
+  )
+  .action(async (source: string, opts: { recipe: string; update?: boolean; json?: boolean }) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError(
+        "ctx pull writes into a local vault for now — run it against a local vault, then `ctx push` to a hosted nest.",
+        "NOT_IMPLEMENTED",
+      );
+    }
+    const target = remoteTarget(source);
+    if (!target) {
+      throw new ContextNestError(
+        `"${source}" is a local vault — pull from a remote nest alias (\`ctx vault add\` registers one).`,
+        "CONFIG_ERROR",
+      );
+    }
+
+    const fetched = await remoteFetchRecipe(target, opts.recipe);
+    const storage = getStorage();
+    const steps = await planPull(storage, fetched, { update: opts.update });
+    const pending = steps.filter((s) => s.action === "create" || s.action === "update");
+
+    const report = (written: PullStep[]) => ({
+      recipe: fetched.manifest.id,
+      recipe_node: fetched.recipe.id,
+      recipe_version: fetched.recipe.version,
+      source: target.alias,
+      namespace: fetched.namespace,
+      dry_run: isDryRun(),
+      steps: steps.map(({ content: _content, ...rest }) => rest),
+      written: written.map((s) => s.to),
+    });
+
+    if (!opts.json) {
+      console.log(
+        chalk.bold(
+          `Recipe ${fetched.manifest.label ?? fetched.manifest.id}` +
+            `${fetched.recipe.version ? ` (v${fetched.recipe.version})` : ""} from ${target.alias}\n`,
+        ),
+      );
+      for (const step of steps) console.log(pullStepLine(step));
+      console.log("");
+    }
+
+    if (isDryRun()) {
+      if (opts.json) console.log(JSON.stringify(report([]), null, 2));
+      else console.log(chalk.yellow(`Dry run — ${pending.length} write(s) planned, nothing written.`));
+      return;
+    }
+
+    const updates = pending.filter((s) => s.action === "update");
+    if (updates.length > 0) {
+      await confirmOrExit(`Overwrite ${updates.length} pulled document(s) with newer upstream versions?`, {
+        destructive: true,
+      });
+    }
+    const written = await applyPull(storage, steps);
+    // After apply: a document that changed while the pull ran becomes a conflict there.
+    const conflicts = steps.filter((s) => s.action === "conflict");
+
+    if (opts.json) {
+      console.log(JSON.stringify(report(written), null, 2));
+      return;
+    }
+    console.log(chalk.green(`Wrote ${written.length} item(s).`));
+    if (conflicts.length > 0) {
+      console.log(chalk.red(`${conflicts.length} conflict(s) left untouched — those paths hold documents this recipe did not pull.`));
+    }
+    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill");
+    if (docs.length > 0) {
+      console.log(chalk.dim("Pulled documents are drafts. Review them, then publish: ctx publish <path>"));
+    }
+    for (const skill of written.filter((s) => s.kind === "skill")) {
+      console.log(chalk.dim(`Install the skill so it can't drift: ctx skill install ${skill.to} --mode loader --write`));
+    }
+    const files = written.filter((s) => s.kind === "file");
+    for (const file of files) {
+      if (file.to.endsWith(".example.yaml")) {
+        console.log(chalk.dim(`Template written: ${file.to} — fill it in and rename it before syncing.`));
+      }
+    }
+  });
+
 // ─── ctx vault ───────────────────────────────────────────────────────────────
 
 const vaultCmd = program
   .command("vault")
-  .description("Manage the central vault registry (alias → path)");
+  .description("Manage the central vault registry (alias → path) and vault encryption");
+
+vaultCmd
+  .command("encrypt")
+  .description("Encrypt this vault's note content at rest (AES-256-GCM); resumes an interrupted run")
+  .action(async () => {
+    const storage = getStorage();
+    const resuming = await storage.isEncrypted();
+    if (!resuming) {
+      console.error(
+        chalk.yellow(
+          "  Back up the vault first (copy the folder). Encryption rewrites every note, keyframe and diff in place;\n" +
+            "  each file is replaced atomically and an interrupted run resumes, but a backup is the only undo.\n" +
+            "  Plaintext already copied elsewhere (sync history, backups, git) is NOT affected.",
+        ),
+      );
+      await confirmOrExit(`Encrypt the vault at ${storage.root}?`, { destructive: true });
+    }
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan("Dry run — nothing was encrypted and no key was created."));
+      return;
+    }
+    const result = await encryptVault(storage);
+    await storage.regenerateIndex();
+    if (result.resumed) {
+      console.log(chalk.green(`  Vault already encrypted — sealed ${result.sealed} remaining plaintext file(s).`));
+    } else {
+      console.log(chalk.green(`  Encrypted ${result.sealed} file(s).`));
+      printEncryptionEnabled(result);
+    }
+  });
+
+vaultCmd
+  .command("decrypt")
+  .description("Decrypt this vault back to plain Markdown (needs the key or the recovery passphrase)")
+  .action(async () => {
+    const storage = getStorage();
+    if (!(await storage.isEncrypted())) {
+      console.log(chalk.dim("  This vault is not encrypted."));
+      return;
+    }
+    await confirmOrExit(
+      `Decrypt every note in ${storage.root} back to plaintext on disk and remove its encryption key?`,
+      { destructive: true },
+    );
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan("Dry run — nothing was decrypted."));
+      return;
+    }
+    const { decrypted } = await decryptVault(storage);
+    await storage.regenerateIndex();
+    console.log(chalk.green(`  Decrypted ${decrypted} file(s). The vault is plain Markdown again.`));
+  });
 
 vaultCmd
   .command("list")
@@ -3626,7 +4259,7 @@ program
     // Diagnostics never fail: every probe degrades to null/"unknown" and the
     // exit code stays 0, so a script can always read the report.
     const report = await buildDoctorReport({
-      cliVersion: pkg.version,
+      cliVersion: CLI_VERSION,
       cliPath: fileURLToPath(import.meta.url),
     });
     if (opts.json) {
@@ -3686,6 +4319,7 @@ program
         ? `${report.plugin.version}  ${chalk.dim(report.plugin.path ?? "")}`
         : chalk.dim("not installed (no contextnest entry in installed_plugins.json)"),
     );
+    row("Privacy", `telemetry + welcome-page analytics ${report.privacy.telemetry ? chalk.yellow("on") : "off"} · credentials: ${report.privacy.credentials}`);
     console.log("");
   });
 
