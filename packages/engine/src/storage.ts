@@ -28,6 +28,7 @@ import {
   verifyDocumentChain,
   verifyCheckpointChain,
 } from "./integrity.js";
+import { reconstructFromHistory } from "./reconstruct.js";
 import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
@@ -909,6 +910,8 @@ export class NestStorage {
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
    *   - unreadable_history when a history.yaml exists but cannot be parsed
+   *   - version_unreconstructable when a recorded version no longer rebuilds
+   *     from its keyframe+diff chain (see verifyHistoryChain)
    *   - sidecar_drift / sidecar_missing for pdf nodes (see verifyPdfSidecars)
    */
   async verifyVaultIntegrity(): Promise<VerificationReport> {
@@ -1169,7 +1172,41 @@ export class NestStorage {
       (version) => keyframeContent.get(version) ?? null,
       (version) => diffContent.get(version) ?? null,
     );
-    return [...cryptoErrors, ...report.errors];
+
+    // The hash checks above prove each artifact matches what the history
+    // RECORDS — not that the chain still REPLAYS. An import that overwrote
+    // artifacts and rewrote their fingerprints to match (a grafted chain)
+    // passes every hash check, yet applying its diffs breaks partway and the
+    // version reads as empty. So: rebuild every recorded version from the
+    // same pre-loaded bytes and report each one that cannot be rebuilt.
+    // Tombstoned versions are skipped — their content was erased on purpose
+    // (§6.3.2), which is not damage. A grafted history can record the same
+    // version number twice; audit each number once.
+    const rebuildErrors: VerificationReport["errors"] = [];
+    const audited = new Set<number>();
+    for (const entry of history.versions) {
+      if (entry.tombstone || audited.has(entry.version)) continue;
+      audited.add(entry.version);
+      try {
+        await reconstructFromHistory(
+          docId,
+          history,
+          entry.version,
+          (version) => keyframeContent.get(version) ?? null,
+          (version) => diffContent.get(version) ?? null,
+        );
+      } catch (err) {
+        rebuildErrors.push({
+          type: "version_unreconstructable",
+          document: docId,
+          version: entry.version,
+          expected: null,
+          actual: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return [...cryptoErrors, ...report.errors, ...rebuildErrors];
   }
 
   /**

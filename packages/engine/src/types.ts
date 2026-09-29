@@ -702,6 +702,11 @@ export interface VerificationReport {
       | "checkpoint_hash_mismatch"
       | "body_drift"
       | "unreadable_history"
+      // A recorded version can no longer be rebuilt from its keyframe+diff
+      // chain (§6.1), even when every stored hash still agrees — e.g. an
+      // import overwrote version artifacts and rewrote their fingerprints
+      // to match, so the diffs no longer apply.
+      | "version_unreconstructable"
       // A pdf node's sidecar (or an archived prior binary) no longer hashes
       // to the sha256 its frontmatter records (§8.4).
       | "sidecar_drift"
