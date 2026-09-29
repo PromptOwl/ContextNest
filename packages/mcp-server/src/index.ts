@@ -27,17 +27,27 @@ import {
   serializeDocument,
   parseDocument,
   publishDocument,
+  deleteDocumentWithTombstone,
   stageSuggestion,
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
   isRejected,
+  isPublished,
   normalizeStatus,
   STATUS_ALIASES,
   normalizeDocumentId,
   ContextNestError,
   applyTypedBlocks,
   sourceMetaSchema,
+  readReviewMode,
+  setReviewMode,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  reviewHeldMessage,
+  currentReviewProposal,
+  stageReviewHold,
   NODE_TYPES,
   withIntegrityWarning,
 } from "@promptowl/contextnest-engine";
@@ -296,11 +306,96 @@ function inputShape(op: OperationDescriptor): Record<string, z.ZodTypeAny> {
   return schema.shape as Record<string, z.ZodTypeAny>;
 }
 
+// ─── Human review gate (engine review.ts) ─────────────────────────────────────
+//
+// With `review: on` in the vault's config, an agent's create/update is held for
+// a human instead of published. The engine never decides this on its own — a
+// surface asks for it with `review: true` — so the gate lives here, at the one
+// place every MCP write passes through. A vault without the key predates the
+// gate and publishes exactly as before.
+
+/** The vault's review setting, read per call so `ctx config set` applies live. */
+async function vaultReviewMode(): Promise<"on" | "off" | undefined> {
+  try {
+    return await readReviewMode(storage);
+  } catch {
+    // An unreadable config is not this gate's to report; the write surfaces it.
+    return undefined;
+  }
+}
+
+/**
+ * Whether a catalog write would publish unless the gate steps in. An explicit
+ * `publish` or `review` is the caller's per-call choice and is honoured (the
+ * CLI's `--publish` equivalent). An update naming a status other than
+ * published is a lifecycle transition that never publishes, so it is not
+ * gated. A create publishes whatever its `status` says (only `publish:false`
+ * stops it), so every create is gated.
+ */
+function wouldPublish(opName: string, args: Record<string, unknown>): boolean {
+  if (args.publish !== undefined || args.review !== undefined) return false;
+  if (opName === "context_create") return true;
+  return args.status === undefined || args.status === "published";
+}
+
+async function runGatedWrite(opName: string, args: Record<string, unknown>) {
+  let input = args;
+  if ((await vaultReviewMode()) === "on" && wouldPublish(opName, args)) {
+    // A held write settles its own status; an explicit `published` would
+    // contradict the hold.
+    const { status: _status, ...rest } = args;
+    input = { ...(args.status === "published" ? rest : args), review: true };
+  }
+  try {
+    const result = (await api.run(opName, withClientDefaults(input), opCtx())) as Record<string, unknown>;
+    if (result && result.held_for_review === true) {
+      return toolResult({ ...result, review: reviewHeldMessage(String(result.id)) });
+    }
+    return toolResult(result);
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
+const GATED_OPS = new Set(["context_create", "context_update"]);
+
 for (const op of listOperations("core")) {
   tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
-    runOp(op.name, args),
+    GATED_OPS.has(op.name) ? runGatedWrite(op.name, args) : runOp(op.name, args),
   );
 }
+
+// ─── Tool: context_review ────────────────────────────────────────────────────
+//
+// Hand-written rather than a catalog op on purpose: the review setting is a
+// local vault's UX preference, and a catalog op would appear on every surface
+// that binds the catalog — including hosted servers with governance of their
+// own, where an agent toggling the gate must not be possible.
+
+tool(
+  "context_review",
+  "Human review gate. When review is on, context_create/context_update hold writes for the user (the result carries `held_for_review` and a `review` note to relay). Actions: `list` — what is waiting; `approve` / `reject` — decide a node's held write (needs `id`; only when the user says so); `off` / `on` — turn the gate off or on (only when the user asks, e.g. \"turn off review\").",
+  {
+    action: z.enum(["list", "approve", "reject", "off", "on"]).describe("What to do"),
+    id: z.string().optional().describe("Node id, for approve / reject"),
+  },
+  async ({ action, id }) => {
+    try {
+      if (action === "list") return toolResult(await listPendingReview(storage));
+      if (action === "on" || action === "off") {
+        await setReviewMode(storage, action);
+        return toolResult({ review: action });
+      }
+      if (!id) return validationError(`\`id\` is required for action "${action}".`);
+      // Verbatim, like context_update (a flat vault's ids have no nodes/
+      // prefix); the engine refuses an id that escapes the vault.
+      const decide = action === "approve" ? approveReview : rejectReview;
+      return toolResult(await decide(storage, id, { actor: "mcp@contextnest.local" }));
+    } catch (err) {
+      return toolError(err);
+    }
+  },
+);
 
 /** Description for a deprecated legacy alias, steering agents to the canonical name. */
 function deprecated(canonical: string, description: string): string {
@@ -960,6 +1055,21 @@ tool(
         };
       }
 
+      // Review gate, same as context_create: held as pending_review, unversioned
+      // (approval publishes v1). The legacy tool must not be a way around it.
+      if ((await vaultReviewMode()) === "on") {
+        node.frontmatter.status = "pending_review";
+        await storage.writeDocument(id, serializeDocument(node));
+        await regenerateIndex();
+        return toolResult({
+          id,
+          frontmatter: node.frontmatter,
+          held_for_review: true,
+          message: "Document created and held for review (status: pending_review). Not published.",
+          review: reviewHeldMessage(id),
+        });
+      }
+
       const content = serializeDocument(node);
       await storage.writeDocument(id, content);
 
@@ -1077,13 +1187,23 @@ tool(
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
       if (!resolvedBody.ok) return validationError(resolvedBody.error);
       const id = normalizeDocumentId(path);
-      const doc = await storage.readDocument(id);
+      let doc = await storage.readDocument(id);
 
       // Normalize caller-supplied status to canonical before any guard or
       // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
       // collapse here so the disk store and downstream tools only ever see
       // canonical values.
       const normalizedStatus = status !== undefined ? normalizeStatus(status) : undefined;
+
+      // Review gate, same as context_update: a write that would publish is held.
+      // An edit to a published node builds on its current held proposal (so a
+      // second held edit carries the first) and is staged, never written in place.
+      const hold =
+        (normalizedStatus === undefined || normalizedStatus === "published") &&
+        (await vaultReviewMode()) === "on";
+      const holdAsSuggestion = hold && isPublished(doc);
+      const proposal = holdAsSuggestion ? await currentReviewProposal(storage, id) : null;
+      if (proposal) doc = parseDocument(doc.filePath, proposal.proposedRaw, id);
 
       // Refuse content edits on rejected docs unless the caller explicitly
       // names a new status (revive to draft/pending_review/approved/published,
@@ -1163,6 +1283,39 @@ tool(
           ],
           isError: true,
         };
+      }
+
+      if (hold) {
+        let suggestionId: string | undefined;
+        if (holdAsSuggestion) {
+          // The proposal keeps its published status: that is what approval publishes.
+          doc.frontmatter.status = "published";
+          const staged = await stageReviewHold(storage, {
+            documentId: id,
+            proposedRawContent: serializeDocument(doc),
+            actor: "mcp@contextnest.local",
+            ...(doc.frontmatter.zone ? { zone: doc.frontmatter.zone } : {}),
+            docTier: doc.frontmatter.governance ?? "standard",
+            supersedes: proposal ? [proposal.suggestionId] : [],
+          });
+          suggestionId = staged?.suggestionId;
+        }
+        // Not published yet, or published but never sealed (no history to
+        // diff against): held in place as pending_review.
+        if (!suggestionId) {
+          doc.frontmatter.status = "pending_review";
+          await storage.writeDocument(id, serializeDocument(doc));
+          await regenerateIndex();
+        }
+        return toolResult({
+          id,
+          held_for_review: true,
+          ...(suggestionId ? { suggestion_id: suggestionId } : { frontmatter: doc.frontmatter }),
+          message: suggestionId
+            ? "Edit held for review. The published version keeps serving until it is approved."
+            : "Document held for review (status: pending_review). Not published.",
+          review: reviewHeldMessage(id),
+        });
       }
 
       const content = serializeDocument(doc);
@@ -1249,10 +1402,13 @@ tool(
     lockedHandler(async () => {
       const id = normalizeDocumentId(path);
 
-      // Verify the document exists before deleting
-      const doc = await storage.readDocument(id);
-
-      await storage.deleteDocument(id);
+      // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
+      // id, and appends an audit-only record (§6.3.4). Additive: the path
+      // stays reusable, so legacy callers see the same behaviour as before.
+      const result = await deleteDocumentWithTombstone(storage, id, {
+        reasonCode: "user_request",
+        deletedBy: "mcp@contextnest.local",
+      });
       await regenerateIndex();
 
       return {
@@ -1260,7 +1416,7 @@ tool(
           {
             type: "text" as const,
             text: JSON.stringify(
-              { id, title: doc.frontmatter.title, message: "Document deleted successfully" },
+              { id, title: result.title, message: "Document deleted successfully" },
               null,
               2,
             ),

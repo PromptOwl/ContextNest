@@ -86,6 +86,16 @@ export function isRejected(node: ContextNode): boolean {
 }
 
 /**
+ * Predicate: document was erased by the forget protocol (§6.3.3) — the live
+ * file is an empty stub and MUST NOT be treated as content. Excluded from
+ * every retrieval path; selectors surface it only for an explicit
+ * `status:forgotten`.
+ */
+export function isForgotten(node: ContextNode): boolean {
+  return node.frontmatter.status === "forgotten";
+}
+
+/**
  * The EXPLICIT lifecycle status the source author wrote, canonicalized, or
  * `null` when the frontmatter carried no `status:` at all.
  *
@@ -127,7 +137,7 @@ export function isSuperseded(node: ContextNode): boolean {
 /**
  * Retrieval predicate — true when the node may surface to LLMs / context
  * APIs under any retrieval setting. Excludes `pending_review`, `approved`,
- * and `rejected`:
+ * `rejected` and `forgotten` (an erased stub, §6.3):
  *   - `rejected` is terminal hide (steward retired the doc).
  *   - `approved` is reviewer-signed-off but not yet live.
  *   - `pending_review` is submitted-for-review; reviewer has not signed off.

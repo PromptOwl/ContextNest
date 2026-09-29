@@ -5,8 +5,28 @@
 import MiniSearch from "minisearch";
 import type { ContextNode, ContextNestUri, Checkpoint } from "./types.js";
 import { extractSection } from "./inline.js";
-import { stripTagPrefix, isPublished } from "./parser.js";
-import { FederationNotSupportedError } from "./errors.js";
+import { stripTagPrefix, isPublished, isForgotten } from "./parser.js";
+import { FederationNotSupportedError, ForgottenVersionError } from "./errors.js";
+
+/**
+ * What a URI for a forgotten node resolves to (§6.3.3): the node, marked
+ * `status: forgotten`, with an EMPTY body — never null. An agent learns the
+ * memory was deliberately removed, which is different information from "never
+ * existed", and MUST NOT treat the stub as content. `version` pins the view to
+ * the version a checkpoint named, when that version is what was forgotten.
+ */
+export function forgottenView(doc: ContextNode, version?: number): ContextNode {
+  return {
+    ...doc,
+    frontmatter: {
+      ...doc.frontmatter,
+      status: "forgotten",
+      ...(version !== undefined ? { version } : {}),
+    },
+    body: "",
+    rawContent: "",
+  };
+}
 
 export interface ResolverOptions {
   /** All documents in the vault */
@@ -109,6 +129,10 @@ export class Resolver {
     const doc = this.documents.get(uri.path);
     if (!doc) return [];
 
+    // Forgotten resolves to `forgotten`, not to nothing (§6.3.3) — whatever
+    // the draft setting, and with no section to extract from an empty stub.
+    if (isForgotten(doc)) return [forgottenView(doc)];
+
     if (!options.includeDrafts && !isPublished(doc)) {
       return [];
     }
@@ -131,12 +155,23 @@ export class Resolver {
     if (!checkpoint) return [];
 
     const version = checkpoint.document_versions[uri.path];
+    const doc = this.documents.get(uri.path);
+    // Pinned or floating, a forgotten node resolves to `forgotten` (§6.3.3) —
+    // whether checkpoint N still names its erased version or, from the
+    // forget's own checkpoint on, no longer names it at all.
+    if (doc && isForgotten(doc)) return [forgottenView(doc, version)];
     if (version === undefined) return [];
 
     if (!this.reconstructVersion) return [];
 
-    const content = await this.reconstructVersion(uri.path, version);
-    const doc = this.documents.get(uri.path);
+    let content: string;
+    try {
+      content = await this.reconstructVersion(uri.path, version);
+    } catch (err) {
+      // Only that version (a forgotten range) was erased.
+      if (err instanceof ForgottenVersionError && doc) return [forgottenView(doc, version)];
+      throw err;
+    }
     if (!doc) return [];
 
     // Return with reconstructed body
@@ -154,7 +189,7 @@ export class Resolver {
 
     return [...docIds]
       .map((id) => this.documents.get(id)!)
-      .filter((d) => options.includeDrafts || isPublished(d));
+      .filter((d) => !isForgotten(d) && (options.includeDrafts || isPublished(d)));
   }
 
   private resolveFolder(
@@ -166,6 +201,7 @@ export class Resolver {
       .filter(
         (d) =>
           (d.id.startsWith(prefix) || d.id.startsWith(uri.path)) &&
+          !isForgotten(d) &&
           (options.includeDrafts || isPublished(d)),
       );
   }

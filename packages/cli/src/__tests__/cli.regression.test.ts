@@ -22,6 +22,8 @@ import {
   appendFileSync,
   existsSync,
   rmSync,
+  readdirSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -98,12 +100,19 @@ function runCtxResult(
   };
 }
 
+// New vaults hold add/update for review; these suites exercise the publish
+// path, so they turn the gate off (review-gate.regression.test.ts covers it).
+function reviewOff(cwd: string): void {
+  execFileSync("node", [distPath, "config", "set", "review", "off"], { cwd, env: ENV, stdio: "ignore" });
+}
+
 function initVault(cwd: string): void {
   execFileSync(
     "node",
     [distPath, "init", "--name", "regression-vault", "--layout", "structured"],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  reviewOff(cwd);
 }
 
 /** Init a vault from a named starter recipe (scaffolds nodes + packs). */
@@ -113,6 +122,7 @@ function initStarter(cwd: string, recipe: string): void {
     [distPath, "init", "--name", "starter-vault", "--starter", recipe],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  reviewOff(cwd);
 }
 
 interface MockServer {
@@ -207,7 +217,7 @@ function startGatedEngine(pollSequence: Array<Record<string, unknown>>): Promise
             JSON.stringify({
               status: "pending_confirmation",
               pending_id: "pid1",
-              confirm_url: "https://ui.example/confirm/pid1",
+              confirm_url: `/nests/${nest}/pending-pushes/pid1/confirm`,
               poll_url: `/nests/${nest}/pending-pushes/pid1`,
               message: "This nest requires confirmation before the push is applied.",
               expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
@@ -780,6 +790,74 @@ describe("[regression] ctx delete", () => {
   });
 });
 
+// ─── forget protocol (spec §6.3) ─────────────────────────────────────────────
+
+describe("[regression] ctx forget", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "Jane's record says GUAVA-ALPHA at intake."]);
+    runCtx(tmp, ["update", "nodes/jane", "--body", "Jane's record says GUAVA-BETA after review."]);
+    runCtx(tmp, ["update", "nodes/jane", "--body", "Jane's record, current revision."]);
+  });
+
+  const grepVault = (needle: string): string[] => {
+    const hits: string[] = [];
+    const walk = (d: string) => {
+      for (const name of readdirSync(d)) {
+        const p = join(d, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (readFileSync(p, "utf-8").includes(needle)) hits.push(p);
+      }
+    };
+    walk(tmp);
+    return hits;
+  };
+
+  it("refuses without --yes and without a closed reason code", () => {
+    expect(runCtxResult(tmp, ["forget", "nodes/jane", "--reason", "user_request"]).status).toBe(1);
+    const bad = runCtxResult(tmp, ["forget", "nodes/jane", "--reason", "she asked", "--yes"]);
+    expect(bad.status).not.toBe(0);
+    expect(grepVault("GUAVA-ALPHA")).not.toEqual([]);
+  });
+
+  it("node forget erases the content, leaves a stub, and verify still passes", () => {
+    const out = runCtx(tmp, [
+      "forget", "nodes/jane", "--reason", "user_request", "--requested-by", "jane@example.com", "--yes",
+    ]);
+    expect(out).toMatch(/Forgot nodes\/jane/);
+    expect(grepVault("GUAVA")).toEqual([]);
+    expect(runCtx(tmp, ["read", "nodes/jane"])).toMatch(/forgotten/);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+    expect(runCtxResult(tmp, ["reconstruct", "nodes/jane", "1"]).status).not.toBe(0);
+
+    const log = JSON.parse(runCtx(tmp, ["forget-log", "nodes/jane", "--json"]));
+    expect(log.events).toHaveLength(1);
+    expect(log.events[0]).toMatchObject({ scope: "node", reason_code: "user_request", requested_by: "jane@example.com" });
+
+    const history = JSON.parse(runCtx(tmp, ["history", "nodes/jane", "--json"]));
+    expect(history.versions.filter((v: { tombstone?: boolean }) => v.tombstone)).toHaveLength(3);
+
+    // Not in default listings; listed on request.
+    expect(runCtx(tmp, ["list", "--json"])).not.toContain("nodes/jane");
+    expect(runCtx(tmp, ["list", "--status", "forgotten", "--json"])).toContain("nodes/jane");
+    // Cannot be edited back into existence.
+    expect(runCtxResult(tmp, ["update", "nodes/jane", "--body", "again"]).status).not.toBe(0);
+  });
+
+  it("delete is logged but the path stays reusable; --purge logs nothing", () => {
+    runCtx(tmp, ["delete", "nodes/jane", "--yes"]);
+    expect(existsSync(join(tmp, "nodes", "jane.md"))).toBe(false);
+    expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events[0]).toMatchObject({ mode: "delete" });
+    runCtx(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "a brand new body"]);
+
+    runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
+    runCtx(tmp, ["delete", "nodes/scratch", "--purge", "--yes"]);
+    expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events).toHaveLength(1);
+    runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+  });
+});
+
 // ─── verify (integrity) ───────────────────────────────────────────────────────
 
 describe("[regression] ctx verify", () => {
@@ -1181,6 +1259,30 @@ describe("[regression] ctx push", () => {
     }
   });
 
+  it("lists skipped and failed documents, and exits non-zero when any failed", async () => {
+    const server = await startMockEngine(() => ({
+      published: 0,
+      context_md_updated: false,
+      node_ids: [],
+      skipped: ["Pushable"],
+      failed: [{ title: "Broken", error: "invalid type" }],
+    }));
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toMatch(/Pushable \(already exists, not overwritten\)/);
+      expect(res.stderr).toMatch(/Broken: invalid type/);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("includes the folder for a folder-nested document, so a catalog-conformant nest can keep it out of the root", async () => {
     // "cli flattens every single write" (Misha, #engineering, 2026-09-18):
     // a document that lives under nodes/<folder>/<slug> locally must not be
@@ -1255,9 +1357,27 @@ describe("[regression] ctx push", () => {
         "--yes",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).toMatch(/Pushed 1 document/);
       expect(server.pollCount()).toBeGreaterThanOrEqual(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a confirmed push that created fewer than it held reports the shortfall", async () => {
+    const server = await startGatedEngine([{ status: "applied", doc_count: 3, applied_node_count: 1 }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Pushed 1 document\b/);
+      expect(res.stdout).toMatch(/2 not created/);
     } finally {
       await server.close();
     }
@@ -1293,7 +1413,7 @@ describe("[regression] ctx push", () => {
         "--no-wait",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).not.toMatch(/Pushed/);
       expect(server.pollCount()).toBe(0);
     } finally {
@@ -1667,7 +1787,7 @@ describe("[regression] file safety — command coverage", () => {
   // --dry-run sandbox and action log with no other symptom, so assert every
   // listed name still resolves to a real command.
   const CLASSIFIED = [
-    "init", "add", "update", "delete", "publish", "index", "welcome",
+    "init", "add", "update", "delete", "forget", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
     "import pdf",

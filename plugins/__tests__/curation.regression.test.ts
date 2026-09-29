@@ -45,6 +45,7 @@ beforeAll(() => {
   vaultDir = mkdtempSync(join(tmpdir(), "cn-plugin-cur-"));
   mkdirSync(vaultDir, { recursive: true });
   ctl(vaultDir, ["init", "--name", "curation", "--description", "storage and infrastructure"]);
+  ctl(vaultDir, ["config", "set", "review", "off"]); // seeds published nodes
 
   // Three published nodes all asserting the same thing, plus one draft — the
   // shape that makes a first-hit-only fix leave the vault self-contradictory.

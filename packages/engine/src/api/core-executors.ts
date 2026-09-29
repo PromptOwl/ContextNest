@@ -27,9 +27,19 @@ import {
   normalizeStatus,
   isRejected,
   isPublished,
+  isForgotten,
   explicitStatus,
   parseDocument,
 } from "../parser.js";
+import {
+  forgetDocument,
+  forgetLog,
+  deleteDocumentWithTombstone,
+  applyImportedTombstones,
+  assertNotForgotten,
+} from "../forget.js";
+import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } from "../tombstones.js";
+import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
 import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
@@ -41,6 +51,7 @@ import { parseUri } from "../uri.js";
 import {
   ContextNestError,
   DocumentNotFoundError,
+  ForgottenDocumentError,
   RejectedDocumentError,
 } from "../errors.js";
 import { sha256Bytes } from "../integrity.js";
@@ -63,6 +74,7 @@ import {
 import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import { currentReviewProposal, stageReviewHold } from "../review.js";
 import { TITLE_MAX_LENGTH } from "../schemas.js";
 import {
   isVersionArtifactPath,
@@ -466,19 +478,36 @@ const create: OperationExecutor = async (ctx, input: any) => {
       "VALIDATION_FAILED",
     );
   }
-  const node = buildDraftNode({ ...input, content });
+  // Held for review (review.ts): an unpublished node is simply written as
+  // pending_review. An explicit publish:true wins — the flag is the caller's
+  // per-call override (`ctx add --publish`).
+  // A create publishes whatever `status` it names, so any status is held — as
+  // pending_review, the one status approval releases (an explicit `published`
+  // left in would land marked published with no version). A rejected create
+  // never publishes, so there is nothing to hold.
+  const hold = input.review === true && input.publish !== true && input.status !== "rejected";
+  const node = buildDraftNode({
+    ...input,
+    content,
+    ...(hold ? { status: "pending_review" } : {}),
+  });
   // A rejected node cannot be published — publish refuses one by design. Left
   // to fall through, the write below lands and publish then throws, stranding a
   // file on disk with no version and no history, and making the caller's retry
   // fail with DOCUMENT_ALREADY_EXISTS for a create it believes never happened.
   // Refuse before anything is written.
-  const publish = node.frontmatter.status === "rejected" ? false : input.publish !== false;
+  const publish = node.frontmatter.status === "rejected" || hold ? false : input.publish !== false;
   // Publish assigns the version (spec §6), so a published node must go to disk
   // WITHOUT one — pre-setting it makes the first published version 2 and leaves
   // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
-  if (!publish) node.frontmatter.version = 1;
+  // A held node is left unversioned instead, so approving it publishes v1.
+  if (!publish && !hold) node.frontmatter.version = 1;
   const createdStatus = node.frontmatter.status;
   assertValid(node);
+  // Refused BEFORE the write, for the same stranded-file reason as rejected:
+  // a path a forget retired, or a body matching erased
+  // content, never takes content again (§6.3.4).
+  await assertNotForgotten(ctx.storage, node);
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
   // the way the pre-check + separate write could race.
@@ -493,6 +522,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
       version: node.frontmatter.version ?? 1,
       status: createdStatus,
       checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
     };
   }
   const result = await publishAndIndex(ctx, node.id, input.note, input.client);
@@ -519,7 +549,15 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // one that would escape the vault root.
   const id: string = input.id;
   assertSafeDocumentId(id);
-  const existing = await ctx.storage.readDocument(id);
+  const live = await ctx.storage.readDocument(id);
+  // Held for review (review.ts). An edit to a PUBLISHED node must not touch
+  // the canonical file — it is staged as a suggestion instead — and it builds
+  // on the node's current held proposal, if any, so a second held edit carries
+  // the first rather than silently dropping it on approval.
+  const hold = input.review === true && input.publish !== true;
+  const holdAsSuggestion = hold && isPublished(live);
+  const proposal = holdAsSuggestion ? await currentReviewProposal(ctx.storage, id) : null;
+  const existing = proposal ? parseDocument(live.filePath, proposal.proposedRaw, id) : live;
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
   // rejects (no version/checksum/history). Reviving one — moving it to some
@@ -529,6 +567,8 @@ const update: OperationExecutor = async (ctx, input: any) => {
   if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
     throw new RejectedDocumentError(id);
   }
+  // A forgotten stub never takes content again, under any status (§6.3.4).
+  if (isForgotten(existing)) throw new ForgottenDocumentError(id);
   // A pdf node's body is the text extracted from its binary; hand-editing it
   // would leave the two disagreeing under one sealed version. The binary is the
   // source of truth, so the way to change the text is a new PDF.
@@ -551,7 +591,17 @@ const update: OperationExecutor = async (ctx, input: any) => {
     assertUsableTitle(String(input.title));
     frontmatter.title = input.title;
   }
-  if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  // Under a hold an explicit `published` is what the hold defers, not a status
+  // to write — applied, an unpublished node would read published, unversioned.
+  if (input.status && !(hold && input.status === "published")) {
+    frontmatter.status = input.status as Frontmatter["status"];
+  }
+  // An unpublished node held for review is marked as such (a staged edit to a
+  // published node keeps its status: the proposal is what approval publishes).
+  // A rejected node stays rejected unless the caller asked to revive it.
+  else if (hold && !holdAsSuggestion && (input.status === "published" || frontmatter.status !== "rejected")) {
+    frontmatter.status = "pending_review";
+  }
   // An empty string CLEARS the description, the same convention `metadata`
   // uses for null: over a JSON wire an absent key cannot be told apart from
   // "leave this alone", so without it a caller has no way to remove one.
@@ -608,7 +658,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // mutated and its checksum dropped. The derived default already lands here;
   // this makes it true of the explicit flag too.
   const publish =
-    frontmatter.status === "rejected"
+    frontmatter.status === "rejected" || hold
       ? false
       : (input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status)));
   // Only an unpublished write may carry a caller-assigned version: publish
@@ -617,6 +667,30 @@ const update: OperationExecutor = async (ctx, input: any) => {
   if (!publish && input.version !== undefined) frontmatter.version = input.version;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
+  if (holdAsSuggestion && frontmatter.status !== "rejected") {
+    const staged = await stageReviewHold(ctx.storage, {
+      documentId: id,
+      proposedRawContent: serializeDocument(node),
+      actor: ctx.actor ?? "engine",
+      ...(live.frontmatter.zone ? { zone: live.frontmatter.zone } : {}),
+      docTier: live.frontmatter.governance ?? "standard",
+      ...(input.note ? { note: input.note } : {}),
+      supersedes: proposal ? [proposal.suggestionId] : [],
+    });
+    if (staged) {
+      return {
+        id,
+        version: live.frontmatter.version ?? 1,
+        status: "pending_review",
+        checkpoint: null,
+        held_for_review: true,
+        suggestion_id: staged.suggestionId,
+      };
+    }
+    // No version history to diff against (a hand-marked "published" file that
+    // was never sealed): fall back to an in-place pending write.
+    node.frontmatter.status = "pending_review";
+  }
   await ctx.storage.writeDocument(id, serializeDocument(node));
   if (!publish) {
     await ctx.storage.regenerateIndex();
@@ -625,6 +699,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
       version: frontmatter.version ?? 1,
       status: frontmatter.status ?? "draft",
       checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
     };
   }
   const result = await publishAndIndex(ctx, id, input.note, input.client);
@@ -651,13 +726,56 @@ const publish: OperationExecutor = async (ctx, input: any) => {
 
 const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  // Read the title BEFORE removing the file — callers report what they deleted,
-  // and after the delete there is nothing left to ask.
-  const { frontmatter } = await ctx.storage.readDocument(id);
-  // deleteDocument throws DOCUMENT_NOT_FOUND when the id doesn't exist.
-  await ctx.storage.deleteDocument(id);
+  // Reads the title BEFORE removing the file (callers report what they
+  // deleted) and throws DOCUMENT_NOT_FOUND when the id doesn't exist. Unless
+  // `purge` is set, leaves an audit-only record of who deleted it and why
+  // (§6.3.4) — it refuses nothing; use forget to erase.
+  const result = await deleteDocumentWithTombstone(ctx.storage, id, {
+    reasonCode: input.reason_code ?? "user_request",
+    deletedBy: ctx.actor ?? "engine",
+    ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
+    ...(input.purge ? { purge: true } : {}),
+  });
   await ctx.storage.regenerateIndex();
-  return { id, title: frontmatter.title, deleted: true as const };
+  return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
+};
+
+const forget: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const result = await forgetDocument(ctx.storage, id, {
+    reasonCode: input.reason_code,
+    forgottenBy: ctx.actor ?? "engine",
+    ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
+    ...(input.client ? { client: input.client } : {}),
+  });
+  await ctx.storage.regenerateIndex();
+  return {
+    id: result.id,
+    versions: result.versions,
+    stub_version: result.stubVersion,
+    checkpoint: result.checkpoint,
+  };
+};
+
+const forgetLogExec: OperationExecutor = async (ctx, input: any) => {
+  const id = input?.id ? sanitizeId(String(input.id)) : undefined;
+  const records = await forgetLog(ctx.storage, id);
+  return {
+    events: records.map((r) => ({
+      event_id: r.event_id,
+      document_id: r.document_id,
+      scope: r.scope,
+      mode: r.mode,
+      versions: r.versions,
+      reason_code: r.reason_code,
+      forgotten_by: r.forgotten_by,
+      forgotten_at: r.forgotten_at,
+      ...(r.requested_by ? { requested_by: r.requested_by } : {}),
+      ...(r.stub_version !== undefined ? { stub_version: r.stub_version } : {}),
+      ...(r.checkpoint !== undefined ? { checkpoint: r.checkpoint } : {}),
+      erased_hashes: r.content_hashes.length + r.body_hashes.length + r.pdf_hashes.length,
+    })),
+  };
 };
 
 const versions: OperationExecutor = async (ctx, input: any) => {
@@ -687,6 +805,15 @@ const versions: OperationExecutor = async (ctx, input: any) => {
         content_hash: v.content_hash,
         chain_hash: v.chain_hash,
         ...(v.client ? { client: v.client } : {}),
+        ...(v.tombstone
+          ? {
+              tombstone: true,
+              ...(v.forgotten_at ? { forgotten_at: v.forgotten_at } : {}),
+              ...(v.forgotten_by ? { forgotten_by: v.forgotten_by } : {}),
+              ...(v.reason_code ? { reason_code: v.reason_code } : {}),
+            }
+          : {}),
+        ...(v.forget_stub ? { forget_stub: true } : {}),
         ...(versionManager
           ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
           : {}),
@@ -721,7 +848,11 @@ const reconstruct: OperationExecutor = async (ctx, input: any) => {
 
 const verify: OperationExecutor = async (ctx) => {
   const report = await ctx.storage.verifyVaultIntegrity();
-  return { valid: report.valid, errors: report.errors };
+  return {
+    valid: report.valid,
+    errors: report.errors,
+    ...(report.tombstoned ? { tombstoned: report.tombstoned } : {}),
+  };
 };
 
 const init: OperationExecutor = async (ctx, input: any) => {
@@ -783,6 +914,8 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
   // is what you edit your way out of). Rendering the rejected text itself is what
   // is refused: an installed skill is matched on and executed, not just displayed.
   // Only a rejected node with nothing approved behind it has nothing safe to serve.
+  // A forgotten stub is not a skill anyone may run (§6.3.3).
+  if (isForgotten(live)) throw new ForgottenDocumentError(id);
   let node = live;
   let servedVersion: number | null = null;
   if (isRejected(live)) {
@@ -965,8 +1098,40 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // Stage 0: land an existing vault's files verbatim. Bounded-parallel because
   // a vault may sit on a network mount where each write is a round trip, and a
   // serial loop then costs one full latency per file.
-  const incoming: { path: string; content: string }[] = input.files ?? [];
+  let incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
+
+  // Forget protocol (§6.3.4): an exported nest carries its tombstones, and an
+  // import MUST honor them — and this vault's own. The incoming chain-event
+  // log is not landed verbatim (it would overwrite this vault's audit trail);
+  // its forget records are merged in, checked against, and re-applied to any
+  // pre-forget copy this vault already holds.
+  const tombstones =
+    incoming.length > 0 || (input.documents?.length ?? 0) > 0 ? await ctx.storage.readTombstones() : null;
+  const incomingEvents: unknown[] = [];
+  if (tombstones) {
+    incoming = incoming.filter((f) => {
+      const p = String(f.path ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
+      if (p !== ".versions/chain_events.yaml") return true;
+      try {
+        const parsed = yaml.load(f.content ?? "");
+        const list = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray((parsed as { events?: unknown[] } | null)?.events)
+            ? (parsed as { events: unknown[] }).events
+            : [];
+        incomingEvents.push(...list);
+      } catch (err) {
+        failed.push({
+          id: String(f.path),
+          error: `unreadable chain-event log: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return false;
+    });
+    for (const rec of buildTombstoneIndex(incomingEvents).records) addTombstone(tombstones, rec);
+  }
+
   if (incoming.length > 0) {
     // Targets are settled for the WHOLE batch BEFORE the parallel write: two
     // files whose names slugify alike must not race for one path, and a
@@ -984,6 +1149,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
     await mapInBatches(plan, async (f) => {
       try {
+        // A pre-forget copy is refused wherever it lands (§6.3.4).
+        const refusal = tombstones ? importVerdict(tombstones, f.path, f.content) : null;
+        if (refusal) throw new ForgottenDocumentError(f.raw, `refused: ${refusal}`);
         // Into the file's OWN warning list: `mapInBatches` finishes in
         // whatever order the writes complete, and the report is per input file.
         await writeImportedFile(ctx, f, f.warnings);
@@ -994,12 +1162,25 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     });
     for (const p of plan) warnings.push(...p.warnings);
   }
+  if (tombstones && incomingEvents.length > 0) {
+    try {
+      await applyImportedTombstones(ctx.storage, incomingEvents, tombstones);
+    } catch (err) {
+      failed.push({
+        id: ".versions/chain_events.yaml",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
   for (const doc of input.documents ?? []) {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
+      // Same guard as context_create (§6.3.4): a retired path or erased body
+      // must not land even as a draft (`publish: false` returns before Stage 3).
+      await assertNotForgotten(ctx.storage, node, tombstones!);
       await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
       batch.push(node.id);
       titleById.set(node.id, doc.title);
@@ -1041,6 +1222,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
       if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      // A forgotten stub is neither published nor held: it is not content.
+      if (isForgotten(doc)) continue;
       const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
         doc,
         doc.id.split("/").pop() ?? doc.id,
@@ -1069,7 +1252,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // An empty call is a caller bug, not an empty result — but a batch where every
   // document failed to stage is a legitimate (fully-failed) result, and a
   // `discover` over a folder with nothing new in it is simply done.
-  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0) {
+  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0 && incomingEvents.length === 0) {
     throw new ContextNestError(
       "context_import requires documents[], ids[], files[] or discover",
       "VALIDATION_FAILED",
@@ -1306,6 +1489,16 @@ async function importPdfLocked(
   }
   assertSafeDocumentId(id);
 
+  // Anti-resurrection (§6.3.4): a path a forget retired (stub since deleted)
+  // or a binary a forget erased never comes back through a PDF import.
+  const tombstones = await ctx.storage.readTombstones();
+  if (!existing && isPathForgotten(tombstones, id)) {
+    throw new ForgottenDocumentError(id, "was forgotten — its path cannot take content again; import under a new path");
+  }
+  if (tombstones.pdfHashes.has(extraction.sha256)) {
+    throw new ForgottenDocumentError(id, "carries a PDF binary a forget erased");
+  }
+
   if (existing) {
     if (existing.frontmatter.type !== "pdf") {
       throw new ContextNestError(
@@ -1314,6 +1507,7 @@ async function importPdfLocked(
       );
     }
     if (isRejected(existing)) throw new RejectedDocumentError(id);
+    if (isForgotten(existing)) throw new ForgottenDocumentError(id);
   }
 
   const sidecar = pdfSidecarPath(id);
@@ -1534,6 +1728,8 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_versions: versions,
   context_reconstruct: reconstruct,
   context_verify: verify,
+  context_forget: locked(forget),
+  context_forget_log: forgetLogExec,
   context_init: init,
   context_packs: packs,
   context_nests: nests,

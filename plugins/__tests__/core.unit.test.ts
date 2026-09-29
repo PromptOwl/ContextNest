@@ -1091,6 +1091,23 @@ describe("sweep-check", () => {
     expect(text).toMatch(/contextnest-curator/);
   });
 
+  it("run: a held update (review on) is not diffed — its last two versions are an older edit", () => {
+    const routes: [string, unknown][] = [
+      ["vault list", [{ alias: "eng", exists: true }]],
+      ["read a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+      ["history a --json --vault eng", { versions: [{ version: 1 }, { version: 2 }] }],
+      ["reconstruct a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/other" }]],
+      ["read nodes/other --raw --vault eng", "---\nt: x\n---\nRedis everywhere."],
+    ];
+    // The command names a bare slug; the review list reports it under nodes/.
+    const held = fakeExec([["review list --json --vault eng", [{ id: "nodes/a", kind: "edit", stale: false }]], ...routes]);
+    const cmd = { tool_input: { command: "ctx update a --vault eng --body whatever" } };
+    expect(sweepCheck({ input: cmd, env: {}, exec: held })).toBeNull();
+    // Control: the same update, published (nothing held), is swept.
+    expect(sweepCheck({ input: cmd, env: {}, exec: fakeExec(routes) })).not.toBeNull();
+  });
+
   it("run: silent when nothing was dropped or no straggler survives the read check", () => {
     const history = { versions: [{ version: 1 }, { version: 2 }] };
     const exec = fakeExec([

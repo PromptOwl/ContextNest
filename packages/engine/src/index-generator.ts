@@ -14,6 +14,9 @@ import type {
 import { buildRelationshipsWithStats, type RelationshipStats } from "./inline.js";
 import { stripTagPrefix } from "./parser.js";
 
+/** Minimum inbound references before a document can be a hub (edges into hubs are free). */
+export const HUB_MIN_DEGREE = 3;
+
 export interface GenerateContextYamlOptions {
   namespace?: string;
   federation?: "none" | "federated" | "scoped";
@@ -111,7 +114,10 @@ export function generateContextYamlWithStats(
     }
   }
 
-  // Compute hubs (top documents by inbound reference count)
+  // Compute hubs (top documents by inbound reference count). Edges into a hub
+  // are free to traverse, so a hub must be genuinely central: without a floor,
+  // every linked node in a small vault lands in the top 10 and `--hops 0`
+  // starts following ordinary one-off links.
   const inboundCount = new Map<string, number>();
   for (const edge of relationships) {
     if (edge.type === "reference") {
@@ -119,6 +125,7 @@ export function generateContextYamlWithStats(
     }
   }
   const hubs: HubEntry[] = [...inboundCount.entries()]
+    .filter(([, degree]) => degree >= HUB_MIN_DEGREE)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
     .map(([id, degree]) => ({ id, degree }));
