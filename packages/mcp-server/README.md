@@ -119,7 +119,7 @@ them over the legacy tools below.
 | `context_versions` | List a document's version history (new capability — nothing exposed this before) |
 | `context_reconstruct` | Reconstruct a specific version. Refuses a version the history does not contain, instead of returning a neighbour's content |
 | `context_packs` | List packs, each with its `includes` and `excludes` |
-| `context_verify` | Verify every hash chain in the vault. Forgotten versions verify hash-only (`tombstoned`) |
+| `context_verify` | Verify every hash chain in the vault and rebuild every recorded version (`version_unreconstructable` when one cannot be rebuilt). Forgotten versions verify hash-only (`tombstoned`) |
 | `context_forget` | Forget a node (spec §6.3): erase every version's content, keep the hashes so verify still passes, leave an empty `status: forgotten` stub every URI resolves to. `reason_code` is a closed set, never free text. Later republish/re-import of the content is refused |
 | `context_forget_log` | The forget audit trail: who, when, reason code, which versions. Never the content |
 | `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |

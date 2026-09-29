@@ -778,6 +778,7 @@ const verifyError = z.object({
     "checkpoint_hash_mismatch",
     "body_drift",
     "unreadable_history",
+    "version_unreconstructable",
     "sidecar_drift",
     "sidecar_missing",
     "forgotten_content_present",
@@ -794,7 +795,7 @@ const verifyOp: OperationDescriptor = {
   name: "context_verify",
   namespace: "core",
   description:
-    "Verify every document and checkpoint hash chain in the vault, and re-hash every pdf node's binary against the sha256 its frontmatter records.",
+    "Verify every document and checkpoint hash chain in the vault, rebuild every recorded document version (one that cannot be rebuilt is reported as `version_unreconstructable`), and re-hash every pdf node's binary against the sha256 its frontmatter records.",
   input: z.object({ ...clientField }),
   output: z.object({
     valid: z.boolean(),
