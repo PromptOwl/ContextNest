@@ -2401,3 +2401,133 @@ describe("[regression] read --out without --html", () => {
     expect(existsSync(target)).toBe(false);
   });
 });
+
+// ─── ctx info ────────────────────────────────────────────────────────────────
+// `info` summarizes the vault: name, path, counts by type and status, tags, and
+// the CONTEXT.md preamble. --json is the machine-readable form agents consume.
+
+describe("[regression] ctx info", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/one", "--title", "One", "--tags", "#a", "--publish"]);
+  });
+
+  it("summarizes counts, tags and name in the human view", () => {
+    const out = runCtx(tmp, ["info"]);
+    expect(out).toMatch(/regression-vault/);
+    expect(out).toMatch(/1 node\(s\)/);
+    expect(out).toMatch(/document: 1/);
+    expect(out).toMatch(/published: 1/);
+    expect(out).toMatch(/#a/);
+  });
+
+  it("--json reports the same summary as a structured envelope", () => {
+    const json = JSON.parse(runCtx(tmp, ["info", "--json"]));
+    expect(json.total).toBe(1);
+    expect(json.by_type).toEqual({ document: 1 });
+    expect(json.by_status).toEqual({ published: 1 });
+    expect(json.tags).toEqual(["#a"]);
+    expect(json.config.name).toBe("regression-vault");
+    expect(typeof json.vault_path).toBe("string");
+  });
+});
+
+// ─── ctx skill show / install ────────────────────────────────────────────────
+// A `type: skill` node renders into an agent-harness SKILL.md. `show` prints an
+// offline snapshot; `install` prints a loader that fetches the node at runtime
+// and, without --write, touches nothing outside the vault. --dry-run keeps the
+// external-write guard honest.
+
+describe("[regression] ctx skill show / install", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, [
+      "add", "nodes/deploy-skill", "--type", "skill",
+      "--title", "Deploy Skill", "--trigger", "when deploying",
+      "--body", "Do the deploy steps.",
+    ]);
+  });
+
+  it("show renders the skill node as a SKILL.md for the harness", () => {
+    const out = runCtx(tmp, ["skill", "show", "nodes/deploy-skill", "--scope", "project"]);
+    expect(out).toMatch(/name: deploy-skill/);
+    expect(out).toMatch(/description: "when deploying"/);
+    expect(out).toMatch(/Do the deploy steps\./);
+    expect(out).toMatch(/skills[\\/]deploy-skill[\\/]SKILL\.md/);
+  });
+
+  it("install without --write prints a loader and writes nothing outside the vault", () => {
+    const out = runCtx(tmp, ["skill", "install", "nodes/deploy-skill", "--scope", "project"]);
+    expect(out).toMatch(/context_skill/);
+    expect(out).toMatch(/Re-run with --write to install these files\./);
+    expect(existsSync(join(tmp, ".claude"))).toBe(false);
+  });
+
+  it("install --write --dry-run reports the target without writing it", () => {
+    // The dry-run report rides the file-safety action log on stderr, which is
+    // what keeps it off stdout (spec: --json output stays parseable).
+    const { status, stderr } = runCtxResult(tmp, [
+      "skill", "install", "nodes/deploy-skill", "--scope", "project", "--write", "--dry-run",
+    ]);
+    expect(status).toBe(0);
+    expect(stderr).toMatch(/Dry run — no files were written/);
+    expect(stderr).toMatch(/skills[\\/]deploy-skill[\\/]SKILL\.md/);
+    expect(existsSync(join(tmp, ".claude"))).toBe(false);
+  });
+
+  it("show on a non-existent skill id fails cleanly", () => {
+    const { status, stderr } = runCtxResult(tmp, ["skill", "show", "nodes/nope", "--scope", "project"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/DOCUMENT_NOT_FOUND/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── ctx validate — circular source dependency (rule 15) ─────────────────────
+// Two source nodes whose `depends_on` URIs point at each other form a cycle.
+// Each node is individually well-formed, so validate surfaces only the cycle,
+// names the loop, and exits non-zero.
+
+describe("[regression] ctx validate — circular source dependency", () => {
+  beforeEach(() => initVault(tmp));
+
+  const writeSource = (id: string, tool: string, dependsOn: string): void => {
+    const dir = join(tmp, dirname(id));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(tmp, `${id}.md`),
+      [
+        "---",
+        `title: ${id}`,
+        "type: source",
+        "status: published",
+        "source:",
+        "  transport: mcp",
+        "  tools:",
+        `    - ${tool}`,
+        "  depends_on:",
+        `    - contextnest://${dependsOn}`,
+        "---",
+        "",
+        "Body.",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+  };
+
+  it("names the cycle and exits non-zero", () => {
+    writeSource("nodes/sources/a", "foo", "nodes/sources/b");
+    writeSource("nodes/sources/b", "bar", "nodes/sources/a");
+
+    const { status, stdout } = runCtxResult(tmp, ["validate"]);
+    expect(status).not.toBe(0);
+    expect(stdout).toMatch(/Circular dependency detected: nodes\/sources\/a → nodes\/sources\/b → nodes\/sources\/a/);
+
+    const json = JSON.parse(runCtxResult(tmp, ["validate", "--json"]).stdout);
+    expect(json.valid).toBe(false);
+    const cycle = json.errors.find((e: { path: string }) => e.path === "sources");
+    expect(cycle.errors[0].rule).toBe(15);
+    expect(cycle.errors[0].message).toMatch(/Circular dependency:/);
+  });
+});
