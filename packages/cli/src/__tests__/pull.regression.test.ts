@@ -150,4 +150,18 @@ describe("[regression] ctx pull — recipe from a stdio remote into a local vaul
     expect(res.status).not.toBe(0);
     expect(res.stderr).toMatch(/is a local vault/);
   });
+
+  it("names the missing recipe when the remote has no such slug", () => {
+    const res = run(configDir, cwd, ["pull", "recipes", "--recipe", "does-not-exist", "--vault", "local"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/No recipe "does-not-exist" in recipes/);
+    expect(res.stderr).toMatch(/recipe-does-not-exist/);
+    expect(res.stderr).not.toMatch(/\n\s+at /);
+  });
+
+  it("requires --recipe", () => {
+    const res = run(configDir, cwd, ["pull", "recipes", "--vault", "local"]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/required option '--recipe <id>' not specified/);
+  });
 });
