@@ -2256,3 +2256,148 @@ describe("[regression] import pubmed + enrich pubtator", () => {
     }
   });
 });
+
+// ─── unknown command / option ────────────────────────────────────────────────
+// Commander rejects an unrecognized command or option during parsing, before
+// any action runs. These lock the friendly, stack-trace-free contract: a typo
+// gets a one-line "unknown …" on stderr and a non-zero exit, never a dump.
+
+describe("[regression] unknown command and option", () => {
+  it("a top-level unknown command fails with a friendly error, no stack trace", () => {
+    const { status, stderr } = runCtxResult(tmp, ["frobnicate"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/unknown command 'frobnicate'/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+
+  it("an unknown option on a known command is rejected before it runs", () => {
+    const { status, stderr } = runCtxResult(tmp, ["list", "--bogus"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/unknown option '--bogus'/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── missing-document error hygiene ──────────────────────────────────────────
+// A write/read against a path that was never created surfaces the engine's
+// DOCUMENT_NOT_FOUND, names the id, exits non-zero, and never leaks a stack.
+// Pairs with the "reconstruct names the missing document" case above; this
+// covers the sibling delete/history/publish/update commands.
+
+describe("[regression] missing-document error hygiene", () => {
+  beforeEach(() => initVault(tmp));
+
+  it.each<[string, string[]]>([
+    ["delete", ["delete", "nodes/ghost", "--yes"]],
+    ["history", ["history", "nodes/ghost"]],
+    ["publish", ["publish", "nodes/ghost"]],
+    ["update", ["update", "nodes/ghost", "--title", "X"]],
+  ])("%s on a non-existent document fails cleanly", (_name, args) => {
+    const { status, stderr } = runCtxResult(tmp, args);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/DOCUMENT_NOT_FOUND/);
+    expect(stderr).toMatch(/nodes\/ghost/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── history --diff ──────────────────────────────────────────────────────────
+// `--diff` folds each version's unified diff from the one before into the
+// history render; without it the render stays a plain version list, and a
+// single-version document has nothing to diff and must not choke.
+
+describe("[regression] history --diff", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/edited", "--title", "Edited", "--body", "first body"]);
+    runCtx(tmp, ["update", "nodes/edited", "--body", "second body"]);
+  });
+
+  it("includes the unified diff between successive versions", () => {
+    const diffed = runCtx(tmp, ["history", "nodes/edited", "--diff"]);
+    expect(diffed).toMatch(/@@/);
+    expect(diffed).toMatch(/-first body/);
+    expect(diffed).toMatch(/\+second body/);
+    // The plain render carries no diff hunk — --diff is what turns it on.
+    expect(runCtx(tmp, ["history", "nodes/edited"])).not.toMatch(/@@/);
+  });
+
+  it("renders a single-version document without a diff hunk, exit 0", () => {
+    runCtx(tmp, ["add", "nodes/solo", "--title", "Solo", "--body", "only body"]);
+    const { status, stdout } = runCtxResult(tmp, ["history", "nodes/solo", "--diff"]);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/v1/);
+    expect(stdout).not.toMatch(/@@/);
+  });
+});
+
+// ─── publish --author / --message ────────────────────────────────────────────
+// `--author` sets the authoring identity recorded on the version entry
+// (`edited_by`, surfaced as the `By:` line), distinct from the caller-attribution
+// --agent/--session/--client block; `--message` becomes that version's note.
+
+describe("[regression] publish --author / --message", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/release", "--title", "Release", "--body", "one"]);
+    runCtx(tmp, ["update", "nodes/release", "--body", "two"]);
+  });
+
+  it("records the author and message on the published version", () => {
+    runCtx(tmp, [
+      "publish", "nodes/release",
+      "--author", "alice@example.com",
+      "--message", "release note",
+    ]);
+    const latest = JSON.parse(runCtx(tmp, ["history", "nodes/release", "--json"]))
+      .versions.at(-1);
+    expect(latest.edited_by).toBe("alice@example.com");
+    expect(latest.note).toBe("release note");
+    // The human render surfaces the same author on the By: line.
+    expect(runCtx(tmp, ["history", "nodes/release"])).toMatch(/By: alice@example\.com/);
+  });
+});
+
+// ─── selector grouping with ( ) ──────────────────────────────────────────────
+// Parentheses group a sub-expression so OR can be intersected with a further
+// term regardless of default operator precedence. Complements the individual
+// | / - / + operator cases above.
+
+describe("[regression] selector grouping", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/g1", "--title", "G1", "--tags", "red,big"]);
+    runCtx(tmp, ["add", "nodes/g2", "--title", "G2", "--tags", "blue,big"]);
+    runCtx(tmp, ["add", "nodes/g3", "--title", "G3", "--tags", "red,small"]);
+  });
+
+  const ids = (json: string): string[] =>
+    JSON.parse(json).map((d: { id: string }) => d.id).sort();
+
+  it("intersects a grouped OR with an outer AND term", () => {
+    expect(ids(runCtx(tmp, ["resolve", "(#red | #blue) + #big", "--json"])))
+      .toEqual(["nodes/g1", "nodes/g2"]);
+    expect(ids(runCtx(tmp, ["resolve", "#red + (#big | #small)", "--json"])))
+      .toEqual(["nodes/g1", "nodes/g3"]);
+  });
+});
+
+// ─── read --out output-path guard ────────────────────────────────────────────
+// `--out` names a file for the rendered HTML and only applies with --html.
+// Without --html the CLI renders to the terminal and writes no file, rather
+// than silently emitting a bare-body file the caller didn't ask for.
+
+describe("[regression] read --out without --html", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/page", "--title", "Page", "--body", "body text"]);
+  });
+
+  it("renders to the terminal and writes no file", () => {
+    const target = join(tmp, "page.html");
+    const { status, stdout } = runCtxResult(tmp, ["read", "nodes/page", "--out", target]);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Page/);
+    expect(existsSync(target)).toBe(false);
+  });
+});
