@@ -1,5 +1,92 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.7.0
+
+### Minor Changes
+
+- c143ac4: The forget protocol: erase a node and keep `verify` passing (spec §6.3)
+
+  `ctx forget <path> --reason <code> [--requested-by <who>]` (MCP / API:
+  `context_forget`) erases a node's content from its whole history — every
+  keyframe, diff, archived PDF binary, staged suggestion and version note — while
+  keeping each version entry's `content_hash` and `chain_hash` unchanged and
+  marking it `tombstone: true`. Because a chain hash is computed from the content
+  hash, never from the content, every later entry and every checkpoint binding
+  still verifies: `ctx verify` treats a tombstoned entry as hash-only and reports
+  it under `tombstoned`, not as an error. The reason is a closed code
+  (`user_request | legal | retention_expiry | error`), never free text.
+
+  The live file becomes an empty stub with the new sixth status `forgotten`,
+  sealed as a keyframe version and a checkpoint. Every `contextnest://` URI for
+  the path — floating or pinned `@N` — resolves to that stub (status
+  `forgotten`, empty body), not to nothing. Forgotten nodes are excluded from
+  retrieval, search, listings and selectors unless `status:forgotten` is asked
+  for. `forgotten` cannot be set through create/update. Readers that predate it
+  normalize it to `draft`, which keeps the stub out of default retrieval.
+  Reconstructing a forgotten version fails with `VERSION_FORGOTTEN`.
+
+  Every forget appends a `document.forgotten` event to
+  `.versions/chain_events.yaml`: who, when, reason code, requested-by and which
+  versions, plus the erased content's hashes, never the content itself.
+  `ctx forget-log [path]` (`context_forget_log`) reads it back.
+
+  Anti-resurrection: that record refuses the forgotten content wherever it turns
+  up. Publishing or creating at a forgotten path, publishing a body whose checksum
+  matches an erased revision, and importing (`context_import` `files`) a
+  pre-forget live file, keyframe, diff, history or PDF are all refused
+  (`FORGOTTEN_DOCUMENT`), at the original path or under a new name. An import
+  that carries a `chain_events.yaml` has its forget records merged into the
+  receiving vault's log instead of overwriting it, and they are re-applied to any
+  pre-forget copy the receiving vault holds. A copied vault carries its
+  tombstones. `ctx verify` reports `forgotten_content_present` (erased content
+  back on disk) and `unrecorded_tombstone` (a tombstone or `forgotten` status no
+  recorded forget accounts for).
+
+  **`ctx delete` is now logged.** `context_delete` (and the legacy
+  `delete_document` tool) removes the file and its history exactly as before,
+  and also appends an audit-only `document.forgotten` event with `mode: delete`
+  (who, when, reason code, the deleted versions' content hashes), visible in
+  `ctx forget-log`. It refuses nothing: the path can be re-created and a
+  renamed copy of the content keeps verifying, and an import never deletes local
+  documents because of it. The new `reason_code` / `requested_by` inputs
+  (`--reason`, `--requested-by`) go on the record; `purge: true`
+  (`ctx delete --purge`) deletes without one. To erase content and refuse its
+  return, use `ctx forget`.
+
+  Not in this release: version-range forget (§6.3.2 re-keyframing), lineage
+  `review_required` flags (§6.3.4) and the `expires_at` / `retain_until` lifespan
+  keys (§6.3.5).
+
+- 668acf7: Human review gate, on by default for new vaults. `ctx init` writes `review: on` to `.context/config.yaml`; with it on, `ctx add` / `ctx update` and MCP `context_create` / `context_update` hold the write for approval instead of publishing it — a new document lands as `pending_review`, an edit to a published document is staged under `_suggestions/` while the published version keeps serving, and nothing is versioned or checkpointed until approved. At a terminal the CLI asks `Held for review. Publish? [y]es / [n]o / [a]lways (turn review off)`; without one it never blocks and prints `Held for review: ctx review approve <path>   (turn off: ctx config set review off)`. MCP results carry `held_for_review` and a sentence telling the agent the user can say "turn off review". New: `ctx review [list|approve|reject]`, `ctx config get|set review`, `--publish` on add/update, the `context_review` MCP tool, and a `review` input on the `context_create` / `context_update` catalog ops. Vaults without the key (created before this release) keep publishing immediately.
+
+  The deprecated MCP `create_document` / `update_document` tools are gated the same way. `ctx review approve|reject` act only on held writes (`pending_review` nodes or held edits), never on plain drafts; `ctx config` / `ctx review` refuse a remote `<server>/<nest>` alias. The Claude Code plugin knows about held writes: the capture and curator agents report them for the user to approve instead of claiming a publish, and the sweep-check hook skips a held `ctx update` rather than diffing an older, unrelated edit.
+
+- 1cdd7b1: Integrity check rebuilds every recorded version, and repair reports what a
+  reader can still be served
+
+  `ctx verify` / `context_verify` proved each version artifact matched what the
+  history _records_ — never that the chain still _replays_. An import that
+  overwrote version artifacts and rewrote their fingerprints to match passed
+  every hash check, yet the diffs no longer applied and older versions read as
+  empty, surfacing only when a reader, export or agent asked for one.
+  Verification now also rebuilds every recorded, non-tombstoned version from its
+  keyframe+diff chain and reports each one that fails as a new error type,
+  `version_unreconstructable`, naming the document and version. Healthy vaults
+  still verify clean; tombstoned versions stay hash-only (§6.3.2), not errors.
+
+  `VersionManager.repairVersions(docId)` repairs what can be repaired and
+  reports the rest: it runs the existing idempotent `repairLatestVersion`
+  re-anchor, then returns `{ repaired, unreadable, newestReadable }` — every
+  recorded version that cannot be rebuilt, and the newest one that can. It never
+  creates a version and never renumbers one; only the saved history is
+  rewritten. Which version is approved for readers stays a product decision —
+  the engine only says what is readable. `repairLatestVersion` itself is
+  unchanged.
+
+  The replay core moved from `VersionManager.reconstructVersion` into a shared
+  `reconstructFromHistory` so verification replays the same algorithm over its
+  pre-loaded bytes; reconstruction behaviour is unchanged.
+
 ## 2.6.0
 
 ### Minor Changes
