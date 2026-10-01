@@ -45,7 +45,7 @@ export async function evaluate(
 }
 
 /** True when `status:forgotten` appears in a positive (non-negated) position. */
-function asksForForgotten(node: SelectorNode, positive: boolean): boolean {
+export function asksForForgotten(node: SelectorNode, positive: boolean): boolean {
   switch (node.type) {
     case "statusFilter":
       return positive && normalizeStatus(node.value) === "forgotten";
