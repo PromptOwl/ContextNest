@@ -417,9 +417,19 @@ export async function assertNotForgotten(
       "was forgotten or deleted — its path cannot take content again; publish under a new path",
     );
   }
-  const body = forgettableBodyHash(node.rawContent || serializeDocument(node));
-  if (body && tombstones.bodyHashes.has(body)) {
-    throw new ForgottenDocumentError(node.id, "carries the content of a forgotten node");
+  const raw = node.rawContent || serializeDocument(node);
+  // A draft that has not been through disk yet serializes without the leading
+  // newline that parse → serialize adds (what publish seals, so what a forget
+  // records). Check that round-tripped form too, or a fresh import of erased
+  // content hashes differently from its erased twin and slips through.
+  const forms = node.rawContent
+    ? [raw]
+    : [raw, serializeDocument(parseDocument(`${node.id}.md`, raw, node.id))];
+  for (const form of forms) {
+    const body = forgettableBodyHash(form);
+    if (body && tombstones.bodyHashes.has(body)) {
+      throw new ForgottenDocumentError(node.id, "carries the content of a forgotten node");
+    }
   }
 }
 
