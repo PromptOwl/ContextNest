@@ -1422,6 +1422,156 @@ describe("[regression] ctx push", () => {
   });
 });
 
+// ─── ctx query @org/pack-name — PromptOwl cloud route (QRY-05) ───────────────
+// `ctx query @org/pack` leaves the local vault entirely and injects a hosted
+// pack over HTTP(S). The cloud is mocked with a loopback HTTP server (plaintext
+// to a loopback address is allowed without --force, per assertSafeEndpoint)
+// selected with PROMPTOWL_API_URL, so the full request/response contract — the
+// POST path and body, the rendered success + --json, and the quota/error
+// branches — is pinned without a real hosted engine.
+
+describe("[regression] ctx query — PromptOwl cloud pack route", () => {
+  interface CloudServer {
+    url: string;
+    lastPath: () => string | undefined;
+    lastBody: () => unknown;
+    close: () => Promise<void>;
+  }
+
+  /** An ephemeral cloud stub for the `/v1/packs/:org/:pack/inject` endpoint. */
+  function startMockCloud(
+    reply: () => { status: number; json?: unknown; text?: string },
+  ): Promise<CloudServer> {
+    return new Promise((resolve) => {
+      let path: string | undefined;
+      let captured: unknown;
+      const server: Server = createServer((req, res) => {
+        path = req.url;
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          captured = raw ? JSON.parse(raw) : null;
+          const r = reply();
+          if (r.text !== undefined) {
+            res.writeHead(r.status, { "Content-Type": "text/plain" });
+            res.end(r.text);
+          } else {
+            res.writeHead(r.status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(r.json));
+          }
+        });
+      });
+      server.listen(0, () => {
+        const port = (server.address() as AddressInfo).port;
+        resolve({
+          url: `http://127.0.0.1:${port}`,
+          lastPath: () => path,
+          lastBody: () => captured,
+          close: () => new Promise((rr) => server.close(() => rr())),
+        });
+      });
+    });
+  }
+
+  /** Run the CLI with PROMPTOWL_API_URL pointed at the mock, tolerating failure. */
+  async function runCloud(
+    cwd: string,
+    args: string[],
+    apiUrl: string,
+  ): Promise<{ status: number; stdout: string; stderr: string }> {
+    const env = { ...ENV, PROMPTOWL_API_URL: apiUrl } as NodeJS.ProcessEnv;
+    try {
+      const { stdout, stderr } = await execFileAsync("node", [distPath, ...args], {
+        cwd,
+        env,
+        encoding: "utf-8",
+      });
+      return { status: 0, stdout, stderr };
+    } catch (e: any) {
+      return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    }
+  }
+
+  it("rejects an @selector that is not @org/pack, before any network call", () => {
+    // No slash → a format error up front (exit 1); nothing is fetched.
+    const res = runCtxResult(tmp, ["query", "@notapack"]);
+    expect(res.status).toBe(1);
+    const out = res.stdout + res.stderr;
+    expect(out).toMatch(/Invalid cloud pack format/);
+    expect(out).toMatch(/@org\/pack-name/);
+  });
+
+  it("injects a cloud pack: POSTs the right path and body, renders docs and metering", async () => {
+    const server = await startMockCloud(() => ({
+      status: 200,
+      json: {
+        documents: [
+          { id: "nodes/a", title: "Alpha", body: "A", type: "document", version: 1 },
+          { id: "nodes/b", title: "Beta", body: "B", type: "document", version: 2 },
+        ],
+        metering: { credits_used: 2, remaining_today: 98, plan: "pro" },
+      },
+    }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status, res.stderr).toBe(0);
+      // Routing contract: the org/pack split and the `pack:` selector body.
+      expect(server.lastPath()).toBe("/v1/packs/promptowl/my-pack/inject");
+      expect(server.lastBody()).toEqual({ selector: "pack:my-pack", format: "markdown" });
+      // Rendered surface: each document, then the metering line.
+      expect(res.stdout).toMatch(/nodes\/a: Alpha/);
+      expect(res.stdout).toMatch(/nodes\/b: Beta/);
+      expect(res.stdout).toMatch(/2 credit\(s\) used, 98 remaining today \(pro plan\)/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("--json prints the raw cloud payload verbatim", async () => {
+    const payload = {
+      documents: [{ id: "nodes/a", title: "Alpha", body: "A", type: "document", version: 1 }],
+      metering: { credits_used: 1, remaining_today: 42, plan: "free" },
+    };
+    const server = await startMockCloud(() => ({ status: 200, json: payload }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack", "--json"], server.url);
+      expect(res.status, res.stderr).toBe(0);
+      // A "☁ Fetching…" status line precedes the JSON; parse from the first brace.
+      const json = JSON.parse(res.stdout.slice(res.stdout.indexOf("{")));
+      expect(json).toEqual(payload);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("surfaces a 429 quota response with the upgrade hint and exits non-zero", async () => {
+    const server = await startMockCloud(() => ({
+      status: 429,
+      json: { message: "Query quota exceeded for today", upgrade_url: "https://promptowl.ai/upgrade" },
+    }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status).toBe(1);
+      const out = res.stdout + res.stderr;
+      expect(out).toMatch(/Query quota exceeded for today/);
+      expect(out).toMatch(/Upgrade: https:\/\/promptowl\.ai\/upgrade/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports a non-OK cloud response with its status and body, and exits non-zero", async () => {
+    const server = await startMockCloud(() => ({ status: 500, text: "internal boom" }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status).toBe(1);
+      expect(res.stdout + res.stderr).toMatch(/Cloud query failed \(500\): internal boom/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 // ─── end-to-end flows ───────────────────────────────────────────────────────
 // Unlike the atomic command tests above, each test here runs a complete
 // user journey on a SINGLE document and asserts state at every step — the
