@@ -12,6 +12,15 @@ import type {
   SuggestionMeta,
   VersionEntry,
 } from "./types.js";
+
+/**
+ * The part of a document's history a seal reads: each version's number and
+ * chain hash. A full `DocumentHistory` fits; so does the one entry carried
+ * forward from the previous head.
+ */
+type SealHistory = {
+  versions: ReadonlyArray<Pick<VersionEntry, "version" | "chain_hash">>;
+};
 import { computeCheckpointHash, computeChainHash } from "./integrity.js";
 import { NestStorage, type CheckpointChainState } from "./storage.js";
 import { mapInBatches } from "./concurrency.js";
@@ -286,15 +295,20 @@ export class CheckpointManager {
       ).filter(isPublished);
       // Snapshot before the reads: a write that lands during the seal stays
       // marked for the next one.
-      const touched = new Set(this.storage.touchedHistories);
+      const touched = this.storage.touchedHistorySnapshot();
       const chainState = await this.storage.readCheckpointChainState();
-      let documentHistories: Map<string, DocumentHistory>;
+      let documentHistories: Map<string, SealHistory>;
       if (chainState.kind === "head") {
         // Every publish seals, so the head already holds the chain hash of each
         // document at the version it had then. Reading every history.yaml
         // again made each publish cost one read per document in the vault —
         // a full walk of a network-backed mount under the vault lock. Read
         // only the documents the head cannot vouch for.
+        //
+        // A hash the head sealed is carried forward as is. If the head sealed
+        // a mismatched hash (the torn-snapshot fallback below), later seals at
+        // that version keep it, where a full re-read would have healed it.
+        // `verify` still flags it, and the next version bump re-reads the doc.
         const head = chainState.checkpoint;
         documentHistories = new Map();
         const stale: string[] = [];
@@ -302,10 +316,7 @@ export class CheckpointManager {
           const hash = head.document_chain_hashes[doc.id];
           const version = doc.frontmatter.version || 1;
           if (hash && head.document_versions[doc.id] === version && !touched.has(doc.id)) {
-            documentHistories.set(doc.id, {
-              keyframe_interval: 1,
-              versions: [{ version, chain_hash: hash } as VersionEntry],
-            });
+            documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
           } else {
             stale.push(doc.id);
           }
@@ -315,7 +326,8 @@ export class CheckpointManager {
             const history = await this.storage.readHistory(id);
             if (history) documentHistories.set(id, history);
           } catch {
-            // Unreadable: no hash, the same as the full crawl skipping it.
+            // Unreadable: no hash for this doc, the same as the full crawl
+            // (called without `onUnreadable`) skipping it. `verify` reports it.
           }
         });
       } else {
@@ -327,7 +339,7 @@ export class CheckpointManager {
         documentHistories,
         chainState,
       );
-      for (const id of touched) this.storage.touchedHistories.delete(id);
+      this.storage.clearTouchedHistories(touched);
       return checkpoint;
     });
   }
@@ -339,7 +351,7 @@ export class CheckpointManager {
   private async sealCheckpoint(
     triggeredBy: string,
     publishedDocuments: ContextNode[],
-    documentHistories: Map<string, DocumentHistory>,
+    documentHistories: ReadonlyMap<string, SealHistory>,
     knownChainState?: CheckpointChainState,
   ): Promise<Checkpoint> {
     {

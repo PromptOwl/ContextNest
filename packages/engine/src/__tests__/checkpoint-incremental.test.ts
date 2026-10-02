@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NestStorage } from "../storage.js";
@@ -68,6 +68,8 @@ describe("checkpoint seal — reads only the histories that changed", () => {
     await publish("nodes/doc-3", "v2");
 
     expect(findAll).not.toHaveBeenCalled();
+    // The seal consumed every mark, including the 10 earlier publishes'.
+    expect(storage.touchedHistorySnapshot().size).toBe(0);
     // The publish itself reads doc-3's history; the seal adds no other doc.
     const others = readHistory.mock.calls.filter(([id]) => id !== "nodes/doc-3");
     expect(others).toEqual([]);
@@ -88,7 +90,7 @@ describe("checkpoint seal — reads only the histories that changed", () => {
     expect(state.checkpoint.document_chain_hashes["nodes/a"]).toBe(fresh.versions.at(-1)!.chain_hash);
   });
 
-  it("does not reuse a deleted document's hash for a re-created one at the same version", async () => {
+  it("re-reads a deleted then re-created document, though its version number is the same", async () => {
     await publish("nodes/a", "first life");
     await publish("nodes/b", "b1");
     await storage.deleteDocument("nodes/a");
@@ -107,5 +109,41 @@ describe("checkpoint seal — reads only the histories that changed", () => {
     await publishDocument(other, "nodes/a", { editedBy: "other" });
     await publish("nodes/b", "b2");
     await expectHeadMatchesDisk();
+  });
+  it("reads every history when there is no head to build on", async () => {
+    const findAll = vi.spyOn(storage, "findAllHistories");
+    await publish("nodes/first", "v1"); // no chain file yet
+    expect(findAll).toHaveBeenCalledTimes(1);
+
+    // An unreadable chain file has no head either: same full read.
+    await writeFile(join(root, ".versions", "context_history.yaml"), "versions: [unclosed");
+    await publish("nodes/second", "v1");
+    expect(findAll).toHaveBeenCalledTimes(2);
+  });
+
+  it("seals without a hash for a changed document whose history is unreadable", async () => {
+    await publish("nodes/a", "a1");
+    await publish("nodes/b", "b1");
+    // Another process bumped b's version and left its history unreadable.
+    const bPath = join(root, "nodes", "b.md");
+    await writeFile(bPath, (await readFile(bPath, "utf-8")).replace(/^version: 1$/m, "version: 2"));
+    await writeFile(join(root, "nodes", ".versions", "b", "history.yaml"), "versions: [unclosed");
+
+    await publish("nodes/a", "a2");
+
+    const state = await storage.readCheckpointChainState();
+    if (state.kind !== "head") throw new Error("no head");
+    expect(state.checkpoint.document_chain_hashes["nodes/b"]).toBeUndefined();
+    expect(state.checkpoint.document_chain_hashes["nodes/a"]).toBeDefined();
+  });
+
+  it("keeps a mark set again during a seal for the next seal", async () => {
+    await publish("nodes/a", "a1");
+    const history = (await storage.readHistory("nodes/a"))!;
+    await storage.writeHistory("nodes/a", history);
+    const snapshot = storage.touchedHistorySnapshot();
+    await storage.writeHistory("nodes/a", history); // lands "during" the seal
+    storage.clearTouchedHistories(snapshot);
+    expect(storage.touchedHistorySnapshot().has("nodes/a")).toBe(true);
   });
 });

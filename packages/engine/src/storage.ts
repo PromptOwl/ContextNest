@@ -577,7 +577,28 @@ export class NestStorage {
    * it, and a delete + re-create can reuse a version number. See
    * `CheckpointManager.createCheckpointFromVault`.
    */
-  readonly touchedHistories = new Set<string>();
+  private touchedHistories = new Map<string, number>();
+  private touchSeq = 0;
+
+  private markHistoryTouched(docId: string): void {
+    this.touchedHistories.set(docId, ++this.touchSeq);
+  }
+
+  /** Which histories were touched since the last seal, each with its mark. */
+  touchedHistorySnapshot(): ReadonlyMap<string, number> {
+    return new Map(this.touchedHistories);
+  }
+
+  /**
+   * Clear the marks a seal consumed. A mark set again after the snapshot (a
+   * write that landed during the seal) has a new number, so it stays for the
+   * next seal.
+   */
+  clearTouchedHistories(snapshot: ReadonlyMap<string, number>): void {
+    for (const [id, seq] of snapshot) {
+      if (this.touchedHistories.get(id) === seq) this.touchedHistories.delete(id);
+    }
+  }
 
   /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
@@ -1601,7 +1622,7 @@ export class NestStorage {
   async deleteDocument(id: string): Promise<void> {
     // Drop the cached serve-path verdict with the document it describes.
     this.historyVerdicts.delete(id);
-    this.touchedHistories.add(id);
+    this.markHistoryTouched(id);
     const filePath = join(this.root, `${id}.md`);
     // A pdf node owns the binary beside it (§1.11): find it BEFORE the .md —
     // the only record of it — is gone. Only the node's own `<id>.pdf` is ever
@@ -1785,7 +1806,7 @@ export class NestStorage {
    * collides with the artifacts already on disk.
    */
   async quarantineHistory(docId: string): Promise<string> {
-    this.touchedHistories.add(docId);
+    this.markHistoryTouched(docId);
     return quarantine(this.historyPath(docId));
   }
 
@@ -1876,7 +1897,7 @@ export class NestStorage {
    * the file for appending. Anything else here is a latent break in append.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
-    this.touchedHistories.add(docId);
+    this.markHistoryTouched(docId);
     const { versions: plainVersions, ...rest } = history;
     const versions: VersionEntry[] = [];
     for (const v of plainVersions) versions.push(await this.sealEntry(docId, v));
@@ -1915,7 +1936,7 @@ export class NestStorage {
     entry: VersionEntry,
     keyframeInterval: number,
   ): Promise<void> {
-    this.touchedHistories.add(docId);
+    this.markHistoryTouched(docId);
     const path = this.historyPath(docId);
     await mkdir(dirname(path), { recursive: true });
 
