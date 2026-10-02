@@ -454,6 +454,19 @@ describe("[regression] remote nests — guardrails", () => {
     expect(res.stderr + res.stdout).toMatch(/farnest/);
   });
 
+  // The review gate is a local vault's setting — a hosted nest governs its own
+  // writes — so `ctx config` / `ctx review` refuse a remote alias outright
+  // rather than silently acting on whatever local vault the cwd resolves to.
+  it.each([["config", "get", "review"], ["config", "set", "review", "off"], ["review", "list"]])(
+    "`ctx %s %s` refuses a remote alias before touching the network",
+    (...cmd: string[]) => {
+      const res = run(cwd, [...cmd, "--vault", "farnest"]);
+      expect(res.status).not.toBe(0);
+      expect(res.status).not.toBe(REMOTE_UNREACHABLE_EXIT); // guard error, not connectivity
+      expect(res.stderr + res.stdout).toMatch(/local vault only/i);
+    },
+  );
+
   it("an unreachable HTTP remote exits with code 3 and names the alias", async () => {
     const port = await closedPort();
     const yaml = [
