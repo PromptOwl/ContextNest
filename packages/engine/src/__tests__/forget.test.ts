@@ -213,7 +213,22 @@ describe("forget protocol — node forget (§6.3.3)", () => {
     const full = await new GraphQueryEngine(storage).query("#patients", { full: true, includeDrafts: true });
     expect(full.documents.map((d) => d.id)).not.toContain(id);
 
-    const search = await api.run<{ results: Array<{ id: string }> }>("context_search", { query: "diagnosis" }, ctx);
+    // An explicit status:forgotten returns the empty stub on the query surfaces
+    // too, in both default and full mode, and `#patients` still hides it.
+    for (const opts of [{}, { full: true }]) {
+      const asked = await new GraphQueryEngine(storage).query("status:forgotten", opts);
+      expect(asked.documents.map((d) => d.id)).toEqual([id]);
+      expect(asked.documents[0].frontmatter.status).toBe("forgotten");
+      expect(asked.documents[0].body.trim()).toBe("");
+    }
+    const viaApi = await api.run<{ documents: Array<{ id: string }> }>(
+      "context_query",
+      { query: "status:forgotten" },
+      ctx,
+    );
+    expect(viaApi.documents.map((d) => d.id)).toEqual([id]);
+
+    const search =await api.run<{ results: Array<{ id: string }> }>("context_search", { query: "diagnosis" }, ctx);
     expect(search.results.map((r) => r.id)).not.toContain(id);
 
     const docs = await storage.discoverDocuments({ includeRetired: true });
@@ -452,6 +467,29 @@ describe("forget protocol — anti-resurrection (§6.3.4)", () => {
     await expect(
       api.run("context_import_pdf", { bytes_base64, title: "Fresh Name" }, ctx),
     ).rejects.toMatchObject({ code: "FORGOTTEN_DOCUMENT" });
+  });
+
+  it("context_import refuses erased content under a new title (draft hash matches published form)", async () => {
+    const body = "SOURCE-SECRET-KIWI-2 revised body 5678";
+    const { id: sharedId } = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Shared", content: body },
+      ctx,
+    );
+    await forgetDocument(storage, sharedId, { reasonCode: "user_request", forgottenBy: "s@example.com" });
+    await expect(
+      api.run("context_create", { title: "Other Name", content: body }, ctx),
+    ).rejects.toMatchObject({ code: "FORGOTTEN_DOCUMENT" });
+    const res = await api.run<{ published: unknown[]; failed: Array<{ error: string }> }>(
+      "context_import",
+      { documents: [{ title: "New Name", content: body }] },
+      ctx,
+    );
+    expect(res.published).toEqual([]);
+    expect(res.failed.length).toBe(1);
+    expect(res.failed[0].error).toContain("carries the content of a forgotten node");
+    expect(existsSync(join(dir, "nodes", "new-name.md"))).toBe(false);
+    expect(await filesContaining(dir, "SOURCE-SECRET")).toEqual([]);
   });
 
   it("a copied vault carries its tombstones (export is the directory)", async () => {
