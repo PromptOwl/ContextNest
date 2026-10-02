@@ -10,9 +10,11 @@ import type {
   DocumentHistory,
   GovernanceTier,
   SuggestionMeta,
+  VersionEntry,
 } from "./types.js";
 import { computeCheckpointHash, computeChainHash } from "./integrity.js";
-import { NestStorage } from "./storage.js";
+import { NestStorage, type CheckpointChainState } from "./storage.js";
+import { mapInBatches } from "./concurrency.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
 import { isPublished } from "./parser.js";
@@ -282,12 +284,51 @@ export class CheckpointManager {
       const publishedDocuments = (
         await this.storage.discoverDocuments()
       ).filter(isPublished);
-      const documentHistories = await this.storage.findAllHistories();
-      return this.sealCheckpoint(
+      // Snapshot before the reads: a write that lands during the seal stays
+      // marked for the next one.
+      const touched = new Set(this.storage.touchedHistories);
+      const chainState = await this.storage.readCheckpointChainState();
+      let documentHistories: Map<string, DocumentHistory>;
+      if (chainState.kind === "head") {
+        // Every publish seals, so the head already holds the chain hash of each
+        // document at the version it had then. Reading every history.yaml
+        // again made each publish cost one read per document in the vault —
+        // a full walk of a network-backed mount under the vault lock. Read
+        // only the documents the head cannot vouch for.
+        const head = chainState.checkpoint;
+        documentHistories = new Map();
+        const stale: string[] = [];
+        for (const doc of publishedDocuments) {
+          const hash = head.document_chain_hashes[doc.id];
+          const version = doc.frontmatter.version || 1;
+          if (hash && head.document_versions[doc.id] === version && !touched.has(doc.id)) {
+            documentHistories.set(doc.id, {
+              keyframe_interval: 1,
+              versions: [{ version, chain_hash: hash } as VersionEntry],
+            });
+          } else {
+            stale.push(doc.id);
+          }
+        }
+        await mapInBatches(stale, async (id) => {
+          try {
+            const history = await this.storage.readHistory(id);
+            if (history) documentHistories.set(id, history);
+          } catch {
+            // Unreadable: no hash, the same as the full crawl skipping it.
+          }
+        });
+      } else {
+        documentHistories = await this.storage.findAllHistories();
+      }
+      const checkpoint = await this.sealCheckpoint(
         triggeredBy,
         publishedDocuments,
         documentHistories,
+        chainState,
       );
+      for (const id of touched) this.storage.touchedHistories.delete(id);
+      return checkpoint;
     });
   }
 
@@ -299,6 +340,7 @@ export class CheckpointManager {
     triggeredBy: string,
     publishedDocuments: ContextNode[],
     documentHistories: Map<string, DocumentHistory>,
+    knownChainState?: CheckpointChainState,
   ): Promise<Checkpoint> {
     {
       // Re-read inside the lock so the checkpoint number and previous-hash
@@ -310,7 +352,8 @@ export class CheckpointManager {
       // The full state, not just the head: whether the existing file gets
       // quarantined below turns on WHY there is no head, and a transient read
       // failure throws out of here rather than being mistaken for one.
-      const chainState = await this.storage.readCheckpointChainState();
+      const chainState =
+        knownChainState ?? (await this.storage.readCheckpointChainState());
       const previousCheckpoint =
         chainState.kind === "head" ? chainState.checkpoint : null;
 

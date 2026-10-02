@@ -570,6 +570,16 @@ export class NestStorage {
   >();
 
   /**
+   * Documents whose history.yaml this instance wrote, rewrote, moved aside or
+   * deleted since the last checkpoint. A checkpoint reuses the previous head's
+   * chain hash only for a document NOT in here whose version is unchanged — a
+   * rewrite (`repairLatestVersion`) can re-hash a version without renumbering
+   * it, and a delete + re-create can reuse a version number. See
+   * `CheckpointManager.createCheckpointFromVault`.
+   */
+  readonly touchedHistories = new Set<string>();
+
+  /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
    * concurrent callers in this process. `createCheckpoint` reads, mutates, and
    * rewrites `context_history.yaml`; without this lock concurrent publishes
@@ -1591,6 +1601,7 @@ export class NestStorage {
   async deleteDocument(id: string): Promise<void> {
     // Drop the cached serve-path verdict with the document it describes.
     this.historyVerdicts.delete(id);
+    this.touchedHistories.add(id);
     const filePath = join(this.root, `${id}.md`);
     // A pdf node owns the binary beside it (§1.11): find it BEFORE the .md —
     // the only record of it — is gone. Only the node's own `<id>.pdf` is ever
@@ -1774,6 +1785,7 @@ export class NestStorage {
    * collides with the artifacts already on disk.
    */
   async quarantineHistory(docId: string): Promise<string> {
+    this.touchedHistories.add(docId);
     return quarantine(this.historyPath(docId));
   }
 
@@ -1864,6 +1876,7 @@ export class NestStorage {
    * the file for appending. Anything else here is a latent break in append.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
+    this.touchedHistories.add(docId);
     const { versions: plainVersions, ...rest } = history;
     const versions: VersionEntry[] = [];
     for (const v of plainVersions) versions.push(await this.sealEntry(docId, v));
@@ -1902,6 +1915,7 @@ export class NestStorage {
     entry: VersionEntry,
     keyframeInterval: number,
   ): Promise<void> {
+    this.touchedHistories.add(docId);
     const path = this.historyPath(docId);
     await mkdir(dirname(path), { recursive: true });
 
