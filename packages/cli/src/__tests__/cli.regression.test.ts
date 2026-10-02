@@ -278,6 +278,20 @@ describe("[regression] ctx init", () => {
     expect(out).toMatch(/developer/);
     expect(existsSync(join(tmp, ".context", "config.yaml"))).toBe(false);
   });
+
+  it("--layout obsidian scaffolds a flat vault without the structured node directories", () => {
+    const out = runCtx(tmp, ["init", "--name", "regression-vault", "--layout", "obsidian"]);
+    expect(out).toMatch(/Initialized obsidian vault/);
+
+    // The shared scaffold lands under either layout.
+    expect(existsSync(join(tmp, ".context", "config.yaml"))).toBe(true);
+    expect(existsSync(join(tmp, "CONTEXT.md"))).toBe(true);
+    // Obsidian is the flat layout: none of structured's node directories are
+    // created — notes live at the vault root (storage.ts detectLayout()).
+    expect(existsSync(join(tmp, "nodes"))).toBe(false);
+    expect(existsSync(join(tmp, "sources"))).toBe(false);
+    expect(existsSync(join(tmp, "packs"))).toBe(false);
+  });
 });
 
 // ─── add ─────────────────────────────────────────────────────────────────────
@@ -2239,6 +2253,25 @@ describe("[regression] ctx import pdf", () => {
     const res = runCtxResult(tmp, ["import", "pdf", join(tmp, "notes.txt")]);
     expect(res.status).not.toBe(0);
     expect(res.stderr + res.stdout).toMatch(/%PDF-/);
+  });
+
+  it("refuses to hand-edit a pdf node's body while still allowing a metadata edit", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--id", "nodes/q3"]);
+
+    // The body is the extracted text — the binary is the source of truth, so an
+    // --body edit is refused (import a new PDF version instead).
+    const edit = runCtxResult(tmp, ["update", "nodes/q3", "--body", "hand edited text"]);
+    expect(edit.status).not.toBe(0);
+    expect(edit.stderr + edit.stdout).toMatch(/is a PDF node/);
+    expect(edit.stderr + edit.stdout).toMatch(/cannot be edited directly/);
+    // The refusal is before any write: the extracted text on disk is untouched.
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toContain("Revenue grew 12 percent.");
+
+    // Metadata still edits — the refusal is body-specific, not a blanket lock.
+    const rename = runCtxResult(tmp, ["update", "nodes/q3", "--title", "Q3 Renamed"]);
+    expect(rename.status).toBe(0);
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toMatch(/title: Q3 Renamed/);
   });
 });
 
