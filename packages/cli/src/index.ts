@@ -25,6 +25,7 @@ import {
   GraphQueryEngine,
   publishDocument,
   ContextNestError,
+  DocumentNotFoundError,
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
@@ -91,7 +92,8 @@ import {
   folderFromId,
   remoteFetchRecipe,
 } from "./remote.js";
-import { planPull, applyPull, type PullStep } from "./pull.js";
+import { planPull, applyPull, type PullStep, kindDocId, parseKindDocument } from "./pull.js";
+import { planKindApply, executeKindPlan, renderKindPlan, parseStewardMappings } from "./kind.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -262,6 +264,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
     commands: [
       ["push", "Push the vault to a hosted ContextNest server"],
       ["pull", "Pull a recipe from a remote nest into this vault, as drafts with lineage"],
+      ["kind", "Apply a pulled kind (edge types, edges, schedules, plugins, stewards) to a hosted nest"],
     ],
   },
 ];
@@ -3862,12 +3865,17 @@ Example:
     if (conflicts.length > 0) {
       console.log(chalk.red(`${conflicts.length} conflict(s) left untouched — those paths hold documents this recipe did not pull.`));
     }
-    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill");
+    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill" || s.kind === "kind");
     if (docs.length > 0) {
       console.log(chalk.dim("Pulled documents are drafts. Review them, then publish: ctx publish <path>"));
     }
     for (const skill of written.filter((s) => s.kind === "skill")) {
       console.log(chalk.dim(`Install the skill so it can't drift: ctx skill install ${skill.to} --mode loader --write`));
+    }
+    for (const k of written.filter((s) => s.kind === "kind")) {
+      console.log(
+        chalk.dim(`Kind written: ${k.to} — review and publish it, then: ctx kind apply ${fetched.manifest.id} --server <url> --nest <id>`),
+      );
     }
     const files = written.filter((s) => s.kind === "file");
     for (const file of files) {
@@ -3875,6 +3883,111 @@ Example:
         console.log(chalk.dim(`Template written: ${file.to} — fill it in and rename it before syncing.`));
       }
     }
+  });
+
+// ─── ctx kind ────────────────────────────────────────────────────────────────
+
+const kindCommand = program
+  .command("kind")
+  .description("Apply the server-side half of a recipe (a kind) to a hosted nest");
+
+kindCommand
+  .command("apply <kind-id>")
+  .description("Apply a pulled kind to a hosted nest — prints the plan; --yes sends it")
+  .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
+  .requiredOption("--nest <id>", "Target nest ID")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option(
+    "--steward <mapping>",
+    "Map a steward placeholder to a person: @placeholder=email (repeatable)",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[],
+  )
+  .option("--json", "Print the plan and result as JSON")
+  .addHelpText(
+    "after",
+    `
+Reads nodes/kinds/<kind-id> from the local vault (written by \`ctx pull\` when a
+recipe carries a kind: section) and maps it onto the server's REST API: edge
+types, edges and schedules (workflow plane), plugin configuration (plugins
+plane) and steward roles. Planes the server has switched off are skipped with
+a warning. Plugins are configured but never enabled, and secrets are never
+sent: set them on the server. Stewards apply only once each placeholder is
+mapped with --steward.
+
+Dry run by default: nothing but GETs leaves the machine until --yes is passed.
+
+Example:
+  ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com
+  ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com --yes`,
+  )
+  .action(async (kindId: string, opts: { server: string; nest: string; key?: string; steward: string[]; json?: boolean }, cmd: Command) => {
+    const apiKey = opts.key ?? process.env.CONTEXTNEST_API_KEY;
+    if (!apiKey) {
+      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+      process.exit(1);
+    }
+    assertSafeEndpoint(opts.server, "--server");
+    const stewards = parseStewardMappings(opts.steward);
+
+    const storage = getStorage();
+    const id = kindDocId(kindId);
+    const node = await storage.readDocument(id).catch((err) => {
+      if (err instanceof DocumentNotFoundError) {
+        throw new ContextNestError(
+          `No kind "${kindId}" in this vault (expected ${id}) — pull a recipe that carries a kind: section first.`,
+          "DOCUMENT_NOT_FOUND",
+        );
+      }
+      throw err;
+    });
+    const kind = parseKindDocument(node.body);
+
+    const target = { server: opts.server.replace(/\/$/, ""), nest: opts.nest, apiKey };
+    const plan = await planKindApply(kindId, kind, target, { stewards });
+    const execute = cmd.optsWithGlobals().yes === true && !isDryRun();
+    const draft = node.frontmatter.status !== "published";
+
+    if (execute) await executeKindPlan(plan, target);
+    const failed = plan.steps.filter((s) => s.result === "failed");
+
+    if (opts.json) {
+      console.log(
+        JSON.stringify(
+          {
+            kind: kindId,
+            document: id,
+            status: node.frontmatter.status,
+            server: target.server,
+            nest: target.nest,
+            dry_run: !execute,
+            steps: plan.steps,
+            warnings: plan.warnings,
+            runner_handlers: plan.runnerHandlers,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(chalk.bold(`Kind ${kindId} → ${target.server} nest ${target.nest}\n`));
+      if (draft) {
+        console.log(chalk.yellow(`! ${id} is ${node.frontmatter.status}, not published — review it before applying.\n`));
+      }
+      for (const line of renderKindPlan(plan)) console.log(line);
+      console.log("");
+      const planned = plan.steps.filter((s) => s.action === "apply").length;
+      if (!execute) {
+        console.log(chalk.yellow(`Dry run — ${planned} request(s) planned, nothing sent. Rerun with --yes to apply.`));
+      } else {
+        console.log(
+          failed.length
+            ? chalk.red(`${planned - failed.length} of ${planned} request(s) applied; ${failed.length} failed.`)
+            : chalk.green(`Applied ${planned} request(s).`),
+        );
+      }
+    }
+    if (failed.length) process.exit(1);
   });
 
 // ─── ctx vault ───────────────────────────────────────────────────────────────

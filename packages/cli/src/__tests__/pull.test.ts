@@ -64,7 +64,9 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { parseRecipeManifest, planPull, applyPull, extractYamlBlock, skillBlockFromBody } = await import("../pull.js");
+const { parseRecipeManifest, planPull, applyPull, extractYamlBlock, skillBlockFromBody, parseKindDocument, kindDocId } = await import(
+  "../pull.js"
+);
 const { remoteFetchRecipe } = await import("../remote.js");
 
 const target = { alias: "recipes", spec: { transport: "stdio", command: "node" } as RemoteNestSpec };
@@ -399,5 +401,233 @@ describe("pull — re-pull", () => {
     const again = await pullOnce();
     expect(again.find((s) => s.kind === "file")!.action).toBe("create");
     expect(existsSync(join(root, "stewards.example.yaml"))).toBe(true);
+  });
+});
+
+// ─── Kind section ───────────────────────────────────────────────────────────
+
+const KIND_YAML = `id: seam
+label: Seam Kind
+includes:
+  - from: nodes/org/spine/method
+    to: nodes/methodologies/method
+kind:
+  plugins:
+    - name: github
+      mode: summary
+      settings:
+        repos: [promptowl/contextnest]
+        folder_hint: inbox
+        max_items: 50
+  edge_types:
+    - name: escalates-when
+      description: Escalate the source to the target when the condition holds.
+      is_flow: true
+      condition_schema:
+        params: [CAC]
+        mode_default: structured
+  edges:
+    - from: nodes/methodologies/method
+      to: nodes/agents/triage
+      type: escalates-when
+      condition:
+        mode: structured
+        term: CAC
+        op: ">"
+        value: 500
+    - from: nodes/agents/triage
+      to: nodes/methodologies/method
+      type: depends-on
+    - from: nodes/agents/triage
+      to: nodes/agents/digest
+      type: next
+      condition:
+        mode: nl
+        text: only when the triage found something new
+  schedules:
+    - agent: nodes/agents/triage
+      every_minutes: 60
+  stewards:
+    - scope: document
+      target: nodes/methodologies/method
+      role: reviewer
+      principal: "@seam-owner"
+    - scope: tag
+      target: "#Seam"
+      role: editor
+      principal: "@seam-editors"
+    - scope: nest
+      role: viewer
+      principal: "@seam-owner"
+  runner:
+    handlers: [llm-judge, http]
+`;
+
+const recipeBlock = (yaml: string) => "```yaml recipe\n" + yaml + "\n```\n";
+
+describe("parseRecipeManifest — kind section", () => {
+  it("reads plugins, edge types, edges, schedules, stewards and runner", () => {
+    const m = parseRecipeManifest(recipeBlock(KIND_YAML));
+    expect(m.kind?.plugins).toEqual([
+      { name: "github", mode: "summary", settings: { repos: ["promptowl/contextnest"], folder_hint: "inbox", max_items: 50 } },
+    ]);
+    expect(m.kind?.edge_types).toEqual([
+      {
+        name: "escalates-when",
+        description: "Escalate the source to the target when the condition holds.",
+        is_flow: true,
+        condition_schema: { params: ["CAC"], mode_default: "structured" },
+      },
+    ]);
+    expect(m.kind?.edges).toEqual([
+      {
+        from: "nodes/methodologies/method",
+        to: "nodes/agents/triage",
+        type: "escalates-when",
+        condition: { mode: "structured", term: "CAC", op: ">", value: 500 },
+      },
+      { from: "nodes/agents/triage", to: "nodes/methodologies/method", type: "depends-on" },
+      {
+        from: "nodes/agents/triage",
+        to: "nodes/agents/digest",
+        type: "next",
+        condition: { mode: "nl", text: "only when the triage found something new" },
+      },
+    ]);
+    expect(m.kind?.schedules).toEqual([{ agent: "nodes/agents/triage", every_minutes: 60 }]);
+    expect(m.kind?.stewards).toEqual([
+      { scope: "document", target: "nodes/methodologies/method", role: "reviewer", principal: "@seam-owner" },
+      { scope: "tag", target: "seam", role: "editor", principal: "@seam-editors" },
+      { scope: "nest", role: "viewer", principal: "@seam-owner" },
+    ]);
+    expect(m.kind?.runner).toEqual({ handlers: ["llm-judge", "http"] });
+  });
+
+  it("accepts a recipe that carries only a kind", () => {
+    const m = parseRecipeManifest(recipeBlock("id: bare\nkind:\n  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 5"));
+    expect(m.includes).toEqual([]);
+    expect(m.kind?.schedules).toEqual([{ agent: "nodes/agents/a", every_minutes: 5 }]);
+  });
+
+  it("leaves kind undefined when the manifest has none", () => {
+    expect(parseRecipeManifest(MANIFEST).kind).toBeUndefined();
+  });
+
+  // Each case swaps one piece of a valid kind for a bad one.
+  const kindWith = (body: string, id = "k") => () => parseRecipeManifest(recipeBlock(`id: ${id}\nkind:\n${body}`));
+  const cases: Array<[string, string, RegExp]> = [
+    ["an empty kind", "  plugins: []", /kind names nothing/],
+    ["an unknown kind key", "  secrets:\n    - name: x", /kind\.secrets is not a known field/],
+    ["an unknown plugin key", "  plugins:\n    - name: gh\n      mode: raw\n      enabled: true", /kind\.plugins\[0\]\.enabled is not a known field/],
+    ["a bad plugin mode", "  plugins:\n    - name: gh\n      mode: full", /kind\.plugins\[0\]\.mode must be "raw" or "summary"/],
+    ["a missing plugin mode", "  plugins:\n    - name: gh", /kind\.plugins\[0\]\.mode must be "raw" or "summary"/],
+    ["a duplicate plugin", "  plugins:\n    - name: gh\n      mode: raw\n    - name: GH\n      mode: raw", /kind\.plugins\[1\]\.name "GH" is listed twice/],
+    ["a secret-named setting", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        api_key: abc", /kind\.plugins\[0\]\.settings\.api_key looks like a secret/],
+    ["a token-named setting", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        accessToken: abc", /settings\.accessToken looks like a secret/],
+    ["a secret-looking value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        org: ghp_abcdefghijklmnopqrstuvwxyz0123456789", /kind\.plugins\[0\]\.settings\.org looks like a secret/],
+    ["a ContextNest key value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        label: cnst_0123456789abcdef", /settings\.label looks like a secret/],
+    ["a high-entropy value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        hint: Zx8q2LmN4pR7tV1wY5bC9dF3gH6jK0sA", /settings\.hint looks like a secret/],
+    ["a credentialed URL", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        url: https://bob:hunter2@example.com/x", /settings\.url looks like a secret/],
+    ["a nested settings object", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        deep:\n          a: 1", /settings\.deep must be a string, number, boolean or a list of them/],
+    ["an edge type with a bad name", "  edge_types:\n    - name: \"has space\"\n      description: d", /kind\.edge_types\[0\]\.name "has space" must be letters, digits and dashes/],
+    ["an edge type with no description", "  edge_types:\n    - name: blocks", /kind\.edge_types\[0\]\.description must be a non-empty string/],
+    ["a non-boolean is_flow", "  edge_types:\n    - name: blocks\n      description: d\n      is_flow: yes-please", /kind\.edge_types\[0\]\.is_flow must be true or false/],
+    ["a bad condition schema", "  edge_types:\n    - name: blocks\n      description: d\n      condition_schema:\n        params: CAC", /kind\.edge_types\[0\]\.condition_schema\.params must be a list/],
+    ["a duplicate edge type", "  edge_types:\n    - name: blocks\n      description: d\n    - name: Blocks\n      description: d", /kind\.edge_types\[1\]\.name "Blocks" is listed twice/],
+    ["an edge of an undeclared type", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: blocks", /kind\.edges\[0\]\.type "blocks" is neither declared in kind\.edge_types nor a stock type/],
+    ["an edge leaving nodes/", "  edges:\n    - from: nodes/a\n      to: ../b\n      type: next", /kind\.edges\[0\]\.to "\.\.\/b" must stay inside the vault/],
+    ["a bad condition mode", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: vibes", /kind\.edges\[0\]\.condition\.mode must be structured \| nl \| open/],
+    ["an nl condition without text", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: nl", /kind\.edges\[0\]\.condition\.text must be a non-empty string/],
+    ["an empty structured condition", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: structured", /kind\.edges\[0\]\.condition needs a predicate/],
+    ["a too-frequent schedule", "  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 1", /kind\.schedules\[0\]\.every_minutes must be a whole number from 5 to 10080/],
+    ["a fractional schedule", "  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 7.5", /every_minutes must be a whole number/],
+    ["a duplicate schedule", "  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 10\n    - agent: nodes/agents/a\n      every_minutes: 20", /kind\.schedules\[1\]\.agent "nodes\/agents\/a" is scheduled twice/],
+    ["a real email as steward", "  stewards:\n    - scope: nest\n      role: reviewer\n      principal: jane@example.com", /kind\.stewards\[0\]\.principal must be a placeholder like "@seam-owner"/],
+    ["a bad steward role", "  stewards:\n    - scope: nest\n      role: owner\n      principal: \"@x\"", /kind\.stewards\[0\]\.role must be editor \| reviewer \| viewer/],
+    ["a bad steward scope", "  stewards:\n    - scope: folder\n      role: editor\n      principal: \"@x\"", /kind\.stewards\[0\]\.scope must be document \| tag \| nest/],
+    ["a document steward with no target", "  stewards:\n    - scope: document\n      role: editor\n      principal: \"@x\"", /kind\.stewards\[0\]\.target must be a non-empty string/],
+    ["a nest steward with a target", "  stewards:\n    - scope: nest\n      target: nodes/a\n      role: editor\n      principal: \"@x\"", /kind\.stewards\[0\]\.target is not allowed for scope "nest"/],
+    ["a bad runner handler", "  runner:\n    handlers: [\"\"]", /kind\.runner\.handlers\[0\] must be a non-empty string/],
+  ];
+  it.each(cases)("refuses %s", (_name, body, message) => {
+    let err: unknown;
+    try {
+      kindWith(body)();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ContextNestError);
+    expect((err as ContextNestError).code).toBe("VALIDATION_FAILED");
+    expect((err as Error).message).toMatch(/^Invalid recipe manifest: /);
+    expect((err as Error).message).toMatch(message);
+  });
+
+  it("refuses a kind whose recipe id cannot name a document", () => {
+    expect(kindWith("  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 5", '"a b"')).toThrow(
+      /id "a b" must be a plain name when the recipe carries a kind/,
+    );
+  });
+});
+
+describe("pull — kind persistence", () => {
+  beforeEach(() => {
+    nodes["nodes/org/recipes/recipe-seam"] = { title: "Recipe · Seam", body: `# Seam\n\n${recipeBlock(KIND_YAML)}`, versions: [1, 2] };
+  });
+
+  it("writes the kind as a draft document under nodes/kinds/ with lineage to the recipe", async () => {
+    const fetched = await remoteFetchRecipe(target, "seam");
+    const steps = await planPull(storage, fetched);
+    expect(steps.map((s) => `${s.kind}:${s.action}:${s.to}`)).toEqual([
+      "document:create:nodes/methodologies/method",
+      "kind:create:nodes/kinds/seam",
+    ]);
+    await applyPull(storage, steps);
+
+    expect(kindDocId("seam")).toBe("nodes/kinds/seam");
+    const kindDoc = doc("nodes/kinds/seam");
+    expect(kindDoc.frontmatter.status).toBe("draft");
+    expect(kindDoc.frontmatter.title).toBe("Kind · Seam Kind");
+    expect(kindDoc.frontmatter.tags).toEqual(["#kind"]);
+    expect(kindDoc.frontmatter.derived_from).toEqual(["contextnest://recipes/nodes/org/recipes/recipe-seam"]);
+    expect((kindDoc.frontmatter.metadata as any).pulled_from).toMatchObject({
+      nest: "recipes",
+      id: "nodes/org/recipes/recipe-seam",
+      version: 2,
+      recipe: "seam",
+    });
+    expect(validateDocument(kindDoc).errors).toEqual([]);
+    expect(kindDoc.body).toContain("ctx kind apply seam");
+
+    // The persisted section round-trips through the same validator.
+    expect(parseKindDocument(kindDoc.body)).toEqual(fetched.manifest.kind);
+  });
+
+  it("re-pulls as up-to-date, and offers the update when the recipe moves on", async () => {
+    await applyPull(storage, await planPull(storage, await remoteFetchRecipe(target, "seam")));
+    let again = await planPull(storage, await remoteFetchRecipe(target, "seam"));
+    expect(again.find((s) => s.kind === "kind")!.action).toBe("up-to-date");
+
+    nodes["nodes/org/recipes/recipe-seam"].versions = [1, 2, 3];
+    nodes["nodes/org/recipes/recipe-seam"].body = nodes["nodes/org/recipes/recipe-seam"].body.replace("every_minutes: 60", "every_minutes: 30");
+    again = await planPull(storage, await remoteFetchRecipe(target, "seam"));
+    expect(again.find((s) => s.kind === "kind")!.action).toBe("update-available");
+    again = await planPull(storage, await remoteFetchRecipe(target, "seam"), { update: true });
+    await applyPull(storage, again);
+    expect(parseKindDocument(doc("nodes/kinds/seam").body).schedules).toEqual([{ agent: "nodes/agents/triage", every_minutes: 30 }]);
+  });
+
+  it("never overwrites a local document at the kind's path", async () => {
+    await storage.writeDocument("nodes/kinds/seam", "---\ntitle: Mine\n---\n\nmine\n");
+    const steps = await planPull(storage, await remoteFetchRecipe(target, "seam"), { update: true });
+    expect(steps.find((s) => s.kind === "kind")!.action).toBe("conflict");
+    await applyPull(storage, steps);
+    expect(doc("nodes/kinds/seam").body).toContain("mine");
+  });
+
+  it("parseKindDocument refuses a body without a kind block, and a hand-edited invalid one", () => {
+    expect(() => parseKindDocument("# nothing here\n")).toThrow(/no ```yaml kind block/);
+    expect(() => parseKindDocument("```yaml kind\n{\"schedules\": [{\"agent\": \"nodes/a\", \"every_minutes\": 1}]}\n```\n")).toThrow(
+      /kind\.schedules\[0\]\.every_minutes/,
+    );
   });
 });
