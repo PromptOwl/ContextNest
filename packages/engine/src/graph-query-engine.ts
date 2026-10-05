@@ -140,6 +140,13 @@ export class GraphQueryEngine {
     const ast = parseSelector(selector);
     const seedIds = await evaluateFromIndex(ast, contextYaml.documents, {
       packLoader: (id) => packLoader.get(id),
+      // context.yaml has no bodies, so a search URI would only match titles,
+      // tags and descriptions. Search full text, as context_search does.
+      search: async (query) =>
+        new Resolver({ documents: await this.storage.discoverDocuments() })
+          .search(query)
+          .filter((h) => isPublished(h.document))
+          .map((h) => h.document.id),
     });
 
     // 2. Traverse graph from seeds
