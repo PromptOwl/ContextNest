@@ -7,6 +7,7 @@
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
     "test:regression": "pnpm --filter \"...@promptowl/contextnest-cli\" --filter \"...@promptowl/contextnest-mcp-server\" --filter \"@promptowl/contextnest-engine\" build && vitest run --config vitest.regression.config.ts",
+    "test:pkg": "pnpm --filter \"@promptowl/contextnest-cli\" build && vitest run --config tests/e2e-pkg/vitest.config.ts",
     "lint": "pnpm -r lint",
     "clean": "pnpm -r clean",
     "plugins:sync": "node scripts/sync-plugins.mjs",

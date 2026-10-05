@@ -278,6 +278,20 @@ describe("[regression] ctx init", () => {
     expect(out).toMatch(/developer/);
     expect(existsSync(join(tmp, ".context", "config.yaml"))).toBe(false);
   });
+
+  it("--layout obsidian scaffolds a flat vault without the structured node directories", () => {
+    const out = runCtx(tmp, ["init", "--name", "regression-vault", "--layout", "obsidian"]);
+    expect(out).toMatch(/Initialized obsidian vault/);
+
+    // The shared scaffold lands under either layout.
+    expect(existsSync(join(tmp, ".context", "config.yaml"))).toBe(true);
+    expect(existsSync(join(tmp, "CONTEXT.md"))).toBe(true);
+    // Obsidian is the flat layout: none of structured's node directories are
+    // created — notes live at the vault root (storage.ts detectLayout()).
+    expect(existsSync(join(tmp, "nodes"))).toBe(false);
+    expect(existsSync(join(tmp, "sources"))).toBe(false);
+    expect(existsSync(join(tmp, "packs"))).toBe(false);
+  });
 });
 
 // ─── add ─────────────────────────────────────────────────────────────────────
@@ -1422,6 +1436,156 @@ describe("[regression] ctx push", () => {
   });
 });
 
+// ─── ctx query @org/pack-name — PromptOwl cloud route (QRY-05) ───────────────
+// `ctx query @org/pack` leaves the local vault entirely and injects a hosted
+// pack over HTTP(S). The cloud is mocked with a loopback HTTP server (plaintext
+// to a loopback address is allowed without --force, per assertSafeEndpoint)
+// selected with PROMPTOWL_API_URL, so the full request/response contract — the
+// POST path and body, the rendered success + --json, and the quota/error
+// branches — is pinned without a real hosted engine.
+
+describe("[regression] ctx query — PromptOwl cloud pack route", () => {
+  interface CloudServer {
+    url: string;
+    lastPath: () => string | undefined;
+    lastBody: () => unknown;
+    close: () => Promise<void>;
+  }
+
+  /** An ephemeral cloud stub for the `/v1/packs/:org/:pack/inject` endpoint. */
+  function startMockCloud(
+    reply: () => { status: number; json?: unknown; text?: string },
+  ): Promise<CloudServer> {
+    return new Promise((resolve) => {
+      let path: string | undefined;
+      let captured: unknown;
+      const server: Server = createServer((req, res) => {
+        path = req.url;
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          captured = raw ? JSON.parse(raw) : null;
+          const r = reply();
+          if (r.text !== undefined) {
+            res.writeHead(r.status, { "Content-Type": "text/plain" });
+            res.end(r.text);
+          } else {
+            res.writeHead(r.status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(r.json));
+          }
+        });
+      });
+      server.listen(0, () => {
+        const port = (server.address() as AddressInfo).port;
+        resolve({
+          url: `http://127.0.0.1:${port}`,
+          lastPath: () => path,
+          lastBody: () => captured,
+          close: () => new Promise((rr) => server.close(() => rr())),
+        });
+      });
+    });
+  }
+
+  /** Run the CLI with PROMPTOWL_API_URL pointed at the mock, tolerating failure. */
+  async function runCloud(
+    cwd: string,
+    args: string[],
+    apiUrl: string,
+  ): Promise<{ status: number; stdout: string; stderr: string }> {
+    const env = { ...ENV, PROMPTOWL_API_URL: apiUrl } as NodeJS.ProcessEnv;
+    try {
+      const { stdout, stderr } = await execFileAsync("node", [distPath, ...args], {
+        cwd,
+        env,
+        encoding: "utf-8",
+      });
+      return { status: 0, stdout, stderr };
+    } catch (e: any) {
+      return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    }
+  }
+
+  it("rejects an @selector that is not @org/pack, before any network call", () => {
+    // No slash → a format error up front (exit 1); nothing is fetched.
+    const res = runCtxResult(tmp, ["query", "@notapack"]);
+    expect(res.status).toBe(1);
+    const out = res.stdout + res.stderr;
+    expect(out).toMatch(/Invalid cloud pack format/);
+    expect(out).toMatch(/@org\/pack-name/);
+  });
+
+  it("injects a cloud pack: POSTs the right path and body, renders docs and metering", async () => {
+    const server = await startMockCloud(() => ({
+      status: 200,
+      json: {
+        documents: [
+          { id: "nodes/a", title: "Alpha", body: "A", type: "document", version: 1 },
+          { id: "nodes/b", title: "Beta", body: "B", type: "document", version: 2 },
+        ],
+        metering: { credits_used: 2, remaining_today: 98, plan: "pro" },
+      },
+    }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status, res.stderr).toBe(0);
+      // Routing contract: the org/pack split and the `pack:` selector body.
+      expect(server.lastPath()).toBe("/v1/packs/promptowl/my-pack/inject");
+      expect(server.lastBody()).toEqual({ selector: "pack:my-pack", format: "markdown" });
+      // Rendered surface: each document, then the metering line.
+      expect(res.stdout).toMatch(/nodes\/a: Alpha/);
+      expect(res.stdout).toMatch(/nodes\/b: Beta/);
+      expect(res.stdout).toMatch(/2 credit\(s\) used, 98 remaining today \(pro plan\)/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("--json prints the raw cloud payload verbatim", async () => {
+    const payload = {
+      documents: [{ id: "nodes/a", title: "Alpha", body: "A", type: "document", version: 1 }],
+      metering: { credits_used: 1, remaining_today: 42, plan: "free" },
+    };
+    const server = await startMockCloud(() => ({ status: 200, json: payload }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack", "--json"], server.url);
+      expect(res.status, res.stderr).toBe(0);
+      // A "☁ Fetching…" status line precedes the JSON; parse from the first brace.
+      const json = JSON.parse(res.stdout.slice(res.stdout.indexOf("{")));
+      expect(json).toEqual(payload);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("surfaces a 429 quota response with the upgrade hint and exits non-zero", async () => {
+    const server = await startMockCloud(() => ({
+      status: 429,
+      json: { message: "Query quota exceeded for today", upgrade_url: "https://promptowl.ai/upgrade" },
+    }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status).toBe(1);
+      const out = res.stdout + res.stderr;
+      expect(out).toMatch(/Query quota exceeded for today/);
+      expect(out).toMatch(/Upgrade: https:\/\/promptowl\.ai\/upgrade/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports a non-OK cloud response with its status and body, and exits non-zero", async () => {
+    const server = await startMockCloud(() => ({ status: 500, text: "internal boom" }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status).toBe(1);
+      expect(res.stdout + res.stderr).toMatch(/Cloud query failed \(500\): internal boom/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 // ─── end-to-end flows ───────────────────────────────────────────────────────
 // Unlike the atomic command tests above, each test here runs a complete
 // user journey on a SINGLE document and asserts state at every step — the
@@ -2090,6 +2254,25 @@ describe("[regression] ctx import pdf", () => {
     expect(res.status).not.toBe(0);
     expect(res.stderr + res.stdout).toMatch(/%PDF-/);
   });
+
+  it("refuses to hand-edit a pdf node's body while still allowing a metadata edit", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--id", "nodes/q3"]);
+
+    // The body is the extracted text — the binary is the source of truth, so an
+    // --body edit is refused (import a new PDF version instead).
+    const edit = runCtxResult(tmp, ["update", "nodes/q3", "--body", "hand edited text"]);
+    expect(edit.status).not.toBe(0);
+    expect(edit.stderr + edit.stdout).toMatch(/is a PDF node/);
+    expect(edit.stderr + edit.stdout).toMatch(/cannot be edited directly/);
+    // The refusal is before any write: the extracted text on disk is untouched.
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toContain("Revenue grew 12 percent.");
+
+    // Metadata still edits — the refusal is body-specific, not a blanket lock.
+    const rename = runCtxResult(tmp, ["update", "nodes/q3", "--title", "Q3 Renamed"]);
+    expect(rename.status).toBe(0);
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toMatch(/title: Q3 Renamed/);
+  });
 });
 
 // ─── ctx import jats — markdown twins that render and retrieve ───────────────
@@ -2254,5 +2437,280 @@ describe("[regression] import pubmed + enrich pubtator", () => {
     } finally {
       await stub.close();
     }
+  });
+});
+
+// ─── unknown command / option ────────────────────────────────────────────────
+// Commander rejects an unrecognized command or option during parsing, before
+// any action runs. These lock the friendly, stack-trace-free contract: a typo
+// gets a one-line "unknown …" on stderr and a non-zero exit, never a dump.
+
+describe("[regression] unknown command and option", () => {
+  it("a top-level unknown command fails with a friendly error, no stack trace", () => {
+    const { status, stderr } = runCtxResult(tmp, ["frobnicate"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/unknown command 'frobnicate'/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+
+  it("an unknown option on a known command is rejected before it runs", () => {
+    const { status, stderr } = runCtxResult(tmp, ["list", "--bogus"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/unknown option '--bogus'/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── missing-document error hygiene ──────────────────────────────────────────
+// A write/read against a path that was never created surfaces the engine's
+// DOCUMENT_NOT_FOUND, names the id, exits non-zero, and never leaks a stack.
+// Pairs with the "reconstruct names the missing document" case above; this
+// covers the sibling delete/history/publish/update commands.
+
+describe("[regression] missing-document error hygiene", () => {
+  beforeEach(() => initVault(tmp));
+
+  it.each<[string, string[]]>([
+    ["delete", ["delete", "nodes/ghost", "--yes"]],
+    ["history", ["history", "nodes/ghost"]],
+    ["publish", ["publish", "nodes/ghost"]],
+    ["update", ["update", "nodes/ghost", "--title", "X"]],
+  ])("%s on a non-existent document fails cleanly", (_name, args) => {
+    const { status, stderr } = runCtxResult(tmp, args);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/DOCUMENT_NOT_FOUND/);
+    expect(stderr).toMatch(/nodes\/ghost/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── history --diff ──────────────────────────────────────────────────────────
+// `--diff` folds each version's unified diff from the one before into the
+// history render; without it the render stays a plain version list, and a
+// single-version document has nothing to diff and must not choke.
+
+describe("[regression] history --diff", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/edited", "--title", "Edited", "--body", "first body"]);
+    runCtx(tmp, ["update", "nodes/edited", "--body", "second body"]);
+  });
+
+  it("includes the unified diff between successive versions", () => {
+    const diffed = runCtx(tmp, ["history", "nodes/edited", "--diff"]);
+    expect(diffed).toMatch(/@@/);
+    expect(diffed).toMatch(/-first body/);
+    expect(diffed).toMatch(/\+second body/);
+    // The plain render carries no diff hunk — --diff is what turns it on.
+    expect(runCtx(tmp, ["history", "nodes/edited"])).not.toMatch(/@@/);
+  });
+
+  it("renders a single-version document without a diff hunk, exit 0", () => {
+    runCtx(tmp, ["add", "nodes/solo", "--title", "Solo", "--body", "only body"]);
+    const { status, stdout } = runCtxResult(tmp, ["history", "nodes/solo", "--diff"]);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/v1/);
+    expect(stdout).not.toMatch(/@@/);
+  });
+});
+
+// ─── publish --author / --message ────────────────────────────────────────────
+// `--author` sets the authoring identity recorded on the version entry
+// (`edited_by`, surfaced as the `By:` line), distinct from the caller-attribution
+// --agent/--session/--client block; `--message` becomes that version's note.
+
+describe("[regression] publish --author / --message", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/release", "--title", "Release", "--body", "one"]);
+    runCtx(tmp, ["update", "nodes/release", "--body", "two"]);
+  });
+
+  it("records the author and message on the published version", () => {
+    runCtx(tmp, [
+      "publish", "nodes/release",
+      "--author", "alice@example.com",
+      "--message", "release note",
+    ]);
+    const latest = JSON.parse(runCtx(tmp, ["history", "nodes/release", "--json"]))
+      .versions.at(-1);
+    expect(latest.edited_by).toBe("alice@example.com");
+    expect(latest.note).toBe("release note");
+    // The human render surfaces the same author on the By: line.
+    expect(runCtx(tmp, ["history", "nodes/release"])).toMatch(/By: alice@example\.com/);
+  });
+});
+
+// ─── selector grouping with ( ) ──────────────────────────────────────────────
+// Parentheses group a sub-expression so OR can be intersected with a further
+// term regardless of default operator precedence. Complements the individual
+// | / - / + operator cases above.
+
+describe("[regression] selector grouping", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/g1", "--title", "G1", "--tags", "red,big"]);
+    runCtx(tmp, ["add", "nodes/g2", "--title", "G2", "--tags", "blue,big"]);
+    runCtx(tmp, ["add", "nodes/g3", "--title", "G3", "--tags", "red,small"]);
+  });
+
+  const ids = (json: string): string[] =>
+    JSON.parse(json).map((d: { id: string }) => d.id).sort();
+
+  it("intersects a grouped OR with an outer AND term", () => {
+    expect(ids(runCtx(tmp, ["resolve", "(#red | #blue) + #big", "--json"])))
+      .toEqual(["nodes/g1", "nodes/g2"]);
+    expect(ids(runCtx(tmp, ["resolve", "#red + (#big | #small)", "--json"])))
+      .toEqual(["nodes/g1", "nodes/g3"]);
+  });
+});
+
+// ─── read --out output-path guard ────────────────────────────────────────────
+// `--out` names a file for the rendered HTML and only applies with --html.
+// Without --html the CLI renders to the terminal and writes no file, rather
+// than silently emitting a bare-body file the caller didn't ask for.
+
+describe("[regression] read --out without --html", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/page", "--title", "Page", "--body", "body text"]);
+  });
+
+  it("renders to the terminal and writes no file", () => {
+    const target = join(tmp, "page.html");
+    const { status, stdout } = runCtxResult(tmp, ["read", "nodes/page", "--out", target]);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Page/);
+    expect(existsSync(target)).toBe(false);
+  });
+});
+
+// ─── ctx info ────────────────────────────────────────────────────────────────
+// `info` summarizes the vault: name, path, counts by type and status, tags, and
+// the CONTEXT.md preamble. --json is the machine-readable form agents consume.
+
+describe("[regression] ctx info", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/one", "--title", "One", "--tags", "#a", "--publish"]);
+  });
+
+  it("summarizes counts, tags and name in the human view", () => {
+    const out = runCtx(tmp, ["info"]);
+    expect(out).toMatch(/regression-vault/);
+    expect(out).toMatch(/1 node\(s\)/);
+    expect(out).toMatch(/document: 1/);
+    expect(out).toMatch(/published: 1/);
+    expect(out).toMatch(/#a/);
+  });
+
+  it("--json reports the same summary as a structured envelope", () => {
+    const json = JSON.parse(runCtx(tmp, ["info", "--json"]));
+    expect(json.total).toBe(1);
+    expect(json.by_type).toEqual({ document: 1 });
+    expect(json.by_status).toEqual({ published: 1 });
+    expect(json.tags).toEqual(["#a"]);
+    expect(json.config.name).toBe("regression-vault");
+    expect(typeof json.vault_path).toBe("string");
+  });
+});
+
+// ─── ctx skill show / install ────────────────────────────────────────────────
+// A `type: skill` node renders into an agent-harness SKILL.md. `show` prints an
+// offline snapshot; `install` prints a loader that fetches the node at runtime
+// and, without --write, touches nothing outside the vault. --dry-run keeps the
+// external-write guard honest.
+
+describe("[regression] ctx skill show / install", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, [
+      "add", "nodes/deploy-skill", "--type", "skill",
+      "--title", "Deploy Skill", "--trigger", "when deploying",
+      "--body", "Do the deploy steps.",
+    ]);
+  });
+
+  it("show renders the skill node as a SKILL.md for the harness", () => {
+    const out = runCtx(tmp, ["skill", "show", "nodes/deploy-skill", "--scope", "project"]);
+    expect(out).toMatch(/name: deploy-skill/);
+    expect(out).toMatch(/description: "when deploying"/);
+    expect(out).toMatch(/Do the deploy steps\./);
+    expect(out).toMatch(/skills[\\/]deploy-skill[\\/]SKILL\.md/);
+  });
+
+  it("install without --write prints a loader and writes nothing outside the vault", () => {
+    const out = runCtx(tmp, ["skill", "install", "nodes/deploy-skill", "--scope", "project"]);
+    expect(out).toMatch(/context_skill/);
+    expect(out).toMatch(/Re-run with --write to install these files\./);
+    expect(existsSync(join(tmp, ".claude"))).toBe(false);
+  });
+
+  it("install --write --dry-run reports the target without writing it", () => {
+    // The dry-run report rides the file-safety action log on stderr, which is
+    // what keeps it off stdout (spec: --json output stays parseable).
+    const { status, stderr } = runCtxResult(tmp, [
+      "skill", "install", "nodes/deploy-skill", "--scope", "project", "--write", "--dry-run",
+    ]);
+    expect(status).toBe(0);
+    expect(stderr).toMatch(/Dry run — no files were written/);
+    expect(stderr).toMatch(/skills[\\/]deploy-skill[\\/]SKILL\.md/);
+    expect(existsSync(join(tmp, ".claude"))).toBe(false);
+  });
+
+  it("show on a non-existent skill id fails cleanly", () => {
+    const { status, stderr } = runCtxResult(tmp, ["skill", "show", "nodes/nope", "--scope", "project"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/DOCUMENT_NOT_FOUND/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── ctx validate — circular source dependency (rule 15) ─────────────────────
+// Two source nodes whose `depends_on` URIs point at each other form a cycle.
+// Each node is individually well-formed, so validate surfaces only the cycle,
+// names the loop, and exits non-zero.
+
+describe("[regression] ctx validate — circular source dependency", () => {
+  beforeEach(() => initVault(tmp));
+
+  const writeSource = (id: string, tool: string, dependsOn: string): void => {
+    const dir = join(tmp, dirname(id));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(tmp, `${id}.md`),
+      [
+        "---",
+        `title: ${id}`,
+        "type: source",
+        "status: published",
+        "source:",
+        "  transport: mcp",
+        "  tools:",
+        `    - ${tool}`,
+        "  depends_on:",
+        `    - contextnest://${dependsOn}`,
+        "---",
+        "",
+        "Body.",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+  };
+
+  it("names the cycle and exits non-zero", () => {
+    writeSource("nodes/sources/a", "foo", "nodes/sources/b");
+    writeSource("nodes/sources/b", "bar", "nodes/sources/a");
+
+    const { status, stdout } = runCtxResult(tmp, ["validate"]);
+    expect(status).not.toBe(0);
+    expect(stdout).toMatch(/Circular dependency detected: nodes\/sources\/a → nodes\/sources\/b → nodes\/sources\/a/);
+
+    const json = JSON.parse(runCtxResult(tmp, ["validate", "--json"]).stdout);
+    expect(json.valid).toBe(false);
+    const cycle = json.errors.find((e: { path: string }) => e.path === "sources");
+    expect(cycle.errors[0].rule).toBe(15);
+    expect(cycle.errors[0].message).toMatch(/Circular dependency:/);
   });
 });

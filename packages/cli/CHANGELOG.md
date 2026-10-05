@@ -1,5 +1,18 @@
 # @promptowl/contextnest-cli
 
+## 3.0.1
+
+### Patch Changes
+
+- 40d6eba: Anti-resurrection: `context_import` (and any other write) now refuses erased content under a new title. Forgotten bodies were matched by a hash of the raw body, so the same text wrapped in different blank lines (`ctx add` writes `"\nX\n"`, an import `"X"`) never matched. Bodies are now trimmed before hashing; the untrimmed hash is still checked so forgets recorded by earlier versions keep refusing an exact copy.
+- 40d6eba: An explicit `status:forgotten` selector now returns the forgotten stub from `ctx query`, `context_query` and the query-backed resolve surfaces (spec §6.3.3). The query engine matched the stub and then dropped it in its retrieval gate, and its default (graph) mode reads a published-only `context.yaml` that never holds stubs. A selector that asks for `status:forgotten` in a positive position now runs in full mode and keeps stubs; every other selector still hides them.
+- 55e5b66: Harden the `ctx push` confirmation-gate poll.
+
+  - A redirect on the poll request now fails at once. It was refused but then retried, so the CLI kept polling until the timeout (15 minutes by default).
+  - A `202` envelope whose `poll_url` is not a path (e.g. `@evil.example/x`) is now treated as unrecognized ("not applied", exit 1). `poll_url` is appended to `--server` and the poll carries the API key, so a non-path value could send the key to another host.
+
+- 40d6eba: `contextnest://search/…` selectors in graph mode (the default for `context_query`, `ctx query` and the deprecated MCP `search` tool) now match body text. They searched only the titles, tags and descriptions in `context.yaml`, so a word that appeared only in a document's body returned nothing. Graph mode now seeds from the same published full-text index `context_search` uses.
+
 ## 3.0.0
 
 ### Major Changes

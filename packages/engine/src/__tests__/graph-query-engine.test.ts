@@ -90,6 +90,17 @@ describe("GraphQueryEngine — graph mode", () => {
     expect(result.documents.map((d) => d.id)).not.toContain("nodes/onboarding");
   });
 
+  it("a search URI matches body text, not just title and tags", async () => {
+    await addDoc("nodes/api", { title: "API", body: "All endpoints require Bearer authentication." });
+    await addDoc("nodes/draft", { title: "Draft", body: "authentication draft", publish: false });
+    await reindex();
+
+    const result = await new GraphQueryEngine(storage).query("contextnest://search/authentication");
+
+    expect(result.mode).toBe("graph");
+    expect(result.documents.map((d) => d.id)).toEqual(["nodes/api"]);
+  });
+
   it("traverses reference edges to reachable neighbors", async () => {
     // api links to helper → helper should be pulled in via 1-hop traversal
     await addDoc("nodes/api", {
