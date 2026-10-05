@@ -599,6 +599,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx search <query>` | Full-text search across vault documents (`--limit` to cap) |
 | `ctx resolve <selector>` | Execute a selector query (low-level) |
 
+
 ### Selectors
 
 ```bash

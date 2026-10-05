@@ -1176,3 +1176,282 @@ describe("[regression] MCP server e2e — review gate", () => {
     expect(json.status).toBe("published");
   });
 });
+
+// ─── context_search & context_query ───────────────────────────────────────────
+//
+// Fixture statuses: api-design, architecture-overview and both sources are
+// published; onboarding-guide is a draft, schema-migration approved,
+// legacy-soap-bridge rejected. Only the published ones may ever be served.
+
+const NEVER_SERVED = ["nodes/onboarding-guide", "nodes/schema-migration", "nodes/legacy-soap-bridge"];
+
+describe("[regression] MCP server e2e — context_search", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  const search = async (args: Record<string, unknown>) => {
+    const { json, isError } = await callJson(client, "context_search", args);
+    expect(isError, JSON.stringify(args)).toBe(false);
+    return json as { results: Array<{ id: string; title: string; score?: number }>; total: number };
+  };
+  const ids = async (query: string) => (await search({ query })).results.map((r) => r.id);
+
+  it("finds a published doc by body text, scored, best hit first", async () => {
+    const res = await search({ query: "authentication" });
+    expect(res.results[0].id).toBe("nodes/api-design");
+    expect(res.results[0].title).toBe("API Design Guidelines");
+    const scores = res.results.map((r) => r.score!);
+    expect(scores.every((s) => typeof s === "number")).toBe(true);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+    expect(res.total).toBe(res.results.length);
+  });
+
+  it("matches title, tags and source nodes, case-insensitively", async () => {
+    expect((await ids("Architecture Overview"))[0]).toBe("nodes/architecture-overview");
+    expect(await ids("guidelines")).toContain("nodes/api-design");
+    expect(await ids("sprint")).toContain("sources/sprint-tickets");
+    expect((await ids("AUTHENTICATION"))[0]).toBe("nodes/api-design");
+  });
+
+  it("ranks a doc matching every term above partial matches", async () => {
+    expect((await ids("API gateway"))[0]).toBe("nodes/architecture-overview");
+  });
+
+  it("never returns draft, approved or rejected docs", async () => {
+    for (const q of ["Onboarding", "migration", "SOAP", "engineering"]) {
+      const got = await ids(q);
+      for (const hidden of NEVER_SERVED) expect(got, q).not.toContain(hidden);
+    }
+  });
+
+  it("limit caps results while total still counts every match", async () => {
+    const all = await search({ query: "API" });
+    expect(all.total).toBeGreaterThan(1);
+    const one = await search({ query: "API", limit: 1 });
+    expect(one.results).toHaveLength(1);
+    expect(one.results[0].id).toBe(all.results[0].id);
+    expect(one.total).toBe(all.total);
+  });
+
+  it("no match and a whitespace-only query return empty results, not an error", async () => {
+    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], total: 0 });
+    expect(await search({ query: "   " })).toEqual({ results: [], total: 0 });
+  });
+
+  it("special characters in the query never break the search", async () => {
+    const queries = ["c++", "\"quoted phrase\"", "API-design", "#engineering", "contextnest://nodes/x", "(", "a|b -c", "50%", "ünïcödé"];
+    for (const q of queries) {
+      const { json, isError } = await callJson(client, "context_search", { query: q });
+      expect(isError, q).toBe(false);
+      expect(Array.isArray(json.results), q).toBe(true);
+    }
+  });
+
+  it("rejects a missing or empty query, a non-positive limit and unknown keys", async () => {
+    expect(await isToolError(client, "context_search", {})).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "" })).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "API", limit: 0 })).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "API", limit: -1 })).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "API", hops: 2 })).toBe(true);
+  });
+
+  it("sees a create at once, an update's new text only, and nothing after a delete", async () => {
+    const { json: created } = await callJson(client, "context_create", {
+      title: "Search Freshness",
+      content: "The token PAPAYAUNIQUE marks this note.",
+    });
+    expect(await ids("PAPAYAUNIQUE")).toContain(created.id);
+
+    await callJson(client, "context_update", { id: created.id, content: "Now it says GUAVAUNIQUE instead." });
+    expect(await ids("PAPAYAUNIQUE")).not.toContain(created.id);
+    expect(await ids("GUAVAUNIQUE")).toContain(created.id);
+
+    await callJson(client, "context_delete", { id: created.id });
+    expect(await ids("GUAVAUNIQUE")).not.toContain(created.id);
+  });
+
+  it("does not return an unpublished draft or a forgotten node", async () => {
+    const { json: draft } = await callJson(client, "context_create", {
+      title: "Search Draft",
+      content: "Draft text with KIWIDRAFTUNIQUE inside.",
+      publish: false,
+    });
+    expect(await ids("KIWIDRAFTUNIQUE")).not.toContain(draft.id);
+
+    const { json: gone } = await callJson(client, "context_create", {
+      title: "Search Forgotten",
+      content: "Erasable text with MANGOFORGETUNIQUE inside.",
+    });
+    expect(await ids("MANGOFORGETUNIQUE")).toContain(gone.id);
+    const forgot = await callText(client, "context_forget", { id: gone.id, reason_code: "user_request" });
+    expect(forgot.isError, forgot.text).toBe(false);
+    expect(await ids("MANGOFORGETUNIQUE")).toEqual([]);
+  });
+
+  it("the deprecated `search` alias still finds documents", async () => {
+    const { json, isError } = await callJson(client, "search", { query: "authentication" });
+    expect(isError).toBe(false);
+    expect(json.documents.map((d: any) => d.id)).toContain("nodes/api-design");
+  });
+});
+
+describe("[regression] MCP server e2e — context_query", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  type QueryResult = {
+    documents: Array<{ id: string; type: string; status: string; body?: string }>;
+    source_nodes?: Array<{ id: string; type: string }>;
+    traversal: { mode: string; hops_used: number; nodes_traversed: number };
+  };
+  const query = async (args: Record<string, unknown>) => {
+    const { json, isError } = await callJson(client, "context_query", args);
+    expect(isError, JSON.stringify(args)).toBe(false);
+    return json as QueryResult;
+  };
+  const docIds = async (q: string, extra: Record<string, unknown> = {}) =>
+    (await query({ query: q, ...extra })).documents.map((d) => d.id).sort();
+
+  it("a tag selector returns matching docs with bodies and traversal stats", async () => {
+    const res = await query({ query: "#api" });
+    expect(res.documents.map((d) => d.id)).toContain("nodes/api-design");
+    expect(typeof res.documents[0].body).toBe("string");
+    expect(res.traversal.mode).toBe("graph");
+    expect(typeof res.traversal.hops_used).toBe("number");
+    expect(typeof res.traversal.nodes_traversed).toBe("number");
+  });
+
+  it("type:source returns sources under source_nodes, not documents", async () => {
+    const res = await query({ query: "type:source", hops: 0 });
+    expect(res.source_nodes!.map((d) => d.id).sort()).toEqual([
+      "sources/active-project-config",
+      "sources/sprint-tickets",
+    ]);
+    expect(res.documents.filter((d) => d.type === "source")).toEqual([]);
+  });
+
+  it("serves only published docs, whatever the selector or mode", async () => {
+    for (const q of ["#engineering", "type:document", "status:published", "#onboarding", "#database", "#legacy"]) {
+      for (const full of [false, true]) {
+        const got = await docIds(q, { full, hops: 3 });
+        for (const hidden of NEVER_SERVED) expect(got, `${q} full=${full}`).not.toContain(hidden);
+      }
+    }
+    const published = await query({ query: "status:published", hops: 0 });
+    expect(published.documents.every((d) => d.status === "published")).toBe(true);
+  });
+
+  it("AND by space and by + agree", async () => {
+    const spaced = await docIds("#engineering type:document", { hops: 0 });
+    expect(spaced).toEqual(["nodes/api-design", "nodes/architecture-overview"]);
+    expect(await docIds("#engineering + type:document", { hops: 0 })).toEqual(spaced);
+  });
+
+  it("| unions, - excludes and parentheses group", async () => {
+    expect(await docIds("#api | #architecture", { hops: 0 })).toEqual([
+      "nodes/api-design",
+      "nodes/architecture-overview",
+    ]);
+    expect(await docIds("#engineering -#api", { hops: 0 })).toEqual(["nodes/architecture-overview"]);
+    expect(await docIds("(#api | #architecture) -#api", { hops: 0 })).toEqual(["nodes/architecture-overview"]);
+  });
+
+  it("a pack selector expands its query and includes", async () => {
+    const got = await docIds("pack:onboarding.basics", { hops: 0 });
+    expect(got).toContain("nodes/architecture-overview");
+    expect(got).not.toContain("nodes/onboarding-guide"); // draft
+  });
+
+  it("URI, bare node id and search URI selectors resolve", async () => {
+    expect(await docIds("contextnest://nodes/api-design", { hops: 0 })).toEqual(["nodes/api-design"]);
+    expect(await docIds("nodes/api-design", { hops: 0 })).toEqual(["nodes/api-design"]);
+    expect(await docIds("contextnest://search/authentication", { hops: 0 })).toContain("nodes/api-design");
+  });
+
+  it("hops widens the result along links; hops 0 returns only the seed", async () => {
+    expect(await docIds("contextnest://nodes/api-design", { hops: 0 })).toEqual(["nodes/api-design"]);
+    expect(await docIds("contextnest://nodes/api-design", { hops: 1 })).toEqual([
+      "nodes/api-design",
+      "nodes/architecture-overview",
+    ]);
+  });
+
+  it("full:true runs full mode and serves the same seed", async () => {
+    const res = await query({ query: "#api", full: true });
+    expect(res.traversal.mode).toBe("full");
+    expect(res.documents.map((d) => d.id)).toContain("nodes/api-design");
+  });
+
+  it("include_drafts surfaces a draft but never an approved or rejected doc", async () => {
+    expect(await docIds("#onboarding")).toEqual([]);
+    expect(await docIds("#onboarding", { include_drafts: true })).toContain("nodes/onboarding-guide");
+    expect(await docIds("#database", { include_drafts: true })).not.toContain("nodes/schema-migration");
+    expect(await docIds("#legacy", { include_drafts: true })).not.toContain("nodes/legacy-soap-bridge");
+  });
+
+  it("a selector matching nothing returns an empty list, not an error", async () => {
+    expect(await docIds("#no-such-tag-anywhere")).toEqual([]);
+  });
+
+  it("refuses a malformed selector, an empty query, negative hops and unknown keys", async () => {
+    expect(await isToolError(client, "context_query", { query: "#api +" })).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "(#api" })).toBe(true);
+    expect(await isToolError(client, "context_query", {})).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "" })).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "#api", hops: -1 })).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "#api", limit: 5 })).toBe(true);
+  });
+
+  it("sees a create and a retag at once in graph mode", async () => {
+    const { json: created } = await callJson(client, "context_create", {
+      title: "Query Freshness",
+      content: "fresh body",
+      tags: ["#freshtag"],
+    });
+    expect(await docIds("#freshtag")).toEqual([created.id]);
+    await callJson(client, "context_update", { id: created.id, tags: ["#retagged"] });
+    expect(await docIds("#freshtag")).toEqual([]);
+    expect(await docIds("#retagged")).toEqual([created.id]);
+  });
+
+  it("hides a forgotten node unless status:forgotten is asked for by name", async () => {
+    const { json: created } = await callJson(client, "context_create", {
+      title: "Query Forgotten",
+      content: "content that will be erased by a forget",
+      tags: ["#forgetme"],
+    });
+    const forgot = await callText(client, "context_forget", { id: created.id, reason_code: "user_request" });
+    expect(forgot.isError, forgot.text).toBe(false);
+    expect(await docIds("#forgetme")).toEqual([]);
+    expect(await docIds("#forgetme", { full: true })).toEqual([]);
+    const stub = await query({ query: "status:forgotten" });
+    expect(stub.documents.map((d) => d.id)).toEqual([created.id]);
+    expect(stub.documents[0].body?.trim()).toBe("");
+  });
+
+  it("the deprecated `resolve` alias returns what context_query returns", async () => {
+    const { json, isError } = await callJson(client, "resolve", { selector: "#engineering", hops: 1 });
+    expect(isError).toBe(false);
+    expect(json.documents.map((d: any) => d.id).sort()).toEqual(await docIds("#engineering", { hops: 1 }));
+  });
+});

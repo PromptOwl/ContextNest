@@ -33,7 +33,7 @@ export async function evaluate(
   // name — `status:forgotten` in a positive position. Every other operand
   // (a URI, a tag, a type, a pack include) can match a stub, and a stub is not
   // content.
-  const includeForgotten = asksForForgotten(node, true);
+  const includeForgotten = asksForForgotten(node);
   const out: ContextNode[] = [];
   for (const id of resultIds) {
     const doc = byId.get(id);
@@ -45,7 +45,7 @@ export async function evaluate(
 }
 
 /** True when `status:forgotten` appears in a positive (non-negated) position. */
-function asksForForgotten(node: SelectorNode, positive: boolean): boolean {
+export function asksForForgotten(node: SelectorNode, positive = true): boolean {
   switch (node.type) {
     case "statusFilter":
       return positive && normalizeStatus(node.value) === "forgotten";
