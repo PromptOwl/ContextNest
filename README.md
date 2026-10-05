@@ -41,6 +41,27 @@ its version and licence alongside the installed ones in
 **[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
 uploads the machine-readable graph as the `dependency-graph` build artifact.
 
+### What leaves your machine
+
+Nothing, unless you run a command that names a destination or opt in:
+
+| Trigger | Destination | Sent | Default |
+|---|---|---|---|
+| Telemetry | `api.promptowl.ai/v1/telemetry` | Random per-vault id, CLI version, OS, Node version, event name, timestamp. Never vault content. | Off. Opt in with `telemetry: true` in `.context/config.yaml`; `DO_NOT_TRACK=1` / `CONTEXTNEST_TELEMETRY=0` force off. |
+| Opening `.context/welcome.html` | Google Analytics | `vault_init` (starter, CLI version, doc count) + GA defaults (IP, user agent) | Off — same flag. Off = the page makes no network requests. |
+| `ctx push` | The `--server` you name | Published documents + your API key | Only when run |
+| `ctx query @org/pack` | `api.promptowl.ai` | Pack name + your PromptOwl token | Only when run |
+| Remote nests | The server you registered | Queries/writes + the bearer from your env var | Only for remotes you add |
+| `ctx import pubmed` / `enrich pubtator` | NCBI | Search terms / ids | Only when run |
+| `ctx doctor` | npm registry | Version lookup | `CONTEXTNEST_DOCTOR_OFFLINE=1` skips |
+
+Stored PromptOwl credentials live in the OS keyring (macOS Keychain, Windows Credential Manager,
+Linux Secret Service via `secret-tool`). With no keyring (headless/CI/Docker), set
+`CONTEXTNEST_CREDENTIALS_KEY` and they go to `~/.promptowl/credentials.enc.json` (AES-256-GCM,
+scrypt-derived key, mode 0600). Never plaintext: a legacy `~/.promptowl/credentials.json` is
+migrated on first read, then overwritten and deleted; with neither keyring nor key the CLI stops
+and says how to fix it. `PROMPTOWL_ACCESS_TOKEN` skips storage entirely.
+
 ## For the solo developer
 
 Your brain, cached for your agent.
@@ -60,6 +81,8 @@ Skill nodes codify team procedures (PR review, incident response, deployment che
 A safe shared brain.
 
 Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+
+Need content encrypted at rest? `ctx init --encrypted` (or `ctx vault encrypt` for an existing vault) seals note bodies and version history with AES-256-GCM while front matter stays indexable. Hash chains keep verifying over the plaintext. It is opt-in: default vaults stay plain Markdown. Read the [threat model and key handling](docs/encrypted-vaults.md) first, because **losing the key and the recovery passphrase means losing the data**.
 
 ## How is this different from...
 
@@ -439,6 +462,44 @@ default to "no".
 `--yes` (or `--force`) when there is no TTY. Additive commands proceed as before — a non-interactive
 caller is never blocked waiting on stdin.
 
+### Review gate (on by default)
+
+New vaults hold writes for a human before they publish — like a coding agent
+asking permission, with a "don't ask again" answer always on offer.
+`ctx init` writes `review: on` to `.context/config.yaml`. With it on, `ctx add`,
+`ctx update` and the MCP server's `context_create` / `context_update` save the
+write for review instead of publishing it. Nothing is versioned or sealed into
+a checkpoint until it is approved.
+
+- A new document is saved with `status: pending_review`. An edit to a published
+  document is staged under `_suggestions/`; the published version keeps serving.
+- At a terminal: `Held for review. Publish? [y]es / [n]o / [a]lways (turn review off)`.
+- Without a terminal (agents, CI) nothing blocks — one line:
+  `Held for review: ctx review approve <path>   (turn off: ctx config set review off)`.
+- MCP results carry `held_for_review: true` and a sentence for the agent to relay
+  (the user can say "turn off review"; the `context_review` tool does it). The
+  deprecated `create_document` / `update_document` tools are gated the same way.
+- The gate guards against *unintended* publishes, not a hostile agent: an MCP
+  caller that passes `publish: true` (or `review: false`), calls `context_publish`,
+  or uses `context_review approve` still publishes. The tool descriptions tell
+  agents to do that only when the user says so.
+- Imports (`ctx import`, `context_import`, `context_import_pdf`) are not gated:
+  they are deliberate bulk loads and publish as before.
+
+| Command | Effect |
+|---|---|
+| `ctx review` | List what is waiting (new documents and held edits) |
+| `ctx review approve <path>` | Publish what is held for a document |
+| `ctx review reject <path>` | Discard a held edit (archived) or retire a pending document |
+| `ctx add/update … --publish` | Publish this one write regardless |
+| `ctx config set review off` / `on` | Turn the gate off or on (`ctx config get review`) |
+
+**Existing vaults are unchanged.** A vault whose config has no `review` key was
+created before the gate and keeps publishing immediately, so automations built
+on it keep working. Opt in with `ctx config set review on`. Re-running
+`ctx init` on an existing vault keeps its setting. Remote nests (`--vault
+<server>/<nest>`) use the server's own governance and are not gated.
+
 ### Choosing a vault
 
 By default `ctx` operates on the vault in (or above) the current directory. To
@@ -502,6 +563,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx vault encrypt` | Encrypt the vault's content at rest in place (AES-256-GCM). Prints a one-time recovery passphrase; rerun to resume an interrupted run. See [encrypted vaults](docs/encrypted-vaults.md) |
+| `ctx vault decrypt` | Decrypt an encrypted vault back to plain Markdown |
 | `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
@@ -510,10 +573,11 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 |---|---|
 | `ctx init` | Initialize a new vault (supports `--starter` recipes; `--register` to register one created under the OS temp dir) |
 | `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
-| `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
+| `ctx add <path>` | Create a new document (publishes, or holds it for review when the vault's [review gate](#review-gate-on-by-default) is on; `--publish` to bypass; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
-| `ctx update <path>` | Update a document's title, tags, or body (auto-publishes) |
-| `ctx delete <path>` | Delete a document and its version history |
+| `ctx update <path>` | Update a document's title, tags, or body (publishes, or holds the edit for review when the gate is on; `--publish` to bypass) |
+| `ctx delete <path>` | Delete a document and its version history, recorded in `ctx forget-log` (`--reason`, `--requested-by`; `--purge` for no record) |
+| `ctx forget <path> --reason <code>` | Forget a document (right to be forgotten, spec §6.3): erase every version's content, keep the hashes so `ctx verify` still passes; leaves an empty `status: forgotten` stub. `--reason` is `user_request`, `legal`, `retention_expiry` or `error` |
 | `ctx read <path>` | Read and display a document in the terminal |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
 | `ctx skill <path>` | Render a `type: skill` node for an agent harness and print it |
@@ -535,6 +599,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx search <query>` | Full-text search across vault documents (`--limit` to cap) |
 | `ctx resolve <selector>` | Execute a selector query (low-level) |
 
+
 ### Selectors
 
 ```bash
@@ -554,7 +619,8 @@ ctx query "#api + status:published"       # Intersection
 | `ctx history <path>` | Show version history |
 | `ctx history <path> --diff` | Include each version's unified diff from the one before |
 | `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
-| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped) |
+| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped). In an encrypted vault without its key it reports `encrypted_key_required` and never passes |
+| `ctx forget-log [path]` | The forget audit trail — who forgot or deleted what, when, and under which reason code (never the content) |
 
 Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
 errors, plain `Error: message` for the rest. Set `CONTEXTNEST_DEBUG=1` to get the
@@ -624,7 +690,7 @@ fetchable; each twin records its licence.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 39 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 41 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -703,10 +769,12 @@ cloud:
 | `context_reconstruct` | Reconstruct a specific version |
 | `context_packs` | List packs with their `includes` and `excludes` |
 | `context_verify` | Verify every hash chain in the vault |
+| `context_forget` | Forget a node: erase its content from history, keep the hashes (verify still passes), leave a `status: forgotten` stub |
+| `context_forget_log` | The forget audit trail — never the forgotten content |
 | `context_create` | Create a node — own `id`, `publish: false`, initial `status`, `note`, full `skill` block |
 | `context_update` | Update a node — rename, set `status`, stamp a `version`, clear metadata with `null` |
 | `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
-| `context_delete` | Delete a node and its history; returns the deleted node's `title` |
+| `context_delete` | Delete a node and its history, recorded in the forget audit log (`purge: true` for none); returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
 | `context_import_pdf` | Import a PDF as a `type: pdf` node — extracted text as the body, the PDF kept beside it and bound by SHA-256; pass `id` to version an existing one |
 
@@ -725,6 +793,7 @@ spec §9.4.
 | `read_index` | Return the context.yaml index |
 | `read_pack` | Resolve and return a context pack with documents |
 | `list_checkpoints` | List recent checkpoints |
+| `context_review` | Review gate: `list` held writes, `approve` / `reject` one (`id`), turn the gate `off` / `on` |
 
 **Deprecated tools** — still registered and unchanged, so existing clients keep
 working; removed in a future major:

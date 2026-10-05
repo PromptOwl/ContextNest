@@ -96,7 +96,8 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
 - `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
 - `ctx update <path>` — Update a document
-- `ctx delete <path>` — Delete a document
+- `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
+- `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
 - `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
 - `ctx publish <path>` — Publish (bump version, create checkpoint)
 - `ctx publish --all` — Publish every unpublished document in one batch, with a live counter. Seals one checkpoint and regenerates the index once, instead of once per document
@@ -116,7 +117,8 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx history <path>` — Show version history
 - `ctx history <path> --diff` — Include each version's unified diff from the one before
 - `ctx reconstruct <path> <version>` — Reconstruct a specific version. A version the history does not contain is now refused rather than answered with a neighbouring version's content
-- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it)
+- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it; forgotten versions verify hash-only)
+- `ctx forget-log [path]` — The forget audit trail (never the forgotten content)
 
 ### File Safety
 
@@ -297,6 +299,38 @@ Query context from cloud-hosted packs without downloading source files:
 ctx query @promptowl/executive-ai-strategy
 ```
 
+## Recipes (`ctx pull`)
+
+A recipe is a node in a remote nest (slug `recipe-<id>`) whose body holds one fenced block that opens with ```` ```yaml recipe ````. It names the remote nodes to copy and where they land, the skills to bring in, the template files to write at the vault root, and the pack to generate. Because the recipe is a node, it is stewarded and versioned like everything it describes.
+
+```bash
+ctx pull <remote-alias> --recipe org-essentials --dry-run   # show the plan, write nothing
+ctx pull <remote-alias> --recipe org-essentials             # pull
+ctx pull <remote-alias> --recipe org-essentials --update    # take newer upstream versions
+```
+
+- Every pulled document lands as a **draft** with `derived_from: contextnest://<nest>/<id>` and `metadata.pulled_from` recording the upstream version. Review it, then `ctx publish`.
+- A later pull skips what is current, reports newer upstream versions (applied only with `--update`), and **never overwrites** a document or file it did not pull, nor a pulled one you have since edited or published.
+- Skills land as `type: skill`. Install one with `ctx skill install <path> --mode loader --write`.
+- Pulls write into a **local vault** for now; use `ctx push` to send the result to a hosted nest.
+
+```yaml recipe
+id: org-essentials
+includes:
+  - from: nodes/org/spine/the-accountability-method   # remote node id
+    to: nodes/methodologies/accountability-method      # local document id
+    tags: [prime-document]                             # optional, added to the source's tags
+skills:
+  - from: nodes/org/skills/distill-capture             # lands at nodes/skills/<slug> unless `to` is set
+files:
+  - from: nodes/org/templates/stewards-example         # first ```yaml block in the node; `to` must be .yaml/.yml, outside nodes/, packs/ and dot-folders
+    to: stewards.example.yaml
+pack:
+  id: org-essentials
+  include: [nodes/methodologies/accountability-method]
+  agent_instructions: Load these first.
+```
+
 ## AI Agent Integration
 
 Running `ctx index` auto-generates config files so AI tools discover your vault:
@@ -313,7 +347,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **39 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
+For direct AI agent access via the Model Context Protocol — **41 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -332,7 +366,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 39 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 41 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 

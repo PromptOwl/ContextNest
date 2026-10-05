@@ -23,6 +23,8 @@ interface WelcomeOptions {
   nodes: WelcomeNode[];
   timestamp: string;
   cliVersion: string;
+  /** Embed Google Analytics. Only when the vault opted in to telemetry; off = zero network requests. */
+  analytics?: boolean;
 }
 
 /**
@@ -74,7 +76,6 @@ export async function generateWelcomeHtml(opts: WelcomeOptions): Promise<string>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Your Vault Is Ready — Context Nest by PromptOwl</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Open+Sans:wght@700;800&display=swap');
 :root {
   --primary: #2B1C50;
   --secondary: #6366F1;
@@ -200,7 +201,7 @@ tr:hover td { background: var(--bg-alt); }
   .card { padding: 1rem 1.25rem; }
 }
 </style>
-<!-- Google Analytics -->
+${opts.analytics ? `<!-- Google Analytics -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-2CS7MD931K"></script>
 <script>
 window.dataLayer = window.dataLayer || [];
@@ -213,7 +214,7 @@ gtag('event', 'vault_init', {
   doc_count: ${opts.nodes.length}
 });
 </script>
-</head>
+` : ""}</head>
 <body>
 
 <!-- Hero -->

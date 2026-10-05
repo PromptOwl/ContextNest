@@ -100,6 +100,8 @@ beforeAll(() => {
   ctl(workspace, ["vault", "remove", "gamma", "--yes"]);
   // scratch is registered but lives under os.tmpdir() (an agent's throwaway).
   ctl(scratchDir, ["init", "--name", "scratch", "--vault", "scratch", "--description", "throwaway"]);
+  // Retrieval reads published nodes; new vaults would hold the seeds for review.
+  for (const dir of [alphaDir, betaDir, gammaDir, scratchDir]) ctl(dir, ["config", "set", "review", "off"]);
 });
 
 afterAll(() => {

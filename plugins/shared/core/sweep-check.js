@@ -173,6 +173,20 @@ export function previousBody(exec, id, alias) {
 }
 
 /**
+ * Whether the node's latest write was HELD for review rather than published
+ * (vault `review: on`). A held update seals no version, so the last two
+ * versions describe an older, unrelated edit — diffing them would report
+ * values this write never removed. The sweep belongs to the approval instead.
+ * A stale hold (the node was published past it) does not count.
+ */
+export function isHeldForReview(exec, id, alias) {
+  const items = ctxJson(exec, withVault(["review", "list", "--json"], alias), []);
+  // The command may name a bare slug; the CLI files it under nodes/.
+  const ids = new Set([id, `nodes/${id}`]);
+  return Array.isArray(items) && items.some((i) => ids.has(i?.id) && !i.stale);
+}
+
+/**
  * Nodes across ALL given vault targets — not just the one that was written —
  * that still carry one of `terms`. The written node itself is excluded in its
  * own vault.
@@ -351,6 +365,7 @@ export function run({ input, env, exec }) {
     // cannot be read back, there is nothing to check.
     const current = ctxText(exec, withVault(["read", target.id, "--raw"], writtenAlias));
     if (!current) continue;
+    if (isHeldForReview(exec, target.id, writtenAlias)) continue;
 
     const before = previousBody(exec, target.id, writtenAlias);
     if (!before) continue;
