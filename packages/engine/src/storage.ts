@@ -35,7 +35,7 @@ import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
 import {
   buildTombstoneIndex,
-  forgettableBodyHash,
+  carriesForgottenBody,
   isPathForgotten,
   type TombstoneIndex,
 } from "./tombstones.js";
@@ -1063,8 +1063,7 @@ export class NestStorage {
         if (index.records.length === 0) continue;
         // A live document back at a path a forget retired,
         // or carrying an erased revision's body anywhere: restored content.
-        const bodyHash = forgettableBodyHash(doc.rawContent);
-        if (isPathForgotten(index, doc.id) || (bodyHash && index.bodyHashes.has(bodyHash))) {
+        if (isPathForgotten(index, doc.id) || carriesForgottenBody(index, doc.rawContent)) {
           errors.push({
             type: "forgotten_content_present",
             document: doc.id,

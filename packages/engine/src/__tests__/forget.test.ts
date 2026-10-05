@@ -224,6 +224,26 @@ describe("forget protocol — node forget (§6.3.3)", () => {
     expect(contextYaml!.documents.map((d) => d.id)).not.toContain(id);
   });
 
+  it("an explicit status:forgotten returns the stub on every query surface", async () => {
+    await forgetDocument(storage, id, { reasonCode: "user_request", forgottenBy: "s@example.com" });
+    await storage.regenerateIndex();
+
+    const engine = new GraphQueryEngine(storage);
+    expect((await engine.query("status:forgotten")).documents.map((d) => d.id)).toEqual([id]);
+    expect((await engine.query("status:forgotten", { full: true })).documents.map((d) => d.id)).toEqual([id]);
+    const q = await api.run<{ documents: Array<{ id: string }> }>("context_query", { query: "status:forgotten" }, ctx);
+    expect(q.documents.map((d) => d.id)).toEqual([id]);
+    const r = await api.run<{ documents: Array<{ id: string; body: string }> }>(
+      "context_resolve",
+      { selector: "status:forgotten" },
+      ctx,
+    );
+    expect(r.documents.map((d) => d.id)).toEqual([id]);
+    expect(r.documents[0].body.trim()).toBe("");
+    // Without the explicit ask the stub stays hidden.
+    expect((await engine.query("#patients", { full: true })).documents.map((d) => d.id)).not.toContain(id);
+  });
+
   it("records an audit event with who/when/why/which versions — and no content", async () => {
     await api.run("context_forget", { id, reason_code: "user_request", requested_by: "jane@example.com" }, ctx);
     const log = await api.run<{ events: Array<Record<string, unknown>> }>("context_forget_log", { id }, ctx);
@@ -439,6 +459,20 @@ describe("forget protocol — anti-resurrection (§6.3.4)", () => {
     expect(res.failed).toHaveLength(2);
     expect(existsSync(join(dir, `${id}.md`))).toBe(false);
     expect(await filesContaining(dir, "MANGO-CORP")).toEqual([]);
+  });
+
+  it("documents[] import refuses an erased body whatever blank lines surround it", async () => {
+    // `ctx add --body X` writes the body as "\nX\n"; an import writes "X".
+    const text = "SOURCE-SECRET-KIWI-2 revised body 5678";
+    const added = await api.run<{ id: string }>("context_create", { title: "Shared", content: `\n${text}\n` }, ctx);
+    await forgetDocument(storage, added.id, { reasonCode: "user_request", forgottenBy: "dpo@example.com" });
+    const res = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { documents: [{ title: "New Name", content: text }] },
+      ctx,
+    );
+    expect(res.failed).toHaveLength(1);
+    expect(await filesContaining(dir, "SOURCE-SECRET")).toEqual([]);
   });
 
   it("context_import_pdf refuses a retired path and an erased binary", async () => {

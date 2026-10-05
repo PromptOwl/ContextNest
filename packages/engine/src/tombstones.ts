@@ -159,14 +159,26 @@ export function isPathForgotten(index: TombstoneIndex, docId: string): boolean {
 }
 
 /**
- * Body checksum of a raw document, in the same form as `frontmatter.checksum`
- * (the anti-resurrection key for live files), or null when the body is too
- * short to be recorded — see {@link MIN_FORGETTABLE_BODY_LENGTH}.
+ * Hash of a raw document's body (the anti-resurrection key for live files), or
+ * null when the body is too short to be recorded — see
+ * {@link MIN_FORGETTABLE_BODY_LENGTH}. The body is trimmed (and CRLF folded)
+ * first: surfaces wrap the same text in different blank lines (`ctx add` writes
+ * "\nX\n", `context_import` writes "X"), and that must not let erased content back.
  */
 export function forgettableBodyHash(raw: string): string | null {
-  const body = getChecksumContent(raw);
-  if (body.trim().length < MIN_FORGETTABLE_BODY_LENGTH) return null;
+  const body = getChecksumContent(raw).replace(/\r\n/g, "\n").trim();
+  if (body.length < MIN_FORGETTABLE_BODY_LENGTH) return null;
   return computeContentHash(body);
+}
+
+/**
+ * True when `raw`'s body matches a forgotten revision. Also checks the
+ * untrimmed hash, which is what forgets recorded before bodies were trimmed.
+ */
+export function carriesForgottenBody(index: TombstoneIndex, raw: string): boolean {
+  const body = forgettableBodyHash(raw);
+  if (!body) return false;
+  return index.bodyHashes.has(body) || index.bodyHashes.has(computeContentHash(getChecksumContent(raw)));
 }
 
 /**
@@ -248,8 +260,7 @@ export function importVerdict(
     if (isPathForgotten(index, id)) {
       return `${id} was forgotten; its path cannot take content again (publish under a new path)`;
     }
-    const bodyHash = forgettableBodyHash(content);
-    if (bodyHash && index.bodyHashes.has(bodyHash)) {
+    if (carriesForgottenBody(index, content)) {
       return `${id} carries the content of a forgotten node`;
     }
   }
