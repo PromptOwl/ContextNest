@@ -93,3 +93,57 @@ describe("[regression] review gate — CLI", () => {
     expect(ctx(tmp, ["config", "get", "review"]).trim()).toBe("on");
   });
 });
+
+/** Run the CLI tolerating failure, returning exit status plus merged output. */
+function ctxResult(cwd: string, args: string[]): { status: number; output: string } {
+  try {
+    const stdout = execFileSync("node", [distPath, ...args], { cwd, env: ENV, encoding: "utf-8" });
+    return { status: 0, output: stdout };
+  } catch (err: any) {
+    return {
+      status: err.status ?? 1,
+      output: (err.stdout?.toString() ?? "") + (err.stderr?.toString() ?? ""),
+    };
+  }
+}
+
+describe("[regression] review list / reject — CLI", () => {
+  it("review list shows every held write; reject retires one and drops it from the list", () => {
+    ctx(tmp, ["add", "nodes/held1", "--title", "Held One"]);
+    ctx(tmp, ["add", "nodes/held2", "--title", "Held Two"]);
+
+    const listed = JSON.parse(ctx(tmp, ["review", "list", "--json"])) as Array<{
+      id: string;
+      kind: string;
+    }>;
+    expect(listed.map((h) => h.id).sort()).toEqual(["nodes/held1", "nodes/held2"]);
+    expect(listed.every((h) => h.kind === "new")).toBe(true);
+    // The human render names each held path too.
+    expect(ctx(tmp, ["review", "list"])).toContain("nodes/held1");
+
+    const rejected = ctx(tmp, ["review", "reject", "nodes/held1"]);
+    expect(rejected).toMatch(/Rejected nodes\/held1 \(status: rejected\)/);
+    expect(doc("nodes/held1")).toMatch(/status: rejected/);
+
+    // The rejected write no longer appears among the pending ones.
+    const after = JSON.parse(ctx(tmp, ["review", "list", "--json"])) as Array<{ id: string }>;
+    expect(after.map((h) => h.id)).toEqual(["nodes/held2"]);
+  });
+});
+
+describe("[regression] config negatives — CLI", () => {
+  it("config set review rejects a value that is not on|off", () => {
+    const { status, output } = ctxResult(tmp, ["config", "set", "review", "maybe"]);
+    expect(status).not.toBe(0);
+    expect(output).toMatch(/Usage: ctx config set review on\|off/);
+    // The bad value never lands: review stays on.
+    expect(ctx(tmp, ["config", "get", "review"]).trim()).toBe("on");
+  });
+
+  it("config get names an unknown setting rather than inventing one", () => {
+    const { status, output } = ctxResult(tmp, ["config", "get", "boguskey"]);
+    expect(status).not.toBe(0);
+    expect(output).toMatch(/Unknown setting "boguskey"/);
+    expect(output).toMatch(/Supported: review/);
+  });
+});

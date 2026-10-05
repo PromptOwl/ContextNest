@@ -66,6 +66,9 @@ export function asPendingConfirmation(status: number, body: unknown): PendingCon
   const b = body as Record<string, unknown>;
   if (b.status !== "pending_confirmation") return null;
   if (typeof b.poll_url !== "string" || typeof b.pending_id !== "string") return null;
+  // poll_url is appended to --server, and the poll carries the API key. Anything
+  // but a path (e.g. "@evil.example/x" → userinfo) would retarget the key.
+  if (!b.poll_url.startsWith("/")) return null;
   return {
     status: "pending_confirmation",
     pending_id: b.pending_id,
@@ -168,25 +171,21 @@ export async function pollUntilDecided(opts: PollOptions): Promise<TerminalOutco
   while (true) {
     attempt++;
     let result: PollResult | null = null;
-    try {
-      const res = await fetchFn(url, {
-        ...NO_REDIRECT,
-        method: "GET",
-        headers: { Authorization: `Bearer ${opts.apiKey}` },
-      });
+    // Only the network call is retried on throw; a redirect or an auth failure
+    // never comes good, so those escape to the caller instead of spinning.
+    const res = await fetchFn(url, {
+      ...NO_REDIRECT,
+      method: "GET",
+      headers: { Authorization: `Bearer ${opts.apiKey}` },
+    }).catch(() => null);
+    if (res) {
       assertNotRedirected(res, "--server");
       if (res.status === 401 || res.status === 403) {
         throw new Error(`poll rejected (${res.status}) — the API key is not authorized for this nest`);
       }
-      if (res.ok) {
-        result = (await res.json()) as PollResult;
-      }
-      // A non-ok, non-auth status (5xx, 404) leaves result null → retried below.
-    } catch (err) {
-      // A hard auth failure is not recoverable; re-throw for the caller to
-      // report. Everything else is a transient blip we retry through.
-      if (err instanceof Error && /not authorized/.test(err.message)) throw err;
-      result = null;
+      // A non-ok, non-auth status (5xx, 404) or an unreadable body leaves
+      // result null → retried below.
+      if (res.ok) result = (await res.json().catch(() => null)) as PollResult | null;
     }
 
     if (result) {

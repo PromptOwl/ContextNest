@@ -77,6 +77,12 @@ describe("asPendingConfirmation", () => {
     expect(asPendingConfirmation(202, { status: "queued" })).toBeNull();
     expect(asPendingConfirmation(202, { status: "pending_confirmation" })).toBeNull(); // no poll_url/id
   });
+
+  it("returns null when poll_url is not a path (it would retarget the API key)", () => {
+    for (const poll_url of ["@evil.example/x", "https://evil.example/x"]) {
+      expect(asPendingConfirmation(202, { status: "pending_confirmation", pending_id: "p1", poll_url })).toBeNull();
+    }
+  });
 });
 
 // ─── exitCodeFor ──────────────────────────────────────────────────────────────
@@ -196,6 +202,28 @@ describe("pollUntilDecided", () => {
     await expect(
       pollUntilDecided({ ...BASE, fetchFn, sleep: clock.sleep, now: clock.now }),
     ).rejects.toThrow(/not authorized/i);
+  });
+
+  it("aborts immediately on a redirect instead of retrying until the timeout", async () => {
+    const clock = fakeClock();
+    const fetchFn = vi.fn(
+      async () => new Response(null, { status: 302, headers: { location: "https://evil.example/" } }),
+    ) as unknown as typeof fetch;
+    await expect(
+      pollUntilDecided({ ...BASE, fetchFn, sleep: clock.sleep, now: clock.now }),
+    ).rejects.toThrow(/redirected/);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries through a dropped connection", async () => {
+    const clock = fakeClock();
+    let n = 0;
+    const fetchFn = vi.fn(async () => {
+      if (n++ === 0) throw new TypeError("fetch failed");
+      return jsonResponse(200, { status: "applied", applied_node_count: 1 });
+    }) as unknown as typeof fetch;
+    const outcome = await pollUntilDecided({ ...BASE, fetchFn, sleep: clock.sleep, now: clock.now });
+    expect(outcome.kind).toBe("applied");
   });
 
   it("caps the backoff at maxDelayMs", async () => {

@@ -454,6 +454,19 @@ describe("[regression] remote nests — guardrails", () => {
     expect(res.stderr + res.stdout).toMatch(/farnest/);
   });
 
+  // The review gate is a local vault's setting — a hosted nest governs its own
+  // writes — so `ctx config` / `ctx review` refuse a remote alias outright
+  // rather than silently acting on whatever local vault the cwd resolves to.
+  it.each([["config", "get", "review"], ["config", "set", "review", "off"], ["review", "list"]])(
+    "`ctx %s %s` refuses a remote alias before touching the network",
+    (...cmd: string[]) => {
+      const res = run(cwd, [...cmd, "--vault", "farnest"]);
+      expect(res.status).not.toBe(0);
+      expect(res.status).not.toBe(REMOTE_UNREACHABLE_EXIT); // guard error, not connectivity
+      expect(res.stderr + res.stdout).toMatch(/local vault only/i);
+    },
+  );
+
   it("an unreachable HTTP remote exits with code 3 and names the alias", async () => {
     const port = await closedPort();
     const yaml = [
@@ -956,5 +969,82 @@ describe("[regression] remote nests — governed nest without publish/verify", (
     expect(res.status, res.stderr).toBe(0);
     expect(res.stdout).toMatch(/v2.*approved.*AI-active/is);
     expect(res.stdout).not.toMatch(/draft/i);
+  });
+});
+
+// ─── 7. ctx move against a nest that DOES expose context_move ────────────────
+//
+// §3c already pins the two refusals the OSS surface can produce: a local vault
+// has no move op, and this repo's MCP server has no `context_move` tool. What
+// neither can exercise is a nest that exposes the tool and then FAILS the move
+// server-side — the move-under-review path. Moving a pending_review document on
+// a hosted Community nest crashes on its YAML dump and returns
+// "unacceptable kind of an object to dump [object Undefined]" (contextnest-
+// community #191). The CLI's job is to relay that cleanly, never to crash on
+// it; the stub reproduces the exact surface so this contract is pinned.
+
+describe("[regression] remote nests — move against a nest exposing context_move", () => {
+  let configDir: string;
+  let cwd: string;
+  let run: ReturnType<typeof makeRunner>;
+
+  const stub = join(here, "fixtures", "move-under-review-stub.mjs");
+
+  beforeAll(() => {
+    configDir = mkdtempSync(join(tmpdir(), "cn-move-cfg-"));
+    cwd = mkdtempSync(join(tmpdir(), "cn-move-cwd-"));
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "config.yaml"),
+      [
+        "version: 1",
+        "remotes:",
+        "  movenest:",
+        "    transport: stdio",
+        `    command: ${yq(process.execPath)}`,
+        "    args:",
+        `      - ${yq(stub)}`,
+        "    description: Nest exposing context_move",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+    run = makeRunner(configDir);
+  });
+
+  afterAll(() => {
+    for (const dir of [configDir, cwd]) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("moves a normal document and reports the id rewrite (proves the route is reached)", () => {
+    const res = run(cwd, ["move", "nodes/published-doc", "archive", "--vault", "movenest", "--yes"]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout).toMatch(/Moved/);
+    expect(res.stdout).toContain("nodes/published-doc");
+    expect(res.stdout).toContain("archive/published-doc");
+  });
+
+  it("relays a server-side move-under-review failure cleanly instead of crashing (MOVE-03 / #191)", () => {
+    const res = run(cwd, ["move", "nodes/under-review", "archive", "--vault", "movenest", "--yes"]);
+    // Exit 1 (the nest answered — this is NOT a connectivity failure, so never 3).
+    expect(res.status).toBe(1);
+    expect(res.status).not.toBe(REMOTE_UNREACHABLE_EXIT);
+    const output = res.stderr + res.stdout;
+    // The server's own message is surfaced, under the typed error code…
+    expect(output).toMatch(/unacceptable kind of an object to dump/);
+    expect(output).toMatch(/\[INTERNAL\]/);
+    // …and never as a raw crash: no Node stack frames, no undefined deref.
+    expect(output).not.toMatch(/Cannot read properties/i);
+    expect(res.stderr).not.toMatch(/^\s+at .+:\d+:\d+/m);
+  });
+
+  it("never dereferences a missing move payload into a raw TypeError", () => {
+    // Success envelope with an undefined payload (nothing came back to dump):
+    // the CLI must still fail as a typed, friendly error — not a crash.
+    const res = run(cwd, ["move", "nodes/empty-move", "archive", "--vault", "movenest", "--yes"]);
+    expect(res.status).toBe(1);
+    const output = res.stderr + res.stdout;
+    expect(output).not.toMatch(/Cannot read properties/i);
+    expect(res.stderr).not.toMatch(/^\s+at .+:\d+:\d+/m);
   });
 });

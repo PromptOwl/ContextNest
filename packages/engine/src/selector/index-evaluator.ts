@@ -14,6 +14,9 @@ import { normalizeStatus } from "../parser.js";
 
 export interface IndexEvaluatorOptions {
   packLoader?: (packId: string) => Pack | undefined;
+  /** Full-text search for `contextnest://search/…`. Without it, only title,
+   *  tags and description are searched — context.yaml holds no bodies. */
+  search?: (query: string) => Promise<string[]>;
 }
 
 /**
@@ -36,8 +39,13 @@ async function evaluateNode(
   switch (node.type) {
     case "tag":
       return evaluateTag(node.value, docs);
-    case "uri":
+    case "uri": {
+      const parsed = parseUri(node.value);
+      if (parsed.kind === "search" && options.search) {
+        return new Set(await options.search(parsed.path.slice(7).replace(/\+/g, " ")));
+      }
       return evaluateUri(node.value, docs);
+    }
     case "pack":
       return evaluatePack(node.value, docs, options);
     case "typeFilter":

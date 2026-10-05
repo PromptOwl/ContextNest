@@ -54,6 +54,7 @@ import { ContextNestError, ForgottenDocumentError } from "./errors.js";
 import {
   FORGET_EVENT_TYPE,
   addTombstone,
+  carriesForgottenBody,
   forgettableBodyHash,
   isPathForgotten,
   tombstoneFromEvent,
@@ -417,8 +418,7 @@ export async function assertNotForgotten(
       "was forgotten or deleted — its path cannot take content again; publish under a new path",
     );
   }
-  const body = forgettableBodyHash(node.rawContent || serializeDocument(node));
-  if (body && tombstones.bodyHashes.has(body)) {
+  if (carriesForgottenBody(tombstones, node.rawContent || serializeDocument(node))) {
     throw new ForgottenDocumentError(node.id, "carries the content of a forgotten node");
   }
 }
