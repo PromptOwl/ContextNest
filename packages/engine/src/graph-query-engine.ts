@@ -20,7 +20,7 @@ import { PackLoader } from "./packs.js";
 import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
-import { isForgotten, isPublished, isRetrievable } from "./parser.js";
+import { isPublished, isRetrievable } from "./parser.js";
 import { parseSelector } from "./selector/parser.js";
 import { asksForForgotten } from "./selector/evaluator.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
@@ -100,9 +100,10 @@ export class GraphQueryEngine {
     // (see `ctx index` and `autoIndex` below). Drafts therefore never appear
     // as seed candidates and graph mode cannot honor `includeDrafts`. Force
     // full mode so draft documents actually surface when callers opt in.
-    // An explicit `status:forgotten` (§6.3.3) also needs full mode: context.yaml
-    // never indexes forgotten stubs, so graph mode could not seed one.
-    if (!full && !includeDrafts && !asksForForgotten(parseSelector(selector))) {
+    // context.yaml is published-only, so it has no forgotten stubs: an explicit
+    // `status:forgotten` (§6.3.3) can only be answered by a full query.
+    const wantsForgotten = asksForForgotten(parseSelector(selector), true);
+    if (!full && !includeDrafts && !wantsForgotten) {
       let contextYaml = await this.storage.readContextYaml();
 
       // Auto-generate context.yaml if missing — but only inside a real vault.
@@ -257,16 +258,16 @@ export class GraphQueryEngine {
 
     // Apply the same retrieval gates as graphQuery so approved/rejected
     // never leak to LLMs, and drafts surface only when explicitly opted in.
-    // A forgotten stub reaching here was asked for by name — the selector
-    // evaluator drops it otherwise — and it carries no content to leak.
-    const gate = (doc: ContextNode) => {
-      if (isForgotten(doc)) return true;
+    // A forgotten stub is returned only when the selector asked for it by name.
+    const wantsForgotten = asksForForgotten(parseSelector(selector), true);
+    const keep = (doc: ContextNode): boolean => {
+      if (wantsForgotten && doc.frontmatter.status === "forgotten") return true;
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;
     };
-    const filteredDocs = result.documents.filter(gate);
-    const filteredSources = result.sourceNodes.filter(gate);
+    const filteredDocs = result.documents.filter(keep);
+    const filteredSources = result.sourceNodes.filter(keep);
 
     return {
       ...result,
