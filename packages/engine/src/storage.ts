@@ -576,7 +576,7 @@ export class NestStorage {
   private tmpWriteCounter = 0;
 
   /** chain_events.yaml as last parsed, keyed by its stat. See `readTombstones`. */
-  private chainEventCache?: { size: number; mtimeMs: number; events: readonly unknown[] };
+  private chainEventCache?: { size: number; mtimeMs: number; ino: number; events: readonly unknown[] };
 
   /**
    * Per-document history verdicts for the serve path, keyed by doc id and
@@ -1168,13 +1168,23 @@ export class NestStorage {
    * forgotten.
    */
   async readTombstones(): Promise<TombstoneIndex> {
-    // Every publish consults the log, and it only grows (each append changes
-    // its size), so its parsed events are reused until a stat says the file
-    // changed — by this process or any other on the same mount. A fresh index
-    // is built per call because callers fold records into the one they get.
+    // Every publish consults the log, and the engine only ever appends to it
+    // (each append changes its size), so its parsed events are reused until a
+    // stat says the file changed — by this process or any other on the same
+    // mount. The inode catches a same-size replacement by rename (a restore,
+    // a sync tool, an editor); an in-place same-size rewrite within one mtime
+    // tick would still be missed. The stat is taken BEFORE the read, so a
+    // write racing the read leaves a stale key and only forces a re-read.
+    // A fresh index is built per call because callers fold records into it.
     const info = await stat(this.chainEventLogPath()).catch(() => null);
     const cached = this.chainEventCache;
-    if (info && cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
+    if (
+      info &&
+      cached &&
+      cached.size === info.size &&
+      cached.mtimeMs === info.mtimeMs &&
+      cached.ino === info.ino
+    ) {
       return buildTombstoneIndex(cached.events);
     }
     this.chainEventCache = undefined;
@@ -1184,7 +1194,7 @@ export class NestStorage {
       // Bounded: a log past the cap is read per check, as before, rather than
       // pinned in memory for the life of the process.
       if (info && info.size <= CHAIN_EVENT_CACHE_MAX_BYTES) {
-        this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, events };
+        this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, events };
       }
     } catch (err) {
       // Every publish consults this, so an unparseable log must not lock the

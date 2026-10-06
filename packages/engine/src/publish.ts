@@ -37,7 +37,11 @@ export interface PublishResult {
   checkpointNumber: number;
   /** The checkpoint this publish sealed — hand it to regenerateIndex. */
   checkpoint: Checkpoint;
-  /** The vault crawl the checkpoint took after the write — hand it to regenerateIndex as `docs`. */
+  /**
+   * The vault crawl the checkpoint took after the write — hand it to
+   * regenerateIndex as `docs`. Like `checkpoint`, only valid passed straight
+   * through under the same lock: any write in between makes it stale.
+   */
   vaultDocs: ContextNode[];
 }
 

@@ -408,7 +408,10 @@ interface CommitInput {
   note?: string;
   /** True for a rollback — see `settlePdfForCommit`. */
   restoring?: boolean;
-  /** History the caller already read under this lock; omit to read it here. */
+  /**
+   * History the caller already read under this lock; omit to read it here.
+   * `null` means the document has no history — not "unknown".
+   */
   knownHistory?: DocumentHistory | null;
 }
 

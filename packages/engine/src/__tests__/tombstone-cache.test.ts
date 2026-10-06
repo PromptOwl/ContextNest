@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, rm, appendFile } from "node:fs/promises";
+import { mkdtemp, rm, appendFile, readFile, writeFile, rename, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { NestStorage, CHAIN_EVENT_CACHE_MAX_BYTES } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
@@ -68,6 +68,25 @@ describe("readTombstones cache", () => {
     expect(isPathForgotten(await storage.readTombstones(), "nodes/a/one")).toBe(true);
     expect(isPathForgotten(await storage.readTombstones(), "nodes/a/one")).toBe(true);
     expect(parse).toHaveBeenCalledTimes(2);
+  });
+
+  it("a same-size, same-mtime replacement by rename is still seen (inode)", async () => {
+    const log = join(dir, ".versions", "chain_events.yaml");
+    const at = new Date("2026-01-01T00:00:00Z");
+    await utimes(log, at, at);
+    expect(isPathForgotten(await storage.readTombstones(), "nodes/a/two")).toBe(false);
+
+    // Same length: only the forgotten path's last segment changes.
+    const swapped = (await readFile(log, "utf-8")).replaceAll("nodes/a/one", "nodes/a/two");
+    const tmp = `${log}.restore`;
+    await writeFile(tmp, swapped);
+    await utimes(tmp, at, at);
+    await rename(tmp, log);
+    const after = await stat(log);
+    expect(after.size).toBe(Buffer.byteLength(swapped));
+    expect(after.mtime.getTime()).toBe(at.getTime());
+
+    expect(isPathForgotten(await storage.readTombstones(), "nodes/a/two")).toBe(true);
   });
 
   it("a record a caller folds in does not reach the next caller", async () => {
