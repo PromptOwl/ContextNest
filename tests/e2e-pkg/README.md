@@ -13,7 +13,18 @@ packaging failures. This suite closes that gap and nothing else.
 It packs the real tarball (`npm pack`), installs it into a throwaway directory
 with **no workspace on the path**, and drives the *installed* binary.
 
-## What it guards (see `packaging.pkg.test.ts`)
+Two kinds of tests share that scaffolding:
+
+| File | What it covers |
+|------|----------------|
+| `packaging.pkg.test.ts` | **PKG-01..08** — install integrity (see the table below). |
+| `journeys.pkg.test.ts` | **User journeys (J1…)** — one realistic user story end-to-end per journey. |
+
+The pack → install → spawn → assert plumbing (including the Windows `npm` shim,
+CRLF handling, and isolated auto-cleaned vaults) lives once in
+`journey-harness.ts`.
+
+## What it guards (`packaging.pkg.test.ts`)
 
 | Case | Guards against |
 |------|----------------|
@@ -30,37 +41,68 @@ with **no workspace on the path**, and drives the *installed* binary.
 regression layer. This suite is breadth — touch each group once — plus install
 integrity. It is not a second regression suite.
 
-## When it runs
-
-Gated to **release PRs / pre-publish**, on the CI OS × Node matrix
-(ubuntu / windows / macOS × Node 20/22). Not on every push — it is slow (packs +
-multiple clean installs) and needs network + `npm`.
-
-## Run it locally
-
-```bash
-pnpm test:pkg          # builds the CLI, then runs this suite
-```
-
-Requires network access (the install resolves `commander` from the registry).
-If you see a "dist/index.js is missing" error, build first:
-`pnpm --filter @promptowl/contextnest-cli build`.
-
 ## User journeys (`journeys.pkg.test.ts`)
 
-Breadth, persona-driven flows that drive the *installed* bin through one
-realistic user story each. They share the install-and-drive scaffolding in
-`journey-harness.ts`, so a new journey is a declarative list of cases — not new
-plumbing. They are breadth, not a second regression suite: per-command depth
-(every flag, every negative) stays in the dev-owned `*.regression.test.ts`.
+Persona-driven flows that drive the *installed* bin through one realistic user
+story each, using the install-and-drive scaffolding in `journey-harness.ts`.
+Like the packaging cases, they are breadth: one pass through a story, not
+per-command depth. Every flag and every negative path belongs in the dev-owned
+`*.regression.test.ts`.
 
-### Adding a journey
+Current journeys:
 
-A `Journey` is a list of **cases**; each case is one numbered ticket line (its
-`id` and `title` are the ticket's verbatim wording) and runs one or more
-**actions**. Each action is a command plus checks on its result
-(`status`, `stdout`, `stdoutNot`, `stderr`, `json`, `files`). Steps share one
-isolated, auto-cleaned vault and run in order.
+| Journey | Story |
+|---------|-------|
+| J1 | capture → recall — capture three linked nodes, publish them past the review gate, then retrieve by tag, by full-text search, and by name. |
+
+## Running the suite
+
+All forms need **`npm` on PATH** and **network access** — the clean install
+resolves `commander` from the registry. The `pnpm test:pkg` entry point builds
+the CLI for you; the direct `vitest` forms do **not**, so if you use those,
+build the CLI first or you will pack a stale `dist`:
+
+```bash
+pnpm --filter @promptowl/contextnest-cli build
+```
+
+```bash
+# Everything — packaging integrity + every journey (builds the CLI first):
+pnpm test:pkg
+
+# --- the forms below assume you have already built the CLI (see above) ---
+
+# Only the packaging cases (PKG-01..08):
+npx vitest run --config tests/e2e-pkg/vitest.config.ts tests/e2e-pkg/packaging.pkg.test.ts
+
+# Only the journeys (all of them):
+npx vitest run --config tests/e2e-pkg/vitest.config.ts tests/e2e-pkg/journeys.pkg.test.ts
+
+# One journey, by name (e.g. J1):
+npx vitest run --config tests/e2e-pkg/vitest.config.ts -t "J1"
+```
+
+If you see a `dist/index.js is missing` error, you skipped the build step above.
+
+## When it runs
+
+**Today it is a manual / local gate** — run it yourself before cutting a release
+(see "Running the suite" above). It is **not yet wired into any CI workflow**:
+`ci.yml` runs `pnpm test` + `pnpm test:regression` on every PR, and `release.yml`
+only versions and publishes — neither invokes `pnpm test:pkg`.
+
+It is intentionally kept off the per-push path: it is slow (packs + multiple
+clean installs) and needs network + `npm`. The intended home, once wired in, is
+release PRs / pre-publish on the full matrix (ubuntu / windows / macOS × Node
+20/22) — until that lands, treat running it before release as a human step.
+
+## Adding a journey
+
+A `Journey` is a list of **cases**. Each case is one numbered ticket line — its
+`id` and `title` are the ticket's verbatim wording — and runs one or more
+**actions**. An action is a command plus checks on its result
+(`status`, `stdout`, `stdoutNot`, `stderr`, `json`, `files`). All cases in a
+journey share one isolated, auto-cleaned vault and run in order.
 
 ```ts
 const J2: Journey = {
@@ -86,22 +128,3 @@ it("J2 — time-travel", () => runJourney({ installDir: INSTALL, scratch }, J2))
 the built bin first and assert what it actually prints, not what the catalog
 assumes. Failures name the ticket case id + title + command, so a red run points
 straight at the ticket line it maps to.
-
-### Running it manually
-
-```bash
-# Everything — packaging integrity + every journey (builds the CLI first):
-pnpm test:pkg
-
-# Iterate on ONE journey. Build once, then filter by test name:
-pnpm --filter @promptowl/contextnest-cli build
-npx vitest run --config tests/e2e-pkg/vitest.config.ts -t "J1"
-
-# Only the journeys file (after a build):
-npx vitest run --config tests/e2e-pkg/vitest.config.ts tests/e2e-pkg/journeys.pkg.test.ts
-```
-
-The direct `vitest` forms skip the build that `pnpm test:pkg` does for you, so
-build the CLI first (or your run packs a stale `dist`). All forms need `npm` on
-PATH and network access (the clean install resolves `commander` from the
-registry).
