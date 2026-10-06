@@ -213,6 +213,21 @@ export const SENSITIVE_FILE_GLOBS = [
   "context.yaml",
 ];
 
+/**
+ * Run a write; only if its directory is missing, create it and write once more.
+ * The directory almost always exists, and an up-front `mkdir -p` is a round
+ * trip per write on a network mount.
+ */
+async function writeInDir<T>(dir: string, write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    await mkdir(dir, { recursive: true });
+    return write();
+  }
+}
+
 /** Largest chain_events.yaml whose parsed events `readTombstones` keeps in memory. */
 export const CHAIN_EVENT_CACHE_MAX_BYTES = 256 * 1024;
 
@@ -937,7 +952,6 @@ export class NestStorage {
 
     for (const file of agentConfigs) {
       const filePath = join(this.root, file.path);
-      await mkdir(dirname(filePath), { recursive: true });
 
       let existing: string | null = null;
       try {
@@ -948,7 +962,9 @@ export class NestStorage {
 
       const merged = mergeAgentConfig(existing, file.content);
       // Usually unchanged between writes — skip the rewrite.
-      if (merged !== existing) await writeFile(filePath, merged, "utf-8");
+      if (merged !== existing) {
+        await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
+      }
     }
   }
 
@@ -1393,13 +1409,14 @@ export class NestStorage {
     options: { exclusive?: boolean } = {},
   ): Promise<void> {
     const filePath = join(this.root, `${id}.md`);
-    await mkdir(dirname(filePath), { recursive: true });
     const onDisk = await this.sealText(id, "doc", content);
     try {
-      await writeFile(filePath, onDisk, {
-        encoding: "utf-8",
-        ...(options.exclusive ? { flag: "wx" } : {}),
-      });
+      await writeInDir(dirname(filePath), () =>
+        writeFile(filePath, onDisk, {
+          encoding: "utf-8",
+          ...(options.exclusive ? { flag: "wx" } : {}),
+        }),
+      );
     } catch (err) {
       if (options.exclusive && (err as NodeJS.ErrnoException).code === "EEXIST") {
         throw new ContextNestError(`Document "${id}" already exists`, "DOCUMENT_ALREADY_EXISTS");
@@ -1972,7 +1989,6 @@ export class NestStorage {
   ): Promise<void> {
     this.markHistoryTouched(docId);
     const path = this.historyPath(docId);
-    await mkdir(dirname(path), { recursive: true });
 
     // One list item, indented to sit under `versions:`. Indenting a whole YAML
     // document by a fixed amount keeps it valid, including multi-line scalars.
@@ -1987,7 +2003,7 @@ export class NestStorage {
     // one header is ever written — and it lands together with its entry, so the
     // file is never left as a header with no versions under it.
     try {
-      const created = await open(path, "wx");
+      const created = await writeInDir(dirname(path), () => open(path, "wx"));
       try {
         await created.write(header + block);
         await created.sync();
@@ -2067,18 +2083,17 @@ export class NestStorage {
     const docName = basename(docId);
     const docDir = dirname(docId);
     const dir = join(this.root, docDir, ".versions", docName);
-    await mkdir(dir, { recursive: true });
     const path = join(dir, fileName);
     content = await this.sealText(docId, fileName.endsWith(".diff") ? "diff" : "keyframe", content);
 
     if (overwrite) {
-      await this.writeFileDurable(path, content);
+      await writeInDir(dir, () => this.writeFileDurable(path, content));
       return;
     }
 
     let handle;
     try {
-      handle = await open(path, "wx");
+      handle = await writeInDir(dir, () => open(path, "wx"));
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") {
         throw new VersionArtifactExistsError(docId, version, fileName);
@@ -2614,8 +2629,8 @@ export class NestStorage {
    * previous checkpoint use {@link startCheckpointHistory}.
    */
   async appendCheckpoint(checkpoint: Checkpoint): Promise<void> {
+    // No mkdir: this only extends a chain file that exists (see above).
     const path = this.checkpointHistoryPath();
-    await mkdir(dirname(path), { recursive: true });
     const block = yaml
       .dump([checkpoint], { lineWidth: -1, noRefs: true })
       .split("\n")
@@ -2754,8 +2769,7 @@ export class NestStorage {
    */
   async writeIndexMd(folder: string, content: string): Promise<void> {
     const indexPath = join(this.root, folder, "INDEX.md");
-    await mkdir(dirname(indexPath), { recursive: true });
-    await writeFile(indexPath, content, "utf-8");
+    await writeInDir(dirname(indexPath), () => writeFile(indexPath, content, "utf-8"));
   }
 
   /**
