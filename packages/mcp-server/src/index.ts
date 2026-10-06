@@ -122,8 +122,6 @@ function tool<Shape extends z.ZodRawShape>(
   );
 }
 
-const regenerateIndex = () => storage.regenerateIndex();
-
 // Permissive RBAC stub — local single-user MCP context has no real identity
 // layer. All gates pass; engine still records the supplied `actor` in the
 // hash chain audit trail and suggestion meta. Real deploys inject a hook
@@ -1060,7 +1058,7 @@ tool(
       if ((await vaultReviewMode()) === "on") {
         node.frontmatter.status = "pending_review";
         await storage.writeDocument(id, serializeDocument(node));
-        await regenerateIndex();
+        await storage.regenerateIndex({ changedIds: [id] });
         return toolResult({
           id,
           frontmatter: node.frontmatter,
@@ -1305,7 +1303,7 @@ tool(
         if (!suggestionId) {
           doc.frontmatter.status = "pending_review";
           await storage.writeDocument(id, serializeDocument(doc));
-          await regenerateIndex();
+          await storage.regenerateIndex({ changedIds: [id] });
         }
         return toolResult({
           id,
@@ -1332,7 +1330,7 @@ tool(
         normalizedStatus === "pending_review" ||
         normalizedStatus === "draft"
       ) {
-        await regenerateIndex();
+        await storage.regenerateIndex({ changedIds: [id] });
         const message =
           normalizedStatus === "rejected"
             ? "Document retired (status: rejected). No new version cut."
@@ -1409,7 +1407,7 @@ tool(
         reasonCode: "user_request",
         deletedBy: "mcp@contextnest.local",
       });
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id] });
 
       return {
         content: [
@@ -1591,7 +1589,7 @@ tool(
       comment,
     });
 
-    await regenerateIndex();
+    await storage.regenerateIndex({ changedIds: [id] });
 
     return {
       content: [

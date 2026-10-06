@@ -3615,7 +3615,7 @@ drift
       comment: opts.comment,
     });
 
-    await regenerateIndex(storage);
+    await storage.regenerateIndex({ changedIds: [id] });
 
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));

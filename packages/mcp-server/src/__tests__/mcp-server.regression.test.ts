@@ -578,6 +578,24 @@ describe("[regression] MCP server e2e — mutation tools", () => {
 
     expect(await isToolError(client, "delete_document", { path: "nodes/disposable" })).toBe(true);
   });
+
+  it("publish and delete rewrite only the touched folder's INDEX.md", async () => {
+    for (const path of ["nodes/scope-a/one", "nodes/scope-a/two", "nodes/scope-b/three"]) {
+      await callJson(client, "create_document", { path, title: path.split("/").pop() });
+    }
+    const otherIndex = join(vault, "nodes", "scope-b", "INDEX.md");
+    const before = await readFile(otherIndex, "utf-8");
+    await new Promise((r) => setTimeout(r, 5));
+
+    await callJson(client, "publish_document", { path: "nodes/scope-a/one", author: "t@example.com" });
+    await callJson(client, "delete_document", { path: "nodes/scope-a/two" });
+
+    expect(await readFile(otherIndex, "utf-8")).toBe(before);
+    const touched = await readFile(join(vault, "nodes", "scope-a", "INDEX.md"), "utf-8");
+    expect(touched).toContain("nodes/scope-a/one");
+    expect(touched).not.toContain("nodes/scope-a/two");
+    expect(JSON.stringify(await storage.readContextYaml())).not.toContain("nodes/scope-a/two");
+  });
 });
 
 // ─── Governance / drift tools (+ internal file assertions) ────────────────────
