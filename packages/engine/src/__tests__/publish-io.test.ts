@@ -14,6 +14,7 @@ import { VersionManager } from "../versioning.js";
 import { serializeDocument } from "../parser.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import { approveSuggestion, rollbackDocument } from "../approval.js";
+import { approveReview, listReviewHolds } from "../review.js";
 import { stageSuggestion } from "../suggestions.js";
 import type { RbacHook } from "../types.js";
 
@@ -181,6 +182,25 @@ describe("publish I/O: one history read per document, same results", () => {
     expect(await versions.reconstructVersion(id, 2)).toContain("$129");
     expect(await versions.reconstructVersion(id, 3)).toContain("$99");
     expect(await versions.reconstructVersion(id, 3)).toBe(await readFile(join(dir, `${id}.md`), "utf-8"));
+  });
+
+  it("review approve of a held edit rebuilds the head once: two history reads, one per step", async () => {
+    const id = "nodes/alpha/held";
+    await api.run("context_create", { id, title: "Held", content: "one" }, ctx);
+    await api.run("context_update", { id, content: "two", review: true }, ctx);
+    expect(await listReviewHolds(storage, id)).toHaveLength(1);
+    const readHistory = vi.spyOn(storage, "readHistory");
+
+    const out = await approveReview(storage, id, { actor: "reviewer" });
+
+    expect(out.version).toBe(2);
+    // One to rebuild the approved head (holds + patch base), one for the publish.
+    expect(countFor(readHistory, id)).toBe(2);
+    vi.restoreAllMocks();
+
+    expect(await listReviewHolds(storage, id)).toHaveLength(0);
+    expect((await storage.readDocument(id)).body).toContain("two");
+    await assertIntact([id]);
   });
 
   it("many sequential publishes keep diffs reconstructable across the keyframe interval", async () => {
