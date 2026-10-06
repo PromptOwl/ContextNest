@@ -48,3 +48,8 @@ describe("task node type", () => {
     expect((parsed.frontmatter.metadata as any).priority).toBe("urgent");
   });
 });
+
+// Compile-time guard: the NodeType union and NODE_TYPES must agree, or a
+// consumer comparing `frontmatter.type === "task"` fails to typecheck.
+const _taskIsNodeType: import("../types.js").NodeType = "task";
+void _taskIsNodeType;
