@@ -309,7 +309,7 @@ export async function approveReview(
         if (other.suggestion_id === chosen.suggestion_id) continue;
         await storage.archiveSuggestion(id, other.suggestion_id, "rejected").catch(() => undefined);
       }
-      await storage.regenerateIndex({ changedIds: [id] });
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
       return {
         id,
         version: result.versionEntry.version,
@@ -340,7 +340,7 @@ export async function approveReview(
       editedBy: opts.actor,
       note: opts.note ?? "Approved in review",
     });
-    await storage.regenerateIndex({ changedIds: [id] });
+    await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
     return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
   });
 }

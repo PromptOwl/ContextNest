@@ -872,8 +872,11 @@ export class NestStorage {
    * `changedIds` scopes the INDEX.md rewrite to the folders holding those docs
    * (a folder's INDEX.md lists only its own docs). context.yaml is always rebuilt.
    * The ids must not have changed folder — a move needs the full rebuild.
+   * `latestCheckpoint` is the head the caller just sealed, saving its re-read.
    */
-  async regenerateIndex(opts: { changedIds?: string[] } = {}): Promise<void> {
+  async regenerateIndex(
+    opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint } = {},
+  ): Promise<void> {
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
     const docs = await this.discoverDocuments({ includeRetired: true });
@@ -883,7 +886,7 @@ export class NestStorage {
     // context_history.yaml grows by one entry per published doc per checkpoint.
     // Parsing it here is what made writes time out on a mature vault while reads
     // — which never come through this path — stayed instant.
-    const latestCheckpoint = await this.readLatestCheckpoint();
+    const latestCheckpoint = opts.latestCheckpoint ?? (await this.readLatestCheckpoint());
     const published = docs.filter((d) => d.frontmatter.status === "published");
     const packs = await this.readPacks();
 
