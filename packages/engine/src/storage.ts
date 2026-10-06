@@ -557,6 +557,9 @@ export class NestStorage {
   /** Disambiguates concurrent `writeFileDurable` temp files. See that method. */
   private tmpWriteCounter = 0;
 
+  /** chain_events.yaml as last parsed, keyed by its stat. See `readTombstones`. */
+  private chainEventCache?: { size: number; mtimeMs: number; events: readonly unknown[] };
+
   /**
    * Per-document history verdicts for the serve path, keyed by doc id and
    * stamped with the digest of the history.yaml bytes they were computed from.
@@ -1146,9 +1149,20 @@ export class NestStorage {
    * forgotten.
    */
   async readTombstones(): Promise<TombstoneIndex> {
+    // Every publish consults the log, and it only grows (each append changes
+    // its size), so its parsed events are reused until a stat says the file
+    // changed — by this process or any other on the same mount. A fresh index
+    // is built per call because callers fold records into the one they get.
+    const info = await stat(this.chainEventLogPath()).catch(() => null);
+    const cached = this.chainEventCache;
+    if (info && cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
+      return buildTombstoneIndex(cached.events);
+    }
+    this.chainEventCache = undefined;
     let events: unknown[];
     try {
       events = await this.readChainEventLog();
+      if (info) this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, events };
     } catch (err) {
       // Every publish consults this, so an unparseable log must not lock the
       // vault. The per-node records (forgotten stubs, tombstoned history
