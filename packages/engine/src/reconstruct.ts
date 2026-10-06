@@ -64,38 +64,81 @@ export async function reconstructFromHistory(
     );
   }
 
-  // Read keyframe content
-  let content = await readKeyframe(keyframeVersion);
-  if (content === null) {
-    throw new ContextNestError(
-      `Keyframe file for version ${keyframeVersion} not found for ${docId}`,
-      "VERSION_NOT_FOUND",
-      "§6",
-    );
-  }
-
-  // Apply diffs forward from keyframe to target
+  // The entries to replay, keyframe to target.
+  const replay: typeof history.versions = [];
   for (const entry of history.versions) {
     if (entry.version <= keyframeVersion) continue;
     if (entry.version > targetVersion) break;
+    replay.push(entry);
+  }
+
+  // The artifacts the replay needs are known now, so read them a window at a
+  // time — each read is a round trip on a network mount — instead of one by
+  // one. A window is applied and released before the next is read, so at most
+  // REPLAY_READ_WINDOW artifacts are in flight or in memory. Settled, then
+  // consumed in order, so a failure surfaces exactly where the sequential
+  // walk hit it.
+  const readFor = (entry: (typeof replay)[number]) =>
+    entry.tombstone ? null : entry.keyframe ? readKeyframe(entry.version) : readDiff(entry.version);
+  let content: string | null = null;
+  for (let start = 0; start === 0 || start < replay.length; start += REPLAY_READ_WINDOW) {
+    const window = replay.slice(start, start + REPLAY_READ_WINDOW);
+    // The first window also reads the anchor keyframe.
+    const reads = await Promise.allSettled([
+      ...(start === 0 ? [readKeyframe(keyframeVersion)] : []),
+      ...window.map(readFor),
+    ]);
+    if (start === 0) {
+      content = value(reads.shift()!);
+      if (content === null) {
+        throw new ContextNestError(
+          `Keyframe file for version ${keyframeVersion} not found for ${docId}`,
+          "VERSION_NOT_FOUND",
+          "§6",
+        );
+      }
+    }
+    content = await applyWindow(docId, content!, window, reads, readDiff);
+  }
+  return content!;
+}
+
+/** A settled read's value, or its error rethrown. */
+function value<T>(r: PromiseSettledResult<T>): T {
+  if (r.status === "rejected") throw r.reason;
+  return r.value;
+}
+
+/** Most version artifacts a replay reads at once (plus its anchor keyframe). */
+const REPLAY_READ_WINDOW = 10;
+
+/** Apply one window of replay entries, in order, to `content`. */
+async function applyWindow(
+  docId: string,
+  content: string,
+  window: DocumentHistory["versions"],
+  reads: PromiseSettledResult<string | null>[],
+  readDiff: ArtifactReader,
+): Promise<string> {
+  for (const [i, entry] of window.entries()) {
     // A forgotten version between the anchor and the target means the diff
     // chain runs through erased content. The forget protocol re-keyframes
     // the first retained version after a range precisely so this cannot
     // happen; reaching it means the history was altered afterwards.
     if (entry.tombstone) throw new ForgottenVersionError(docId, entry.version);
-
+    const read = value(reads[i]);
     if (entry.keyframe) {
-      // This is another keyframe — read it directly
-      const kf = await readKeyframe(entry.version);
-      if (kf !== null) {
-        content = kf;
+      // This is another keyframe — use it directly when its file exists
+      if (read !== null) {
+        content = read;
         continue;
       }
     }
 
     // v{N}.diff on disk, falling back to the patch stored inline on the
     // entry by histories written before diffs were externalized.
-    const patch = (await readDiff(entry.version)) ?? entry.diff;
+    const diff = entry.keyframe ? await readDiff(entry.version) : read;
+    const patch = diff ?? entry.diff;
     if (patch) {
       const result = applyPatch(content, patch);
       if (typeof result === "string") {

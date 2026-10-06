@@ -238,8 +238,9 @@ async function publishAndIndex(
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
-  // mcp-server/CLI both regenerate here.
-  await ctx.storage.regenerateIndex();
+  // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
+  // INDEX.md needs rewriting.
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
   return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
@@ -715,7 +716,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
     ...(input.note ? { note: input.note } : {}),
     ...(input.client ? { client: input.client } : {}),
   });
-  await ctx.storage.regenerateIndex();
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
   return {
     id,
     version: result.versionEntry.version,
@@ -1267,7 +1268,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       onProgress: ctx.onProgress,
+      ...(input.note ? { note: input.note } : {}),
       ...(input.client ? { client: input.client } : {}),
+      // Ids-only (e.g. a bulk approval) writes nothing but these docs, so only
+      // their folders' INDEX.md can change. Other modes write files too.
+      indexOnlyBatchFolders:
+        !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who

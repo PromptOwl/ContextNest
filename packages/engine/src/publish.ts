@@ -3,7 +3,9 @@
  * Ties together versioning, integrity, checkpoints, and index regeneration.
  */
 
+import { join } from "node:path";
 import type {
+  Checkpoint,
   ClientMetadata,
   ContextNode,
   Frontmatter,
@@ -12,7 +14,7 @@ import type {
 import { NestStorage, assertSafeDocumentId } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
-import { serializeDocument, getChecksumContent, isRejected } from "./parser.js";
+import { serializeDocument, getChecksumContent, isRejected, parseDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
@@ -33,6 +35,14 @@ export interface PublishResult {
   node: ContextNode;
   versionEntry: VersionEntry;
   checkpointNumber: number;
+  /** The checkpoint this publish sealed — hand it to regenerateIndex. */
+  checkpoint: Checkpoint;
+  /**
+   * The vault crawl the checkpoint took after the write — hand it to
+   * regenerateIndex as `docs`. Like `checkpoint`, only valid passed straight
+   * through under the same lock: any write in between makes it stale.
+   */
+  vaultDocs: ContextNode[];
 }
 
 /**
@@ -78,11 +88,16 @@ export async function publishDocument(
   // put the author right back behind the corrupt file we just worked around.
   const { history: existingHistory, quarantinedAs } =
     await versionManager.historyOrRepair(docId);
-  if (!existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1) {
+  const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
+  if (seeded) {
     await versionManager.createVersion(node, "system:seed", {
       note: "Pre-publish snapshot (auto-seeded — no prior history)",
+      knownHistory: null,
     });
   }
+  // The history read above, reused below instead of re-read; a seed just
+  // appended to it, so then it is read fresh.
+  const knownHistory = seeded ? undefined : existingHistory;
 
   // Bump version — past the recorded history too, not just frontmatter, so a
   // doc whose frontmatter lags its history.yaml (imported/copied vault) cannot
@@ -90,6 +105,7 @@ export async function publishDocument(
   const newVersion = await versionManager.nextVersion(
     docId,
     node.frontmatter.version || 0,
+    knownHistory,
   );
   node.frontmatter.version = newVersion;
   node.frontmatter.status = "published";
@@ -109,8 +125,8 @@ export async function publishDocument(
   // Write updated document to disk
   await storage.writeDocument(docId, finalContent);
 
-  // Re-read to get clean parse
-  node = await storage.readDocument(docId);
+  // Clean parse of exactly what was written — no read back from disk.
+  node = parseWritten(storage, docId, finalContent);
 
   const publishedAt = new Date().toISOString();
 
@@ -119,6 +135,7 @@ export async function publishDocument(
     note: options.note,
     publishedAt,
     client: options.client,
+    knownHistory,
   });
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
@@ -126,13 +143,25 @@ export async function publishDocument(
   // publish cannot slip between two separate reads and leave a doc missing from
   // — or version-skewed within — the checkpoint this publish seals.
   const checkpointManager = new CheckpointManager(storage);
-  const checkpoint = await checkpointManager.createCheckpointFromVault(docId);
+  let vaultDocs: ContextNode[] = [];
+  const checkpoint = await checkpointManager.createCheckpointFromVault(
+    docId,
+    new Map([[docId, versionEntry]]),
+    (docs) => (vaultDocs = docs),
+  );
 
   return {
     node,
     versionEntry,
     checkpointNumber: checkpoint.checkpoint,
+    checkpoint,
+    vaultDocs,
   };
+}
+
+/** Parse a document from the plaintext just written, as readDocument would. */
+function parseWritten(storage: NestStorage, docId: string, content: string): ContextNode {
+  return parseDocument(join(storage.root, `${docId}.md`), content, docId);
 }
 
 // ─── Bulk publish (importers) ────────────────────────────────────────────────
@@ -143,6 +172,11 @@ export interface BulkPublishOptions extends PublishOptions {
   concurrency?: number;
   /** Regenerate context.yaml / INDEX.md once after the batch (default true). */
   regenerateIndex?: boolean;
+  /**
+   * Rewrite INDEX.md only for the folders of the batch's documents. Only safe
+   * when nothing else in the vault changed in the same operation.
+   */
+  indexOnlyBatchFolders?: boolean;
   /** Fires once per document as it settles, published or failed. Advisory: with
    * concurrency > 1 docs finish out of input order, so only the count is
    * monotonic — it drives progress bars, not per-doc reporting. */
@@ -233,19 +267,23 @@ export async function publishDocuments(
       if (stamp) node = { ...node, frontmatter: { ...node.frontmatter, ...stamp } };
 
       const versionManager = new VersionManager(storage);
-      // Same resilient read, and the same seed skip on a restart — see the
-      // note in publishDocument.
+      // Same resilient read, the same seed skip on a restart, and the same
+      // single history read — see the notes in publishDocument.
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
-      if (!existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1) {
+      const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
+      if (seeded) {
         await versionManager.createVersion(node, "system:seed", {
           note: "Pre-publish snapshot (auto-seeded — no prior history)",
+          knownHistory: null,
         });
       }
+      const knownHistory = seeded ? undefined : existingHistory;
 
       const newVersion = await versionManager.nextVersion(
         docId,
         node.frontmatter.version || 0,
+        knownHistory,
       );
       node.frontmatter.version = newVersion;
       node.frontmatter.status = "published";
@@ -256,11 +294,12 @@ export async function publishDocuments(
       const finalContent = serializeDocument(node);
       await storage.writeDocument(docId, finalContent);
 
-      node = await storage.readDocument(docId);
+      node = parseWritten(storage, docId, finalContent);
       const versionEntry = await versionManager.createVersion(node, options.editedBy, {
         note: options.note,
         publishedAt: new Date().toISOString(),
         client: options.client,
+        knownHistory,
       });
       published.push({
         id: docId,
@@ -283,18 +322,25 @@ export async function publishDocuments(
 
   // ONE checkpoint sealing every doc published above (createCheckpointFromVault
   // snapshots all published docs in the vault under the checkpoint lock).
-  let checkpointNumber: number | null = null;
+  let checkpoint: Checkpoint | undefined;
+  let vaultDocs: ContextNode[] | undefined;
   if (published.length > 0) {
-    const checkpoint = await new CheckpointManager(storage).createCheckpointFromVault(
+    checkpoint = await new CheckpointManager(storage).createCheckpointFromVault(
       `bulk-import (${published.length} docs)`,
+      new Map(published.map((p) => [p.id, { version: p.version, chain_hash: p.chainHash }])),
+      (docs) => (vaultDocs = docs),
     );
-    checkpointNumber = checkpoint.checkpoint;
   }
 
   // ONE index regen for the whole batch (skippable by callers that regen later).
   if (options.regenerateIndex !== false) {
-    await storage.regenerateIndex();
+    await storage.regenerateIndex({
+      ...(options.indexOnlyBatchFolders ? { changedIds: ids } : {}),
+      ...(checkpoint ? { latestCheckpoint: checkpoint } : {}),
+      ...(vaultDocs ? { docs: vaultDocs } : {}),
+    });
   }
+  const checkpointNumber = checkpoint?.checkpoint ?? null;
 
   return { published, failed, checkpointNumber };
 }
