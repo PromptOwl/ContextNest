@@ -1,5 +1,13 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.7.2
+
+### Patch Changes
+
+- fbfd50a: **Approving an external edit or suggestion, rolling back, and publishing from the MCP server now read less from disk.** Approving a staged suggestion reads the document's version history once instead of four times, and a rollback or direct edit once instead of three times; version numbering, diffs and chain hashes are computed exactly as before. The MCP server's create, update and publish tools rebuild only the published document's folder index and reuse the checkpoint the publish just sealed, matching `context_publish`.
+- fbfd50a: **Approving a suggestion, holding a write for review, changing a status and deleting rewrite only that document's folder index.** The MCP server's suggestion-approval, held-write, status-update and delete tools, and `ctx drift approve`, rebuilt every folder's INDEX.md after changing a single document. They now rewrite only the folder that document lives in; `context.yaml` is still rebuilt in full. This matches what publishing already does.
+- fbfd50a: **A publish lists the vault once instead of twice.** Sealing the checkpoint and rebuilding the index after a publish each read and parsed every document in the vault. The checkpoint's listing is now handed to the index rebuild, which uses it instead of listing again (`regenerateIndex` takes it as `docs`; `publishDocument` returns it as `vaultDocs`). Applies to `context_publish`, create/update with publish, review approval, bulk `context_import`, and the MCP server's publish tools. Without a document cache (the CLI and the MCP server) this halves the reads a publish makes on a large or network-mounted vault.
+
 ## 2.7.1
 
 ### Patch Changes
