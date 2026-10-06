@@ -45,3 +45,63 @@ pnpm test:pkg          # builds the CLI, then runs this suite
 Requires network access (the install resolves `commander` from the registry).
 If you see a "dist/index.js is missing" error, build first:
 `pnpm --filter @promptowl/contextnest-cli build`.
+
+## User journeys (`journeys.pkg.test.ts`)
+
+Breadth, persona-driven flows that drive the *installed* bin through one
+realistic user story each. They share the install-and-drive scaffolding in
+`journey-harness.ts`, so a new journey is a declarative list of cases — not new
+plumbing. They are breadth, not a second regression suite: per-command depth
+(every flag, every negative) stays in the dev-owned `*.regression.test.ts`.
+
+### Adding a journey
+
+A `Journey` is a list of **cases**; each case is one numbered ticket line (its
+`id` and `title` are the ticket's verbatim wording) and runs one or more
+**actions**. Each action is a command plus checks on its result
+(`status`, `stdout`, `stdoutNot`, `stderr`, `json`, `files`). Steps share one
+isolated, auto-cleaned vault and run in order.
+
+```ts
+const J2: Journey = {
+  id: "J2",
+  title: "Time-travel (auditor)",
+  cases: [
+    {
+      id: "J2-01",
+      title: "I edit a node and each save is kept as its own version",
+      actions: [
+        { args: ["init", "--name", "audit"] },
+        { args: ["add", "nodes/n", "--publish", "-y"] },
+        { args: ["history", "nodes/n", "--json"], stdout: ["version"] },
+      ],
+    },
+  ],
+};
+
+it("J2 — time-travel", () => runJourney({ installDir: INSTALL, scratch }, J2));
+```
+
+**Golden rule:** assert to *observed* behavior — run the command once against
+the built bin first and assert what it actually prints, not what the catalog
+assumes. Failures name the ticket case id + title + command, so a red run points
+straight at the ticket line it maps to.
+
+### Running it manually
+
+```bash
+# Everything — packaging integrity + every journey (builds the CLI first):
+pnpm test:pkg
+
+# Iterate on ONE journey. Build once, then filter by test name:
+pnpm --filter @promptowl/contextnest-cli build
+npx vitest run --config tests/e2e-pkg/vitest.config.ts -t "J1"
+
+# Only the journeys file (after a build):
+npx vitest run --config tests/e2e-pkg/vitest.config.ts tests/e2e-pkg/journeys.pkg.test.ts
+```
+
+The direct `vitest` forms skip the build that `pnpm test:pkg` does for you, so
+build the CLI first (or your run packs a stale `dist`). All forms need `npm` on
+PATH and network access (the clean install resolves `commander` from the
+registry).
