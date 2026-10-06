@@ -13,6 +13,11 @@ import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { serializeDocument } from "../parser.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { approveSuggestion, rollbackDocument } from "../approval.js";
+import { stageSuggestion } from "../suggestions.js";
+import type { RbacHook } from "../types.js";
+
+const ALLOW_ALL: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
 
 describe("publish I/O: one history read per document, same results", () => {
   let ctx: OperationContext;
@@ -137,6 +142,40 @@ describe("publish I/O: one history read per document, same results", () => {
     expect(history.versions.map((v) => v.version)).toEqual([3, 4]);
     expect(history.versions[0].note).toMatch(/auto-seeded/);
     await assertIntact([id]);
+  });
+
+  it("external-edit approval and rollback: one history read each, chain intact", async () => {
+    const id = "nodes/alpha/sug";
+    await api.run("context_create", { id, title: "Sug", content: "Price is $99." }, ctx);
+    const approvedRaw = await readFile(join(dir, `${id}.md`), "utf-8");
+    const staged = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: approvedRaw,
+      proposedRawContent: approvedRaw.replace("$99", "$129"),
+      source: "out-of-band-edit",
+      actor: "user:analyst",
+      zone: "z",
+      docTier: "primary",
+    });
+    const base = { storage, rbac: ALLOW_ALL, documentId: id, actor: "czar", zone: "z" };
+    const readHistory = vi.spyOn(storage, "readHistory");
+
+    const approved = await approveSuggestion({ ...base, suggestionId: staged.meta.suggestion_id });
+    expect(approved.versionEntry.version).toBe(2);
+    expect(countFor(readHistory, id)).toBe(1);
+
+    readHistory.mockClear();
+    const rolled = await rollbackDocument({ ...base, targetVersion: 1, docTier: "primary" });
+    expect(rolled.versionEntry.version).toBe(3);
+    expect(countFor(readHistory, id)).toBe(1);
+    vi.restoreAllMocks();
+
+    expect((await storage.verifyVaultIntegrity()).valid).toBe(true);
+    const versions = new VersionManager(storage);
+    expect(await versions.reconstructVersion(id, 2)).toContain("$129");
+    expect(await versions.reconstructVersion(id, 3)).toContain("$99");
+    expect(await versions.reconstructVersion(id, 3)).toBe(await readFile(join(dir, `${id}.md`), "utf-8"));
   });
 
   it("many sequential publishes keep diffs reconstructable across the keyframe interval", async () => {

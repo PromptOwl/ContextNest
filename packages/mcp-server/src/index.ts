@@ -1094,7 +1094,7 @@ tool(
         throw err;
       }
 
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
 
       return {
         content: [
@@ -1366,7 +1366,7 @@ tool(
         client: defaultClient(),
       });
 
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
 
       return {
         content: [
@@ -1449,7 +1449,7 @@ tool(
         client: defaultClient(),
       });
 
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
 
       return {
         content: [
