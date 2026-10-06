@@ -240,7 +240,7 @@ async function publishAndIndex(
   // context_query) seed from it, so a stale index would hide the write. OSS
   // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
   // INDEX.md needs rewriting.
-  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint });
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
   return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
@@ -716,7 +716,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
     ...(input.note ? { note: input.note } : {}),
     ...(input.client ? { client: input.client } : {}),
   });
-  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
   return {
     id,
     version: result.versionEntry.version,

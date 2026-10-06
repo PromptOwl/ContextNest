@@ -296,11 +296,15 @@ export class CheckpointManager {
      * history.yaml; anything else is read as usual.
      */
     justSealed?: ReadonlyMap<string, Pick<VersionEntry, "version" | "chain_hash">>,
+    /** Receives the vault crawl, so the index rebuild after it need not crawl again. */
+    onCrawl?: (docs: ContextNode[]) => void,
   ): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
-      const publishedDocuments = (
-        await this.storage.discoverDocuments()
-      ).filter(isPublished);
+      // includeRetired only adds rejected docs, which the published filter drops
+      // anyway — and it is the set regenerateIndex needs.
+      const crawled = await this.storage.discoverDocuments({ includeRetired: true });
+      onCrawl?.(crawled);
+      const publishedDocuments = crawled.filter(isPublished);
       // Snapshot before the reads: a write that lands during the seal stays
       // marked for the next one.
       const touched = this.storage.touchedHistorySnapshot();

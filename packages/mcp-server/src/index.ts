@@ -1094,7 +1094,7 @@ tool(
         throw err;
       }
 
-      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
 
       return {
         content: [
@@ -1366,7 +1366,7 @@ tool(
         client: defaultClient(),
       });
 
-      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
 
       return {
         content: [
@@ -1449,7 +1449,7 @@ tool(
         client: defaultClient(),
       });
 
-      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint });
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
 
       return {
         content: [

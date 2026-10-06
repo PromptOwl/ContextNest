@@ -873,13 +873,15 @@ export class NestStorage {
    * (a folder's INDEX.md lists only its own docs). context.yaml is always rebuilt.
    * The ids must not have changed folder — a move needs the full rebuild.
    * `latestCheckpoint` is the head the caller just sealed, saving its re-read.
+   * `docs` is a crawl (includeRetired) the caller took after its last document
+   * write — the checkpoint's — saving a second full crawl.
    */
   async regenerateIndex(
-    opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint } = {},
+    opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint; docs?: ContextNode[] } = {},
   ): Promise<void> {
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
-    const docs = await this.discoverDocuments({ includeRetired: true });
+    const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
     const config = await this.readConfig();
     // Only the LATEST checkpoint reaches context.yaml, so this must not load the
     // whole chain: regenerateIndex runs after every single write, and

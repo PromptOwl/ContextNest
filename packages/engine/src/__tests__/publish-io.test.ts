@@ -73,6 +73,7 @@ describe("publish I/O: one history read per document, same results", () => {
     const readHistory = vi.spyOn(storage, "readHistory");
     const readDocument = vi.spyOn(storage, "readDocument");
     const readHead = vi.spyOn(storage, "readLatestCheckpoint");
+    const crawl = vi.spyOn(storage, "discoverDocuments");
 
     const out = await api.run<{ version: number }>("context_publish", { id: "nodes/alpha/doc" }, ctx);
 
@@ -81,6 +82,8 @@ describe("publish I/O: one history read per document, same results", () => {
     expect(countFor(readDocument, "nodes/alpha/doc")).toBe(1);
     // The index rebuild reuses the checkpoint the publish just sealed.
     expect(readHead).not.toHaveBeenCalled();
+    // One vault crawl, shared by the checkpoint and the index rebuild.
+    expect(crawl).toHaveBeenCalledTimes(1);
     vi.restoreAllMocks();
 
     const doc = await storage.readDocument("nodes/alpha/doc");
@@ -101,6 +104,7 @@ describe("publish I/O: one history read per document, same results", () => {
     const checkpointsBefore = (await storage.readCheckpointHistory())!.checkpoints.length;
     await new Promise((r) => setTimeout(r, 5));
     const readHistory = vi.spyOn(storage, "readHistory");
+    const crawl = vi.spyOn(storage, "discoverDocuments");
 
     const out = await api.run<{ published: { id: string; version: number }[]; failed: unknown[] }>(
       "context_import",
@@ -111,6 +115,7 @@ describe("publish I/O: one history read per document, same results", () => {
     expect(out.failed).toEqual([]);
     expect(out.published.every((p) => p.version === 2)).toBe(true);
     for (const id of ids) expect(countFor(readHistory, id)).toBe(1);
+    expect(crawl).toHaveBeenCalledTimes(1);
     vi.restoreAllMocks();
 
     expect((await storage.readCheckpointHistory())!.checkpoints.length).toBe(checkpointsBefore + 1);
