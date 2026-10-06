@@ -871,6 +871,7 @@ export class NestStorage {
    *
    * `changedIds` scopes the INDEX.md rewrite to the folders holding those docs
    * (a folder's INDEX.md lists only its own docs). context.yaml is always rebuilt.
+   * The ids must not have changed folder — a move needs the full rebuild.
    */
   async regenerateIndex(opts: { changedIds?: string[] } = {}): Promise<void> {
     // Per-folder INDEX.md must list retired docs too so stewards can find
