@@ -64,8 +64,29 @@ export async function reconstructFromHistory(
     );
   }
 
-  // Read keyframe content
-  let content = await readKeyframe(keyframeVersion);
+  // The entries to replay, keyframe to target.
+  const replay: typeof history.versions = [];
+  for (const entry of history.versions) {
+    if (entry.version <= keyframeVersion) continue;
+    if (entry.version > targetVersion) break;
+    replay.push(entry);
+  }
+
+  // Every artifact the replay needs is known now, so read them together —
+  // each read is a round trip on a network mount. Settled, then consumed in
+  // order, so a failure surfaces exactly where the sequential walk hit it.
+  const [anchor, ...reads] = await Promise.allSettled([
+    readKeyframe(keyframeVersion),
+    ...replay.map((entry) =>
+      entry.tombstone ? null : entry.keyframe ? readKeyframe(entry.version) : readDiff(entry.version),
+    ),
+  ]);
+  const value = <T>(r: PromiseSettledResult<T>): T => {
+    if (r.status === "rejected") throw r.reason;
+    return r.value;
+  };
+
+  let content = value(anchor);
   if (content === null) {
     throw new ContextNestError(
       `Keyframe file for version ${keyframeVersion} not found for ${docId}`,
@@ -75,27 +96,25 @@ export async function reconstructFromHistory(
   }
 
   // Apply diffs forward from keyframe to target
-  for (const entry of history.versions) {
-    if (entry.version <= keyframeVersion) continue;
-    if (entry.version > targetVersion) break;
+  for (const [i, entry] of replay.entries()) {
     // A forgotten version between the anchor and the target means the diff
     // chain runs through erased content. The forget protocol re-keyframes
     // the first retained version after a range precisely so this cannot
     // happen; reaching it means the history was altered afterwards.
     if (entry.tombstone) throw new ForgottenVersionError(docId, entry.version);
-
+    const read = value(reads[i]);
     if (entry.keyframe) {
-      // This is another keyframe — read it directly
-      const kf = await readKeyframe(entry.version);
-      if (kf !== null) {
-        content = kf;
+      // This is another keyframe — use it directly when its file exists
+      if (read !== null) {
+        content = read;
         continue;
       }
     }
 
     // v{N}.diff on disk, falling back to the patch stored inline on the
     // entry by histories written before diffs were externalized.
-    const patch = (await readDiff(entry.version)) ?? entry.diff;
+    const diff = entry.keyframe ? await readDiff(entry.version) : read;
+    const patch = diff ?? entry.diff;
     if (patch) {
       const result = applyPatch(content, patch);
       if (typeof result === "string") {
