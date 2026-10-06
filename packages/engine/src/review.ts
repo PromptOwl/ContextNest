@@ -135,16 +135,28 @@ async function approvedHead(storage: NestStorage, id: string): Promise<string | 
   const history = await storage.readHistory(id);
   if (!history || history.versions.length === 0) return null;
   const latest = history.versions[history.versions.length - 1];
-  return new VersionManager(storage).reconstructVersion(id, latest.version);
+  return new VersionManager(storage).reconstructVersion(id, latest.version, history);
+}
+
+/**
+ * Review holds plus the chain head they were checked against, so a caller that
+ * needs the head too does not rebuild it a second time. `head` is null when
+ * nothing is held (it is not computed then) or the node has no history.
+ */
+async function holdsWithHead(
+  storage: NestStorage,
+  id: string,
+): Promise<{ holds: ReviewHold[]; head: string | null }> {
+  const metas = (await listSuggestions(storage, id)).filter(isReviewHold);
+  if (metas.length === 0) return { holds: [], head: null };
+  const head = await approvedHead(storage, id);
+  const headHash = head === null ? null : computeContentHash(getChecksumContent(head));
+  return { holds: metas.map((m) => ({ ...m, stale: m.target_hash !== headHash })), head };
 }
 
 /** Review holds staged for one node, oldest first. */
 export async function listReviewHolds(storage: NestStorage, id: string): Promise<ReviewHold[]> {
-  const metas = (await listSuggestions(storage, id)).filter(isReviewHold);
-  if (metas.length === 0) return [];
-  const head = await approvedHead(storage, id);
-  const headHash = head === null ? null : computeContentHash(getChecksumContent(head));
-  return metas.map((m) => ({ ...m, stale: m.target_hash !== headHash }));
+  return (await holdsWithHead(storage, id)).holds;
 }
 
 /**
@@ -155,9 +167,9 @@ export async function currentReviewProposal(
   storage: NestStorage,
   id: string,
 ): Promise<{ suggestionId: string; approvedRaw: string; proposedRaw: string } | null> {
-  const holds = (await listReviewHolds(storage, id)).filter((h) => !h.stale);
+  const { holds: all, head: approvedRaw } = await holdsWithHead(storage, id);
+  const holds = all.filter((h) => !h.stale);
   if (holds.length === 0) return null;
-  const approvedRaw = await approvedHead(storage, id);
   if (approvedRaw === null) return null;
   const newest = holds[holds.length - 1];
   const sug = await readSuggestion(storage, id, newest.suggestion_id);
@@ -277,7 +289,8 @@ export async function approveReview(
 ): Promise<ApproveReviewResult> {
   assertSafeDocumentId(id);
   return withVaultLock(storage.root, async () => {
-    const holds = await listReviewHolds(storage, id);
+    // The head the holds were checked against is the one the patch applies to.
+    const { holds, head: approvedRaw } = await holdsWithHead(storage, id);
     const chosen = holds.filter((h) => !h.stale).at(-1) ?? holds.at(-1);
 
     if (chosen) {
@@ -287,7 +300,6 @@ export async function approveReview(
           "content_hash_mismatch",
         );
       }
-      const approvedRaw = await approvedHead(storage, id);
       const sug = await readSuggestion(storage, id, chosen.suggestion_id);
       const proposedRaw =
         approvedRaw !== null && sug ? applyPatch(approvedRaw, sug.patch) : false;
@@ -309,7 +321,7 @@ export async function approveReview(
         if (other.suggestion_id === chosen.suggestion_id) continue;
         await storage.archiveSuggestion(id, other.suggestion_id, "rejected").catch(() => undefined);
       }
-      await storage.regenerateIndex({ changedIds: [id] });
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
       return {
         id,
         version: result.versionEntry.version,
@@ -340,7 +352,7 @@ export async function approveReview(
       editedBy: opts.actor,
       note: opts.note ?? "Approved in review",
     });
-    await storage.regenerateIndex({ changedIds: [id] });
+    await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
     return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
   });
 }

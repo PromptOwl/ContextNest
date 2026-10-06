@@ -1109,6 +1109,12 @@ const importOp: OperationDescriptor = {
       .describe(
         "With `discover`: stamped as `author` on every imported document. The importing user, not the vault's own `author:` — which names someone who need not exist on this host.",
       ),
+    note: z
+      .string()
+      .optional()
+      .describe(
+        "Version-history note recorded against every document this call publishes (audit trail), e.g. the reviewer's note on a bulk approval.",
+      ),
     ...clientField,
   }),
   output: z.object({
