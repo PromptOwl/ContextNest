@@ -74,6 +74,40 @@ describe("reconstructFromHistory reads artifacts in parallel", () => {
     expect(r.peak()).toBe(6);
   });
 
+  it("a long replay reads at most the anchor plus 10 artifacts at once", async () => {
+    const versions = Array.from({ length: 30 }, (_, i) => ({
+      version: i + 1,
+      ...(i === 0 ? { keyframe: true } : {}),
+      edited_by: "t",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: "h",
+      chain_hash: "c",
+    }));
+    let inFlight = 0;
+    let peak = 0;
+    let reads = 0;
+    const slow = (v: string | null) => async () => {
+      reads++;
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 2));
+      inFlight--;
+      return v;
+    };
+
+    const content = await reconstructFromHistory(
+      id,
+      { keyframe_interval: 100, versions },
+      30,
+      slow("anchor"),
+      slow(null),
+    );
+
+    expect(content).toBe("anchor");
+    expect(reads).toBe(30);
+    expect(peak).toBe(11);
+  });
+
   it("a missing keyframe still wins over a later failing diff read", async () => {
     const history = (await storage.readHistory(id))!;
     const content = reconstructFromHistory(

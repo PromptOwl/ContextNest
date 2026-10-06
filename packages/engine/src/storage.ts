@@ -213,6 +213,9 @@ export const SENSITIVE_FILE_GLOBS = [
   "context.yaml",
 ];
 
+/** Largest chain_events.yaml whose parsed events `readTombstones` keeps in memory. */
+export const CHAIN_EVENT_CACHE_MAX_BYTES = 256 * 1024;
+
 const NON_DOCUMENT_FILES = [
   "**/node_modules/**",
   "**/.versions/**",
@@ -1162,7 +1165,11 @@ export class NestStorage {
     let events: unknown[];
     try {
       events = await this.readChainEventLog();
-      if (info) this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, events };
+      // Bounded: a log past the cap is read per check, as before, rather than
+      // pinned in memory for the life of the process.
+      if (info && info.size <= CHAIN_EVENT_CACHE_MAX_BYTES) {
+        this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, events };
+      }
     } catch (err) {
       // Every publish consults this, so an unparseable log must not lock the
       // vault. The per-node records (forgotten stubs, tombstoned history

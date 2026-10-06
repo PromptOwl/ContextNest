@@ -6,9 +6,9 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { NestStorage } from "../storage.js";
+import { NestStorage, CHAIN_EVENT_CACHE_MAX_BYTES } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
@@ -57,6 +57,17 @@ describe("readTombstones cache", () => {
     await expect(
       api.run("context_create", { id: "nodes/a/two", title: "Back", content: "two" }, contextFor(storage)),
     ).rejects.toThrow();
+  });
+
+  it("a log over the size cap is not kept in memory: read on every check", async () => {
+    const log = join(dir, ".versions", "chain_events.yaml");
+    const pad = `# ${"x".repeat(1022)}\n`.repeat(Math.ceil(CHAIN_EVENT_CACHE_MAX_BYTES / 1024) + 1);
+    await appendFile(log, pad);
+    const parse = vi.spyOn(storage, "readChainEventLog");
+
+    expect(isPathForgotten(await storage.readTombstones(), "nodes/a/one")).toBe(true);
+    expect(isPathForgotten(await storage.readTombstones(), "nodes/a/one")).toBe(true);
+    expect(parse).toHaveBeenCalledTimes(2);
   });
 
   it("a record a caller folds in does not reach the next caller", async () => {
