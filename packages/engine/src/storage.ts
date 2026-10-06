@@ -868,8 +868,12 @@ export class NestStorage {
    * Single source for mcp-server, cli, and desktop. Each agent-config file
    * is merged with its existing on-disk content so user-authored sections
    * outside engine-managed blocks are preserved.
+   *
+   * `changedIds` scopes the INDEX.md rewrite to the folders holding those docs
+   * (a folder's INDEX.md lists only its own docs). context.yaml is always rebuilt.
+   * The ids must not have changed folder — a move needs the full rebuild.
    */
-  async regenerateIndex(): Promise<void> {
+  async regenerateIndex(opts: { changedIds?: string[] } = {}): Promise<void> {
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
     const docs = await this.discoverDocuments({ includeRetired: true });
@@ -886,18 +890,22 @@ export class NestStorage {
     const contextYaml = generateContextYaml(published, config, latestCheckpoint);
     await this.writeContextYaml(contextYaml);
 
+    const folderOf = (id: string) => {
+      const parts = id.split("/");
+      return parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+    };
     const folders = new Map<string, ContextNode[]>();
     for (const doc of docs) {
-      const parts = doc.id.split("/");
-      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+      const folder = folderOf(doc.id);
       if (!folders.has(folder)) folders.set(folder, []);
       folders.get(folder)!.push(doc);
     }
+    const scope = opts.changedIds ? new Set(opts.changedIds.map(folderOf)) : null;
 
     // Distinct folders write distinct INDEX.md files, so the writes are
     // independent — batch them (an imported vault can carry hundreds).
     await mapInBatches(
-      [...folders].filter(([folder]) => folder !== "."),
+      [...folders].filter(([folder]) => folder !== "." && (!scope || scope.has(folder))),
       async ([folder, folderDocs]) => {
         const title = folder
           .split("/")
@@ -928,7 +936,8 @@ export class NestStorage {
       }
 
       const merged = mergeAgentConfig(existing, file.content);
-      await writeFile(filePath, merged, "utf-8");
+      // Usually unchanged between writes — skip the rewrite.
+      if (merged !== existing) await writeFile(filePath, merged, "utf-8");
     }
   }
 

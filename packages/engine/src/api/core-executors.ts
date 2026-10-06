@@ -238,8 +238,9 @@ async function publishAndIndex(
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
-  // mcp-server/CLI both regenerate here.
-  await ctx.storage.regenerateIndex();
+  // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
+  // INDEX.md needs rewriting.
+  await ctx.storage.regenerateIndex({ changedIds: [id] });
   return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
@@ -715,7 +716,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
     ...(input.note ? { note: input.note } : {}),
     ...(input.client ? { client: input.client } : {}),
   });
-  await ctx.storage.regenerateIndex();
+  await ctx.storage.regenerateIndex({ changedIds: [id] });
   return {
     id,
     version: result.versionEntry.version,
