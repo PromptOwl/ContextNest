@@ -17,7 +17,8 @@ export type NodeType =
   | "agent"
   | "artifact"
   | "table"
-  | "pdf";
+  | "pdf"
+  | "task";
 
 /** Document status (§1.5)
  *

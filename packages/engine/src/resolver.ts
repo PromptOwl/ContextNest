@@ -28,6 +28,36 @@ export function forgottenView(doc: ContextNode, version?: number): ContextNode {
   };
 }
 
+/**
+ * English function words dropped from both the index and the query. Hosts pass
+ * the user's question straight through ("what is the refund policy for…"), and
+ * with these indexed every node containing "the" was an OR hit — and got cited.
+ */
+const STOPWORDS = new Set(
+  ("a an and are as at be been but by can could did do does for from had has have how i if in into is it its " +
+    "me my of on or our should so than that the their them then there these they this those to was we were " +
+    "what when where which who whom why will with would you your").split(" "),
+);
+
+/** MiniSearch `processTerm`: lowercase, and drop stopwords (null = not indexed/searched). */
+export function processSearchTerm(term: string): string | null {
+  const t = term.toLowerCase();
+  return STOPWORDS.has(t) ? null : t;
+}
+
+/** A title or tag hit says more about what a node is ABOUT than a body mention. */
+const SEARCH_BOOST = { title: 3, tags: 2, description: 1.5 };
+
+/**
+ * Partial (not-every-term) hits scoring below this fraction of the best hit are
+ * dropped: a node sharing one term with the question, buried in an unrelated
+ * page, is noise a host would otherwise cite. Full-term hits are always kept.
+ */
+// ponytail: fixed heuristic. A one-of-three-terms hit in a tiny vault scores ~0.08x
+// the top; a one-term mention buried in an unrelated page ~0.01x. Tune here,
+// or move to a semantic re-rank if fixed ratios stop separating them.
+const MIN_RELATIVE_SCORE = 0.05;
+
 export interface ResolverOptions {
   /** All documents in the vault */
   documents: ContextNode[];
@@ -74,6 +104,8 @@ export class Resolver {
       fields: ["title", "description", "body", "tags"],
       storeFields: ["id"],
       idField: "id",
+      processTerm: processSearchTerm,
+      searchOptions: { boost: SEARCH_BOOST },
     });
 
     const searchDocs = options.documents
@@ -225,6 +257,9 @@ export class Resolver {
    * The AND pass pins the full matches to the top; the OR pass keeps recall
    * when nothing matches every term. `score` is the BM25 score of the OR
    * pass (identical for a doc in both passes: same terms, same sum).
+   *
+   * Stopwords never match (see STOPWORDS), and partial hits far below the
+   * best score are dropped (see MIN_RELATIVE_SCORE).
    */
   search(query: string): SearchHit[] {
     const q = query.trim();
@@ -233,9 +268,11 @@ export class Resolver {
     if (partial.length === 0) return [];
     const full = new Set(this.searchIndex.search(q, { combineWith: "AND" }).map((r) => r.id));
     const tier = (id: unknown) => (full.has(id) ? 1 : 0);
+    const floor = partial[0].score * MIN_RELATIVE_SCORE;
     // MiniSearch returns score-descending; the sort is stable, so this only
     // lifts the full-match tier without reshuffling within it.
-    return [...partial]
+    return partial
+      .filter((r) => full.has(r.id) || r.score >= floor)
       .sort((a, b) => tier(b.id) - tier(a.id) || b.score - a.score)
       .map((r) => ({ document: this.documents.get(r.id as string), score: r.score }))
       .filter((h): h is SearchHit => h.document !== undefined);

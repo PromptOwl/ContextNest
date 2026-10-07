@@ -316,7 +316,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // intersection/union walk the left side first, so
   // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
-  if (!query) return { results: [], total: 0 };
+  if (!query) return { results: [], count: 0, total: 0 };
   const docs = await ctx.storage.discoverDocuments();
   const hits = new Resolver({ documents: docs })
     .search(query)
@@ -324,6 +324,8 @@ const search: OperationExecutor = async (ctx, input: any) => {
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
     results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    // Counted before the `limit` slice. `total` is the deprecated alias.
+    count: hits.length,
     total: hits.length,
   };
 };

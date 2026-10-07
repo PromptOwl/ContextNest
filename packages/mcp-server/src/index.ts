@@ -584,7 +584,7 @@ tool(
           required: false,
           type: "string",
           default: "document",
-          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf", "task"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -599,6 +599,7 @@ tool(
             artifact: "Generated output, as stored by other tools (no type-specific rules)",
             table: "Tabular data, as stored by other tools (no type-specific rules)",
             pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
+            task: "A unit of work on a project board; board fields (assignee, due, priority, parent) live in metadata (no type-specific rules)",
           },
         },
         tags: {
