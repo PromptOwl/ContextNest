@@ -10,7 +10,8 @@
  *  - hits come back best-first, with a numeric `score` on each;
  *  - a document matching every query term outranks one matching a single
  *    term, regardless of how the ids sort;
- *  - drafts never surface; `limit` truncates but `total` still counts.
+ *  - drafts never surface; `limit` truncates but `count` (and its deprecated
+ *    alias `total`) still reports every match (issue #103).
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -108,14 +109,37 @@ describe("context_search — relevance ranking", () => {
     expect(results.map((r) => r.id)).not.toContain("nodes/b-draft");
   });
 
-  it("`limit` truncates the ranked list but `total` still reports every match", async () => {
-    const out = await api.run<{ results: Hit[]; total: number }>(
+  it("`limit` truncates the ranked list but `count` still reports every match", async () => {
+    const out = await api.run<{ results: Hit[]; count: number; total: number }>(
       "context_search",
       { query: "alpha beta gamma", limit: 1 },
       ctx,
     );
     expect(out.results.map((r) => r.id)).toEqual(["nodes/z-full"]);
-    expect(out.total).toBe(2);
+    expect(out.count).toBe(2);
+    expect(out.total).toBe(out.count);
+  });
+
+  it("`count` equals the number of results when nothing is truncated", async () => {
+    for (const input of [{ query: "alpha beta gamma" }, { query: "alpha beta gamma", limit: 50 }]) {
+      const out = await api.run<{ results: Hit[]; count: number; total: number }>(
+        "context_search",
+        input,
+        ctx,
+      );
+      expect(out.results).toHaveLength(2);
+      expect(out.count).toBe(out.results.length);
+      expect(out.total).toBe(out.count);
+    }
+  });
+
+  it("`count` is 0 when nothing matches", async () => {
+    const out = await api.run<{ results: Hit[]; count: number }>(
+      "context_search",
+      { query: "zzqx-no-such-term" },
+      ctx,
+    );
+    expect(out).toMatchObject({ results: [], count: 0 });
   });
 
   it("the full-mode `contextnest://search/` query path keeps the ranked order too", async () => {

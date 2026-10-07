@@ -119,7 +119,11 @@ const searchOp: OperationDescriptor = {
     // Best hit first: documents matching every query term, then partial
     // matches, each tier by descending BM25 `score`.
     results: z.array(nodeSummary.extend({ score: z.number().optional() })),
-    // Matches before `limit` was applied, so a caller can say "N more".
+    // Every match before `limit` was applied, so a capped page never reads
+    // as the whole answer and a caller can say "N more". Same name as the
+    // hosted REST and MCP search responses.
+    count: z.number().int().nonnegative(),
+    // Deprecated alias of `count`, kept for clients of engine <= 2.9.x.
     total: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED"],
