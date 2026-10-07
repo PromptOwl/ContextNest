@@ -75,7 +75,10 @@ export interface StageSuggestionResult {
 export async function stageSuggestion(
   input: StageSuggestionInput,
 ): Promise<StageSuggestionResult> {
-  // Staged edits live beside the document, keyed by its id: never under machinery.
+  // Staged edits live beside the document, keyed by its id: never under
+  // machinery. Not the full write guard (assertWritableDocumentPath): staging
+  // an edit to an existing legacy document (`Nodes/…`, the root `packs/`) only
+  // proposes it — its approval goes through the full guard when it publishes.
   assertNotMachineryPath(input.documentId);
   await assertResolvesOutsideMachinery(input.storage.root, input.documentId);
   const detectedAt = input.detectedAt ?? new Date().toISOString();

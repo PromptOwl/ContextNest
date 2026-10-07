@@ -9,6 +9,8 @@ import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink, rename } from
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { publishDocument, publishDocuments } from "../publish.js";
+import { computeContentHash } from "../integrity.js";
+import { sealedHead } from "../structure-store.js";
 import yaml from "js-yaml";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
@@ -1750,5 +1752,140 @@ describe("QA round 9: decoy sets, deep erases, in-batch sidecars, read limits", 
       const err = await refusal(op, { id: `nodes/${"z".repeat(300)}`, version: 1 });
       expect(err.message, op).not.toContain(dir);
     }
+  });
+});
+
+describe("architecture round 10: judged bytes are landed bytes", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const X = "nodes/notes/x";
+  const V = "nodes/notes/.versions/x";
+  const historyFor = (content: string) =>
+    yaml.dump({
+      versions: [
+        {
+          version: 1,
+          keyframe: true,
+          edited_by: "a",
+          edited_at: "2026-01-01T00:00:00Z",
+          content_hash: computeContentHash(content),
+          chain_hash: `sha256:${"0".repeat(64)}`,
+        },
+      ],
+    });
+
+  it("a normalization twin planted earlier never becomes a head that grandfathers a missing section", async () => {
+    const A = "---\ntitle: X\n---\nintro\n## Summary\nok\n";
+    const B = "---\ntitle: X\n---\nintro\r## Summary\nok\n"; // same content_hash as A
+    expect(computeContentHash(A)).toBe(computeContentHash(B));
+    await writeConfig(SUMMARY);
+    await api.run(
+      "context_import",
+      { files: [{ path: `${X}.md`, content: A }, { path: `${V}/v1.md`, content: B }], publish: false },
+      ctx,
+    );
+    await api.run(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/history.yaml`, content: historyFor(A) },
+          { path: `${V}/${"./".repeat(510)}v1.md`, content: A },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    // An overwrite is judged only against the sealed head: B must never be it.
+    const third = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${X}.md`, content: "---\ntitle: X\nstatus: published\n---\nintro\nno summary\n" }], overwrite: true },
+      ctx,
+    );
+    expect(third.failed.map((f) => f.id)).toEqual([`${X}.md`]);
+  });
+
+  it("a history set with a member that cannot land is refused whole", async () => {
+    await writeConfig(SUMMARY);
+    const A = "---\ntitle: X\n---\n## Summary\nok\n";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/history.yaml`, content: historyFor(A) },
+          { path: `${V}/v1.md`, content: A },
+          { path: `${V}/${"z".repeat(300)}.pdf`, content: "x" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(expect.arrayContaining([`${V}/history.yaml`, `${V}/v1.md`]));
+    expect(await exists(`${V}/history.yaml`)).toBe(false);
+  });
+
+  it("an overwrite that brings its own history is judged against that history's head, before it lands", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cn-structure-overlay-"));
+    try {
+      const s = new NestStorage(src);
+      await s.init("src");
+      const sctx = { ...ctx, storage: s, query: new GraphQueryEngine(s), versions: new VersionManager(s) };
+      await api.run("context_create", { id: X, title: "X", content: "## Summary\nok\n" }, sctx);
+      const read = (n: string) => readFile(join(src, V, n), "utf-8");
+      // A legacy document here, without the Summary, made before the rules.
+      await api.run("context_create", { id: X, title: "X", content: "## Notes\nold\n" }, ctx);
+      const live = await readFile(join(dir, `${X}.md`), "utf-8");
+      await writeConfig(SUMMARY);
+      const res = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        {
+          files: [
+            { path: `${X}.md`, content: "---\ntitle: X\n---\n## Notes\nnew\n" },
+            { path: `${V}/history.yaml`, content: await read("history.yaml") },
+            { path: `${V}/v1.md`, content: await read("v1.md") },
+          ],
+          overwrite: true,
+        },
+        ctx,
+      );
+      expect(res.failed.map((f) => f.id)).toContain(`${X}.md`);
+      expect(await readFile(join(dir, `${X}.md`), "utf-8")).toBe(live);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it("a refused PDF takes its .md with it", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const md = await readFile(join(dir, `${res.id}.md`), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${res.id}.md`, content: md.replace(/sha256:[0-9a-f]{64}/, `sha256:${"b".repeat(64)}`) },
+          { path: `${res.id}.pdf`, content: "%PDF-1.4 evil" },
+        ],
+        overwrite: true,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual([`${res.id}.md`, `${res.id}.pdf`].sort());
+    expect(await readFile(join(dir, `${res.id}.md`), "utf-8")).toBe(md);
+  });
+
+  it("sealedHead trusts only a segment whose versions strictly increase", async () => {
+    const entry = (version: number) => ({
+      version,
+      keyframe: true,
+      edited_by: "a",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: computeContentHash("x"),
+      chain_hash: `sha256:${"0".repeat(64)}`,
+    });
+    const head = await sealedHead("d", { versions: [entry(2), entry(1)] } as never, () => "x", () => null);
+    expect(head).toBeNull();
   });
 });

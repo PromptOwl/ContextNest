@@ -62,7 +62,7 @@ import {
   ForgottenDocumentError,
   RejectedDocumentError,
 } from "../errors.js";
-import { sha256Bytes } from "../integrity.js";
+import { normalizeForHash, sha256Bytes } from "../integrity.js";
 import {
   DEFAULT_PDF_MAX_BYTES,
   PDF_EXTRACTOR,
@@ -1235,23 +1235,43 @@ async function importVerdicts(
   const refusedDocs = new Set<string>();
   const structured = (await ctx.storage.detectLayout()) === "structured";
   const message = (v: Violation[]) => v.map((x) => x.message).join(" ");
-  // A document an overwrite replaces is judged as the publish that follows
-  // will judge it (grandfathered against its sealed version, in full if it was
-  // never sealed), read in parallel — so nothing lands that the publish refuses.
   const docs = plan.map((f) => importedDoc(f.path, f.content));
-  const overwritten = new Map<string, Violation[]>();
-  if (overwrite) {
-    await mapInBatches(docs, async (doc) => {
-      if (doc && (await readIfExists(ctx, doc.id))) {
-        overwritten.set(doc.id, (await structurePublishViolations(ctx.storage, rules, doc)).violations);
-      }
-    });
+
+  // History first: each `.versions/<doc>/` set as the vault will hold it after
+  // this call (its files over what is already there). See historySetVerdict.
+  const sets = new Map<string, Map<string, string>>();
+  for (const f of plan) {
+    const v = versionsArtifact(f.path);
+    if (!v) continue;
+    const set = sets.get(v.owner) ?? new Map<string, string>();
+    set.set(v.name, f.content);
+    sets.set(v.owner, set);
   }
+  const setVerdicts = new Map<string, { refusal: string | null; head: StructureDoc | null }>();
+  await mapInBatches([...sets], async ([owner, set]) => {
+    setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set));
+  });
+
+  // Each document is judged as the publish that follows will judge it: against
+  // the head its history will have after this call — the one this call brings,
+  // or for an overwrite the sealed one here — and in full when there is none.
+  // Read in parallel; so nothing lands that the publish refuses.
+  const docVerdicts = new Map<string, Violation[]>();
+  await mapInBatches(docs, async (doc) => {
+    if (!doc) return;
+    const brought = setVerdicts.get(doc.id);
+    let violations: Violation[];
+    if (brought) violations = brought.head ? checkUpdate(rules, brought.head, doc) : checkDocument(rules, doc);
+    else if (overwrite && (await readIfExists(ctx, doc.id))) {
+      violations = (await structurePublishViolations(ctx.storage, rules, doc)).violations;
+    } else violations = checkDocument(rules, doc);
+    docVerdicts.set(doc.id, violations);
+  });
   plan.forEach((f, i) => {
     const doc = docs[i];
     let violations: Violation[];
     if (doc) {
-      violations = overwritten.get(doc.id) ?? checkDocument(rules, doc);
+      violations = docVerdicts.get(doc.id) ?? [];
       if (violations.length > 0) refusedDocs.add(doc.id);
     } else {
       const norm = f.path.replace(/\\/g, "/");
@@ -1262,25 +1282,6 @@ async function importVerdicts(
     }
     if (violations.length > 0) refused.set(f.raw, `${f.raw}: ${message(violations)}`);
   });
-  // History an import brings is judged by its own head: grandfathering judges
-  // later writes against the sealed head, so a head the rules would refuse
-  // (a donor's history, planted under another document) would make them
-  // lenient. Every `.versions/<doc>/` set must rebuild from this call's files
-  // to a head that passes the full check — in batch, beside a document already
-  // here, or ahead of one. A conforming head grants nothing a full check would
-  // not, so a chunked import may still send a document before its history.
-  const sets = new Map<string, Map<string, string>>();
-  for (const f of plan) {
-    const v = versionsArtifact(f.path);
-    if (!v || refusedDocs.has(v.owner)) continue;
-    const set = sets.get(v.owner) ?? new Map<string, string>();
-    set.set(v.name, f.content);
-    sets.set(v.owner, set);
-  }
-  const setVerdicts = new Map<string, string | null>();
-  await mapInBatches([...sets], async ([owner, set]) => {
-    setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set));
-  });
   for (const f of plan) {
     if (refused.has(f.raw)) continue;
     // A document's history, staged edits and PDF sidecar go where it goes.
@@ -1288,11 +1289,37 @@ async function importVerdicts(
     const v = versionsArtifact(f.path);
     if (owner && refusedDocs.has(owner)) {
       refused.set(f.raw, `${f.raw}: belongs to ${owner}, which the structure rules refused`);
-    } else if (v && setVerdicts.get(v.owner)) {
-      refused.set(f.raw, `${f.raw}: ${setVerdicts.get(v.owner)}`);
+    } else if (v && setVerdicts.get(v.owner)?.refusal) {
+      refused.set(f.raw, `${f.raw}: ${setVerdicts.get(v.owner)!.refusal}`);
     }
   }
   return refused;
+}
+
+/** Every per-file refusal of an import that needs no structure rules. */
+async function assertImportable(
+  ctx: OperationContext,
+  f: { raw: string; path: string; content: string },
+  tombstones: Parameters<typeof importVerdict>[0] | null,
+): Promise<void> {
+  assertFitsFileSystem(f.path, 255);
+  const alias = machineryAliasSegment(f.path);
+  if (alias !== undefined) {
+    throw new ContextNestError(
+      `${f.raw}: "${alias}" is another spelling of a reserved folder (.context, .versions, _suggestions)`,
+      "VALIDATION_FAILED",
+    );
+  }
+  await assertSidecarKept(ctx, f);
+  if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
+    throw new ContextNestError(
+      `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // A pre-forget copy is refused wherever it lands (§6.3.4).
+  const refusal = tombstones ? importVerdict(tombstones, f.path, f.content) : null;
+  if (refusal) throw new ForgottenDocumentError(f.raw, `refused: ${refusal}`);
 }
 
 /**
@@ -1348,7 +1375,8 @@ async function historySetVerdict(
   rules: CompiledStructure,
   owner: string,
   set: Map<string, string>,
-): Promise<string | null> {
+): Promise<{ refusal: string | null; head: StructureDoc | null }> {
+  const refuse = (refusal: string) => ({ refusal, head: null });
   let history: DocumentHistory | null = null;
   const text = set.get("history.yaml");
   try {
@@ -1361,12 +1389,11 @@ async function historySetVerdict(
   } catch {
     history = null;
   }
-  if (text !== undefined && !history) return `${owner}'s history.yaml is not a valid history`;
-  if (!history) return null;
-  const head = history.versions.at(-1);
-  // No head, or a forgotten one: nothing to rebuild, nothing that could make a
-  // later check lenient.
-  if (!head || head.tombstone) return null;
+  if (text !== undefined && !history) return refuse(`${owner}'s history.yaml is not a valid history`);
+  // No history, no head, or a forgotten one: nothing to rebuild, nothing that
+  // could make a later check lenient.
+  const last = history?.versions.at(-1);
+  if (!history || !last || last.tombstone) return { refusal: null, head: null };
   const raw = await sealedHead(
     owner,
     history,
@@ -1378,19 +1405,22 @@ async function historySetVerdict(
   // longer verifies and is judged in full — but only if the head judged here
   // verified in the first place.
   if (raw === null) {
-    return `${owner}'s history does not rebuild, matching its own hashes, from what the vault will hold — send its keyframes and diffs with or before its history.yaml`;
+    return refuse(
+      `${owner}'s history does not rebuild, matching its own hashes, from what the vault will hold — send its keyframes and diffs with or before its history.yaml`,
+    );
   }
-  let doc: StructureDoc;
+  let head: StructureDoc;
   try {
-    const node = parseDocument(`${owner}.md`, raw, owner);
-    doc = { id: owner, type: node.frontmatter.type, body: node.body };
+    // The view that was hashed (§8 normalization), as structurePublishViolations judges it.
+    const node = parseDocument(`${owner}.md`, normalizeForHash(raw), owner);
+    head = { id: owner, type: node.frontmatter.type, body: node.body };
   } catch {
-    doc = { id: owner, body: raw };
+    head = { id: owner, body: normalizeForHash(raw) };
   }
-  const violations = checkDocument(rules, doc);
+  const violations = checkDocument(rules, head);
   return violations.length === 0
-    ? null
-    : `${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`;
+    ? { refusal: null, head }
+    : refuse(`${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`);
 }
 
 const importDocs: OperationExecutor = async (ctx, input: any) => {
@@ -1469,37 +1499,50 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
       )
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
+    // Every refusal that needs no structure rules, BEFORE any judging: a file
+    // that will not land is never judged, or its bytes could vouch for a
+    // history they never join. (A look-alike machinery folder,
+    // `.ver\u200Bsions` or `.versions::$DATA`, is one such refusal.)
+    const preRefused = new Map<string, string>();
+    await mapInBatches(plan, async (f) => {
+      try {
+        await assertImportable(ctx, f, tombstones);
+      } catch (err) {
+        preRefused.set(f.raw, err instanceof Error ? err.message : String(err));
+      }
+    });
+    // A refused sidecar takes its node's .md with it, which would otherwise
+    // name bytes that are not there.
+    for (const f of plan) {
+      if (!preRefused.has(f.raw) || !/\.pdf$/i.test(f.path) || storeOwner(f.path)) continue;
+      const md = plan.find((p) => p.path === `${f.path.slice(0, -".pdf".length)}.md`);
+      if (md && !preRefused.has(md.raw)) preRefused.set(md.raw, `${md.raw}: its PDF ${f.raw} was refused`);
+    }
+    // A history with any refused file is refused whole.
+    const brokenSets = new Set(plan.flatMap((f) => (preRefused.has(f.raw) ? (versionsArtifact(f.path)?.owner ?? []) : [])));
+    for (const f of plan) {
+      const v = versionsArtifact(f.path);
+      if (v && brokenSets.has(v.owner) && !preRefused.has(f.raw)) {
+        preRefused.set(f.raw, `${f.raw}: another file of ${v.owner}'s history was refused, so none of it lands`);
+      }
+    }
+    const real = plan.filter((f) => !preRefused.has(f.raw));
     // Structure verdicts for the whole batch BEFORE anything lands, so a
     // refused document takes its version history and its folder's other files
     // with it instead of leaving them behind as orphans.
-    // A look-alike of a machinery folder (`.ver\u200Bsions`, `.versions::$DATA`)
-    // never lands, and never takes part in judging the real one beside it: a
-    // decoy that vouches for a history and is then refused would leave the
-    // real files judged by bytes that never landed.
-    const aliased = new Set(plan.filter((f) => machineryAliasSegment(f.path) !== undefined).map((f) => f.raw));
-    const real = plan.filter((f) => !aliased.has(f.raw));
     const refused = rules ? await importVerdicts(ctx, rules, real, input.overwrite === true) : new Map<string, string>();
-    await mapInBatches(plan, async (f) => {
+    // history.yaml goes last, and only if every other file of its history
+    // landed: the files it names are the files that were judged.
+    const isHistory = (f: { path: string }) => versionsArtifact(f.path)?.name === "history.yaml";
+    const failedSets = new Set<string>();
+    const stage = async (f: (typeof plan)[number]) => {
       try {
-        assertFitsFileSystem(f.path, 255);
-        if (aliased.has(f.raw)) {
-          throw new ContextNestError(
-            `${f.raw}: "${machineryAliasSegment(f.path)}" is another spelling of a reserved folder (.context, .versions, _suggestions)`,
-            "VALIDATION_FAILED",
-          );
+        const pre = preRefused.get(f.raw) ?? refused.get(f.raw);
+        if (pre) throw new ContextNestError(pre, "VALIDATION_FAILED");
+        const set = versionsArtifact(f.path)?.owner;
+        if (set && isHistory(f) && failedSets.has(set)) {
+          throw new ContextNestError(`${f.raw}: a file of ${set}'s history did not land, so its history.yaml is not written`, "VALIDATION_FAILED");
         }
-        await assertSidecarKept(ctx, f);
-        if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
-          throw new ContextNestError(
-            `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,
-            "VALIDATION_FAILED",
-          );
-        }
-        // A pre-forget copy is refused wherever it lands (§6.3.4).
-        const refusal = tombstones ? importVerdict(tombstones, f.path, f.content) : null;
-        if (refusal) throw new ForgottenDocumentError(f.raw, `refused: ${refusal}`);
-        const verdict = refused.get(f.raw);
-        if (verdict) throw new ContextNestError(verdict, "VALIDATION_FAILED");
         const doc = importedDoc(f.path, f.content);
         // Reserved paths (root packs/ …) hold no documents, rules or not.
         // Not a structure rule, so a trusted restore (`skip`) does not lift it.
@@ -1511,8 +1554,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         written++;
       } catch (err) {
         failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
+        const set = versionsArtifact(f.path)?.owner;
+        if (set) failedSets.add(set);
       }
-    });
+    };
+    await mapInBatches(plan.filter((f) => !isHistory(f)), stage);
+    await mapInBatches(plan.filter(isHistory), stage);
     // A refused file landed nowhere, so its "written as …" rename warning would mislead.
     const failedRaw = new Set(failed.map((f) => f.id));
     for (const p of plan) if (!failedRaw.has(p.raw)) warnings.push(...p.warnings);
@@ -1533,7 +1580,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
-      assertWritableDocumentId(node.id);
+      // Before noteFolders: a refused write must not get its folders scaffolded.
+      await assertWritableDocumentPath(ctx.storage.root, node.id);
       if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
       // Same guard as context_create (§6.3.4): a retired path or erased body
       // must not land even as a draft (`publish: false` returns before Stage 3).

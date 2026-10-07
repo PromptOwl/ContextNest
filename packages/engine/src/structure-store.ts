@@ -31,7 +31,7 @@ import {
   type Violation,
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
-import { computeContentHash } from "./integrity.js";
+import { computeContentHash, normalizeForHash } from "./integrity.js";
 import { reconstructFromHistory, type ArtifactReader } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
@@ -103,31 +103,39 @@ export async function sealedHead(
   if (end < 0 || versions[end].tombstone) return null;
   let start = end;
   while (start >= 0 && !versions[start].keyframe) start--;
-  if (start < 0) return null;
+  if (start < 0 || end - start >= MAX_SEALED_SEGMENT) return null;
+  // Versions must strictly increase, the whole history over: with a duplicate
+  // or out-of-order entry (a grafted chain) "the head" is ambiguous.
+  if (versions.some((e, i) => i > 0 && e.version <= versions[i - 1].version)) return null;
+  const segment = versions.slice(start, end + 1);
+  if (segment.some((e) => e.tombstone)) return null;
   try {
-    // Read once, verified, then replayed from what was verified.
-    const keyframes = new Map<number, string>();
-    const diffs = new Map<number, string>();
-    for (let i = start; i <= end; i++) {
-      const entry = versions[i];
-      if (entry.tombstone) return null;
-      const content = entry.keyframe
-        ? await readKeyframe(entry.version)
-        : ((await readDiff(entry.version)) ?? entry.diff ?? null);
-      if (content === null || computeContentHash(content) !== entry.content_hash) return null;
-      (entry.keyframe ? keyframes : diffs).set(entry.version, content);
-    }
+    // Read, verify, then replay exactly what was verified — the segment alone.
+    const contents = await Promise.all(
+      segment.map(async (e) =>
+        e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null),
+      ),
+    );
+    if (contents.some((c, i) => c === null || computeContentHash(c) !== segment[i].content_hash)) return null;
+    const byVersion = new Map(segment.map((e, i) => [e.version, contents[i] as string]));
     return await reconstructFromHistory(
       id,
-      history,
+      { ...history, versions: segment },
       versions[end].version,
-      (v) => keyframes.get(v) ?? null,
-      (v) => diffs.get(v) ?? null,
+      (v) => (segment[0].version === v ? (byVersion.get(v) ?? null) : null),
+      (v) => (segment[0].version === v ? null : (byVersion.get(v) ?? null)),
     );
   } catch {
     return null;
   }
 }
+
+/**
+ * Longest keyframe-to-head run sealedHead will read (one artifact each, under
+ * the vault lock). The interval is read from history.yaml, so it is bounded
+ * here; a longer run is not trusted (judged in full).
+ */
+const MAX_SEALED_SEGMENT = 1000;
 
 /**
  * What a publish of `live` breaks under enforced rules (§11.1.1): a first
@@ -160,7 +168,9 @@ export async function structurePublishViolations(
     : null;
   if (raw === null) return { violations: checkDocument(rules, live), first };
   try {
-    const node = parseDocument(`${id}.md`, raw, id);
+    // The view that was hashed (§8 normalization): any bytes with this head's
+    // hashes get the same verdict.
+    const node = parseDocument(`${id}.md`, normalizeForHash(raw), id);
     return { violations: checkUpdate(rules, { id, type: node.frontmatter.type, body: node.body }, live), first };
   } catch {
     return { violations: checkDocument(rules, live), first };

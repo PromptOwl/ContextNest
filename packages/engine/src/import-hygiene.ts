@@ -51,7 +51,11 @@ const EXTENSION = /\.[a-z0-9]{1,8}$/i;
  * looks legitimate.
  */
 export function slugifyImportPath(relPath: string): string {
-  const segments = String(relPath ?? "").split(/[/\\]/).filter(Boolean);
+  // `.` segments dropped: `a/./b` is `a/b` to every file system, so two
+  // spellings of one target must not reach the checks as two paths.
+  const segments = String(relPath ?? "")
+    .split(/[/\\]/)
+    .filter((s) => s !== "" && s !== ".");
   return segments
     .map((raw, i) => {
       // Trailing dots and spaces dropped, as Windows drops them, so every
