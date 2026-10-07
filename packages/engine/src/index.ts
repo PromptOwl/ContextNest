@@ -492,6 +492,35 @@ export type {
   RejectReviewResult,
 } from "./review.js";
 
+// Structure rules (§11.1) — see structure.ts / structure-store.ts
+export {
+  compileStructure,
+  checkDocument,
+  checkUpdate,
+  checkFolder,
+  checkDeleteDocument,
+  checkDeleteFolder,
+  scaffoldPlan,
+  auditStructure,
+  resolveFolder,
+  describeStructure,
+  enforceStructure,
+  documentFolders,
+  MAX_MATCHED_NAME,
+} from "./structure.js";
+export type {
+  StructureConfig,
+  StructureDoc,
+  Violation,
+  ViolationCode,
+  CompiledStructure,
+  CompiledRule,
+  FolderRuleView,
+  ResolvedFolderRule,
+  StructureView,
+} from "./structure.js";
+export { setStructure } from "./structure-store.js";
+
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
 export {
   extractPdf,

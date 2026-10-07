@@ -436,13 +436,32 @@ export interface NestConfig {
   defaults?: {
     status?: Status;
   };
+  /** Structure rules switches (§11.1) — see `structure.ts`. */
+  structure?: {
+    /** Refuse writes that break a rule. Absent/false: report-only. */
+    enforce?: boolean;
+    /** Only declared folders may exist and hold documents. */
+    closed?: boolean;
+  };
+  /**
+   * Folder rules, keyed by a folder path PATTERN (`clients/{client}/meetings`);
+   * a plain folder name is a literal pattern. Every field but `description`
+   * and `template` is a structure rule (§11.1, `structure.ts`).
+   */
   folders?: Record<
     string,
     {
       description?: string;
       template?: string;
+      types?: string[];
+      folder_name?: string;
+      file_name?: string;
+      required?: boolean;
+      files?: Record<string, { template?: string; type?: string }>;
     }
   >;
+  /** Named templates for `folders.*.template` / `files.*.template` (§11.1). */
+  templates?: Record<string, { body?: string; required_sections?: string[] }>;
   servers?: Record<
     string,
     {

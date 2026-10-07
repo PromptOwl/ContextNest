@@ -87,6 +87,7 @@ import {
   remotePublish,
   remoteDelete,
   remoteMove,
+  remoteStructure,
   expandServerVaults,
   folderFromId,
   remoteFetchRecipe,
@@ -100,6 +101,8 @@ import {
   type SearchHitView,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
 import { createEngineApi } from "@promptowl/contextnest-engine/api";
 import type { OperationContext } from "@promptowl/contextnest-engine/api";
@@ -1650,8 +1653,21 @@ program
     }
 
     let body: string;
+    // A folder with a template (§11.1 structure rules) starts its files from it.
+    const template =
+      !opts.body && opts.type !== "skill"
+        ? (
+            await cliApi().run<StructureOutput>(
+              "context_structure",
+              { folder: id.split("/").slice(0, -1).join("/") },
+              opContext(storage, "cli@contextnest.local"),
+            )
+          ).resolved?.template_body
+        : undefined;
     if (opts.body) {
       body = `\n${opts.body}\n`;
+    } else if (template) {
+      body = `\n${template}`;
     } else if (opts.type === "skill") {
       body = `\n# ${title}\n\n## Steps\n\n1. \n2. \n3. \n\n## Expected Output\n\nDescribe what the agent should produce.\n`;
     } else {
@@ -1712,6 +1728,32 @@ async function afterHold(storage: NestStorage, id: string): Promise<void> {
     print: (line) => console.log(chalk.yellow(line)),
   });
 }
+
+// ─── ctx structure ─────────────────────────────────────────────────────────────
+
+program
+  .command("structure")
+  .description("Show the nest's structure rules: allowed folders, node types, name formats and templates")
+  .option("--folder <path>", "Show the rule governing one folder, with its template")
+  .option("--report", "Also list existing content that breaks the rules")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteStructure(remote, opts);
+      return;
+    }
+    const storage = getStorage();
+    const out = await cliApi().run<StructureOutput>(
+      "context_structure",
+      {
+        ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+        ...(opts.report ? { report: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    printStructure(out, opts);
+  });
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 

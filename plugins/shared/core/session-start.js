@@ -14,6 +14,7 @@ import {
   cwdVault,
   isVaultRegistered,
   squish,
+  withVault,
   runAsHook,
   isMain,
 } from "./lib.js";
@@ -98,11 +99,49 @@ export function run({ env, exec }) {
     }
   }
 
+  // The vault captures land in: the pinned one, else the working-directory
+  // one. Only that vault's structure rules are shown — fanning out over every
+  // registered vault would cost one `ctx` call each on every session start.
+  const target = config.vault && pinnedIsRegistered ? { alias: config.vault } : local;
+  if (target) lines.push(...structureLines(exec, withVault(["structure", "--json"], target.alias)));
+
   lines.push(
     "Query the vault before answering domain questions (`ctx query`/`/contextnest:recall`); cite nodes as `vault:id`.",
   );
 
   return wrap(lines.join("\n"));
+}
+
+/** Folder rules shown before eliding the rest to `ctx structure`. */
+const MAX_RULE_LINES = 15;
+
+/**
+ * A compact blueprint of the vault's structure rules (§11.1), or nothing when
+ * it has none — or when `ctx` predates the command (non-zero exit).
+ */
+function structureLines(exec, args) {
+  const s = ctxJson(exec, args, null);
+  if (!s || typeof s !== "object" || !Array.isArray(s.folders) || s.folders.length === 0) return [];
+  const mode = s.enforce ? "enforced — writes that break them are refused" : "report-only";
+  const lines = [`Structure rules for this vault (${mode}${s.closed ? "; closed: only these folders may exist" : ""}):`];
+  for (const f of s.folders.slice(0, MAX_RULE_LINES)) {
+    const parts = [];
+    if (Array.isArray(f.types)) parts.push(f.types.length ? `types ${f.types.join("/")}` : "no documents directly");
+    if (f.folder_name) parts.push(`folder names ${f.folder_name}`);
+    if (f.file_name) parts.push(`file names ${f.file_name}`);
+    if (f.template) parts.push(`template ${f.template}`);
+    const files = Object.keys(f.files ?? {});
+    if (files.length) parts.push(`required files ${files.join(", ")}`);
+    if (f.required) parts.push("required");
+    lines.push(`- \`${f.pattern}\`${parts.length ? ` — ${parts.join("; ")}` : ""}`);
+  }
+  if (s.folders.length > MAX_RULE_LINES) {
+    lines.push(`- … ${s.folders.length - MAX_RULE_LINES} more — run \`ctx structure\``);
+  }
+  lines.push(
+    "Before writing a node, run `ctx structure --folder <folder> --json` for its allowed types, file-name format and template body (file names come from titles).",
+  );
+  return lines;
 }
 
 function wrap(additionalContext) {

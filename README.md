@@ -500,6 +500,60 @@ on it keep working. Opt in with `ctx config set review on`. Re-running
 `ctx init` on an existing vault keeps its setting. Remote nests (`--vault
 <server>/<nest>`) use the server's own governance and are not gated.
 
+### Structure rules
+
+A nest owner can lay down hard rules for the vault's layout in
+`.context/config.yaml`: which folders may exist, which node types each takes,
+the shape of folder and file names, the template a folder's files start from
+(and the headings they must keep), and the subfolders and files every matching
+folder must have.
+
+```yaml
+structure:
+  enforce: true    # false (default): report-only
+  closed: true     # only declared folders may exist and hold documents
+folders:
+  "clients/{client}":
+    folder_name: "/[a-z]+-[0-9]{3}/"          # token pattern or /regex/
+    types: [document]
+    files: { overview: { template: client-overview } }   # required file
+  "clients/{client}/meetings":
+    required: true                             # created with its parent
+    file_name: "{date}-{slug}"                 # tokens: {slug} {date} {yyyy} {n}
+    template: meeting-note
+templates:
+  meeting-note:
+    body: "## Attendees\n## Decisions\n## Action items\n"
+    required_sections: [Decisions, Action items]
+  client-overview:
+    body: "## Summary\n## Contacts\n"
+```
+
+- Every write surface enforces them: `ctx add/update/delete/import`, every MCP
+  write tool (the deprecated ones too), and `context_import_pdf`. A refusal
+  names the rule and the expected format.
+- Existing content is grandfathered: an edit is refused only for what it newly
+  breaks (a re-type into a refused type, a dropped required heading).
+- Creating a folder creates its required subfolders and files (drafts from
+  their templates). `ctx add` without `--body` starts from the folder's template.
+- File names come from titles (lowercased, words joined by `-`), so a rule like
+  `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
+- A regex is anchored and refused if it could backtrack badly (nested or
+  alternating repetition, lookaround, backreferences, more than 3 unbounded
+  repetitions, over 200 characters).
+- `context_import` never writes `.context/` — an import cannot rewrite the
+  rules or the review gate.
+
+| Command | Effect |
+|---|---|
+| `ctx structure` | Show the rules (`--json` for agents; works on remote nests too) |
+| `ctx structure --folder <path>` | The rule governing one folder, with its template |
+| `ctx structure --report` | Existing content that breaks the rules |
+
+Rules are set by editing `.context/config.yaml` (or `setStructure()` from the
+engine, which rewrites only the rule blocks). Engines older than this feature
+ignore the keys.
+
 ### Choosing a vault
 
 By default `ctx` operates on the vault in (or above) the current directory. To
@@ -759,6 +813,7 @@ cloud:
 | `context_nests` | List every nest in the central registry |
 | `context_skill` | Render a `type: skill` node as a harness-ready skill file |
 | `context_skill_install` | Build the file manifest that installs a vault skill locally |
+| `context_structure` | The nest's structure rules: allowed folders, node types, name formats, templates (`folder` for one folder's rule, `report` for what breaks them) |
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
 | `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
 | `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |

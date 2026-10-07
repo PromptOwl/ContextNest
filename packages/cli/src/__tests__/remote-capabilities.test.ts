@@ -187,6 +187,32 @@ describe("remoteAdd — folder", () => {
   });
 });
 
+describe("remoteAdd — structure template", () => {
+  it("a bodiless add starts from the folder's template when the nest advertises context_structure", async () => {
+    advertised = new Set(["context_create", "context_structure"]);
+    replies.context_structure = { resolved: { template_body: "## Decisions\n" } };
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+
+    await remoteAdd(target, "nodes/m/x", {});
+
+    expect(calls[0]).toMatchObject({ op: "context_structure", input: { folder: "m" } });
+    expect(calls[1].input).toMatchObject({ content: "\n## Decisions\n" });
+  });
+
+  it("asks nothing of a nest that predates structure rules, and an explicit body wins", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+    await remoteAdd(target, "nodes/m/x", {});
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+
+    calls = [];
+    advertised = new Set(["context_create", "context_structure"]);
+    await remoteAdd(target, "nodes/m/y", { body: "mine" });
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+    expect(calls[0].input).toMatchObject({ content: "\nmine\n" });
+  });
+});
+
 describe("remoteAdd — push-confirmation gate", () => {
   it("reports a held create instead of failing, and does not claim it was created", async () => {
     advertised = new Set(["context_create"]);

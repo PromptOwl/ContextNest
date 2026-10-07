@@ -55,6 +55,15 @@ export interface OperationContext {
    * limit — the host (CLI, MCP server, Community) decides it.
    */
   readonly limits?: OperationLimits;
+  /**
+   * `"skip"`: a trusted host operation that brings a whole vault back as it
+   * was (Community's import staging, bundle restore, folder sync) or derives
+   * content rather than authoring it (annotation projections). Structure
+   * rules (§11.1) are not enforced and `context_import` may land
+   * `.context/` files. On the context, never in an input: a caller that could
+   * ask for it would have no rules at all.
+   */
+  readonly structure?: "skip";
 }
 
 /** See {@link OperationContext.limits}. */

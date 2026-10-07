@@ -21,7 +21,7 @@ import { mkdtemp, rm, cp, readFile, writeFile, access, readdir } from "node:fs/p
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { NestStorage } from "@promptowl/contextnest-engine";
+import { NestStorage, setStructure } from "@promptowl/contextnest-engine";
 
 const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.url));
 const FIXTURES = fileURLToPath(new URL("../../../../fixtures/minimal-vault", import.meta.url));
@@ -53,6 +53,7 @@ const EXPECTED_TOOLS = [
   "context_nests",
   "context_skill",
   "context_skill_install",
+  "context_structure",
   // Hand-written, still current.
   "document_format",
   "read_index",
@@ -1471,5 +1472,91 @@ describe("[regression] MCP server e2e — context_query", () => {
     const { json, isError } = await callJson(client, "resolve", { selector: "#engineering", hops: 1 });
     expect(isError).toBe(false);
     expect(json.documents.map((d: any) => d.id).sort()).toEqual(await docIds("#engineering", { hops: 1 }));
+  });
+});
+
+// ─── Structure rules ─────────────────────────────────────────────────────────
+//
+// docs/prds/structure-rules.md (Community repo): rules in .context/config.yaml
+// are enforced by the engine, so every write tool — catalog-driven AND the
+// deprecated legacy twins that write storage directly — refuses the same way.
+
+describe("[regression] MCP server e2e — structure rules", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    await setStructure(new NestStorage(vault), {
+      structure: { enforce: true, closed: true },
+      folders: {
+        "/": {},
+        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr" },
+      },
+      templates: { adr: { body: "## Context\n## Decision\n", required_sections: ["Decision"] } },
+    });
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("context_structure returns the rules and the resolved folder rule", async () => {
+    const { json, isError } = await callJson(client, "context_structure", { folder: "decisions" });
+    expect(isError).toBe(false);
+    expect(json.enforce).toBe(true);
+    expect(json.folders.map((f: { pattern: string }) => f.pattern)).toContain("decisions");
+    expect(json.resolved).toMatchObject({ file_name: "adr-{n}-{slug}", template_body: "## Context\n## Decision\n" });
+  });
+
+  it("context_create into an undeclared folder is refused with the rule", async () => {
+    const { text, isError } = await callText(client, "context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(isError).toBe(true);
+    expect(text).toContain("VALIDATION_FAILED");
+    expect(text).toMatch(/not an allowed folder/);
+    await expect(access(join(vault, "nodes", "notes", "idea.md"))).rejects.toThrow();
+  });
+
+  it("context_create that fits the rules lands", async () => {
+    const { json, isError } = await callJson(client, "context_create", {
+      title: "ADR 1 Use Postgres",
+      content: "## Context\nx\n## Decision\nPostgres.\n",
+      folder: "decisions",
+    });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/decisions/adr-1-use-postgres");
+  });
+
+  it("the deprecated create_document is no way around the rules", async () => {
+    const { text, isError } = await callText(client, "create_document", {
+      path: "nodes/notes/legacy",
+      title: "Legacy",
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/not an allowed folder/);
+    await expect(access(join(vault, "nodes", "notes", "legacy.md"))).rejects.toThrow();
+  });
+
+  it("the deprecated update_document cannot drop a required section", async () => {
+    const { text, isError } = await callText(client, "update_document", {
+      path: "nodes/decisions/adr-1-use-postgres",
+      body: "## Context\nonly\n",
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/Decision/);
+    const raw = await readFile(join(vault, "nodes", "decisions", "adr-1-use-postgres.md"), "utf-8");
+    expect(raw).toContain("Postgres.");
+  });
+
+  it("context_import cannot rewrite .context/config.yaml", async () => {
+    const before = await readFile(join(vault, ".context", "config.yaml"), "utf-8");
+    const { json } = await callJson(client, "context_import", {
+      files: [{ path: ".context/config.yaml", content: "version: 1\nname: pwned\n" }],
+      overwrite: true,
+    });
+    expect(json.failed.map((f: { id?: string }) => f.id)).toEqual([".context/config.yaml"]);
+    expect(await readFile(join(vault, ".context", "config.yaml"), "utf-8")).toBe(before);
   });
 });

@@ -19,7 +19,7 @@ divergence stops at the root.
 
 | Piece | What |
 |---|---|
-| **Catalog (schemas)** | `core` namespace — 17 ops. Zod input/output + draft-07 JSON Schema per op. Canonical names are `context_*`; OSS legacy names are captured as `aliases`. Schemas compose the engine's existing domain schemas (`frontmatterSchema`, `NODE_TYPES`, …) — no duplication. |
+| **Catalog (schemas)** | `core` namespace — 23 ops. Zod input/output + draft-07 JSON Schema per op. Canonical names are `context_*`; OSS legacy names are captured as `aliases`. Schemas compose the engine's existing domain schemas (`frontmatterSchema`, `NODE_TYPES`, …) — no duplication. |
 | **Executable ops** | `createEngineApi().run(name, input, ctx)` — one implementation bound to engine primitives (`GraphQueryEngine`, `NestStorage`, `publishDocument`). Ungated mechanics only; no governance policy in the engine (preserves the AGPL↔Commercial line). |
 | **Extension framework** | `EngineExtension` lets consumers register new ops (governance/workflow/sync) and wrap every op with `authorize` + `onResult`, without forking the engine. |
 | **Namespace discovery** | `NAMESPACES` advertises the implemented set for MCP `initialize` / REST manifest. |
@@ -33,6 +33,7 @@ Write/lifecycle: `context_create` · `context_update` · `context_publish` ·
 History/audit: `context_versions` · `context_reconstruct` · `context_verify` · `context_forget` (erase a node, keep its hashes — spec §6.3) · `context_forget_log`
 Registry: `context_nests` (list every registered nest)
 Skills: `context_skill`, `context_skill_install` (render/install a vault-hosted skill)
+Structure: `context_structure` (the nest's structure rules, one folder's rule, the compliance report — spec §11.1)
 
 These cover the operations all three surfaces (OSS MCP, CLI, Community MCP)
 expose, so Phase 2 bindings import them instead of hand-rolling. `governance`,

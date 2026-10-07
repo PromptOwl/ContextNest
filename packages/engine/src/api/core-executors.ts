@@ -81,6 +81,21 @@ import {
   planImportPaths,
   sanitizeImportedFrontmatter,
 } from "../import-hygiene.js";
+import {
+  auditStructure,
+  checkDeleteDocument,
+  checkDocument,
+  checkUpdate,
+  compileStructure,
+  describeStructure,
+  documentFolders,
+  enforceStructure,
+  resolveFolder,
+  scaffoldPlan,
+  type CompiledStructure,
+  type StructureDoc,
+} from "../structure.js";
+import { generateIndexMd } from "../index-md-generator.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 import { isDeepStrictEqual } from "node:util";
 
@@ -222,6 +237,87 @@ function assertValid(node: ContextNode): void {
       "VALIDATION_FAILED",
     );
   }
+}
+
+// ─── Structure rules (§11.1, structure.ts) ───────────────────────────────────
+
+/**
+ * The vault's structure rules, or null when this call skips them (a trusted
+ * host restoring a vault — see `OperationContext.structure`). Compiled per
+ * write, so a bad rule refuses the write with CONFIG_ERROR and never a read.
+ */
+async function structureRules(ctx: OperationContext): Promise<CompiledStructure | null> {
+  if (ctx.structure === "skip") return null;
+  return compileStructure(await ctx.storage.readConfig());
+}
+
+const structureDoc = (node: ContextNode): StructureDoc => ({
+  id: node.id,
+  type: node.frontmatter.type,
+  body: node.body,
+});
+
+/** Folders a write of `id` would bring into existence (content-relative). */
+async function newFolders(
+  ctx: OperationContext,
+  id: string,
+): Promise<{ root: string; folders: string[] }> {
+  const { root, folders } = documentFolders(id);
+  const missing: string[] = [];
+  for (const folder of folders) {
+    if (!(await ctx.storage.hasVaultFile(root ? `${root}/${folder}` : folder))) missing.push(folder);
+  }
+  return { root, folders: missing };
+}
+
+/**
+ * Create what newly created folders must contain — their required subfolders
+ * and required files, each file a draft from its template. Best effort: a
+ * required file that cannot be written (a forgotten path, a lost race) stays
+ * missing, and the compliance report (`context_structure` report) names it.
+ */
+async function scaffold(
+  ctx: OperationContext,
+  rules: CompiledStructure,
+  created: { root: string; folders: string[] },
+): Promise<void> {
+  if (created.folders.length === 0) return;
+  const plan = scaffoldPlan(rules, created.folders);
+  const at = (path: string) => (created.root ? `${created.root}/${path}` : path);
+  let wrote = false;
+  for (const folder of plan.folders) {
+    const rel = at(folder);
+    if (await ctx.storage.hasVaultFile(rel)) continue;
+    const name = folder.split("/").pop() ?? folder;
+    await ctx.storage.writeIndexMd(rel, generateIndexMd(rel, name.replace(/-/g, " "), []));
+    wrote = true;
+  }
+  for (const doc of plan.documents) {
+    const id = at(doc.path);
+    if (await ctx.storage.hasVaultFile(`${id}.md`)) continue;
+    const node = buildDraftNode({ id, title: doc.title, content: doc.body, type: doc.type });
+    node.frontmatter.version = 1;
+    try {
+      assertValid(node);
+      await assertNotForgotten(ctx.storage, node);
+      await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: true });
+      wrote = true;
+    } catch (err) {
+      if (!(err instanceof ContextNestError)) throw err;
+    }
+  }
+  if (wrote) await ctx.storage.regenerateIndex();
+}
+
+/**
+ * `.context/` holds the vault's own settings — its structure rules and review
+ * gate among them. An import that could write there could switch both off,
+ * so only a trusted host restoring a whole vault may.
+ */
+function isSettingsPath(path: string): boolean {
+  return String(path)
+    .split(/[\\/]+/)
+    .some((segment) => segment.toLowerCase() === ".context");
 }
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
@@ -505,14 +601,19 @@ const create: OperationExecutor = async (ctx, input: any) => {
   if (!publish && !hold) node.frontmatter.version = 1;
   const createdStatus = node.frontmatter.status;
   assertValid(node);
+  // Structure rules (§11.1), before anything is written — held writes too.
+  const rules = await structureRules(ctx);
+  if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
   // Refused BEFORE the write, for the same stranded-file reason as rejected:
   // a path a forget retired, or a body matching erased
   // content, never takes content again (§6.3.4).
   await assertNotForgotten(ctx.storage, node);
+  const created = rules ? await newFolders(ctx, node.id) : null;
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
   // the way the pre-check + separate write could race.
   await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
+  if (rules && created) await scaffold(ctx, rules, created);
   // Governed callers create the node WITHOUT publishing: the write has to clear
   // review before it becomes retrievable. Still regenerate the index so the
   // draft is discoverable to the surfaces that list drafts.
@@ -668,6 +769,9 @@ const update: OperationExecutor = async (ctx, input: any) => {
   if (!publish && input.version !== undefined) frontmatter.version = input.version;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
+  // Grandfathered (§11.1): only what this edit newly breaks is refused.
+  const rules = await structureRules(ctx);
+  if (rules) enforceStructure(rules, checkUpdate(rules, structureDoc(existing), structureDoc(node)));
   if (holdAsSuggestion && frontmatter.status !== "rejected") {
     const staged = await stageReviewHold(ctx.storage, {
       documentId: id,
@@ -727,6 +831,9 @@ const publish: OperationExecutor = async (ctx, input: any) => {
 
 const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
+  // A required file (§11.1) goes with its folder, never on its own.
+  const rules = await structureRules(ctx);
+  if (rules) enforceStructure(rules, checkDeleteDocument(rules, id));
   // Reads the title BEFORE removing the file (callers report what they
   // deleted) and throws DOCUMENT_NOT_FOUND when the id doesn't exist. Unless
   // `purge` is set, leaves an audit-only record of who deleted it and why
@@ -1085,6 +1192,24 @@ async function writeImportedFile(
   await ctx.storage.writeVaultFile(relPath, content);
 }
 
+/**
+ * The structure-rule view (§11.1) of an imported file, or null when it is not
+ * a document (version history, binaries, dot-files). Unparseable frontmatter
+ * is still a document — checked as type document with its raw text.
+ */
+function importedDoc(relPath: string, content: string): StructureDoc | null {
+  const norm = relPath.replace(/\\/g, "/");
+  const last = norm.split("/").pop() ?? norm;
+  if (isVersionArtifactPath(norm) || !/\.md$/i.test(last) || last.startsWith(".")) return null;
+  const id = norm.replace(/\.md$/i, "");
+  try {
+    const node = parseDocument(`${id}.md`, content, id);
+    return { id, type: node.frontmatter.type, body: node.body };
+  } catch {
+    return { id, body: content };
+  }
+}
+
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
   const titleById = new Map<string, string>();
@@ -1101,6 +1226,19 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // serial loop then costs one full latency per file.
   let incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
+
+  // Structure rules (§11.1) apply to every document this call writes; the
+  // folders those writes create are scaffolded once, after staging.
+  const rules =
+    incoming.length > 0 || (input.documents?.length ?? 0) > 0 ? await structureRules(ctx) : null;
+  const createdFolders = new Map<string, Set<string>>();
+  const noteFolders = async (id: string) => {
+    if (!rules) return;
+    const { root, folders } = await newFolders(ctx, id);
+    const set = createdFolders.get(root) ?? new Set<string>();
+    for (const f of folders) set.add(f);
+    createdFolders.set(root, set);
+  };
 
   // Forget protocol (§6.3.4): an exported nest carries its tombstones, and an
   // import MUST honor them — and this vault's own. The incoming chain-event
@@ -1150,9 +1288,20 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
     await mapInBatches(plan, async (f) => {
       try {
+        if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
+          throw new ContextNestError(
+            `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,
+            "VALIDATION_FAILED",
+          );
+        }
         // A pre-forget copy is refused wherever it lands (§6.3.4).
         const refusal = tombstones ? importVerdict(tombstones, f.path, f.content) : null;
         if (refusal) throw new ForgottenDocumentError(f.raw, `refused: ${refusal}`);
+        const doc = rules ? importedDoc(f.path, f.content) : null;
+        if (rules && doc) {
+          enforceStructure(rules, checkDocument(rules, doc));
+          await noteFolders(doc.id);
+        }
         // Into the file's OWN warning list: `mapInBatches` finishes in
         // whatever order the writes complete, and the report is per input file.
         await writeImportedFile(ctx, f, f.warnings);
@@ -1181,13 +1330,19 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       assertValid(node);
       // Same guard as context_create (§6.3.4): a retired path or erased body
       // must not land even as a draft (`publish: false` returns before Stage 3).
+      if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
       await assertNotForgotten(ctx.storage, node, tombstones!);
+      await noteFolders(node.id);
       await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
       batch.push(node.id);
       titleById.set(node.id, doc.title);
     } catch (err) {
       failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
     }
+  }
+
+  if (rules) {
+    for (const [root, folders] of createdFolders) await scaffold(ctx, rules, { root, folders: [...folders] });
   }
 
   // A staging call — files written, publishing deferred to the caller's final
@@ -1637,6 +1792,18 @@ async function importPdfLocked(
   }
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
+  // Structure rules (§11.1): a new PDF is checked in full, a new version of
+  // one only for what it newly breaks.
+  const rules = await structureRules(ctx);
+  if (rules) {
+    enforceStructure(
+      rules,
+      existing
+        ? checkUpdate(rules, structureDoc(existing), structureDoc(node))
+        : checkDocument(rules, structureDoc(node)),
+    );
+  }
+  const created = rules && !existing ? await newFolders(ctx, id) : null;
 
   // ── Write: archive what is on disk, sidecar, then the node, then publish ──
   // The sidecar goes first so the node never points at a binary that is not
@@ -1655,6 +1822,7 @@ async function importPdfLocked(
     }
     await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: !existing });
     wroteNode = true;
+    if (rules && created) await scaffold(ctx, rules, created);
     if (!publish) {
       await ctx.storage.regenerateIndex();
       return {
@@ -1708,6 +1876,27 @@ async function importPdfLocked(
 }
 
 /**
+ * `context_structure` — the nest's structure rules (§11.1), the rule
+ * governing one folder, and the compliance report. Read-only, and it ignores
+ * the skip flag: a trusted host still asks what the rules are.
+ */
+const structureExec: OperationExecutor = async (ctx, input: any) => {
+  const rules = compileStructure(await ctx.storage.readConfig());
+  const out: Record<string, unknown> = { ...describeStructure(rules) };
+  if (input?.folder !== undefined) out.resolved = resolveFolder(rules, String(input.folder));
+  if (input?.report === true) {
+    const docs = await ctx.storage.discoverDocuments();
+    const folders = await ctx.storage.listFolders();
+    out.violations = auditStructure(
+      rules,
+      docs.map((d) => ({ id: d.id, type: d.frontmatter.type, body: d.body })),
+      folders.map((f) => f.path),
+    );
+  }
+  return out;
+};
+
+/**
  * Serialize a mutating executor on the vault's write lock. Every mutation
  * read-modify-writes the nest-level checkpoint chain; without this, concurrent
  * writers (parallel agents, two terminals, N remote clients on one server)
@@ -1744,4 +1933,5 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_import_pdf: importPdf,
   context_skill: skill,
   context_skill_install: skillInstall,
+  context_structure: structureExec,
 });

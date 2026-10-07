@@ -112,6 +112,10 @@ In any of those cases: **stop and ask.** Present the change-set — the ids, wha
 each would become, and which rung triggered the escalation — and wait. Do not
 begin a rename or a restructure on your own authority.
 
+A restructure must fit the vault's structure rules: check the target with
+`ctx structure --folder <folder> --vault <alias> --json` before proposing it,
+and propose no folder, type or name the rules refuse.
+
 Once the user approves: refile a node with `ctx move <id> <folder> --vault
 <alias>` (its id changes; history and links follow). That works on a remote
 Community nest only, and a rename (`ctx update --title`) does not work on a

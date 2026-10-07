@@ -1858,6 +1858,45 @@ The optional `review` key (`on` | `off`; YAML 1.1 booleans `true`/`false` are ac
 
 No version or checkpoint is created until the hold is approved; approval performs exactly the write and publish the hold deferred. A hold whose base is no longer the node's latest version is stale and MUST NOT be approved. A vault without the key predates the gate and publishes immediately.
 
+#### 11.1.1 Structure rules
+
+Three optional keys let a vault owner constrain its layout. A vault without them is unconstrained, exactly as before.
+
+```yaml
+structure:
+  enforce: true      # false or absent: rules are report-only
+  closed: true       # only declared folders (and their ancestors) may exist and hold documents
+
+folders:             # each key is a folder path PATTERN; a plain name is a literal pattern
+  "clients/{client}":
+    folder_name: "/[a-z]+-[0-9]{3}/"   # format of the trailing {placeholder}
+    types: [document]                  # node types allowed directly here ([] = none)
+    files:                             # files every matching folder must contain
+      overview: { template: client-overview }
+  "clients/{client}/meetings":
+    required: true                     # fixed-name subfolder, created with its parent
+    types: [document]
+    file_name: "{date}-{slug}"         # format of file names here
+    template: meeting-note             # body new files here start from
+
+templates:
+  meeting-note:
+    body: "## Attendees\n## Decisions\n## Action items\n"
+    required_sections: [Decisions, Action items]
+```
+
+**Paths.** A rule applies to a document id or folder with any leading `nodes/` removed, so structured and flat layouts are checked alike. `"/"` (or `nodes`) is the vault root. Exempt: `packs/`, `_suggestions/`, any dot-segment (`.versions/`, `.context/`), `INDEX.md`, the root `CONTEXT.md`, and `sources/` for `type: source` nodes only.
+
+**Patterns.** A segment is a lowercase literal (`a-z`, `0-9`, `-`) or a `{placeholder}`. A placeholder whose label is a token (`{yyyy}`) takes that token's format; any other label takes the `folder_name` of the rule declaring that exact folder, else any slug. When several patterns match, they are compared segment by segment and at the first difference a literal beats a placeholder (declaration order is not significant).
+
+**Formats.** `folder_name` and `file_name` are a token pattern — literals plus `{slug}` (kebab-case), `{date}` (`YYYY-MM-DD`), `{yyyy}`, `{n}` (digits), at most one `{slug}` — or a `/regex/`, implicitly anchored, without flags, matched against the slugified name. Implementations MUST refuse a regex that is longer than 200 characters, uses backreferences or lookaround, repeats a group that itself repeats or alternates, or has more than 3 unbounded repetitions, and MUST NOT run a format against a name longer than 128 characters. File names are checked on the id's last segment; a required file's name is always allowed.
+
+**Required structure.** When a write brings a folder into existence, implementations SHOULD also create its `required` subfolders (recursively) and its `files`, each a draft whose body is its template. Placeholder folders are never created this way. Deleting a required file or folder on its own is refused when enforced; deleting its parent is not.
+
+**Enforcement.** With `enforce: true`, a create, move or import that would place a document where its folder, type, name or required headings break a rule MUST be refused. An update is refused only for what it newly breaks: a change to a type the folder does not allow, or removing a required heading the body had. Content that predates the rules stays readable and editable. A rule that cannot be compiled refuses writes (`CONFIG_ERROR`) but MUST NOT prevent reads. The `.context/` directory MUST NOT be writable through a bulk import, so the rules and the review gate cannot be rewritten by a caller of it.
+
+Like `review`, these keys are read by write surfaces, not by the storage layer. An implementation that does not know them ignores them.
+
 ### 11.2 syntax.yml (Optional)
 
 Allows customization of selector token syntax per vault:
@@ -2022,6 +2061,7 @@ The following components remain proprietary:
 
 ### 1.2 — draft
 
+- **Structure rules** (§11.1.1). New optional `structure`, extended `folders` (path patterns, `types`, `folder_name`, `file_name`, `required`, `files`) and `templates` config keys: hard rules on folder layout, node-type placement, folder/file-name formats (tokens or a guarded regex), templates with required sections, and required subfolders/files. Enforced by write surfaces when `structure.enforce` is true; existing content is grandfathered. `.context/` is not writable through bulk import.
 - **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and an audit-only record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
 
 ### 1.1 — 2026-09

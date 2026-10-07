@@ -46,6 +46,10 @@ import {
   approveReview,
   rejectReview,
   reviewHeldMessage,
+  compileStructure,
+  enforceStructure,
+  checkDocument,
+  checkUpdate,
   currentReviewProposal,
   stageReviewHold,
   NODE_TYPES,
@@ -917,6 +921,23 @@ tool(
 const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
   withVaultLock(storage.root, fn);
 
+/**
+ * Structure rules (§11.1) for the legacy writers below. They write storage
+ * directly instead of through the catalog executors, so without this they
+ * would be a way around every rule. Returns the error result, or null to go on.
+ */
+async function structureRefusal(
+  check: (rules: ReturnType<typeof compileStructure>) => ReturnType<typeof checkDocument>,
+) {
+  try {
+    const rules = compileStructure(await storage.readConfig());
+    enforceStructure(rules, check(rules));
+    return null;
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
 tool(
@@ -1052,6 +1073,11 @@ tool(
           isError: true,
         };
       }
+
+      const refused = await structureRefusal((rules) =>
+        checkDocument(rules, { id, type: node.frontmatter.type, body: node.body }),
+      );
+      if (refused) return refused;
 
       // Review gate, same as context_create: held as pending_review, unversioned
       // (approval publishes v1). The legacy tool must not be a way around it.
@@ -1202,6 +1228,9 @@ tool(
       const holdAsSuggestion = hold && isPublished(doc);
       const proposal = holdAsSuggestion ? await currentReviewProposal(storage, id) : null;
       if (proposal) doc = parseDocument(doc.filePath, proposal.proposedRaw, id);
+      // What the edit starts from, before `doc` is mutated in place below —
+      // structure rules refuse only what the edit newly breaks.
+      const before = { id, type: doc.frontmatter.type, body: doc.body };
 
       // Refuse content edits on rejected docs unless the caller explicitly
       // names a new status (revive to draft/pending_review/approved/published,
@@ -1282,6 +1311,10 @@ tool(
           isError: true,
         };
       }
+      const refused = await structureRefusal((rules) =>
+        checkUpdate(rules, before, { id, type: doc.frontmatter.type, body: doc.body }),
+      );
+      if (refused) return refused;
 
       if (hold) {
         let suggestionId: string | undefined;

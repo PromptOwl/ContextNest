@@ -37,6 +37,8 @@ import {
   printSearchResults,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
 
 export interface RemoteTarget {
@@ -645,7 +647,7 @@ export async function remoteAdd(
     const input: Record<string, unknown> = {
       id,
       title,
-      content: opts.body ? `\n${opts.body}\n` : `\n# ${title}\n\n`,
+      content: opts.body ? `\n${opts.body}\n` : await remoteTemplateBody(conn, id, title),
     };
     // Send the folder alongside the id. A nest whose `context_create` predates
     // the catalog's `id` parameter drops that key and derives the id from the
@@ -670,6 +672,32 @@ export async function remoteAdd(
     }
     console.log(chalk.green(`Created and published ${created.id}.md (remote: ${target.alias})`));
     console.log(`  Version: ${created.version}`);
+  });
+}
+
+/**
+ * The body a bodiless `ctx add` starts from on a remote nest: the folder's
+ * template (§11.1), same as the local branch. A nest that does not advertise
+ * `context_structure` (it predates structure rules) gets the plain heading.
+ */
+async function remoteTemplateBody(conn: RemoteNestConnection, id: string, title: string): Promise<string> {
+  const heading = `\n# ${title}\n\n`;
+  if (!(await conn.toolNames()).has("context_structure")) return heading;
+  const out = await conn.run<StructureOutput>("context_structure", { folder: folderFromId(id) });
+  return out.resolved?.template_body ? `\n${out.resolved.template_body}` : heading;
+}
+
+/** `ctx structure` against a remote nest — the same op, the same output. */
+export async function remoteStructure(
+  target: RemoteTarget,
+  opts: { folder?: string; report?: boolean; json?: boolean },
+): Promise<void> {
+  await withRemote(target, async (conn) => {
+    const out = await conn.run<StructureOutput>("context_structure", {
+      ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+      ...(opts.report ? { report: true } : {}),
+    });
+    printStructure(out, opts);
   });
 }
 

@@ -188,3 +188,92 @@ export function parseTagsOption(tags: string): string[] {
   }
   return parsed;
 }
+
+// ─── ctx structure ─────────────────────────────────────────────────────────
+
+/** One folder rule as `context_structure` reports it. */
+export interface StructureFolderView {
+  pattern: string;
+  description?: string;
+  types?: string[];
+  folder_name?: string;
+  file_name?: string;
+  template?: string;
+  required: boolean;
+  files: Record<string, { template?: string; type?: string }>;
+}
+
+/** The `context_structure` output — printed verbatim by `ctx structure --json`. */
+export interface StructureOutput {
+  enforce: boolean;
+  closed: boolean;
+  folders: StructureFolderView[];
+  templates: Record<string, { body: string; required_sections: string[] }>;
+  resolved?: (StructureFolderView & { template_body?: string; required_sections?: string[] }) | null;
+  violations?: Array<{ code: string; path: string; rule?: string; message: string }>;
+}
+
+function describeRule(f: StructureFolderView): string {
+  const parts: string[] = [];
+  if (f.types) parts.push(f.types.length ? `types: ${f.types.join(", ")}` : "no documents directly here");
+  if (f.folder_name) parts.push(`folder names: ${f.folder_name}`);
+  if (f.file_name) parts.push(`file names: ${f.file_name}`);
+  if (f.template) parts.push(`template: ${f.template}`);
+  const files = Object.entries(f.files ?? {});
+  if (files.length) {
+    parts.push(`required files: ${files.map(([leaf, s]) => (s.template ? `${leaf} (${s.template})` : leaf)).join(", ")}`);
+  }
+  if (f.required) parts.push("required");
+  return parts.join(" · ");
+}
+
+/**
+ * Print `context_structure` output — shared by the local and remote branches
+ * so `ctx structure` reads the same wherever the nest lives.
+ */
+export function printStructure(out: StructureOutput, opts: { json?: boolean; folder?: string }): void {
+  if (opts.json) {
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+  if (out.folders.length === 0 && Object.keys(out.templates).length === 0) {
+    console.log(chalk.dim("No structure rules — any folder, type and file name is allowed."));
+  } else {
+    const mode = out.enforce ? chalk.red("enforced") : chalk.yellow("report-only");
+    const scope = out.closed ? "closed (only these folders may exist)" : "open (rules apply where they match)";
+    console.log(chalk.bold(`Structure rules — ${mode}, ${scope}`));
+    const width = Math.max(...out.folders.map((f) => f.pattern.length), 0);
+    for (const f of out.folders) {
+      const rule = describeRule(f);
+      console.log(`  ${chalk.cyan(f.pattern.padEnd(width))}${rule ? `  ${rule}` : ""}`);
+    }
+    const templates = Object.entries(out.templates);
+    if (templates.length) {
+      console.log(chalk.bold("\nTemplates"));
+      for (const [name, t] of templates) {
+        const req = t.required_sections.length ? ` — requires: ${t.required_sections.join(", ")}` : "";
+        console.log(`  ${chalk.cyan(name)}${req}`);
+      }
+    }
+  }
+  if (opts.folder !== undefined) {
+    console.log(chalk.bold(`\n${opts.folder}`));
+    if (!out.resolved) {
+      console.log(chalk.dim(out.closed ? "  No rule governs this folder — it may not hold documents." : "  No rule governs this folder."));
+    } else {
+      console.log(`  rule: ${chalk.cyan(out.resolved.pattern)}${describeRule(out.resolved) ? `  ${describeRule(out.resolved)}` : ""}`);
+      if (out.resolved.required_sections?.length) {
+        console.log(`  required sections: ${out.resolved.required_sections.join(", ")}`);
+      }
+      if (out.resolved.template_body) {
+        console.log(chalk.dim("  template:"));
+        for (const line of out.resolved.template_body.replace(/\n$/, "").split("\n")) console.log(chalk.dim(`    ${line}`));
+      }
+    }
+  }
+  if (out.violations) {
+    console.log(chalk.bold("\nCompliance"));
+    if (out.violations.length === 0) console.log(chalk.green("  ✓ Everything fits the rules."));
+    for (const v of out.violations) console.log(`  ${chalk.red("✗")} ${chalk.dim(v.code)} ${v.message}`);
+  }
+}

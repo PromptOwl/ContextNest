@@ -110,6 +110,7 @@ them over the legacy tools below.
 | `context_nests` | List every nest in the central registry — alias, path, description, which is default, whether it exists |
 | `context_skill` | Render a `type: skill` node for an agent harness (Claude Code, Cursor, Codex, raw) — trigger becomes the harness matcher |
 | `context_skill_install` | Build the file manifest that installs a vault skill. Loader mode (default) fetches at runtime and cannot drift; `full` embeds an offline copy that will |
+| `context_structure` | The nest's structure rules — allowed folders, node types, folder/file-name formats, templates and required sections/files. `folder` resolves one folder's rule with its template body; `report` lists existing content that breaks the rules. Writes that break an enforced rule are refused |
 | `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
 | `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
 | `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |

@@ -381,11 +381,37 @@ export const nestConfigSchema = z.object({
       status: z.enum(STATUSES).optional(),
     })
     .optional(),
+  // Structure rules (§11.1, structure.ts). SHAPE ONLY, on purpose: this schema
+  // runs on every config read — writes and graph reads alike — so a strict
+  // enum or pattern check here would let one typo in a rule brick the vault.
+  // Patterns, regexes and type names are compiled by compileStructure() when a
+  // write is checked, where a bad rule refuses writes and nothing else.
+  structure: z
+    .object({
+      enforce: z.boolean().optional(),
+      closed: z.boolean().optional(),
+    })
+    .optional(),
   folders: z
     .record(
       z.object({
         description: z.string().optional(),
         template: z.string().optional(),
+        types: z.array(z.string()).optional(),
+        folder_name: z.string().optional(),
+        file_name: z.string().optional(),
+        required: z.boolean().optional(),
+        files: z
+          .record(z.object({ template: z.string().optional(), type: z.string().optional() }))
+          .optional(),
+      }),
+    )
+    .optional(),
+  templates: z
+    .record(
+      z.object({
+        body: z.string().optional(),
+        required_sections: z.array(z.string()).optional(),
       }),
     )
     .optional(),

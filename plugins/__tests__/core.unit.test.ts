@@ -816,6 +816,87 @@ describe("session-start", () => {
   });
 });
 
+describe("session-start — structure rules", () => {
+  const RULES = {
+    enforce: true,
+    closed: true,
+    folders: [
+      { pattern: "clients/{client}", types: ["document"], folder_name: "/[a-z]+-[0-9]{3}/", required: false, files: { overview: { template: "client-overview" } } },
+      { pattern: "clients/{client}/meetings", types: ["document"], file_name: "{date}-{slug}", template: "meeting-note", required: true, files: {} },
+    ],
+    templates: { "meeting-note": { body: "## Decisions\n", required_sections: ["Decisions"] } },
+  };
+  const calls = (log: string[][]) => log.filter((a) => a[0] === "structure");
+  const recording = (routes: [string, unknown][]) => {
+    const log: string[][] = [];
+    const inner = fakeExec(routes);
+    return { log, exec: (args: string[]) => (log.push(args), inner(args)) };
+  };
+
+  it("injects a compact blueprint for the pinned vault", () => {
+    const { log, exec } = recording([
+      ["vault list", [{ alias: "home", exists: true }]],
+      ["structure --json", RULES],
+    ]);
+    const ctx = additional(startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec }))!;
+    expect(calls(log)).toEqual([["structure", "--json", "--vault", "home"]]);
+    expect(ctx).toMatch(/structure rules/i);
+    expect(ctx).toMatch(/enforced/);
+    expect(ctx).toContain("clients/{client}/meetings");
+    expect(ctx).toContain("{date}-{slug}");
+    expect(ctx).toContain("meeting-note");
+    expect(ctx).toContain("ctx structure --folder");
+  });
+
+  it("uses the working-directory vault when nothing is pinned", () => {
+    const { log, exec } = recording([
+      ["vault list", []],
+      ["vault which", { kind: "local", path: "/proj/notes", source: "local" }],
+      ["structure --json", RULES],
+    ]);
+    const ctx = additional(startSession({ input: {}, env: {}, exec }))!;
+    expect(calls(log)).toEqual([["structure", "--json"]]);
+    expect(ctx).toContain("clients/{client}/meetings");
+  });
+
+  it("asks no vault at all when nothing is pinned and the cwd is not a vault", () => {
+    const { log, exec } = recording([["vault list", [{ alias: "work", exists: true }]]]);
+    startSession({ input: {}, env: {}, exec });
+    expect(calls(log)).toEqual([]);
+  });
+
+  it("says nothing about structure when the vault has no rules", () => {
+    const { exec } = recording([
+      ["vault list", [{ alias: "home", exists: true }]],
+      ["structure --json", { enforce: false, closed: false, folders: [], templates: {} }],
+    ]);
+    const ctx = additional(startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec }))!;
+    expect(ctx).not.toMatch(/structure rules/i);
+  });
+
+  it("an older ctx without the command (non-zero exit) is skipped silently", () => {
+    const routes = fakeExec([["vault list", [{ alias: "home", exists: true }]]]);
+    const exec = (args: string[]) =>
+      args[0] === "structure" ? { status: 1, stdout: "", stderr: "unknown command 'structure'" } : routes(args);
+    const ctx = additional(startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec }))!;
+    expect(ctx).not.toMatch(/structure rules/i);
+    expect(ctx).toContain("`home`");
+  });
+
+  it("caps a long rule set and points at ctx structure for the rest", () => {
+    const folders = Array.from({ length: 40 }, (_, i) => ({ pattern: `area-${i}`, types: ["document"], required: false, files: {} }));
+    const { exec } = recording([
+      ["vault list", [{ alias: "home", exists: true }]],
+      ["structure --json", { enforce: false, closed: false, folders, templates: {} }],
+    ]);
+    const ctx = additional(startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec }))!;
+    expect(ctx).toMatch(/report-only/);
+    expect(ctx).toContain("area-0");
+    expect(ctx).not.toContain("area-39");
+    expect(ctx).toMatch(/more.*ctx structure/);
+  });
+});
+
 describe("signals", () => {
   it("lastUserMessage returns the newest human turn, skipping tool_result echoes", () => {
     const lines = [
