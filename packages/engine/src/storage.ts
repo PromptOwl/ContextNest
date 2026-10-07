@@ -176,16 +176,6 @@ export function assertWritableDocumentId(raw: string): void {
     );
   }
   assertNotMachineryPath(raw);
-  // A new name never looks like an NTFS short name (`VERSIO~1`), which may
-  // alias a reserved folder; no slug contains one. (Erasing an existing file
-  // so named resolves it instead — see assertErasableDocumentId.)
-  const short = raw.split("/").find((seg) => /~\d/.test(seg));
-  if (short !== undefined) {
-    throw new ContextNestError(
-      `${shown}: "${short}" looks like an NTFS short name, which may alias a reserved path (.context, .versions, _suggestions) — use the full name`,
-      "VALIDATION_FAILED",
-    );
-  }
   const segments = raw
     .split("/")
     .map(comparableSegment)
@@ -206,11 +196,15 @@ export function assertWritableDocumentId(raw: string): void {
  * node writes beside them; imported file paths, which carry their own, are
  * held to NAME_MAX itself.
  */
-export function assertFitsFileSystem(raw: string, maxSegmentBytes = MAX_SEGMENT_BYTES): void {
+export function assertFitsFileSystem(
+  raw: string,
+  maxSegmentBytes = MAX_SEGMENT_BYTES,
+  maxLength = MAX_DOCUMENT_ID_LENGTH,
+): void {
   const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
-  if (raw.length > MAX_DOCUMENT_ID_LENGTH) {
+  if (raw.length > maxLength) {
     throw new ContextNestError(
-      `Invalid path ${shown}: longer than ${MAX_DOCUMENT_ID_LENGTH} characters`,
+      `Invalid path ${shown}: longer than ${maxLength} characters`,
       "INVALID_DOCUMENT_ID",
     );
   }
@@ -244,24 +238,49 @@ export function assertNotMachineryPath(raw: string): void {
 
 /**
  * Refuse erasing (delete, forget — imported forgets too) anything but a
- * document: {@link assertNotMachineryPath}, and for a segment that may be an
- * NTFS short name (`VERSIO~1`), the file's resolved path, which is where
- * Windows expands it. On POSIX `~2` is an ordinary character, so a legacy
- * `draft~2` can still be erased.
+ * document: {@link assertNotMachineryPath} and {@link assertResolvesOutsideMachinery}.
+ * Nothing else here — a legacy id the write guard would refuse (`Nodes/…`,
+ * an over-long name) stays erasable — except a name no file system could
+ * hold, refused before its error could name the vault path.
  */
 export async function assertErasableDocumentId(root: string, id: string): Promise<void> {
+  assertFitsFileSystem(id, 255, 4096);
   assertNotMachineryPath(id);
-  if (!id.split("/").some((seg) => /~\d/.test(seg))) return;
-  let resolved: string;
+  await assertResolvesOutsideMachinery(root, id);
+}
+
+/**
+ * Refuse an id with a segment that may be an NTFS short name (`VERSIO~1`)
+ * when the path it names resolves into vault machinery — which is where
+ * Windows expands it (fs/promises `realpath` has `realpath.native`
+ * semantics). Resolves the deepest part of the path that exists, so a new
+ * file under an aliased folder is caught too. On a volume with no short
+ * names (`~2` is an ordinary character there) nothing resolves differently,
+ * so `Plan~2` is an ordinary name. Every document write and erase reaches
+ * this; ids without `~` and a digit cost nothing.
+ */
+export async function assertResolvesOutsideMachinery(root: string, id: string): Promise<void> {
+  const segs = id.split("/");
+  if (!segs.some((seg) => /~\d/.test(seg))) return;
   let base: string;
   try {
-    // fs/promises realpath has realpath.native semantics: Windows expands short names.
-    [resolved, base] = await Promise.all([realpath(join(root, `${id}.md`)), realpath(root)]);
+    base = await realpath(root);
   } catch {
-    return; // nothing there to erase — the caller's read reports it
+    return;
   }
-  const rel = relative(base, resolved).split(/[/\\]+/).join("/");
-  assertNotMachineryPath(rel.replace(/\.md$/i, ""));
+  for (let n = segs.length; n > 0; n--) {
+    const tail = segs.slice(n);
+    let resolved: string;
+    try {
+      resolved = await realpath(join(root, ...segs.slice(0, n - 1), n === segs.length ? `${segs[n - 1]}.md` : segs[n - 1]));
+    } catch {
+      continue; // not there yet — try the folder above
+    }
+    const rel = [...relative(base, resolved).split(/[/\\]+/), ...tail].join("/").replace(/\.md$/i, "");
+    if (rel.startsWith("..")) return; // outside the vault: not machinery of this one
+    assertNotMachineryPath(rel);
+    return;
+  }
 }
 
 export function assertSafeDocumentId(raw: string): void {
@@ -1549,6 +1568,7 @@ export class NestStorage {
     options: { exclusive?: boolean } = {},
   ): Promise<void> {
     assertNotMachineryPath(id);
+    await assertResolvesOutsideMachinery(this.root, id);
     const filePath = join(this.root, `${id}.md`);
     const onDisk = await this.sealText(id, "doc", content);
     try {
@@ -1813,6 +1833,7 @@ export class NestStorage {
    */
   async deleteDocument(id: string): Promise<void> {
     assertNotMachineryPath(id);
+    await assertResolvesOutsideMachinery(this.root, id);
     // Drop the cached serve-path verdict with the document it describes.
     this.historyVerdicts.delete(id);
     this.markHistoryTouched(id);

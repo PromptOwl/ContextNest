@@ -1234,11 +1234,25 @@ describe("architecture round 7: machinery paths for delete and forget, 8.3 names
     expect(JSON.stringify(forgotten)).not.toContain(".versions");
   });
 
-  it.each(["nodes/VERSIO~1/k/v1", "CONTEX~1/x", "nodes/x/_SUGGE~1/y"])(
-    "an NTFS short name that may alias vault machinery is refused: %s",
-    async (id) => {
-      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
-      expect(err.message).toMatch(/short name|reserved/);
+  it.skipIf(process.platform === "win32")(
+    "a ~digit name that resolves into vault machinery is refused, as an NTFS short name would",
+    async () => {
+      await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+      // A symlink stands in for an NTFS short name: VERSIO~1 resolving to .versions.
+      await symlink(join(dir, "nodes", "meetings", ".versions"), join(dir, "nodes", "meetings", "VERSIO~1"));
+      const keyframe = join(dir, "nodes", "meetings", ".versions", "k", "v1.md");
+      const before = await readFile(keyframe, "utf-8");
+      const attempts: Array<[string, Record<string, unknown>]> = [
+        ["context_update", { id: "nodes/meetings/VERSIO~1/k/v1", content: "evil" }],
+        ["context_create", { id: "nodes/meetings/VERSIO~1/k/v9", title: "Evil", content: "x" }],
+        ["context_delete", { id: "nodes/meetings/VERSIO~1/k/v1", purge: true }],
+        ["context_forget", { id: "nodes/meetings/VERSIO~1/k/v1", reason_code: "user_request" }],
+      ];
+      for (const [op, input] of attempts) {
+        const err = await refusal(op, input);
+        expect(err.message, op).toMatch(/reserved/);
+      }
+      expect(await readFile(keyframe, "utf-8")).toBe(before);
     },
   );
 
@@ -1499,7 +1513,60 @@ describe("architecture round 8: imported history heads, imported forgets, sideca
     expect((await storage.readDocument("nodes/notes/draft~2")).frontmatter.status).toBe("forgotten");
     await api.run("context_delete", { id: "nodes/notes/draft~3", purge: true }, ctx);
     expect(await exists("nodes/notes/draft~3.md")).toBe(false);
-    const err = await refusal("context_create", { id: "nodes/notes/draft~4", title: "D", content: "x" });
-    expect(err.message).toMatch(/short name/);
+    // Nothing to alias on this volume: an ordinary name, written, edited and published.
+    const res = await api.run<{ id: string }>("context_create", { id: "nodes/notes/draft~4", title: "D", content: "x" }, ctx);
+    expect(res.id).toBe("nodes/notes/draft~4");
+    await writeFile(join(dir, "nodes", "notes", "plan~5.md"), "---\ntitle: Plan\ntype: document\nstatus: draft\n---\nx\n", "utf-8");
+    await api.run("context_update", { id: "nodes/notes/plan~5", content: "edited", publish: false }, ctx);
+    await api.run("context_publish", { id: "nodes/notes/plan~5" }, ctx);
+  });
+});
+
+describe("QA round 8: aliases, erase limits, scaffold scale", () => {
+  it("a settings path hidden behind an ignorable code point is not importable", async () => {
+    const path = ".con\u200Ctext/config.yaml";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "version: 1\nname: evil\n" }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual([path]);
+  });
+
+  it("history files spelled with trailing dots are judged as the set they are", async () => {
+    await api.run("context_create", { id: "nodes/meetings/donor", title: "Donor", content: "## Notes\nx\n" }, ctx);
+    await writeConfig({
+      structure: { enforce: true },
+      folders: { meetings: { types: ["document"], template: "m" } },
+      templates: { m: { body: "## Agenda\n", required_sections: ["Agenda"] } },
+    });
+    const from = join(dir, "nodes", "meetings", ".versions", "donor");
+    const files = await Promise.all(
+      [["history.yaml", "history.yaml."], ["v1.md", "v1.md."]].map(async ([src, as]) => ({
+        path: `nodes/meetings/.versions./victim/${as}`,
+        content: await readFile(join(from, src), "utf-8"),
+      })),
+    );
+    const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(res.failed.map((f) => f.id).sort()).toEqual(files.map((f) => f.path).sort());
+  });
+
+  it.each(["context_delete", "context_forget", "context_get"])(
+    "%s of an id no file system could hold fails without naming the vault path",
+    async (op) => {
+      const err = await refusal(op, { id: `nodes/${"z".repeat(300)}`, reason_code: "user_request" });
+      expect(err.message).not.toContain(dir);
+    },
+  );
+
+  it("scaffolding a batch of thousands of new folders stays linear in CPU", async () => {
+    // Ids under a folder that does not exist yet: no directory I/O to hide a
+    // quadratic step (a growing array copied per folder took minutes here).
+    const rules = compileStructure({ structure: { enforce: true }, folders: { t: { files: { overview: {} } } } });
+    const ids = Array.from({ length: 20000 }, (_, i) => `nodes/t/b${i}/c/d/x`);
+    const started = Date.now();
+    await scaffoldFirstPublish(storage, rules, ids);
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(await exists("nodes/t/overview.md")).toBe(true);
   });
 });

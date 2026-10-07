@@ -263,6 +263,7 @@ export {
   assertWritableDocumentId,
   assertNotMachineryPath,
   assertErasableDocumentId,
+  assertResolvesOutsideMachinery,
   assertFitsFileSystem,
 } from "./storage.js";
 export type {

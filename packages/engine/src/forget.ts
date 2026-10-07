@@ -162,7 +162,7 @@ export async function forgetDocument(
   docId: string,
   options: ForgetOptions,
 ): Promise<ForgetResult> {
-  assertNotMachineryPath(docId);
+  await assertErasableDocumentId(storage.root, docId);
   assertReason(options.reasonCode);
   const node = await storage.readDocument(docId);
   const history = await storage.readHistory(docId);

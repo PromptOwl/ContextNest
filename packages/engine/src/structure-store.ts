@@ -346,7 +346,9 @@ async function scaffoldFirstPublishOrThrow(
     const extra = (total.get(path) ?? 0) - count;
     if (extra > MAX_HELD_SIBLINGS) continue;
     if (extra > 0 && (await readFor(path)).some((id) => id === path || id.startsWith(`${path}/`))) continue;
-    byRoot.set(root, [...(byRoot.get(root) ?? []), folder]);
+    const list = byRoot.get(root);
+    if (list) list.push(folder);
+    else byRoot.set(root, [folder]);
   }
   const written: string[] = [];
   for (const [root, folders] of byRoot) written.push(...(await scaffoldFolders(storage, rules, { root, folders })));

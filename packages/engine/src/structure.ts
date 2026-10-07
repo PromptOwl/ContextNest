@@ -726,7 +726,9 @@ const rawSegments = (path: string) =>
  * quadratically on a long run of dots and spaces.
  */
 export function comparableSegment(segment: string): string {
-  const name = segment.split(":")[0];
+  // Default-ignorable code points (U+200C, U+200D, …) are dropped too: HFS+
+  // ignores them, so `.con\u200Ctext` there is `.context`.
+  const name = segment.split(":")[0].replace(/\p{Default_Ignorable_Code_Point}/gu, "");
   let end = name.length;
   while (end > 0 && (name[end - 1] === "." || name[end - 1] === " ")) end--;
   return name.slice(0, end).toUpperCase().toLowerCase();
