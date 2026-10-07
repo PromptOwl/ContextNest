@@ -261,7 +261,8 @@ export {
   normalizeDocumentId,
   normalizeFolder,
   assertWritableDocumentId,
-  comparableSegment,
+  assertNotMachineryPath,
+  assertFitsFileSystem,
 } from "./storage.js";
 export type {
   LayoutMode,
@@ -514,6 +515,7 @@ export {
   enforceStructure,
   documentFolders,
   MAX_MATCHED_NAME,
+  comparableSegment,
 } from "./structure.js";
 export type {
   StructureConfig,

@@ -52,7 +52,7 @@ import type {
 } from "./types.js";
 import { assertWritableDocumentId, type NestStorage } from "./storage.js";
 import { settlePdfForCommit } from "./pdf-nodes.js";
-import { assertStructurePublish, enforcedStructure } from "./structure-store.js";
+import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish } from "./structure-store.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -429,7 +429,7 @@ async function commitNewVersion(
 
   // Judged before historyOrRepair: a refused write quarantines nothing.
   const rules = await enforcedStructure(input.storage);
-  if (rules) await assertStructurePublish(input.storage, rules, parsed, input.knownHistory);
+  const first = rules ? await assertStructurePublish(input.storage, rules, parsed, input.knownHistory) : false;
 
   const versionManager = new VersionManager(input.storage);
   // Read once, shared by the numbering and the append below.
@@ -478,6 +478,9 @@ async function commitNewVersion(
   // chain consistent (history wrote first, live file matches the chain
   // head only after this succeeds).
   await input.storage.writeDocument(input.documentId, serialized);
+  // A czar direct edit may create the document: its new folders get their
+  // required contents, as any first publish's do.
+  if (rules && first) await scaffoldFirstPublish(input.storage, rules, [input.documentId]);
 
   return { versionEntry, serialized };
 }

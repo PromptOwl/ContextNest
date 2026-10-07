@@ -534,9 +534,9 @@ templates:
 - An enforced write that creates a folder also creates its required subfolders and files (drafts from their templates). A required file can be deleted only as the last document in its folder. `ctx add` without `--body` starts from the folder's template.
 - File names come from titles (lowercased, words joined by `-`), so a rule like `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
 - A `/regex/` must stay inside a small grammar: quantifiers on single characters or `[classes]` (bounds of at most 3 digits), groups with `|` that are never repeated, literal `{ } [ ]` escaped, no lookaround or backreferences, at most 200 characters (spec §11.1.1 has the exact grammar). It is matched in linear time, never by the backtracking regex engine — token patterns too — so no pattern can stall a write.
-- Re-running `ctx init` on a vault keeps its rules (a config that is not YAML but mentions them is refused, not overwritten), and a starter leaves out what they refuse.
+- Re-running `ctx init` on a vault keeps its rules (a config that is not valid YAML is refused, not overwritten), and a starter leaves out what they refuse.
 - Existing `folders:` blocks keep working: a `template` naming no entry under `templates` is a label, and folder names are matched literally.
-- No write puts a document under `.context/`, `.versions/` or `_suggestions/` (any depth) or the vault-root `packs/`, and `context_import` never writes `.context/` — an import cannot rewrite the rules or the review gate. Ids use `/`, never `\`, spell the content root exactly `nodes/` (not `NODES/`), and stay under 1024 characters with no name over 251 bytes.
+- No write puts a document under `.context/`, `.versions/` or `_suggestions/` (any depth) or the vault-root `packs/`, and `context_import` never writes `.context/` — an import cannot rewrite the rules or the review gate. Ids use `/`, never `\`, stay under 1024 characters with no name over 251 bytes, and under enforced rules spell the content root exactly `nodes/` (not `NODES/`).
 - Folder names in rules match case-insensitively; at most 256 folder rules; a `template` name not defined under `templates` is reported as a warning by `ctx structure`.
 
 | Command | Effect |

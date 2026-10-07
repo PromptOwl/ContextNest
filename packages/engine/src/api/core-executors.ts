@@ -42,7 +42,7 @@ import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } fro
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
-import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, comparableSegment } from "../storage.js";
+import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, assertFitsFileSystem } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
@@ -94,6 +94,7 @@ import {
   type CompiledStructure,
   type StructureDoc,
   type Violation,
+  comparableSegment,
 } from "../structure.js";
 import {
   assertStructureDelete,
@@ -1199,7 +1200,8 @@ function storeIndex(segs: string[]): number {
 
 /** The document a `.versions/` or `_suggestions/` file belongs to (`a/.versions/x/…` → `a/x`), or null. */
 function storeOwner(relPath: string): string | null {
-  const segs = relPath.replace(/\\/g, "/").split("/");
+  // As the file system resolves the path: `.versions/./x/` is `.versions/x/`.
+  const segs = relPath.replace(/\\/g, "/").split("/").filter((s) => s !== "" && s !== ".");
   const k = storeIndex(segs);
   return k === -1 || k + 1 >= segs.length - 1 ? null : [...segs.slice(0, k), segs[k + 1]].join("/");
 }
@@ -1258,10 +1260,18 @@ async function importVerdicts(
     const owner = store ?? (/\.pdf$/i.test(f.path) ? f.path.slice(0, -".pdf".length) : null);
     if (owner && refusedDocs.has(owner)) {
       refused.set(f.raw, `${f.raw}: belongs to ${owner}, which the structure rules refused`);
-    } else if (store && !batchDocs.has(store) && (await readIfExists(ctx, store))) {
+    } else if (store && !batchDocs.has(store)) {
       // History planted beside a document already here would turn its
-      // first-publish check (in full) into an update check.
-      refused.set(f.raw, `${f.raw}: belongs to ${store}, already in the vault and not part of this import`);
+      // first-publish check (in full) into an update check. It is refused
+      // only where that matters — a document its full check refuses — so a
+      // chunked import may still send a (conforming) document before its history.
+      const owned = await readIfExists(ctx, store);
+      if (owned && checkDocument(rules, structureDoc(owned)).length > 0) {
+        refused.set(
+          f.raw,
+          `${f.raw}: belongs to ${store}, already in the vault, which the rules would refuse as a first publish — an import cannot bring it history`,
+        );
+      }
     }
   });
   return refused;
@@ -1349,6 +1359,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const refused = rules ? await importVerdicts(ctx, rules, plan, input.overwrite === true) : new Map<string, string>();
     await mapInBatches(plan, async (f) => {
       try {
+        assertFitsFileSystem(f.path, 255);
         if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
           throw new ContextNestError(
             `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,
@@ -1862,10 +1873,12 @@ async function importPdfLocked(
   }
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
-  // Structure rules (§11.1): a new PDF is checked in full, a new version of
-  // one only for what it newly breaks.
+  // Structure rules (§11.1.1): judged before anything is written, as the
+  // publish will judge it — a new PDF in full, a new version of one only for
+  // what it newly breaks.
   const rules = await structureRules(ctx);
-  if (rules) {
+  if (rules && publish) await assertStructurePublish(ctx.storage, rules, node);
+  else if (rules) {
     enforceStructure(
       rules,
       existing
@@ -1873,6 +1886,7 @@ async function importPdfLocked(
         : checkDocument(rules, structureDoc(node)),
     );
   }
+
   const created = rules && !existing ? await missingFolders(ctx.storage, id) : null;
 
   // ── Write: archive what is on disk, sidecar, then the node, then publish ──

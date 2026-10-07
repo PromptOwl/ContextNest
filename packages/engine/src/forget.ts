@@ -38,7 +38,7 @@ import type {
   VersionEntry,
 } from "./types.js";
 import type { NestStorage } from "./storage.js";
-import { assertSafeDocumentId } from "./storage.js";
+import { assertNotMachineryPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { ChainEventLog } from "./chain-log.js";
@@ -162,7 +162,7 @@ export async function forgetDocument(
   docId: string,
   options: ForgetOptions,
 ): Promise<ForgetResult> {
-  assertSafeDocumentId(docId);
+  assertNotMachineryPath(docId);
   assertReason(options.reasonCode);
   const node = await storage.readDocument(docId);
   const history = await storage.readHistory(docId);
@@ -343,7 +343,7 @@ export async function deleteDocumentWithTombstone(
   docId: string,
   options: DeleteOptions,
 ): Promise<DeleteResult> {
-  assertSafeDocumentId(docId);
+  assertNotMachineryPath(docId);
   const node = await storage.readDocument(docId);
   const title = node.frontmatter.title;
   if (options.purge || isForgotten(node)) {

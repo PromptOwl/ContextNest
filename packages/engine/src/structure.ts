@@ -498,7 +498,13 @@ function compileFormat(spelling: string, key: string): Matcher {
 
 /** `"/nodes/a/b/"` → `"a/b"`; `"/"`, `""` and `"nodes"` → `""` (the root). */
 function normalizeKey(key: string): string {
-  const k = key.replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "");
+  // Trimmed with a loop: `/\/+$/` retries from every slash of a long run.
+  let k = key.replace(/\\/g, "/").trim();
+  let start = 0;
+  let end = k.length;
+  while (start < end && k[start] === "/") start++;
+  while (end > start && k[end - 1] === "/") end--;
+  k = k.slice(start, end);
   const segs = k.split("/");
   // The owner's spelling: `Nodes/clients` keys `clients`.
   return segs[0].toLowerCase() === "nodes" ? segs.slice(1).join("/") : k;
@@ -514,7 +520,7 @@ function isPlaceholder(seg: Segment): seg is { label: string; matcher: Matcher }
  * case-insensitively, see `sameName`).
  */
 function shapeKey(segments: Segment[]): string {
-  return segments.map((s) => (isPlaceholder(s) ? "{}" : s.literal.toLowerCase())).join("/");
+  return segments.map((s) => (isPlaceholder(s) ? "{}" : fold(s.literal))).join("/");
 }
 
 function assertType(type: string, key: string): void {
@@ -711,11 +717,27 @@ const rawSegments = (path: string) =>
     .filter((s) => s && s !== ".");
 
 /**
+ * A path segment as a file system may resolve it, for refusing a reserved
+ * name: NTFS reads `.context::$INDEX_ALLOCATION` as the folder `.context` and
+ * drops trailing dots and spaces, and a case-insensitive volume folds `ſ`
+ * (long s) to `s`. Upper- then lower-casing gives that full case folding;
+ * `toLowerCase` alone keeps `ſ`. Use it to refuse, never to exempt.
+ * Linear: the trailing trim is a loop, not `/[. ]+$/`, which backtracks
+ * quadratically on a long run of dots and spaces.
+ */
+export function comparableSegment(segment: string): string {
+  const name = segment.split(":")[0];
+  let end = name.length;
+  while (end > 0 && (name[end - 1] === "." || name[end - 1] === " ")) end--;
+  return name.slice(0, end).toUpperCase().toLowerCase();
+}
+
+/**
  * Whether a path starts in `nodes/` — compared exactly. On a case-sensitive
  * volume `NODES/` or `nodes:x/` is a folder of its own, so folding here would
- * judge a document as if it lived somewhere it does not. The write guard
- * (assertWritableDocumentId) refuses those spellings instead, so a volume
- * that folds them never receives one.
+ * judge a document as if it lived somewhere it does not. checkDocument
+ * refuses those spellings instead (see `respelledRoot`), so under enforced
+ * rules a volume that folds them never receives one.
  */
 const inNodes = (raw: string[]) => raw[0] === "nodes";
 
@@ -768,7 +790,8 @@ export function documentFolders(id: string): { root: string; folders: string[] }
  * Literal names compare case-insensitively: on a case-insensitive filesystem
  * (macOS, Windows) `NOTES/x` lands in `notes/`, so the `notes` rule must judge it.
  */
-const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+const fold = (name: string) => name.toUpperCase().toLowerCase();
+const sameName = (a: string, b: string) => fold(a) === fold(b);
 
 function segmentFits(seg: Segment, name: string): boolean {
   return isPlaceholder(seg) ? fits(seg.matcher, name) : sameName(seg.literal, name);
@@ -871,7 +894,24 @@ function requiredSections(rules: CompiledStructure, rule: CompiledRule, leaf: st
 // ─── Checks ─────────────────────────────────────────────────────────────────
 
 /** Everything about this document that breaks a rule (create, move, import, audit). */
+/**
+ * Another spelling of the content root (`NODES/`, `nodes./`, `nodes:x/`): its
+ * own folder on one volume and `nodes/` on another, so no rule could judge
+ * both. Refused as a document's folder, never exempted.
+ */
+function respelledRoot(id: string): Violation | null {
+  const first = rawSegments(id)[0];
+  if (first === undefined || first === "nodes" || comparableSegment(first) !== "nodes") return null;
+  return {
+    code: "FOLDER_NOT_ALLOWED",
+    path: first,
+    message: `"${first}/" is another spelling of the vault's nodes/ folder — write it as nodes/.`,
+  };
+}
+
 export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Violation[] {
+  const respelled = respelledRoot(doc.id);
+  if (respelled) return [respelled];
   const p = docPath(doc.id);
   if (!p) return [];
   const type = doc.type ?? "document";

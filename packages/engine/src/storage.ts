@@ -18,6 +18,7 @@ import {
 import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
+import { comparableSegment } from "./structure.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
@@ -144,22 +145,6 @@ const MAX_DOCUMENT_ID_LENGTH = 1024;
  */
 const MAX_SEGMENT_BYTES = 251;
 
-/**
- * A path segment as a file system may resolve it, for refusing a reserved
- * name: NTFS reads `.context::$INDEX_ALLOCATION` as the folder `.context` and
- * drops trailing dots and spaces, and a case-insensitive volume folds `ſ`
- * (long s) to `s`. Upper- then lower-casing gives that full case folding;
- * `toLowerCase` alone keeps `ſ`. Use it to refuse, never to exempt.
- * Linear: the trailing trim is a loop, not `/[. ]+$/`, which backtracks
- * quadratically on a long run of dots and spaces.
- */
-export function comparableSegment(segment: string): string {
-  const name = segment.split(":")[0];
-  let end = name.length;
-  while (end > 0 && (name[end - 1] === "." || name[end - 1] === " ")) end--;
-  return name.slice(0, end).toUpperCase().toLowerCase();
-}
-
 /** Segments that hold vault machinery at any depth — never a document. */
 const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
 
@@ -172,22 +157,8 @@ const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
  * {@link assertSafeDocumentId} alone.
  */
 export function assertWritableDocumentId(raw: string): void {
-  // Sized for a file system before anything touches one: an over-long id
-  // otherwise costs a stat per ancestor folder before failing with an error
-  // that names the absolute vault path — and never echoes the id back whole.
+  assertFitsFileSystem(raw);
   const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
-  if (raw.length > MAX_DOCUMENT_ID_LENGTH) {
-    throw new ContextNestError(
-      `Invalid document id ${shown}: longer than ${MAX_DOCUMENT_ID_LENGTH} characters`,
-      "INVALID_DOCUMENT_ID",
-    );
-  }
-  if (raw.split("/").some((seg) => Buffer.byteLength(seg) > MAX_SEGMENT_BYTES)) {
-    throw new ContextNestError(
-      `Invalid document id ${shown}: a folder or file name is longer than ${MAX_SEGMENT_BYTES} bytes`,
-      "INVALID_DOCUMENT_ID",
-    );
-  }
   assertSafeDocumentId(raw);
   // A backslash is a separator on Windows but a literal file-name character
   // on POSIX, so the path a check judges and the file storage writes would
@@ -203,21 +174,63 @@ export function assertWritableDocumentId(raw: string): void {
       "INVALID_DOCUMENT_ID",
     );
   }
+  assertNotMachineryPath(raw);
   const segments = raw
     .split("/")
     .map(comparableSegment)
     .filter((seg) => seg !== "");
-  // Another spelling of the content root (`NODES/`, `nodes./`, `nodes:x/`) is
-  // its own folder on one volume and `nodes/` on another; no rule could judge
-  // both, so it is refused.
-  if (segments[0] === "nodes" && raw.split("/")[0] !== "nodes") {
+  if (segments[0] === "packs") {
     throw new ContextNestError(
-      `${shown}: "${raw.split("/")[0]}" is another spelling of the vault's nodes/ folder — write it as nodes/`,
+      `${raw}: "packs" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
       "VALIDATION_FAILED",
     );
   }
-  const reserved =
-    segments.find((seg) => RESERVED_SEGMENTS.has(seg)) ?? (segments[0] === "packs" ? "packs" : undefined);
+}
+
+/**
+ * Refuse a path a file system cannot hold, before anything touches one: an
+ * over-long path otherwise costs a stat per ancestor folder before failing
+ * with an error that names the absolute vault path. Never echoes the path
+ * back whole. Document ids pass through this with room for the extension a
+ * node writes beside them; imported file paths, which carry their own, are
+ * held to NAME_MAX itself.
+ */
+export function assertFitsFileSystem(raw: string, maxSegmentBytes = MAX_SEGMENT_BYTES): void {
+  const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
+  if (raw.length > MAX_DOCUMENT_ID_LENGTH) {
+    throw new ContextNestError(
+      `Invalid path ${shown}: longer than ${MAX_DOCUMENT_ID_LENGTH} characters`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  if (raw.split(/[/\\]/).some((seg) => Buffer.byteLength(seg) > maxSegmentBytes)) {
+    throw new ContextNestError(
+      `Invalid path ${shown}: a folder or file name is longer than ${maxSegmentBytes} bytes`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+}
+
+/**
+ * Refuse an id that names vault machinery: a `.context`, `.versions` or
+ * `_suggestions` segment at any depth, compared as a file system resolves it,
+ * or an NTFS short name (`VERSIO~1`) — which may alias one of them, and which
+ * no slug contains. Every document write, delete and forget calls this before
+ * touching anything; deletes and forgets call it alone, so a legacy id the
+ * full write guard would refuse (`Nodes/…`, an over-long name) can still be
+ * erased.
+ */
+export function assertNotMachineryPath(raw: string): void {
+  assertSafeDocumentId(raw);
+  const segments = raw.split(/[/\\]+/);
+  const short = segments.find((seg) => /~\d/.test(seg));
+  if (short !== undefined) {
+    throw new ContextNestError(
+      `${raw}: "${short}" looks like an NTFS short name, which may alias a reserved path (.context, .versions, _suggestions) — use the full name`,
+      "VALIDATION_FAILED",
+    );
+  }
+  const reserved = segments.map(comparableSegment).find((seg) => RESERVED_SEGMENTS.has(seg));
   if (reserved) {
     throw new ContextNestError(
       `${raw}: "${reserved}" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
@@ -1510,6 +1523,7 @@ export class NestStorage {
     content: string,
     options: { exclusive?: boolean } = {},
   ): Promise<void> {
+    assertNotMachineryPath(id);
     const filePath = join(this.root, `${id}.md`);
     const onDisk = await this.sealText(id, "doc", content);
     try {
@@ -1773,6 +1787,7 @@ export class NestStorage {
    * node, its binary sidecar (archived prior binaries go with `.versions/`).
    */
   async deleteDocument(id: string): Promise<void> {
+    assertNotMachineryPath(id);
     // Drop the cached serve-path verdict with the document it describes.
     this.historyVerdicts.delete(id);
     this.markHistoryTouched(id);
@@ -2962,7 +2977,8 @@ export class NestStorage {
     // A re-init keeps the vault's structure rules (§11.1.1): re-initializing
     // must never be a way to drop them. They are read as plain YAML, so a
     // config that fails validation elsewhere still hands them over; one that
-    // is not YAML at all but names them is refused rather than overwritten.
+    // is not YAML at all may hold them however spelled, so it is refused
+    // rather than overwritten.
     const configPath = join(this.root, ".context", "config.yaml");
     const prior = await readFile(configPath, "utf-8").catch(() => null);
     const rules: Record<string, unknown> = {};
@@ -2971,13 +2987,9 @@ export class NestStorage {
       try {
         parsed = yaml.load(prior);
       } catch {
-        // Any mention, not just a column-0 key: an unparseable file may hold
-        // them indented, quoted, flow-style or as explicit keys.
-        if (/structure|folders|templates/.test(prior)) {
-          throw new ConfigError(
-            `${configPath} is not valid YAML and holds structure rules — fix it by hand before re-initializing, or the rules would be lost.`,
-          );
-        }
+        throw new ConfigError(
+          `${configPath} is not valid YAML — fix or remove it before re-initializing (it may hold structure rules that would be lost).`,
+        );
       }
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const key of ["structure", "folders", "templates"]) {

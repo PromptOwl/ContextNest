@@ -21,6 +21,8 @@ import {
   stageSuggestion,
   czarDirectEdit,
   rollbackDocument,
+  compileStructure,
+  scaffoldFirstPublish,
   type RbacHook,
   type StructureConfig,
 } from "../index.js";
@@ -1125,8 +1127,9 @@ describe("architecture round 6: czar edits, rollbacks, damaged history, import o
 
 describe("QA round 6: root spellings, deep ids, the enforce switch, re-init, history", () => {
   it.each(["Nodes/docs/x", "NODES/notes/y", "nodes:evil/notes/x", "nodes./x"])(
-    "the write guard refuses %s — another spelling of nodes/",
+    "enforced rules refuse %s — another spelling of nodes/",
     async (id) => {
+      await writeConfig({ structure: { enforce: true } });
       const err = await refusal("context_create", { id, title: "Evil", content: "x" });
       expect(err.code).toBe("VALIDATION_FAILED");
       expect(err.message).toMatch(/nodes\//);
@@ -1208,5 +1211,181 @@ describe("QA round 6: root spellings, deep ids, the enforce switch, re-init, his
     );
     expect(res.failed.map((f) => f.id)).toEqual([path]);
     expect(await exists(path)).toBe(false);
+  });
+});
+
+describe("architecture round 7: machinery paths for delete and forget, 8.3 names, scaffolding gaps", () => {
+  const CZAR: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+  const KEYFRAME = "nodes/meetings/.versions/k/v1";
+
+  it.each([
+    ["context_delete", { id: KEYFRAME, purge: true }],
+    ["context_delete", { id: KEYFRAME }],
+    ["context_forget", { id: KEYFRAME, reason_code: "user_request" }],
+  ])("%s %j never touches a sealed keyframe", async (op, input) => {
+    await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+    const before = await readFile(join(dir, `${KEYFRAME}.md`), "utf-8");
+    const err = await refusal(op, input);
+    expect(err.message).toMatch(/reserved/);
+    expect(await readFile(join(dir, `${KEYFRAME}.md`), "utf-8")).toBe(before);
+    const forgotten = await api.run<{ events?: unknown[] }>("context_forget_log", {}, ctx).catch(() => ({ events: [] }));
+    expect(JSON.stringify(forgotten)).not.toContain(".versions");
+  });
+
+  it.each(["nodes/VERSIO~1/k/v1", "CONTEX~1/x", "nodes/x/_SUGGE~1/y"])(
+    "an NTFS short name that may alias vault machinery is refused: %s",
+    async (id) => {
+      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+      expect(err.message).toMatch(/short name|reserved/);
+    },
+  );
+
+  it("a czar direct edit that creates a document scaffolds its new folders", async () => {
+    await writeConfig(RULES);
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    await czarDirectEdit({
+      storage,
+      rbac: CZAR,
+      documentId: id,
+      newRawContent: `---\ntitle: 2026-10-07 Kickoff\ntype: document\nstatus: published\n---\n${MEETING}`,
+      actor: "czar",
+      zone: "z",
+    });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it("an approved held create scaffolds in a flat (obsidian) vault too", async () => {
+    const vdir = await mkdtemp(join(tmpdir(), "cn-structure-flat-"));
+    try {
+      const v = new NestStorage(vdir);
+      await v.init("flat", "obsidian");
+      const vctx = { ...ctx, storage: v, query: new GraphQueryEngine(v), versions: new VersionManager(v) };
+      await writeFile(join(vdir, ".context", "config.yaml"), yaml.dump({ version: 1, name: "flat", ...RULES }), "utf-8");
+      const r = await api.run<{ id: string }>(
+        "context_create",
+        { id: "clients/acme-042/meetings/2026-10-07-kickoff", title: "2026-10-07 Kickoff", content: MEETING, review: true },
+        vctx,
+      );
+      expect(r.id).toBe("clients/acme-042/meetings/2026-10-07-kickoff");
+      await approveReview(v, r.id, { actor: "owner" });
+      await expect(access(join(vdir, "clients", "acme-042", "overview.md"))).resolves.toBeUndefined();
+    } finally {
+      await rm(vdir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("QA round 7: heading cost, batch scaffolding cost, planted history, rules-off vaults", () => {
+  const KICKOFF = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+  const VICTIM = "nodes/clients/acme-042/meetings/2026-10-08-review";
+
+  it("a vault with no rules writes a Nodes/ folder like any other (only enforced rules change a write)", async () => {
+    const res = await api.run<{ id: string }>("context_create", { id: "Nodes/docs/x", title: "X", content: "x" }, ctx);
+    expect(res.id).toBe("Nodes/docs/x");
+  });
+
+  it("structure: false is off", async () => {
+    await writeConfig({ structure: false, folders: { notes: { types: ["glossary"] } } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+  });
+
+  it("re-init over any config that is not YAML is refused (it may hold rules however they are spelled)", async () => {
+    const cfg = join(dir, ".context", "config.yaml");
+    const broken = '"\\u0073tructure": [unclosed\n';
+    await writeFile(cfg, broken, "utf-8");
+    await expect(storage.init("again")).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(cfg, "utf-8")).toBe(broken);
+  });
+
+  it.skipIf(process.platform === "win32")("an import of an over-long path fails without naming the vault path", async () => {
+    const res = await api.run<{ failed: { error: string }[] }>(
+      "context_import",
+      { files: [{ path: `nodes/.versions/${"a".repeat(300)}/history.yaml`, content: "x" }] },
+      ctx,
+    );
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0].error).not.toContain(dir);
+  });
+
+  it("a held create beside a later draft still scaffolds the folder they share when approved", async () => {
+    await writeConfig(RULES);
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true }, ctx);
+    await api.run("context_create", { title: "2026-10-08 Review", content: MEETING, folder: "clients/acme-042/meetings", publish: false }, ctx);
+    await approveReview(storage, KICKOFF, { actor: "owner" });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it.each([["the plain path", ".versions"], ["a ./ segment", ".versions/."]])(
+    "planted history (%s) never makes a non-conforming draft look grandfathered",
+    async (_l, store) => {
+      // A donor's real history, planted under a draft that misses a required section.
+      await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+      await api.run("context_create", { title: "2026-10-08 Review", content: "## Notes\nx\n", folder: "clients/acme-042/meetings", publish: false }, ctx);
+      const donor = join(dir, "nodes", "clients", "acme-042", "meetings", ".versions", "2026-10-07-kickoff");
+      await writeConfig(RULES);
+      const folder = "nodes/clients/acme-042/meetings";
+      const files = await Promise.all(
+        ["history.yaml", "v1.md"].map(async (name) => ({
+          path: `${folder}/${store}/2026-10-08-review/${name}`,
+          content: await readFile(join(donor, name), "utf-8"),
+        })),
+      );
+      const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+      expect(res.failed.map((f) => f.id).sort()).toEqual(files.map((f) => f.path).sort());
+      const err = await refusal("context_publish", { id: VICTIM });
+      expect(err.code).toBe("VALIDATION_FAILED");
+    },
+  );
+
+  it("a chunked import may send a document before its history", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cn-structure-chunk-src-"));
+    try {
+      const s = new NestStorage(src);
+      await s.init("src");
+      const sctx = { ...ctx, storage: s, query: new GraphQueryEngine(s), versions: new VersionManager(s) };
+      await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, sctx);
+      const rel = "nodes/clients/acme-042/meetings";
+      const read = (p: string) => readFile(join(src, p), "utf-8");
+      await writeConfig(RULES);
+      const doc = await api.run<{ failed: unknown[] }>(
+        "context_import",
+        { files: [{ path: `${rel}/2026-10-07-kickoff.md`, content: await read(`${rel}/2026-10-07-kickoff.md`) }], publish: false },
+        ctx,
+      );
+      expect(doc.failed).toEqual([]);
+      const history = await api.run<{ failed: unknown[] }>(
+        "context_import",
+        {
+          files: await Promise.all(
+            ["history.yaml", "v1.md"].map(async (n) => ({
+              path: `${rel}/.versions/2026-10-07-kickoff/${n}`,
+              content: await read(`${rel}/.versions/2026-10-07-kickoff/${n}`),
+            })),
+          ),
+          publish: false,
+        },
+        ctx,
+      );
+      expect(history.failed).toEqual([]);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("scaffolding a wide, deep batch of first publishes stays linear", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { t: { files: { overview: {} } } } });
+    const ids: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const id = `nodes/t/b${i}/${"a/".repeat(100)}x`;
+      await mkdir(join(dir, dirname(id)), { recursive: true });
+      await writeFile(join(dir, `${id}.md`), "---\ntitle: X\ntype: document\nstatus: published\n---\nx\n", "utf-8");
+      ids.push(id);
+    }
+    const rules = compileStructure(yaml.load(await readFile(join(dir, ".context", "config.yaml"), "utf-8")) as never);
+    const started = Date.now();
+    await scaffoldFirstPublish(storage, rules, ids);
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(await exists("nodes/t/overview.md")).toBe(true);
   });
 });

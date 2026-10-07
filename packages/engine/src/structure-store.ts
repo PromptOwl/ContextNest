@@ -43,7 +43,8 @@ import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
  * `folders:` block) is written exactly as before, and a rule that does not
  * compile can refuse writes only in a vault that asked for enforcement.
  *
- * Off means no `structure` key, or one whose `enforce` is absent or `false`.
+ * Off means no `structure` key (or `structure: false`), or one whose `enforce`
+ * is absent or `false`.
  * Anything else that is not that — `enforce: "yes"`, `structure: true`, a
  * list — asked for something in a way that is not the switch, so it is
  * compiled and refused with CONFIG_ERROR naming the key, never read as off.
@@ -56,7 +57,7 @@ export async function enforcedStructure(storage: NestStorage): Promise<CompiledS
 /** Whether writes enforce the rules — see {@link enforcedStructure}. */
 export function isEnforced(config: { structure?: unknown } | null | undefined): boolean {
   const structure = config?.structure;
-  if (structure === undefined || structure === null) return false;
+  if (structure === undefined || structure === null || structure === false) return false;
   if (typeof structure !== "object" || Array.isArray(structure)) return true;
   const enforce = (structure as { enforce?: unknown }).enforce;
   return enforce !== undefined && enforce !== false;
@@ -246,9 +247,9 @@ export async function scaffoldFolders(
 }
 
 /**
- * Documents outside a batch read, at most, to see past held-for-review
- * siblings (one document read each). ponytail: a folder with more non-batch
- * documents than this counts as occupied, held or not.
+ * Documents outside a batch read, at most, to see past unpublished siblings
+ * (one document read each). ponytail: a folder with more non-batch documents
+ * than this counts as occupied, published or not.
  */
 const MAX_HELD_SIBLINGS = 32;
 
@@ -256,16 +257,31 @@ const MAX_HELD_SIBLINGS = 32;
  * Scaffold for documents just published for the first time — a held create
  * approved, say, which nothing scaffolded while it was held. The folders they
  * brought into being are the ones no other document occupies, so those get
- * their required contents now. Documents still held for review do not occupy
- * a folder: held creates sharing a new folder scaffold it with whichever is
- * approved first. Batch-aware: fifty first publishes into one new folder
- * still scaffold it.
+ * their required contents now. Only a published (or approved) document
+ * occupies a folder — drafts, held and rejected ones do not — so held creates
+ * sharing a new folder scaffold it with whichever is approved first.
+ * Batch-aware: fifty first publishes into one new folder still scaffold it.
  *
  * Linear in the depth of the ids: one directory crawl per top-level ancestor,
  * not one per ancestor — a deep id would otherwise cost depth² directory
  * reads, under the vault lock.
  */
 export async function scaffoldFirstPublish(
+  storage: NestStorage,
+  rules: CompiledStructure,
+  ids: string[],
+): Promise<string[]> {
+  // Best effort, like scaffoldFolders: the version is already sealed, so a
+  // folder that cannot be read (a malformed sibling) leaves it unscaffolded —
+  // reported by the compliance report — rather than failing the publish.
+  try {
+    return await scaffoldFirstPublishOrThrow(storage, rules, ids);
+  } catch {
+    return [];
+  }
+}
+
+async function scaffoldFirstPublishOrThrow(
   storage: NestStorage,
   rules: CompiledStructure,
   ids: string[],
@@ -284,41 +300,50 @@ export async function scaffoldFirstPublish(
   }
   if (batch.size === 0) return [];
 
-  // Direct document counts of every folder under each top-level ancestor.
+  // Direct document counts of every folder under each top-level ancestor,
+  // each parent listed once however many tops share it.
   const direct = new Map<string, number>();
+  const parents = new Map<string, Promise<{ path: string; count: number }[]>>();
   for (const top of tops) {
     const parent = top.split("/").slice(0, -1).join("/");
-    const own = (await storage.listFolders({ folder: parent, recursive: false })).find((f) => f.path === top);
+    if (!parents.has(parent)) parents.set(parent, storage.listFolders({ folder: parent, recursive: false }));
+    const own = (await parents.get(parent)!).find((f) => f.path === top);
     direct.set(top, own?.count ?? 0);
     for (const f of await storage.listFolders({ folder: top })) direct.set(f.path, f.count);
   }
-  const within = (path: string, parent: string) => path === parent || path.startsWith(`${parent}/`);
-  const others = (path: string, count: number) => {
-    let n = 0;
-    for (const [p, c] of direct) if (within(p, path)) n += c;
-    return n - count;
-  };
+  // Subtree totals in one pass, deepest first: each folder adds its total to
+  // its parent's. Linear — a sum per batch folder would be batch × folders.
+  const total = new Map(direct);
+  const depth = (p: string) => p.split("/").length;
+  for (const p of [...direct.keys()].sort((x, y) => depth(y) - depth(x))) {
+    if (tops.has(p)) continue;
+    const parent = p.slice(0, p.lastIndexOf("/"));
+    if (total.has(parent)) total.set(parent, total.get(parent)! + total.get(p)!);
+  }
 
-  // Shallowest first, so one read of a folder's few documents answers for
-  // every folder below it too.
-  const read = new Map<string, ContextNode[]>();
+  // Shallowest first, so one read of a folder's few other documents answers
+  // for every folder below it too. Only a published (or approved) document
+  // occupies a folder: drafts, held and rejected ones do not.
   const batchIds = new Set(ids);
-  const byRoot = new Map<string, string[]>();
-  const ordered = [...batch].sort(([a], [b]) => a.split("/").length - b.split("/").length);
-  for (const [path, { root, folder, count }] of ordered) {
-    const extra = others(path, count);
-    if (extra > MAX_HELD_SIBLINGS) continue;
-    if (extra > 0) {
-      let docs = [...read].find(([p]) => within(path, p))?.[1];
-      if (!docs) {
-        docs = await storage.discoverDocuments({ folder: path, includeRetired: true });
-        read.set(path, docs);
-      }
-      const occupied = docs.some(
-        (d) => within(d.id, path) && !batchIds.has(d.id) && d.frontmatter.status !== "pending_review",
-      );
-      if (occupied) continue;
+  const occupants = new Map<string, string[]>();
+  const readFor = async (path: string): Promise<string[]> => {
+    for (let p = path; p; p = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "") {
+      const known = occupants.get(p);
+      if (known) return known;
     }
+    const docs = await storage.discoverDocuments({ folder: path, includeRetired: true });
+    const found = docs
+      .filter((d) => !batchIds.has(d.id) && (d.frontmatter.status === "published" || d.frontmatter.status === "approved"))
+      .map((d) => d.id);
+    occupants.set(path, found);
+    return found;
+  };
+  const byRoot = new Map<string, string[]>();
+  const ordered = [...batch].sort(([a], [b]) => depth(a) - depth(b));
+  for (const [path, { root, folder, count }] of ordered) {
+    const extra = (total.get(path) ?? 0) - count;
+    if (extra > MAX_HELD_SIBLINGS) continue;
+    if (extra > 0 && (await readFor(path)).some((id) => id === path || id.startsWith(`${path}/`))) continue;
     byRoot.set(root, [...(byRoot.get(root) ?? []), folder]);
   }
   const written: string[] = [];

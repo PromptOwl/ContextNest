@@ -283,10 +283,13 @@ function topLevelHeadings(lines: string[]): Heading[] {
     const atx = /^ {0,3}(#{1,6})\s/.exec(lines[i]);
     if (atx) {
       const depth = atx[1].length;
-      // Drop an optional closing sequence: `## Title ##`. Trailing whitespace
-      // goes first so the pattern can anchor to the end with nothing ambiguous
-      // in front of it.
-      const text = lines[i].slice(atx[0].length).trimEnd().replace(/#+$/, "");
+      // Drop an optional closing sequence: `## Title ##`. A loop, not
+      // `/#+$/`: unanchored at the start, that regex retries from every `#`
+      // of a long run followed by other text — quadratic.
+      let text = lines[i].slice(atx[0].length).trimEnd();
+      let end = text.length;
+      while (end > 0 && text[end - 1] === "#") end--;
+      text = text.slice(0, end);
       headings.push({ depth, anchor: toAnchor(text), line: i });
       continue;
     }

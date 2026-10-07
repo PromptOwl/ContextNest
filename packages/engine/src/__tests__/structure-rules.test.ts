@@ -21,7 +21,7 @@ import {
   type StructureConfig,
   type Violation,
 } from "../structure.js";
-import { comparableSegment } from "../storage.js";
+import { comparableSegment } from "../structure.js";
 import { ContextNestError } from "../errors.js";
 
 /** The worked example from the PRD — reused across most cases. */
@@ -134,6 +134,36 @@ describe("compileStructure", () => {
     // A rule key's nodes/ prefix is the owner's spelling, matched without case.
     const keyed = compileStructure({ folders: { "Nodes/docs": { types: ["document"] } } });
     expect(codes(checkDocument(keyed, { id: "nodes/docs/x", type: "agent", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
+  });
+
+  it("literal folder names fold case fully when they judge (deciſions/ is decisions/ on a folding volume)", () => {
+    const r = compileStructure({ folders: { decisions: { types: ["document"] } } });
+    expect(codes(checkDocument(r, { id: "nodes/deciſions/x", type: "agent", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
+  });
+
+  it("a heading with a long run of closing #s is parsed in linear time", () => {
+    const r = compileStructure({
+      folders: { meetings: { template: "m" } },
+      templates: { m: { body: "## Summary\n", required_sections: ["Summary"] } },
+    });
+    const started = Date.now();
+    const body = `## Summary\nok\n# ${"#".repeat(80000)}x\n`;
+    expect(checkDocument(r, { id: "nodes/meetings/x", type: "document", body })).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(300);
+  });
+
+  it("a rule key with a long run of slashes compiles (or fails) in linear time", () => {
+    const started = Date.now();
+    expect(() => compileStructure({ folders: { [`x${"/".repeat(50000)}y`]: {} } })).toThrow();
+    expect(Date.now() - started).toBeLessThan(100);
+  });
+
+  it("checkDocument refuses another spelling of nodes/ (NODES/, nodes:x/) — enforced, the write is refused", () => {
+    const r = compileStructure({ folders: { docs: { types: ["document"] } } });
+    for (const id of ["Nodes/docs/x", "NODES/docs/x", "nodes:x/docs/y", "nodes./docs/x"]) {
+      expect(codes(checkDocument(r, { id, type: "document", body: "" })), id).toContain("FOLDER_NOT_ALLOWED");
+    }
+    expect(checkDocument(r, { id: "nodes/docs/x", type: "document", body: "" })).toEqual([]);
   });
 
   it("comparableSegment is linear on a long run of dots and spaces", () => {
