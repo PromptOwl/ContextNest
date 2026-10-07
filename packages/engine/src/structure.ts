@@ -916,6 +916,14 @@ function respelledRoot(id: string): Violation | null {
   };
 }
 
+/**
+ * A `source` under the vault's `sources/`: the rules do not judge it, so it is
+ * no baseline either — what it becomes is judged in full.
+ */
+function exemptSource(doc: StructureDoc): boolean {
+  return (docPath(doc.id)?.sourcesRoot ?? false) && (doc.type ?? "document") === "source";
+}
+
 /** Everything about this document that breaks a rule (create, move, import, audit). */
 export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Violation[] {
   const respelled = respelledRoot(doc.id);
@@ -923,7 +931,7 @@ export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Viol
   const p = docPath(doc.id);
   if (!p) return [];
   const type = doc.type ?? "document";
-  if (p.sourcesRoot && type === "source") return [];
+  if (exemptSource(doc)) return [];
   const path = display([...p.folder, p.leaf]);
 
   const chain = folderViolations(rules, p.folder);
@@ -1017,7 +1025,7 @@ export function checkUpdate(
 ): Violation[] {
   // A forget stub owes no sections, so as a baseline it would excuse every
   // one: it grants nothing, and what follows it is judged in full.
-  if (before.status === "forgotten") return checkDocument(rules, after);
+  if (before.status === "forgotten" || exemptSource(before)) return checkDocument(rules, after);
   const p = docPath(after.id);
   if (!p) return [];
   const out: Violation[] = [];

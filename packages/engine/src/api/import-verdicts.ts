@@ -55,7 +55,7 @@ export async function importRefusals(
   // buy unbounded work from histories planted earlier.
   const budget: ReplayBudget = { left: ctx.limits?.importReplayChars ?? DEFAULT_IMPORT_REPLAY_CHARS };
   const spellings = new Map<string, number>();
-  for (const f of plan) spellings.set(f.path.toLowerCase(), (spellings.get(f.path.toLowerCase()) ?? 0) + 1);
+  for (const f of plan) spellings.set(folded(f.path), (spellings.get(folded(f.path)) ?? 0) + 1);
   await mapInBatches(plan, async (f) => {
     try {
       assertKeptName(f, spellings);
@@ -94,13 +94,14 @@ export async function importRefusals(
   // Over budget, some verdict was cut short: none of this call is trusted.
   if (budget.spent) {
     for (const f of plan) {
-      if (!refused.has(f.raw)) {
-        refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls`);
-      }
+      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls`);
     }
   }
   return refused;
 }
+
+/** A path as file systems that fold names read it: case, trailing dots, ignorables. */
+const folded = (path: string) => path.split("/").map(comparableSegment).join("/");
 
 /** Most history characters one import may replay — see OperationLimits.importReplayChars. */
 export const DEFAULT_IMPORT_REPLAY_CHARS = 512 * 2 ** 20;
@@ -117,7 +118,7 @@ function assertKeptName(f: PlannedFile, spellings: Map<string, number>): void {
   if (f.path.split("/").pop() !== asked) {
     throw new ContextNestError(`${f.raw}: ${asked} is already in the vault — import with overwrite to replace it`, "VALIDATION_FAILED");
   }
-  if ((spellings.get(f.path.toLowerCase()) ?? 0) > 1) {
+  if ((spellings.get(folded(f.path)) ?? 0) > 1) {
     throw new ContextNestError(`${f.raw}: another file of this import is the same name in other capitals`, "VALIDATION_FAILED");
   }
 }
@@ -280,7 +281,7 @@ async function assertImportable(
   // nest's own ledgers too.
   const segs = f.path.split("/");
   const k = segs.findIndex((seg) => comparableSegment(seg) === ".versions");
-  if (k !== -1 && k === segs.length - 2 && !(k === 0 && ROOT_LEDGERS.has(segs[k + 1]))) {
+  if (k !== -1 && k >= segs.length - 2 && !(k === 0 && ROOT_LEDGERS.has(segs[k + 1]))) {
     throw new ContextNestError(`${f.raw}: .versions/ holds a folder per document, not files`, "VALIDATION_FAILED");
   }
   await assertNoCaseTwin(ctx, f);
@@ -325,24 +326,29 @@ async function assertSidecarKept(
   if (!onDisk || sha256Bytes(onDisk) === bytes) return;
   const owner = f.path.slice(0, -".pdf".length);
   const node = await readIfExists(ctx, owner);
-  if (node?.frontmatter.type === "pdf" || (await pdfByHistory(ctx, owner, budget))) {
-    throw new ContextNestError(
-      `${f.raw}: would replace the PDF of ${owner} on disk — import a new version with context_import_pdf`,
-      "VALIDATION_FAILED",
-    );
-  }
+  const sealed = await historyPdf(ctx, owner, budget);
+  if (node?.frontmatter.type !== "pdf" && !sealed.pdf) return;
+  // The sealed bytes may come back over bytes that are neither those nor the
+  // .md's (drift); archiveReplacedPdf keeps what they replace.
+  if (sealed.sha256 !== undefined && bytes === sealed.sha256 && sha256Bytes(onDisk) !== node?.frontmatter.pdf?.sha256) return;
+  throw new ContextNestError(
+    `${f.raw}: would replace the PDF of ${owner} on disk — import a new version with context_import_pdf`,
+    "VALIDATION_FAILED",
+  );
 }
 
 /**
- * Whether a document's history marks it as a pdf node: its verified head is
- * one, or the history cannot be verified (protected, never exempt).
+ * Whether a document's history marks it as a pdf node — its verified head is
+ * one, or the history cannot be verified (protected, never exempt) — and the
+ * `pdf.sha256` that head seals.
  */
-async function pdfByHistory(ctx: OperationContext, owner: string, budget: ReplayBudget): Promise<boolean> {
+async function historyPdf(ctx: OperationContext, owner: string, budget: ReplayBudget): Promise<{ pdf: boolean; sha256?: string }> {
   const history = await ctx.storage.readHistory(owner).catch(() => undefined);
-  if (history === null) return false;
-  if (history === undefined) return true;
+  if (history === null) return { pdf: false };
+  if (history === undefined) return { pdf: true };
   const head = await sealedHeadView(owner, history, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n), budget);
-  return !head?.node || head.node.frontmatter.type === "pdf";
+  if (!head?.node) return { pdf: true };
+  return head.node.frontmatter.type === "pdf" ? { pdf: true, sha256: head.node.frontmatter.pdf?.sha256 } : { pdf: false };
 }
 
 /** A vault file's bytes, or null when there is none. */
@@ -377,9 +383,9 @@ async function assertNoCaseTwin(ctx: OperationContext, f: PlannedFile): Promise<
   const cut = f.path.lastIndexOf("/");
   const name = f.path.slice(cut + 1);
   if (!KEPT_IMPORT_NAMES.has(name)) return;
-  const folded = name.toLowerCase();
+  const fold = comparableSegment(name);
   const twin = (await ctx.storage.vaultEntryNames(f.path.slice(0, Math.max(cut, 0)))).find(
-    (e) => e !== name && e.toLowerCase() === folded,
+    (e) => e !== name && comparableSegment(e) === fold,
   );
   if (twin !== undefined) {
     throw new ContextNestError(`${f.raw}: its folder holds "${twin}", which a case-insensitive file system would overwrite`, "VALIDATION_FAILED");
@@ -444,7 +450,8 @@ async function historySetVerdict(
   const here = onDisk
     ? await sealedHeadView(owner, onDisk, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n), budget)
     : null;
-  const judge = (head: StructureDoc) => (here ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
+  // A head that does not parse is no baseline (as at publish): judged in full.
+  const judge = (head: StructureDoc) => (here?.node ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
   // The history.yaml this call brings is written last and may not land (a file
   // of its set fails): the history already here, over these files, is a head
   // the vault may then hold too. A file counts there only if its bytes are the
@@ -482,8 +489,13 @@ async function historySetVerdict(
   // could make a later check lenient.
   const last = history?.versions.at(-1);
   if (!history || !last || last.tombstone) return { refusal: null, head: null };
-  // The same history as the one here rebuilds, hash for hash, to the same head.
-  const view = here && isDeepStrictEqual(history.versions, onDisk?.versions) ? here : await sealedHeadView(owner, history, keyframe, diff, budget);
+  // The same history as the one here, with no version file of this call in it,
+  // rebuilds to the same head; a file this call brings is always replayed.
+  const brings = [...set.keys()].some((n) => /^v\d+\.(md|diff)$/i.test(n));
+  const view =
+    here && !brings && isDeepStrictEqual(history.versions, onDisk?.versions)
+      ? here
+      : await sealedHeadView(owner, history, keyframe, diff, budget);
   // Refused, not waved through: the bytes judged here are pinned to their
   // content hashes, so if a file then fails to land the head on disk no
   // longer verifies and is judged in full — but only if the head judged here
@@ -496,7 +508,7 @@ async function historySetVerdict(
   const head = view.doc;
   const violations = judge(head);
   return violations.length === 0
-    ? { refusal: null, head }
+    ? { refusal: null, head: view.node ? head : null }
     : refuse(`${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`);
 }
 

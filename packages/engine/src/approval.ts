@@ -26,7 +26,7 @@
  */
 
 import { join } from "node:path";
-import { applyPatch } from "diff";
+import { applyPatchBounded } from "./reconstruct.js";
 import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
@@ -109,7 +109,7 @@ async function approveSuggestionImpl(
   const approved = await loadApprovedBase(input.storage, input.documentId);
   await assertNotStale(approved.content, sug.meta.target_hash, input.suggestionId);
 
-  const patched = applyPatch(approved.content, sug.patch);
+  const patched = applyPatchBounded(approved.content, sug.patch).result;
   if (typeof patched !== "string" || patched === "") {
     throw new IntegrityError(
       `Failed to apply suggestion "${input.suggestionId}" to current approved content`,

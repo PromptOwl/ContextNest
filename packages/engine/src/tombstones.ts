@@ -205,9 +205,13 @@ export function importVerdict(
 ): string | null {
   if (index.records.length === 0) return null;
   const path = relPath.replace(/\\/g, "/");
-  // A forgotten binary, under any name or path (§6.3.4) — `copy.bin` too.
+  // A forgotten binary or version text, under any name or path (§6.3.4) —
+  // `copy.bin`, `copy.txt` too.
   if (index.pdfHashes.size > 0 && index.pdfHashes.has(sha256Bytes(Buffer.from(content, "utf-8")))) {
     return `${path} restores a PDF binary a forget erased`;
+  }
+  if (index.contentHashes.has(computeContentHash(content))) {
+    return `${path} restores content a forget erased`;
   }
 
   const versioned = /^(?:(.*)\/)?\.versions\/([^/]+)\/([^/]+)$/.exec(path);

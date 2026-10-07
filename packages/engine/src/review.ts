@@ -31,7 +31,7 @@
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applyPatch } from "diff";
+import { applyPatchBounded } from "./reconstruct.js";
 import { parseConfig } from "./config.js";
 import { ConfigError, ContextNestError, IntegrityError } from "./errors.js";
 import { computeContentHash } from "./integrity.js";
@@ -175,7 +175,7 @@ export async function currentReviewProposal(
   const newest = holds[holds.length - 1];
   const sug = await readSuggestion(storage, id, newest.suggestion_id);
   if (!sug) return null;
-  const proposedRaw = applyPatch(approvedRaw, sug.patch);
+  const proposedRaw = applyPatchBounded(approvedRaw, sug.patch).result;
   if (typeof proposedRaw !== "string" || proposedRaw === "") return null;
   return { suggestionId: newest.suggestion_id, approvedRaw, proposedRaw };
 }
@@ -303,7 +303,7 @@ export async function approveReview(
       }
       const sug = await readSuggestion(storage, id, chosen.suggestion_id);
       const proposedRaw =
-        approvedRaw !== null && sug ? applyPatch(approvedRaw, sug.patch) : false;
+        approvedRaw !== null && sug ? applyPatchBounded(approvedRaw, sug.patch).result : false;
       if (typeof proposedRaw !== "string" || proposedRaw === "") {
         throw new IntegrityError(
           `Could not apply the held edit ${chosen.suggestion_id} to ${id}.`,

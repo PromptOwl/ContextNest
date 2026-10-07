@@ -1279,10 +1279,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     try {
       await applyImportedTombstones(ctx.storage, incomingEvents, tombstones);
     } catch (err) {
-      failed.push({
-        id: ".versions/chain_events.yaml",
-        error: err instanceof Error ? err.message : String(err),
-      });
+      failed.push({ id: ".versions/chain_events.yaml", error: vaultError(ctx, err) });
     }
   }
 

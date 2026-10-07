@@ -2616,7 +2616,7 @@ describe("QA round 15: chunked PDF restores, replay cost, kept names, store squa
     const tight = { ...ctx, limits: { importReplayChars: 12_000 } };
     const imp = await api.run<{ failed: { error: string }[] }>("context_import", { files, overwrite: true, publish: false }, tight);
     expect(imp.failed).toHaveLength(3);
-    expect(imp.failed[0].error).toMatch(/split/i);
+    for (const f of imp.failed) expect(f.error).toMatch(/split/i);
     const roomy = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
     expect(roomy.failed).toEqual([]);
   });
@@ -2637,22 +2637,24 @@ describe("QA round 15: chunked PDF restores, replay cost, kept names, store squa
         chain_hash: `sha256:${"0".repeat(64)}`,
       })),
     } as never;
-    let last = performance.now();
-    let gap = 0;
-    const timer = setInterval(() => {
-      const now = performance.now();
-      gap = Math.max(gap, now - last);
-      last = now;
-    }, 5);
-    const start = performance.now();
+    // Turns of the event loop that ran while the replay was in progress:
+    // without yields there are none, whatever the machine's speed.
+    let turns = 0;
+    let running = true;
+    const tick = () => {
+      if (!running) return;
+      turns++;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+    const head = sealedHead("d", history, (v) => (v === 1 ? A : null), (v) => (v > 1 ? artifact(v) : null));
+    const before = turns;
     try {
-      expect(await sealedHead("d", history, (v) => (v === 1 ? A : null), (v) => (v > 1 ? artifact(v) : null))).toBe(B);
-      gap = Math.max(gap, performance.now() - last);
+      expect(await head).toBe(B);
     } finally {
-      clearInterval(timer);
+      running = false;
     }
-    const total = performance.now() - start;
-    expect(gap, `max gap ${gap.toFixed(0)} ms of ${total.toFixed(0)} ms`).toBeLessThan(total / 3);
+    expect(turns - before).toBeGreaterThanOrEqual(5);
   });
 
   it("the rules report does not hold a forget stub to its folder's sections", async () => {
@@ -2683,5 +2685,142 @@ describe("QA round 15: chunked PDF restores, replay cost, kept names, store squa
       ctx,
     );
     expect(imp.failed.map((f) => f.id)).toEqual(["nodes/notes/.versions/x"]);
+  });
+});
+
+describe("architecture round 17: bounded patch search, the batch's own files, parsed baselines", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const entry = (version: number, content: string, keyframe = true) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("a hunk that fits nowhere is given up on quickly, not searched line by line", async () => {
+    const kf = "x\n".repeat(40_000);
+    const context = Array(6_000).fill(" x");
+    context[context.length - 1] = " y";
+    const patch = `--- a\n+++ b\n@@ -1,6000 +1,6000 @@\n${context.join("\n")}\n`;
+    const history = { versions: [entry(1, kf), entry(2, patch, false)] } as never;
+    const start = performance.now();
+    expect(await sealedHead("d", history, (v) => (v === 1 ? kf : null), (v) => (v === 2 ? patch : null))).toBeNull();
+    expect(performance.now() - start).toBeLessThan(1500);
+  });
+
+  it("a set that brings a version file is replayed, even when its history matches the one here", async () => {
+    await api.run("context_create", { id: "nodes/notes/d", title: "D", content: "## Summary\none\n" }, ctx);
+    await api.run("context_update", { id: "nodes/notes/d", content: "## Summary\ntwo\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/d";
+    const history = yaml.load(await readFile(join(dir, V, "history.yaml"), "utf-8")) as { versions: { version: number; keyframe?: boolean }[] };
+    const diff = history.versions.find((e) => !e.keyframe)!.version;
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${V}/v${diff}.diff`, content: "garbage" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual([`${V}/v${diff}.diff`]);
+  });
+
+  it("a head that does not parse is no baseline for an import", async () => {
+    const V = "nodes/notes/.versions/b";
+    const broken = "---\ntitle: [unclosed\n---\nno summary\n";
+    await mkdir(join(dir, V), { recursive: true });
+    await writeFile(join(dir, V, "v1.md"), broken, "utf-8");
+    await writeFile(join(dir, V, "history.yaml"), yaml.dump({ versions: [entry(1, broken)] }), "utf-8");
+    await writeConfig(SUMMARY);
+    const next = "---\ntitle: b\n---\nstill no summary\n";
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/v2.md`, content: next },
+          { path: `${V}/history.yaml`, content: yaml.dump({ versions: [entry(1, broken), entry(2, next)] }) },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain(`${V}/history.yaml`);
+  });
+
+  it("a file named .versions is refused: it would block every document in its folder", async () => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/other/.versions", content: "squat" }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/other/.versions"]);
+  });
+
+  it("a type the rules exempt is no baseline: retyping a source to a document is judged in full", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { sources: { types: ["document", "source"], template: "n" } }, templates: SUMMARY.templates });
+    const made = await api.run<{ id: string }>(
+      "context_create",
+      { id: "sources/s", title: "S", type: "source", content: "body\n", source: { transport: "mcp", server: "harvest", tools: ["list_projects"] } },
+      ctx,
+    );
+    expect(made.id, made.id).toMatch(/^sources\//);
+    const err = await refusal("context_update", { id: made.id, type: "document", content: "no summary\n" });
+    expect(err.message).toMatch(/Summary/);
+    await api.run("context_update", { id: made.id, type: "document", content: "## Summary\nok\n" }, ctx);
+  });
+
+  it("the sealed bytes restore over a sidecar that matches neither the .md nor its sealed version", async () => {
+    const id = (await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx)).id;
+    await writeFile(join(dir, `${id}.pdf`), "%PDF-1.4 drifted", "utf-8");
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${id}.pdf`, content: Buffer.from(textPdf()).toString("utf-8") }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed, JSON.stringify(imp.failed)).toEqual([]);
+    const name = id.split("/").pop()!;
+    const drifted = sha256Bytes(Buffer.from("%PDF-1.4 drifted", "utf-8")).slice("sha256:".length);
+    expect(await exists(`${dirname(id)}/.versions/${name}/${drifted}.pdf`)).toBe(true);
+  });
+
+  it("a kept name's twin is found however the file system folds it", async () => {
+    await mkdir(join(dir, "nodes", "t"), { recursive: true });
+    await writeFile(join(dir, "nodes", "t", "readme.md."), "x", "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/t/README.md", content: "# r\n" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/t/README.md"]);
+  });
+
+  it("a forgotten version's text is refused under any name", async () => {
+    await api.run("context_create", { id: "nodes/k", title: "K", content: "secret body\n" }, ctx);
+    const kf = await readFile(join(dir, "nodes/.versions/k/v1.md"), "utf-8");
+    await api.run("context_forget", { id: "nodes/k", reason_code: "user_request" }, ctx);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/elsewhere/copy.txt", content: kf }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/elsewhere/copy.txt"]);
+  });
+
+  it("every parser of a .versions path agrees on planned import paths", async () => {
+    const { versionsArtifact, storeOwner, historyMember } = await import("../api/import-verdicts.js");
+    const { isVersionArtifactPath, slugifyImportPath } = await import("../import-hygiene.js");
+    for (const raw of ["nodes/a/.versions/x/v2.diff", "nodes/./a/.versions/x/history.yaml", ".versions/x/v1.md", "a/b/.versions/Doc Name/v3.md", "nodes/.versions/x/" + "f".repeat(64) + ".pdf"]) {
+      const path = slugifyImportPath(raw);
+      const v = versionsArtifact(path);
+      expect(v, raw).not.toBeNull();
+      expect(storeOwner(path), raw).toBe(v!.owner);
+      expect(isVersionArtifactPath(path), raw).toBe(true);
+      expect(historyMember(path), raw).toBe(/\.pdf$/.test(path) ? null : v!.owner);
+    }
   });
 });

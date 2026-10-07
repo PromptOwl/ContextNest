@@ -34,8 +34,7 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { applyPatch } from "diff";
-import type { ArtifactReader } from "./reconstruct.js";
+import { applyPatchBounded, type ArtifactReader } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -135,6 +134,8 @@ async function verifyAndReplay(
   contents: (string | null)[],
   budget: ReplayBudget | undefined,
 ): Promise<string | null> {
+  // Another history of this call spent the budget: the call is refused whole.
+  if (budget?.spent) return null;
   let sinceYield = 0;
   const step = async (chars: number) => {
     sinceYield += chars;
@@ -160,10 +161,10 @@ async function verifyAndReplay(
         return null;
       }
     }
-    const next = applyPatch(content, patch);
+    const { result: next, compared } = applyPatchBounded(content, patch);
     if (typeof next !== "string") return null;
     content = next;
-    await step(content.length);
+    await step(content.length + compared);
   }
   return content;
 }

@@ -103,6 +103,37 @@ export async function reconstructFromHistory(
   return content!;
 }
 
+/**
+ * `applyPatch`, its position search bounded. A hunk that does not fit where its
+ * header says is looked for line by line across the whole text — lines × hunk
+ * length, in one synchronous call — so a crafted patch could hold the process
+ * for as long as it likes. The comparisons are capped near the patch's own
+ * size: a patch that fits where it says, or close by, never comes near the
+ * cap. Past it the patch does not apply (`false`). `compared` is the work done.
+ */
+export function applyPatchBounded(content: string, patch: string): { result: string | false; compared: number } {
+  let compared = 0;
+  const cap = 2 * patch.length + PATCH_SEARCH_SLACK;
+  try {
+    const result = applyPatch(content, patch, {
+      compareLine: (_line, line, _op, want) => {
+        compared += 1 + Math.min(line?.length ?? 0, want.length);
+        if (compared > cap) throw PATCH_TOO_FAR;
+        return line === want;
+      },
+    });
+    return { result, compared };
+  } catch (err) {
+    if (err === PATCH_TOO_FAR) return { result: false, compared };
+    throw err;
+  }
+}
+
+const PATCH_TOO_FAR = new Error("the patch does not fit where it says");
+
+/** Characters of line comparison a patch may spend beyond twice its own size. */
+const PATCH_SEARCH_SLACK = 2 ** 20;
+
 /** A settled read's value, or its error rethrown. */
 function value<T>(r: PromiseSettledResult<T>): T {
   if (r.status === "rejected") throw r.reason;
@@ -140,7 +171,7 @@ async function applyWindow(
     const diff = entry.keyframe ? await readDiff(entry.version) : read;
     const patch = diff ?? entry.diff;
     if (patch) {
-      const result = applyPatch(content, patch);
+      const { result } = applyPatchBounded(content, patch);
       if (typeof result === "string") {
         content = result;
       } else if (result === false) {
