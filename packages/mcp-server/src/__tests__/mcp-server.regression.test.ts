@@ -1137,6 +1137,8 @@ describe("[regression] MCP server e2e — review gate", () => {
     expect(json.checkpoint).toBeNull();
     expect(json.review).toMatch(/pending review/);
     expect(json.review).toMatch(/turn off review/);
+    // First-run trap: a held node is invisible to search, so say so.
+    expect(json.review).toMatch(/not searchable/);
   });
 
   it("context_review approve publishes the held node", async () => {
@@ -1474,5 +1476,46 @@ describe("[regression] MCP server e2e — context_query", () => {
     const { json, isError } = await callJson(client, "resolve", { selector: "#engineering", hops: 1 });
     expect(isError).toBe(false);
     expect(json.documents.map((d: any) => d.id).sort()).toEqual(await docIds("#engineering", { hops: 1 }));
+  });
+});
+
+// ─── Onboarding: placement outside discovered folders ─────────────────────────
+
+describe("[regression] MCP server e2e — writes outside nodes/ are re-rooted", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("create_document with a path outside nodes/ lands under nodes/ and says so", async () => {
+    const { json, isError } = await callJson(client, "create_document", { path: "projects/plan", title: "Plan" });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/projects/plan");
+    expect(json.placement).toMatch(/outside nodes\//);
+    expect(await exists(join(vault, "nodes", "projects", "plan.md"))).toBe(true);
+    expect(await exists(join(vault, "projects", "plan.md"))).toBe(false);
+  });
+
+  it("context_create with an explicit id outside nodes/ is re-rooted and listable", async () => {
+    const { json, isError } = await callJson(client, "context_create", { title: "Alpha", id: "projects/alpha", content: "a" });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/projects/alpha");
+    expect(json.placement).toMatch(/outside nodes\//);
+    const list = await callText(client, "context_list", {});
+    expect(list.text).toContain("nodes/projects/alpha");
+  });
+
+  it("an id already under nodes/ is untouched and carries no placement note", async () => {
+    const { json } = await callJson(client, "context_create", { title: "Beta", id: "nodes/beta", content: "b" });
+    expect(json.id).toBe("nodes/beta");
+    expect(json.placement).toBeUndefined();
   });
 });

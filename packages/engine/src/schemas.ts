@@ -24,6 +24,11 @@ export const NODE_TYPES = [
   // A PDF document: the body is the text extracted from it, and the required
   // `pdf:` block binds the binary sidecar beside the .md by SHA-256 (§1.11).
   "pdf",
+  // A unit of work on a project board. Body is markdown; board fields
+  // (assignee, due, priority, parent) live in `metadata`. No type-specific
+  // validation rules — it behaves exactly like `document` here, and servers
+  // decide what governance (if any) applies to it.
+  "task",
 ] as const;
 
 export const STATUSES = [
