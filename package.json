@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "build": "pnpm -r build",
+    "build:full": "pnpm build && pnpm deps:graph",
     "test": "vitest run",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
@@ -15,7 +16,7 @@
     "deps:graph": "node scripts/dep-graph.mjs",
     "deps:check": "node scripts/dep-graph.mjs --check",
     "prepublish": "pnpm -r build",
-    "version-packages": "changeset version && pnpm install --lockfile-only",
+    "version-packages": "changeset version && pnpm install --lockfile-only && pnpm build:full",
     "release": "pnpm prepublish && changeset publish"
   },
   "devDependencies": {

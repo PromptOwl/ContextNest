@@ -578,6 +578,24 @@ describe("[regression] MCP server e2e — mutation tools", () => {
 
     expect(await isToolError(client, "delete_document", { path: "nodes/disposable" })).toBe(true);
   });
+
+  it("publish and delete rewrite only the touched folder's INDEX.md", async () => {
+    for (const path of ["nodes/scope-a/one", "nodes/scope-a/two", "nodes/scope-b/three"]) {
+      await callJson(client, "create_document", { path, title: path.split("/").pop() });
+    }
+    const otherIndex = join(vault, "nodes", "scope-b", "INDEX.md");
+    const before = await readFile(otherIndex, "utf-8");
+    await new Promise((r) => setTimeout(r, 5));
+
+    await callJson(client, "publish_document", { path: "nodes/scope-a/one", author: "t@example.com" });
+    await callJson(client, "delete_document", { path: "nodes/scope-a/two" });
+
+    expect(await readFile(otherIndex, "utf-8")).toBe(before);
+    const touched = await readFile(join(vault, "nodes", "scope-a", "INDEX.md"), "utf-8");
+    expect(touched).toContain("nodes/scope-a/one");
+    expect(touched).not.toContain("nodes/scope-a/two");
+    expect(JSON.stringify(await storage.readContextYaml())).not.toContain("nodes/scope-a/two");
+  });
 });
 
 // ─── Governance / drift tools (+ internal file assertions) ────────────────────
@@ -1202,7 +1220,7 @@ describe("[regression] MCP server e2e — context_search", () => {
   const search = async (args: Record<string, unknown>) => {
     const { json, isError } = await callJson(client, "context_search", args);
     expect(isError, JSON.stringify(args)).toBe(false);
-    return json as { results: Array<{ id: string; title: string; score?: number }>; total: number };
+    return json as { results: Array<{ id: string; title: string; score?: number }>; count: number; total: number };
   };
   const ids = async (query: string) => (await search({ query })).results.map((r) => r.id);
 
@@ -1234,18 +1252,21 @@ describe("[regression] MCP server e2e — context_search", () => {
     }
   });
 
-  it("limit caps results while total still counts every match", async () => {
+  it("limit caps results while count still counts every match", async () => {
     const all = await search({ query: "API" });
-    expect(all.total).toBeGreaterThan(1);
+    expect(all.count).toBeGreaterThan(1);
+    expect(all.count).toBe(all.results.length);
     const one = await search({ query: "API", limit: 1 });
     expect(one.results).toHaveLength(1);
     expect(one.results[0].id).toBe(all.results[0].id);
-    expect(one.total).toBe(all.total);
+    expect(one.count).toBe(all.count);
+    // Deprecated alias, same value.
+    expect(one.total).toBe(one.count);
   });
 
   it("no match and a whitespace-only query return empty results, not an error", async () => {
-    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], total: 0 });
-    expect(await search({ query: "   " })).toEqual({ results: [], total: 0 });
+    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], count: 0, total: 0 });
+    expect(await search({ query: "   " })).toEqual({ results: [], count: 0, total: 0 });
   });
 
   it("special characters in the query never break the search", async () => {

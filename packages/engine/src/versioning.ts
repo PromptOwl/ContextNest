@@ -85,8 +85,14 @@ export class VersionManager {
    * (see {@link historyOrRepair}) leaves nothing to read but the `v{N}` files
    * it sealed — and restarting at 1 there would collide with every one of them.
    */
-  async nextVersion(docId: string, hint = 0): Promise<number> {
-    const { history } = await this.historyOrRepair(docId);
+  async nextVersion(
+    docId: string,
+    hint = 0,
+    /** History the caller already read under the same lock; omit to read it. */
+    knownHistory?: DocumentHistory | null,
+  ): Promise<number> {
+    const history =
+      knownHistory !== undefined ? knownHistory : (await this.historyOrRepair(docId)).history;
     const recorded = (history?.versions ?? []).reduce(
       (max, entry) => Math.max(max, entry.version),
       0,
@@ -131,12 +137,20 @@ export class VersionManager {
       keyframe?: boolean;
       /** Mark the entry as the empty stub a node-level forget sealed. */
       forgetStub?: boolean;
+      /**
+       * History the caller already read (via historyOrRepair) under the same
+       * lock, with nothing appended since; `null` = none. Omit to read it here.
+       */
+      knownHistory?: DocumentHistory | null;
     } = {},
   ): Promise<VersionEntry> {
     // Resilient read: an unreadable history is moved aside and treated as
     // absent, so this write restarts the chain rather than failing. See
     // historyOrRepair for why that is safe.
-    const { history: readHistory } = await this.historyOrRepair(node.id);
+    const readHistory =
+      options.knownHistory !== undefined
+        ? options.knownHistory
+        : (await this.historyOrRepair(node.id)).history;
     // Decided BEFORE this version's own artifact is written below: counting
     // the v{N}.md we are about to seal made every brand-new document's first
     // entry claim "Chain restarted" (it saw its own keyframe as prior history).
@@ -171,6 +185,7 @@ export class VersionManager {
         previousContent = await this.reconstructVersion(
           node.id,
           currentVersion - 1,
+          history,
         );
       } catch {
         isKeyframe = true;
@@ -262,8 +277,13 @@ export class VersionManager {
    * The replay itself lives in {@link reconstructFromHistory} so integrity
    * verification can run it over pre-loaded bytes without this class.
    */
-  async reconstructVersion(docId: string, targetVersion: number): Promise<string> {
-    const history = await this.storage.readHistory(docId);
+  async reconstructVersion(
+    docId: string,
+    targetVersion: number,
+    /** History already in hand; omit to read it. */
+    knownHistory?: DocumentHistory,
+  ): Promise<string> {
+    const history = knownHistory ?? (await this.storage.readHistory(docId));
     if (!history) {
       throw new ContextNestError(
         `No version history found for ${docId}`,

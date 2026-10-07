@@ -2942,7 +2942,7 @@ program
     }
     const storage = getStorage();
     const limit = searchLimit(opts.limit);
-    const out = await cliApi().run<{ results: SearchHitView[]; total?: number }>(
+    const out = await cliApi().run<{ results: SearchHitView[]; count?: number; total?: number }>(
       "context_search",
       { query, ...(limit ? { limit } : {}) },
       opContext(storage, "cli@contextnest.local"),
@@ -3615,7 +3615,7 @@ drift
       comment: opts.comment,
     });
 
-    await regenerateIndex(storage);
+    await storage.regenerateIndex({ changedIds: [id] });
 
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
