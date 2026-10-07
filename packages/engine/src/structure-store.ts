@@ -185,7 +185,7 @@ function withoutRules(raw: string): unknown {
 async function writeStructure(storage: NestStorage, rules: StructureConfig): Promise<void> {
   const path = join(storage.root, ".context", "config.yaml");
   const original = await readFile(path, "utf-8");
-  const bom = original.startsWith("﻿") ? "﻿" : "";
+  const bom = original.startsWith("\uFEFF") ? "\uFEFF" : "";
   const raw = original.slice(bom.length);
   const lines = linesWithEnds(raw);
   const eol = raw.includes("\r\n") ? "\r\n" : "\n";
