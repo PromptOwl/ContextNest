@@ -131,15 +131,16 @@ export function searchLimit(raw: number | undefined): number | undefined {
 
 /**
  * Render `context_search` output, local or remote. Hits arrive best-first;
- * when `total` says the list was cut, a footer names the remainder (on
- * stderr in `--json` mode so stdout stays a parseable array).
+ * when `count` says the list was cut, a footer names the remainder (on
+ * stderr in `--json` mode so stdout stays a parseable array). `total` is the
+ * deprecated alias an engine <= 2.9.x sends instead of `count`.
  */
 export function printSearchResults(
-  out: { results: SearchHitView[]; total?: number },
+  out: { results: SearchHitView[]; count?: number; total?: number },
   opts: { json?: boolean },
 ): void {
   const { results } = out;
-  const total = out.total ?? results.length;
+  const total = out.count ?? out.total ?? results.length;
   const more = Math.max(0, total - results.length);
   const footer = `… ${more} more — raise --limit (0 = all)`;
   if (opts.json) {

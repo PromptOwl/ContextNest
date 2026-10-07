@@ -382,13 +382,13 @@ export async function remoteSearch(
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     const limit = searchLimit(opts.limit);
-    const out = await conn.run<{ results: NodeSummary[]; total?: number }>("context_search", {
+    const out = await conn.run<{ results: NodeSummary[]; count?: number; total?: number }>("context_search", {
       query,
       ...(limit ? { limit } : {}),
     });
-    // Rendering shared with the local branch (doc-views.ts). An older remote
-    // engine sends neither `score` nor `total`; both degrade to the previous
-    // output.
+    // Rendering shared with the local branch (doc-views.ts). A remote may
+    // send `count`, only the deprecated `total`, or (an older engine) neither
+    // and no `score`; each degrades to the previous output.
     printSearchResults({ ...out, results: await labelFanout(target, conn, out.results) }, opts);
   });
 }
