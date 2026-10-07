@@ -291,11 +291,13 @@ export function validateDocument(
       else if (field.startsWith("pdf.")) rule = 28;
       else if (field === "pdf" && issue.message.includes("must not")) rule = 29;
       else if (field === "view" || field.startsWith("view.")) {
-        // View messages name their rule (30–35). What does not — an unknown
-        // key refused by the strict block schema — is rule 33: the block may
-        // carry nothing beyond its declared fields.
+        // View messages name their rule (30–36). An unknown key refused by the
+        // strict schema is rule 33 — the block may carry nothing beyond its
+        // declared fields. Anything else (a bad enum value, a number out of
+        // range) breaks no numbered rule and stays 0, like any shape error.
         const named = /§13 rule (\d+)/.exec(issue.message);
-        rule = named ? Number(named[1]) : 33;
+        if (named) rule = Number(named[1]);
+        else if (issue.code === "unrecognized_keys") rule = 33;
       }
 
       errors.push({

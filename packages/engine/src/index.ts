@@ -517,6 +517,7 @@ export {
   VIEW_RENDER_MODES,
   VIEW_AUDIENCES,
   VIEW_LAYOUTS,
+  VIEW_LIST_FIELDS,
 } from "./view-schema.js";
 export { resolveView, viewFingerprint, DEFAULT_VIEW_LIST_LIMIT } from "./view-nodes.js";
 export type {

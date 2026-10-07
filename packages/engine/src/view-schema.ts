@@ -33,6 +33,8 @@ export const VIEW_BLOCK_KINDS = [
 export const VIEW_RENDER_MODES = ["live-approved", "pinned"] as const;
 export const VIEW_AUDIENCES = ["human", "agent"] as const;
 export const VIEW_LAYOUTS = ["stack", "grid"] as const;
+/** What a `list` block may show per member — a closed set, like every other field here. */
+export const VIEW_LIST_FIELDS = ["id", "title", "version", "status", "tags"] as const;
 
 /** A block id: what `from` / `data_from` point at. */
 const BLOCK_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
@@ -50,7 +52,7 @@ export function isVaultRef(ref: string): boolean {
   if (path.length === 0) return false;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(path)) return false;
   if (path.startsWith("/") || path.includes("\\") || path.includes("@") || path.includes("#")) return false;
-  return !path.split("/").some((seg) => seg === ".." || seg === ".");
+  return !path.split("/").some((seg) => seg === "" || seg === ".." || seg === ".");
 }
 
 const vaultRef = (field: string) =>
@@ -83,7 +85,13 @@ const KIND_SCHEMAS: Record<(typeof VIEW_BLOCK_KINDS)[number], z.ZodTypeAny> = {
   list: z
     .object({
       select: selector,
-      fields: z.array(z.string().min(1)).optional(),
+      fields: z
+        .array(
+          z.enum(VIEW_LIST_FIELDS, {
+            errorMap: () => ({ message: `list.fields entries must be one of ${VIEW_LIST_FIELDS.join(", ")} (§13 rule 33)` }),
+          }),
+        )
+        .optional(),
       limit: z.number().int().min(1).max(500).optional(),
     })
     .strict(),

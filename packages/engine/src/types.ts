@@ -153,7 +153,7 @@ export type ViewAudience = "human" | "agent";
 /** One block of a view (§1.12.2): an optional `id` plus exactly one kind. */
 export type ViewBlock = { id?: string } & (
   | { md: { ref: string; version?: number } }
-  | { list: { select: string; fields?: string[]; limit?: number } }
+  | { list: { select: string; fields?: Array<"id" | "title" | "version" | "status" | "tags">; limit?: number } }
   | { summary: { select: string; style?: "brief" | "detailed"; max_nodes?: number } }
   | { html: { ref: string; data_from?: string[] } }
   | { table: { from: string; title?: string } }

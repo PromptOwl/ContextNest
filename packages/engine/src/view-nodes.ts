@@ -20,7 +20,7 @@ import { isForgotten, isPublished, parseDocument } from "./parser.js";
 import { Resolver } from "./resolver.js";
 import { parseSelector } from "./selector/parser.js";
 import { evaluate } from "./selector/evaluator.js";
-import { ForgottenVersionError } from "./errors.js";
+import { ContextNestError, ForgottenVersionError } from "./errors.js";
 import { blockKind, type VIEW_BLOCK_KINDS } from "./view-schema.js";
 import type { ContextNode, ViewAudience, ViewMeta, ViewRenderMode } from "./types.js";
 
@@ -54,7 +54,13 @@ interface BlockBase {
   id?: string;
 }
 
-/** Why a block resolved to nothing. Structured output only — never rendered. */
+/**
+ * Why a block resolved to nothing. Structured output only — never rendered.
+ * `not_found` and `not_published` tell apart a node that does not exist from
+ * one the reader may not see, so a serving layer MUST NOT forward `reason` to
+ * a reader who could not otherwise learn that the node exists; it is for
+ * authors, stewards and logs.
+ */
 export type ViewBlockUnavailableReason =
   | "not_found"
   | "not_published"
@@ -157,7 +163,7 @@ function refToId(ref: string): string {
  */
 export async function resolveView(view: ContextNode, options: ResolveViewOptions): Promise<ResolvedView> {
   const meta = view.frontmatter.view;
-  if (!meta) throw new Error(`${view.id} has no view block (§13 rule 30)`);
+  if (!meta) throw new ContextNestError(`${view.id} has no view block (§13 rule 30)`, "VALIDATION_FAILED");
 
   const includeDrafts = options.includeDrafts ?? false;
   const byId = new Map(options.documents.map((d) => [d.id, d] as const));
@@ -168,7 +174,9 @@ export async function resolveView(view: ContextNode, options: ResolveViewOptions
   for (const [index, raw] of meta.blocks.entries()) {
     const block = raw as Record<string, unknown>;
     const kind = blockKind(block);
-    if (!kind) throw new Error(`${view.id} block ${index} declares no single kind (§13 rule 32)`);
+    if (!kind) {
+      throw new ContextNestError(`${view.id} block ${index} declares no single kind (§13 rule 32)`, "VALIDATION_FAILED");
+    }
     const opts = block[kind] as Record<string, unknown>;
     const base: BlockBase = { index, ...(typeof block.id === "string" ? { id: block.id } : {}) };
 
@@ -265,12 +273,26 @@ async function resolveMd(
     if (err instanceof ForgottenVersionError) {
       return { ...base, kind: "md", status: "forgotten", ref, version: opts.version };
     }
-    return unavailable("version_not_found");
+    // Only "there is no such version" is an answer. Anything else — I/O, a
+    // corrupt chain, a failed decryption — is a failure, and reporting it as
+    // a missing version would put a false statement in the receipt.
+    if (err instanceof ContextNestError && err.code === "VERSION_NOT_FOUND") {
+      return unavailable("version_not_found");
+    }
+    throw err;
   }
-  // Only publish and approval write versions (§6), so a recorded version was
-  // published when it was cut: pinning one needs no visibility check of its own.
   const past = content.startsWith("---") ? parseDocument(`${ref}.md`, content, ref) : null;
+  // The version must itself have been published when it was cut — not merely
+  // approved — or a pin would serve content the floating path never would.
+  if (past && !(options.includeDrafts ?? false) && !isPublished(past)) {
+    return unavailable("not_published");
+  }
   return resolved(past ? past.body : content, opts.version, past?.frontmatter.title ?? doc.frontmatter.title);
+}
+
+/** One line of plain text: line breaks collapsed, markdown-active characters escaped. */
+function inlineText(text: string): string {
+  return text.replace(/\s*[\r\n]+\s*/g, " ").replace(/[\\`*_[\]<>|]/g, (c) => `\\${c}`);
 }
 
 /** Text safe inside a markdown link label: brackets and backslashes escaped. */
@@ -288,9 +310,9 @@ function listLine(item: ResolvedListItem, fields: string[] | undefined): string 
   const extra = (fields ?? [])
     .filter((f) => f !== "title")
     .map((f) => {
-      const value = (item as unknown as Record<string, unknown>)[f];
+      const value = item[f as keyof ResolvedListItem];
       if (value === undefined || value === null) return null;
-      return Array.isArray(value) ? value.join(" ") : String(value);
+      return inlineText(Array.isArray(value) ? value.join(" ") : String(value));
     })
     .filter((v): v is string => v !== null && v !== "");
   return `- [${linkText(item.title)}](contextnest://${item.id})${extra.length ? ` — ${extra.join(" · ")}` : ""}`;
@@ -323,7 +345,7 @@ function renderMarkdown(view: ContextNode, blocks: ResolvedViewBlock[]): string 
         );
         break;
       case "callout":
-        parts.push(`> ${block.tone === "warning" ? "**Warning:** " : ""}${block.text.replace(/\n/g, "\n> ")}`);
+        parts.push(`> ${block.tone === "warning" ? "**Warning:** " : ""}${block.text.replace(/\r?\n/g, "\n> ")}`);
         break;
       default:
         parts.push(`<!-- ${label}: resolved by the server -->`);

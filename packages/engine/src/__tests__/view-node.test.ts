@@ -111,6 +111,27 @@ describe("view node — validation", () => {
     expect(errorsFor({ blocks: [{ md: { ref: "nodes/x#intro" } }] })).toMatch(/rule 33/);
   });
 
+  it("rejects empty path segments (rule 33)", () => {
+    expect(errorsFor({ blocks: [{ md: { ref: "nodes//x" } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ md: { ref: "contextnest://nodes//x" } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ md: { ref: "nodes/x/" } }] })).toMatch(/rule 33/);
+  });
+
+  it("list fields are a closed set — no prototype keys or arbitrary names (rule 33)", () => {
+    expect(errorsFor({ blocks: [{ list: { select: "#a", fields: ["constructor"] } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ list: { select: "#a", fields: ["toString"] } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ list: { select: "#a", fields: ["id", "title", "version", "status", "tags"] } }] })).toBe("");
+  });
+
+  it("does not attribute every malformed view field to rule 33", () => {
+    const rules = (view: unknown) => validateDocument(viewNode(view)).errors.map((e) => e.rule);
+    expect(rules({ render: "sometimes", blocks: [{ md: { ref: "nodes/a" } }] })).not.toContain(33);
+    expect(rules({ audience: [], blocks: [{ md: { ref: "nodes/a" } }] })).not.toContain(33);
+    expect(rules({ blocks: [{ summary: { select: "#a", max_nodes: 9999 } }] })).not.toContain(33);
+    // An unknown key IS rule 33.
+    expect(rules({ blocks: [{ md: { ref: "nodes/a", url: "x" } }] })).toContain(33);
+  });
+
   it("under render: pinned, every md block must pin a version (rule 36)", () => {
     expect(errorsFor({ render: "pinned", blocks: [{ md: { ref: "nodes/a" } }] })).toMatch(/rule 36/);
     expect(errorsFor({ render: "pinned", blocks: [{ md: { ref: "nodes/a", version: 2 } }, { list: { select: "#a" } }] })).toBe("");
@@ -399,6 +420,64 @@ describe("view node — catalog round-trip and static resolution", () => {
     expect(r.markdown).not.toContain("Personal data.");
   });
 
+  it("a pinned version whose recorded status was not published is not served", async () => {
+    const a = await create({ title: "Approved Only", content: "Live body." });
+    const view = await create({
+      title: "Approved Pin",
+      content: "v",
+      type: "view",
+      view: { blocks: [{ md: { ref: a.id, version: 7 } }] },
+    });
+    const all = await docs();
+    const fake = async () =>
+      `---\ntitle: Approved Only\nstatus: approved\nversion: 7\n---\nApproved but never published.\n`;
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all, reconstructVersion: fake });
+    expect(r.blocks[0]).toMatchObject({ kind: "md", status: "unavailable", reason: "not_published" });
+    expect(r.markdown).not.toContain("never published");
+  });
+
+  it("rethrows a history failure instead of reporting the version as missing", async () => {
+    const a = await create({ title: "Broken History", content: "x" });
+    const view = await create({
+      title: "Broken Pin",
+      content: "v",
+      type: "view",
+      view: { blocks: [{ md: { ref: a.id, version: 9 } }] },
+    });
+    const all = await docs();
+    const failing = async () => {
+      throw new Error("EIO: decryption failed");
+    };
+    await expect(
+      resolveView(all.find((d) => d.id === view.id)!, { documents: all, reconstructVersion: failing }),
+    ).rejects.toThrow(/decryption failed/);
+    // A version that genuinely does not exist is still just unavailable.
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all, reconstructVersion });
+    expect(r.blocks[0]).toMatchObject({ kind: "md", status: "unavailable", reason: "version_not_found" });
+  });
+
+  it("a negated selector still never surfaces drafts", async () => {
+    await create({ title: "Pub", content: "p", tags: ["#neg"] });
+    await create({ title: "Hidden Draft", content: "d", tags: ["#neg"], publish: false });
+    const view = await create({ title: "Neg", content: "v", type: "view", view: { blocks: [{ list: { select: "#neg -#nothing" } }] } });
+    const all = await docs();
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all });
+    expect(r.blocks[0].kind === "list" && r.blocks[0].items.map((i) => i.title)).toEqual(["Pub"]);
+  });
+
+  it("renders CRLF callouts without stray carriage returns", async () => {
+    const view = await create({
+      title: "Callout",
+      content: "v",
+      type: "view",
+      view: { blocks: [{ callout: { text: "line one\r\nline two" } }] },
+    });
+    const all = await docs();
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all });
+    expect(r.markdown).toContain("> line one\n> line two");
+    expect(r.markdown).not.toContain("\r");
+  });
+
   it("caps a list at `limit` and says it was truncated", async () => {
     for (const n of ["One", "Two", "Three"]) await create({ title: n, content: n, tags: ["#cap"] });
     const view = await create({ title: "Cap", content: "v", type: "view", view: { blocks: [{ list: { select: "#cap", limit: 2 } }] } });
@@ -420,11 +499,14 @@ describe("view node — catalog round-trip and static resolution", () => {
     const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all });
     expect(r.markdown).toContain("Q3 \\[draft\\]");
     expect(r.markdown).toContain("published");
-    // No comment closes early: with every well-formed comment removed, nothing
-    // of a comment's inside (the "view block" label) is left in the text.
-    const outside = r.markdown.replace(/<!--[\s\S]*?-->/g, "");
-    expect(outside).not.toContain("view block");
-    expect(outside).not.toContain("<!--");
+    // No comment closes early: the renderer's comments carry no `--` inside,
+    // and each one opens and closes on its own line.
+    const commentLines = r.markdown.split("\n").filter((line) => line.startsWith("<!-- "));
+    expect(commentLines.length).toBeGreaterThan(0);
+    for (const line of commentLines) {
+      expect(line.endsWith(" -->")).toBe(true);
+      expect(line.slice(5, -4)).not.toContain("--");
+    }
   });
 
   it("does not expand a view referenced from a view — no recursion", async () => {

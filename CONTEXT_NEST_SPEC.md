@@ -808,7 +808,7 @@ A block is an object with an optional `id` (letters, digits, `_`, `-`; starting 
 | Kind | Fields | Resolves to |
 |------|--------|-------------|
 | `md` | `ref`, `version?` | The body of the node `ref` names |
-| `list` | `select`, `fields?`, `limit?` | The nodes the selector (§2) `select` matches |
+| `list` | `select`, `fields?` (any of `id`, `title`, `version`, `status`, `tags`), `limit?` | The nodes the selector (§2) `select` matches |
 | `summary` | `select`, `style?` (`brief`\|`detailed`), `max_nodes?` | A generated summary of the nodes `select` matches |
 | `html` | `ref`, `data_from?` | The artifact node `ref` names, rendered in isolation, fed the output of the blocks `data_from` names |
 | `table`, `kpi`, `chart` | `from`, `title?` | A presentation of the output of block `from` |
@@ -820,7 +820,7 @@ A block is an object with an optional `id` (letters, digits, `_`, `-`; starting 
 
 #### 1.12.3 Resolution
 
-Reading a view resolves each block. `md`, `list` and `callout` need nothing but the vault, and implementations MUST resolve them under the same visibility rules as retrieval: an `md` block whose node is not currently published — whether or not the block pins a version — and a `list` member that is not published resolve to nothing unless the reader asked for drafts, and forgotten nodes (§6.3) never resolve to content. A pinned version is thus served only while its node is still visible: rejecting or retracting a node stops every view serving any of its versions. Status visibility is not access control: an implementation resolves a view over only the nodes the reader may see, and decides whether the reader is in the view's `audience`. A view referenced from an `md` block is served as its body and is not expanded. The remaining kinds need a model, a renderer, an isolated execution context or a binding resolver; this specification defines their fields, not how they are resolved. Implementations SHOULD record, for each read they serve, enough to replay it — each `md` block's `ref@version` and content hash, each `list` block's members and a hash over them, and the hash of the layout itself.
+Reading a view resolves each block. `md`, `list` and `callout` need nothing but the vault, and implementations MUST resolve them under the same visibility rules as retrieval: an `md` block whose node is not currently published — whether or not the block pins a version — and a `list` member that is not published resolve to nothing unless the reader asked for drafts, and forgotten nodes (§6.3) never resolve to content. A pinned version is thus served only while its node is still visible — rejecting or retracting a node stops every view serving any of its versions — and only if it was itself published when it was cut. A failure to read history is an error, not an unavailable block. Status visibility is not access control: an implementation resolves a view over only the nodes the reader may see, and decides whether the reader is in the view's `audience`. A view referenced from an `md` block is served as its body and is not expanded. The remaining kinds need a model, a renderer, an isolated execution context or a binding resolver; this specification defines their fields, not how they are resolved. Implementations SHOULD record, for each read they serve, enough to replay it — each `md` block's `ref@version` and content hash, each `list` block's members and a hash over them, and the hash of the layout itself.
 
 ---
 
@@ -2029,7 +2029,7 @@ In addition to the base validation rules, `type: view` nodes MUST satisfy (rules
 30. The `view` block MUST be present in frontmatter
 31. The `view` block MUST NOT be present on nodes where `type` is not `view` (an untyped node is a `document`)
 32. `view.blocks` MUST be a non-empty array, and each block MUST declare exactly one kind from §1.12.2
-33. Every `ref` and `binding` MUST be a vault reference — a node path or a `contextnest://` URI, with no other scheme, no leading `/` or `//`, no `\`, no `@` pin or `#` anchor, and no `.` or `..` segments — and no part of the `view` block may carry keys beyond those §1.12 defines
+33. Every `ref` and `binding` MUST be a vault reference — a node path or a `contextnest://` URI, with no other scheme, no leading `/` or `//`, no `\`, no `@` pin or `#` anchor, and no empty, `.` or `..` segments — and no part of the `view` block may carry keys beyond those §1.12 defines
 34. Every `select` MUST parse as a selector (§2)
 35. Block `id`s MUST be unique within the view, and every `from` / `data_from` entry MUST name the `id` of an earlier block
 36. When `view.render` is `pinned`, every `md` block MUST carry a `version`
