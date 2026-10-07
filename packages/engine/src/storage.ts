@@ -1713,9 +1713,14 @@ export class NestStorage {
       if (fm.type === "pdf" && fm.pdf?.file) {
         // Compared against the on-disk spelling: on a case-insensitive
         // filesystem the caller may have reached `nodes/Report.md` as
-        // `nodes/report` (#117).
+        // `nodes/report` (#117). The caller's spelling still counts, for a
+        // node written before #117 that recorded it — both name this node's
+        // own file. Never a case-folded compare: on a case-sensitive
+        // filesystem that could name another node's binary.
         const onDisk = await this.resolveDocumentIdCasing(id);
-        if (fm.pdf.file === `${onDisk}.pdf`) sidecar = fm.pdf.file;
+        if (fm.pdf.file === `${onDisk}.pdf` || fm.pdf.file === `${id}.pdf`) {
+          sidecar = fm.pdf.file;
+        }
       }
     } catch {
       // Missing or unparseable: the unlink below reports the former, and an

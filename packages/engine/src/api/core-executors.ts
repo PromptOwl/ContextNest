@@ -1578,7 +1578,10 @@ async function importPdfLocked(
       );
     const wantsDescription =
       typeof input.description === "string" && input.description !== (fm.description ?? "");
-    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription) {
+    // A node written before #117 may record `pdf.file` in the caller's
+    // casing; rewriting it to the on-disk spelling repairs rule 26.
+    const wantsRepair = existingPdf.file !== sidecar;
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription && !wantsRepair) {
       return {
         id,
         version: fm.version ?? 1,
@@ -1596,7 +1599,7 @@ async function importPdfLocked(
   // restamp extracted_at); new bytes get both fresh.
   const pdf: PdfMeta =
     sameBytes && existingPdf
-      ? existingPdf
+      ? { ...existingPdf, file: sidecar }
       : {
           file: sidecar,
           sha256: extraction.sha256,

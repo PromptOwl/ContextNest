@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, rm, readdir, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, readdir, readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { NestStorage, type ReadDocumentOptions } from "../storage.js";
@@ -175,7 +175,26 @@ describe("context_import_pdf with an id in another casing (#117)", () => {
     const again = await importPdf({ bytes_base64: bytes, id: "nodes/report" });
     expect(again).toMatchObject({ id: "nodes/Report", created: false, unchanged: true, version: 1 });
   });
+
+  it("a same-bytes re-import repairs a pdf.file written in the caller's casing before #117", async () => {
+    const bytes = toBase64(textPdf());
+    await importPdf({ bytes_base64: bytes, id: "nodes/Report", publish: false });
+    await recordLegacyPdfFile(dir, "nodes/Report", "nodes/report.pdf");
+
+    const again = await importPdf({ bytes_base64: bytes, id: "nodes/report", publish: false });
+    expect(again).toMatchObject({ id: "nodes/Report", unchanged: false });
+    expect(again.pdf.file).toBe("nodes/Report.pdf");
+    const node = await ctx.storage.readDocument("nodes/Report");
+    expect(validateDocument(node).valid).toBe(true);
+  });
 });
+
+/** Rewrites a node's `pdf.file` the way the pre-#117 import recorded it. */
+async function recordLegacyPdfFile(root: string, id: string, file: string): Promise<void> {
+  const md = join(root, ...id.split("/")) + ".md";
+  const raw = await readFile(md, "utf-8");
+  await writeFile(md, raw.replace(`file: ${id}.pdf`, `file: ${file}`));
+}
 
 /** True when this tmpdir's filesystem folds case (macOS and Windows defaults). */
 function tmpdirIsCaseInsensitive(): boolean {
@@ -227,5 +246,12 @@ describe.runIf(tmpdirIsCaseInsensitive())("pdf ids on a real case-insensitive fi
     await ctx.storage.deleteDocument("NODES/REPORT");
     expect(existsSync(join(dir, "nodes", "Report.pdf"))).toBe(false);
     expect(existsSync(join(dir, "nodes", "keep", "other.pdf"))).toBe(true);
+  });
+
+  it("delete in the casing a pre-#117 node recorded still removes its sidecar", async () => {
+    await importPdf({ bytes_base64: toBase64(textPdf()), id: "nodes/Report" });
+    await recordLegacyPdfFile(dir, "nodes/Report", "nodes/report.pdf");
+    await ctx.storage.deleteDocument("nodes/report");
+    expect(await reportFiles(join(dir, "nodes"))).toEqual([]);
   });
 });
