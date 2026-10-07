@@ -20,7 +20,7 @@ import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import { resolveView, viewFingerprint } from "../view-nodes.js";
-import type { ContextNode, Frontmatter, ViewMeta } from "../types.js";
+import type { ContextNode, Frontmatter, ViewBlock, ViewMeta } from "../types.js";
 
 const VIEW: ViewMeta = {
   render: "live-approved",
@@ -102,6 +102,35 @@ describe("view node — validation", () => {
     expect(errorsFor({ blocks: [{ md: { ref: "contextnest://../secrets" } }] })).toMatch(/rule 33/);
     expect(errorsFor({ blocks: [{ md: { ref: "contextnest://https://evil.example" } }] })).toMatch(/rule 33/);
     expect(errorsFor({ blocks: [{ md: { ref: "contextnest://nodes/finance/commentary" } }] })).toBe("");
+  });
+
+  it("rejects Windows-style paths and URI suffixes in refs — pins go in `version` (rule 33)", () => {
+    expect(errorsFor({ blocks: [{ md: { ref: "C:\\x" } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ md: { ref: "a\\b" } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ md: { ref: "contextnest://nodes/x@3" } }] })).toMatch(/rule 33/);
+    expect(errorsFor({ blocks: [{ md: { ref: "nodes/x#intro" } }] })).toMatch(/rule 33/);
+  });
+
+  it("under render: pinned, every md block must pin a version (rule 36)", () => {
+    expect(errorsFor({ render: "pinned", blocks: [{ md: { ref: "nodes/a" } }] })).toMatch(/rule 36/);
+    expect(errorsFor({ render: "pinned", blocks: [{ md: { ref: "nodes/a", version: 2 } }, { list: { select: "#a" } }] })).toBe("");
+    expect(errorsFor({ blocks: [{ md: { ref: "nodes/a" } }] })).toBe("");
+  });
+
+  it("every block kind's TypeScript shape is accepted by the schema (no drift)", () => {
+    const one: ViewBlock[] = [
+      { id: "doc", md: { ref: "nodes/a", version: 1 } },
+      { id: "rows", list: { select: "#a", fields: ["status"], limit: 5 } },
+      { summary: { select: "#a", style: "detailed", max_nodes: 10 } },
+      { html: { ref: "nodes/chart", data_from: ["rows"] } },
+      { table: { from: "rows", title: "T" } },
+      { kpi: { from: "rows" } },
+      { chart: { from: "rows" } },
+      { callout: { text: "Heads up", tone: "warning" } },
+      { metric: { ref: "nodes/metrics/arr" } },
+      { data: { binding: "nodes/bindings/hubspot", as: "json" } },
+    ];
+    expect(errorsFor({ render: "pinned", audience: ["agent"], layout: "grid", blocks: one })).toBe("");
   });
 
   it("requires list and summary selectors to parse (rule 34)", () => {
@@ -328,6 +357,74 @@ describe("view node — catalog round-trip and static resolution", () => {
     expect(r.blocks[0]).toMatchObject({ kind: "md", status: "resolved", version: a.version });
     expect(r.blocks[0].kind === "md" && r.blocks[0].body).toContain("Version one text.");
     expect(r.blocks[0].kind === "md" && r.blocks[0].body).not.toContain("Version two text.");
+  });
+
+  it("a pinned version stops serving once the node itself is no longer visible", async () => {
+    const a = await create({ title: "Retracted Doc", content: "Old public text." });
+    await api.run("context_update", { id: a.id, content: "Newer text." }, ctx);
+    // Taken back to draft: still discovered, no longer published.
+    await api.run("context_update", { id: a.id, status: "draft", publish: false }, ctx);
+    const b = await create({ title: "Rejected Doc", content: "Rejected public text." });
+    await api.run("context_update", { id: b.id, content: "Later." }, ctx);
+    await api.run("context_update", { id: b.id, status: "rejected", publish: false }, ctx);
+    const view = await create({
+      title: "Pin View",
+      content: "v",
+      type: "view",
+      view: { blocks: [{ md: { ref: a.id, version: a.version } }, { md: { ref: b.id, version: b.version } }] },
+    });
+    const all = await docs();
+    expect(all.find((d) => d.id === a.id)?.frontmatter.status).toBe("draft");
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all, reconstructVersion });
+    expect(r.blocks[0]).toMatchObject({ kind: "md", status: "unavailable", reason: "not_published" });
+    // A rejected node is not even discovered — it resolves to nothing at all.
+    expect(r.blocks[1]).toMatchObject({ kind: "md", status: "unavailable" });
+    expect(r.markdown).not.toContain("Old public text.");
+    expect(r.markdown).not.toContain("Rejected public text.");
+  });
+
+  it("a forgotten node resolves to `forgotten`, floating or pinned, and never to its content", async () => {
+    const a = await create({ title: "Erase Me", content: "Personal data." });
+    const view = await create({
+      title: "Forget View",
+      content: "v",
+      type: "view",
+      view: { blocks: [{ md: { ref: a.id } }, { md: { ref: a.id, version: a.version } }, { list: { select: "#gone" } }] },
+    });
+    await api.run("context_forget", { id: a.id, reason_code: "user_request", requested_by: "s@example.com" }, ctx);
+    const all = await docs();
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all, reconstructVersion });
+    expect(r.blocks[0]).toMatchObject({ kind: "md", status: "forgotten" });
+    expect(r.blocks[1]).toMatchObject({ kind: "md", status: "forgotten" });
+    expect(r.markdown).not.toContain("Personal data.");
+  });
+
+  it("caps a list at `limit` and says it was truncated", async () => {
+    for (const n of ["One", "Two", "Three"]) await create({ title: n, content: n, tags: ["#cap"] });
+    const view = await create({ title: "Cap", content: "v", type: "view", view: { blocks: [{ list: { select: "#cap", limit: 2 } }] } });
+    const all = await docs();
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all });
+    expect(r.blocks[0]).toMatchObject({ kind: "list", truncated: true });
+    expect(r.blocks[0].kind === "list" && r.blocks[0].items).toHaveLength(2);
+  });
+
+  it("renders requested list fields and escapes titles and labels that would break the markdown", async () => {
+    await create({ title: "Q3 [draft] -->", content: "x", tags: ["#esc"] });
+    const view = await create({
+      title: "Esc",
+      content: "v",
+      type: "view",
+      view: { blocks: [{ id: "a--b", list: { select: "#esc", fields: ["status"] } }] },
+    });
+    const all = await docs();
+    const r = await resolveView(all.find((d) => d.id === view.id)!, { documents: all });
+    expect(r.markdown).toContain("Q3 \\[draft\\]");
+    expect(r.markdown).toContain("published");
+    // No comment closes early: with every well-formed comment removed, nothing
+    // of a comment's inside (the "view block" label) is left in the text.
+    const outside = r.markdown.replace(/<!--[\s\S]*?-->/g, "");
+    expect(outside).not.toContain("view block");
+    expect(outside).not.toContain("<!--");
   });
 
   it("does not expand a view referenced from a view — no recursion", async () => {

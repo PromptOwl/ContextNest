@@ -1,5 +1,5 @@
 /**
- * The `view` frontmatter block (§1.12, §13.5 rules 32–35).
+ * The `view` frontmatter block (§1.12, §13.5 rules 32–36).
  *
  * Kept out of schemas.ts only because it needs the selector parser to check
  * `select` strings (rule 34); schemas.ts imports it like any other block.
@@ -41,13 +41,15 @@ const BLOCK_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
  * True when `ref` names something inside this vault: a node path
  * (`nodes/finance/arr`) or a `contextnest://` URI. Anything carrying another
  * scheme (`https:`, `javascript:`, `data:`), a scheme-relative `//host`, an
- * absolute or Windows path, or a `..` segment is not.
+ * absolute or Windows path, or a `..` segment is not. Nor is a URI suffix:
+ * `@N` is a CHECKPOINT pin in §4 and `#section` an anchor — a view pins a
+ * node's version through the block's own `version` field instead.
  */
 export function isVaultRef(ref: string): boolean {
   const path = ref.startsWith("contextnest://") ? ref.slice("contextnest://".length) : ref;
   if (path.length === 0) return false;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(path)) return false;
-  if (path.startsWith("/") || path.includes("\\")) return false;
+  if (path.startsWith("/") || path.includes("\\") || path.includes("@") || path.includes("#")) return false;
   return !path.split("/").some((seg) => seg === ".." || seg === ".");
 }
 
@@ -55,7 +57,10 @@ const vaultRef = (field: string) =>
   z
     .string()
     .min(1)
-    .refine(isVaultRef, `${field} must be a vault reference (a node path or contextnest:// URI), not a URL (§13 rule 33)`);
+    .refine(
+      isVaultRef,
+      `${field} must be a vault reference (a node path or contextnest:// URI, no @pin or #anchor — pin with \`version\`), not a URL (§13 rule 33)`,
+    );
 
 const selector = z
   .string()
@@ -167,6 +172,19 @@ export const viewMetaSchema: z.ZodType<ViewMeta, z.ZodTypeDef, unknown> = z
         code: z.ZodIssueCode.custom,
         message: "a view must have at least one block (§13 rule 32)",
         path: ["blocks"],
+      });
+    }
+    // Rule 36: a pinned view replays exactly, so every md block names its version.
+    if (view.render === "pinned") {
+      view.blocks.forEach((block, i) => {
+        const md = block.md as { version?: unknown } | undefined;
+        if (md && md.version === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `block ${i} is an md block without a version, and render is "pinned" (§13 rule 36)`,
+            path: ["blocks", i, "md", "version"],
+          });
+        }
       });
     }
     // Rule 35: ids unique, and a block reads only from blocks BEFORE it — which
