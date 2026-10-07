@@ -43,7 +43,14 @@ import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } fro
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
-import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, assertWritableDocumentPath, assertFitsFileSystem } from "../storage.js";
+import {
+  normalizeDocumentId,
+  assertSafeDocumentId,
+  assertWritableDocumentId,
+  assertWritableDocumentPath,
+  assertFitsFileSystem,
+  machineryAliasSegment,
+} from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
@@ -1289,24 +1296,31 @@ async function importVerdicts(
 }
 
 /**
- * Refuse an imported `<doc>.pdf` that would replace the sealed binary of a pdf
- * node already here that this import does not bring: that file is the only
- * copy of its current version (archives hold prior ones). The same bytes — a
- * chunked restore — are fine.
+ * Refuse an imported PDF binary that would replace sealed bytes: a node's
+ * `<doc>.pdf` is the only copy of its current version, and an archived
+ * `.versions/<doc>/<sha-hex>.pdf` is named by its own hash. The same bytes — a
+ * chunked restore — are fine; a new version of a PDF comes through
+ * context_import_pdf, which archives the one it replaces.
  */
 async function assertSidecarKept(
   ctx: OperationContext,
   f: { raw: string; path: string; content: string },
-  incoming: Set<string>,
 ): Promise<void> {
-  if (!/\.pdf$/i.test(f.path) || storeOwner(f.path)) return;
+  if (!/\.pdf$/i.test(f.path)) return;
+  const bytes = sha256Bytes(Buffer.from(f.content, "utf-8"));
+  if (storeOwner(f.path)) {
+    const named = /([0-9a-f]{64})\.pdf$/i.exec(f.path)?.[1];
+    if (named && bytes !== `sha256:${named.toLowerCase()}`) {
+      throw new ContextNestError(`${f.raw}: an archived PDF's bytes must hash to its name`, "VALIDATION_FAILED");
+    }
+    return;
+  }
   const owner = f.path.slice(0, -".pdf".length);
-  if (incoming.has(owner)) return;
   const node = await readIfExists(ctx, owner);
   const sealed = node?.frontmatter.type === "pdf" ? node.frontmatter.pdf?.sha256 : undefined;
-  if (sealed && sha256Bytes(Buffer.from(f.content, "utf-8")) !== sealed) {
+  if (sealed && bytes !== sealed) {
     throw new ContextNestError(
-      `${f.raw}: would replace the sealed PDF of ${owner}, which this import does not bring`,
+      `${f.raw}: would replace the sealed PDF of ${owner} — import a new version with context_import_pdf`,
       "VALIDATION_FAILED",
     );
   }
@@ -1347,14 +1361,25 @@ async function historySetVerdict(
   } catch {
     history = null;
   }
+  if (text !== undefined && !history) return `${owner}'s history.yaml is not a valid history`;
   if (!history) return null;
+  const head = history.versions.at(-1);
+  // No head, or a forgotten one: nothing to rebuild, nothing that could make a
+  // later check lenient.
+  if (!head || head.tombstone) return null;
   const raw = await sealedHead(
     owner,
     history,
     (n) => set.get(`v${n}.md`) ?? ctx.storage.readKeyframe(owner, n),
     (n) => set.get(`v${n}.diff`) ?? ctx.storage.readDiff(owner, n),
   );
-  if (raw === null) return null;
+  // Refused, not waved through: the bytes judged here are pinned to their
+  // content hashes, so if a file then fails to land the head on disk no
+  // longer verifies and is judged in full — but only if the head judged here
+  // verified in the first place.
+  if (raw === null) {
+    return `${owner}'s history does not rebuild, matching its own hashes, from what the vault will hold — send its keyframes and diffs with or before its history.yaml`;
+  }
   let doc: StructureDoc;
   try {
     const node = parseDocument(`${owner}.md`, raw, owner);
@@ -1447,12 +1472,23 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     // Structure verdicts for the whole batch BEFORE anything lands, so a
     // refused document takes its version history and its folder's other files
     // with it instead of leaving them behind as orphans.
-    const refused = rules ? await importVerdicts(ctx, rules, plan, input.overwrite === true) : new Map<string, string>();
-    const incomingDocs = new Set(plan.flatMap((f) => importedDoc(f.path, f.content)?.id ?? []));
+    // A look-alike of a machinery folder (`.ver\u200Bsions`, `.versions::$DATA`)
+    // never lands, and never takes part in judging the real one beside it: a
+    // decoy that vouches for a history and is then refused would leave the
+    // real files judged by bytes that never landed.
+    const aliased = new Set(plan.filter((f) => machineryAliasSegment(f.path) !== undefined).map((f) => f.raw));
+    const real = plan.filter((f) => !aliased.has(f.raw));
+    const refused = rules ? await importVerdicts(ctx, rules, real, input.overwrite === true) : new Map<string, string>();
     await mapInBatches(plan, async (f) => {
       try {
         assertFitsFileSystem(f.path, 255);
-        await assertSidecarKept(ctx, f, incomingDocs);
+        if (aliased.has(f.raw)) {
+          throw new ContextNestError(
+            `${f.raw}: "${machineryAliasSegment(f.path)}" is another spelling of a reserved folder (.context, .versions, _suggestions)`,
+            "VALIDATION_FAILED",
+          );
+        }
+        await assertSidecarKept(ctx, f);
         if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
           throw new ContextNestError(
             `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,

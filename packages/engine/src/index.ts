@@ -265,6 +265,7 @@ export {
   assertErasableDocumentId,
   assertResolvesOutsideMachinery,
   assertWritableDocumentPath,
+  machineryAliasSegment,
   assertFitsFileSystem,
 } from "./storage.js";
 export type {

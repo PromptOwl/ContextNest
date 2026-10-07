@@ -227,6 +227,19 @@ export function assertFitsFileSystem(
 }
 
 /**
+ * The first segment of a path that is another spelling of a machinery folder
+ * — it resolves to `.context`, `.versions` or `_suggestions` on some file
+ * system (case, trailing dots, `:stream`, ignorable code points) but is not
+ * spelled so. Undefined when there is none.
+ */
+export function machineryAliasSegment(path: string): string | undefined {
+  return path.split(/[/\\]+/).find((seg) => {
+    const folded = comparableSegment(seg);
+    return RESERVED_SEGMENTS.has(folded) && folded !== seg;
+  });
+}
+
+/**
  * Refuse an id that names vault machinery: a `.context`, `.versions` or
  * `_suggestions` segment at any depth, compared as a file system resolves it.
  * NestStorage.writeDocument/deleteDocument call this as a backstop; deletes
@@ -278,23 +291,32 @@ export async function assertResolvesOutsideMachinery(root: string, id: string): 
   } catch {
     return;
   }
-  for (let n = segs.length; n > 0; n--) {
-    const tail = segs.slice(n);
-    let resolved: string;
-    try {
-      resolved = await realpath(join(root, ...segs.slice(0, n - 1), n === segs.length ? `${segs[n - 1]}.md` : segs[n - 1]));
-    } catch {
-      continue; // not there yet — try the folder above
-    }
-    const inVault = relative(base, resolved);
-    // Outside the vault is no machinery of this one — but a folder named `..x` is inside.
-    if (inVault === ".." || inVault.startsWith(`..${sep}`) || isAbsolute(inVault)) return;
-    assertNotMachineryPath([...inVault.split(/[/\\]+/), ...tail].join("/").replace(/\.md$/i, ""));
-    return;
+  // The deepest part of the path that exists, by binary search: existence is
+  // monotone along prefixes, and resolving each prefix in turn costs depth².
+  const at = (n: number) => join(root, ...segs.slice(0, n - 1), n === segs.length ? `${segs[n - 1]}.md` : segs[n - 1]);
+  let lo = 0; // longest prefix known to exist (0 = the root)
+  let hi = segs.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const exists = await stat(at(mid)).then(
+      () => true,
+      () => false,
+    );
+    if (exists) lo = mid;
+    else hi = mid - 1;
   }
+  if (lo === 0) return;
+  const finalResolved = await realpath(at(lo)).catch(() => null);
+  if (finalResolved === null) return;
+  const inVault = relative(base, finalResolved);
+  // Outside the vault is no machinery of this one — but a folder named `..x` is inside.
+  if (inVault === ".." || inVault.startsWith(`..${sep}`) || isAbsolute(inVault)) return;
+  assertNotMachineryPath([...inVault.split(/[/\\]+/), ...segs.slice(lo)].join("/").replace(/\.md$/i, ""));
 }
 
 export function assertSafeDocumentId(raw: string): void {
+  // No file system holds more; refused here so an error never names the vault path.
+  assertFitsFileSystem(raw, 255, 4096);
   const segments = raw.split(/[/\\]/);
   if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(

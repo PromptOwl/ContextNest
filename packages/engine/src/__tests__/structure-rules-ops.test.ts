@@ -1664,3 +1664,91 @@ describe("architecture round 9: the head an import is judged by is the head the 
     ).rejects.toThrow(/reserved/);
   });
 });
+
+describe("QA round 9: decoy sets, deep erases, in-batch sidecars, read limits", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it.each([".versions::$DATA", ".ver\u200Bsions"])(
+    "a decoy under %s cannot vouch for the real history beside it",
+    async (decoy) => {
+      // Donor history whose head has no Summary, made before the rules.
+      await api.run("context_create", { id: "nodes/notes/donor", title: "Donor", content: "## Notes\nx\n" }, ctx);
+      const from = join(dir, "nodes", "notes", ".versions", "donor");
+      const [history, v1] = await Promise.all(["history.yaml", "v1.md"].map((n) => readFile(join(from, n), "utf-8")));
+      await api.run("context_create", { id: "nodes/notes/victim", title: "Victim", content: "## Summary\nx\n", publish: false }, ctx);
+      await writeConfig(SUMMARY);
+      const res = await api.run<{ failed: { id?: string }[]; written: number }>(
+        "context_import",
+        {
+          files: [
+            { path: "nodes/notes/.versions/victim/history.yaml", content: history },
+            { path: "nodes/notes/.versions/victim/v1.md", content: v1 },
+            { path: `nodes/notes/${decoy}/victim/v1.md`, content: "---\ntitle: Victim\n---\n## Summary\nx\n" },
+          ],
+          publish: false,
+        },
+        ctx,
+      );
+      expect(res.failed.map((f) => f.id)).toContain("nodes/notes/.versions/victim/history.yaml");
+      expect(await exists("nodes/notes/.versions/victim/history.yaml")).toBe(false);
+    },
+  );
+
+  it("an imported history that does not rebuild and verify from what the vault will hold is refused", async () => {
+    await writeConfig(SUMMARY);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          {
+            path: "nodes/notes/.versions/x/history.yaml",
+            content: yaml.dump({ document: "nodes/notes/x", versions: [{ version: 1, keyframe: true, edited_by: "a", edited_at: "2026-01-01T00:00:00Z", content_hash: `sha256:${"0".repeat(64)}`, chain_hash: `sha256:${"0".repeat(64)}` }] }),
+          },
+          { path: "nodes/notes/.versions/x/v1.md", content: "---\ntitle: X\n---\n## Summary\nx\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toContain("nodes/notes/.versions/x/history.yaml");
+  });
+
+  it.skipIf(process.platform === "win32")("erasing a deep id with a ~digit segment stays fast", async () => {
+    const deep = `${"a/".repeat(400)}`;
+    await api.run("context_create", { id: `${deep}doc`, title: "Doc", content: "x" }, ctx);
+    const started = Date.now();
+    await refusal("context_delete", { id: `${deep}x~1/${"b/".repeat(800)}z` });
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it("an import never replaces a sealed PDF, even beside its own .md, nor an archived binary with other bytes", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const md = await readFile(join(dir, `${res.id}.md`), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.md`, content: md }, { path: `${res.id}.pdf`, content: "%PDF-1.4 evil" }], overwrite: true },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain(`${res.id}.pdf`);
+    const name = res.id.split("/").pop()!;
+    const folder = res.id.split("/").slice(0, -1).join("/");
+    const archive = `${folder}/.versions/${name}/${"a".repeat(64)}.pdf`;
+    const arch = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: archive, content: "not those bytes" }], overwrite: true },
+      ctx,
+    );
+    expect(arch.failed.map((f) => f.id)).toEqual([archive]);
+  });
+
+  it("reads of an id no file system could hold fail without naming the vault path", async () => {
+    for (const op of ["context_get", "context_versions", "context_reconstruct"]) {
+      const err = await refusal(op, { id: `nodes/${"z".repeat(300)}`, version: 1 });
+      expect(err.message, op).not.toContain(dir);
+    }
+  });
+});
