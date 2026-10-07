@@ -9,7 +9,7 @@ import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink, rename } from
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { publishDocument, publishDocuments } from "../publish.js";
-import { computeContentHash } from "../integrity.js";
+import { computeContentHash, sha256Bytes } from "../integrity.js";
 import { sealedHead } from "../structure-store.js";
 import yaml from "js-yaml";
 import { NestStorage } from "../storage.js";
@@ -1887,5 +1887,97 @@ describe("architecture round 10: judged bytes are landed bytes", () => {
     });
     const head = await sealedHead("d", { versions: [entry(2), entry(1)] } as never, () => "x", () => null);
     expect(head).toBeNull();
+  });
+});
+
+describe("QA round 10: duplicate spellings of a history file, sidecars against the disk, native name limits", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const pinned = (content: string) =>
+    yaml.dump({
+      versions: [
+        {
+          version: 1,
+          keyframe: true,
+          edited_by: "a",
+          edited_at: "2026-01-01T00:00:00Z",
+          content_hash: computeContentHash(content),
+          chain_hash: `sha256:${"0".repeat(64)}`,
+        },
+      ],
+    });
+
+  it.each([["the unjudged spelling first", false], ["the judged spelling first", true]])(
+    "two spellings of one history file never leave an unjudged head (%s)",
+    async (_l, longFirst) => {
+      await writeConfig(SUMMARY);
+      const V = "nodes/notes/.versions/victim";
+      const long = `${V}/${"./".repeat(520)}`;
+      const B = "---\ntitle: V\n---\n## Notes\nx\n";
+      const G = "---\ntitle: V\n---\n## Summary\nx\n";
+      const short = [
+        { path: `${V}/history.yaml`, content: pinned(B) },
+        { path: `${V}/v1.md`, content: B },
+      ];
+      const dotted = [
+        { path: `${long}history.yaml`, content: pinned(G) },
+        { path: `${long}v1.md`, content: G },
+      ];
+      await api.run(
+        "context_import",
+        {
+          files: [{ path: "nodes/notes/victim.md", content: G }, ...(longFirst ? [...dotted, ...short] : [...short, ...dotted])],
+          overwrite: true,
+          publish: false,
+        },
+        ctx,
+      );
+      const second = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        { files: [{ path: "nodes/notes/victim.md", content: "---\ntitle: V\nstatus: published\n---\n## Notes\ny\n" }], overwrite: true },
+        ctx,
+      );
+      expect(second.failed.map((f) => f.id)).toEqual(["nodes/notes/victim.md"]);
+    },
+  );
+
+  it.each([["one call, after other files", true], ["a later call", false]])(
+    "a rewritten .md never lets an import replace the PDF on disk (%s)",
+    async (_l, oneCall) => {
+      const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+      const sidecar = join(dir, `${res.id}.pdf`);
+      const sealed = await readFile(sidecar);
+      const evil = "%PDF-1.4 evil";
+      const md = (await readFile(join(dir, `${res.id}.md`), "utf-8")).replace(
+        /sha256:[0-9a-f]{64}/,
+        sha256Bytes(Buffer.from(evil, "utf-8")),
+      );
+      const filler = Array.from({ length: 40 }, (_, i) => ({ path: `assets/f${i}.yaml`, content: "x: 1\n" }));
+      if (oneCall) {
+        await api.run(
+          "context_import",
+          { files: [{ path: `${res.id}.md`, content: md }, ...filler, { path: `${res.id}.pdf`, content: evil }], overwrite: true },
+          ctx,
+        );
+      } else {
+        await api.run("context_import", { files: [{ path: `${res.id}.md`, content: md }], overwrite: true, publish: false }, ctx);
+        const later = await api.run<{ failed: { id?: string }[] }>(
+          "context_import",
+          { files: [{ path: `${res.id}.pdf`, content: evil }], overwrite: true },
+          ctx,
+        );
+        expect(later.failed.map((f) => f.id)).toEqual([`${res.id}.pdf`]);
+      }
+      expect((await readFile(sidecar)).equals(sealed)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform === "win32")("a name NTFS holds (86 CJK characters) is still readable", async () => {
+    const id = `nodes/${"漢".repeat(86)}`;
+    const err = await refusal("context_get", { id });
+    expect(err.code).not.toBe("INVALID_DOCUMENT_ID");
   });
 });

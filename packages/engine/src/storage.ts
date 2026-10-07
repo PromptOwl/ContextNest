@@ -210,6 +210,13 @@ export function assertFitsFileSystem(
   raw: string,
   maxSegmentBytes = MAX_SEGMENT_BYTES,
   maxLength = MAX_DOCUMENT_ID_LENGTH,
+  /**
+   * Measure a name as this platform's file system does — NTFS counts UTF-16
+   * units, so 86 CJK characters (258 UTF-8 bytes) is a legal name there. For
+   * reads and erases of what may already exist; new names stay in bytes, so
+   * a vault written anywhere fits everywhere.
+   */
+  native = false,
 ): void {
   const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
   if (raw.length > maxLength) {
@@ -218,7 +225,8 @@ export function assertFitsFileSystem(
       "INVALID_DOCUMENT_ID",
     );
   }
-  if (raw.split(/[/\\]/).some((seg) => Buffer.byteLength(seg) > maxSegmentBytes)) {
+  const size = native && process.platform === "win32" ? (seg: string) => seg.length : (seg: string) => Buffer.byteLength(seg);
+  if (raw.split(/[/\\]/).some((seg) => size(seg) > maxSegmentBytes)) {
     throw new ContextNestError(
       `Invalid path ${shown}: a folder or file name is longer than ${maxSegmentBytes} bytes`,
       "INVALID_DOCUMENT_ID",
@@ -267,7 +275,7 @@ export function assertNotMachineryPath(raw: string): void {
  * hold, refused before its error could name the vault path.
  */
 export async function assertErasableDocumentId(root: string, id: string): Promise<void> {
-  assertFitsFileSystem(id, 255, 4096);
+  assertFitsFileSystem(id, 255, 4096, true);
   assertNotMachineryPath(id);
   await assertResolvesOutsideMachinery(root, id);
 }
@@ -316,7 +324,7 @@ export async function assertResolvesOutsideMachinery(root: string, id: string): 
 
 export function assertSafeDocumentId(raw: string): void {
   // No file system holds more; refused here so an error never names the vault path.
-  assertFitsFileSystem(raw, 255, 4096);
+  assertFitsFileSystem(raw, 255, 4096, true);
   const segments = raw.split(/[/\\]/);
   if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(

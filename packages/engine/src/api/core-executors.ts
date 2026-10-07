@@ -1344,12 +1344,23 @@ async function assertSidecarKept(
   }
   const owner = f.path.slice(0, -".pdf".length);
   const node = await readIfExists(ctx, owner);
-  const sealed = node?.frontmatter.type === "pdf" ? node.frontmatter.pdf?.sha256 : undefined;
+  if (!node) return; // no document here: an ordinary file, not a sidecar
+  // Judged against the bytes on disk, which nothing in this import has touched
+  // yet — never against the .md, which this call or an earlier one may have
+  // rewritten to name other bytes.
+  const onDisk = await ctx.storage.readVaultBinary(f.path).catch(() => null);
+  if (onDisk) {
+    if (sha256Bytes(onDisk) !== bytes) {
+      throw new ContextNestError(
+        `${f.raw}: would replace the PDF of ${owner} on disk — import a new version with context_import_pdf`,
+        "VALIDATION_FAILED",
+      );
+    }
+    return;
+  }
+  const sealed = node.frontmatter.type === "pdf" ? node.frontmatter.pdf?.sha256 : undefined;
   if (sealed && bytes !== sealed) {
-    throw new ContextNestError(
-      `${f.raw}: would replace the sealed PDF of ${owner} — import a new version with context_import_pdf`,
-      "VALIDATION_FAILED",
-    );
+    throw new ContextNestError(`${f.raw}: is not the PDF ${owner} records`, "VALIDATION_FAILED");
   }
 }
 
