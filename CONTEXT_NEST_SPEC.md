@@ -257,8 +257,9 @@ Every document has a `type` that classifies its content:
 | `artifact` | Generated outputs kept for reference | A produced report, a generated spec |
 | `table` | Tabular data | A pricing matrix, a feature comparison |
 | `pdf` | A PDF document: the body is the text extracted from it, and the PDF itself is kept beside the node as a binary sidecar | A contract, a board deck, a research paper |
+| `task` | A unit of work tracked on a project board. Board fields (`assignee`, `due`, `priority`, `parent`) live in `metadata` | "Ship the onboarding email", a bug to fix |
 
-The `source` type is described in detail in §1.9, the `skill` type in §1.10, and the `pdf` type in §1.11. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`.
+The `source` type is described in detail in §1.9, the `skill` type in §1.10, and the `pdf` type in §1.11. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`. `task` likewise carries no type-specific validation rules; its board fields are ordinary `metadata` keys, and whether a task goes through review is an implementation's governance decision, not a validation rule.
 
 ### 1.7 Inline Syntax
 
