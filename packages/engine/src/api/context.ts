@@ -74,6 +74,13 @@ export interface OperationLimits {
    * `DEFAULT_PDF_MAX_BYTES` (50 MB).
    */
   readonly pdfMaxBytes?: number;
+  /**
+   * Most version-history text one `context_import` may replay while judging
+   * its batch (characters, across every history it checks). Over it, the call
+   * is refused whole and asked to split. Default `DEFAULT_IMPORT_REPLAY_CHARS`
+   * (512 Mi — about two seconds of work).
+   */
+  readonly importReplayChars?: number;
 }
 
 /**

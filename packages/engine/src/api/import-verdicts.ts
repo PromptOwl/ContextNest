@@ -6,10 +6,11 @@
  * bytes where bytes are what is protected (PDF sidecars and archives).
  */
 
+import { isDeepStrictEqual } from "node:util";
 import yaml from "js-yaml";
 import { mapInBatches } from "../concurrency.js";
 import { ContextNestError, CorruptHistoryError, ForgottenDocumentError } from "../errors.js";
-import { isVersionArtifactPath, KEPT_IMPORT_NAMES } from "../import-hygiene.js";
+import { isVersionArtifactPath, KEPT_IMPORT_NAMES, slugifyImportPath } from "../import-hygiene.js";
 import { computeContentHash, sha256Bytes } from "../integrity.js";
 import { parseDocument } from "../parser.js";
 import { documentHistorySchema } from "../schemas.js";
@@ -24,7 +25,7 @@ import {
   type StructureDoc,
   type Violation,
 } from "../structure.js";
-import { sealedHeadView, structurePublishViolations } from "../structure-store.js";
+import { sealedHeadView, structurePublishViolations, type ReplayBudget } from "../structure-store.js";
 import { importVerdict, type TombstoneIndex } from "../tombstones.js";
 import type { ContextNode, DocumentHistory } from "../types.js";
 import { readIfExists, type OperationContext } from "./context.js";
@@ -50,9 +51,15 @@ export async function importRefusals(
   opts: { overwrite: boolean; tombstones: TombstoneIndex | null },
 ): Promise<Map<string, string>> {
   const refused = new Map<string, string>();
+  // Sealed heads this call replays share one budget: a small request must not
+  // buy unbounded work from histories planted earlier.
+  const budget: ReplayBudget = { left: ctx.limits?.importReplayChars ?? DEFAULT_IMPORT_REPLAY_CHARS };
+  const spellings = new Map<string, number>();
+  for (const f of plan) spellings.set(f.path.toLowerCase(), (spellings.get(f.path.toLowerCase()) ?? 0) + 1);
   await mapInBatches(plan, async (f) => {
     try {
-      await assertImportable(ctx, f, opts.tombstones);
+      assertKeptName(f, spellings);
+      await assertImportable(ctx, f, opts.tombstones, budget);
     } catch (err) {
       refused.set(f.raw, err instanceof Error ? err.message : String(err));
     }
@@ -80,10 +87,39 @@ export async function importRefusals(
       refused.set(f.raw, `${f.raw}: another file of ${v.owner}'s history was refused, so none of it lands`);
     }
   }
-  if (!rules) return refused;
-  const verdicts = await importVerdicts(ctx, rules, plan.filter((f) => !refused.has(f.raw)), opts.overwrite);
-  for (const [raw, reason] of verdicts) refused.set(raw, reason);
+  if (rules) {
+    const verdicts = await importVerdicts(ctx, rules, plan.filter((f) => !refused.has(f.raw)), opts.overwrite, budget);
+    for (const [raw, reason] of verdicts) refused.set(raw, reason);
+  }
+  // Over budget, some verdict was cut short: none of this call is trusted.
+  if (budget.spent) {
+    for (const f of plan) {
+      if (!refused.has(f.raw)) {
+        refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls`);
+      }
+    }
+  }
   return refused;
+}
+
+/** Most history characters one import may replay — see OperationLimits.importReplayChars. */
+export const DEFAULT_IMPORT_REPLAY_CHARS = 512 * 2 ** 20;
+
+/**
+ * A name kept with its capitals (`README.md`) is never renamed to dodge a
+ * collision — `INDEX-2.md` would be read as a node — nor written beside
+ * another spelling of itself in the batch, one file on a case-insensitive
+ * file system.
+ */
+function assertKeptName(f: PlannedFile, spellings: Map<string, number>): void {
+  const asked = slugifyImportPath(f.raw).split("/").pop() ?? "";
+  if (!KEPT_IMPORT_NAMES.has(asked)) return;
+  if (f.path.split("/").pop() !== asked) {
+    throw new ContextNestError(`${f.raw}: ${asked} is already in the vault — import with overwrite to replace it`, "VALIDATION_FAILED");
+  }
+  if ((spellings.get(f.path.toLowerCase()) ?? 0) > 1) {
+    throw new ContextNestError(`${f.raw}: another file of this import is the same name in other capitals`, "VALIDATION_FAILED");
+  }
 }
 
 /**
@@ -121,6 +157,9 @@ export function importedDoc(relPath: string, content: string): StructureDoc | nu
 /** Where a document's history and staged edits live: `<dir>/<store>/<doc>/…`. */
 const PER_DOCUMENT_STORES = [".versions", "_suggestions"];
 
+/** What the vault root's .versions/ holds besides documents' folders. */
+const ROOT_LEDGERS = new Set(["context_history.yaml", "context_latest.yaml", "chain_events.yaml"]);
+
 /** The index of the per-document store segment in a path, or -1. */
 function storeIndex(segs: string[]): number {
   // As Windows resolves the name: `.versions.` and `.versions::$X` are `.versions`.
@@ -149,6 +188,7 @@ async function importVerdicts(
   rules: CompiledStructure,
   plan: Array<{ raw: string; path: string; content: string }>,
   overwrite: boolean,
+  budget: ReplayBudget,
 ): Promise<Map<string, string>> {
   const refused = new Map<string, string>();
   const refusedDocs = new Set<string>();
@@ -168,7 +208,7 @@ async function importVerdicts(
   }
   const setVerdicts = new Map<string, { refusal: string | null; head: StructureDoc | null }>();
   await mapInBatches([...sets], async ([owner, set]) => {
-    setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set));
+    setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set, budget));
   });
 
   // Each document is judged as the publish that follows will judge it: against
@@ -182,7 +222,7 @@ async function importVerdicts(
     let violations: Violation[];
     if (brought) violations = brought.head ? checkUpdate(rules, brought.head, doc) : checkDocument(rules, doc);
     else if (overwrite && (await readIfExists(ctx, doc.id))) {
-      violations = (await structurePublishViolations(ctx.storage, rules, doc)).violations;
+      violations = (await structurePublishViolations(ctx.storage, rules, doc, undefined, budget)).violations;
     } else violations = checkDocument(rules, doc);
     docVerdicts.set(doc.id, violations);
   });
@@ -220,6 +260,7 @@ async function assertImportable(
   ctx: OperationContext,
   f: { raw: string; path: string; content: string },
   tombstones: TombstoneIndex | null,
+  budget: ReplayBudget,
 ): Promise<void> {
   assertFitsFileSystem(f.path, 255);
   const alias = machineryAliasSegment(f.path);
@@ -234,8 +275,16 @@ async function assertImportable(
   if (versionsArtifact(f.path)?.name.includes("/")) {
     throw new ContextNestError(`${f.raw}: a document's .versions/ folder holds files, not folders`, "VALIDATION_FAILED");
   }
+  // `.versions/<doc>` is the document's folder: a file there would keep its
+  // history from ever being written. The vault root's .versions/ holds the
+  // nest's own ledgers too.
+  const segs = f.path.split("/");
+  const k = segs.findIndex((seg) => comparableSegment(seg) === ".versions");
+  if (k !== -1 && k === segs.length - 2 && !(k === 0 && ROOT_LEDGERS.has(segs[k + 1]))) {
+    throw new ContextNestError(`${f.raw}: .versions/ holds a folder per document, not files`, "VALIDATION_FAILED");
+  }
   await assertNoCaseTwin(ctx, f);
-  await assertSidecarKept(ctx, f);
+  await assertSidecarKept(ctx, f, budget);
   if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
     throw new ContextNestError(
       `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,
@@ -248,18 +297,20 @@ async function assertImportable(
 }
 
 /**
- * Refuse an imported PDF binary that would replace sealed bytes: a pdf node's
- * `<doc>.pdf` is the only copy of its current version, and an archived
- * `.versions/<doc>/<sha-hex>.pdf` is named by its own hash. Judged on bytes
- * first — the same bytes (a chunked restore) always land. A node its `.md` or
- * its history marks as a pdf node (an unverifiable history counts) keeps its
- * sidecar; one that both say is not a pdf node holds an ordinary file, whose
- * replaced bytes archiveReplacedPdf keeps. A new version of a PDF comes
- * through context_import_pdf, which archives the one it replaces.
+ * Refuse an imported PDF binary that would replace PDF bytes on disk: a pdf
+ * node's `<doc>.pdf` is the only copy of its current version, and an archived
+ * `.versions/<doc>/<sha-hex>.pdf` is named by its own hash. Judged on bytes —
+ * what is protected is what is on disk. The same bytes always land; with none
+ * there, there is nothing to replace, and verify and publish hold the sidecar
+ * to its `.md` (§1.11). Other bytes over a pdf node's sidecar — one its `.md`
+ * or its history marks as such, an unverifiable history included — are
+ * refused; over any other file they land, and archiveReplacedPdf keeps what
+ * they replace. A new version of a PDF comes through context_import_pdf.
  */
 async function assertSidecarKept(
   ctx: OperationContext,
   f: { raw: string; path: string; content: string },
+  budget: ReplayBudget,
 ): Promise<void> {
   if (!/\.pdf$/i.test(f.path)) return;
   const bytes = sha256Bytes(Buffer.from(f.content, "utf-8"));
@@ -271,44 +322,27 @@ async function assertSidecarKept(
     return;
   }
   const onDisk = await vaultBytesIfExists(ctx, f.path);
-  if (onDisk && sha256Bytes(onDisk) === bytes) return;
+  if (!onDisk || sha256Bytes(onDisk) === bytes) return;
   const owner = f.path.slice(0, -".pdf".length);
   const node = await readIfExists(ctx, owner);
-  const sealed = await sealedPdfOf(ctx, owner, node);
-  // Neither the .md nor any history makes this a pdf node: an ordinary file
-  // (a companion PDF), whose replaced bytes are archived as it lands.
-  if (node?.frontmatter.type !== "pdf" && sealed === null) return;
-  if (onDisk) {
+  if (node?.frontmatter.type === "pdf" || (await pdfByHistory(ctx, owner, budget))) {
     throw new ContextNestError(
       `${f.raw}: would replace the PDF of ${owner} on disk — import a new version with context_import_pdf`,
-      "VALIDATION_FAILED",
-    );
-  }
-  if (bytes !== sealed) {
-    throw new ContextNestError(
-      `${f.raw}: is not the PDF ${owner}'s sealed version records — restore it with the same bytes, or import a new version with context_import_pdf`,
       "VALIDATION_FAILED",
     );
   }
 }
 
 /**
- * The `pdf.sha256` a document's history seals: null when it seals none,
- * undefined when the history does not verify (protected, never exempt). With
- * no history at all nothing is sealed yet, so the live `.md`'s block stands —
- * an assertion its first publish checks (§1.11).
+ * Whether a document's history marks it as a pdf node: its verified head is
+ * one, or the history cannot be verified (protected, never exempt).
  */
-async function sealedPdfOf(
-  ctx: OperationContext,
-  owner: string,
-  node: ContextNode | null,
-): Promise<string | null | undefined> {
+async function pdfByHistory(ctx: OperationContext, owner: string, budget: ReplayBudget): Promise<boolean> {
   const history = await ctx.storage.readHistory(owner).catch(() => undefined);
-  if (history === null) return node?.frontmatter.type === "pdf" ? (node.frontmatter.pdf?.sha256 ?? null) : null;
-  if (history === undefined) return undefined;
-  const head = await sealedHeadView(owner, history, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n));
-  if (!head?.node) return undefined;
-  return head.node.frontmatter.type === "pdf" ? (head.node.frontmatter.pdf?.sha256 ?? null) : null;
+  if (history === null) return false;
+  if (history === undefined) return true;
+  const head = await sealedHeadView(owner, history, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n), budget);
+  return !head?.node || head.node.frontmatter.type === "pdf";
 }
 
 /** A vault file's bytes, or null when there is none. */
@@ -374,6 +408,7 @@ async function historySetVerdict(
   rules: CompiledStructure,
   owner: string,
   set: Map<string, string>,
+  budget: ReplayBudget,
 ): Promise<{ refusal: string | null; head: StructureDoc | null }> {
   const refuse = (refusal: string) => ({ refusal, head: null });
   let history: DocumentHistory | null = null;
@@ -407,7 +442,7 @@ async function historySetVerdict(
   // it, so a head this call brings is judged as an update over it — only for
   // what it newly breaks, as any other write to this document is.
   const here = onDisk
-    ? await sealedHeadView(owner, onDisk, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n))
+    ? await sealedHeadView(owner, onDisk, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n), budget)
     : null;
   const judge = (head: StructureDoc) => (here ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
   // The history.yaml this call brings is written last and may not land (a file
@@ -418,16 +453,22 @@ async function historySetVerdict(
   // disk already holds grants nothing new.
   if (text !== undefined && onDisk) {
     const pinnedHash = new Map(onDisk.versions.map((e) => [e.version, e.content_hash]));
-    const pinned = (name: string, n: number, read: () => Promise<string | null>) => {
+    const counts = (name: string, n: number) => {
       const m = set.get(name);
-      return m !== undefined && computeContentHash(m) === pinnedHash.get(n) ? m : read();
+      return m !== undefined && computeContentHash(m) === pinnedHash.get(n);
     };
-    const kept = await sealedHeadView(
-      owner,
-      onDisk,
-      (n) => pinned(`v${n}.md`, n, () => ctx.storage.readKeyframe(owner, n)),
-      (n) => pinned(`v${n}.diff`, n, () => ctx.storage.readDiff(owner, n)),
-    );
+    const pinned = (name: string, n: number, read: () => Promise<string | null>) => (counts(name, n) ? set.get(name)! : read());
+    // With no file of this call pinned there, the kept head is the head here.
+    const anyPinned = onDisk.versions.some((e) => counts(`v${e.version}.md`, e.version) || counts(`v${e.version}.diff`, e.version));
+    const kept = anyPinned
+      ? await sealedHeadView(
+          owner,
+          onDisk,
+          (n) => pinned(`v${n}.md`, n, () => ctx.storage.readKeyframe(owner, n)),
+          (n) => pinned(`v${n}.diff`, n, () => ctx.storage.readDiff(owner, n)),
+          budget,
+        )
+      : here;
     if (kept && kept.raw !== here?.raw) {
       const violations = judge(kept.doc);
       if (violations.length > 0) {
@@ -441,7 +482,8 @@ async function historySetVerdict(
   // could make a later check lenient.
   const last = history?.versions.at(-1);
   if (!history || !last || last.tombstone) return { refusal: null, head: null };
-  const view = await sealedHeadView(owner, history, keyframe, diff);
+  // The same history as the one here rebuilds, hash for hash, to the same head.
+  const view = here && isDeepStrictEqual(history.versions, onDisk?.versions) ? here : await sealedHeadView(owner, history, keyframe, diff, budget);
   // Refused, not waved through: the bytes judged here are pinned to their
   // content hashes, so if a file then fails to land the head on disk no
   // longer verifies and is judged in full — but only if the head judged here

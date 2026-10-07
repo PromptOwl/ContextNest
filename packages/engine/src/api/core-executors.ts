@@ -1876,7 +1876,7 @@ const structureExec: OperationExecutor = async (ctx, input: any) => {
       .filter((p) => !structured || p === "nodes" || p.startsWith("nodes/"));
     out.violations = auditStructure(
       rules,
-      docs.map((d) => ({ id: d.id, type: d.frontmatter.type, body: d.body })),
+      docs.map((d) => structureView(d.id, d)),
       folders,
     );
   }

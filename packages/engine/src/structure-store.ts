@@ -97,6 +97,7 @@ export async function sealedHead(
   history: DocumentHistory,
   readKeyframe: ArtifactReader,
   readDiff: ArtifactReader,
+  budget?: ReplayBudget,
 ): Promise<string | null> {
   const versions = history.versions;
   const end = versions.length - 1;
@@ -118,23 +119,65 @@ export async function sealedHead(
       async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null)),
       4,
     );
-    if (contents.some((c, i) => c === null || computeContentHash(c) !== segment[i].content_hash)) return null;
-    // Replayed here, the work counted as it goes: each diff walks the whole
-    // text, so one planted history must not stall every write judged against it.
-    let content = contents[0] as string;
-    let work = 0;
-    for (const patch of contents.slice(1) as string[]) {
-      if (!patch) continue;
-      work += content.length;
-      if (work > MAX_REPLAY_WORK) return null;
-      const next = applyPatch(content, patch);
-      if (typeof next !== "string") return null;
-      content = next;
-    }
-    return content;
+    return await oneAtATime(() => verifyAndReplay(segment, contents, budget));
   } catch {
     return null;
   }
+}
+
+/**
+ * Hashed and replayed, the work counted as it goes and the event loop let in
+ * every so often: each diff walks the whole text, so one planted history must
+ * neither stall the process nor every write judged against it.
+ */
+async function verifyAndReplay(
+  segment: DocumentHistory["versions"],
+  contents: (string | null)[],
+  budget: ReplayBudget | undefined,
+): Promise<string | null> {
+  let sinceYield = 0;
+  const step = async (chars: number) => {
+    sinceYield += chars;
+    if (sinceYield >= YIELD_EVERY) {
+      sinceYield = 0;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+  for (const [i, c] of contents.entries()) {
+    if (c === null || computeContentHash(c) !== segment[i].content_hash) return null;
+    await step(c.length);
+  }
+  let content = contents[0] as string;
+  let work = 0;
+  for (const patch of contents.slice(1) as string[]) {
+    if (!patch) continue;
+    work += content.length;
+    if (work > MAX_REPLAY_WORK) return null;
+    if (budget) {
+      budget.left -= content.length;
+      if (budget.left < 0) {
+        budget.spent = true;
+        return null;
+      }
+    }
+    const next = applyPatch(content, patch);
+    if (typeof next !== "string") return null;
+    content = next;
+    await step(content.length);
+  }
+  return content;
+}
+
+let replaying: Promise<unknown> = Promise.resolve();
+
+/**
+ * One replay at a time, process-wide. Replays that yield together each take a
+ * step per turn of the event loop, and the turn is as long as all of them.
+ */
+function oneAtATime<T>(task: () => Promise<T>): Promise<T> {
+  const run = replaying.then(task, task);
+  replaying = run.catch(() => undefined);
+  return run;
 }
 
 /**
@@ -147,8 +190,9 @@ export async function sealedHeadView(
   history: DocumentHistory,
   readKeyframe: ArtifactReader,
   readDiff: ArtifactReader,
+  budget?: ReplayBudget,
 ): Promise<{ raw: string; node: ContextNode | null; doc: StructureDoc } | null> {
-  const raw = await sealedHead(id, history, readKeyframe, readDiff);
+  const raw = await sealedHead(id, history, readKeyframe, readDiff, budget);
   if (raw === null) return null;
   const text = normalizeForHash(raw);
   try {
@@ -173,6 +217,18 @@ const MAX_SEALED_SEGMENT = 1000;
  */
 const MAX_REPLAY_WORK = 128 * 2 ** 20;
 
+/** Characters hashed or replayed between yields to the event loop. */
+const YIELD_EVERY = 2 ** 20;
+
+/**
+ * Replay work one caller allows across many sealed heads (an import judging a
+ * batch): spent heads come back null and set `spent`, which the caller reports.
+ */
+export interface ReplayBudget {
+  left: number;
+  spent?: boolean;
+}
+
 /**
  * What a publish of `live` breaks under enforced rules (§11.1.1): a first
  * publish is judged in full, a later one only for what the live file newly
@@ -190,6 +246,7 @@ export async function structurePublishViolations(
   rules: CompiledStructure,
   live: StructureDoc,
   history?: DocumentHistory | null,
+  budget?: ReplayBudget,
 ): Promise<{ violations: Violation[]; first: boolean }> {
   const id = live.id;
   let known: DocumentHistory | null = null;
@@ -201,7 +258,7 @@ export async function structurePublishViolations(
   const first = !known || known.versions.length === 0;
   // The view that was hashed: any bytes with this head's hashes get the same verdict.
   const head = known
-    ? await sealedHeadView(id, known, (v) => storage.readKeyframe(id, v), (v) => storage.readDiff(id, v))
+    ? await sealedHeadView(id, known, (v) => storage.readKeyframe(id, v), (v) => storage.readDiff(id, v), budget)
     : null;
   if (!head?.node) return { violations: checkDocument(rules, live), first };
   return { violations: checkUpdate(rules, head.doc, live), first };
