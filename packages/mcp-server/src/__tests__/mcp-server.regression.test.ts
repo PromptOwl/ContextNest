@@ -1479,6 +1479,8 @@ describe("[regression] MCP server e2e — context_query", () => {
   });
 });
 
+// ─── Onboarding: placement outside discovered folders ─────────────────────────
+
 describe("[regression] MCP server e2e — writes outside nodes/ are re-rooted", () => {
   let vault: string;
   let client: Client;

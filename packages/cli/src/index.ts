@@ -2969,15 +2969,6 @@ program
       const held = countHeldMatches(await storage.discoverDocuments(), query);
       if (held > 0) console.log(chalk.dim(`\n${heldSearchHint(held)}`));
     }
-    const storage = getStorage();
-    const limit = searchLimit(opts.limit);
-    const out = await cliApi().run<{ results: SearchHitView[]; count?: number; total?: number }>(
-      "context_search",
-      { query, ...(limit ? { limit } : {}) },
-      opContext(storage, "cli@contextnest.local"),
-    );
-    // Rendering shared with the remote branch (doc-views.ts).
-    printSearchResults(out, opts);
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────
