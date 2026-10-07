@@ -100,6 +100,8 @@ import {
   enforcedStructure,
   missingFolders,
   assertStructurePublish,
+  structurePublishViolations,
+  isEnforced,
   scaffoldFolders,
 } from "../structure-store.js";
 import { NON_DOCUMENT_BASENAMES } from "../storage.js";
@@ -568,7 +570,10 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // content, never takes content again (§6.3.4).
   await assertNotForgotten(ctx.storage, node);
   // A held create is not scaffolded now — nothing beyond the held write lands
-  // before a human approves it; its first publish scaffolds (see `publish`).
+  // before a human approves it; its first publish scaffolds (publishDocument).
+  // Scaffolded here, not left to the publish, because a draft (`publish:
+  // false`) is never published; for a publishing create the publish's own
+  // pass finds everything already in place.
   const created = rules && !hold ? await missingFolders(ctx.storage, node.id) : null;
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
@@ -1202,10 +1207,11 @@ function storeOwner(relPath: string): string | null {
 /**
  * Structure verdicts for a planned `files[]` batch: raw path → refusal.
  * A document is checked in full, or — when it overwrites one already in the
- * vault — only for what it newly breaks (grandfathering). Any other file is
+ * vault — as the publish that follows will judge it. Any other file is
  * refused when its folder may not exist; in a structured vault only `nodes/`
  * is content, so root-level folders (`assets/`) are not judged. The history
- * of a refused document is refused with it.
+ * of a refused document is refused with it, and so is history for a document
+ * already in the vault that the batch does not bring.
  */
 async function importVerdicts(
   ctx: OperationContext,
@@ -1217,22 +1223,23 @@ async function importVerdicts(
   const refusedDocs = new Set<string>();
   const structured = (await ctx.storage.detectLayout()) === "structured";
   const message = (v: Violation[]) => v.map((x) => x.message).join(" ");
-  // Documents an overwrite replaces, read in parallel: grandfathering judges
-  // the replacement against them.
+  // A document an overwrite replaces is judged as the publish that follows
+  // will judge it (grandfathered against its sealed version, in full if it was
+  // never sealed), read in parallel — so nothing lands that the publish refuses.
   const docs = plan.map((f) => importedDoc(f.path, f.content));
-  const existing = new Map<string, ContextNode>();
+  const overwritten = new Map<string, Violation[]>();
   if (overwrite) {
     await mapInBatches(docs, async (doc) => {
-      const found = doc ? await readIfExists(ctx, doc.id) : null;
-      if (doc && found) existing.set(doc.id, found);
+      if (doc && (await readIfExists(ctx, doc.id))) {
+        overwritten.set(doc.id, (await structurePublishViolations(ctx.storage, rules, doc)).violations);
+      }
     });
   }
   plan.forEach((f, i) => {
     const doc = docs[i];
     let violations: Violation[];
     if (doc) {
-      const before = existing.get(doc.id);
-      violations = before ? checkUpdate(rules, structureDoc(before), doc) : checkDocument(rules, doc);
+      violations = overwritten.get(doc.id) ?? checkDocument(rules, doc);
       if (violations.length > 0) refusedDocs.add(doc.id);
     } else {
       const norm = f.path.replace(/\\/g, "/");
@@ -1243,13 +1250,20 @@ async function importVerdicts(
     }
     if (violations.length > 0) refused.set(f.raw, `${f.raw}: ${message(violations)}`);
   });
-  for (const f of plan) {
+  const batchDocs = new Set(docs.flatMap((d) => (d ? [d.id] : [])));
+  await mapInBatches(plan, async (f) => {
+    if (refused.has(f.raw)) return;
     // A document's history, staged edits and PDF sidecar go where it goes.
-    const owner = storeOwner(f.path) ?? (/\.pdf$/i.test(f.path) ? f.path.slice(0, -".pdf".length) : null);
-    if (owner && refusedDocs.has(owner) && !refused.has(f.raw)) {
+    const store = storeOwner(f.path);
+    const owner = store ?? (/\.pdf$/i.test(f.path) ? f.path.slice(0, -".pdf".length) : null);
+    if (owner && refusedDocs.has(owner)) {
       refused.set(f.raw, `${f.raw}: belongs to ${owner}, which the structure rules refused`);
+    } else if (store && !batchDocs.has(store) && (await readIfExists(ctx, store))) {
+      // History planted beside a document already here would turn its
+      // first-publish check (in full) into an update check.
+      refused.set(f.raw, `${f.raw}: belongs to ${store}, already in the vault and not part of this import`);
     }
-  }
+  });
   return refused;
 }
 
@@ -1946,7 +1960,7 @@ const structureExec: OperationExecutor = async (ctx, input: any) => {
     // not thrown, so an agent (and `ctx add`'s template lookup) learns why.
     if (!(err instanceof ContextNestError && err.code === "CONFIG_ERROR")) throw err;
     return {
-      enforce: config?.structure?.enforce === true,
+      enforce: isEnforced(config),
       closed: config?.structure?.closed === true,
       folders: [],
       templates: {},

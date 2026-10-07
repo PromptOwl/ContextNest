@@ -535,6 +535,8 @@ export {
   assertStructureDelete,
   scaffoldFirstPublish,
   assertStructurePublish,
+  structurePublishViolations,
+  isEnforced,
 } from "./structure-store.js";
 
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.

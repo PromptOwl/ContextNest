@@ -50,9 +50,9 @@ import type {
   RbacHook,
   VersionEntry,
 } from "./types.js";
-import type { NestStorage } from "./storage.js";
+import { assertWritableDocumentId, type NestStorage } from "./storage.js";
 import { settlePdfForCommit } from "./pdf-nodes.js";
-import { assertStructureUpdate } from "./structure-store.js";
+import { assertStructurePublish, enforcedStructure } from "./structure-store.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -116,10 +116,8 @@ async function approveSuggestionImpl(
       "content_hash_mismatch",
     );
   }
-  // Approval is the governed write: it is judged against the structure rules
-  // in force now (§11.1.1), for what the edit newly breaks.
-  await assertStructureUpdate(input.storage, input.documentId, approved.content, patched);
-
+  // commitNewVersion judges it against the structure rules in force now
+  // (§11.1.1), for what the edit newly breaks against the approved base.
   const { versionEntry } = await commitNewVersion({
     storage: input.storage,
     documentId: input.documentId,
@@ -422,8 +420,16 @@ interface CommitInput {
 async function commitNewVersion(
   input: CommitInput,
 ): Promise<{ versionEntry: VersionEntry; serialized: string }> {
+  // Every caller (suggestion approval, rollback, czar direct edit) seals and
+  // writes a version, so the id guard and the structure rules (§11.1.1) are
+  // applied here, before anything is written.
+  assertWritableDocumentId(input.documentId);
   const filePath = join(input.storage.root, `${input.documentId}.md`);
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
+
+  // Judged before historyOrRepair: a refused write quarantines nothing.
+  const rules = await enforcedStructure(input.storage);
+  if (rules) await assertStructurePublish(input.storage, rules, parsed, input.knownHistory);
 
   const versionManager = new VersionManager(input.storage);
   // Read once, shared by the numbering and the append below.

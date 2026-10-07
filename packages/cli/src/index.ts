@@ -23,7 +23,7 @@ import {
   CheckpointManager,
   ContextInjector,
   GraphQueryEngine,
-  publishDocument,
+  publishDocuments,
   ContextNestError,
   assertVaultRoot,
   isRefusedCwd,
@@ -1018,12 +1018,15 @@ async function applyStarter(
     await fs.promises.writeFile(packPath, pack.content, "utf-8");
   }
 
-  // Publish all starter nodes
-  for (const node of nodes) {
-    await publishDocument(storage, node.path, {
-      editedBy: "cli@contextnest.local",
-      note: `Created by ${starter.id} starter`,
-    });
+  // Publish all starter nodes as one batch: one checkpoint, and folders the
+  // starter shares between nodes are scaffolded under enforced rules.
+  const published = await publishDocuments(
+    storage,
+    nodes.map((node) => node.path),
+    { editedBy: "cli@contextnest.local", note: `Created by ${starter.id} starter` },
+  );
+  if (published.failed.length > 0) {
+    throw new Error(`Could not publish starter documents: ${published.failed.map((f) => `${f.id}: ${f.error}`).join("; ")}`);
   }
 
   await regenerateIndex(storage);

@@ -17,7 +17,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtemp, rm, cp, readFile, writeFile, access, readdir } from "node:fs/promises";
+import { mkdtemp, rm, cp, readFile, writeFile, access, readdir, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1548,6 +1548,19 @@ describe("[regression] MCP server e2e — structure rules", () => {
     expect(text).toMatch(/Decision/);
     const raw = await readFile(join(vault, "nodes", "decisions", "adr-1-use-postgres.md"), "utf-8");
     expect(raw).toContain("Postgres.");
+  });
+
+  it("the deprecated update_document judges a publishing edit before it writes anything", async () => {
+    // A never-published draft that predates the rules: the edit itself is
+    // grandfathered, but publishing it is its first publish, judged in full.
+    const file = join(vault, "nodes", "drafts", "old.md");
+    const raw = "---\ntitle: Old\ntype: document\nstatus: draft\n---\nold\n";
+    await mkdir(join(vault, "nodes", "drafts"), { recursive: true });
+    await writeFile(file, raw, "utf-8");
+    const { text, isError } = await callText(client, "update_document", { path: "nodes/drafts/old", body: "new" });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/not an allowed folder/);
+    expect(await readFile(file, "utf-8")).toBe(raw);
   });
 
   it("the deprecated delete_document cannot delete a required file on its own", async () => {

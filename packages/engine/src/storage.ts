@@ -137,18 +137,27 @@ export function normalizeDocumentId(raw: string): string {
  */
 /** Longest document id a write accepts (paths stay well inside PATH_MAX). */
 const MAX_DOCUMENT_ID_LENGTH = 1024;
-/** Longest id segment: NAME_MAX (255 bytes) less the suffix of a temp write (`.md.<pid>.<n>.tmp`). */
-const MAX_SEGMENT_BYTES = 230;
+/**
+ * Longest id segment: NAME_MAX (255 bytes) less the longest extension a node
+ * writes beside it (`.pdf`). A longer name cannot exist on disk, so no document
+ * is frozen by this.
+ */
+const MAX_SEGMENT_BYTES = 251;
 
 /**
- * A path segment as a file system may resolve it, for comparing against a
- * reserved name: NTFS reads `.context::$INDEX_ALLOCATION` as the folder
- * `.context` and drops trailing dots and spaces, and a case-insensitive volume
- * folds `ſ` (long s) to `s`. Upper- then lower-casing gives that full case
- * folding; `toLowerCase` alone keeps `ſ`.
+ * A path segment as a file system may resolve it, for refusing a reserved
+ * name: NTFS reads `.context::$INDEX_ALLOCATION` as the folder `.context` and
+ * drops trailing dots and spaces, and a case-insensitive volume folds `ſ`
+ * (long s) to `s`. Upper- then lower-casing gives that full case folding;
+ * `toLowerCase` alone keeps `ſ`. Use it to refuse, never to exempt.
+ * Linear: the trailing trim is a loop, not `/[. ]+$/`, which backtracks
+ * quadratically on a long run of dots and spaces.
  */
 export function comparableSegment(segment: string): string {
-  return segment.split(":")[0].replace(/[. ]+$/, "").toUpperCase().toLowerCase();
+  const name = segment.split(":")[0];
+  let end = name.length;
+  while (end > 0 && (name[end - 1] === "." || name[end - 1] === " ")) end--;
+  return name.slice(0, end).toUpperCase().toLowerCase();
 }
 
 /** Segments that hold vault machinery at any depth — never a document. */
@@ -198,6 +207,15 @@ export function assertWritableDocumentId(raw: string): void {
     .split("/")
     .map(comparableSegment)
     .filter((seg) => seg !== "");
+  // Another spelling of the content root (`NODES/`, `nodes./`, `nodes:x/`) is
+  // its own folder on one volume and `nodes/` on another; no rule could judge
+  // both, so it is refused.
+  if (segments[0] === "nodes" && raw.split("/")[0] !== "nodes") {
+    throw new ContextNestError(
+      `${shown}: "${raw.split("/")[0]}" is another spelling of the vault's nodes/ folder — write it as nodes/`,
+      "VALIDATION_FAILED",
+    );
+  }
   const reserved =
     segments.find((seg) => RESERVED_SEGMENTS.has(seg)) ?? (segments[0] === "packs" ? "packs" : undefined);
   if (reserved) {
@@ -2953,7 +2971,9 @@ export class NestStorage {
       try {
         parsed = yaml.load(prior);
       } catch {
-        if (/^\uFEFF?(structure|folders|templates)\s*:/m.test(prior)) {
+        // Any mention, not just a column-0 key: an unparseable file may hold
+        // them indented, quoted, flow-style or as explicit keys.
+        if (/structure|folders|templates/.test(prior)) {
           throw new ConfigError(
             `${configPath} is not valid YAML and holds structure rules — fix it by hand before re-initializing, or the rules would be lost.`,
           );

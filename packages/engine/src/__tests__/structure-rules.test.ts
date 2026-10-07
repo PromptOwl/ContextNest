@@ -21,6 +21,7 @@ import {
   type StructureConfig,
   type Violation,
 } from "../structure.js";
+import { comparableSegment } from "../storage.js";
 import { ContextNestError } from "../errors.js";
 
 /** The worked example from the PRD — reused across most cases. */
@@ -118,11 +119,28 @@ describe("compileStructure", () => {
     expect(codes(checkDocument(r, { id: "nodes/clients/acme/meetings/x", type: "document", body: "" }))).toEqual(["FOLDER_NAME"]);
   });
 
-  it("the nodes/ and sources/ roots are recognised whatever their case (a case-insensitive volume merges them)", () => {
-    const r = compileStructure({ folders: { docs: { types: ["document"] } } });
-    expect(codes(checkDocument(r, { id: "Nodes/docs/x", type: "agent", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
-    const closed = compileStructure({ structure: { closed: true }, folders: { docs: {} } });
-    expect(checkDocument(closed, { id: "Sources/x", type: "source", body: "" })).toEqual([]);
+  it("roots compare exactly — folding them would hand a case-sensitive volume an unjudged folder", () => {
+    const r = compileStructure({ structure: { closed: true }, folders: { notes: { types: ["document"] } } });
+    for (const [id, type] of [
+      ["NODES/notes/y", "document"],
+      ["nodes:evil/notes/x", "document"],
+      ["Sources/evil/x", "source"],
+      ["ſources/x", "source"],
+      ["sources./x", "source"],
+    ]) {
+      expect(codes(checkDocument(r, { id, type, body: "" })), id).toEqual(["FOLDER_NOT_ALLOWED"]);
+    }
+    expect(checkDocument(r, { id: "sources/x", type: "source", body: "" })).toEqual([]);
+    // A rule key's nodes/ prefix is the owner's spelling, matched without case.
+    const keyed = compileStructure({ folders: { "Nodes/docs": { types: ["document"] } } });
+    expect(codes(checkDocument(keyed, { id: "nodes/docs/x", type: "agent", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
+  });
+
+  it("comparableSegment is linear on a long run of dots and spaces", () => {
+    const started = Date.now();
+    expect(comparableSegment(`${" .".repeat(50000)}x`)).toMatch(/x$/);
+    expect(comparableSegment(`.context${" .".repeat(50000)}`)).toBe(".context");
+    expect(Date.now() - started).toBeLessThan(100);
   });
 
   it("literal folder names match case-insensitively (case-insensitive filesystems put NOTES/ in notes/)", () => {

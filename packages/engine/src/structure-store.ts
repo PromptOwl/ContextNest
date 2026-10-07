@@ -10,7 +10,7 @@
 
 import { chmod, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { parseConfig } from "./config.js";
 import { ConfigError } from "./errors.js";
@@ -27,6 +27,8 @@ import {
   scaffoldPlan,
   type CompiledStructure,
   type StructureConfig,
+  type StructureDoc,
+  type Violation,
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { VersionManager } from "./versioning.js";
@@ -41,17 +43,23 @@ import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
  * `folders:` block) is written exactly as before, and a rule that does not
  * compile can refuse writes only in a vault that asked for enforcement.
  *
- * Off means `enforce` is absent or `false`. Any other value (`"yes"`, `1`)
- * asked for enforcement in a way that is not a boolean, so it is compiled —
- * and refused with CONFIG_ERROR naming `structure.enforce` — rather than
- * silently read as off.
+ * Off means no `structure` key, or one whose `enforce` is absent or `false`.
+ * Anything else that is not that — `enforce: "yes"`, `structure: true`, a
+ * list — asked for something in a way that is not the switch, so it is
+ * compiled and refused with CONFIG_ERROR naming the key, never read as off.
  */
 export async function enforcedStructure(storage: NestStorage): Promise<CompiledStructure | null> {
   const config = await storage.readConfig();
-  const structure = config?.structure as { enforce?: unknown } | null | undefined;
-  if (!structure || typeof structure !== "object") return null;
-  if (structure.enforce === undefined || structure.enforce === false) return null;
-  return compileStructure(config);
+  return isEnforced(config) ? compileStructure(config) : null;
+}
+
+/** Whether writes enforce the rules — see {@link enforcedStructure}. */
+export function isEnforced(config: { structure?: unknown } | null | undefined): boolean {
+  const structure = config?.structure;
+  if (structure === undefined || structure === null) return false;
+  if (typeof structure !== "object" || Array.isArray(structure)) return true;
+  const enforce = (structure as { enforce?: unknown }).enforce;
+  return enforce !== undefined && enforce !== false;
 }
 
 /**
@@ -75,11 +83,45 @@ export async function assertStructureUpdate(
 }
 
 /**
- * Judge a publish against enforced rules (§11.1.1): a first publish in full,
- * a later one only for what the live file newly breaks against its last sealed
- * version (an out-of-band edit, an approved held edit). publishDocument and
- * publishDocuments call this, so every approval surface that ends in a publish
- * is judged the same way. Pass `history` when the caller has already read it.
+ * What a publish of `live` breaks under enforced rules (§11.1.1): a first
+ * publish is judged in full, a later one only for what the live file newly
+ * breaks against its last sealed version (an out-of-band edit, an approved
+ * held edit). Pass `history` when the caller has already read it.
+ *
+ * History that cannot be rebuilt — a lost keyframe, a corrupt history.yaml —
+ * is judged in full, as a first publish would be: the publish that follows
+ * recovers by restarting the chain, and this must neither block that recovery
+ * nor judge it more leniently.
+ */
+export async function structurePublishViolations(
+  storage: NestStorage,
+  rules: CompiledStructure,
+  live: StructureDoc,
+  history?: DocumentHistory | null,
+): Promise<{ violations: Violation[]; first: boolean }> {
+  const id = live.id;
+  let first = true;
+  let sealed: StructureDoc | null = null;
+  try {
+    const known = history === undefined ? await storage.readHistory(id) : history;
+    const head = known?.versions.at(-1);
+    if (known && head) {
+      first = false;
+      const raw = await new VersionManager(storage).reconstructVersion(id, head.version, known);
+      const node = parseDocument(`${id}.md`, raw, id);
+      sealed = { id, type: node.frontmatter.type, body: node.body };
+    }
+  } catch {
+    sealed = null; // judged in full, below
+  }
+  return { violations: sealed ? checkUpdate(rules, sealed, live) : checkDocument(rules, live), first };
+}
+
+/**
+ * Refuse a publish that breaks enforced rules — see
+ * {@link structurePublishViolations}. publishDocument(s) and every other
+ * writer that seals a version call this, so every approval surface is judged
+ * the same way.
  *
  * @returns true when this is the document's first publish.
  */
@@ -89,17 +131,10 @@ export async function assertStructurePublish(
   live: ContextNode,
   history?: DocumentHistory | null,
 ): Promise<boolean> {
-  const id = live.id;
-  const view = (node: ContextNode) => ({ id, type: node.frontmatter.type, body: node.body });
-  const known = history === undefined ? await storage.readHistory(id) : history;
-  const head = known?.versions.at(-1);
-  if (!known || !head) {
-    enforceStructure(rules, checkDocument(rules, view(live)));
-    return true;
-  }
-  const raw = await new VersionManager(storage).reconstructVersion(id, head.version, known);
-  enforceStructure(rules, checkUpdate(rules, view(parseDocument(`${id}.md`, raw, id)), view(live)));
-  return false;
+  const doc = { id: live.id, type: live.frontmatter.type, body: live.body };
+  const { violations, first } = await structurePublishViolations(storage, rules, doc, history);
+  enforceStructure(rules, violations);
+  return first;
 }
 
 /**
@@ -211,11 +246,24 @@ export async function scaffoldFolders(
 }
 
 /**
+ * Documents outside a batch read, at most, to see past held-for-review
+ * siblings (one document read each). ponytail: a folder with more non-batch
+ * documents than this counts as occupied, held or not.
+ */
+const MAX_HELD_SIBLINGS = 32;
+
+/**
  * Scaffold for documents just published for the first time — a held create
  * approved, say, which nothing scaffolded while it was held. The folders they
  * brought into being are the ones no other document occupies, so those get
- * their required contents now. Batch-aware: fifty first publishes into one new
- * folder still scaffold it.
+ * their required contents now. Documents still held for review do not occupy
+ * a folder: held creates sharing a new folder scaffold it with whichever is
+ * approved first. Batch-aware: fifty first publishes into one new folder
+ * still scaffold it.
+ *
+ * Linear in the depth of the ids: one directory crawl per top-level ancestor,
+ * not one per ancestor — a deep id would otherwise cost depth² directory
+ * reads, under the vault lock.
  */
 export async function scaffoldFirstPublish(
   storage: NestStorage,
@@ -223,6 +271,7 @@ export async function scaffoldFirstPublish(
   ids: string[],
 ): Promise<string[]> {
   const batch = new Map<string, { root: string; folder: string; count: number }>();
+  const tops = new Set<string>();
   for (const id of ids) {
     const { root, folders } = documentFolders(id);
     for (const folder of folders) {
@@ -231,10 +280,45 @@ export async function scaffoldFirstPublish(
       entry.count++;
       batch.set(path, entry);
     }
+    if (folders.length > 0) tops.add(root ? `${root}/${folders[0]}` : folders[0]);
   }
+  if (batch.size === 0) return [];
+
+  // Direct document counts of every folder under each top-level ancestor.
+  const direct = new Map<string, number>();
+  for (const top of tops) {
+    const parent = top.split("/").slice(0, -1).join("/");
+    const own = (await storage.listFolders({ folder: parent, recursive: false })).find((f) => f.path === top);
+    direct.set(top, own?.count ?? 0);
+    for (const f of await storage.listFolders({ folder: top })) direct.set(f.path, f.count);
+  }
+  const within = (path: string, parent: string) => path === parent || path.startsWith(`${parent}/`);
+  const others = (path: string, count: number) => {
+    let n = 0;
+    for (const [p, c] of direct) if (within(p, path)) n += c;
+    return n - count;
+  };
+
+  // Shallowest first, so one read of a folder's few documents answers for
+  // every folder below it too.
+  const read = new Map<string, ContextNode[]>();
+  const batchIds = new Set(ids);
   const byRoot = new Map<string, string[]>();
-  for (const [path, { root, folder, count }] of batch) {
-    if ((await documentsUnder(storage, path)) > count) continue;
+  const ordered = [...batch].sort(([a], [b]) => a.split("/").length - b.split("/").length);
+  for (const [path, { root, folder, count }] of ordered) {
+    const extra = others(path, count);
+    if (extra > MAX_HELD_SIBLINGS) continue;
+    if (extra > 0) {
+      let docs = [...read].find(([p]) => within(path, p))?.[1];
+      if (!docs) {
+        docs = await storage.discoverDocuments({ folder: path, includeRetired: true });
+        read.set(path, docs);
+      }
+      const occupied = docs.some(
+        (d) => within(d.id, path) && !batchIds.has(d.id) && d.frontmatter.status !== "pending_review",
+      );
+      if (occupied) continue;
+    }
     byRoot.set(root, [...(byRoot.get(root) ?? []), folder]);
   }
   const written: string[] = [];
@@ -356,7 +440,7 @@ async function writeStructure(storage: NestStorage, rules: StructureConfig): Pro
   // onto the symlink's target, not the link, with the file's own mode.
   const target = await realpath(path);
   const inside = relative(await realpath(storage.root), target);
-  if (inside.startsWith("..") || isAbsolute(inside)) {
+  if (inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) {
     throw new ConfigError(
       `${path} links outside the vault — setStructure will not rewrite another directory's file. Edit it by hand.`,
     );

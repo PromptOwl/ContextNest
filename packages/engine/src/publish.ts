@@ -97,10 +97,11 @@ export async function publishDocument(
   // seeding would write `v{current}.md` at a number the old chain may already
   // have sealed as a keyframe — an exclusive create that throws, which would
   // put the author right back behind the corrupt file we just worked around.
+  // Every publish surface ends here, so the structure rules judge it here —
+  // before historyOrRepair, so a refused publish never quarantines a history.
+  const firstPublish = rules ? await assertStructurePublish(storage, rules, node) : false;
   const { history: existingHistory, quarantinedAs } =
     await versionManager.historyOrRepair(docId);
-  // Every publish surface ends here, so the structure rules judge it here.
-  const firstPublish = rules ? await assertStructurePublish(storage, rules, node, existingHistory) : false;
   const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
   if (seeded) {
     await versionManager.createVersion(node, "system:seed", {
@@ -286,9 +287,10 @@ export async function publishDocuments(
       const versionManager = new VersionManager(storage);
       // Same resilient read, the same seed skip on a restart, and the same
       // single history read — see the notes in publishDocument.
+      // Judged before historyOrRepair: a refused publish quarantines nothing.
+      const firstPublish = rules ? await assertStructurePublish(storage, rules, node) : false;
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
-      const firstPublish = rules ? await assertStructurePublish(storage, rules, node, existingHistory) : false;
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
       if (seeded) {
         await versionManager.createVersion(node, "system:seed", {

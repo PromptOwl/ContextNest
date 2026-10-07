@@ -19,7 +19,6 @@
 import { ConfigError, ContextNestError } from "./errors.js";
 import { headingAnchor, headingAnchors } from "./inline.js";
 import { NODE_TYPES, structureRulesSchema } from "./schemas.js";
-import { comparableSegment } from "./storage.js";
 import type { NestConfig } from "./types.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -499,10 +498,10 @@ function compileFormat(spelling: string, key: string): Matcher {
 
 /** `"/nodes/a/b/"` → `"a/b"`; `"/"`, `""` and `"nodes"` → `""` (the root). */
 function normalizeKey(key: string): string {
-  let k = key.replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "");
-  if (k === "nodes") k = "";
-  else if (k.startsWith("nodes/")) k = k.slice("nodes/".length);
-  return k;
+  const k = key.replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "");
+  const segs = k.split("/");
+  // The owner's spelling: `Nodes/clients` keys `clients`.
+  return segs[0].toLowerCase() === "nodes" ? segs.slice(1).join("/") : k;
 }
 
 function isPlaceholder(seg: Segment): seg is { label: string; matcher: Matcher } {
@@ -712,17 +711,19 @@ const rawSegments = (path: string) =>
     .filter((s) => s && s !== ".");
 
 /**
- * The root a path starts in, compared as a file system resolves it — a
- * case-insensitive volume puts `Nodes/x` in `nodes/x`.
+ * Whether a path starts in `nodes/` — compared exactly. On a case-sensitive
+ * volume `NODES/` or `nodes:x/` is a folder of its own, so folding here would
+ * judge a document as if it lived somewhere it does not. The write guard
+ * (assertWritableDocumentId) refuses those spellings instead, so a volume
+ * that folds them never receives one.
  */
-const rootOf = (raw: string[]) => (raw.length > 0 ? comparableSegment(raw[0]) : "");
+const inNodes = (raw: string[]) => raw[0] === "nodes";
 
 /** Folder segments of a path, `nodes/` dropped; null when it is exempt. */
 function folderSegments(folder: string): string[] | null {
   const raw = rawSegments(folder);
-  const root = rootOf(raw);
-  if (SYSTEM_ROOTS.has(root) || root === "sources") return null;
-  return root === "nodes" ? raw.slice(1) : raw;
+  if (raw.length > 0 && (SYSTEM_ROOTS.has(raw[0]) || raw[0] === "sources")) return null;
+  return inNodes(raw) ? raw.slice(1) : raw;
 }
 
 /**
@@ -732,15 +733,14 @@ function folderSegments(folder: string): string[] | null {
  */
 function docPath(id: string): { folder: string[]; leaf: string; sourcesRoot: boolean } | null {
   const raw = rawSegments(id);
-  const root = rootOf(raw);
-  if (raw.length === 0 || SYSTEM_ROOTS.has(root)) return null;
+  if (raw.length === 0 || SYSTEM_ROOTS.has(raw[0])) return null;
   // The vault's CONTEXT.md, exactly: exempting `context` too would hand a
   // case-sensitive volume a root file no rule ever judges.
   if (raw.length === 1 && raw[0] === "CONTEXT") return null;
-  const segs = root === "nodes" ? raw.slice(1) : raw;
+  const segs = inNodes(raw) ? raw.slice(1) : raw;
   const leaf = segs.pop();
   if (!leaf) return null;
-  return { folder: segs, leaf, sourcesRoot: root === "sources" };
+  return { folder: segs, leaf, sourcesRoot: raw[0] === "sources" };
 }
 
 const display = (segs: string[]) => segs.join("/");
@@ -754,7 +754,7 @@ const shown = (pattern: string) => pattern || "/";
  */
 export function documentFolders(id: string): { root: string; folders: string[] } {
   const segs = id.replace(/\\/g, "/").split("/").filter(Boolean);
-  const root = rootOf(segs) === "nodes" ? segs[0] : "";
+  const root = inNodes(segs) ? segs[0] : "";
   if (root) segs.shift();
   segs.pop();
   const folders: string[] = [];

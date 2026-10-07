@@ -529,14 +529,14 @@ templates:
     body: "## Summary\n## Contacts\n"
 ```
 
-- With `enforce: true`, every write surface refuses what breaks a rule: `ctx add/update/delete/import/pull`, every MCP write tool (the deprecated ones too), `context_import_pdf`, and every publish — whichever surface approves a held write, its first publish is judged in full and scaffolds its new folders. A refusal names the rule and the expected format. Report-only rules (`enforce: false`, or no `enforce`) write and refuse nothing; any other value of `enforce` is an error, never off.
+- With `enforce: true`, every write surface refuses what breaks a rule: `ctx add/update/delete/import/pull`, every MCP write tool (the deprecated ones too), `context_import_pdf`, and every publish — whichever surface approves a held write, its first publish is judged in full and scaffolds its new folders. A refusal names the rule and the expected format. Report-only rules (`enforce: false`, or no `enforce`) write and refuse nothing; any other value of `enforce` or `structure` is an error, never off.
 - Existing content is grandfathered: an edit is refused only for what it newly breaks (a re-type into a refused type, a dropped required heading).
 - An enforced write that creates a folder also creates its required subfolders and files (drafts from their templates). A required file can be deleted only as the last document in its folder. `ctx add` without `--body` starts from the folder's template.
 - File names come from titles (lowercased, words joined by `-`), so a rule like `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
 - A `/regex/` must stay inside a small grammar: quantifiers on single characters or `[classes]` (bounds of at most 3 digits), groups with `|` that are never repeated, literal `{ } [ ]` escaped, no lookaround or backreferences, at most 200 characters (spec §11.1.1 has the exact grammar). It is matched in linear time, never by the backtracking regex engine — token patterns too — so no pattern can stall a write.
-- Re-running `ctx init` on a vault keeps its rules (a config that is not YAML but names rules is refused, not overwritten), and a starter leaves out what they refuse.
+- Re-running `ctx init` on a vault keeps its rules (a config that is not YAML but mentions them is refused, not overwritten), and a starter leaves out what they refuse.
 - Existing `folders:` blocks keep working: a `template` naming no entry under `templates` is a label, and folder names are matched literally.
-- No write puts a document under `.context/`, `.versions/` or `_suggestions/` (any depth) or the vault-root `packs/`, and `context_import` never writes `.context/` — an import cannot rewrite the rules or the review gate. Ids use `/`, never `\`, and stay under 1024 characters with no name over 230 bytes.
+- No write puts a document under `.context/`, `.versions/` or `_suggestions/` (any depth) or the vault-root `packs/`, and `context_import` never writes `.context/` — an import cannot rewrite the rules or the review gate. Ids use `/`, never `\`, spell the content root exactly `nodes/` (not `NODES/`), and stay under 1024 characters with no name over 251 bytes.
 - Folder names in rules match case-insensitively; at most 256 folder rules; a `template` name not defined under `templates` is reported as a warning by `ctx structure`.
 
 | Command | Effect |
