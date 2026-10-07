@@ -63,6 +63,7 @@ import {
 } from "@promptowl/contextnest-engine/api";
 import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
+import { rerootForDiscovery, placementNote, heldReviewNotice } from "./onboarding-hints.js";
 
 /** Engine operation catalog — schemas and implementations for `context_*` tools. */
 const engineApi = createEngineApi();
@@ -337,6 +338,17 @@ function wouldPublish(opName: string, args: Record<string, unknown>): boolean {
 }
 
 async function runGatedWrite(opName: string, args: Record<string, unknown>) {
+  // An explicit create id outside nodes/ would land where discovery never looks
+  // (list, search and agents would not see it). Re-root it and say so.
+  let placement: string | undefined;
+  if (opName === "context_create" && typeof args.id === "string") {
+    const requested = normalizeDocumentId(args.id);
+    const placed = rerootForDiscovery(requested, await storage.detectLayout());
+    if (placed.rerooted) {
+      args = { ...args, id: placed.id };
+      placement = placementNote(requested, placed.id);
+    }
+  }
   let input = args;
   if ((await vaultReviewMode()) === "on" && wouldPublish(opName, args)) {
     // A held write settles its own status; an explicit `published` would
@@ -346,10 +358,11 @@ async function runGatedWrite(opName: string, args: Record<string, unknown>) {
   }
   try {
     const result = (await api.run(opName, withClientDefaults(input), opCtx())) as Record<string, unknown>;
+    const withPlacement = placement ? { ...result, placement } : result;
     if (result && result.held_for_review === true) {
-      return toolResult({ ...result, review: reviewHeldMessage(String(result.id)) });
+      return toolResult({ ...withPlacement, review: heldReviewNotice(String(result.id)) });
     }
-    return toolResult(result);
+    return toolResult(withPlacement);
   } catch (err) {
     return toolError(err);
   }
@@ -975,8 +988,13 @@ tool(
 
       // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
       // lands in the same place as one created via `ctx add` (single source of
-      // truth — normalizeDocumentId in the engine).
-      const id = normalizeDocumentId(path);
+      // truth — normalizeDocumentId in the engine). A folder discovery never
+      // scans would hide the document from list, search and agents, so re-root
+      // it under nodes/ and say so, as `ctx add` does.
+      const requested = normalizeDocumentId(path);
+      const placed = rerootForDiscovery(requested, await storage.detectLayout());
+      const id = placed.id;
+      const placement = placed.rerooted ? placementNote(requested, id) : undefined;
 
       // Check if document already exists
       try {
@@ -1065,7 +1083,8 @@ tool(
           frontmatter: node.frontmatter,
           held_for_review: true,
           message: "Document created and held for review (status: pending_review). Not published.",
-          review: reviewHeldMessage(id),
+          review: heldReviewNotice(id),
+          ...(placement ? { placement } : {}),
         });
       }
 
@@ -1107,6 +1126,7 @@ tool(
                 checkpoint: result.checkpointNumber,
                 chain_hash: result.versionEntry.chain_hash,
                 message: "Document created and published successfully",
+                ...(placement ? { placement } : {}),
               },
               null,
               2,
