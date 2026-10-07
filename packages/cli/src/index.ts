@@ -1612,7 +1612,7 @@ program
     if (placed.rerooted) {
       console.log(
         chalk.yellow(
-          `Note: ${normalizeDocumentId(path)} is outside nodes/ and sources/, where documents are found — creating ${id} instead.`,
+          `Note: ${normalizeDocumentId(path)} is outside nodes/ and sources/, where documents are found — creating ${id} instead. Use ${id} from now on.`,
         ),
       );
     }
@@ -2963,7 +2963,9 @@ program
     // Search is published-only. A fresh vault holds new documents for review,
     // so say when held documents would have matched rather than leaving a
     // bare "No results found." Human output only; --json stays unchanged.
-    if (!opts.json) {
+    // Only on an empty result: that is the dead end, and it skips a second
+    // vault scan on every normal search.
+    if (!opts.json && out.results.length === 0) {
       const held = countHeldMatches(await storage.discoverDocuments(), query);
       if (held > 0) console.log(chalk.dim(`\n${heldSearchHint(held)}`));
     }

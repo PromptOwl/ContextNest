@@ -54,6 +54,14 @@ describe("[regression] onboarding hints — CLI", () => {
     expect(out).toContain("1 matching document is held for review and not searchable until approved: ctx review list");
   });
 
+  it("no held hint when search found published results", () => {
+    ctx(tmp, ["add", "nodes/pub", "--title", "Pub", "--body", "zebra", "--publish"]);
+    ctx(tmp, ["add", "nodes/held", "--title", "Held", "--body", "zebra"]);
+    const out = ctx(tmp, ["search", "zebra"]);
+    expect(out).toContain("nodes/pub");
+    expect(out).not.toContain("held for review");
+  });
+
   it("no held hint once the document is approved", () => {
     ctx(tmp, ["add", "nodes/alpha", "--title", "Alpha", "--body", "zebra policy"]);
     ctx(tmp, ["review", "approve", "nodes/alpha"]);
