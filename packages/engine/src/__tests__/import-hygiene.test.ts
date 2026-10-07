@@ -468,3 +468,27 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     }
   });
 });
+
+describe("planImportPaths — QA round 12", () => {
+  it("a generated INDEX.md or README.md keeps its name, so it is never read as a node", () => {
+    expect(slugifyImportPath("nodes/notes/INDEX.md")).toBe("nodes/notes/INDEX.md");
+    expect(slugifyImportPath("README.md")).toBe("README.md");
+  });
+
+  it("a ./ spelling of a renamed document takes its history along", async () => {
+    const plan = await planImportPaths(["nodes/./x.md", "nodes/.versions/x/v1.md"], async (p) => p === "nodes/x.md");
+    expect(plan.map((p) => p.path)).toEqual(["nodes/x-2.md", "nodes/.versions/x-2/v1.md"]);
+  });
+
+  it("many names colliding on one slug cost a linear number of lookups", async () => {
+    let calls = 0;
+    // The vault already holds x.md and x-2.md … x-400.md.
+    const plan = await planImportPaths(Array(400).fill("nodes/x.md"), async (p) => {
+      calls++;
+      const m = /^nodes\/x(?:-(\d+))?\.md$/.exec(p);
+      return !!m && Number(m[1] ?? 1) <= 400;
+    });
+    expect(new Set(plan.map((p) => p.path)).size).toBe(400);
+    expect(calls).toBeLessThan(2000);
+  });
+});

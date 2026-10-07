@@ -13,6 +13,7 @@
  */
 
 import { NODE_TYPES, TAG_PATTERN } from "./schemas.js";
+import { NON_DOCUMENT_BASENAMES } from "./storage.js";
 import type { ContextNode, Frontmatter, NodeType, PdfMeta } from "./types.js";
 
 const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES);
@@ -68,6 +69,8 @@ export function slugifyImportPath(relPath: string): string {
       if (segment.startsWith(".")) return segment.toLowerCase();
       if (CLEAN_SEGMENT.test(segment)) return segment;
       const isLast = i === segments.length - 1;
+      // `INDEX.md`, `README.md`: kept as named, or the copy is read as a node.
+      if (isLast && NON_DOCUMENT_BASENAMES.has(segment)) return segment;
       const ext = isLast ? (segment.match(EXTENSION)?.[0] ?? "") : "";
       const stem = ext ? segment.slice(0, -ext.length) : segment;
       const slug = slugify(stem) || "untitled";
@@ -125,9 +128,10 @@ function versionPathParts(path: string): { prefix: string; suffix: string } | un
  * to prevent.
  */
 function rawDocKey(rawPath: string): string {
+  // `.` segments resolve away, as slugifyImportPath drops them.
   const segments = String(rawPath ?? "")
     .split(/[/\\]/)
-    .filter(Boolean);
+    .filter((s) => s !== "" && s !== ".");
   const i = segments.findIndex((segment) => segment.toLowerCase() === ".versions");
   if (i >= 0 && i + 1 < segments.length) {
     return [...segments.slice(0, i), segments[i + 1]].join("/");
@@ -164,6 +168,9 @@ export async function planImportPaths(
 ): Promise<Array<{ raw: string; path: string; warnings: string[] }>> {
   const claimed = new Map<string, string>(); // target → raw path that owns it
   const renamedStems = new Map<string, string>(); // `<dir>/<stem>` → new stem
+  // Next `-n` to try per `<dir><stem>\0<ext>`: a suffix taken once stays
+  // taken, so a run of collisions on one slug costs linear lookups, not n².
+  const nextSuffix = new Map<string, number>();
   const bases = rawPaths.map((raw) => slugifyImportPath(raw));
   const plan: Array<{ raw: string; path: string; warnings: string[] }> = new Array(rawPaths.length);
   // Stable sort, so documents — and version files among themselves — keep
@@ -194,7 +201,9 @@ export async function planImportPaths(
 
     let target = base;
     let takenBy: string | undefined;
-    for (let n = 2; ; n++) {
+    const key = `${dir}${stem}\0${ext}`;
+    let n = nextSuffix.get(key) ?? 2;
+    for (;;) {
       const owner = claimed.get(target);
       if (owner !== undefined) {
         takenBy ??= owner;
@@ -203,8 +212,9 @@ export async function planImportPaths(
       } else {
         break;
       }
-      target = `${dir}${stem}-${n}${ext}`;
+      target = `${dir}${stem}-${n++}${ext}`;
     }
+    if (target !== base) nextSuffix.set(key, n);
     claimed.set(target, raw);
     if (!parts && target !== base) {
       renamedStems.set(rawDocKey(raw), target.slice(cut, -ext.length || undefined));

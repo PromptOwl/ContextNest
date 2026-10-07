@@ -21,6 +21,7 @@ import { parseDocument, serializeDocument, validateDocument } from "./parser.js"
 import {
   checkDeleteDocument,
   checkDocument,
+  structureView,
   checkUpdate,
   compileStructure,
   enforceStructure,
@@ -78,10 +79,7 @@ export async function assertStructureUpdate(
 ): Promise<void> {
   const rules = await enforcedStructure(storage);
   if (!rules) return;
-  const view = (raw: string) => {
-    const node = parseDocument(`${id}.md`, raw, id);
-    return { id, type: node.frontmatter.type, body: node.body };
-  };
+  const view = (raw: string) => structureView(id, parseDocument(`${id}.md`, raw, id));
   enforceStructure(rules, checkUpdate(rules, view(beforeRaw), view(afterRaw)));
 }
 
@@ -116,6 +114,10 @@ export async function sealedHead(
       e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null),
     );
     if (contents.some((c, i) => c === null || computeContentHash(c) !== segment[i].content_hash)) return null;
+    // Each diff replays over the whole text: bound the work, or one planted
+    // history stalls every write judged against it.
+    const size = contents.reduce((n, c) => n + (c as string).length, 0);
+    if (size * (segment.length - 1) > MAX_REPLAY_WORK) return null;
     const byVersion = new Map(segment.map((e, i) => [e.version, contents[i] as string]));
     return await reconstructFromHistory(
       id,
@@ -135,6 +137,13 @@ export async function sealedHead(
  * here; a longer run is not trusted (judged in full).
  */
 const MAX_SEALED_SEGMENT = 1000;
+
+/**
+ * Most characters a sealed-head replay may touch (text size × diffs). A
+ * default-interval history fits up to ~6 MB of text; past it the history is
+ * not trusted (judged in full).
+ */
+const MAX_REPLAY_WORK = 64 * 2 ** 20;
 
 /**
  * What a publish of `live` breaks under enforced rules (§11.1.1): a first
@@ -170,7 +179,7 @@ export async function structurePublishViolations(
     // The view that was hashed (§8 normalization): any bytes with this head's
     // hashes get the same verdict.
     const node = parseDocument(`${id}.md`, normalizeForHash(raw), id);
-    return { violations: checkUpdate(rules, { id, type: node.frontmatter.type, body: node.body }, live), first };
+    return { violations: checkUpdate(rules, structureView(id, node), live), first };
   } catch {
     return { violations: checkDocument(rules, live), first };
   }

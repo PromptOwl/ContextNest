@@ -5,7 +5,8 @@
  * rules back. The pure checker is covered by structure-rules.test.ts.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink, rename } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink, rename, readdir } from "node:fs/promises";
+import { createPatch } from "diff";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { publishDocument, publishDocuments } from "../publish.js";
@@ -1819,7 +1820,7 @@ describe("architecture round 10: judged bytes are landed bytes", () => {
         files: [
           { path: `${V}/history.yaml`, content: historyFor(A) },
           { path: `${V}/v1.md`, content: A },
-          { path: `${V}/${"z".repeat(300)}.pdf`, content: "x" },
+          { path: `${V}/${"z".repeat(300)}.diff`, content: "x" },
         ],
         publish: false,
       },
@@ -2138,5 +2139,136 @@ describe("architecture round 12: one line model, old histories, sidecar fallback
     );
     expect(res.failed.find((f) => f.id === `${V}/history.yaml`)?.error).toMatch(/did not land/);
     expect(await readFile(join(dir, V, "history.yaml"), "utf-8")).toBe(before);
+  });
+});
+
+describe("QA round 12: fence twins, forgotten exports, replay budget, archives, error paths", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const NOTE = "---\ntitle: f\ntype: document\nstatus: draft\n---\ngone\n";
+
+  async function exportFiles(root: string, sub = ""): Promise<{ path: string; content: string }[]> {
+    const out: { path: string; content: string }[] = [];
+    for (const e of await readdir(join(root, sub), { withFileTypes: true })) {
+      const rel = sub ? `${sub}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (rel !== ".context" && !/^\.versions\/(checkpoints|nest)/.test(rel)) out.push(...(await exportFiles(root, rel)));
+      } else if (rel !== "context.yaml") {
+        out.push({ path: rel, content: await readFile(join(root, rel), "utf-8") });
+      }
+    }
+    return out;
+  }
+
+  it("a lone CR that opens a fence hides the heading below it from the rules too (QA fence4)", async () => {
+    await writeConfig(SUMMARY);
+    await api.run("context_create", { id: "nodes/notes/f", title: "f", content: "## Summary\nreal summary\n" }, ctx);
+    const err = await refusal("context_update", { id: "nodes/notes/f", content: "x\r```\n## Summary\nreal summary\n" });
+    expect(err.code).toBe("VALIDATION_FAILED");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/f.md", content: NOTE }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/notes/f.md"]);
+  });
+
+  it("an export holding a forgotten document restores under enforced rules, fresh and over itself", async () => {
+    await writeConfig(SUMMARY);
+    for (const id of ["gone", "kept"]) {
+      await api.run("context_create", { id: `nodes/notes/${id}`, title: id, content: `## Summary\nv1 ${id}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${id}`, content: `## Summary\nv2 ${id}\n` }, ctx);
+    }
+    await api.run("context_forget", { id: "nodes/notes/gone", reason_code: "legal" }, ctx);
+    const files = await exportFiles(dir);
+    const other = await mkdtemp(join(tmpdir(), "cn-structure-ops-b-"));
+    try {
+      const s2 = new NestStorage(other);
+      await s2.init("b");
+      await writeFile(join(other, ".context", "config.yaml"), yaml.dump({ version: 1, name: "b", ...SUMMARY }), "utf-8");
+      const c2: OperationContext = { storage: s2, query: new GraphQueryEngine(s2), versions: new VersionManager(s2), actor: "t" };
+      const fresh = await api.run<{ failed: unknown[] }>("context_import", { files, publish: false }, c2);
+      expect(fresh.failed, JSON.stringify(fresh.failed)).toEqual([]);
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+    const self = await api.run<{ failed: unknown[] }>("context_import", { files, publish: false, overwrite: true }, ctx);
+    expect(self.failed).toEqual([]);
+  });
+
+  it("a forgotten stub with content in it is still judged in full", async () => {
+    await writeConfig(SUMMARY);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/s.md", content: "---\ntitle: s\nstatus: forgotten\n---\nsmuggled\n" }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/notes/s.md"]);
+  });
+
+  it("a segment whose replay would cost more than its budget is not trusted", async () => {
+    const kf = `---\ntitle: X\n---\n${"y".repeat(8 * 2 ** 20)}\n`;
+    const noop = createPatch("x", "a\n", "a\n");
+    const entry = (version: number) => ({
+      version,
+      keyframe: version === 1,
+      edited_by: "a",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: computeContentHash(version === 1 ? kf : noop),
+      chain_hash: `sha256:${"0".repeat(64)}`,
+    });
+    const history = (n: number) => ({ versions: Array.from({ length: n }, (_, i) => entry(i + 1)) }) as never;
+    const keyframe = (v: number) => (v === 1 ? kf : null);
+    const diff = (v: number) => (v > 1 ? noop : null);
+    expect(await sealedHead("d", history(3), keyframe, diff)).toBe(kf);
+    expect(await sealedHead("d", history(20), keyframe, diff)).toBeNull();
+  });
+
+  it("an archived PDF that fails its hash is refused alone: the history beside it still lands", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const name = res.id.split("/").pop()!;
+    const V = `${res.id.split("/").slice(0, -1).join("/")}/.versions/${name}`;
+    const history = await readFile(join(dir, V, "history.yaml"), "utf-8");
+    const archive = `${V}/${"b".repeat(64)}.pdf`;
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${V}/history.yaml`, content: history }, { path: archive, content: "mangled" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id), JSON.stringify(imp.failed)).toEqual([archive]);
+  });
+
+  it("a PDF node with no history on disk takes the sidecar its .md names (a chunked restore)", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const name = res.id.split("/").pop()!;
+    await rm(join(dir, `${res.id}.pdf`));
+    await rm(join(dir, dirname(res.id), ".versions", name), { recursive: true });
+    const bytes = Buffer.from(textPdf()).toString("utf-8");
+    const bad = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: "%PDF-1.4 other" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(bad.failed.map((f) => f.id)).toEqual([`${res.id}.pdf`]);
+    const ok = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: bytes }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(ok.failed).toEqual([]);
+  });
+
+  it("a write that fails on disk reports an error without the vault path", async () => {
+    await mkdir(join(dir, "nodes", "d", "q.md"), { recursive: true });
+    const imp = await api.run<{ failed: { error: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/d/q.md", content: "---\ntitle: Q\n---\nx\n" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed).toHaveLength(1);
+    expect(imp.failed[0].error).not.toContain(dir);
   });
 });

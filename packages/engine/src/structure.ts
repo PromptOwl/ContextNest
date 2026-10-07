@@ -51,6 +51,12 @@ export interface StructureDoc {
   id: string;
   type?: string;
   body?: string;
+  status?: string;
+}
+
+/** What the rules judge of a parsed document. */
+export function structureView(id: string, node: { frontmatter: { type?: string; status?: string }; body: string }): StructureDoc {
+  return { id, type: node.frontmatter.type, body: node.body, status: node.frontmatter.status };
 }
 
 interface Matcher {
@@ -980,6 +986,9 @@ export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Viol
       });
     }
   }
+  // A forget stub (§6.3) holds no content, so it owes no sections — one with
+  // content in it is no stub, and is judged in full.
+  if (doc.status === "forgotten" && !(doc.body ?? "").trim()) return out;
   const have = headingAnchors(doc.body ?? "");
   const template = governingTemplate(rule, p.leaf);
   for (const section of requiredSections(rules, rule, p.leaf)) {

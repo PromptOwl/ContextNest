@@ -97,6 +97,7 @@ import {
   checkUpdate,
   compileStructure,
   describeStructure,
+  structureView,
   enforceStructure,
   resolveFolder,
   type CompiledStructure,
@@ -271,11 +272,11 @@ async function structureRules(ctx: OperationContext): Promise<CompiledStructure 
   return enforcedStructure(ctx.storage);
 }
 
-const structureDoc = (node: ContextNode): StructureDoc => ({
-  id: node.id,
-  type: node.frontmatter.type,
-  body: node.body,
-});
+const structureDoc = (node: ContextNode): StructureDoc => structureView(node.id, node);
+
+/** An error's message with the vault's location cut out: callers see vault paths only. */
+const vaultError = (ctx: OperationContext, err: unknown) =>
+  (err instanceof Error ? err.message : String(err)).split(ctx.storage.root).join(".");
 
 /**
  * `.context/` holds the vault's own settings — its structure rules and review
@@ -1192,8 +1193,7 @@ function importedDoc(relPath: string, content: string): StructureDoc | null {
   if (norm.split("/").includes("_suggestions")) return null;
   const id = norm.slice(0, -".md".length);
   try {
-    const node = parseDocument(`${id}.md`, content, id);
-    return { id, type: node.frontmatter.type, body: node.body };
+    return structureView(id, parseDocument(`${id}.md`, content, id));
   } catch {
     return { id, body: content };
   }
@@ -1348,7 +1348,10 @@ async function assertSidecarKept(
   // What the vault sealed for this node: its verified head's pdf block — never
   // the live .md, which this call or an earlier one may have rewritten.
   const sealedPdf = await (async () => {
-    const history = await ctx.storage.readHistory(owner).catch(() => null);
+    const history = await ctx.storage.readHistory(owner).catch(() => undefined);
+    // Never sealed: nothing to protect, and the .md's pdf block is an
+    // assertion its first publish checks (§1.11) — a chunked restore lands.
+    if (history === null) return node.frontmatter.type === "pdf" ? (node.frontmatter.pdf?.sha256 ?? null) : null;
     const raw = history
       ? await sealedHead(owner, history, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n))
       : null;
@@ -1436,8 +1439,7 @@ async function historySetVerdict(
     if (kept !== null) {
       const node = (() => {
         try {
-          const n = parseDocument(`${owner}.md`, normalizeForHash(kept), owner);
-          return { id: owner, type: n.frontmatter.type, body: n.body };
+          return structureView(owner, parseDocument(`${owner}.md`, normalizeForHash(kept), owner));
         } catch {
           return { id: owner, body: normalizeForHash(kept) };
         }
@@ -1467,8 +1469,7 @@ async function historySetVerdict(
   let head: StructureDoc;
   try {
     // The view that was hashed (§8 normalization), as structurePublishViolations judges it.
-    const node = parseDocument(`${owner}.md`, normalizeForHash(raw), owner);
-    head = { id: owner, type: node.frontmatter.type, body: node.body };
+    head = structureView(owner, parseDocument(`${owner}.md`, normalizeForHash(raw), owner));
   } catch {
     head = { id: owner, body: normalizeForHash(raw) };
   }
@@ -1568,9 +1569,10 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     });
     // A refused sidecar takes its node's .md with it, which would otherwise
     // name bytes that are not there.
+    const byPath = new Map(plan.map((p) => [p.path, p]));
     for (const f of plan) {
       if (!preRefused.has(f.raw) || !/\.pdf$/i.test(f.path) || storeOwner(f.path)) continue;
-      const md = plan.find((p) => p.path === `${f.path.slice(0, -".pdf".length)}.md`);
+      const md = byPath.get(`${f.path.slice(0, -".pdf".length)}.md`);
       if (md && !preRefused.has(md.raw)) preRefused.set(md.raw, `${md.raw}: its PDF ${f.raw} was refused`);
     }
     // A history with any refused file is refused whole — and so is the history
@@ -1579,7 +1581,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       plan.flatMap((f) => {
         if (!preRefused.has(f.raw)) return [];
         const v = versionsArtifact(f.path);
-        if (v) return [v.owner];
+        // An archived binary takes no part in rebuilding the history.
+        if (v) return /\.pdf$/i.test(v.name) ? [] : [v.owner];
         const m = /^(.*)\.(md|pdf)$/i.exec(f.path);
         return m && !storeOwner(f.path) ? [m[1]] : [];
       }),
@@ -1617,9 +1620,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         await writeImportedFile(ctx, f, f.warnings);
         written++;
       } catch (err) {
-        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
-        const set = versionsArtifact(f.path)?.owner;
-        if (set) failedSets.add(set);
+        failed.push({ id: f.raw, error: vaultError(ctx, err) });
+        const v = versionsArtifact(f.path);
+        if (v && !/\.pdf$/i.test(v.name)) failedSets.add(v.owner);
       }
     };
     await mapInBatches(plan.filter((f) => !isHistory(f)), stage);
@@ -1655,7 +1658,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       batch.push(node.id);
       titleById.set(node.id, doc.title);
     } catch (err) {
-      failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
+      failed.push({ title: doc.title, error: vaultError(ctx, err) });
     }
   }
 
