@@ -141,6 +141,7 @@ import {
   NO_REDIRECT,
 } from "./safety.js";
 import { resolveHeldWrite } from "./review-gate.js";
+import { rerootForDiscovery, countHeldMatches, heldSearchHint } from "./onboarding-hints.js";
 import {
   asPendingConfirmation,
   pollUntilDecided,
@@ -1604,7 +1605,17 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    // A folder discovery never scans (structured layout) would hide the new
+    // document from list, search and agents. Re-root it under nodes/ and say so.
+    const placed = rerootForDiscovery(normalizeDocumentId(path), await storage.detectLayout());
+    const id = placed.id;
+    if (placed.rerooted) {
+      console.log(
+        chalk.yellow(
+          `Note: ${normalizeDocumentId(path)} is outside nodes/ and sources/, where documents are found — creating ${id} instead. Use ${id} from now on.`,
+        ),
+      );
+    }
 
     // Refuse to clobber an existing document. This used to fail only by
     // accident: the template below resets the version to 1, which collided with
@@ -2949,6 +2960,15 @@ program
     );
     // Rendering shared with the remote branch (doc-views.ts).
     printSearchResults(out, opts);
+    // Search is published-only. A fresh vault holds new documents for review,
+    // so say when held documents would have matched rather than leaving a
+    // bare "No results found." Human output only; --json stays unchanged.
+    // Only on an empty result: that is the dead end, and it skips a second
+    // vault scan on every normal search.
+    if (!opts.json && out.results.length === 0) {
+      const held = countHeldMatches(await storage.discoverDocuments(), query);
+      if (held > 0) console.log(chalk.dim(`\n${heldSearchHint(held)}`));
+    }
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────
