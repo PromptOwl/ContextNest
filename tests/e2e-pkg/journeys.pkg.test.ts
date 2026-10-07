@@ -164,9 +164,9 @@ const J1: Journey = {
 };
 
 /** The version rows `ctx history --json` returns. */
-type HistoryVersion = { version: number; keyframe: boolean };
+type HistoryVersion = { version: number };
 const versionNumbers = (data: unknown) =>
-  ((data as { versions: HistoryVersion[] }).versions ?? []).map((v) => v.version);
+  (data as { versions: HistoryVersion[] }).versions.map((v) => v.version);
 
 /**
  * J2 — "I audit a node's version history."
@@ -228,8 +228,10 @@ const J2: Journey = {
       title: "history lists every version in order",
       actions: [
         {
+          // Ordered match: the keyframe v1 then v2 then v3, top to bottom —
+          // a bare "v2"/"v3" substring would also match "v20" or stray text.
           args: ["history", "nodes/policy"],
-          stdout: ["v1 [keyframe]", "v2", "v3"],
+          stdout: [/v1 \[keyframe\][\s\S]*v2[\s\S]*v3/],
         },
       ],
     },
@@ -238,12 +240,11 @@ const J2: Journey = {
       title: "Diffing two versions shows what changed between them",
       actions: [
         {
+          // Ordered match: v1→v2 removes "one"/adds "two", then v2→v3 removes
+          // "two"/adds "three" — pins the pairing, not just the presence of lines.
           args: ["history", "nodes/policy", "--diff"],
           stdout: [
-            "-version one body",
-            "+version two body",
-            "-version two body",
-            "+version three body",
+            /-version one body[\s\S]*\+version two body[\s\S]*-version two body[\s\S]*\+version three body/,
           ],
         },
       ],
@@ -259,8 +260,11 @@ const J2: Journey = {
           stdoutNot: ["version three body"],
         },
         {
+          // v2 round-trips exactly — neither the earlier nor the later body,
+          // which would catch an off-by-one in version resolution.
           args: ["reconstruct", "nodes/policy", "2"],
-          stdout: ["version two body"],
+          stdout: ["version two body", "version: 2"],
+          stdoutNot: ["version one body", "version three body"],
         },
       ],
     },
@@ -269,10 +273,15 @@ const J2: Journey = {
       title: "Integrity check confirms the version chain is intact",
       actions: [
         {
+          // Assert the per-document line (the doc hash chain) as well as the
+          // overall pass — avoid the ✓ glyph so stdout decoding can't trip the
+          // match on the Windows matrix; `--json` below is the structural proof.
           args: ["verify"],
-          stdout: ["✓ Checkpoint chain", "All integrity checks passed"],
+          stdout: ["nodes/policy", "All integrity checks passed"],
         },
         {
+          // valid:true + no errors covers BOTH the document version chain and
+          // the checkpoint chain — a regression in either shows up here.
           args: ["verify", "--json"],
           json: (data) => {
             expect((data as { valid: boolean }).valid).toBe(true);
