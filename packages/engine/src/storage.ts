@@ -33,6 +33,7 @@ import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
+import { resolveIdCasing } from "./id-casing.js";
 import {
   buildTombstoneIndex,
   carriesForgottenBody,
@@ -791,6 +792,21 @@ export class NestStorage {
 
     await scan(base, options.recursive === false ? 1 : Infinity);
     return found.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * The id of an existing document as it is spelled on disk (issue #117).
+   *
+   * `readDocument` returns the id it was given. On a case-insensitive
+   * filesystem that may not be the spelling discovery reports (`nodes/report`
+   * reads `nodes/Report.md`), so a caller about to derive paths from the id —
+   * a pdf sidecar, `pdf.file`, version history — resolves it here first.
+   * Unchanged on a case-sensitive filesystem, and for an id with no file.
+   */
+  async resolveDocumentIdCasing(id: string): Promise<string> {
+    return resolveIdCasing(id, (relDir) =>
+      readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root),
+    );
   }
 
   /**
@@ -1694,7 +1710,18 @@ export class NestStorage {
     try {
       const raw = await this.readText(filePath, "doc", id);
       const fm = parseDocument(filePath, raw, id).frontmatter;
-      if (fm.type === "pdf" && fm.pdf?.file === `${id}.pdf`) sidecar = fm.pdf.file;
+      if (fm.type === "pdf" && fm.pdf?.file) {
+        // Compared against the on-disk spelling: on a case-insensitive
+        // filesystem the caller may have reached `nodes/Report.md` as
+        // `nodes/report` (#117). The caller's spelling still counts, for a
+        // node written before #117 that recorded it — both name this node's
+        // own file. Never a case-folded compare: on a case-sensitive
+        // filesystem that could name another node's binary.
+        const onDisk = await this.resolveDocumentIdCasing(id);
+        if (fm.pdf.file === `${onDisk}.pdf` || fm.pdf.file === `${id}.pdf`) {
+          sidecar = fm.pdf.file;
+        }
+      }
     } catch {
       // Missing or unparseable: the unlink below reports the former, and an
       // unparseable file declares no sidecar.
