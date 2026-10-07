@@ -26,7 +26,7 @@
  * purpose; neither supersedes the other.
  */
 
-import { codeMask, stripInlineCode } from "./markdown-mask.js";
+import { codeMask, splitLines, stripInlineCode } from "./markdown-mask.js";
 
 // Inline link `[text](contextnest://…)` or autolink `<contextnest://…>`.
 // Reference definitions are deliberately not matched — they were not links
@@ -49,9 +49,9 @@ const CONTEXT_LINK =
 
 /** Extract all contextnest:// link targets from a markdown body */
 export function extractContextLinks(body: string): string[] {
-  // Split on CRLF as well as LF: `.` does not match `\r` in a JS regex, so a
-  // stray carriage return would defeat every end-anchored pattern below.
-  const lines = body.split(/\r?\n/);
+  // CRLF, LF and lone CR: `.` does not match `\r` in a JS regex, so a stray
+  // carriage return would defeat every end-anchored pattern below.
+  const lines = splitLines(body);
   const mask = codeMask(lines);
   const links: string[] = [];
 
@@ -110,7 +110,7 @@ export function extractWikiLinks(body: string): string[] {
   // overlapping '[[' — keeps this linear and avoids the polynomial-ReDoS
   // pattern CodeQL flags for `[^\]]+?` on uncontrolled document bodies.
   const re = /\[\[([^[\]]+)\]\]/g;
-  const lines = body.split(/\r?\n/);
+  const lines = splitLines(body);
   const mask = codeMask(lines);
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;

@@ -170,8 +170,9 @@ function splitFrontmatter(raw: string): { data: Record<string, unknown>; body: s
   }
 
   const rest = content.slice(DELIMITER.length);
-  const close = "\n" + DELIMITER;
-  const closeIndex = rest.indexOf(close);
+  // The closing delimiter starts a line — after LF, CRLF or a lone CR, the one
+  // line model of markdown-mask.ts.
+  const closeIndex = rest.search(/[\r\n]---/);
 
   const block = rest.slice(0, closeIndex === -1 ? rest.length : closeIndex);
 
@@ -184,7 +185,7 @@ function splitFrontmatter(raw: string): { data: Record<string, unknown>; body: s
 
   if (closeIndex === -1) return { data, body: "" };
 
-  let body = rest.slice(closeIndex + close.length);
+  let body = rest.slice(closeIndex + 1 + DELIMITER.length);
   // Drop the line break that terminates the closing delimiter's own line.
   if (body[0] === "\r") body = body.slice(1);
   if (body[0] === "\n") body = body.slice(1);

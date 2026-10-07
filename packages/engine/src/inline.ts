@@ -4,7 +4,7 @@
  */
 
 import type { ContextNode, RelationshipEdge } from "./types.js";
-import { codeMask } from "./markdown-mask.js";
+import { codeMask, splitLines } from "./markdown-mask.js";
 import {
   buildWikiTitleIndex,
   contextLinkTarget,
@@ -204,15 +204,6 @@ export function extractSection(body: string, anchor: string): string | null {
   return lines.slice(headings[start].line, endLine).join("\n").trim();
 }
 
-/**
- * A body's lines as CommonMark reads them: CRLF, LF and a lone CR each end a
- * line. One model for every parser here — and the same view content hashes
- * cover (§8 normalization) — so "this heading exists" means one thing whether
- * a body is judged raw or normalized, read or checked.
- */
-function splitLines(body: string): string[] {
-  return body.split(/\r\n|\r|\n/);
-}
 
 /**
  * Anchors of a body's top-level headings — the same parser section links

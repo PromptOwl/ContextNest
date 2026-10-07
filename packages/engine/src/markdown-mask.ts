@@ -6,6 +6,16 @@
  */
 
 /**
+ * A body's lines as CommonMark reads them: CRLF, LF and a lone CR each end a
+ * line. One model for every body scanner (headings, sections, links) — and the
+ * view content hashes cover (§8 normalization) — so "this heading exists"
+ * means one thing whether a body is judged raw or normalized, read or checked.
+ */
+export function splitLines(body: string): string[] {
+  return body.split(/\r\n|\r|\n/);
+}
+
+/**
  * Mark which lines sit inside a fenced code block, so link and heading
  * scanning skips them the way a real markdown parse would.
  */

@@ -18,7 +18,7 @@
 
 import yaml from "js-yaml";
 import { documentHistorySchema, FORGET_REASON_CODES } from "./schemas.js";
-import { computeContentHash } from "./integrity.js";
+import { computeContentHash, sha256Bytes } from "./integrity.js";
 import { getChecksumContent, parseDocument } from "./parser.js";
 import type { ForgetReasonCode } from "./types.js";
 
@@ -204,6 +204,10 @@ export function importVerdict(
 ): string | null {
   if (index.records.length === 0) return null;
   const path = relPath.replace(/\\/g, "/");
+  // A forgotten binary, under any name or path (§6.3.4).
+  if (/\.pdf$/i.test(path) && index.pdfHashes.has(sha256Bytes(Buffer.from(content, "utf-8")))) {
+    return `${path} restores a PDF binary a forget erased`;
+  }
 
   const versioned = /^(?:(.*)\/)?\.versions\/([^/]+)\/([^/]+)$/.exec(path);
   if (versioned) {

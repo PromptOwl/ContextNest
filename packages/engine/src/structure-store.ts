@@ -110,8 +110,12 @@ export async function sealedHead(
   if (segment.some((e) => e.tombstone)) return null;
   try {
     // Read, verify, then replay exactly what was verified — the segment alone.
-    const contents = await mapInBatches(segment, async (e) =>
-      e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null),
+    // A few reads at a time: callers already batch documents, and nested full
+    // batches multiply into hundreds of open files.
+    const contents = await mapInBatches(
+      segment,
+      async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null)),
+      4,
     );
     if (contents.some((c, i) => c === null || computeContentHash(c) !== segment[i].content_hash)) return null;
     // Each diff replays over the whole text: bound the work, or one planted
@@ -128,6 +132,28 @@ export async function sealedHead(
     );
   } catch {
     return null;
+  }
+}
+
+/**
+ * The verified head (see {@link sealedHead}) as the rules judge it: parsed in
+ * the view its hashes cover (§8 normalization). `node` is null when that view
+ * does not parse; `doc` is then the bare body, judged as such.
+ */
+export async function sealedHeadView(
+  id: string,
+  history: DocumentHistory,
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
+): Promise<{ raw: string; node: ContextNode | null; doc: StructureDoc } | null> {
+  const raw = await sealedHead(id, history, readKeyframe, readDiff);
+  if (raw === null) return null;
+  const text = normalizeForHash(raw);
+  try {
+    const node = parseDocument(`${id}.md`, text, id);
+    return { raw, node, doc: structureView(id, node) };
+  } catch {
+    return { raw, node: null, doc: { id, body: text } };
   }
 }
 
@@ -171,18 +197,12 @@ export async function structurePublishViolations(
     known = null; // corrupt: judged in full below
   }
   const first = !known || known.versions.length === 0;
-  const raw = known
-    ? await sealedHead(id, known, (v) => storage.readKeyframe(id, v), (v) => storage.readDiff(id, v))
+  // The view that was hashed: any bytes with this head's hashes get the same verdict.
+  const head = known
+    ? await sealedHeadView(id, known, (v) => storage.readKeyframe(id, v), (v) => storage.readDiff(id, v))
     : null;
-  if (raw === null) return { violations: checkDocument(rules, live), first };
-  try {
-    // The view that was hashed (§8 normalization): any bytes with this head's
-    // hashes get the same verdict.
-    const node = parseDocument(`${id}.md`, normalizeForHash(raw), id);
-    return { violations: checkUpdate(rules, structureView(id, node), live), first };
-  } catch {
-    return { violations: checkDocument(rules, live), first };
-  }
+  if (!head?.node) return { violations: checkDocument(rules, live), first };
+  return { violations: checkUpdate(rules, head.doc, live), first };
 }
 
 /**

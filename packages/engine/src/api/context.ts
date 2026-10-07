@@ -14,10 +14,11 @@
  * inspects actor strings or role tables. Commercial governance enforcement is
  * layered on via the extension framework (`extension.ts`), not here.
  */
+import { DocumentNotFoundError } from "../errors.js";
 import type { NestStorage } from "../storage.js";
 import type { GraphQueryEngine } from "../graph-query-engine.js";
 import type { VersionManager } from "../versioning.js";
-import type { RbacHook } from "../types.js";
+import type { ContextNode, RbacHook } from "../types.js";
 
 /**
  * Everything an executor needs to run one operation against a single vault.
@@ -84,3 +85,13 @@ export type OperationExecutor<Input = unknown, Output = unknown> = (
   ctx: OperationContext,
   input: Input,
 ) => Promise<Output> | Output;
+
+/** Read a node, or null when there is none at that id. */
+export async function readIfExists(ctx: OperationContext, id: string): Promise<ContextNode | null> {
+  try {
+    return await ctx.storage.readDocument(id);
+  } catch (err) {
+    if (err instanceof DocumentNotFoundError) return null;
+    throw err;
+  }
+}

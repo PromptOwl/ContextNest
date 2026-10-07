@@ -523,6 +523,17 @@ export interface NestStorageOptions {
   encryption?: VaultCryptoOptions;
 }
 
+/**
+ * A version artifact that is absent reads as null; one that is present but
+ * unreadable (a directory, EACCES, EMFILE) is corrupt history, never "missing"
+ * — a reader that fell back past it (an inline diff, a neighbouring keyframe)
+ * would rebuild a version the disk does not hold.
+ */
+function missingArtifact(err: unknown, docId: string): null {
+  if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+  throw new CorruptHistoryError(docId, err instanceof Error ? err.message : String(err));
+}
+
 /** Artifact kind a vault-relative path holds, for sealing on import. */
 function kindForVaultPath(relPath: string): { kind: SealKind; docId: string } | null {
   const norm = relPath.replace(/\\/g, "/");
@@ -2264,8 +2275,8 @@ export class NestStorage {
     let raw: string;
     try {
       raw = await readFile(keyframePath, "utf-8");
-    } catch {
-      return null;
+    } catch (err) {
+      return missingArtifact(err, docId);
     }
     // Decryption errors propagate on purpose: a keyframe that cannot be opened
     // must never read as "no keyframe" — that is how a verify passes silently.
@@ -2362,8 +2373,8 @@ export class NestStorage {
     let raw: string;
     try {
       raw = await readFile(diffPath, "utf-8");
-    } catch {
-      return null;
+    } catch (err) {
+      return missingArtifact(err, docId);
     }
     return this.openText(raw, "diff", `${docId} v${version} diff`);
   }
