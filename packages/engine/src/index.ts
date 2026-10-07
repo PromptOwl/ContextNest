@@ -264,6 +264,7 @@ export {
   assertNotMachineryPath,
   assertErasableDocumentId,
   assertResolvesOutsideMachinery,
+  assertWritableDocumentPath,
   assertFitsFileSystem,
 } from "./storage.js";
 export type {
@@ -540,6 +541,7 @@ export {
   scaffoldFirstPublish,
   assertStructurePublish,
   structurePublishViolations,
+  sealedHead,
   isEnforced,
 } from "./structure-store.js";
 

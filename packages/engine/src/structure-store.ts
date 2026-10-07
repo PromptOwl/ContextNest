@@ -31,7 +31,8 @@ import {
   type Violation,
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
-import { VersionManager } from "./versioning.js";
+import { computeContentHash } from "./integrity.js";
+import { reconstructFromHistory, type ArtifactReader } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -84,13 +85,59 @@ export async function assertStructureUpdate(
 }
 
 /**
+ * A history's head as it can be trusted: rebuilt from its last keyframe
+ * forward, every replayed entry's `content_hash` matching what was replayed.
+ * Null when it cannot be rebuilt or does not match its own hashes — a lost
+ * keyframe, a corrupt history, artifacts swapped after the fact. Grandfathering
+ * judges writes against this head, so anything less than a verified head
+ * grants nothing.
+ */
+export async function sealedHead(
+  id: string,
+  history: DocumentHistory,
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
+): Promise<string | null> {
+  const versions = history.versions;
+  const end = versions.length - 1;
+  if (end < 0 || versions[end].tombstone) return null;
+  let start = end;
+  while (start >= 0 && !versions[start].keyframe) start--;
+  if (start < 0) return null;
+  try {
+    // Read once, verified, then replayed from what was verified.
+    const keyframes = new Map<number, string>();
+    const diffs = new Map<number, string>();
+    for (let i = start; i <= end; i++) {
+      const entry = versions[i];
+      if (entry.tombstone) return null;
+      const content = entry.keyframe
+        ? await readKeyframe(entry.version)
+        : ((await readDiff(entry.version)) ?? entry.diff ?? null);
+      if (content === null || computeContentHash(content) !== entry.content_hash) return null;
+      (entry.keyframe ? keyframes : diffs).set(entry.version, content);
+    }
+    return await reconstructFromHistory(
+      id,
+      history,
+      versions[end].version,
+      (v) => keyframes.get(v) ?? null,
+      (v) => diffs.get(v) ?? null,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
  * What a publish of `live` breaks under enforced rules (§11.1.1): a first
  * publish is judged in full, a later one only for what the live file newly
- * breaks against its last sealed version (an out-of-band edit, an approved
- * held edit). Pass `history` when the caller has already read it.
+ * breaks against its sealed head (an out-of-band edit, an approved held edit).
+ * Pass `history` when the caller has already read it.
  *
- * History that cannot be rebuilt — a lost keyframe, a corrupt history.yaml —
- * is judged in full, as a first publish would be: the publish that follows
+ * A head that cannot be rebuilt and verified ({@link sealedHead}) — a lost
+ * keyframe, a corrupt history.yaml, artifacts that do not match their hashes
+ * — is judged in full, as a first publish would be: the publish that follows
  * recovers by restarting the chain, and this must neither block that recovery
  * nor judge it more leniently.
  */
@@ -101,21 +148,23 @@ export async function structurePublishViolations(
   history?: DocumentHistory | null,
 ): Promise<{ violations: Violation[]; first: boolean }> {
   const id = live.id;
-  let first = true;
-  let sealed: StructureDoc | null = null;
+  let known: DocumentHistory | null = null;
   try {
-    const known = history === undefined ? await storage.readHistory(id) : history;
-    const head = known?.versions.at(-1);
-    if (known && head) {
-      first = false;
-      const raw = await new VersionManager(storage).reconstructVersion(id, head.version, known);
-      const node = parseDocument(`${id}.md`, raw, id);
-      sealed = { id, type: node.frontmatter.type, body: node.body };
-    }
+    known = history === undefined ? await storage.readHistory(id) : history;
   } catch {
-    sealed = null; // judged in full, below
+    known = null; // corrupt: judged in full below
   }
-  return { violations: sealed ? checkUpdate(rules, sealed, live) : checkDocument(rules, live), first };
+  const first = !known || known.versions.length === 0;
+  const raw = known
+    ? await sealedHead(id, known, (v) => storage.readKeyframe(id, v), (v) => storage.readDiff(id, v))
+    : null;
+  if (raw === null) return { violations: checkDocument(rules, live), first };
+  try {
+    const node = parseDocument(`${id}.md`, raw, id);
+    return { violations: checkUpdate(rules, { id, type: node.frontmatter.type, body: node.body }, live), first };
+  } catch {
+    return { violations: checkDocument(rules, live), first };
+  }
 }
 
 /**

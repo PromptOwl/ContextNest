@@ -301,6 +301,10 @@ export class VersionManager {
   }
 
   /**
+   * NOTE (structure rules, §11.1.1): this re-anchors the sealed head on the
+   * live document without any structure check — grandfathering judges writes
+   * against that head, so a caller must judge the live document in full first.
+   *
    * Make a document's LATEST version readable again after a chain graft.
    *
    * A history grafted by an older import — duplicate version numbers, keyframe

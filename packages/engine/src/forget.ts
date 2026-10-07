@@ -443,10 +443,11 @@ export async function applyImportedTombstones(
   for (const raw of incomingEvents) {
     const rec = tombstoneFromEvent(raw);
     if (!rec) continue;
-    // A record naming no document of this vault (`../`, `.versions/…`) is
-    // neither logged nor applied.
+    // A record naming no document of this vault (`../`, `.versions/…`, a
+    // short-name alias of one, an id no file system holds) is neither logged
+    // nor applied.
     try {
-      assertNotMachineryPath(rec.document_id);
+      await assertErasableDocumentId(storage.root, rec.document_id);
     } catch {
       continue;
     }

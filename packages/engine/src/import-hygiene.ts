@@ -53,7 +53,14 @@ const EXTENSION = /\.[a-z0-9]{1,8}$/i;
 export function slugifyImportPath(relPath: string): string {
   const segments = String(relPath ?? "").split(/[/\\]/).filter(Boolean);
   return segments
-    .map((segment, i) => {
+    .map((raw, i) => {
+      // Trailing dots and spaces dropped, as Windows drops them, so every
+      // check downstream sees the name the file system will hold
+      // (`history.yaml.` is `history.yaml`). Dot-only segments (`..`) are left
+      // for the traversal guard. A loop, not `/[. ]+$/`, which is quadratic.
+      let end = raw.length;
+      if (!/^\.+$/.test(raw)) while (end > 0 && (raw[end - 1] === "." || raw[end - 1] === " ")) end--;
+      const segment = raw.slice(0, end) || raw;
       if (segment.startsWith(".")) return segment.toLowerCase();
       if (CLEAN_SEGMENT.test(segment)) return segment;
       const isLast = i === segments.length - 1;

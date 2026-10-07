@@ -50,7 +50,7 @@ import type {
   RbacHook,
   VersionEntry,
 } from "./types.js";
-import { assertResolvesOutsideMachinery, assertWritableDocumentId, type NestStorage } from "./storage.js";
+import { assertWritableDocumentPath, type NestStorage } from "./storage.js";
 import { settlePdfForCommit } from "./pdf-nodes.js";
 import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish } from "./structure-store.js";
 
@@ -423,8 +423,7 @@ async function commitNewVersion(
   // Every caller (suggestion approval, rollback, czar direct edit) seals and
   // writes a version, so the id guard and the structure rules (§11.1.1) are
   // applied here, before anything is written.
-  assertWritableDocumentId(input.documentId);
-  await assertResolvesOutsideMachinery(input.storage.root, input.documentId);
+  await assertWritableDocumentPath(input.storage.root, input.documentId);
   const filePath = join(input.storage.root, `${input.documentId}.md`);
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
 

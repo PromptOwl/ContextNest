@@ -22,7 +22,7 @@ import { createPatch } from "diff";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { suggestionMetaSchema } from "./schemas.js";
-import type { NestStorage } from "./storage.js";
+import { assertNotMachineryPath, assertResolvesOutsideMachinery, type NestStorage } from "./storage.js";
 import type {
   GovernanceTier,
   SuggestionMeta,
@@ -75,6 +75,9 @@ export interface StageSuggestionResult {
 export async function stageSuggestion(
   input: StageSuggestionInput,
 ): Promise<StageSuggestionResult> {
+  // Staged edits live beside the document, keyed by its id: never under machinery.
+  assertNotMachineryPath(input.documentId);
+  await assertResolvesOutsideMachinery(input.storage.root, input.documentId);
   const detectedAt = input.detectedAt ?? new Date().toISOString();
   const targetHash = computeContentHash(getChecksumContent(input.approvedRawContent));
   const proposedHash = computeContentHash(getChecksumContent(input.proposedRawContent));

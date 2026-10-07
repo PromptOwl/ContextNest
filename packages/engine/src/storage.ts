@@ -16,7 +16,7 @@ import {
   readdir,
   realpath,
 } from "node:fs/promises";
-import { join, dirname, basename, isAbsolute, relative } from "node:path";
+import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
 import { comparableSegment } from "./structure.js";
@@ -189,6 +189,16 @@ export function assertWritableDocumentId(raw: string): void {
 }
 
 /**
+ * {@link assertWritableDocumentId} and {@link assertResolvesOutsideMachinery}
+ * together: what every writer that touches files keyed by a document id
+ * (history, sidecars, staged edits) calls before its first write.
+ */
+export async function assertWritableDocumentPath(root: string, id: string): Promise<void> {
+  assertWritableDocumentId(id);
+  await assertResolvesOutsideMachinery(root, id);
+}
+
+/**
  * Refuse a path a file system cannot hold, before anything touches one: an
  * over-long path otherwise costs a stat per ancestor folder before failing
  * with an error that names the absolute vault path. Never echoes the path
@@ -276,9 +286,10 @@ export async function assertResolvesOutsideMachinery(root: string, id: string): 
     } catch {
       continue; // not there yet — try the folder above
     }
-    const rel = [...relative(base, resolved).split(/[/\\]+/), ...tail].join("/").replace(/\.md$/i, "");
-    if (rel.startsWith("..")) return; // outside the vault: not machinery of this one
-    assertNotMachineryPath(rel);
+    const inVault = relative(base, resolved);
+    // Outside the vault is no machinery of this one — but a folder named `..x` is inside.
+    if (inVault === ".." || inVault.startsWith(`..${sep}`) || isAbsolute(inVault)) return;
+    assertNotMachineryPath([...inVault.split(/[/\\]+/), ...tail].join("/").replace(/\.md$/i, ""));
     return;
   }
 }

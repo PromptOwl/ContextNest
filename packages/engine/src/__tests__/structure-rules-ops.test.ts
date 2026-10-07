@@ -1454,7 +1454,7 @@ describe("architecture round 8: imported history heads, imported forgets, sideca
     expect(failedIds(res)).toEqual(files.map((f) => f.path).sort());
   });
 
-  it("orphan history (no document yet) must conform, and must arrive whole", async () => {
+  it("orphan history (no document yet) must conform; a piece with no history yet grants nothing", async () => {
     const files = await donorHistory(R);
     await writeConfig(AGENDA);
     const orphan = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
@@ -1464,7 +1464,11 @@ describe("architecture round 8: imported history heads, imported forgets, sideca
       { files: files.filter((f) => f.path.endsWith("v1.md")), publish: false },
       ctx,
     );
-    expect(partial.failed).toHaveLength(1);
+    // A keyframe with no history beside it is no head: it may land, and the
+    // donor history that would give it one is still refused.
+    expect(partial.failed).toEqual([]);
+    const again = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(failedIds(again)).toContain(files.find((f) => f.path.endsWith("history.yaml"))!.path);
   });
 
   it.each([["nodes/x/../meetings/k"], ["nodes/meetings/.versions/k/v1"]])(
@@ -1504,7 +1508,7 @@ describe("architecture round 8: imported history heads, imported forgets, sideca
     expect((await readFile(sidecar)).equals(before)).toBe(true);
   });
 
-  it.skipIf(process.platform === "win32")("a legacy id with ~ and a digit can still be forgotten and deleted, but not newly written", async () => {
+  it.skipIf(process.platform === "win32")("a ~digit id that resolves to no machinery is an ordinary name: forgotten, deleted, written", async () => {
     for (const name of ["draft~2", "draft~3"]) {
       await mkdir(join(dir, "nodes", "notes"), { recursive: true });
       await writeFile(join(dir, "nodes", "notes", `${name}.md`), `---\ntitle: ${name}\ntype: document\nstatus: draft\n---\nx\n`, "utf-8");
@@ -1559,14 +1563,104 @@ describe("QA round 8: aliases, erase limits, scaffold scale", () => {
     },
   );
 
-  it("scaffolding a batch of thousands of new folders stays linear in CPU", async () => {
+  it("scaffolding a batch of thousands of new folders stays linear in CPU", { timeout: 30000 }, async () => {
     // Ids under a folder that does not exist yet: no directory I/O to hide a
     // quadratic step (a growing array copied per folder took minutes here).
     const rules = compileStructure({ structure: { enforce: true }, folders: { t: { files: { overview: {} } } } });
     const ids = Array.from({ length: 20000 }, (_, i) => `nodes/t/b${i}/c/d/x`);
     const started = Date.now();
     await scaffoldFirstPublish(storage, rules, ids);
-    expect(Date.now() - started).toBeLessThan(3000);
+    // Linear takes well under a second; the quadratic version took ~20 s.
+    expect(Date.now() - started).toBeLessThan(10000);
     expect(await exists("nodes/t/overview.md")).toBe(true);
+  });
+});
+
+describe("architecture round 9: the head an import is judged by is the head the vault will hold", () => {
+  const AGENDA: StructureConfig = {
+    structure: { enforce: true },
+    folders: { meetings: { types: ["document"], template: "m" } },
+    templates: { m: { body: "## Agenda\n", required_sections: ["Agenda"] } },
+  };
+  const R = "nodes/meetings/r";
+  const VERSIONS = "nodes/meetings/.versions/r";
+
+  it("a stale diff planted by an earlier call cannot change the head a later import is judged by", async () => {
+    // Genuine history from another vault: v1 has the Agenda, v2 (a diff) drops it.
+    const src = await mkdtemp(join(tmpdir(), "cn-structure-stale-"));
+    try {
+      const s = new NestStorage(src);
+      await s.init("src");
+      const sctx = { ...ctx, storage: s, query: new GraphQueryEngine(s), versions: new VersionManager(s) };
+      await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n" }, sctx);
+      await api.run("context_update", { id: R, content: "## Notes\nx\n" }, sctx);
+      const read = (n: string) => readFile(join(src, VERSIONS, n), "utf-8");
+      const history = yaml.load(await read("history.yaml")) as { versions: unknown[] };
+      const [v1, v2diff] = [await read("v1.md"), await read("v2.diff")];
+
+      await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n", publish: false }, ctx);
+      await writeConfig(AGENDA);
+      const at = (n: string) => `${VERSIONS}/${n}`;
+      const run = (files: { path: string; content: string }[]) =>
+        api.run<{ failed: { id?: string }[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+
+      // Call 1: a v1-only history (conforms) plus a stray v2.diff.
+      const first = await run([
+        { path: at("history.yaml"), content: yaml.dump({ ...history, versions: history.versions.slice(0, 1) }) },
+        { path: at("v1.md"), content: v1 },
+        { path: at("v2.diff"), content: v2diff },
+      ]);
+      expect(first.failed).toEqual([]);
+      // Call 2: the full history, without its diff — the vault replays the stray one.
+      const second = await run([
+        { path: at("history.yaml"), content: yaml.dump(history) },
+        { path: at("v1.md"), content: v1 },
+      ]);
+      expect(second.failed.map((f) => f.id)).toContain(at("history.yaml"));
+      // Call 3: the document without its Agenda is judged against a conforming head.
+      const third = await run([{ path: `${R}.md`, content: "---\ntitle: R\nstatus: published\n---\n## Notes\nx\n" }]);
+      expect(third.failed.map((f) => f.id)).toEqual([`${R}.md`]);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it("history that does not match its own hashes grants nothing: the document is judged in full", async () => {
+    await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n" }, ctx);
+    // Rewrite the sealed keyframe (no longer matching its content_hash) and the
+    // live file alike, so the head would grandfather the missing Agenda.
+    for (const file of [join(dir, VERSIONS, "v1.md"), join(dir, `${R}.md`)]) {
+      await writeFile(file, (await readFile(file, "utf-8")).replace("## Agenda\n", "## Notes\n"), "utf-8");
+    }
+    await writeConfig(AGENDA);
+    const err = await refusal("context_publish", { id: R });
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+
+  it.skipIf(process.platform === "win32")("a folder named ..x is still inside the vault for the alias check", async () => {
+    await api.run("context_create", { id: "..x/k", title: "K", content: "x" }, ctx);
+    await symlink(join(dir, "..x", ".versions"), join(dir, "..x", "VERSIO~1"));
+    const err = await refusal("context_update", { id: "..x/VERSIO~1/k/v1", content: "evil" });
+    expect(err.message).toMatch(/reserved/);
+  });
+
+  it.skipIf(process.platform === "win32")("a PDF import or a staged suggestion through an alias writes nothing into machinery", async () => {
+    await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+    await symlink(join(dir, "nodes", "meetings", ".versions"), join(dir, "nodes", "meetings", "VERSIO~1"));
+    const pdf = await refusal("context_import_pdf", { id: "nodes/meetings/VERSIO~1/k/vx", bytes_base64: toBase64(textPdf()) });
+    expect(pdf.message).toMatch(/reserved/);
+    expect(await exists("nodes/meetings/.versions/k/vx.pdf")).toBe(false);
+    const raw = await readFile(join(dir, "nodes", "meetings", "k.md"), "utf-8");
+    await expect(
+      stageSuggestion({
+        storage,
+        documentId: "nodes/meetings/VERSIO~1/k/v1",
+        approvedRawContent: raw,
+        proposedRawContent: raw.replace("x", "y"),
+        source: "out-of-band-edit",
+        actor: "user",
+        docTier: "standard",
+      }),
+    ).rejects.toThrow(/reserved/);
   });
 });

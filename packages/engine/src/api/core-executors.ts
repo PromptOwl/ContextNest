@@ -41,10 +41,9 @@ import {
 } from "../forget.js";
 import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
-import { reconstructFromHistory } from "../reconstruct.js";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
-import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, assertFitsFileSystem } from "../storage.js";
+import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, assertWritableDocumentPath, assertFitsFileSystem } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
@@ -104,6 +103,7 @@ import {
   missingFolders,
   assertStructurePublish,
   structurePublishViolations,
+  sealedHead,
   isEnforced,
   scaffoldFolders,
 } from "../structure-store.js";
@@ -622,7 +622,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // An update writes the file before any publish, so a reserved path
   // (§11.1.1: `.versions/`, `_suggestions/`, the root `packs/`) is refused
   // here, not left to the publish guard after the edit has landed.
-  assertWritableDocumentId(id);
+  await assertWritableDocumentPath(ctx.storage.root, id);
   const live = await ctx.storage.readDocument(id);
   // Held for review (review.ts). An edit to a PUBLISHED node must not touch
   // the canonical file — it is staged as a suggestion instead — and it builds
@@ -1272,7 +1272,7 @@ async function importVerdicts(
   }
   const setVerdicts = new Map<string, string | null>();
   await mapInBatches([...sets], async ([owner, set]) => {
-    setVerdicts.set(owner, await historySetVerdict(rules, owner, set));
+    setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set));
   });
   for (const f of plan) {
     if (refused.has(f.raw)) continue;
@@ -1320,42 +1320,49 @@ function versionsArtifact(relPath: string): { owner: string; name: string } | nu
   return { owner: [...segs.slice(0, k), segs[k + 1]].join("/"), name: segs.slice(k + 2).join("/") };
 }
 
-/** Why an imported history set is refused, or null when its head conforms. */
+/**
+ * Why an imported history set is refused, or null. Judged on what the vault
+ * will hold after this call — these files laid over what is already in the
+ * document's `.versions/` — so a file planted by an earlier call is replayed
+ * here exactly as it will be replayed later. Only a head that rebuilds, matches
+ * its own hashes and fails the full check is refused: anything that does not
+ * rebuild and verify grants nothing (sealedHead), so later writes to that
+ * document are judged in full.
+ */
 async function historySetVerdict(
+  ctx: OperationContext,
   rules: CompiledStructure,
   owner: string,
   set: Map<string, string>,
 ): Promise<string | null> {
+  let history: DocumentHistory | null = null;
   const text = set.get("history.yaml");
-  if (text === undefined) {
-    return `arrives without ${owner}'s history.yaml — a document's .versions/ files must arrive together`;
-  }
-  let history: DocumentHistory;
   try {
-    const parsed = documentHistorySchema.safeParse(yaml.load(text));
-    if (!parsed.success) return `${owner}'s history.yaml is not a valid history`;
-    history = parsed.data as DocumentHistory;
+    if (text !== undefined) {
+      const parsed = documentHistorySchema.safeParse(yaml.load(text));
+      history = parsed.success ? (parsed.data as DocumentHistory) : null;
+    } else {
+      history = await ctx.storage.readHistory(owner);
+    }
   } catch {
-    return `${owner}'s history.yaml is not valid YAML`;
+    history = null;
   }
-  const head = history.versions.at(-1);
-  // No head, or a forgotten one: nothing to rebuild, so nothing that could
-  // make a later check lenient — such a document is judged in full.
-  if (!head || head.tombstone) return null;
-  let raw: string;
+  if (!history) return null;
+  const raw = await sealedHead(
+    owner,
+    history,
+    (n) => set.get(`v${n}.md`) ?? ctx.storage.readKeyframe(owner, n),
+    (n) => set.get(`v${n}.diff`) ?? ctx.storage.readDiff(owner, n),
+  );
+  if (raw === null) return null;
+  let doc: StructureDoc;
   try {
-    raw = await reconstructFromHistory(
-      owner,
-      history,
-      head.version,
-      (n) => set.get(`v${n}.md`) ?? null,
-      (n) => set.get(`v${n}.diff`) ?? null,
-    );
+    const node = parseDocument(`${owner}.md`, raw, owner);
+    doc = { id: owner, type: node.frontmatter.type, body: node.body };
   } catch {
-    return `${owner}'s history cannot be rebuilt from the files this import brings — send its .versions/ files together`;
+    doc = { id: owner, body: raw };
   }
-  const node = parseDocument(`${owner}.md`, raw, owner);
-  const violations = checkDocument(rules, { id: owner, type: node.frontmatter.type, body: node.body });
+  const violations = checkDocument(rules, doc);
   return violations.length === 0
     ? null
     : `${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`;
@@ -1815,7 +1822,8 @@ async function importPdfLocked(
     }
   }
   assertSafeDocumentId(id);
-  assertWritableDocumentId(id);
+  // Before the sidecar is archived or written: those writes precede the node's.
+  await assertWritableDocumentPath(ctx.storage.root, id);
 
   // Anti-resurrection (§6.3.4): a path a forget retired (stub since deleted)
   // or a binary a forget erased never comes back through a PDF import.

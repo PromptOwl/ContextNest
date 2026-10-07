@@ -11,7 +11,7 @@ import type {
   Frontmatter,
   VersionEntry,
 } from "./types.js";
-import { NestStorage, assertResolvesOutsideMachinery, assertWritableDocumentId } from "./storage.js";
+import { NestStorage, assertWritableDocumentId, assertWritableDocumentPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected, parseDocument } from "./parser.js";
@@ -63,8 +63,7 @@ export async function publishDocument(
 ): Promise<PublishResult> {
   // Every publish surface (context_publish, ids[] imports, approvals, legacy
   // tools) ends here, so a reserved path is refused once, for all of them.
-  assertWritableDocumentId(docId);
-  await assertResolvesOutsideMachinery(storage.root, docId);
+  await assertWritableDocumentPath(storage.root, docId);
   // Read current document
   let node = await storage.readDocument(docId);
 
@@ -274,7 +273,7 @@ export async function publishDocuments(
 
   const publishOne = async (docId: string): Promise<void> => {
     try {
-      await assertResolvesOutsideMachinery(storage.root, docId);
+      await assertWritableDocumentPath(storage.root, docId);
       let node = await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
       await assertNotForgotten(storage, node, tombstones);
