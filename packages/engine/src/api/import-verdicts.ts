@@ -8,8 +8,8 @@
 
 import yaml from "js-yaml";
 import { mapInBatches } from "../concurrency.js";
-import { ContextNestError, ForgottenDocumentError } from "../errors.js";
-import { isVersionArtifactPath } from "../import-hygiene.js";
+import { ContextNestError, CorruptHistoryError, ForgottenDocumentError } from "../errors.js";
+import { isVersionArtifactPath, KEPT_IMPORT_NAMES } from "../import-hygiene.js";
 import { computeContentHash, sha256Bytes } from "../integrity.js";
 import { parseDocument } from "../parser.js";
 import { documentHistorySchema } from "../schemas.js";
@@ -24,7 +24,7 @@ import {
   type StructureDoc,
   type Violation,
 } from "../structure.js";
-import { sealedHead, sealedHeadView, structurePublishViolations } from "../structure-store.js";
+import { sealedHeadView, structurePublishViolations } from "../structure-store.js";
 import { importVerdict, type TombstoneIndex } from "../tombstones.js";
 import type { ContextNode, DocumentHistory } from "../types.js";
 import { readIfExists, type OperationContext } from "./context.js";
@@ -234,6 +234,7 @@ async function assertImportable(
   if (versionsArtifact(f.path)?.name.includes("/")) {
     throw new ContextNestError(`${f.raw}: a document's .versions/ folder holds files, not folders`, "VALIDATION_FAILED");
   }
+  await assertNoCaseTwin(ctx, f);
   await assertSidecarKept(ctx, f);
   if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
     throw new ContextNestError(
@@ -250,10 +251,11 @@ async function assertImportable(
  * Refuse an imported PDF binary that would replace sealed bytes: a pdf node's
  * `<doc>.pdf` is the only copy of its current version, and an archived
  * `.versions/<doc>/<sha-hex>.pdf` is named by its own hash. Judged on bytes
- * first — the same bytes (a chunked restore) always land, and nothing a `.md`
- * or a history says, both importable, can free a pdf node's sidecar for other
- * bytes. A new version of a PDF comes through context_import_pdf, which
- * archives the one it replaces.
+ * first — the same bytes (a chunked restore) always land. A node its `.md` or
+ * its history marks as a pdf node (an unverifiable history counts) keeps its
+ * sidecar; one that both say is not a pdf node holds an ordinary file, whose
+ * replaced bytes archiveReplacedPdf keeps. A new version of a PDF comes
+ * through context_import_pdf, which archives the one it replaces.
  */
 async function assertSidecarKept(
   ctx: OperationContext,
@@ -332,6 +334,24 @@ export async function archiveReplacedPdf(ctx: OperationContext, f: { path: strin
   if (history !== null || (await readIfExists(ctx, owner).catch(() => null))) await ctx.storage.archivePdfBinary(owner, onDisk);
 }
 
+/**
+ * Refuse a name kept with its capitals (`README.md`, see slugifyImportPath)
+ * when its folder holds another spelling of it: a case-insensitive file system
+ * would write into that file — a node, unjudged, at whatever path it holds.
+ */
+async function assertNoCaseTwin(ctx: OperationContext, f: PlannedFile): Promise<void> {
+  const cut = f.path.lastIndexOf("/");
+  const name = f.path.slice(cut + 1);
+  if (!KEPT_IMPORT_NAMES.has(name)) return;
+  const folded = name.toLowerCase();
+  const twin = (await ctx.storage.vaultEntryNames(f.path.slice(0, Math.max(cut, 0)))).find(
+    (e) => e !== name && e.toLowerCase() === folded,
+  );
+  if (twin !== undefined) {
+    throw new ContextNestError(`${f.raw}: its folder holds "${twin}", which a case-insensitive file system would overwrite`, "VALIDATION_FAILED");
+  }
+}
+
 /** `<dir>/.versions/<name>/<artifact>` → its document (`<dir>/<name>`) and artifact name. */
 export function versionsArtifact(relPath: string): { owner: string; name: string } | null {
   const segs = relPath.replace(/\\/g, "/").split("/").filter((s) => s !== "" && s !== ".");
@@ -358,7 +378,18 @@ async function historySetVerdict(
   const refuse = (refusal: string) => ({ refusal, head: null });
   let history: DocumentHistory | null = null;
   const text = set.get("history.yaml");
-  const onDisk = await ctx.storage.readHistory(owner).catch(() => null);
+  let onDisk: DocumentHistory | null;
+  try {
+    onDisk = await ctx.storage.readHistory(owner);
+  } catch (err) {
+    // Unparseable: never trusted, so nothing to keep — an import may replace
+    // it. Unreadable (EMFILE, EACCES): what it holds is unknown, so nothing is
+    // waved through on its account.
+    if (!(err instanceof CorruptHistoryError) || err.ioError !== undefined) {
+      return refuse(`${owner}'s history.yaml could not be read (${err instanceof Error ? err.message.split("\n")[0] : String(err)})`);
+    }
+    onDisk = null;
+  }
   try {
     if (text !== undefined) {
       const parsed = documentHistorySchema.safeParse(yaml.load(text));
@@ -372,6 +403,13 @@ async function historySetVerdict(
   if (text !== undefined && !history) return refuse(`${owner}'s history.yaml is not a valid history`);
   const keyframe = (n: number) => set.get(`v${n}.md`) ?? ctx.storage.readKeyframe(owner, n);
   const diff = (n: number) => set.get(`v${n}.diff`) ?? ctx.storage.readDiff(owner, n);
+  // The head the disk holds now, if it verifies: grandfathering already trusts
+  // it, so a head this call brings is judged as an update over it — only for
+  // what it newly breaks, as any other write to this document is.
+  const here = onDisk
+    ? await sealedHeadView(owner, onDisk, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n))
+    : null;
+  const judge = (head: StructureDoc) => (here ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
   // The history.yaml this call brings is written last and may not land (a file
   // of its set fails): the history already here, over these files, is a head
   // the vault may then hold too. A file counts there only if its bytes are the
@@ -390,9 +428,8 @@ async function historySetVerdict(
       (n) => pinned(`v${n}.md`, n, () => ctx.storage.readKeyframe(owner, n)),
       (n) => pinned(`v${n}.diff`, n, () => ctx.storage.readDiff(owner, n)),
     );
-    const current = kept && (await sealedHead(owner, onDisk, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n)));
-    if (kept && kept.raw !== current) {
-      const violations = checkDocument(rules, kept.doc);
+    if (kept && kept.raw !== here?.raw) {
+      const violations = judge(kept.doc);
       if (violations.length > 0) {
         return refuse(
           `${owner}'s history, kept with these files, ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`,
@@ -415,12 +452,11 @@ async function historySetVerdict(
     );
   }
   const head = view.doc;
-  const violations = checkDocument(rules, head);
+  const violations = judge(head);
   return violations.length === 0
     ? { refusal: null, head }
     : refuse(`${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`);
 }
-
 
 /**
  * `.context/` holds the vault's own settings — its structure rules and review

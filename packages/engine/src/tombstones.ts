@@ -194,8 +194,9 @@ export function carriesForgottenBody(index: TombstoneIndex, raw: string): boolea
  *   - a live `.md` at a path a node-level forget retired (unless it is itself
  *     a forgotten stub), or whose body matches an erased revision.
  *
- * Unparseable files are let through: they carry nothing this check can match,
- * and `ctx validate` / `ctx verify` report them.
+ * A `.md` whose frontmatter does not parse is still checked by its path and
+ * its body; other unparseable files carry nothing this check can match, and
+ * `ctx validate` / `ctx verify` report them.
  */
 export function importVerdict(
   index: TombstoneIndex,
@@ -204,8 +205,8 @@ export function importVerdict(
 ): string | null {
   if (index.records.length === 0) return null;
   const path = relPath.replace(/\\/g, "/");
-  // A forgotten binary, under any name or path (§6.3.4).
-  if (/\.pdf$/i.test(path) && index.pdfHashes.has(sha256Bytes(Buffer.from(content, "utf-8")))) {
+  // A forgotten binary, under any name or path (§6.3.4) — `copy.bin` too.
+  if (index.pdfHashes.size > 0 && index.pdfHashes.has(sha256Bytes(Buffer.from(content, "utf-8")))) {
     return `${path} restores a PDF binary a forget erased`;
   }
 
@@ -247,19 +248,17 @@ export function importVerdict(
 
   if (/\.md$/i.test(path)) {
     const id = path.replace(/\.md$/i, "");
-    let status: string | undefined;
-    let body = "";
+    let node: ReturnType<typeof parseDocument> | null = null;
     try {
-      const node = parseDocument(`${id}.md`, content, id);
-      status = node.frontmatter.status;
-      body = node.body;
+      node = parseDocument(`${id}.md`, content, id);
     } catch {
-      return null;
+      // Unparseable frontmatter is still checked by path and by body below:
+      // one broken line must not carry an erased body back in.
     }
     // A forgotten stub carries no content — importing one propagates the
     // forget. One that does carry a body is not a stub, whatever it says.
-    if (status === "forgotten") {
-      return body.trim() === "" ? null : `${id} claims status forgotten but carries a body`;
+    if (node?.frontmatter.status === "forgotten") {
+      return node.body.trim() === "" ? null : `${id} claims status forgotten but carries a body`;
     }
     if (isPathForgotten(index, id)) {
       return `${id} was forgotten; its path cannot take content again (publish under a new path)`;

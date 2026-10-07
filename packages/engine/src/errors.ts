@@ -96,6 +96,8 @@ export class CorruptHistoryError extends ContextNestError {
   constructor(
     public readonly documentId: string,
     public readonly reason: string,
+    /** The I/O error when the file could not be read at all; unset when it read but did not parse. */
+    public readonly ioError?: unknown,
   ) {
     super(
       `Version history for "${documentId}" exists but could not be read: ${reason}\n` +

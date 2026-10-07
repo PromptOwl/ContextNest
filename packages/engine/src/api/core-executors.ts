@@ -274,7 +274,11 @@ const structureDoc = (node: ContextNode): StructureDoc => structureView(node.id,
 
 /** An error's message with the vault's location cut out: callers see vault paths only. */
 const vaultError = (ctx: OperationContext, err: unknown) =>
-  (err instanceof Error ? err.message : String(err)).split(ctx.storage.root).join(".");
+  (err instanceof Error ? err.message : String(err))
+    .split(ctx.storage.root)
+    .join(".")
+    .split(ctx.storage.root.replace(/\\/g, "/"))
+    .join(".");
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
 async function publishAndIndex(
@@ -1213,10 +1217,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
             : [];
         incomingEvents.push(...list);
       } catch (err) {
-        failed.push({
-          id: String(f.path),
-          error: `unreadable chain-event log: ${err instanceof Error ? err.message : String(err)}`,
-        });
+        failed.push({ id: String(f.path), error: `unreadable chain-event log: ${vaultError(ctx, err)}` });
       }
       return false;
     });

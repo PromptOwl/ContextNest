@@ -13,7 +13,6 @@
  */
 
 import { NODE_TYPES, TAG_PATTERN } from "./schemas.js";
-import { NON_DOCUMENT_BASENAMES } from "./storage.js";
 import type { ContextNode, Frontmatter, NodeType, PdfMeta } from "./types.js";
 
 const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES);
@@ -70,7 +69,7 @@ export function slugifyImportPath(relPath: string): string {
       if (CLEAN_SEGMENT.test(segment)) return segment;
       const isLast = i === segments.length - 1;
       // `INDEX.md`, `README.md`: kept as named, or the copy is read as a node.
-      if (isLast && NON_DOCUMENT_BASENAMES.has(segment)) return segment;
+      if (isLast && KEPT_IMPORT_NAMES.has(segment)) return segment;
       const ext = isLast ? (segment.match(EXTENSION)?.[0] ?? "") : "";
       const stem = ext ? segment.slice(0, -ext.length) : segment;
       const slug = slugify(stem) || "untitled";
@@ -78,6 +77,13 @@ export function slugifyImportPath(relPath: string): string {
     })
     .join("/");
 }
+
+/**
+ * File names an import keeps with their capitals: a generated `INDEX.md` and a
+ * folder's `README.md` are not nodes, and lowercased they would be. Only these
+ * two — import-verdicts refuses one whose folder holds another spelling of it.
+ */
+export const KEPT_IMPORT_NAMES: ReadonlySet<string> = new Set(["INDEX.md", "README.md"]);
 
 /** Where the last path segment's extension starts, or its length if none. */
 function extensionStart(segment: string): number {

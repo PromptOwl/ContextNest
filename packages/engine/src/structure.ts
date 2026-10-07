@@ -1015,6 +1015,9 @@ export function checkUpdate(
   before: StructureDoc,
   after: StructureDoc,
 ): Violation[] {
+  // A forget stub owes no sections, so as a baseline it would excuse every
+  // one: it grants nothing, and what follows it is judged in full.
+  if (before.status === "forgotten") return checkDocument(rules, after);
   const p = docPath(after.id);
   if (!p) return [];
   const out: Violation[] = [];

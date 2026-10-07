@@ -2414,3 +2414,134 @@ describe("architecture round 13: bytes on disk first, status-quo histories, flat
     expect(extractWikiLinks("```\r[[hidden]]\r```\r[[shown]]")).toEqual(["shown"]);
   });
 });
+
+describe("architecture round 15: stubs grant nothing, restores over the status quo, kept names", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const ZERO = `sha256:${"0".repeat(64)}`;
+  const entry = (version: number, content: string) => ({
+    version,
+    keyframe: true,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: ZERO,
+  });
+
+  it("a forged forget stub is no baseline: a document over one is judged in full", async () => {
+    await writeConfig(SUMMARY);
+    const stub = "---\ntitle: s\nstatus: forgotten\n---\n";
+    const V = "nodes/notes/.versions/s";
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/v1.md`, content: stub },
+          { path: `${V}/history.yaml`, content: yaml.dump({ versions: [entry(1, stub)] }) },
+          { path: "nodes/notes/s.md", content: "---\ntitle: s\n---\nno summary\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain("nodes/notes/s.md");
+  });
+
+  it("a grandfathered document's own export restores over it", async () => {
+    await api.run("context_create", { id: "nodes/notes/old", title: "Old", content: "## Notes\nlegacy\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/old";
+    const files = [
+      { path: "nodes/notes/old.md", content: await readFile(join(dir, "nodes/notes/old.md"), "utf-8") },
+      ...(await Promise.all(
+        (await readdir(join(dir, V))).map(async (n) => ({ path: `${V}/${n}`, content: await readFile(join(dir, V, n), "utf-8") })),
+      )),
+    ];
+    const imp = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+    expect(imp.failed, JSON.stringify(imp.failed)).toEqual([]);
+  });
+
+  it("a kept README.md never writes into a different-case file beside it", async () => {
+    await api.run("context_create", { id: "nodes/x/readme", title: "readme", content: "node\n" }, ctx);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/x/README.md", content: "# readme\n" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/x/README.md"]);
+  });
+
+  it("verify reports an unreadable version artifact instead of failing the vault", async () => {
+    await api.run("context_create", { id: "nodes/v", title: "V", content: "one\n" }, ctx);
+    await api.run("context_update", { id: "nodes/v", content: "two\n" }, ctx);
+    await api.run("context_create", { id: "nodes/f", title: "F", content: "gone\n" }, ctx);
+    await api.run("context_forget", { id: "nodes/f", reason_code: "user_request" }, ctx);
+    const history = yaml.load(await readFile(join(dir, "nodes/.versions/v/history.yaml"), "utf-8")) as { versions: { version: number; keyframe?: boolean }[] };
+    const diffVersion = history.versions.find((e) => !e.keyframe)!.version;
+    await rm(join(dir, "nodes/.versions/v", `v${diffVersion}.diff`), { force: true });
+    await mkdir(join(dir, "nodes/.versions/v", `v${diffVersion}.diff`));
+    await mkdir(join(dir, "nodes/.versions/f/v1.md"), { recursive: true });
+    const report = await api.run<{ valid: boolean; errors: { type: string; document?: string }[] }>("context_verify", {}, ctx);
+    expect(report.valid).toBe(false);
+    expect(report.errors.find((e) => e.document === "nodes/v")?.type).not.toBe("decryption_failed");
+    expect(report.errors.some((e) => e.document === "nodes/f" && e.type === "forgotten_content_present")).toBe(true);
+  });
+
+  it("an unreadable history on disk refuses its set; an unparseable one is replaced", async () => {
+    await writeConfig(SUMMARY);
+    const A = "---\ntitle: A\n---\nbody\n";
+    await mkdir(join(dir, "nodes/.versions/a/history.yaml"), { recursive: true });
+    const io = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/.versions/a/v1.md", content: A }, { path: "nodes/.versions/a/history.yaml", content: yaml.dump({ versions: [entry(1, A)] }) }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(io.failed.map((f) => f.id).sort()).toEqual(["nodes/.versions/a/history.yaml", "nodes/.versions/a/v1.md"]);
+    expect(await exists("nodes/.versions/a/v1.md")).toBe(false);
+    await mkdir(join(dir, "nodes/.versions/b"), { recursive: true });
+    await writeFile(join(dir, "nodes/.versions/b/history.yaml"), "{{ not yaml", "utf-8");
+    const fix = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/.versions/b/v1.md", content: A }, { path: "nodes/.versions/b/history.yaml", content: yaml.dump({ versions: [entry(1, A)] }) }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(fix.failed, JSON.stringify(fix.failed)).toEqual([]);
+  });
+
+  it("a replay is budgeted by the work it does: nine full rewrites of a 400 KB note stay trusted", async () => {
+    const text = (i: number) => `---\ntitle: X\n---\n${Array.from({ length: 40 }, (_, l) => `${i}-${l}-`.padEnd(10_000, String(i))).join("\n")}\n`;
+    const versions = Array.from({ length: 10 }, (_, i) => text(i));
+    const artifacts = versions.map((v, i) => (i === 0 ? v : createPatch("x", versions[i - 1], v)));
+    const history = {
+      versions: artifacts.map((a, i) => ({ ...entry(i + 1, a), keyframe: i === 0 })),
+    } as never;
+    const head = await sealedHead("d", history, (v) => (v === 1 ? artifacts[0] : null), (v) => (v > 1 ? artifacts[v - 1] : null));
+    expect(head).toBe(versions[9]);
+  });
+
+  it("a forgotten PDF's bytes are refused under any name, and a broken-frontmatter copy of a forgotten body too", async () => {
+    const id = (await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx)).id;
+    const body = "This erased body is long enough to be remembered by its hash after the forget.\n";
+    await api.run("context_create", { id: "nodes/secret", title: "Secret", content: body }, ctx);
+    const copy = await readFile(join(dir, "nodes/secret.md"), "utf-8");
+    await api.run("context_forget", { id, reason_code: "user_request" }, ctx);
+    await api.run("context_forget", { id: "nodes/secret", reason_code: "user_request" }, ctx);
+    const broken = copy.replace(/^title:.*$/m, "title: [unclosed");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/elsewhere/copy.bin", content: Buffer.from(textPdf()).toString("utf-8") },
+          { path: "nodes/secret.md", content: broken },
+          { path: "nodes/elsewhere/secret.md", content: broken },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual(["nodes/elsewhere/copy.bin", "nodes/elsewhere/secret.md", "nodes/secret.md"]);
+  });
+});

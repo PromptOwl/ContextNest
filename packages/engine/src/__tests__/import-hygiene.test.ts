@@ -473,6 +473,8 @@ describe("planImportPaths — QA round 12", () => {
   it("a generated INDEX.md or README.md keeps its name, so it is never read as a node", () => {
     expect(slugifyImportPath("nodes/notes/INDEX.md")).toBe("nodes/notes/INDEX.md");
     expect(slugifyImportPath("README.md")).toBe("README.md");
+    // Only those two: an agent-config name is slugified like any other.
+    expect(slugifyImportPath("nodes/CLAUDE.md")).toBe("nodes/claude.md");
   });
 
   it("a ./ spelling of a renamed document takes its history along", async () => {

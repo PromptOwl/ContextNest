@@ -34,7 +34,8 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { reconstructFromHistory, type ArtifactReader } from "./reconstruct.js";
+import { applyPatch } from "diff";
+import type { ArtifactReader } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -118,18 +119,19 @@ export async function sealedHead(
       4,
     );
     if (contents.some((c, i) => c === null || computeContentHash(c) !== segment[i].content_hash)) return null;
-    // Each diff replays over the whole text: bound the work, or one planted
-    // history stalls every write judged against it.
-    const size = contents.reduce((n, c) => n + (c as string).length, 0);
-    if (size * (segment.length - 1) > MAX_REPLAY_WORK) return null;
-    const byVersion = new Map(segment.map((e, i) => [e.version, contents[i] as string]));
-    return await reconstructFromHistory(
-      id,
-      { ...history, versions: segment },
-      versions[end].version,
-      (v) => (segment[0].version === v ? (byVersion.get(v) ?? null) : null),
-      (v) => (segment[0].version === v ? null : (byVersion.get(v) ?? null)),
-    );
+    // Replayed here, the work counted as it goes: each diff walks the whole
+    // text, so one planted history must not stall every write judged against it.
+    let content = contents[0] as string;
+    let work = 0;
+    for (const patch of contents.slice(1) as string[]) {
+      if (!patch) continue;
+      work += content.length;
+      if (work > MAX_REPLAY_WORK) return null;
+      const next = applyPatch(content, patch);
+      if (typeof next !== "string") return null;
+      content = next;
+    }
+    return content;
   } catch {
     return null;
   }
@@ -165,11 +167,11 @@ export async function sealedHeadView(
 const MAX_SEALED_SEGMENT = 1000;
 
 /**
- * Most characters a sealed-head replay may touch (text size × diffs). A
- * default-interval history fits up to ~6 MB of text; past it the history is
- * not trusted (judged in full).
+ * Most characters a sealed-head replay may walk (the text's length, once per
+ * diff). A default-interval history fits ~14 MB of text; past it the history
+ * is not trusted (judged in full).
  */
-const MAX_REPLAY_WORK = 64 * 2 ** 20;
+const MAX_REPLAY_WORK = 128 * 2 ** 20;
 
 /**
  * What a publish of `live` breaks under enforced rules (§11.1.1): a first

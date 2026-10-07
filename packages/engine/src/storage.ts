@@ -531,7 +531,7 @@ export interface NestStorageOptions {
  */
 function missingArtifact(err: unknown, docId: string): null {
   if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-  throw new CorruptHistoryError(docId, err instanceof Error ? err.message : String(err));
+  throw new CorruptHistoryError(docId, err instanceof Error ? err.message : String(err), err);
 }
 
 /** Artifact kind a vault-relative path holds, for sealing on import. */
@@ -1286,8 +1286,10 @@ export class NestStorage {
         if (entry.tombstone) {
           const leftovers: string[] = [];
           if (entry.diff) leftovers.push("inline diff");
-          if ((await this.readKeyframe(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.md`);
-          if ((await this.readDiff(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.diff`);
+          // Present but unreadable (a directory, EACCES) is still present.
+          const present = (read: Promise<string | null>) => read.then((c) => c !== null, () => true);
+          if (await present(this.readKeyframe(docId, entry.version))) leftovers.push(`v${entry.version}.md`);
+          if (await present(this.readDiff(docId, entry.version))) leftovers.push(`v${entry.version}.diff`);
           if (leftovers.length > 0) {
             errors.push({
               type: "forgotten_content_present",
@@ -1451,7 +1453,8 @@ export class NestStorage {
         if (!(err instanceof ContextNestError)) throw err;
         if (err instanceof VaultLockedError || err instanceof WrongVaultKeyError) throw err;
         cryptoErrors.push({
-          type: "decryption_failed",
+          // Unreadable on disk (a directory, EACCES): its bytes match no hash.
+          type: err instanceof CorruptHistoryError ? "content_hash_mismatch" : "decryption_failed",
           document: docId,
           version: entry.version,
           expected: entry.content_hash,
@@ -1694,6 +1697,19 @@ export class NestStorage {
    * is the guard that actually refuses it, so the caller sees that path fail
    * on its own. Do not read a `false` here as "safe to write".
    */
+  /**
+   * The entry names of a vault folder (`""` is the root), as the file system
+   * spells them; empty when there is none. Same path guard.
+   */
+  async vaultEntryNames(relDir: string): Promise<string[]> {
+    try {
+      return await readdir(relDir === "" ? this.root : this.vaultFilePath(relDir));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return [];
+      throw err;
+    }
+  }
+
   async hasVaultFile(relPath: string): Promise<boolean> {
     try {
       await access(this.vaultFilePath(relPath));
@@ -2044,6 +2060,7 @@ export class NestStorage {
       throw new CorruptHistoryError(
         docId,
         err instanceof Error ? err.message : String(err),
+        err,
       );
     }
 
