@@ -18,7 +18,7 @@
 
 import { ConfigError, ContextNestError } from "./errors.js";
 import { headingAnchor, headingAnchors } from "./inline.js";
-import { NODE_TYPES } from "./schemas.js";
+import { NODE_TYPES, structureRulesSchema } from "./schemas.js";
 import type { NestConfig } from "./types.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -56,7 +56,8 @@ export interface StructureDoc {
 interface Matcher {
   /** As the owner wrote it — what messages and the wire shape show. */
   spelling: string;
-  re: RegExp;
+  /** Whole-name match. Never the backtracking engine for an owner regex. */
+  test: (name: string) => boolean;
   /**
    * name → result. A check runs the same matcher against the same name once
    * per rule and folder depth; memoizing keeps one write's regex work to one
@@ -124,15 +125,6 @@ export const MAX_MATCHED_NAME = 128;
 /** Longest owner-written regex accepted. */
 const MAX_REGEX_LENGTH = 200;
 /**
- * Variable-length quantifiers (`*`, `+`, `?`, `{m,}`, `{m,n}` with m < n)
- * allowed in one owner-written regex. With no repeated groups, a failing
- * match explores about n²/2 splits of a name of length n per alternation path
- * (≤ 16 paths): ~130k steps at the 128-character cap, well under a
- * millisecond — so even 256 distinct rules meeting one name stay fast.
- * (Three allowed n³/6 per path; 256 such rules held a write for ~3 s.)
- */
-const MAX_VARIABLE = 2;
-/**
  * `{slug}`/`{n}` tokens per token pattern. Tokens compile to unambiguous
  * expressions (each `{slug}` repetition starts with "-", `{n}` is digits and
  * two never touch), so three cost microseconds.
@@ -140,8 +132,6 @@ const MAX_VARIABLE = 2;
 const MAX_VARIABLE_TOKENS = 3;
 /** Folder rules allowed in one vault: bounds the rules a single check walks. */
 const MAX_RULES = 256;
-/** `|` alternatives allowed in one regex (at most 2⁴ branch combinations). */
-const MAX_BARS = 4;
 /** Patterns listed in a "not an allowed folder" message before eliding. */
 const MAX_LISTED = 12;
 
@@ -158,154 +148,277 @@ const TOKEN_LIST = Object.keys(TOKENS).map((t) => `{${t}}`).join(", ");
 const VARIABLE_TOKENS = new Set(["slug", "n"]);
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const LABEL = /^\{([a-z][a-z0-9_-]*)\}$/i;
-const matcher = (spelling: string, re: RegExp): Matcher => ({ spelling, re, memo: new Map() });
-const slugMatcher = () => matcher("{slug}", new RegExp(`^${TOKENS.slug}$`));
-const tokenMatcher = (token: string) => matcher(`{${token}}`, new RegExp(`^${TOKENS[token]}$`));
+const matcher = (spelling: string, test: (name: string) => boolean): Matcher => ({
+  spelling,
+  test,
+  memo: new Map(),
+});
+/** Token patterns compile to unambiguous expressions, safe on the regex engine. */
+const tokenRegexMatcher = (spelling: string, re: RegExp) => matcher(spelling, (name) => re.test(name));
+const slugMatcher = () => tokenRegexMatcher("{slug}", new RegExp(`^${TOKENS.slug}$`));
+const tokenMatcher = (token: string) => tokenRegexMatcher(`{${token}}`, new RegExp(`^${TOKENS[token]}$`));
 
 /** Whether `name` fits, never running a pattern on an over-long name. */
 function fits(m: Matcher, name: string): boolean {
   if (name.length > MAX_MATCHED_NAME) return false;
   let hit = m.memo.get(name);
   if (hit === undefined) {
-    hit = m.re.test(name);
+    hit = m.test(name);
     if (m.memo.size >= 4096) m.memo.clear();
     m.memo.set(name, hit);
   }
   return hit;
 }
 
-// ─── Regex safety ───────────────────────────────────────────────────────────
-
-/** Escapes a regex may use: the class shorthands, and escaped punctuation. */
-function escapeProblem(e: string | undefined): string | null {
-  if (e === undefined) return "ends with a lone backslash";
-  if (!"dDwWsS".includes(e) && !/[!-/:-@[-`{-~]/.test(e)) {
-    return `uses the escape \\${e} (allowed: \\d \\w \\s, their negations, and escaped ASCII punctuation)`;
-  }
-  return null;
-}
+// ─── Owner regexes: a linear-time matcher ───────────────────────────────────
 
 /**
- * Why an owner-written regex is unsafe to run on a shared server, or null.
- *
- * A WHITELIST, not a list of known-bad constructs: literals, escapes,
- * `[classes]`, `.`, `^`/`$`, quantifiers on single atoms, and un-repeated
- * `( )` / `(?: )` groups with at most {@link MAX_BARS} `|`. No group may be
- * repeated, so there is no nested repetition to explode; at most
- * {@link MAX_VARIABLE} variable-length quantifiers keep backtracking
- * polynomial and small on names capped at {@link MAX_MATCHED_NAME}.
- * Backreferences, lookaround and named groups are not in the grammar.
+ * An owner-written `/regex/` never runs on the JavaScript regex engine. That
+ * engine backtracks, and every attempt to bound its backtracking by banning
+ * constructs was broken in review (padded bounds, alternation chains, many
+ * rules multiplying one slow pattern). Instead the whitelisted grammar is
+ * parsed into this small AST and matched by position-set simulation: each
+ * item turns the set of positions reachable so far into the next set, in
+ * O(name length). A match costs O(items × length) — no pattern in the
+ * grammar can stall a write, however it is shaped or however many rules
+ * carry it. The grammar has no repeated groups, which is what keeps every
+ * item a single pass.
  */
-function regexProblem(src: string): string | null {
-  if (src.length > MAX_REGEX_LENGTH) return `is longer than ${MAX_REGEX_LENGTH} characters`;
-  let variable = 0;
-  let bars = 0;
-  let depth = 0;
-  // What a quantifier here would repeat.
-  let last: "atom" | "group" | null = null;
-  let i = 0;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === "\\") {
-      const problem = escapeProblem(src[i + 1]);
-      if (problem) return problem;
-      i += 2;
-      last = "atom";
-      continue;
-    }
-    if (c === "[") {
-      // As JavaScript reads it: the first `]` closes the class, even straight
-      // after `[` or `[^` — so `[]` and `[^]` are whole classes.
-      let j = i + 1;
-      if (src[j] === "^") j++;
-      while (j < src.length && src[j] !== "]") {
-        if (src[j] === "\\") {
-          const problem = escapeProblem(src[j + 1]);
-          if (problem) return problem;
-          j += 2;
-          continue;
-        }
-        j++;
-      }
-      if (j >= src.length) return "has an unclosed [ character class";
-      i = j + 1;
-      last = "atom";
-      continue;
-    }
-    if (c === "(") {
-      if (src[i + 1] === "?") {
-        if (src[i + 2] !== ":") return "uses a group other than ( ) or (?: ) (no lookaround or named groups)";
-        i += 3;
-      } else {
-        i += 1;
-      }
-      depth++;
-      last = null;
-      continue;
-    }
-    if (c === ")") {
-      if (depth === 0) return "has an unbalanced parenthesis";
-      depth--;
-      i++;
-      last = "group";
-      continue;
-    }
-    if (c === "|") {
-      if (++bars > MAX_BARS) return `has more than ${MAX_BARS} | alternatives`;
-      i++;
-      last = null;
-      continue;
-    }
-    if (c === "^" || c === "$") {
-      i++;
-      last = null;
-      continue;
-    }
-    if (c === "}" || c === "]") return `has an unescaped ${c} (write \\${c} for the character)`;
-    const q = quantifierAt(src, i);
-    if (q && "problem" in q) return q.problem;
-    if (q) {
-      if (last === null) return "has a quantifier with nothing to repeat";
-      if (last === "group") {
-        return "repeats a group — repeat a single character or [class] instead, or use a token pattern";
-      }
-      if (q.variable && ++variable > MAX_VARIABLE) {
-        return `has more than ${MAX_VARIABLE} variable-length repetitions (*, +, ?, {m,n})`;
-      }
-      i += q.length;
-      if (src[i] === "?") i++; // lazy suffix
-      last = null;
-      continue;
-    }
-    i++;
-    last = "atom";
-  }
-  if (depth !== 0) return "has an unbalanced parenthesis";
-  return null;
-}
+type CharTest = (code: number) => boolean;
+type RegexItem =
+  | { kind: "atom"; test: CharTest; min: number; max: number }
+  | { kind: "group"; alternatives: RegexItem[][] }
+  | { kind: "start" }
+  | { kind: "end" };
 
+const isDigit: CharTest = (c) => c >= 48 && c <= 57;
+const isWord: CharTest = (c) => isDigit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+const WHITESPACE = new Set([9, 10, 11, 12, 13, 32, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]);
+const isSpace: CharTest = (c) => WHITESPACE.has(c) || (c >= 0x2000 && c <= 0x200a);
+const isLineTerminator = (c: number) => c === 10 || c === 13 || c === 0x2028 || c === 0x2029;
+const SHORTHANDS: Readonly<Record<string, CharTest>> = {
+  d: isDigit,
+  D: (c) => !isDigit(c),
+  w: isWord,
+  W: (c) => !isWord(c),
+  s: isSpace,
+  S: (c) => !isSpace(c),
+};
+const ASCII_PUNCTUATION = /^[!-/:-@[-`{-~]$/;
+const equals = (code: number): CharTest => (c) => c === code;
 const BRACE_QUANTIFIER = /\{(\d+)(?:(,)(\d*))?\}/y;
 
+class RegexSyntaxError extends Error {}
+
 /**
- * The quantifier starting at `i`, null if `src[i]` starts none, or why a `{`
- * there is refused. Parsed over the whole source: a window would read a
- * zero-padded bound (`{0,000…099}`) as literal text while the regex engine
- * runs it as a repetition.
+ * Parse a regex body in the §11.1.1 grammar (ECMAScript, no flags,
+ * non-Unicode), refusing everything outside it.
  */
-function quantifierAt(
-  src: string,
-  i: number,
-): { length: number; variable: boolean } | { problem: string } | null {
-  const c = src[i];
-  if (c === "*" || c === "+" || c === "?") return { length: 1, variable: true };
-  if (c !== "{") return null;
-  BRACE_QUANTIFIER.lastIndex = i;
-  const m = BRACE_QUANTIFIER.exec(src);
-  if (!m) return { problem: "has an unescaped { that is not a quantifier (write \\{ for the character)" };
-  if (m[1].length > 3 || (m[3]?.length ?? 0) > 3) return { problem: "has a quantifier bound longer than 3 digits" };
-  const min = Number(m[1]);
-  const max = m[2] === undefined ? min : m[3] === "" ? Infinity : Number(m[3]);
-  return { length: m[0].length, variable: max !== min };
+function parseRegex(src: string): RegexItem[][] {
+  let i = 0;
+  const fail = (why: string): never => {
+    throw new RegexSyntaxError(why);
+  };
+
+  const escape = (): { shorthand: CharTest } | { char: number } => {
+    const e = src[i + 1];
+    if (e === undefined) fail("ends with a lone backslash");
+    i += 2;
+    if (Object.hasOwn(SHORTHANDS, e)) return { shorthand: SHORTHANDS[e] };
+    if (!ASCII_PUNCTUATION.test(e)) {
+      fail(`uses the escape \\${e} (allowed: \\d \\w \\s, their negations, and escaped ASCII punctuation)`);
+    }
+    return { char: e.charCodeAt(0) };
+  };
+
+  // As JavaScript reads a class: the first `]` closes it, even straight after
+  // `[` or `[^`, so `[]` matches nothing and `[^]` anything; `-` is a range
+  // only between two characters.
+  const charClass = (): CharTest => {
+    i++;
+    let negate = false;
+    if (src[i] === "^") {
+      negate = true;
+      i++;
+    }
+    const members: CharTest[] = [];
+    for (;;) {
+      if (i >= src.length) fail("has an unclosed [ character class");
+      if (src[i] === "]") {
+        i++;
+        break;
+      }
+      let from: number;
+      if (src[i] === "\\") {
+        const e = escape();
+        if ("shorthand" in e) {
+          members.push(e.shorthand);
+          continue;
+        }
+        from = e.char;
+      } else {
+        from = src.charCodeAt(i++);
+      }
+      if (src[i] === "-" && src[i + 1] !== undefined && src[i + 1] !== "]") {
+        i++;
+        let to: number;
+        if (src[i] === "\\") {
+          const e = escape();
+          if ("shorthand" in e) {
+            members.push(equals(from), equals(45), e.shorthand);
+            continue;
+          }
+          to = e.char;
+        } else {
+          to = src.charCodeAt(i++);
+        }
+        if (to < from) fail("has a character range out of order");
+        const lo = from;
+        members.push((c) => c >= lo && c <= to);
+        continue;
+      }
+      members.push(equals(from));
+    }
+    return (c) => members.some((m) => m(c)) !== negate;
+  };
+
+  const quantifier = (): { min: number; max: number } | null => {
+    const c = src[i];
+    if (c === "*") return (i++, { min: 0, max: Infinity });
+    if (c === "+") return (i++, { min: 1, max: Infinity });
+    if (c === "?") return (i++, { min: 0, max: 1 });
+    if (c !== "{") return null;
+    BRACE_QUANTIFIER.lastIndex = i;
+    const m = BRACE_QUANTIFIER.exec(src);
+    if (!m) return fail("has an unescaped { that is not a quantifier (write \\{ for the character)");
+    if (m[1].length > 3 || (m[3]?.length ?? 0) > 3) fail("has a quantifier bound longer than 3 digits");
+    const min = Number(m[1]);
+    const max = m[2] === undefined ? min : m[3] === "" ? Infinity : Number(m[3]);
+    if (max < min) fail("has a quantifier whose bounds are out of order");
+    i += m[0].length;
+    return { min, max };
+  };
+
+  const sequence = (): RegexItem[] => {
+    const items: RegexItem[] = [];
+    while (i < src.length && src[i] !== "|" && src[i] !== ")") {
+      const c = src[i];
+      let item: RegexItem;
+      if (c === "(") {
+        if (src[i + 1] === "?") {
+          if (src[i + 2] !== ":") fail("uses a group other than ( ) or (?: ) (no lookaround or named groups)");
+          i += 3;
+        } else {
+          i++;
+        }
+        const alternatives = alternation();
+        if (src[i] !== ")") fail("has an unbalanced parenthesis");
+        i++;
+        item = { kind: "group", alternatives };
+      } else if (c === "^" || c === "$") {
+        i++;
+        item = { kind: c === "^" ? "start" : "end" };
+      } else if (c === "[") {
+        item = { kind: "atom", test: charClass(), min: 1, max: 1 };
+      } else if (c === "\\") {
+        const e = escape();
+        item = { kind: "atom", test: "shorthand" in e ? e.shorthand : equals(e.char), min: 1, max: 1 };
+      } else if (c === ".") {
+        i++;
+        item = { kind: "atom", test: (x) => !isLineTerminator(x), min: 1, max: 1 };
+      } else if (c === "*" || c === "+" || c === "?" || c === "{") {
+        return fail(c === "{" ? "has an unescaped { (write \\{ for the character)" : "has a quantifier with nothing to repeat");
+      } else if (c === "}" || c === "]") {
+        return fail(`has an unescaped ${c} (write \\${c} for the character)`);
+      } else {
+        i++;
+        item = { kind: "atom", test: equals(c.charCodeAt(0)), min: 1, max: 1 };
+      }
+      const q = quantifier();
+      if (q) {
+        if (item.kind === "group") fail("repeats a group — repeat a single character or [class] instead, or use a token pattern");
+        if (item.kind !== "atom") fail("has a quantifier with nothing to repeat");
+        (item as { min: number; max: number }).min = q.min;
+        (item as { min: number; max: number }).max = q.max;
+        if (src[i] === "?") i++; // lazy: the same set of whole-name matches
+        if (src[i] === "*" || src[i] === "+" || src[i] === "?" || src[i] === "{") {
+          fail("has a quantifier with nothing to repeat");
+        }
+      }
+      items.push(item);
+    }
+    return items;
+  };
+
+  const alternation = (): RegexItem[][] => {
+    const alternatives = [sequence()];
+    while (src[i] === "|") {
+      i++;
+      alternatives.push(sequence());
+    }
+    return alternatives;
+  };
+
+  const top = alternation();
+  if (i < src.length) fail("has an unbalanced parenthesis");
+  return top;
+}
+
+/** Positions reachable after `alternatives`, from the positions in `from`. */
+function advanceAlternatives(alternatives: RegexItem[][], name: string, from: Uint8Array): Uint8Array {
+  if (alternatives.length === 1) return advanceSequence(alternatives[0], name, from);
+  const out = new Uint8Array(name.length + 1);
+  for (const alternative of alternatives) {
+    const reached = advanceSequence(alternative, name, from);
+    for (let p = 0; p <= name.length; p++) out[p] |= reached[p];
+  }
+  return out;
+}
+
+function advanceSequence(items: RegexItem[], name: string, from: Uint8Array): Uint8Array {
+  const n = name.length;
+  let current = from;
+  for (const item of items) {
+    if (item.kind === "group") {
+      current = advanceAlternatives(item.alternatives, name, current);
+      continue;
+    }
+    const next = new Uint8Array(n + 1);
+    if (item.kind === "start") {
+      next[0] = current[0];
+    } else if (item.kind === "end") {
+      next[n] = current[n];
+    } else {
+      // run[p]: how many characters from p the atom matches in a row; from p
+      // the atom ends anywhere in [p + min, p + min(max, run[p])]. Marking
+      // those ranges through a difference array keeps the step linear.
+      const run = new Uint32Array(n + 1);
+      for (let p = n - 1; p >= 0; p--) run[p] = item.test(name.charCodeAt(p)) ? run[p + 1] + 1 : 0;
+      const diff = new Int32Array(n + 2);
+      for (let p = 0; p <= n; p++) {
+        if (!current[p]) continue;
+        const lo = p + item.min;
+        const hi = p + Math.min(item.max, run[p]);
+        if (lo <= hi) {
+          diff[lo]++;
+          diff[hi + 1]--;
+        }
+      }
+      for (let p = 0, open = 0; p <= n; p++) {
+        open += diff[p];
+        next[p] = open > 0 ? 1 : 0;
+      }
+    }
+    current = next;
+  }
+  return current;
+}
+
+/** Whole-name match, as `^(?:body)$` would, in linear time. */
+function linearTest(alternatives: RegexItem[][], name: string): boolean {
+  const start = new Uint8Array(name.length + 1);
+  start[0] = 1;
+  return advanceAlternatives(alternatives, name, start)[name.length] === 1;
 }
 
 // ─── Compiling ──────────────────────────────────────────────────────────────
@@ -315,15 +428,17 @@ function compileFormat(spelling: string, key: string): Matcher {
   if (spelling.length >= 2 && spelling.startsWith("/") && spelling.endsWith("/")) {
     const body = spelling.slice(1, -1);
     if (!body) throw new ConfigError(`${key}: the regex is empty`);
-    const problem = regexProblem(body);
-    if (problem) throw new ConfigError(`${key}: the regex ${spelling} ${problem}`);
-    let re: RegExp;
-    try {
-      re = new RegExp(`^(?:${body})$`);
-    } catch (err) {
-      throw new ConfigError(`${key}: ${spelling} is not a valid regex (${(err as Error).message})`);
+    if (body.length > MAX_REGEX_LENGTH) {
+      throw new ConfigError(`${key}: the regex ${spelling} is longer than ${MAX_REGEX_LENGTH} characters`);
     }
-    return matcher(spelling, re);
+    let alternatives: RegexItem[][];
+    try {
+      alternatives = parseRegex(body);
+    } catch (err) {
+      if (!(err instanceof RegexSyntaxError)) throw err;
+      throw new ConfigError(`${key}: the regex ${spelling} ${err.message}`);
+    }
+    return matcher(spelling, (name) => linearTest(alternatives, name));
   }
   if (!spelling) throw new ConfigError(`${key}: the format is empty`);
   let source = "";
@@ -362,7 +477,7 @@ function compileFormat(spelling: string, key: string): Matcher {
       source += part;
     }
   }
-  return matcher(spelling, new RegExp(`^${source}$`));
+  return tokenRegexMatcher(spelling, new RegExp(`^${source}$`));
 }
 
 /** `"/nodes/a/b/"` → `"a/b"`; `"/"`, `""` and `"nodes"` → `""` (the root). */
@@ -398,6 +513,17 @@ function assertType(type: string, key: string): void {
  * compiles to an empty, report-only rule set.
  */
 export function compileStructure(config: StructureConfig | null | undefined): CompiledStructure {
+  // The config schema leaves these keys unchecked (see schemas.ts), so their
+  // shape is checked here, naming the offending key.
+  const shape = structureRulesSchema.safeParse({
+    structure: config?.structure,
+    folders: config?.folders,
+    templates: config?.templates,
+  });
+  if (!shape.success) {
+    const issue = shape.error.issues[0];
+    throw new ConfigError(`${issue.path.join(".")}: ${issue.message}`);
+  }
   // Null prototype: a template named `constructor` or `toString` must never
   // resolve to an inherited Object property.
   const templates: CompiledStructure["templates"] = Object.create(null);

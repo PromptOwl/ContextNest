@@ -72,6 +72,9 @@ import {
   approveReview,
   rejectReview,
   REVIEW_OFF_COMMAND,
+  enforcedStructure,
+  checkDocument,
+  parseDocument,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -987,8 +990,24 @@ async function applyStarter(
     await storage.writeConfig(initialConfig);
   }
 
+  // A starter on a re-initialized vault meets its structure rules like any
+  // other write: what they refuse is left out, not forced in.
+  const rules = await enforcedStructure(storage);
+  const nodes = starter.nodes.filter((node) => {
+    if (!rules) return true;
+    const doc = parseDocument(`${node.path}.md`, node.content, node.path);
+    return checkDocument(rules, { id: node.path, type: doc.frontmatter.type, body: doc.body }).length === 0;
+  });
+  if (nodes.length < starter.nodes.length) {
+    console.log(
+      chalk.yellow(
+        `  Skipped ${starter.nodes.length - nodes.length} starter document(s) this vault's structure rules refuse (ctx structure).`,
+      ),
+    );
+  }
+
   // Write starter nodes
-  for (const node of starter.nodes) {
+  for (const node of nodes) {
     await storage.writeDocument(node.path, node.content);
   }
 
@@ -1000,7 +1019,7 @@ async function applyStarter(
   }
 
   // Publish all starter nodes
-  for (const node of starter.nodes) {
+  for (const node of nodes) {
     await publishDocument(storage, node.path, {
       editedBy: "cli@contextnest.local",
       note: `Created by ${starter.id} starter`,
@@ -1011,8 +1030,8 @@ async function applyStarter(
 
   // Print results
   console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
-  console.log(`  Created ${starter.nodes.length} documents:`);
-  for (const node of starter.nodes) {
+  console.log(`  Created ${nodes.length} documents:`);
+  for (const node of nodes) {
     console.log(`    ${chalk.cyan(node.path + ".md")}`);
   }
   console.log(`  Created ${starter.packs.length} pack(s):`);
@@ -1036,7 +1055,7 @@ async function applyStarter(
     vaultName: opts.name,
     starterName: starter.id,
     starterDisplayName: starter.name,
-    nodes: starter.nodes.map((n) => ({
+    nodes: nodes.map((n) => ({
       path: n.path,
       title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
       type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
@@ -1226,7 +1245,18 @@ program
     const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
     const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
     const review = reinit ? priorReview : "on";
-    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
+    // Structure rules survive a re-init too: re-initializing must not be a way
+    // to drop them. (A config that will not parse has none we can read.)
+    const prior = reinit ? await storage.readConfig().catch(() => null) : null;
+    const rules = {
+      ...(prior?.structure !== undefined ? { structure: prior.structure } : {}),
+      ...(prior?.folders !== undefined ? { folders: prior.folders } : {}),
+      ...(prior?.templates !== undefined ? { templates: prior.templates } : {}),
+    };
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, {
+      ...(review ? { review } : {}),
+      rules,
+    });
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
     if (review === "on") {
       console.log(

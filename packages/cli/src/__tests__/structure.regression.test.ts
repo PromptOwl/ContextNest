@@ -204,6 +204,16 @@ describe("[regression] structure rules — ctx on a local vault", () => {
     expect(ctx(["update", "nodes/notes/old", "--body", "edited"]).status).toBe(0);
   });
 
+  it("re-running ctx init keeps the rules, and a starter cannot write where they refuse", async () => {
+    await setStructure(new NestStorage(vault), RULES);
+    const res = ctx(["init", "--name", "structure-vault", "--layout", "structured", "--starter", "developer", "--yes"]);
+    expect(res.status, res.stderr).toBe(0);
+    const after = JSON.parse(ctx(["structure", "--json"]).stdout);
+    expect(after.enforce).toBe(true);
+    expect(after.folders.map((f: any) => f.pattern)).toContain("clients/{client}/meetings");
+    expect(JSON.parse(ctx(["structure", "--report", "--json"]).stdout).violations).toEqual([]);
+  });
+
   it("a bad rule fails writes with CONFIG_ERROR naming the key; reads still work", () => {
     const cfg = join(vault, ".context", "config.yaml");
     writeFileSync(cfg, `${readFileSync(cfg, "utf-8")}\nstructure: {enforce: true}\nfolders:\n  d:\n    file_name: "/(a+)+/"\n`);

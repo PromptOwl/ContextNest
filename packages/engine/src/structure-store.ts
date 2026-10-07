@@ -8,7 +8,7 @@
  * these, so none of them re-implements scaffolding or the enforce gate.
  */
 
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import yaml from "js-yaml";
@@ -298,8 +298,18 @@ async function writeStructure(storage: NestStorage, rules: StructureConfig): Pro
   }
   compileStructure(parseConfig(next));
   // Temp file + rename: a crash mid-write never leaves a half-written config,
-  // which every later read and write of the vault would trip over.
-  const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile(tmp, `${bom}${next}`, "utf-8");
-  await rename(tmp, path);
+  // which every later read and write of the vault would trip over. Renamed
+  // onto the symlink's target, not the link, with the file's own mode.
+  const target = await realpath(path);
+  const { mode } = await stat(target);
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    // Created with the mode (never briefly wider), then chmod past the umask.
+    await writeFile(tmp, `${bom}${next}`, { encoding: "utf-8", mode: mode & 0o777, flag: "wx" });
+    await chmod(tmp, mode & 0o7777);
+    await rename(tmp, target);
+  } catch (err) {
+    await unlink(tmp).catch(() => undefined);
+    throw err;
+  }
 }

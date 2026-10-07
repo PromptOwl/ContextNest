@@ -264,6 +264,51 @@ describe("reserved paths are never document paths, in any layout", () => {
   );
 });
 
+describe("malformed but unenforced rules never stop a write", () => {
+  it.each([
+    [{ templates: ["meeting"] }],
+    [{ structure: true }],
+    [{ structure: { enforce: false }, folders: { notes: { types: "document" } } }],
+  ])("%j: writes succeed and context_structure reports the error", async (extra) => {
+    await writeConfig(extra as never);
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+    const out = await api.run<any>("context_structure", {}, ctx);
+    expect(out.error).toBeTruthy();
+  });
+
+  it("the same malformed rule in an enforced vault refuses writes with CONFIG_ERROR", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { notes: { types: "document" } } });
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(err.code).toBe("CONFIG_ERROR");
+    expect(err.message).toMatch(/folders\.notes\.types/);
+  });
+});
+
+describe("publishing never reaches a reserved path", () => {
+  it("context_import ids[] and context_publish refuse ids under packs/ and .versions/", async () => {
+    await writeFile(join(dir, "packs", "evil.md"), "---\ntitle: Evil\n---\nx\n", "utf-8");
+    const res = await api.run<{ published: unknown[]; failed: { id?: string }[] }>(
+      "context_import",
+      { ids: ["packs/evil"] },
+      ctx,
+    );
+    expect(res.published).toEqual([]);
+    expect(res.failed.map((f) => f.id)).toEqual(["packs/evil"]);
+    const err = await refusal("context_publish", { id: "packs/evil" });
+    expect(err.message).toMatch(/reserved/);
+  });
+
+  it.each(["nodes/x/.verſions/y", "packſ/x", ".context::$INDEX_ALLOCATION/x", "nodes/a\u0000b"])(
+    "the write guard sees through %j (long s, NTFS streams, control characters)",
+    async (id) => {
+      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+      expect(err.code).toMatch(/VALIDATION_FAILED|INVALID_DOCUMENT_ID/);
+      expect(err.message).not.toContain(dir);
+    },
+  );
+});
+
 describe("context_import files[] honours the reserved paths too", () => {
   it.each([["structured"], ["obsidian"]])("a %s vault refuses a document under the root packs/", async (layout) => {
     const vdir = await mkdtemp(join(tmpdir(), "cn-structure-import-packs-"));
@@ -829,6 +874,18 @@ describe("setStructure", () => {
     await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
     await expect(setStructure(storage, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
     expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toBe(cfg);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the config file's mode and writes through a symlink", async () => {
+    const { chmod, stat, symlink, rename, lstat } = await import("node:fs/promises");
+    const cfg = join(dir, ".context", "config.yaml");
+    await chmod(cfg, 0o600);
+    await setStructure(storage, RULES);
+    expect((await stat(cfg)).mode & 0o777).toBe(0o600);
+    await rename(cfg, join(dir, ".context", "real.yaml"));
+    await symlink("real.yaml", cfg);
+    await setStructure(storage, {});
+    expect((await lstat(cfg)).isSymbolicLink()).toBe(true);
   });
 
   it("refuses a directory that is not a vault", async () => {

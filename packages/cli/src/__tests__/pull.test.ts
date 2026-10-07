@@ -179,7 +179,7 @@ describe("parseRecipeManifest", () => {
       expect(bad(`id: x\nincludes:\n  - from: nodes/a\n    to: ${to}`)).toThrow(/reserved/);
     }
     // Template files: YAML only, never a dot-folder (code-running config) or a governed folder.
-    for (const to of [".context/config.yaml", ".git/hooks/pre-commit", ".claude/settings.yaml", "nodes/x.yaml", "packs/x.yml", "run.sh"]) {
+    for (const to of [".context/config.yaml", ".git/hooks/pre-commit", ".claude/settings.yaml", "nodes/x.yaml", "packs/x.yml", "PACKS/x.yml", "Nodes/misc/x.yaml", "run.sh"]) {
       expect(bad(`id: x\nfiles:\n  - from: nodes/a\n    to: ${to}`)).toThrow(/must be a \.yaml\/\.yml path/);
     }
     expect(parseRecipeManifest("```yaml recipe\nid: x\nfiles:\n  - from: nodes/a\n    to: config/stewards.yml\n```\n").files[0].to).toBe(

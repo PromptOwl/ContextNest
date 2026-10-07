@@ -157,8 +157,10 @@ export function parseRecipeManifest(body: string): RecipeManifest {
     const to = safeRelPath(str(entry.to, `files[${i}].to`), `files[${i}].to`);
     // A template is YAML. No dot-segment keeps a recipe out of .git/hooks,
     // .claude/, .vscode/ and .context/ (places that run code or hold vault
-    // state); no nodes/ or packs/ keeps it from writing past governance.
-    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || /^(nodes|packs)\//.test(to)) {
+    // state); no nodes/ or packs/ keeps it from writing past governance —
+    // compared as a case-insensitive volume or Windows would read the name.
+    const root = to.split("/")[0].split(":")[0].replace(/[. ]+$/, "").toUpperCase().toLowerCase();
+    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || root === "nodes" || root === "packs") {
       throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/ and dot-folders`);
     }
     return { from: normalizeDocumentId(str(entry.from, `files[${i}].from`)), to, extract: "yaml" as const };

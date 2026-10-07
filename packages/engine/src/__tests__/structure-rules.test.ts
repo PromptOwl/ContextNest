@@ -123,6 +123,16 @@ describe("compileStructure", () => {
     expect(codes(checkDocument(r, { id: "nodes/NOTES/x", type: "glossary", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
   });
 
+  it.each([
+    ["templates as a list", { templates: ["meeting"] }, /templates/],
+    ["structure as a scalar", { structure: true }, /structure/],
+    ["types as a string", { folders: { notes: { types: "document" } } }, /folders\.notes\.types/],
+    ["required as a string", { folders: { notes: { required: "yes" } } }, /folders\.notes\.required/],
+    ["a template body as a list", { templates: { t: { body: ["x"] } } }, /templates\.t\.body/],
+  ])("a malformed %s is a CONFIG_ERROR naming the key (the schema no longer refuses it)", (_l, cfg, key) => {
+    expectConfigError(cfg as never, key);
+  });
+
   it("the spec's own §11.1 example still compiles: an unresolved template is a legacy label", () => {
     const r = compileStructure({ folders: { decisions: { template: "adr" }, engineering: { description: "x" } } });
     expect(resolveFolder(r, "decisions")).toMatchObject({ pattern: "decisions", template: "adr" });
@@ -183,22 +193,17 @@ describe("compileStructure", () => {
       ["lookahead", "/(?=a)a/"],
       ["negative lookahead", "/(?!b)a/"],
       ["lookbehind", "/(?<=a)b/"],
-      ["too many unbounded quantifiers", "/a*b*c*d*/"],
       ["longer than 200 characters", `/${"a".repeat(201)}/`],
       ["invalid syntax", "/(/"],
       ["empty", "//"],
       // QA + architecture repros: each was accepted by the old blocklist and
       // stalled the process for seconds on a ≤128-character name.
       ["[^] hiding a nested group", "/[^](?:a+)+b/"],
-      ["many bounded repetitions", "/a{0,30}a{0,30}a{0,30}a{0,30}a{0,30}a{0,30}b/"],
       ["a repeated group of optionals", "/(?:a?a?)+b/"],
       ["an optional inside a repeated group", "/(a?){50}a{50}/"],
-      ["a long chain of alternations", `/${"(?:a|a)".repeat(26)}/`],
-      ["fourteen bounded repetitions", `/${"a{0,20}".repeat(14)}b/`],
       ["any quantified group", "/(?:-v[0-9])?x/"],
       ["a named group", "/(?<x>a)b/"],
       ["an unknown letter escape", "/\\x41/"],
-      ["more than 4 alternation bars", "/(a|b|c|d|e|f)/"],
       // Round 3: a zero-padded bound hid the quantifier from a 24-char window.
       ["a zero-padded quantifier on a group", `/(?:a|aa){0,${"0".repeat(22)}99}!/`],
       ["zero-padded quantifiers past the budget", `/[a-z]*[a-z]*[a-z]*[a-z]{0,${"0".repeat(22)}9}[a-z]{0,${"0".repeat(22)}9}!/`],
@@ -207,8 +212,6 @@ describe("compileStructure", () => {
       ["an unescaped }", "/a}/"],
       ["an escaped non-ASCII character", "/a\\é/"],
       ["an escaped space", "/a\\ b/"],
-      // Round 4: 3 variable quantifiers × 256 distinct rules took ~3s per write.
-      ["three variable-width quantifiers", "/a*a*a*b/"],
     ])("refuses %s", (_label, src) => {
       expectConfigError({ folders: { d: { file_name: src } } }, /folders\.d\.file_name/);
     });
@@ -233,6 +236,56 @@ describe("compileStructure", () => {
       const started = Date.now();
       checkDocument(r, { id: `d/${name}`, type: "document", body: "" });
       expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    // Round 5: owner regexes run on a linear-time position-set matcher, never
+    // on the backtracking engine — so no pattern in the grammar can stall a
+    // write, however it is shaped or however many rules carry it.
+    it.each([
+      "/.*.*.*(?:.{9}|.{9})(?:.{9}|.{9})(?:.{9}|.{9})(?:.{9}|.{9})x/",
+      "/a*b*c*d*e*f*!/",
+      `/${"a{0,20}".repeat(9)}b/`,
+      `/${"(?:a|a)".repeat(24)}!/`,
+      "/(a|b|c|d|e|f|g)[a-z]*-[0-9]*/",
+    ])("accepts %s and matches it in linear time", (src) => {
+      const r = compileStructure({ folders: { d: { file_name: src } } });
+      const started = Date.now();
+      for (let i = 0; i < 50; i++) checkDocument(r, { id: `d/${"a".repeat(127 - (i % 3))}c`, type: "document", body: "" });
+      expect(Date.now() - started).toBeLessThan(500);
+    });
+
+    it("256 distinct deep rules with the most expensive shape still check fast", () => {
+      const worst = "/.*.*.*(?:.{9}|.{9})(?:.{9}|.{9})(?:.{9}|.{9})(?:.{9}|.{9})x/";
+      const folders: Record<string, object> = {};
+      for (let i = 0; i < 256; i++) {
+        const segs = Array.from({ length: 8 }, (_, j) => ((i >> j) & 1 ? "a" : "{p}"));
+        folders[[...segs, "{t}"].join("/")] = { folder_name: worst };
+      }
+      const r = compileStructure({ folders: folders as never });
+      const started = Date.now();
+      checkDocument(r, { id: `${"a/".repeat(8)}${"a".repeat(128)}/doc`, type: "document", body: "" });
+      expect(Date.now() - started).toBeLessThan(500);
+    });
+
+    it("agrees with JavaScript's RegExp on every accepted pattern (differential)", () => {
+      const patterns = [
+        "a*b", "(a|ab)(c|bcd)(d*)", "[a-c]+-[0-9]{2,3}", "[^a]x?", ".*-.*", "(?:ab|a)(?:b|)c?",
+        "\\d{2}\\w\\s?", "[\\d-z]+", "a{0,2}b{2}", "(a|)(b|)", "[]a|b", "[^]{2}", "x|", "(?:a|b(?:c|d))e*",
+        "\\.-\\{\\}", "^ab$", "a^b", "[a-]+", "(a|b|c|d|e|f|g)",
+      ];
+      const alphabet = ["a", "b", "c", "d", "e", "x", "-", "0", "1", "_", " ", ".", "{", "}", "\n"];
+      let seed = 7;
+      const rand = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2147483648) % n);
+      for (const src of patterns) {
+        const r = compileStructure({ folders: { d: { file_name: `/${src}/` } } });
+        const re = new RegExp(`^(?:${src})$`);
+        for (let i = 0; i < 300; i++) {
+          const name = Array.from({ length: rand(7) }, () => alphabet[rand(alphabet.length)]).join("");
+          if (!name || name === "." || name === "..") continue; // not ids — the id guard refuses them
+          const ok = checkDocument(r, { id: `d/${name}`, type: "document", body: "" }).length === 0;
+          expect(ok, `${src} vs ${JSON.stringify(name)}`).toBe(re.test(name));
+        }
+      }
     });
 
     it("escaped braces are literal text", () => {

@@ -372,6 +372,38 @@ export const frontmatterSchema = z
     }
   });
 
+/** The shape of the structure-rule keys (§11.1.1); see compileStructure(). */
+export const structureRulesSchema = z.object({
+  structure: z.object({ enforce: z.boolean().optional(), closed: z.boolean().optional() }).nullish(),
+  folders: z
+    .record(
+      z
+        .object({
+          description: z.string().optional(),
+          template: z.string().optional(),
+          types: z.array(z.string()).optional(),
+          folder_name: z.string().optional(),
+          file_name: z.string().optional(),
+          required: z.boolean().optional(),
+          files: z
+            .record(z.object({ template: z.string().optional(), type: z.string().optional() }).nullable())
+            .nullish(),
+        })
+        .nullable(),
+    )
+    .nullish(),
+  templates: z
+    .record(
+      z
+        .object({
+          body: z.string().optional(),
+          required_sections: z.array(z.string()).optional(),
+        })
+        .nullable(),
+    )
+    .nullish(),
+});
+
 export const nestConfigSchema = z.object({
   version: z.number().int(),
   name: z.string(),
@@ -381,40 +413,14 @@ export const nestConfigSchema = z.object({
       status: z.enum(STATUSES).optional(),
     })
     .optional(),
-  // Structure rules (§11.1, structure.ts). SHAPE ONLY, on purpose: this schema
-  // runs on every config read — writes and graph reads alike — so a strict
-  // enum or pattern check here would let one typo in a rule brick the vault.
-  // Patterns, regexes and type names are compiled by compileStructure() when a
-  // write is checked, where a bad rule refuses writes and nothing else.
-  structure: z
-    .object({
-      enforce: z.boolean().optional(),
-      closed: z.boolean().optional(),
-    })
-    .optional(),
-  folders: z
-    .record(
-      z.object({
-        description: z.string().optional(),
-        template: z.string().optional(),
-        types: z.array(z.string()).optional(),
-        folder_name: z.string().optional(),
-        file_name: z.string().optional(),
-        required: z.boolean().optional(),
-        files: z
-          .record(z.object({ template: z.string().optional(), type: z.string().optional() }))
-          .optional(),
-      }),
-    )
-    .optional(),
-  templates: z
-    .record(
-      z.object({
-        body: z.string().optional(),
-        required_sections: z.array(z.string()).optional(),
-      }),
-    )
-    .optional(),
+  // Structure rules (§11.1.1). Not checked here, on purpose: this schema runs
+  // on every config read — writes and graph reads alike — so any check here
+  // (even of shape) would let one typo in a rule brick the vault. Their shape
+  // is `structureRulesSchema`, checked by compileStructure() when the rules
+  // are used: a bad rule refuses writes only where the rules are enforced.
+  structure: z.unknown().optional(),
+  folders: z.unknown().optional(),
+  templates: z.unknown().optional(),
   servers: z
     .record(
       z.object({

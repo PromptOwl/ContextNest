@@ -141,8 +141,8 @@ const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
  * Refuse a document id a WRITE must never create: anything under `.context/`
  * (the vault's settings — structure rules, review gate), `.versions/` (sealed
  * history), `_suggestions/` (staged edits), or the vault-root `packs/`.
- * Case-insensitive, with trailing dots and spaces dropped, because Windows
- * drops them: `.context.` IS `.context` there. Reads keep going through
+ * Case-folded, with trailing dots and spaces and any `:stream`
+ * suffix dropped, because Windows drops them: `.context.` IS `.context` there. Reads keep going through
  * {@link assertSafeDocumentId} alone.
  */
 export function assertWritableDocumentId(raw: string): void {
@@ -153,9 +153,21 @@ export function assertWritableDocumentId(raw: string): void {
   if (raw.includes("\\")) {
     throw new ContextNestError(`Invalid document id "${raw}": use "/" between folders, not "\\"`, "INVALID_DOCUMENT_ID");
   }
+  // A control character is never a name, and NUL makes fs throw an error
+  // that carries the absolute vault path.
+  if (/[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new ContextNestError(
+      `Invalid document id ${JSON.stringify(raw)}: control characters are not allowed`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  // Compared as a file system would resolve the name: NTFS reads
+  // `.context::$INDEX_ALLOCATION` as the folder `.context`, and a
+  // case-insensitive volume folds `ſ` (long s) to `s`. Upper- then
+  // lower-casing gives that full case folding; `toLowerCase` alone keeps `ſ`.
   const segments = raw
-    .split(/[/\\]+/)
-    .map((seg) => seg.replace(/[. ]+$/, "").toLowerCase())
+    .split("/")
+    .map((seg) => seg.split(":")[0].replace(/[. ]+$/, "").toUpperCase().toLowerCase())
     .filter((seg) => seg !== "");
   const reserved =
     segments.find((seg) => RESERVED_SEGMENTS.has(seg)) ?? (segments[0] === "packs" ? "packs" : undefined);
@@ -2898,7 +2910,7 @@ export class NestStorage {
     name: string,
     layout: LayoutMode = "structured",
     description?: string,
-    options: { review?: ReviewMode } = {},
+    options: { review?: ReviewMode; rules?: Pick<NestConfig, "structure" | "folders" | "templates"> } = {},
   ): Promise<void> {
     await mkdir(this.root, { recursive: true });
 
@@ -2922,6 +2934,8 @@ export class NestStorage {
       // writes for review. Embedders calling init() directly keep the
       // pre-gate config (no key → publish by default).
       ...(options.review ? { review: options.review } : {}),
+      // A re-init carries the vault's structure rules over (§11.1.1).
+      ...options.rules,
     };
     await this.writeConfig(config);
 
