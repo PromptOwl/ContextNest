@@ -290,6 +290,13 @@ export function validateDocument(
       else if (field === "pdf.sha256") rule = 27;
       else if (field.startsWith("pdf.")) rule = 28;
       else if (field === "pdf" && issue.message.includes("must not")) rule = 29;
+      else if (field === "view" || field.startsWith("view.")) {
+        // View messages name their rule (30–35). What does not — an unknown
+        // key refused by the strict block schema — is rule 33: the block may
+        // carry nothing beyond its declared fields.
+        const named = /§13 rule (\d+)/.exec(issue.message);
+        rule = named ? Number(named[1]) : 33;
+      }
 
       errors.push({
         rule,

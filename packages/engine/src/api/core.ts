@@ -25,6 +25,7 @@ import {
   tagSchema as tag,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
+import { viewMetaSchema } from "../view-schema.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
@@ -433,6 +434,13 @@ const createOp: OperationDescriptor = {
       .describe(
         'Source block (required for type:source): how an agent fetches the live data this node stands for.',
       ),
+    // Like `source`, the `view` block is required by one type and forbidden on
+    // the rest, so it travels as its own field rather than inside `metadata`.
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required for type:view): the layout of blocks this view composes — md/list/summary/html/table/kpi/chart/callout/metric/data. Refs and bindings must be vault references, never URLs (§1.12).",
+      ),
     ...clientField,
   }),
   output: z.object({
@@ -530,13 +538,20 @@ const updateOp: OperationDescriptor = {
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node. Nothing converts to or from `pdf`: pdf nodes come only from context_import_pdf.",
+        "New node type. Converting to or from source/skill/view needs that type's block in the same call — `source` for a source node, `trigger` for a skill node, `view` for a view node. Nothing converts to or from `pdf`: pdf nodes come only from context_import_pdf.",
       ),
     source: sourceMetaSchema
       .strict()
       .optional()
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    // Like `source`, the `view` block is required by one type and forbidden on
+    // the rest, so it travels as its own field rather than inside `metadata`.
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "Replacement view block, for a node that is (or is becoming) type:view. Replaces the block wholesale.",
       ),
     trigger: z
       .string()
@@ -1030,6 +1045,13 @@ const importDoc = z
       .optional()
       .describe(
         "Source block (required for type:source): how an agent fetches the live data this node stands for.",
+      ),
+    // Like `source`, the `view` block is required by one type and forbidden on
+    // the rest, so it travels as its own field rather than inside `metadata`.
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required for type:view): the layout of blocks this view composes (§1.12).",
       ),
     trigger: z.string().optional().describe("Skill trigger (required for type:skill)"),
     tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
