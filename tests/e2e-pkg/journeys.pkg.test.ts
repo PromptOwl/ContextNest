@@ -162,8 +162,133 @@ const J1: Journey = {
   ],
 };
 
+/** The version rows `ctx history --json` returns. */
+type HistoryVersion = { version: number; keyframe: boolean };
+const versionNumbers = (data: unknown) =>
+  ((data as { versions: HistoryVersion[] }).versions ?? []).map((v) => v.version);
+
+/**
+ * J2 — "I audit a node's version history."
+ * The headline Context Nest promise from the auditor's seat: a node is revised
+ * over time, and later every change must be accountable. Capture a node and
+ * revise it so it accrues three versions, then list the history, diff two
+ * versions to see exactly what changed, read an older version back verbatim, and
+ * run an integrity check that proves the hash-chained history was not tampered
+ * with.
+ *
+ * The review gate is turned OFF here (unlike J1): this journey is about the
+ * version chain, so each write should land as its own published version without
+ * a gate in between.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J2: Journey = {
+  id: "J2",
+  title: "Time-travel — audit a node's version history (auditor)",
+  cases: [
+    {
+      id: "J2-01",
+      title: "Editing a node three times produces three distinct versions",
+      actions: [
+        { args: ["init", "--name", "audit-log"], stdout: ["Initialized"] },
+        // Writes should land directly as versions — no review gate in between.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/policy",
+            "--type", "document",
+            "--title", "Policy",
+            "--tags", "#audit",
+            "--body", "version one body",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/policy.md", exists: true }],
+        },
+        {
+          args: ["update", "nodes/policy", "--body", "version two body", "-y"],
+          stdout: ["Version: 2"],
+        },
+        {
+          args: ["update", "nodes/policy", "--body", "version three body", "-y"],
+          stdout: ["Version: 3"],
+        },
+        // Three distinct versions on the chain.
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => {
+            expect(versionNumbers(data)).toEqual([1, 2, 3]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J2-02",
+      title: "history lists every version in order",
+      actions: [
+        {
+          args: ["history", "nodes/policy"],
+          stdout: ["v1 [keyframe]", "v2", "v3"],
+        },
+      ],
+    },
+    {
+      id: "J2-03",
+      title: "Diffing two versions shows what changed between them",
+      actions: [
+        {
+          args: ["history", "nodes/policy", "--diff"],
+          stdout: [
+            "-version one body",
+            "+version two body",
+            "-version two body",
+            "+version three body",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J2-04",
+      title: "An older version can be read back with its original content",
+      actions: [
+        {
+          // `version` is a positional (--version collides with the global flag).
+          args: ["reconstruct", "nodes/policy", "1"],
+          stdout: ["version one body", "version: 1"],
+          stdoutNot: ["version three body"],
+        },
+        {
+          args: ["reconstruct", "nodes/policy", "2"],
+          stdout: ["version two body"],
+        },
+      ],
+    },
+    {
+      id: "J2-05",
+      title: "Integrity check confirms the version chain is intact",
+      actions: [
+        {
+          args: ["verify"],
+          stdout: ["✓ Checkpoint chain", "All integrity checks passed"],
+        },
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
+  });
+
+  it("J2 — time-travel through a node's history", () => {
+    runJourney({ installDir: INSTALL, scratch }, J2);
   });
 });
