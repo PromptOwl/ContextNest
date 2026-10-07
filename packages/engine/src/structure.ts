@@ -893,7 +893,6 @@ function requiredSections(rules: CompiledStructure, rule: CompiledRule, leaf: st
 
 // ─── Checks ─────────────────────────────────────────────────────────────────
 
-/** Everything about this document that breaks a rule (create, move, import, audit). */
 /**
  * Another spelling of the content root (`NODES/`, `nodes./`, `nodes:x/`): its
  * own folder on one volume and `nodes/` on another, so no rule could judge
@@ -909,6 +908,7 @@ function respelledRoot(id: string): Violation | null {
   };
 }
 
+/** Everything about this document that breaks a rule (create, move, import, audit). */
 export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Violation[] {
   const respelled = respelledRoot(doc.id);
   if (respelled) return [respelled];

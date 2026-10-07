@@ -13,6 +13,7 @@
  */
 import type {
   ClientMetadata,
+  DocumentHistory,
   ContextNode,
   Frontmatter,
   IntegrityFailure,
@@ -40,6 +41,7 @@ import {
 } from "../forget.js";
 import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
+import { reconstructFromHistory } from "../reconstruct.js";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
 import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, assertFitsFileSystem } from "../storage.js";
@@ -75,7 +77,7 @@ import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
 import { currentReviewProposal, stageReviewHold } from "../review.js";
-import { TITLE_MAX_LENGTH } from "../schemas.js";
+import { TITLE_MAX_LENGTH, documentHistorySchema } from "../schemas.js";
 import {
   isVersionArtifactPath,
   planImportPaths,
@@ -1195,7 +1197,8 @@ const PER_DOCUMENT_STORES = [".versions", "_suggestions"];
 
 /** The index of the per-document store segment in a path, or -1. */
 function storeIndex(segs: string[]): number {
-  return segs.findIndex((seg) => PER_DOCUMENT_STORES.includes(seg));
+  // As Windows resolves the name: `.versions.` and `.versions::$X` are `.versions`.
+  return segs.findIndex((seg) => PER_DOCUMENT_STORES.includes(comparableSegment(seg)));
 }
 
 /** The document a `.versions/` or `_suggestions/` file belongs to (`a/.versions/x/…` → `a/x`), or null. */
@@ -1252,29 +1255,110 @@ async function importVerdicts(
     }
     if (violations.length > 0) refused.set(f.raw, `${f.raw}: ${message(violations)}`);
   });
-  const batchDocs = new Set(docs.flatMap((d) => (d ? [d.id] : [])));
-  await mapInBatches(plan, async (f) => {
-    if (refused.has(f.raw)) return;
+  // History an import brings is judged by its own head: grandfathering judges
+  // later writes against the sealed head, so a head the rules would refuse
+  // (a donor's history, planted under another document) would make them
+  // lenient. Every `.versions/<doc>/` set must rebuild from this call's files
+  // to a head that passes the full check — in batch, beside a document already
+  // here, or ahead of one. A conforming head grants nothing a full check would
+  // not, so a chunked import may still send a document before its history.
+  const sets = new Map<string, Map<string, string>>();
+  for (const f of plan) {
+    const v = versionsArtifact(f.path);
+    if (!v || refusedDocs.has(v.owner)) continue;
+    const set = sets.get(v.owner) ?? new Map<string, string>();
+    set.set(v.name, f.content);
+    sets.set(v.owner, set);
+  }
+  const setVerdicts = new Map<string, string | null>();
+  await mapInBatches([...sets], async ([owner, set]) => {
+    setVerdicts.set(owner, await historySetVerdict(rules, owner, set));
+  });
+  for (const f of plan) {
+    if (refused.has(f.raw)) continue;
     // A document's history, staged edits and PDF sidecar go where it goes.
-    const store = storeOwner(f.path);
-    const owner = store ?? (/\.pdf$/i.test(f.path) ? f.path.slice(0, -".pdf".length) : null);
+    const owner = storeOwner(f.path) ?? (/\.pdf$/i.test(f.path) ? f.path.slice(0, -".pdf".length) : null);
+    const v = versionsArtifact(f.path);
     if (owner && refusedDocs.has(owner)) {
       refused.set(f.raw, `${f.raw}: belongs to ${owner}, which the structure rules refused`);
-    } else if (store && !batchDocs.has(store)) {
-      // History planted beside a document already here would turn its
-      // first-publish check (in full) into an update check. It is refused
-      // only where that matters — a document its full check refuses — so a
-      // chunked import may still send a (conforming) document before its history.
-      const owned = await readIfExists(ctx, store);
-      if (owned && checkDocument(rules, structureDoc(owned)).length > 0) {
-        refused.set(
-          f.raw,
-          `${f.raw}: belongs to ${store}, already in the vault, which the rules would refuse as a first publish — an import cannot bring it history`,
-        );
-      }
+    } else if (v && setVerdicts.get(v.owner)) {
+      refused.set(f.raw, `${f.raw}: ${setVerdicts.get(v.owner)}`);
     }
-  });
+  }
   return refused;
+}
+
+/**
+ * Refuse an imported `<doc>.pdf` that would replace the sealed binary of a pdf
+ * node already here that this import does not bring: that file is the only
+ * copy of its current version (archives hold prior ones). The same bytes — a
+ * chunked restore — are fine.
+ */
+async function assertSidecarKept(
+  ctx: OperationContext,
+  f: { raw: string; path: string; content: string },
+  incoming: Set<string>,
+): Promise<void> {
+  if (!/\.pdf$/i.test(f.path) || storeOwner(f.path)) return;
+  const owner = f.path.slice(0, -".pdf".length);
+  if (incoming.has(owner)) return;
+  const node = await readIfExists(ctx, owner);
+  const sealed = node?.frontmatter.type === "pdf" ? node.frontmatter.pdf?.sha256 : undefined;
+  if (sealed && sha256Bytes(Buffer.from(f.content, "utf-8")) !== sealed) {
+    throw new ContextNestError(
+      `${f.raw}: would replace the sealed PDF of ${owner}, which this import does not bring`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
+/** `<dir>/.versions/<name>/<artifact>` → its document (`<dir>/<name>`) and artifact name. */
+function versionsArtifact(relPath: string): { owner: string; name: string } | null {
+  const segs = relPath.replace(/\\/g, "/").split("/").filter((s) => s !== "" && s !== ".");
+  const k = segs.findIndex((seg) => comparableSegment(seg) === ".versions");
+  if (k === -1 || k + 2 >= segs.length) return null;
+  return { owner: [...segs.slice(0, k), segs[k + 1]].join("/"), name: segs.slice(k + 2).join("/") };
+}
+
+/** Why an imported history set is refused, or null when its head conforms. */
+async function historySetVerdict(
+  rules: CompiledStructure,
+  owner: string,
+  set: Map<string, string>,
+): Promise<string | null> {
+  const text = set.get("history.yaml");
+  if (text === undefined) {
+    return `arrives without ${owner}'s history.yaml — a document's .versions/ files must arrive together`;
+  }
+  let history: DocumentHistory;
+  try {
+    const parsed = documentHistorySchema.safeParse(yaml.load(text));
+    if (!parsed.success) return `${owner}'s history.yaml is not a valid history`;
+    history = parsed.data as DocumentHistory;
+  } catch {
+    return `${owner}'s history.yaml is not valid YAML`;
+  }
+  const head = history.versions.at(-1);
+  // No head, or a forgotten one: nothing to rebuild, so nothing that could
+  // make a later check lenient — such a document is judged in full.
+  if (!head || head.tombstone) return null;
+  let raw: string;
+  try {
+    raw = await reconstructFromHistory(
+      owner,
+      history,
+      head.version,
+      (n) => set.get(`v${n}.md`) ?? null,
+      (n) => set.get(`v${n}.diff`) ?? null,
+    );
+  } catch {
+    return `${owner}'s history cannot be rebuilt from the files this import brings — send its .versions/ files together`;
+  }
+  const node = parseDocument(`${owner}.md`, raw, owner);
+  const violations = checkDocument(rules, { id: owner, type: node.frontmatter.type, body: node.body });
+  return violations.length === 0
+    ? null
+    : `${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`;
 }
 
 const importDocs: OperationExecutor = async (ctx, input: any) => {
@@ -1357,9 +1441,11 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     // refused document takes its version history and its folder's other files
     // with it instead of leaving them behind as orphans.
     const refused = rules ? await importVerdicts(ctx, rules, plan, input.overwrite === true) : new Map<string, string>();
+    const incomingDocs = new Set(plan.flatMap((f) => importedDoc(f.path, f.content)?.id ?? []));
     await mapInBatches(plan, async (f) => {
       try {
         assertFitsFileSystem(f.path, 255);
+        await assertSidecarKept(ctx, f, incomingDocs);
         if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
           throw new ContextNestError(
             `${f.raw}: .context/ holds this vault's own settings (structure rules, review gate) and cannot be imported`,
@@ -1877,8 +1963,11 @@ async function importPdfLocked(
   // publish will judge it — a new PDF in full, a new version of one only for
   // what it newly breaks.
   const rules = await structureRules(ctx);
-  if (rules && publish) await assertStructurePublish(ctx.storage, rules, node);
-  else if (rules) {
+  if (rules && publish) {
+    // Against the sealed head and, like an update, the live file.
+    await assertStructurePublish(ctx.storage, rules, node);
+    if (existing) enforceStructure(rules, checkUpdate(rules, structureDoc(existing), structureDoc(node)));
+  } else if (rules) {
     enforceStructure(
       rules,
       existing

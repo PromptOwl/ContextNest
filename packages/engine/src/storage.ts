@@ -14,8 +14,9 @@ import {
   rm,
   rename,
   readdir,
+  realpath,
 } from "node:fs/promises";
-import { join, dirname, basename, isAbsolute } from "node:path";
+import { join, dirname, basename, isAbsolute, relative } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
 import { comparableSegment } from "./structure.js";
@@ -175,13 +176,23 @@ export function assertWritableDocumentId(raw: string): void {
     );
   }
   assertNotMachineryPath(raw);
+  // A new name never looks like an NTFS short name (`VERSIO~1`), which may
+  // alias a reserved folder; no slug contains one. (Erasing an existing file
+  // so named resolves it instead — see assertErasableDocumentId.)
+  const short = raw.split("/").find((seg) => /~\d/.test(seg));
+  if (short !== undefined) {
+    throw new ContextNestError(
+      `${shown}: "${short}" looks like an NTFS short name, which may alias a reserved path (.context, .versions, _suggestions) — use the full name`,
+      "VALIDATION_FAILED",
+    );
+  }
   const segments = raw
     .split("/")
     .map(comparableSegment)
     .filter((seg) => seg !== "");
   if (segments[0] === "packs") {
     throw new ContextNestError(
-      `${raw}: "packs" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
+      `${shown}: "packs" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
       "VALIDATION_FAILED",
     );
   }
@@ -213,30 +224,44 @@ export function assertFitsFileSystem(raw: string, maxSegmentBytes = MAX_SEGMENT_
 
 /**
  * Refuse an id that names vault machinery: a `.context`, `.versions` or
- * `_suggestions` segment at any depth, compared as a file system resolves it,
- * or an NTFS short name (`VERSIO~1`) — which may alias one of them, and which
- * no slug contains. Every document write, delete and forget calls this before
- * touching anything; deletes and forgets call it alone, so a legacy id the
+ * `_suggestions` segment at any depth, compared as a file system resolves it.
+ * NestStorage.writeDocument/deleteDocument call this as a backstop; deletes
+ * and forgets go through {@link assertErasableDocumentId}, so a legacy id the
  * full write guard would refuse (`Nodes/…`, an over-long name) can still be
  * erased.
  */
 export function assertNotMachineryPath(raw: string): void {
   assertSafeDocumentId(raw);
-  const segments = raw.split(/[/\\]+/);
-  const short = segments.find((seg) => /~\d/.test(seg));
-  if (short !== undefined) {
-    throw new ContextNestError(
-      `${raw}: "${short}" looks like an NTFS short name, which may alias a reserved path (.context, .versions, _suggestions) — use the full name`,
-      "VALIDATION_FAILED",
-    );
-  }
-  const reserved = segments.map(comparableSegment).find((seg) => RESERVED_SEGMENTS.has(seg));
+  const reserved = raw.split(/[/\\]+/).map(comparableSegment).find((seg) => RESERVED_SEGMENTS.has(seg));
   if (reserved) {
+    const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
     throw new ContextNestError(
-      `${raw}: "${reserved}" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
+      `${shown}: "${reserved}" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
       "VALIDATION_FAILED",
     );
   }
+}
+
+/**
+ * Refuse erasing (delete, forget — imported forgets too) anything but a
+ * document: {@link assertNotMachineryPath}, and for a segment that may be an
+ * NTFS short name (`VERSIO~1`), the file's resolved path, which is where
+ * Windows expands it. On POSIX `~2` is an ordinary character, so a legacy
+ * `draft~2` can still be erased.
+ */
+export async function assertErasableDocumentId(root: string, id: string): Promise<void> {
+  assertNotMachineryPath(id);
+  if (!id.split("/").some((seg) => /~\d/.test(seg))) return;
+  let resolved: string;
+  let base: string;
+  try {
+    // fs/promises realpath has realpath.native semantics: Windows expands short names.
+    [resolved, base] = await Promise.all([realpath(join(root, `${id}.md`)), realpath(root)]);
+  } catch {
+    return; // nothing there to erase — the caller's read reports it
+  }
+  const rel = relative(base, resolved).split(/[/\\]+/).join("/");
+  assertNotMachineryPath(rel.replace(/\.md$/i, ""));
 }
 
 export function assertSafeDocumentId(raw: string): void {

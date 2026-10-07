@@ -276,7 +276,9 @@ export async function scaffoldFirstPublish(
   // reported by the compliance report — rather than failing the publish.
   try {
     return await scaffoldFirstPublishOrThrow(storage, rules, ids);
-  } catch {
+  } catch (err) {
+    // I/O and vault errors only: a programming error must still surface.
+    if (err instanceof TypeError || err instanceof ReferenceError || err instanceof RangeError) throw err;
     return [];
   }
 }

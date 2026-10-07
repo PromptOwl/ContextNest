@@ -38,7 +38,7 @@ import type {
   VersionEntry,
 } from "./types.js";
 import type { NestStorage } from "./storage.js";
-import { assertNotMachineryPath } from "./storage.js";
+import { assertErasableDocumentId, assertNotMachineryPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { ChainEventLog } from "./chain-log.js";
@@ -176,6 +176,9 @@ async function forgetNode(
   options: ForgetOptions,
 ): Promise<ForgetResult> {
   const docId = node.id;
+  // Every forget — requested or imported (§6.3.4) — erases only a document,
+  // before any history is touched.
+  await assertErasableDocumentId(storage.root, docId);
   if (isForgotten(node)) throw new ForgottenDocumentError(docId, "is already forgotten");
 
   const vm = new VersionManager(storage);
@@ -343,7 +346,7 @@ export async function deleteDocumentWithTombstone(
   docId: string,
   options: DeleteOptions,
 ): Promise<DeleteResult> {
-  assertNotMachineryPath(docId);
+  await assertErasableDocumentId(storage.root, docId);
   const node = await storage.readDocument(docId);
   const title = node.frontmatter.title;
   if (options.purge || isForgotten(node)) {
@@ -440,6 +443,13 @@ export async function applyImportedTombstones(
   for (const raw of incomingEvents) {
     const rec = tombstoneFromEvent(raw);
     if (!rec) continue;
+    // A record naming no document of this vault (`../`, `.versions/…`) is
+    // neither logged nor applied.
+    try {
+      assertNotMachineryPath(rec.document_id);
+    } catch {
+      continue;
+    }
     if (!known.has(rec.event_id)) {
       try {
         await log.append(raw as HashChainEvent);

@@ -262,6 +262,7 @@ export {
   normalizeFolder,
   assertWritableDocumentId,
   assertNotMachineryPath,
+  assertErasableDocumentId,
   assertFitsFileSystem,
 } from "./storage.js";
 export type {

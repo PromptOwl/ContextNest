@@ -1194,9 +1194,10 @@ describe("QA round 6: root spellings, deep ids, the enforce switch, re-init, his
     expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
   });
 
-  it("an import cannot plant history for a document already in the vault that it does not bring", async () => {
-    // A draft in an allowed folder that misses a required section: its first
-    // publish is judged in full — planted history would make it an update.
+  it("planted empty history leaves a non-conforming draft judged in full", async () => {
+    // A draft in an allowed folder that misses a required section. History
+    // with no head grants nothing, so the draft's first publish is still
+    // judged in full.
     await api.run(
       "context_create",
       { title: "2026-10-07 Kickoff", content: "## Notes\nx\n", folder: "clients/acme-042/meetings", publish: false },
@@ -1209,8 +1210,9 @@ describe("QA round 6: root spellings, deep ids, the enforce switch, re-init, his
       { files: [{ path, content: "document: x\nversions: []\n" }] },
       ctx,
     );
-    expect(res.failed.map((f) => f.id)).toEqual([path]);
-    expect(await exists(path)).toBe(false);
+    expect(res.failed).toEqual([]);
+    const err = await refusal("context_publish", { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" });
+    expect(err.code).toBe("VALIDATION_FAILED");
   });
 });
 
@@ -1332,7 +1334,9 @@ describe("QA round 7: heading cost, batch scaffolding cost, planted history, rul
         })),
       );
       const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
-      expect(res.failed.map((f) => f.id).sort()).toEqual(files.map((f) => f.path).sort());
+      // A conforming donor head grants nothing a full check would not: the
+      // history may land, and the draft is still refused.
+      expect(res.failed).toEqual([]);
       const err = await refusal("context_publish", { id: VICTIM });
       expect(err.code).toBe("VALIDATION_FAILED");
     },
@@ -1387,5 +1391,115 @@ describe("QA round 7: heading cost, batch scaffolding cost, planted history, rul
     await scaffoldFirstPublish(storage, rules, ids);
     expect(Date.now() - started).toBeLessThan(3000);
     expect(await exists("nodes/t/overview.md")).toBe(true);
+  });
+});
+
+describe("architecture round 8: imported history heads, imported forgets, sidecars, legacy ~ ids", () => {
+  const AGENDA: StructureConfig = {
+    structure: { enforce: true },
+    folders: { meetings: { types: ["document"], template: "m" } },
+    templates: { m: { body: "## Agenda\n", required_sections: ["Agenda"] } },
+  };
+  const R = "nodes/meetings/r";
+  /** A genuine history whose head lacks the required Agenda — made before the rules. */
+  const donorHistory = async (target: string) => {
+    await api.run("context_create", { id: "nodes/meetings/donor", title: "Donor", content: "## Notes\nx\n" }, ctx);
+    const from = join(dir, "nodes", "meetings", ".versions", "donor");
+    const name = target.split("/").pop()!;
+    return Promise.all(
+      ["history.yaml", "v1.md"].map(async (n) => ({
+        path: `nodes/meetings/.versions/${name}/${n}`,
+        content: await readFile(join(from, n), "utf-8"),
+      })),
+    );
+  };
+  const failedIds = (r: { failed: { id?: string }[] }) => r.failed.map((f) => f.id).sort();
+
+  it("history for a conforming document already here must itself conform — never a donor head", async () => {
+    const files = await donorHistory(R);
+    await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n", publish: false }, ctx);
+    await writeConfig(AGENDA);
+    const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(failedIds(res)).toEqual(files.map((f) => f.path).sort());
+    const overwrite = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${R}.md`, content: "---\ntitle: R\nstatus: published\n---\n## Notes\nx\n" }], overwrite: true },
+      ctx,
+    );
+    expect(failedIds(overwrite)).toEqual([`${R}.md`]);
+  });
+
+  it("history sent with its (conforming) document in one call must conform too", async () => {
+    const files = await donorHistory(R);
+    await writeConfig(AGENDA);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${R}.md`, content: "---\ntitle: R\n---\n## Agenda\nx\n" }, ...files], publish: false },
+      ctx,
+    );
+    expect(failedIds(res)).toEqual(files.map((f) => f.path).sort());
+  });
+
+  it("orphan history (no document yet) must conform, and must arrive whole", async () => {
+    const files = await donorHistory(R);
+    await writeConfig(AGENDA);
+    const orphan = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(failedIds(orphan)).toEqual(files.map((f) => f.path).sort());
+    const partial = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: files.filter((f) => f.path.endsWith("v1.md")), publish: false },
+      ctx,
+    );
+    expect(partial.failed).toHaveLength(1);
+  });
+
+  it.each([["nodes/x/../meetings/k"], ["nodes/meetings/.versions/k/v1"]])(
+    "an imported forget of %s touches nothing",
+    async (target) => {
+      await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+      const keyframe = join(dir, "nodes", "meetings", ".versions", "k", "v1.md");
+      const before = await readFile(keyframe, "utf-8");
+      const event = {
+        event_id: "evt-1",
+        event_type: "document.forgotten",
+        document_id: target,
+        actor: "importer",
+        timestamp: "2026-01-01T00:00:00Z",
+        action_metadata: { scope: "node", reason_code: "user_request", versions: [1] },
+      };
+      await api.run(
+        "context_import",
+        { files: [{ path: ".versions/chain_events.yaml", content: yaml.dump([event]) }] },
+        ctx,
+      ).catch(() => undefined);
+      expect(await readFile(keyframe, "utf-8")).toBe(before);
+      expect((await storage.readDocument("nodes/meetings/k")).frontmatter.status).not.toBe("forgotten");
+    },
+  );
+
+  it("an import cannot overwrite a sealed PDF binary of a node it does not bring", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "papers", title: "Paper", bytes_base64: toBase64(textPdf()) }, ctx);
+    const sidecar = join(dir, `${res.id}.pdf`);
+    const before = await readFile(sidecar);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: "not the sealed bytes" }], overwrite: true },
+      ctx,
+    );
+    expect(failedIds(imp)).toEqual([`${res.id}.pdf`]);
+    expect((await readFile(sidecar)).equals(before)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("a legacy id with ~ and a digit can still be forgotten and deleted, but not newly written", async () => {
+    for (const name of ["draft~2", "draft~3"]) {
+      await mkdir(join(dir, "nodes", "notes"), { recursive: true });
+      await writeFile(join(dir, "nodes", "notes", `${name}.md`), `---\ntitle: ${name}\ntype: document\nstatus: draft\n---\nx\n`, "utf-8");
+    }
+    await api.run("context_forget", { id: "nodes/notes/draft~2", reason_code: "user_request" }, ctx);
+    expect((await storage.readDocument("nodes/notes/draft~2")).frontmatter.status).toBe("forgotten");
+    await api.run("context_delete", { id: "nodes/notes/draft~3", purge: true }, ctx);
+    expect(await exists("nodes/notes/draft~3.md")).toBe(false);
+    const err = await refusal("context_create", { id: "nodes/notes/draft~4", title: "D", content: "x" });
+    expect(err.message).toMatch(/short name/);
   });
 });
