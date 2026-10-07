@@ -160,6 +160,15 @@ const matches = (haystack: string, m: Matcher) =>
  * `add` actions; "drafts become published" is list → publish → list.
  */
 export interface Action {
+  /**
+   * Mutate the vault on disk BEFORE this action's command runs — e.g. corrupt a
+   * version-history file to prove `verify` catches tampering, or delete a node
+   * to set up a restore. `vaultDir` is the journey's isolated vault root. This
+   * is the one escape hatch from the pure drive-the-bin model, for the handful
+   * of journeys (integrity, disaster-recovery, forget) whose story requires the
+   * vault to change out from under the CLI between commands.
+   */
+  mutate?: (vaultDir: string) => void;
   /** The ctx args to run (e.g. ["add", "nodes/x", "-y"]). */
   args: string[];
   /** Expected exit status (default 0). */
@@ -213,6 +222,7 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
   const { vault, cfg } = makeSandbox(ctx.scratch, journey.id.toLowerCase());
   for (const c of journey.cases) {
     for (const a of c.actions) {
+      if (a.mutate) a.mutate(vault);
       const r = runInstalled(ctx.installDir, vault, a.args, cfg);
       const at = `${c.id} — ${c.title} [ctx ${a.args.join(" ")}]`;
       expect(r.status, `${at} — exit ${r.status}: ${r.stderr || r.stdout}`).toBe(

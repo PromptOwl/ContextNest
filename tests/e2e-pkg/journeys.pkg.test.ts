@@ -15,7 +15,8 @@
  */
 
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
-import { rmSync } from "node:fs";
+import { rmSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { packCli, freshInstall, runJourney, type Journey } from "./journey-harness.js";
 
 let INSTALL: string;
@@ -276,6 +277,38 @@ const J2: Journey = {
           json: (data) => {
             expect((data as { valid: boolean }).valid).toBe(true);
             expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J2-06",
+      title: "If a past version is altered on disk, the integrity check catches it",
+      actions: [
+        {
+          // Corrupt the v1 keyframe in the version history, mimicking tampering.
+          // verify guards the hash-chained history's reconstructability, so a
+          // changed keyframe breaks v1's content hash and makes v2/v3
+          // unreconstructable from it.
+          mutate: (vault) => {
+            const keyframe = join(vault, "nodes", ".versions", "policy", "v1.md");
+            const corrupted = readFileSync(keyframe, "utf-8").replace(
+              "version one body",
+              "tampered body",
+            );
+            writeFileSync(keyframe, corrupted);
+          },
+          args: ["verify"],
+          status: 1,
+          stdout: ["content_hash_mismatch", "integrity error(s) found"],
+          stdoutNot: ["All integrity checks passed"],
+        },
+        {
+          args: ["verify", "--json"],
+          status: 1,
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(false);
+            expect((data as { errors: unknown[] }).errors.length).toBeGreaterThan(0);
           },
         },
       ],
