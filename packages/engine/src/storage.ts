@@ -54,6 +54,7 @@ import type {
   IntegrityFailure,
 } from "./types.js";
 import {
+  ConfigError,
   ContextNestError,
   CorruptHistoryError,
   DocumentNotFoundError,
@@ -134,6 +135,22 @@ export function normalizeDocumentId(raw: string): string {
  * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
  * needs the traversal check WITHOUT the rewrite.
  */
+/** Longest document id a write accepts (paths stay well inside PATH_MAX). */
+const MAX_DOCUMENT_ID_LENGTH = 1024;
+/** Longest id segment: NAME_MAX (255 bytes) less the suffix of a temp write (`.md.<pid>.<n>.tmp`). */
+const MAX_SEGMENT_BYTES = 230;
+
+/**
+ * A path segment as a file system may resolve it, for comparing against a
+ * reserved name: NTFS reads `.context::$INDEX_ALLOCATION` as the folder
+ * `.context` and drops trailing dots and spaces, and a case-insensitive volume
+ * folds `ſ` (long s) to `s`. Upper- then lower-casing gives that full case
+ * folding; `toLowerCase` alone keeps `ſ`.
+ */
+export function comparableSegment(segment: string): string {
+  return segment.split(":")[0].replace(/[. ]+$/, "").toUpperCase().toLowerCase();
+}
+
 /** Segments that hold vault machinery at any depth — never a document. */
 const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
 
@@ -146,6 +163,22 @@ const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
  * {@link assertSafeDocumentId} alone.
  */
 export function assertWritableDocumentId(raw: string): void {
+  // Sized for a file system before anything touches one: an over-long id
+  // otherwise costs a stat per ancestor folder before failing with an error
+  // that names the absolute vault path — and never echoes the id back whole.
+  const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
+  if (raw.length > MAX_DOCUMENT_ID_LENGTH) {
+    throw new ContextNestError(
+      `Invalid document id ${shown}: longer than ${MAX_DOCUMENT_ID_LENGTH} characters`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  if (raw.split("/").some((seg) => Buffer.byteLength(seg) > MAX_SEGMENT_BYTES)) {
+    throw new ContextNestError(
+      `Invalid document id ${shown}: a folder or file name is longer than ${MAX_SEGMENT_BYTES} bytes`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
   assertSafeDocumentId(raw);
   // A backslash is a separator on Windows but a literal file-name character
   // on POSIX, so the path a check judges and the file storage writes would
@@ -157,17 +190,13 @@ export function assertWritableDocumentId(raw: string): void {
   // that carries the absolute vault path.
   if (/[\u0000-\u001f\u007f]/.test(raw)) {
     throw new ContextNestError(
-      `Invalid document id ${JSON.stringify(raw)}: control characters are not allowed`,
+      `Invalid document id ${shown}: control characters are not allowed`,
       "INVALID_DOCUMENT_ID",
     );
   }
-  // Compared as a file system would resolve the name: NTFS reads
-  // `.context::$INDEX_ALLOCATION` as the folder `.context`, and a
-  // case-insensitive volume folds `ſ` (long s) to `s`. Upper- then
-  // lower-casing gives that full case folding; `toLowerCase` alone keeps `ſ`.
   const segments = raw
     .split("/")
-    .map((seg) => seg.split(":")[0].replace(/[. ]+$/, "").toUpperCase().toLowerCase())
+    .map(comparableSegment)
     .filter((seg) => seg !== "");
   const reserved =
     segments.find((seg) => RESERVED_SEGMENTS.has(seg)) ?? (segments[0] === "packs" ? "packs" : undefined);
@@ -2910,8 +2939,33 @@ export class NestStorage {
     name: string,
     layout: LayoutMode = "structured",
     description?: string,
-    options: { review?: ReviewMode; rules?: Pick<NestConfig, "structure" | "folders" | "templates"> } = {},
+    options: { review?: ReviewMode } = {},
   ): Promise<void> {
+    // A re-init keeps the vault's structure rules (§11.1.1): re-initializing
+    // must never be a way to drop them. They are read as plain YAML, so a
+    // config that fails validation elsewhere still hands them over; one that
+    // is not YAML at all but names them is refused rather than overwritten.
+    const configPath = join(this.root, ".context", "config.yaml");
+    const prior = await readFile(configPath, "utf-8").catch(() => null);
+    const rules: Record<string, unknown> = {};
+    if (prior !== null) {
+      let parsed: unknown;
+      try {
+        parsed = yaml.load(prior);
+      } catch {
+        if (/^\uFEFF?(structure|folders|templates)\s*:/m.test(prior)) {
+          throw new ConfigError(
+            `${configPath} is not valid YAML and holds structure rules — fix it by hand before re-initializing, or the rules would be lost.`,
+          );
+        }
+      }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const key of ["structure", "folders", "templates"]) {
+          const value = (parsed as Record<string, unknown>)[key];
+          if (value !== undefined) rules[key] = value;
+        }
+      }
+    }
     await mkdir(this.root, { recursive: true });
 
     if (layout === "structured") {
@@ -2934,8 +2988,7 @@ export class NestStorage {
       // writes for review. Embedders calling init() directly keep the
       // pre-gate config (no key → publish by default).
       ...(options.review ? { review: options.review } : {}),
-      // A re-init carries the vault's structure rules over (§11.1.1).
-      ...options.rules,
+      ...rules,
     };
     await this.writeConfig(config);
 

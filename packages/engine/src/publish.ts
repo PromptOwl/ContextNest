@@ -20,6 +20,7 @@ import { RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
 import { assertPdfSidecarIntact } from "./pdf-nodes.js";
 import { assertNotForgotten } from "./forget.js";
+import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish } from "./structure-store.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -29,6 +30,12 @@ export interface PublishOptions {
    * which agent, in which session. Not hashed; see `VersionEntry.client`.
    */
   client?: ClientMetadata;
+  /**
+   * `skip` leaves structure rules (§11.1.1) unchecked — for trusted hosts
+   * restoring a whole vault only, as `OperationContext.structure`. The
+   * reserved-path guard still applies.
+   */
+  structure?: "skip";
 }
 
 export interface PublishResult {
@@ -72,6 +79,7 @@ export async function publishDocument(
   await assertNotForgotten(storage, node);
   // A pdf node seals pdf.sha256 into the chain; the bytes must be there.
   await assertPdfSidecarIntact(storage, docId, node);
+  const rules = options.structure === "skip" ? null : await enforcedStructure(storage);
 
   const versionManager = new VersionManager(storage);
 
@@ -91,6 +99,8 @@ export async function publishDocument(
   // put the author right back behind the corrupt file we just worked around.
   const { history: existingHistory, quarantinedAs } =
     await versionManager.historyOrRepair(docId);
+  // Every publish surface ends here, so the structure rules judge it here.
+  const firstPublish = rules ? await assertStructurePublish(storage, rules, node, existingHistory) : false;
   const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
   if (seeded) {
     await versionManager.createVersion(node, "system:seed", {
@@ -140,6 +150,8 @@ export async function publishDocument(
     client: options.client,
     knownHistory,
   });
+  // Before the checkpoint, so the vault crawl it hands back includes them.
+  if (rules && firstPublish) await scaffoldFirstPublish(storage, rules, [docId]);
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
   // INSIDE the checkpoint lock (createCheckpointFromVault) so a concurrent
@@ -253,8 +265,10 @@ export async function publishDocuments(
     }
   }
 
-  // One read of the forget registry for the whole batch.
+  // One read of the forget registry, and of the structure rules, for the whole batch.
   const tombstones = await storage.readTombstones();
+  const rules = options.structure === "skip" ? null : await enforcedStructure(storage);
+  const firstPublished: string[] = [];
 
   const publishOne = async (docId: string): Promise<void> => {
     try {
@@ -274,6 +288,7 @@ export async function publishDocuments(
       // single history read — see the notes in publishDocument.
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
+      const firstPublish = rules ? await assertStructurePublish(storage, rules, node, existingHistory) : false;
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
       if (seeded) {
         await versionManager.createVersion(node, "system:seed", {
@@ -309,6 +324,7 @@ export async function publishDocuments(
         version: versionEntry.version,
         chainHash: versionEntry.chain_hash,
       });
+      if (firstPublish) firstPublished.push(docId);
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -322,6 +338,8 @@ export async function publishDocuments(
   // (the shared helper avoids pulling in a p-limit dependency). publishOne
   // records its own outcome, so the returned array is unused.
   await mapInBatches(ids, publishOne, concurrency);
+  // Before the checkpoint, so the vault crawl it takes includes them.
+  if (rules && firstPublished.length > 0) await scaffoldFirstPublish(storage, rules, firstPublished);
 
   // ONE checkpoint sealing every doc published above (createCheckpointFromVault
   // snapshots all published docs in the vault under the checkpoint lock).

@@ -34,6 +34,7 @@ import {
   missingFolders,
   scaffoldFolders,
   assertWritableDocumentId,
+  comparableSegment,
 } from "@promptowl/contextnest-engine";
 import type { ContextNode, Frontmatter, NestStorage, Violation } from "@promptowl/contextnest-engine";
 
@@ -159,7 +160,7 @@ export function parseRecipeManifest(body: string): RecipeManifest {
     // .claude/, .vscode/ and .context/ (places that run code or hold vault
     // state); no nodes/ or packs/ keeps it from writing past governance —
     // compared as a case-insensitive volume or Windows would read the name.
-    const root = to.split("/")[0].split(":")[0].replace(/[. ]+$/, "").toUpperCase().toLowerCase();
+    const root = comparableSegment(to.split("/")[0]);
     if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || root === "nodes" || root === "packs") {
       throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/ and dot-folders`);
     }

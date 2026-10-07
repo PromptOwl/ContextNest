@@ -42,7 +42,7 @@ import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } fro
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
-import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId } from "../storage.js";
+import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId, comparableSegment } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
@@ -99,7 +99,7 @@ import {
   assertStructureDelete,
   enforcedStructure,
   missingFolders,
-  scaffoldApprovedCreate,
+  assertStructurePublish,
   scaffoldFolders,
 } from "../structure-store.js";
 import { NON_DOCUMENT_BASENAMES } from "../storage.js";
@@ -274,7 +274,7 @@ const structureDoc = (node: ContextNode): StructureDoc => ({
 function isSettingsPath(path: string): boolean {
   return String(path)
     .split(/[\\/]+/)
-    .some((segment) => segment.replace(/[. ]+$/, "").toLowerCase() === ".context");
+    .some((segment) => comparableSegment(segment) === ".context");
 }
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
@@ -288,6 +288,7 @@ async function publishAndIndex(
     editedBy: ctx.actor ?? "engine",
     ...(note ? { note } : {}),
     ...(client ? { client } : {}),
+    ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
@@ -610,7 +611,10 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // already resolves an id for its own layout — all this has to do is refuse
   // one that would escape the vault root.
   const id: string = input.id;
-  assertSafeDocumentId(id);
+  // An update writes the file before any publish, so a reserved path
+  // (§11.1.1: `.versions/`, `_suggestions/`, the root `packs/`) is refused
+  // here, not left to the publish guard after the edit has landed.
+  assertWritableDocumentId(id);
   const live = await ctx.storage.readDocument(id);
   // Held for review (review.ts). An edit to a PUBLISHED node must not touch
   // the canonical file — it is staged as a suggestion instead — and it builds
@@ -732,6 +736,9 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // Grandfathered (§11.1): only what this edit newly breaks is refused.
   const rules = await structureRules(ctx);
   if (rules) enforceStructure(rules, checkUpdate(rules, structureDoc(existing), structureDoc(node)));
+  // A publishing edit is judged as its publish will be — a never-published
+  // document in full — BEFORE the file is written, so a refusal leaves no edit behind.
+  if (rules && publish) await assertStructurePublish(ctx.storage, rules, node);
   if (holdAsSuggestion && frontmatter.status !== "rejected") {
     const staged = await stageReviewHold(ctx.storage, {
       documentId: id,
@@ -773,34 +780,16 @@ const update: OperationExecutor = async (ctx, input: any) => {
 
 const publish: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  // Every approval surface ends in a publish (Community's review approve
-  // included), so the rules in force judge it here (§11.1.1): a first publish
-  // in full, a later one for what the live file newly breaks against the
-  // last sealed version (an out-of-band edit, say).
-  const rules = await structureRules(ctx);
-  let firstPublish = false;
-  if (rules) {
-    const live = await ctx.storage.readDocument(id);
-    const history = await ctx.storage.readHistory(id);
-    const head = history?.versions.at(-1);
-    if (history && head) {
-      const raw = await ctx.versions.reconstructVersion(id, head.version, history);
-      const sealed = parseDocument(`${id}.md`, raw, id);
-      enforceStructure(rules, checkUpdate(rules, structureDoc(sealed), structureDoc(live)));
-    } else {
-      firstPublish = true;
-      enforceStructure(rules, checkDocument(rules, structureDoc(live)));
-    }
-  }
-  // publishDocument guards rejected docs and seals a checkpoint; regenerate the
-  // index so graph-mode reads see the freshly-published node (same as create/update).
+  // publishDocument guards rejected docs, judges the structure rules (§11.1.1)
+  // and seals a checkpoint; regenerate the index so graph-mode reads see the
+  // freshly-published node (same as create/update).
   const result = await publishDocument(ctx.storage, id, {
     editedBy: ctx.actor ?? "engine",
     ...(input.note ? { note: input.note } : {}),
     ...(input.client ? { client: input.client } : {}),
+    ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
   });
   await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
-  if (rules && firstPublish) await scaffoldApprovedCreate(ctx.storage, rules, id);
   return {
     id,
     version: result.versionEntry.version,
@@ -1359,7 +1348,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         if (verdict) throw new ContextNestError(verdict, "VALIDATION_FAILED");
         const doc = importedDoc(f.path, f.content);
         // Reserved paths (root packs/ …) hold no documents, rules or not.
-        if (doc && ctx.structure !== "skip") assertWritableDocumentId(doc.id);
+        // Not a structure rule, so a trusted restore (`skip`) does not lift it.
+        if (doc) assertWritableDocumentId(doc.id);
         if (doc && rules) await noteFolders(doc.id);
         // Into the file's OWN warning list: `mapInBatches` finishes in
         // whatever order the writes complete, and the report is per input file.
@@ -1486,6 +1476,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   if (batch.length > 0) {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
+      ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
       onProgress: ctx.onProgress,
       ...(input.note ? { note: input.note } : {}),
       ...(input.client ? { client: input.client } : {}),

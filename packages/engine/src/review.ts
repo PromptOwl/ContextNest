@@ -40,8 +40,7 @@ import { publishDocument } from "./publish.js";
 import { listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { assertStructureUpdate, enforcedStructure, scaffoldApprovedCreate } from "./structure-store.js";
-import { checkDocument, enforceStructure } from "./structure.js";
+import { assertStructureUpdate } from "./structure-store.js";
 import { assertSafeDocumentId } from "./storage.js";
 import type { NestStorage } from "./storage.js";
 import type { GovernanceTier, ReviewMode, SuggestionMeta } from "./types.js";
@@ -353,17 +352,12 @@ export async function approveReview(
         "VALIDATION_FAILED",
       );
     }
-    // A held create met the rules when it was held; approval is judged
-    // against the rules in force now (§11.1.1).
-    const rules = await enforcedStructure(storage);
-    if (rules) {
-      enforceStructure(rules, checkDocument(rules, { id, type: node.frontmatter.type, body: node.body }));
-    }
+    // A held create met the rules when it was held; publishDocument judges it
+    // against the rules in force now and scaffolds its folders (§11.1.1).
     const result = await publishDocument(storage, id, {
       editedBy: opts.actor,
       note: opts.note ?? "Approved in review",
     });
-    if (rules) await scaffoldApprovedCreate(storage, rules, id);
     await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
     return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
   });

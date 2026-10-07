@@ -371,3 +371,12 @@ describe("linkCitations — in-vault citation graph", () => {
     expect(out.content).toBe(r.content);
   });
 });
+
+describe("jatsToDocument — reserved folders", () => {
+  it.each([".versions", "_suggestions", "packs", "nodes/x/.context"])(
+    "refuses --folder %s before anything is written",
+    (folder) => {
+      expect(() => jatsToDocument(xml, { sourcePath: "s.xml", folder })).toThrow(/reserved/);
+    },
+  );
+});

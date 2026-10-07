@@ -27,7 +27,7 @@ import { createHash } from "node:crypto";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { parseDocument, serializeDocument } from "../parser.js";
 import { TAG_PATTERN } from "../schemas.js";
-import { normalizeFolder } from "../storage.js";
+import { assertWritableDocumentId, normalizeFolder } from "../storage.js";
 import { slugify } from "../import-hygiene.js";
 import type { Frontmatter } from "../types.js";
 
@@ -1047,6 +1047,9 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   // empty segments dropped, `..` refused.
   const folder = normalizeFolder(opts.folder ?? "nodes/papers") || "nodes/papers";
   const path = `${folder}/${slugId}.md`;
+  // Refused here, before any caller stages the file: a reserved folder
+  // (`.versions/`, `_suggestions/`, the root `packs/`) never holds a twin.
+  assertWritableDocumentId(`${folder}/${slugId}`);
 
   const frontmatter: Frontmatter = {
     title: titlePlain.slice(0, 200),

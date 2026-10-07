@@ -1245,18 +1245,8 @@ program
     const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
     const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
     const review = reinit ? priorReview : "on";
-    // Structure rules survive a re-init too: re-initializing must not be a way
-    // to drop them. (A config that will not parse has none we can read.)
-    const prior = reinit ? await storage.readConfig().catch(() => null) : null;
-    const rules = {
-      ...(prior?.structure !== undefined ? { structure: prior.structure } : {}),
-      ...(prior?.folders !== undefined ? { folders: prior.folders } : {}),
-      ...(prior?.templates !== undefined ? { templates: prior.templates } : {}),
-    };
-    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, {
-      ...(review ? { review } : {}),
-      rules,
-    });
+    // storage.init carries the vault's structure rules over a re-init.
+    await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
     if (review === "on") {
       console.log(

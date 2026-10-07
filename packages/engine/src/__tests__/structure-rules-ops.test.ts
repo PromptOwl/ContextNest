@@ -5,9 +5,10 @@
  * rules back. The pure checker is covered by structure-rules.test.ts.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, writeFile, access } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { publishDocument, publishDocuments } from "../publish.js";
 import yaml from "js-yaml";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
@@ -891,5 +892,137 @@ describe("setStructure", () => {
   it("refuses a directory that is not a vault", async () => {
     const other = new NestStorage(await mkdtemp(join(tmpdir(), "cn-not-vault-")));
     await expect(setStructure(other, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+  });
+});
+
+describe("QA round 5: ids a file system cannot hold, stream suffixes, the enforce flag", () => {
+  it.each([
+    ["too deep", `nodes/${"a/".repeat(5000)}x`],
+    ["with a name too long", `nodes/${"b".repeat(300)}`],
+  ])("an id %s is refused at once, without the vault path", async (_l, id) => {
+    await writeConfig({ structure: { enforce: true } });
+    const started = Date.now();
+    const err = await refusal("context_create", { id, title: "Deep", content: "x" });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(err.code).toBe("INVALID_DOCUMENT_ID");
+    expect(err.message).not.toContain(dir);
+    expect(err.message.length).toBeLessThan(400);
+  });
+
+  it("a settings path behind an NTFS stream suffix is not importable", async () => {
+    const path = ".context::$INDEX_ALLOCATION/config.yaml";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "version: 1\nname: evil\n" }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual([path]);
+  });
+
+  it.each([["yes"], ["true"], [1]])("enforce: %j is not a boolean — writes fail closed, naming the key", async (flag) => {
+    await writeConfig({ ...RULES, structure: { enforce: flag, closed: true } });
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(err.code).toBe("CONFIG_ERROR");
+    expect(err.message).toContain("structure.enforce");
+  });
+
+  it("a stale temp file from an earlier crash does not fail setStructure", async () => {
+    const { realpath } = await import("node:fs/promises");
+    const tmp = `${await realpath(join(dir, ".context", "config.yaml"))}.${process.pid}.tmp`;
+    await writeFile(tmp, "stale", "utf-8");
+    await setStructure(storage, RULES);
+    await expect(access(tmp)).rejects.toThrow();
+  });
+
+  it("re-initializing a vault keeps its rules, even when the config fails validation", async () => {
+    await writeFile(
+      join(dir, ".context", "config.yaml"),
+      yaml.dump({ version: "not-a-number", name: "x", ...RULES }, { lineWidth: -1 }),
+      "utf-8",
+    );
+    await storage.init("again");
+    expect((await storage.readConfig())?.structure).toEqual(RULES.structure);
+    expect((await storage.readConfig())?.folders).toEqual(RULES.folders);
+  });
+
+  it("re-initializing over a config that is not YAML but names rules is refused, and the file is kept", async () => {
+    const cfg = join(dir, ".context", "config.yaml");
+    const broken = "version: 1\nname: x\nstructure: {enforce: true\nfolders: [unclosed\n";
+    await writeFile(cfg, broken, "utf-8");
+    await expect(storage.init("again")).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(cfg, "utf-8")).toBe(broken);
+  });
+});
+
+describe("architecture round 5: every publish path, update guard, symlinks, trusted restores", () => {
+  const ID = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+  const hold = () =>
+    api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+  const firstFailure = (r: { failed: { error: string }[] }) => {
+    if (r.failed.length) throw new Error(r.failed[0].error);
+  };
+  const surfaces: Array<[string, () => Promise<unknown>]> = [
+    ["context_import ids[]", async () => firstFailure(await api.run("context_import", { ids: [ID] }, ctx))],
+    ["context_update publish: true", () => api.run("context_update", { id: ID, publish: true }, ctx)],
+    ["publishDocument", () => publishDocument(storage, ID, { editedBy: "owner" })],
+    ["publishDocuments", async () => firstFailure(await publishDocuments(storage, [ID], { editedBy: "owner" }))],
+  ];
+
+  it.each(surfaces)("%s scaffolds what a held create's folders require", async (_l, approve) => {
+    await writeConfig(RULES);
+    await hold();
+    await approve();
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it.each(surfaces)("%s judges a held create in full against the rules in force", async (_l, approve) => {
+    await writeConfig(RULES);
+    await hold();
+    const meetings = { ...RULES.folders!["clients/{client}/meetings"], types: ["glossary"] };
+    await writeConfig({ ...RULES, folders: { ...RULES.folders, "clients/{client}/meetings": meetings } });
+    await expect(approve()).rejects.toThrow(/glossary/);
+    expect((await storage.readDocument(ID)).frontmatter.status).toBe("pending_review");
+  });
+
+  it.each(["Packs/gear", "nodes/.versions/foo/v1", "x/_suggestions/y"])(
+    "context_update never rewrites %s, a reserved path",
+    async (id) => {
+      const raw = "---\ntitle: Gear\ntype: document\nstatus: draft\n---\nold\n";
+      await mkdir(dirname(join(dir, `${id}.md`)), { recursive: true });
+      await writeFile(join(dir, `${id}.md`), raw, "utf-8");
+      const err = await refusal("context_update", { id, content: "new", publish: false });
+      expect(err.message).toMatch(/reserved/);
+      expect(await readFile(join(dir, `${id}.md`), "utf-8")).toBe(raw);
+    },
+  );
+
+  it("a trusted restore (structure: skip) still never lands a document under a reserved path", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "packs/evil.md", content: "---\ntitle: Evil\n---\nx\n" }], overwrite: true },
+      { ...ctx, structure: "skip" },
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["packs/evil.md"]);
+    expect(await exists("packs/evil.md")).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("setStructure refuses a config symlinked outside the vault", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "cn-structure-outside-"));
+    try {
+      const cfg = join(dir, ".context", "config.yaml");
+      const target = join(outside, "config.yaml");
+      const original = await readFile(cfg, "utf-8");
+      await writeFile(target, original, "utf-8");
+      await rm(cfg);
+      await symlink(target, cfg);
+      await expect(setStructure(storage, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+      expect(await readFile(target, "utf-8")).toBe(original);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });

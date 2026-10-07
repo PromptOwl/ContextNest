@@ -118,6 +118,13 @@ describe("compileStructure", () => {
     expect(codes(checkDocument(r, { id: "nodes/clients/acme/meetings/x", type: "document", body: "" }))).toEqual(["FOLDER_NAME"]);
   });
 
+  it("the nodes/ and sources/ roots are recognised whatever their case (a case-insensitive volume merges them)", () => {
+    const r = compileStructure({ folders: { docs: { types: ["document"] } } });
+    expect(codes(checkDocument(r, { id: "Nodes/docs/x", type: "agent", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
+    const closed = compileStructure({ structure: { closed: true }, folders: { docs: {} } });
+    expect(checkDocument(closed, { id: "Sources/x", type: "source", body: "" })).toEqual([]);
+  });
+
   it("literal folder names match case-insensitively (case-insensitive filesystems put NOTES/ in notes/)", () => {
     const r = compileStructure({ structure: { closed: true }, folders: { notes: { types: ["document"] } } });
     expect(codes(checkDocument(r, { id: "nodes/NOTES/x", type: "glossary", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
@@ -272,6 +279,7 @@ describe("compileStructure", () => {
         "a*b", "(a|ab)(c|bcd)(d*)", "[a-c]+-[0-9]{2,3}", "[^a]x?", ".*-.*", "(?:ab|a)(?:b|)c?",
         "\\d{2}\\w\\s?", "[\\d-z]+", "a{0,2}b{2}", "(a|)(b|)", "[]a|b", "[^]{2}", "x|", "(?:a|b(?:c|d))e*",
         "\\.-\\{\\}", "^ab$", "a^b", "[a-]+", "(a|b|c|d|e|f|g)",
+        "[\\d-a-z]+", "[\\d--a]", "[\\d-z-a]", "[a-\\d]+", "[\\w-]+", "[-\\d]", "[\\s-x]",
       ];
       const alphabet = ["a", "b", "c", "d", "e", "x", "-", "0", "1", "_", " ", ".", "{", "}", "\n"];
       let seed = 7;
@@ -286,6 +294,46 @@ describe("compileStructure", () => {
           expect(ok, `${src} vs ${JSON.stringify(name)}`).toBe(re.test(name));
         }
       }
+    });
+
+    it("token patterns are matched in linear time too: 256 rules of the costliest token shape", () => {
+      const folders: Record<string, object> = {};
+      for (let i = 0; i < 256; i++) {
+        const segs = Array.from({ length: 8 }, (_, j) => ((i >> j) & 1 ? "a" : "{p}"));
+        folders[[...segs, "{t}"].join("/")] = { folder_name: "{n}0{n}0{slug}" };
+      }
+      const r = compileStructure({ folders: folders as never });
+      const started = Date.now();
+      checkDocument(r, { id: `${"a/".repeat(8)}${"0".repeat(127)}A/doc`, type: "document", body: "" });
+      expect(Date.now() - started).toBeLessThan(100);
+    });
+
+    it("token patterns agree with the expressions they stand for (differential)", () => {
+      const TOKEN_SOURCES: Record<string, string> = {
+        slug: "[a-z0-9]+(?:-[a-z0-9]+)*",
+        date: "[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])",
+        yyyy: "[0-9]{4}",
+        n: "[0-9]+",
+      };
+      const formats = ["{slug}", "{date}-{slug}", "{yyyy}", "{n}-{slug}", "adr-{n}-{slug}", "{date}", "v{n}", "{slug}-0{n}"];
+      const alphabet = ["a", "b", "z", "0", "1", "2", "9", "-", "_", "A", "d", "r"];
+      let seed = 11;
+      const rand = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2147483648) % n);
+      for (const format of formats) {
+        const r = compileStructure({ folders: { d: { file_name: format } } });
+        const re = new RegExp(`^${format.replace(/\{(\w+)\}/g, (_m, t: string) => TOKEN_SOURCES[t])}$`);
+        const samples = ["2026-10-07-kickoff", "adr-12-x", "v3", "a-0-0", "abc-07", "2026", "a--b", "-a", "a-"];
+        for (let i = 0; i < 400; i++) samples.push(Array.from({ length: 1 + rand(12) }, () => alphabet[rand(alphabet.length)]).join(""));
+        for (const name of samples) {
+          const ok = checkDocument(r, { id: `d/${name}`, type: "document", body: "" }).length === 0;
+          expect(ok, `${format} vs ${JSON.stringify(name)}`).toBe(re.test(name));
+        }
+      }
+    });
+
+    it("a class escape beside - is a union with the next atom, never a range end (JavaScript Annex B)", () => {
+      expect(() => compileStructure({ folders: { d: { file_name: "/[\\d-z-a]/" } } })).not.toThrow();
+      expect(() => compileStructure({ folders: { d: { file_name: "/[^\\W--/--/-]/" } } })).toThrow(/out of order/);
     });
 
     it("escaped braces are literal text", () => {

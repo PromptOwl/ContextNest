@@ -261,6 +261,7 @@ export {
   normalizeDocumentId,
   normalizeFolder,
   assertWritableDocumentId,
+  comparableSegment,
 } from "./storage.js";
 export type {
   LayoutMode,
@@ -532,7 +533,8 @@ export {
   scaffoldFolders,
   assertStructureUpdate,
   assertStructureDelete,
-  scaffoldApprovedCreate,
+  scaffoldFirstPublish,
+  assertStructurePublish,
 } from "./structure-store.js";
 
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.

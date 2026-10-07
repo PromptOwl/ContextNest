@@ -54,6 +54,7 @@ import {
   scaffoldFolders,
   assertStructureDelete,
   assertWritableDocumentId,
+  assertStructurePublish,
   currentReviewProposal,
   stageReviewHold,
   NODE_TYPES,
@@ -1229,6 +1230,13 @@ tool(
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
       if (!resolvedBody.ok) return validationError(resolvedBody.error);
       const id = normalizeDocumentId(path);
+      // Before any write — the file is written before the publish that would
+      // otherwise be the first to refuse a reserved path.
+      try {
+        assertWritableDocumentId(id);
+      } catch (err) {
+        return toolError(err);
+      }
       let doc = await storage.readDocument(id);
 
       // Normalize caller-supplied status to canonical before any guard or
@@ -1333,6 +1341,15 @@ tool(
         checkUpdate(rules, before, { id, type: doc.frontmatter.type, body: doc.body }),
       );
       if (refused) return refused;
+      // A publishing edit is judged as its publish will be (a never-published
+      // document in full), before the file is written.
+      if (!hold && (normalizedStatus === undefined || normalizedStatus === "published")) {
+        const refusedPublish = await structureRefusal(async (rules) => {
+          await assertStructurePublish(storage, rules, doc);
+          return [];
+        });
+        if (refusedPublish) return refusedPublish;
+      }
 
       if (hold) {
         let suggestionId: string | undefined;

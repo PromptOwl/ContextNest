@@ -10,7 +10,7 @@
 
 import { chmod, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import yaml from "js-yaml";
 import { parseConfig } from "./config.js";
 import { ConfigError } from "./errors.js";
@@ -19,6 +19,7 @@ import { generateIndexMd } from "./index-md-generator.js";
 import { parseDocument, serializeDocument, validateDocument } from "./parser.js";
 import {
   checkDeleteDocument,
+  checkDocument,
   checkUpdate,
   compileStructure,
   enforceStructure,
@@ -28,8 +29,9 @@ import {
   type StructureConfig,
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
+import { VersionManager } from "./versioning.js";
 import type { NestStorage } from "./storage.js";
-import type { ContextNode, Frontmatter } from "./types.js";
+import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
 // ─── Reading ────────────────────────────────────────────────────────────────
 
@@ -38,10 +40,17 @@ import type { ContextNode, Frontmatter } from "./types.js";
  * this: a vault whose rules are report-only (or absent, or a legacy
  * `folders:` block) is written exactly as before, and a rule that does not
  * compile can refuse writes only in a vault that asked for enforcement.
+ *
+ * Off means `enforce` is absent or `false`. Any other value (`"yes"`, `1`)
+ * asked for enforcement in a way that is not a boolean, so it is compiled —
+ * and refused with CONFIG_ERROR naming `structure.enforce` — rather than
+ * silently read as off.
  */
 export async function enforcedStructure(storage: NestStorage): Promise<CompiledStructure | null> {
   const config = await storage.readConfig();
-  if (config?.structure?.enforce !== true) return null;
+  const structure = config?.structure as { enforce?: unknown } | null | undefined;
+  if (!structure || typeof structure !== "object") return null;
+  if (structure.enforce === undefined || structure.enforce === false) return null;
   return compileStructure(config);
 }
 
@@ -63,6 +72,34 @@ export async function assertStructureUpdate(
     return { id, type: node.frontmatter.type, body: node.body };
   };
   enforceStructure(rules, checkUpdate(rules, view(beforeRaw), view(afterRaw)));
+}
+
+/**
+ * Judge a publish against enforced rules (§11.1.1): a first publish in full,
+ * a later one only for what the live file newly breaks against its last sealed
+ * version (an out-of-band edit, an approved held edit). publishDocument and
+ * publishDocuments call this, so every approval surface that ends in a publish
+ * is judged the same way. Pass `history` when the caller has already read it.
+ *
+ * @returns true when this is the document's first publish.
+ */
+export async function assertStructurePublish(
+  storage: NestStorage,
+  rules: CompiledStructure,
+  live: ContextNode,
+  history?: DocumentHistory | null,
+): Promise<boolean> {
+  const id = live.id;
+  const view = (node: ContextNode) => ({ id, type: node.frontmatter.type, body: node.body });
+  const known = history === undefined ? await storage.readHistory(id) : history;
+  const head = known?.versions.at(-1);
+  if (!known || !head) {
+    enforceStructure(rules, checkDocument(rules, view(live)));
+    return true;
+  }
+  const raw = await new VersionManager(storage).reconstructVersion(id, head.version, known);
+  enforceStructure(rules, checkUpdate(rules, view(parseDocument(`${id}.md`, raw, id)), view(live)));
+  return false;
 }
 
 /**
@@ -108,7 +145,10 @@ export async function missingFolders(
   const { root, folders } = documentFolders(id);
   const missing: string[] = [];
   for (const folder of folders) {
-    if (!(await storage.hasVaultFile(root ? `${root}/${folder}` : folder))) missing.push(folder);
+    // Shallowest first: below a missing folder, every folder is missing.
+    if (missing.length > 0 || !(await storage.hasVaultFile(root ? `${root}/${folder}` : folder))) {
+      missing.push(folder);
+    }
   }
   return { root, folders: missing };
 }
@@ -171,21 +211,35 @@ export async function scaffoldFolders(
 }
 
 /**
- * Scaffold for a held create that was just approved. Nothing was scaffolded
- * when the write was held; the folders it created are the ones it still
- * occupies alone, so those get their required contents now.
+ * Scaffold for documents just published for the first time — a held create
+ * approved, say, which nothing scaffolded while it was held. The folders they
+ * brought into being are the ones no other document occupies, so those get
+ * their required contents now. Batch-aware: fifty first publishes into one new
+ * folder still scaffold it.
  */
-export async function scaffoldApprovedCreate(
+export async function scaffoldFirstPublish(
   storage: NestStorage,
   rules: CompiledStructure,
-  id: string,
+  ids: string[],
 ): Promise<string[]> {
-  const { root, folders } = documentFolders(id);
-  const alone: string[] = [];
-  for (const folder of folders) {
-    if ((await documentsUnder(storage, root ? `${root}/${folder}` : folder)) <= 1) alone.push(folder);
+  const batch = new Map<string, { root: string; folder: string; count: number }>();
+  for (const id of ids) {
+    const { root, folders } = documentFolders(id);
+    for (const folder of folders) {
+      const path = root ? `${root}/${folder}` : folder;
+      const entry = batch.get(path) ?? { root, folder, count: 0 };
+      entry.count++;
+      batch.set(path, entry);
+    }
   }
-  return scaffoldFolders(storage, rules, { root, folders: alone });
+  const byRoot = new Map<string, string[]>();
+  for (const [path, { root, folder, count }] of batch) {
+    if ((await documentsUnder(storage, path)) > count) continue;
+    byRoot.set(root, [...(byRoot.get(root) ?? []), folder]);
+  }
+  const written: string[] = [];
+  for (const [root, folders] of byRoot) written.push(...(await scaffoldFolders(storage, rules, { root, folders })));
+  return written;
 }
 
 // ─── Writing the rules ──────────────────────────────────────────────────────
@@ -301,8 +355,16 @@ async function writeStructure(storage: NestStorage, rules: StructureConfig): Pro
   // which every later read and write of the vault would trip over. Renamed
   // onto the symlink's target, not the link, with the file's own mode.
   const target = await realpath(path);
+  const inside = relative(await realpath(storage.root), target);
+  if (inside.startsWith("..") || isAbsolute(inside)) {
+    throw new ConfigError(
+      `${path} links outside the vault — setStructure will not rewrite another directory's file. Edit it by hand.`,
+    );
+  }
   const { mode } = await stat(target);
   const tmp = `${target}.${process.pid}.tmp`;
+  // A crash may have left this very name behind; `wx` below needs it gone.
+  await unlink(tmp).catch(() => undefined);
   try {
     // Created with the mode (never briefly wider), then chmod past the umask.
     await writeFile(tmp, `${bom}${next}`, { encoding: "utf-8", mode: mode & 0o777, flag: "wx" });

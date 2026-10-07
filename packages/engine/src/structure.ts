@@ -19,6 +19,7 @@
 import { ConfigError, ContextNestError } from "./errors.js";
 import { headingAnchor, headingAnchors } from "./inline.js";
 import { NODE_TYPES, structureRulesSchema } from "./schemas.js";
+import { comparableSegment } from "./storage.js";
 import type { NestConfig } from "./types.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -125,9 +126,9 @@ export const MAX_MATCHED_NAME = 128;
 /** Longest owner-written regex accepted. */
 const MAX_REGEX_LENGTH = 200;
 /**
- * `{slug}`/`{n}` tokens per token pattern. Tokens compile to unambiguous
- * expressions (each `{slug}` repetition starts with "-", `{n}` is digits and
- * two never touch), so three cost microseconds.
+ * `{slug}`/`{n}` tokens per token pattern — a readability limit (§11.1.1).
+ * Cost is not the reason: token patterns run on the same linear matcher as
+ * owner regexes.
  */
 const MAX_VARIABLE_TOKENS = 3;
 /** Folder rules allowed in one vault: bounds the rules a single check walks. */
@@ -137,6 +138,11 @@ const MAX_LISTED = 12;
 
 // ─── Tokens ─────────────────────────────────────────────────────────────────
 
+/**
+ * What each token matches, as a regex in the §11.1.1 grammar. `slug` repeats
+ * a group, which the grammar does not allow, so it is its own matcher item
+ * (see `tokenItem`); its expression is listed for reference.
+ */
 const TOKENS: Readonly<Record<string, string>> = {
   slug: "[a-z0-9]+(?:-[a-z0-9]+)*",
   date: "[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])",
@@ -153,10 +159,11 @@ const matcher = (spelling: string, test: (name: string) => boolean): Matcher => 
   test,
   memo: new Map(),
 });
-/** Token patterns compile to unambiguous expressions, safe on the regex engine. */
-const tokenRegexMatcher = (spelling: string, re: RegExp) => matcher(spelling, (name) => re.test(name));
-const slugMatcher = () => tokenRegexMatcher("{slug}", new RegExp(`^${TOKENS.slug}$`));
-const tokenMatcher = (token: string) => tokenRegexMatcher(`{${token}}`, new RegExp(`^${TOKENS[token]}$`));
+/** A token pattern's items, matched like an owner regex — never by `RegExp`. */
+const itemsMatcher = (spelling: string, items: RegexItem[]) =>
+  matcher(spelling, (name) => linearTest([items], name));
+const slugMatcher = () => itemsMatcher("{slug}", [tokenItem("slug")]);
+const tokenMatcher = (token: string) => itemsMatcher(`{${token}}`, [tokenItem(token)]);
 
 /** Whether `name` fits, never running a pattern on an over-long name. */
 function fits(m: Matcher, name: string): boolean {
@@ -188,6 +195,7 @@ type CharTest = (code: number) => boolean;
 type RegexItem =
   | { kind: "atom"; test: CharTest; min: number; max: number }
   | { kind: "group"; alternatives: RegexItem[][] }
+  | { kind: "slug" }
   | { kind: "start" }
   | { kind: "end" };
 
@@ -232,8 +240,10 @@ function parseRegex(src: string): RegexItem[][] {
   };
 
   // As JavaScript reads a class: the first `]` closes it, even straight after
-  // `[` or `[^`, so `[]` matches nothing and `[^]` anything; `-` is a range
-  // only between two characters.
+  // `[` or `[^`, so `[]` matches nothing and `[^]` anything. `-` between two
+  // atoms is a range; when either end is a class escape (`\d-z`), Annex B
+  // makes it the union of both ends and `-` — the next atom is consumed, never
+  // the start of another range.
   const charClass = (): CharTest => {
     i++;
     let negate = false;
@@ -241,6 +251,12 @@ function parseRegex(src: string): RegexItem[][] {
       negate = true;
       i++;
     }
+    const atom = (): CharTest | number => {
+      if (src[i] !== "\\") return src.charCodeAt(i++);
+      const e = escape();
+      return "shorthand" in e ? e.shorthand : e.char;
+    };
+    const asTest = (a: CharTest | number): CharTest => (typeof a === "number" ? equals(a) : a);
     const members: CharTest[] = [];
     for (;;) {
       if (i >= src.length) fail("has an unclosed [ character class");
@@ -248,36 +264,19 @@ function parseRegex(src: string): RegexItem[][] {
         i++;
         break;
       }
-      let from: number;
-      if (src[i] === "\\") {
-        const e = escape();
-        if ("shorthand" in e) {
-          members.push(e.shorthand);
-          continue;
-        }
-        from = e.char;
-      } else {
-        from = src.charCodeAt(i++);
-      }
-      if (src[i] === "-" && src[i + 1] !== undefined && src[i + 1] !== "]") {
-        i++;
-        let to: number;
-        if (src[i] === "\\") {
-          const e = escape();
-          if ("shorthand" in e) {
-            members.push(equals(from), equals(45), e.shorthand);
-            continue;
-          }
-          to = e.char;
-        } else {
-          to = src.charCodeAt(i++);
-        }
-        if (to < from) fail("has a character range out of order");
-        const lo = from;
-        members.push((c) => c >= lo && c <= to);
+      const from = atom();
+      if (src[i] !== "-" || src[i + 1] === undefined || src[i + 1] === "]") {
+        members.push(asTest(from));
         continue;
       }
-      members.push(equals(from));
+      i++;
+      const to = atom();
+      if (typeof from === "number" && typeof to === "number") {
+        if (to < from) fail("has a character range out of order");
+        members.push((c) => c >= from && c <= to);
+      } else {
+        members.push(asTest(from), equals(45), asTest(to));
+      }
     }
     return (c) => members.some((m) => m(c)) !== negate;
   };
@@ -384,7 +383,20 @@ function advanceSequence(items: RegexItem[], name: string, from: Uint8Array): Ui
       continue;
     }
     const next = new Uint8Array(n + 1);
-    if (item.kind === "start") {
+    if (item.kind === "slug") {
+      // [a-z0-9]+(?:-[a-z0-9]+)* in one left-to-right pass: `word` is "a slug
+      // runs up to here and ends in a letter or digit", `dash` "…ends in -".
+      let word = false;
+      let dash = false;
+      for (let p = 0; p < n; p++) {
+        const c = name.charCodeAt(p);
+        const alnum = (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+        const nextWord: boolean = alnum && (word || dash || current[p] === 1);
+        dash = c === 45 && word;
+        word = nextWord;
+        next[p + 1] = word ? 1 : 0;
+      }
+    } else if (item.kind === "start") {
       next[0] = current[0];
     } else if (item.kind === "end") {
       next[n] = current[n];
@@ -414,6 +426,11 @@ function advanceSequence(items: RegexItem[], name: string, from: Uint8Array): Ui
   return current;
 }
 
+/** A token as one matcher item. */
+function tokenItem(token: string): RegexItem {
+  return token === "slug" ? { kind: "slug" } : { kind: "group", alternatives: parseRegex(TOKENS[token]) };
+}
+
 /** Whole-name match, as `^(?:body)$` would, in linear time. */
 function linearTest(alternatives: RegexItem[][], name: string): boolean {
   const start = new Uint8Array(name.length + 1);
@@ -441,7 +458,7 @@ function compileFormat(spelling: string, key: string): Matcher {
     return matcher(spelling, (name) => linearTest(alternatives, name));
   }
   if (!spelling) throw new ConfigError(`${key}: the format is empty`);
-  let source = "";
+  const items: RegexItem[] = [];
   let slugs = 0;
   let variable = 0;
   let previous: string | null = null; // the token just before, if nothing separates them
@@ -466,7 +483,7 @@ function compileFormat(spelling: string, key: string): Matcher {
         }
       }
       previous = token;
-      source += TOKENS[token];
+      items.push(tokenItem(token));
     } else {
       previous = null;
       if (!/^[a-z0-9-]+$/.test(part)) {
@@ -474,10 +491,10 @@ function compileFormat(spelling: string, key: string): Matcher {
           `${key}: "${part}" can never match — names are lowercase a-z, 0-9 and "-" (titles are slugified)`,
         );
       }
-      source += part;
+      items.push(...parseRegex(part)[0]);
     }
   }
-  return tokenRegexMatcher(spelling, new RegExp(`^${source}$`));
+  return itemsMatcher(spelling, items);
 }
 
 /** `"/nodes/a/b/"` → `"a/b"`; `"/"`, `""` and `"nodes"` → `""` (the root). */
@@ -694,11 +711,18 @@ const rawSegments = (path: string) =>
     .split("/")
     .filter((s) => s && s !== ".");
 
+/**
+ * The root a path starts in, compared as a file system resolves it — a
+ * case-insensitive volume puts `Nodes/x` in `nodes/x`.
+ */
+const rootOf = (raw: string[]) => (raw.length > 0 ? comparableSegment(raw[0]) : "");
+
 /** Folder segments of a path, `nodes/` dropped; null when it is exempt. */
 function folderSegments(folder: string): string[] | null {
   const raw = rawSegments(folder);
-  if (raw.length > 0 && (SYSTEM_ROOTS.has(raw[0]) || raw[0] === "sources")) return null;
-  return raw[0] === "nodes" ? raw.slice(1) : raw;
+  const root = rootOf(raw);
+  if (SYSTEM_ROOTS.has(root) || root === "sources") return null;
+  return root === "nodes" ? raw.slice(1) : raw;
 }
 
 /**
@@ -708,12 +732,15 @@ function folderSegments(folder: string): string[] | null {
  */
 function docPath(id: string): { folder: string[]; leaf: string; sourcesRoot: boolean } | null {
   const raw = rawSegments(id);
-  if (raw.length === 0 || SYSTEM_ROOTS.has(raw[0])) return null;
-  if (raw.length === 1 && raw[0] === "CONTEXT") return null; // the vault's CONTEXT.md
-  const segs = raw[0] === "nodes" ? raw.slice(1) : raw;
+  const root = rootOf(raw);
+  if (raw.length === 0 || SYSTEM_ROOTS.has(root)) return null;
+  // The vault's CONTEXT.md, exactly: exempting `context` too would hand a
+  // case-sensitive volume a root file no rule ever judges.
+  if (raw.length === 1 && raw[0] === "CONTEXT") return null;
+  const segs = root === "nodes" ? raw.slice(1) : raw;
   const leaf = segs.pop();
   if (!leaf) return null;
-  return { folder: segs, leaf, sourcesRoot: raw[0] === "sources" };
+  return { folder: segs, leaf, sourcesRoot: root === "sources" };
 }
 
 const display = (segs: string[]) => segs.join("/");
@@ -727,7 +754,7 @@ const shown = (pattern: string) => pattern || "/";
  */
 export function documentFolders(id: string): { root: string; folders: string[] } {
   const segs = id.replace(/\\/g, "/").split("/").filter(Boolean);
-  const root = segs[0] === "nodes" ? "nodes" : "";
+  const root = rootOf(segs) === "nodes" ? segs[0] : "";
   if (root) segs.shift();
   segs.pop();
   const folders: string[] = [];
