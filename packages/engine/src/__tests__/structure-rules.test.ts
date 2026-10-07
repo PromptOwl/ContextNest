@@ -88,6 +88,26 @@ describe("compileStructure", () => {
     expect(checkDocument(r, { id: "nodes/engineering/Anything", type: "prompt", body: "" })).toEqual([]);
   });
 
+  it("the spec's own §11.1 example still compiles: an unresolved template is a legacy label", () => {
+    const r = compileStructure({ folders: { decisions: { template: "adr" }, engineering: { description: "x" } } });
+    expect(resolveFolder(r, "decisions")).toMatchObject({ pattern: "decisions", template: "adr" });
+    expect(resolveFolder(r, "decisions")?.template_body).toBeUndefined();
+    expect(checkDocument(r, { id: "nodes/decisions/anything", type: "document", body: "" })).toEqual([]);
+    const files = compileStructure({ folders: { d: { files: { o: { template: "missing" } } } } });
+    expect(scaffoldPlan(files, ["d"]).documents[0].body).toBe("");
+  });
+
+  it("legacy folder keys that are not slugs (Obsidian names) compile and match literally", () => {
+    const r = compileStructure({
+      structure: { closed: true },
+      folders: { Engineering: {}, "my notes": {}, _drafts: {} },
+    });
+    for (const id of ["Engineering/x", "my notes/x", "_drafts/x"]) {
+      expect(checkDocument(r, { id, type: "document", body: "" })).toEqual([]);
+    }
+    expect(codes(checkDocument(r, { id: "engineering/x", type: "document", body: "" }))).toEqual(["FOLDER_NOT_ALLOWED"]);
+  });
+
   it("normalizes pattern keys: leading nodes/, slashes, and / for the root", () => {
     const r = compileStructure({
       structure: { closed: true },
@@ -104,12 +124,12 @@ describe("compileStructure", () => {
     ["underscore literal", { folders: { d: { file_name: "adr_{n}" } } }, /folders\.d\.file_name/],
     ["unknown node type", { folders: { d: { types: ["memo"] } } }, /folders\.d\.types.*memo/],
     ["required on a placeholder folder", { folders: { "c/{x}": { required: true } } }, /required/],
-    ["undefined template", { folders: { d: { template: "nope" } } }, /template.*nope/],
-    ["undefined template on a required file", { folders: { d: { files: { o: { template: "nope" } } } } }, /nope/],
     ["folder_name on a literal folder", { folders: { d: { folder_name: "{yyyy}" } } }, /folder_name/],
     ["empty segment", { folders: { "a//b": {} } }, /a\/\/b/],
     ["traversal", { folders: { "a/../b": {} } }, /\.\./],
-    ["uppercase literal folder", { folders: { Clients: {} } }, /Clients/],
+    ["a dot-segment literal", { folders: { ".hidden": {} } }, /\.hidden/],
+    ["a required file of type source (needs a source block)", { folders: { d: { files: { feed: { type: "source" } } } } }, /source/],
+    ["a required file of type skill (needs a skill block)", { folders: { d: { files: { s: { type: "skill" } } } } }, /skill/],
     ["required file leaf not a slug", { folders: { d: { files: { "Over View": {} } } } }, /Over View/],
     ["unknown required-file type", { folders: { d: { files: { o: { type: "memo" } } } } }, /memo/],
   ] as const)("refuses %s with CONFIG_ERROR naming the key", (_label, cfg, key) => {
@@ -131,6 +151,18 @@ describe("compileStructure", () => {
       ["longer than 200 characters", `/${"a".repeat(201)}/`],
       ["invalid syntax", "/(/"],
       ["empty", "//"],
+      // QA + architecture repros: each was accepted by the old blocklist and
+      // stalled the process for seconds on a ≤128-character name.
+      ["[^] hiding a nested group", "/[^](?:a+)+b/"],
+      ["many bounded repetitions", "/a{0,30}a{0,30}a{0,30}a{0,30}a{0,30}a{0,30}b/"],
+      ["a repeated group of optionals", "/(?:a?a?)+b/"],
+      ["an optional inside a repeated group", "/(a?){50}a{50}/"],
+      ["a long chain of alternations", `/${"(?:a|a)".repeat(26)}/`],
+      ["fourteen bounded repetitions", `/${"a{0,20}".repeat(14)}b/`],
+      ["any quantified group", "/(?:-v[0-9])?x/"],
+      ["a named group", "/(?<x>a)b/"],
+      ["an unknown letter escape", "/\\x41/"],
+      ["more than 4 alternation bars", "/(a|b|c|d|e|f)/"],
     ])("refuses %s", (_label, src) => {
       expectConfigError({ folders: { d: { file_name: src } } }, /folders\.d\.file_name/);
     });
@@ -144,6 +176,22 @@ describe("compileStructure", () => {
       const r = compileStructure({ folders: { d: { file_name: src } } });
       expect(checkDocument(r, { id: `d/${yes}`, type: "document", body: "" })).toEqual([]);
       expect(codes(checkDocument(r, { id: `d/${no}`, type: "document", body: "" }))).toEqual(["FILE_NAME"]);
+    });
+
+    it.each([
+      ["/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*a*b/", "a".repeat(127) + "c"],
+      ["/.*.*.*x/", "a".repeat(128)],
+      ["/[a-z]{0,60}[a-z]{0,60}[a-z]{0,60}0/", "a".repeat(128)],
+    ])("the worst shape the whitelist accepts stays fast: %s", (src, name) => {
+      const r = compileStructure({ folders: { d: { file_name: src } } });
+      const started = Date.now();
+      checkDocument(r, { id: `d/${name}`, type: "document", body: "" });
+      expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    it("parses [] and [^] the way JavaScript does", () => {
+      expect(() => compileStructure({ folders: { d: { file_name: "/[^]x/" } } })).not.toThrow();
+      expectConfigError({ folders: { d: { file_name: "/[^](a+)+/" } } }, /folders\.d\.file_name/);
     });
 
     it("anchors the whole name: a prefix or suffix match is not a match", () => {
@@ -185,6 +233,22 @@ describe("name tokens", () => {
     expect(ok(withName("adr-{n}-{slug}"), "adr-x-use-pg")).toBe(false);
   });
 
+  it.each([
+    ["{n}{n}x"],
+    ["{n}{n}{n}{n}{n}{n}{n}{n}x"],
+    ["{slug}{n}"],
+    ["{n}{slug}"],
+    ["{n}-{n}-{n}-{n}"],
+  ])("refuses a token pattern that would backtrack: %s", (spelling) => {
+    expectConfigError({ folders: { d: { file_name: spelling } } }, /folders\.d\.file_name/);
+  });
+
+  it("fixed-width tokens may touch; variable ones need a literal between them", () => {
+    expect(ok(withName("{date}{slug}"), "2026-10-07kickoff")).toBe(true);
+    expect(ok(withName("{yyyy}{n}"), "202612")).toBe(true);
+    expect(ok(withName("{n}-{n}-{slug}"), "1-2-x")).toBe(true);
+  });
+
   it("{slug} alone is any kebab-case name", () => {
     const r = withName("{slug}");
     expect(ok(r, "a-b-c")).toBe(true);
@@ -203,24 +267,43 @@ describe("paths", () => {
     expect(b).toEqual([]);
   });
 
-  it("system paths are exempt even under closed", () => {
+  it("only the vault-root system paths are exempt", () => {
     const r = rules();
-    for (const id of [
-      "packs/onboarding",
-      ".versions/x/v1",
-      "nodes/decisions/.versions/x/v1",
-      "_suggestions/x",
-      "nodes/clients/INDEX",
-      "context",
-    ]) {
+    for (const id of ["packs/onboarding", "_suggestions/x", "CONTEXT"]) {
       expect(checkDocument(r, { id, type: "document", body: "" })).toEqual([]);
     }
   });
 
-  it("sources/ is exempt only for type: source", () => {
+  it.each([
+    "nodes/packs/evil",
+    "nodes/_suggestions/evil",
+    "nodes/context",
+    "nodes/Context",
+    "context",
+    "nodes/.hidden/evil",
+    "nodes/notes/.evil",
+    "nodes/forbidden/INDEX",
+    "nodes/clients/INDEX",
+    ".versions/x/v1",
+    "nodes/decisions/.versions/x/v1",
+  ])("a look-alike of a system path is checked like any other under closed: %s", (id) => {
+    expect(checkDocument(rules(), { id, type: "document", body: "## Decision\n" }).length).toBeGreaterThan(0);
+  });
+
+  it("an id is never extension-stripped: adr-1-x.md does not pass as adr-1-x", () => {
+    const r = rules();
+    expect(codes(checkDocument(r, { id: "nodes/decisions/adr-0001-x.md", type: "document", body: "## Decision\n" }))).toEqual([
+      "FILE_NAME",
+    ]);
+  });
+
+  it("sources/ is exempt only at the vault root and only for type: source", () => {
     const r = rules();
     expect(checkDocument(r, { id: "sources/jira", type: "source", body: "" })).toEqual([]);
     expect(codes(checkDocument(r, { id: "sources/jira", type: "document", body: "" }))).toEqual([
+      "FOLDER_NOT_ALLOWED",
+    ]);
+    expect(codes(checkDocument(r, { id: "nodes/sources/jira", type: "source", body: "" }))).toEqual([
       "FOLDER_NOT_ALLOWED",
     ]);
   });
@@ -356,6 +439,12 @@ describe("file names", () => {
     expect(v[0].message).toMatch(/title/i);
   });
 
+  it("a required file must have the type it declares", () => {
+    const r = compileStructure({ folders: { d: { types: ["glossary"], files: { overview: { type: "document" } } } } });
+    expect(checkDocument(r, { id: "nodes/d/overview", type: "document", body: "" })).toEqual([]);
+    expect(codes(checkDocument(r, { id: "nodes/d/overview", type: "glossary", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
+  });
+
   it("required-file leaves are allowed whatever file_name says", () => {
     const r = compileStructure({
       folders: { d: { file_name: "{date}-{slug}", files: { overview: {} } } },
@@ -388,6 +477,18 @@ describe("required sections", () => {
     expect(
       checkDocument(rules(), { id: "nodes/clients/acme-042/meetings/2026-10-07-k", type: "document", body }),
     ).toEqual([]);
+  });
+
+  it("a setext heading counts; one in an HTML comment, a fence or indented code does not", () => {
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-k";
+    expect(checkDocument(rules(), { id, type: "document", body: "Decisions\n---------\n\nAction items\n============\n" })).toEqual([]);
+    for (const body of [
+      "<!--\n## Decisions\n## Action items\n-->\n",
+      "```\n## Decisions\n## Action items\n```\n",
+      "    ## Decisions\n    ## Action items\n",
+    ]) {
+      expect(codes(checkDocument(rules(), { id, type: "document", body }))).toEqual(["MISSING_SECTION", "MISSING_SECTION"]);
+    }
   });
 
   it("the words in prose do not count as a heading", () => {
@@ -431,11 +532,15 @@ describe("checkUpdate — grandfathering", () => {
 // ─── Deletes ────────────────────────────────────────────────────────────────
 
 describe("deletes", () => {
-  it("a required file cannot be deleted on its own", () => {
-    const v = checkDeleteDocument(rules(), "nodes/clients/acme-042/overview");
+  it("a required file cannot be deleted while its folder holds anything else", () => {
+    const v = checkDeleteDocument(rules(), "nodes/clients/acme-042/overview", 2);
     expect(codes(v)).toEqual(["MISSING_FILE"]);
-    expect(v[0].message).toMatch(/delete the folder instead/);
-    expect(checkDeleteDocument(rules(), "nodes/clients/acme-042/meetings/2026-10-07-k")).toEqual([]);
+    expect(v[0].message).toMatch(/delete the folder/);
+    expect(checkDeleteDocument(rules(), "nodes/clients/acme-042/meetings/2026-10-07-k", 3)).toEqual([]);
+  });
+
+  it("the last document in a folder may go, so a folder can be emptied without a folder delete", () => {
+    expect(checkDeleteDocument(rules(), "nodes/clients/acme-042/overview", 0)).toEqual([]);
   });
 
   it("a required subfolder cannot be deleted on its own; its placeholder parent can", () => {
@@ -493,7 +598,7 @@ describe("auditStructure", () => {
       ["clients", "clients/acme-042", "clients/acme-042/meetings", "notes"],
     );
     const byCode = (c: string) => v.filter((x) => x.code === c).map((x) => x.path).sort();
-    expect(byCode("FOLDER_NOT_ALLOWED")).toEqual(["notes", "notes"]);
+    expect(byCode("FOLDER_NOT_ALLOWED")).toEqual(["notes"]); // one finding per code and path
     expect(byCode("MISSING_FOLDER")).toEqual(["clients/acme-042/contracts"]);
     expect(byCode("MISSING_FILE")).toEqual(["clients/acme-042/overview"]);
   });
@@ -512,6 +617,11 @@ describe("resolveFolder / describeStructure", () => {
       required: true,
     });
     expect(resolveFolder(rules(), "misc")).toBeNull();
+  });
+
+  it("orders patterns by code unit, never by the host's locale", () => {
+    const r = compileStructure({ folders: { b: {}, Zeta: {}, a: {}, "a/{x}": {} } });
+    expect(describeStructure(r).folders.map((f) => f.pattern)).toEqual(["Zeta", "a", "a/{x}", "b"]);
   });
 
   it("describes the whole rule set in the wire shape", () => {

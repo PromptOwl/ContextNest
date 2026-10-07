@@ -120,20 +120,24 @@ const MAX_RULE_LINES = 15;
  * it has none — or when `ctx` predates the command (non-zero exit).
  */
 function structureLines(exec, args) {
+  // Rule text is written by the vault's owner — for a pinned remote nest,
+  // someone else. One line per value and a hard length cap, so it can never
+  // break out of its bullet into instructions of its own.
+  const clean = (value, max = 60) => squish(String(value).replace(/`/g, "'"), max);
   const s = ctxJson(exec, args, null);
   if (!s || typeof s !== "object" || !Array.isArray(s.folders) || s.folders.length === 0) return [];
   const mode = s.enforce ? "enforced — writes that break them are refused" : "report-only";
   const lines = [`Structure rules for this vault (${mode}${s.closed ? "; closed: only these folders may exist" : ""}):`];
   for (const f of s.folders.slice(0, MAX_RULE_LINES)) {
     const parts = [];
-    if (Array.isArray(f.types)) parts.push(f.types.length ? `types ${f.types.join("/")}` : "no documents directly");
-    if (f.folder_name) parts.push(`folder names ${f.folder_name}`);
-    if (f.file_name) parts.push(`file names ${f.file_name}`);
-    if (f.template) parts.push(`template ${f.template}`);
+    if (Array.isArray(f.types)) parts.push(f.types.length ? `types ${clean(f.types.join("/"))}` : "no documents directly");
+    if (f.folder_name) parts.push(`folder names ${clean(f.folder_name)}`);
+    if (f.file_name) parts.push(`file names ${clean(f.file_name)}`);
+    if (f.template) parts.push(`template ${clean(f.template, 40)}`);
     const files = Object.keys(f.files ?? {});
-    if (files.length) parts.push(`required files ${files.join(", ")}`);
+    if (files.length) parts.push(`required files ${clean(files.join(", "))}`);
     if (f.required) parts.push("required");
-    lines.push(`- \`${f.pattern}\`${parts.length ? ` — ${parts.join("; ")}` : ""}`);
+    lines.push(`- \`${clean(f.pattern)}\`${parts.length ? ` — ${parts.join("; ")}` : ""}`);
   }
   if (s.folders.length > MAX_RULE_LINES) {
     lines.push(`- … ${s.folders.length - MAX_RULE_LINES} more — run \`ctx structure\``);

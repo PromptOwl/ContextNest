@@ -52,6 +52,7 @@ import type {
 } from "./types.js";
 import type { NestStorage } from "./storage.js";
 import { settlePdfForCommit } from "./pdf-nodes.js";
+import { assertStructureUpdate } from "./structure-store.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -115,6 +116,9 @@ async function approveSuggestionImpl(
       "content_hash_mismatch",
     );
   }
+  // Approval is the governed write: it is judged against the structure rules
+  // in force now (§11.1.1), for what the edit newly breaks.
+  await assertStructureUpdate(input.storage, input.documentId, approved.content, patched);
 
   const { versionEntry } = await commitNewVersion({
     storage: input.storage,

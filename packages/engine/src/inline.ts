@@ -205,6 +205,54 @@ export function extractSection(body: string, anchor: string): string | null {
   return lines.slice(headings[start].line, endLine).join("\n").trim();
 }
 
+/**
+ * Anchors of a body's top-level headings — the same parser section links
+ * (`#section`) resolve against, so "this heading exists" means the same thing
+ * everywhere. Text inside an HTML comment is not a heading.
+ */
+export function headingAnchors(body: string): Set<string> {
+  const lines = maskHtmlComments(body.split("\n").map((l) => l.replace(/\r$/, "")));
+  return new Set(topLevelHeadings(lines).map((h) => h.anchor));
+}
+
+/** The anchor a heading with this text gets (see {@link headingAnchors}). */
+export function headingAnchor(text: string): string {
+  return toAnchor(text);
+}
+
+/** Blank every line touched by an HTML comment (linear: indexOf, no regex). */
+function maskHtmlComments(lines: string[]): string[] {
+  let inside = false;
+  return lines.map((line) => {
+    let kept = "";
+    let rest = line;
+    let touched = false;
+    while (rest.length > 0) {
+      if (inside) {
+        const end = rest.indexOf("-->");
+        touched = true;
+        if (end === -1) {
+          rest = "";
+          break;
+        }
+        rest = rest.slice(end + 3);
+        inside = false;
+      } else {
+        const start = rest.indexOf("<!--");
+        if (start === -1) {
+          kept += rest;
+          break;
+        }
+        kept += rest.slice(0, start);
+        rest = rest.slice(start + 4);
+        inside = true;
+        touched = true;
+      }
+    }
+    return touched && kept.trim() === "" ? "" : touched ? kept : line;
+  });
+}
+
 interface Heading {
   depth: number;
   anchor: string;

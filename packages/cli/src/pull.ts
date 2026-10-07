@@ -28,8 +28,12 @@ import {
   serializeDocument,
   validateDocument,
   withVaultLock,
+  enforcedStructure,
+  checkDocument,
+  checkUpdate,
+  checkFolder,
 } from "@promptowl/contextnest-engine";
-import type { ContextNode, Frontmatter, NestStorage } from "@promptowl/contextnest-engine";
+import type { ContextNode, Frontmatter, NestStorage, Violation } from "@promptowl/contextnest-engine";
 
 // ─── Manifest ───────────────────────────────────────────────────────────────
 
@@ -457,15 +461,36 @@ export async function applyPull(storage: NestStorage, steps: PullStep[]): Promis
 
 async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise<PullStep[]> {
   const written: PullStep[] = [];
+  // A recipe names its own destinations, so an enforced vault's structure
+  // rules (§11.1.1) judge every one before it lands.
+  const rules = await enforcedStructure(storage);
+  const refuse = (step: PullStep, violations: Violation[]) =>
+    Object.assign(step, {
+      action: "conflict",
+      content: undefined,
+      note: `${step.to}: ${violations.map((v) => v.message).join(" ")}`,
+    });
   for (const step of steps) {
     if ((step.action !== "create" && step.action !== "update") || step.content === undefined) continue;
     if (step.kind === "document" || step.kind === "skill") {
       const changed = () =>
         Object.assign(step, { action: "conflict", content: undefined, note: `${step.to} changed while the pull ran — left untouched` });
+      let local: ContextNode | null = null;
       if (step.action === "update") {
-        const local = await readLocal(storage, step.to);
+        local = await readLocal(storage, step.to);
         if (!local || pulledFrom(local)?.id !== step.from || !untouched(local)) {
           changed();
+          continue;
+        }
+      }
+      if (rules) {
+        const incoming = parseDocument(`${step.to}.md`, step.content, step.to);
+        const after = { id: step.to, type: incoming.frontmatter.type, body: incoming.body };
+        const violations = local
+          ? checkUpdate(rules, { id: step.to, type: local.frontmatter.type, body: local.body }, after)
+          : checkDocument(rules, after);
+        if (violations.length > 0) {
+          refuse(step, violations);
           continue;
         }
       }
@@ -477,6 +502,13 @@ async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise
         continue;
       }
     } else {
+      if (rules && step.to.startsWith("nodes/")) {
+        const violations = checkFolder(rules, step.to.split("/").slice(0, -1).join("/"));
+        if (violations.length > 0) {
+          refuse(step, violations);
+          continue;
+        }
+      }
       // Re-checked at write time: a file that appeared since planning is kept.
       if (await storage.hasVaultFile(step.to)) continue;
       await storage.writeVaultFile(step.to, step.content);

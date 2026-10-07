@@ -1410,6 +1410,10 @@ const structureOp: OperationDescriptor = {
       )
       .optional()
       .describe("With `report`: what breaks the rules today (grandfathered content stays editable)"),
+    error: z
+      .string()
+      .optional()
+      .describe("Present when the rules in config.yaml do not compile: why. Writes are refused only if the rules are enforced"),
   }),
   errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
 };

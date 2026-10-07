@@ -211,6 +211,8 @@ export interface StructureOutput {
   templates: Record<string, { body: string; required_sections: string[] }>;
   resolved?: (StructureFolderView & { template_body?: string; required_sections?: string[] }) | null;
   violations?: Array<{ code: string; path: string; rule?: string; message: string }>;
+  /** The rules do not compile: why (writes are refused only when enforced). */
+  error?: string;
 }
 
 function describeRule(f: StructureFolderView): string {
@@ -236,7 +238,10 @@ export function printStructure(out: StructureOutput, opts: { json?: boolean; fol
     console.log(JSON.stringify(out, null, 2));
     return;
   }
-  if (out.folders.length === 0 && Object.keys(out.templates).length === 0) {
+  if (out.error) {
+    console.log(chalk.red(`Structure rules do not compile: ${out.error}`));
+    console.log(chalk.dim(out.enforce ? "Writes are refused until .context/config.yaml is fixed." : "They are not enforced, so nothing is refused."));
+  } else if (out.folders.length === 0 && Object.keys(out.templates).length === 0) {
     console.log(chalk.dim("No structure rules — any folder, type and file name is allowed."));
   } else {
     const mode = out.enforce ? chalk.red("enforced") : chalk.yellow("report-only");

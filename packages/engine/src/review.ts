@@ -40,6 +40,8 @@ import { publishDocument } from "./publish.js";
 import { listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
+import { assertStructureUpdate, enforcedStructure } from "./structure-store.js";
+import { checkDocument, enforceStructure } from "./structure.js";
 import { assertSafeDocumentId } from "./storage.js";
 import type { NestStorage } from "./storage.js";
 import type { GovernanceTier, ReviewMode, SuggestionMeta } from "./types.js";
@@ -309,6 +311,9 @@ export async function approveReview(
           "content_hash_mismatch",
         );
       }
+      // Judged against the structure rules in force now (§11.1.1) — they may
+      // have changed since the edit was held.
+      await assertStructureUpdate(storage, id, approvedRaw!, proposedRaw);
       // The write the hold deferred, then the publish it would have done.
       await storage.writeDocument(id, proposedRaw);
       const result = await publishDocument(storage, id, {
@@ -347,6 +352,12 @@ export async function approveReview(
         `Nothing is pending review for ${id} (status: ${node.frontmatter.status ?? "draft"}).`,
         "VALIDATION_FAILED",
       );
+    }
+    // A held create met the rules when it was held; approval is judged
+    // against the rules in force now (§11.1.1).
+    const rules = await enforcedStructure(storage);
+    if (rules) {
+      enforceStructure(rules, checkDocument(rules, { id, type: node.frontmatter.type, body: node.body }));
     }
     const result = await publishDocument(storage, id, {
       editedBy: opts.actor,

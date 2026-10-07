@@ -519,7 +519,13 @@ export type {
   ResolvedFolderRule,
   StructureView,
 } from "./structure.js";
-export { setStructure } from "./structure-store.js";
+export {
+  setStructure,
+  enforcedStructure,
+  missingFolders,
+  scaffoldFolders,
+  assertStructureUpdate,
+} from "./structure-store.js";
 
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
 export {

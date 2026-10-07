@@ -401,3 +401,19 @@ describe("pull — re-pull", () => {
     expect(existsSync(join(root, "stewards.example.yaml"))).toBe(true);
   });
 });
+
+describe("pull — structure rules", () => {
+  it("a destination the vault's enforced rules refuse is reported, not written; the rest lands", async () => {
+    writeFileSync(
+      join(root, ".context", "config.yaml"),
+      "version: 1\nname: pull-test\nstructure: {enforce: true, closed: true}\nfolders:\n  standards: {}\n  skills: {}\n",
+    );
+    const steps = await planPull(storage, await remoteFetchRecipe(target, "test"));
+    await applyPull(storage, steps);
+    const step = steps.find((s) => s.to === "nodes/methodologies/method")!;
+    expect(step.action).toBe("conflict");
+    expect(step.note).toMatch(/not an allowed folder/);
+    expect(existsSync(join(root, "nodes", "methodologies", "method.md"))).toBe(false);
+    expect(existsSync(join(root, "nodes", "standards", "facts.md"))).toBe(true);
+  });
+});

@@ -187,7 +187,7 @@ describe("[regression] structure rules — ctx on a local vault", () => {
     ctx(["add", "nodes/clients/acme-042/meetings/2026-10-07-kickoff", "--title", "2026-10-07 Kickoff"]);
     const res = ctx(["delete", "nodes/clients/acme-042/overview", "--yes"]);
     expect(res.status).toBe(1);
-    expect(res.stderr).toMatch(/delete the folder instead/);
+    expect(res.stderr).toMatch(/delete the folder/);
     expect(existsSync(join(vault, "nodes", "clients", "acme-042", "overview.md"))).toBe(true);
   });
 
@@ -206,7 +206,7 @@ describe("[regression] structure rules — ctx on a local vault", () => {
 
   it("a bad rule fails writes with CONFIG_ERROR naming the key; reads still work", () => {
     const cfg = join(vault, ".context", "config.yaml");
-    writeFileSync(cfg, `${readFileSync(cfg, "utf-8")}\nfolders:\n  d:\n    file_name: "/(a+)+/"\n`);
+    writeFileSync(cfg, `${readFileSync(cfg, "utf-8")}\nstructure: {enforce: true}\nfolders:\n  d:\n    file_name: "/(a+)+/"\n`);
     const res = ctx(["add", "nodes/x", "--title", "X"]);
     expect(res.status).toBe(1);
     expect(res.stderr).toContain("CONFIG_ERROR");
@@ -261,20 +261,22 @@ describe("[regression] structure rules — ctx structure over a remote nest", ()
     for (const dir of [configDir, cwd, localVault, serverVault]) rmSync(dir, { recursive: true, force: true });
   });
 
-  it("ctx structure --report --json is shape-identical between local and remote", () => {
+  // Byte-identical, order included: describeStructure sorts by code unit, so
+  // a locale- or discovery-order drift between the two would show here.
+  it("ctx structure --report --json is byte-identical between local and remote", () => {
     const local = run(cwd, ["structure", "--report", "--json", "--vault", "local"]);
     expect(local.status, local.stderr).toBe(0);
     const remote = run(cwd, ["structure", "--report", "--json", "--vault", "farnest"]);
     expect(remote.status, remote.stderr).toBe(0);
-    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+    expect(remote.stdout).toBe(local.stdout);
   });
 
-  it("ctx structure --folder --json is shape-identical between local and remote", () => {
+  it("ctx structure --folder --json is byte-identical between local and remote", () => {
     const args = ["structure", "--folder", "clients/acme-042/meetings", "--json"];
     const local = run(cwd, [...args, "--vault", "local"]);
     const remote = run(cwd, [...args, "--vault", "farnest"]);
     expect(remote.status, remote.stderr).toBe(0);
-    expect(normalized(remote.stdout)).toEqual(normalized(local.stdout));
+    expect(remote.stdout).toBe(local.stdout);
   });
 
   it("the remote nest enforces the rules on ctx add", () => {

@@ -17,6 +17,7 @@
  */
 
 import { ConfigError, ContextNestError } from "./errors.js";
+import { headingAnchor, headingAnchors } from "./inline.js";
 import { NODE_TYPES } from "./schemas.js";
 import type { NestConfig } from "./types.js";
 
@@ -113,8 +114,14 @@ export interface StructureView {
 export const MAX_MATCHED_NAME = 128;
 /** Longest owner-written regex accepted. */
 const MAX_REGEX_LENGTH = 200;
-/** Unbounded repetitions (`*`, `+`, `{n,}`) allowed in one regex. */
-const MAX_UNBOUNDED = 3;
+/**
+ * Variable-length repetitions (`*`, `+`, `?`, `{m,}`, `{m,n}` with m < n)
+ * allowed in one format — regex quantifiers and `{slug}`/`{n}` tokens alike.
+ * With no repeated groups, a match tries at most ~n² splits per alternative.
+ */
+const MAX_VARIABLE = 3;
+/** `|` alternatives allowed in one regex (at most 2⁴ branch combinations). */
+const MAX_BARS = 4;
 /** Patterns listed in a "not an allowed folder" message before eliding. */
 const MAX_LISTED = 12;
 
@@ -127,6 +134,8 @@ const TOKENS: Readonly<Record<string, string>> = {
   n: "[0-9]+",
 };
 const TOKEN_LIST = Object.keys(TOKENS).map((t) => `{${t}}`).join(", ");
+/** Tokens whose width varies — two of them may not touch. */
+const VARIABLE_TOKENS = new Set(["slug", "n"]);
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const LABEL = /^\{([a-z][a-z0-9_-]*)\}$/i;
 const SLUG_MATCHER: Matcher = { spelling: "{slug}", re: new RegExp(`^${TOKENS.slug}$`) };
@@ -137,109 +146,122 @@ function tokenMatcher(token: string): Matcher {
 
 // ─── Regex safety ───────────────────────────────────────────────────────────
 
+/** Escapes a regex may use: the class shorthands, and escaped punctuation. */
+function escapeProblem(e: string | undefined): string | null {
+  if (e === undefined) return "ends with a lone backslash";
+  if (/[A-Za-z0-9]/.test(e) && !"dDwWsS".includes(e)) {
+    return `uses the escape \\${e} (allowed: \\d \\w \\s, their negations, and escaped punctuation)`;
+  }
+  return null;
+}
+
 /**
  * Why an owner-written regex is unsafe to run on a shared server, or null.
  *
- * Refuses the constructs that make a backtracking engine blow up: nested
- * repetition (`(a+)+`), alternation inside a repeated group (`(a|aa)*`),
- * backreferences and lookaround, and more than {@link MAX_UNBOUNDED}
- * unbounded repetitions in total (`a*a*a*a*` is polynomial in their count).
- * With inputs capped at {@link MAX_MATCHED_NAME}, what remains is bounded.
+ * A WHITELIST, not a list of known-bad constructs: literals, escapes,
+ * `[classes]`, `.`, `^`/`$`, quantifiers on single atoms, and un-repeated
+ * `( )` / `(?: )` groups with at most {@link MAX_BARS} `|`. No group may be
+ * repeated, so there is no nested repetition to explode; at most
+ * {@link MAX_VARIABLE} variable-length quantifiers keep backtracking
+ * polynomial and small on names capped at {@link MAX_MATCHED_NAME}.
+ * Backreferences, lookaround and named groups are not in the grammar.
  */
 function regexProblem(src: string): string | null {
   if (src.length > MAX_REGEX_LENGTH) return `is longer than ${MAX_REGEX_LENGTH} characters`;
-  if (/\\[1-9]|\\k</.test(src)) return "uses a backreference";
-  if (/\(\?<?[=!]/.test(src)) return "uses lookahead or lookbehind";
-
-  interface Group {
-    repeats: boolean;
-    alternates: boolean;
-  }
-  const stack: Group[] = [{ repeats: false, alternates: false }];
-  let unbounded = 0;
-  // The atom a quantifier would apply to: a closed group, or anything else.
-  let last: Group | "atom" | null = null;
-
-  for (let i = 0; i < src.length; i++) {
+  let variable = 0;
+  let bars = 0;
+  let depth = 0;
+  // What a quantifier here would repeat.
+  let last: "atom" | "group" | null = null;
+  let i = 0;
+  while (i < src.length) {
     const c = src[i];
     if (c === "\\") {
-      i++;
+      const problem = escapeProblem(src[i + 1]);
+      if (problem) return problem;
+      i += 2;
       last = "atom";
       continue;
     }
     if (c === "[") {
-      i++;
-      if (src[i] === "^") i++;
-      if (src[i] === "]") i++;
-      while (i < src.length && src[i] !== "]") {
-        if (src[i] === "\\") i++;
-        i++;
+      // As JavaScript reads it: the first `]` closes the class, even straight
+      // after `[` or `[^` — so `[]` and `[^]` are whole classes.
+      let j = i + 1;
+      if (src[j] === "^") j++;
+      while (j < src.length && src[j] !== "]") {
+        if (src[j] === "\\") {
+          const problem = escapeProblem(src[j + 1]);
+          if (problem) return problem;
+          j += 2;
+          continue;
+        }
+        j++;
       }
+      if (j >= src.length) return "has an unclosed [ character class";
+      i = j + 1;
       last = "atom";
       continue;
     }
     if (c === "(") {
-      stack.push({ repeats: false, alternates: false });
       if (src[i + 1] === "?") {
-        if (src[i + 2] === ":") i += 2;
-        else if (src[i + 2] === "<") {
-          const end = src.indexOf(">", i);
-          i = end === -1 ? src.length : end;
-        }
+        if (src[i + 2] !== ":") return "uses a group other than ( ) or (?: ) (no lookaround or named groups)";
+        i += 3;
+      } else {
+        i += 1;
       }
+      depth++;
       last = null;
       continue;
     }
     if (c === ")") {
-      if (stack.length < 2) return "has an unbalanced parenthesis";
-      const group = stack.pop()!;
-      const parent = stack[stack.length - 1];
-      parent.repeats ||= group.repeats;
-      parent.alternates ||= group.alternates;
-      last = group;
+      if (depth === 0) return "has an unbalanced parenthesis";
+      depth--;
+      i++;
+      last = "group";
       continue;
     }
     if (c === "|") {
-      stack[stack.length - 1].alternates = true;
+      if (++bars > MAX_BARS) return `has more than ${MAX_BARS} | alternatives`;
+      i++;
+      last = null;
+      continue;
+    }
+    if (c === "^" || c === "$") {
+      i++;
       last = null;
       continue;
     }
     const q = quantifierAt(src, i);
     if (q) {
-      if (q.repeating) {
-        if (last && last !== "atom" && (last.repeats || last.alternates)) {
-          return "repeats a group that itself repeats or alternates (exponential backtracking)";
-        }
-        stack[stack.length - 1].repeats = true;
+      if (last === null) return "has a quantifier with nothing to repeat";
+      if (last === "group") {
+        return "repeats a group — repeat a single character or [class] instead, or use a token pattern";
       }
-      if (q.unbounded && ++unbounded > MAX_UNBOUNDED) {
-        return `has more than ${MAX_UNBOUNDED} unbounded repetitions (*, +, {n,})`;
+      if (q.variable && ++variable > MAX_VARIABLE) {
+        return `has more than ${MAX_VARIABLE} variable-length repetitions (*, +, ?, {m,n})`;
       }
-      i += q.length - 1;
-      if (src[i + 1] === "?") i++; // lazy suffix
+      i += q.length;
+      if (src[i] === "?") i++; // lazy suffix
       last = null;
       continue;
     }
+    i++;
     last = "atom";
   }
+  if (depth !== 0) return "has an unbalanced parenthesis";
   return null;
 }
 
 /** A quantifier starting at `i`, or null if `src[i]` is not one. */
-function quantifierAt(
-  src: string,
-  i: number,
-): { length: number; repeating: boolean; unbounded: boolean } | null {
+function quantifierAt(src: string, i: number): { length: number; variable: boolean } | null {
   const c = src[i];
-  if (c === "*" || c === "+") return { length: 1, repeating: true, unbounded: true };
-  if (c === "?") return { length: 1, repeating: false, unbounded: false };
+  if (c === "*" || c === "+" || c === "?") return { length: 1, variable: true };
   if (c !== "{") return null;
   const m = /^\{(\d+)(,(\d*))?\}/.exec(src.slice(i, i + 24));
   if (!m) return null;
   const min = Number(m[1]);
-  const open = m[2] !== undefined && m[3] === "";
-  const max = m[2] === undefined ? min : open ? Infinity : Number(m[3]);
-  return { length: m[0].length, repeating: max > 1, unbounded: open };
+  const max = m[2] === undefined ? min : m[3] === "" ? Infinity : Number(m[3]);
+  return { length: m[0].length, variable: max !== min };
 }
 
 // ─── Compiling ──────────────────────────────────────────────────────────────
@@ -262,6 +284,8 @@ function compileFormat(spelling: string, key: string): Matcher {
   if (!spelling) throw new ConfigError(`${key}: the format is empty`);
   let source = "";
   let slugs = 0;
+  let variable = 0;
+  let previous: string | null = null; // the token just before, if nothing separates them
   for (const part of spelling.split(/(\{[^}]*\})/)) {
     if (!part) continue;
     const token = /^\{(.*)\}$/.exec(part)?.[1];
@@ -272,8 +296,20 @@ function compileFormat(spelling: string, key: string): Matcher {
       if (token === "slug" && ++slugs > 1) {
         throw new ConfigError(`${key}: a name format may contain at most one {slug}`);
       }
+      if (VARIABLE_TOKENS.has(token)) {
+        if (previous && VARIABLE_TOKENS.has(previous)) {
+          throw new ConfigError(
+            `${key}: {${previous}}{${token}} — two variable-width tokens need a literal between them (e.g. "-")`,
+          );
+        }
+        if (++variable > MAX_VARIABLE) {
+          throw new ConfigError(`${key}: at most ${MAX_VARIABLE} {slug}/{n} tokens per format`);
+        }
+      }
+      previous = token;
       source += TOKENS[token];
     } else {
+      previous = null;
       if (!/^[a-z0-9-]+$/.test(part)) {
         throw new ConfigError(
           `${key}: "${part}" can never match — names are lowercase a-z, 0-9 and "-" (titles are slugified)`,
@@ -331,11 +367,14 @@ export function compileStructure(config: StructureConfig | null | undefined): Co
       const label = LABEL.exec(part)?.[1];
       if (label) {
         segments.push({ label, matcher: label in TOKENS ? tokenMatcher(label) : SLUG_MATCHER });
-      } else if (SLUG.test(part)) {
+      } else if (part && !part.startsWith(".") && !/[{}]/.test(part)) {
+        // Any folder name, not just a slug: engine-written folders are always
+        // slugs, but a vault's own (`Engineering`, `my notes`) are matched
+        // literally, as the spec's `folders` keys always were.
         segments.push({ literal: part });
       } else {
         throw new ConfigError(
-          `${key}: "${part || "(empty)"}" in "${rawKey}" is neither a lowercase folder name (a-z, 0-9, "-") nor a {placeholder}`,
+          `${key}: "${part || "(empty)"}" in "${rawKey}" is not a folder name or a {placeholder}`,
         );
       }
     }
@@ -395,12 +434,9 @@ function compileRule(
     trailing.matcher = rule.folderName;
   }
   if (spec.file_name !== undefined) rule.fileName = compileFormat(spec.file_name, `${key}.file_name`);
-  if (spec.template !== undefined) {
-    if (!templates[spec.template]) {
-      throw new ConfigError(`${key}.template: no template "${spec.template}" in templates`);
-    }
-    rule.template = spec.template;
-  }
+  // A template that names nothing under `templates` is a label (the spec's
+  // `template: adr` predates structure rules): no body, no required sections.
+  if (spec.template !== undefined) rule.template = spec.template;
   if (spec.required) {
     if (!trailing || isPlaceholder(trailing)) {
       throw new ConfigError(
@@ -414,13 +450,12 @@ function compileRule(
     if (!SLUG.test(leaf)) {
       throw new ConfigError(`${fileKey}: "${leaf}" is not a file name (lowercase a-z, 0-9, "-")`);
     }
-    if (file?.template !== undefined && !templates[file.template]) {
-      throw new ConfigError(`${fileKey}.template: no template "${file.template}" in templates`);
-    }
     if (file?.type !== undefined) {
       assertType(file.type, `${fileKey}.type`);
-      if (file.type === "pdf") {
-        throw new ConfigError(`${fileKey}.type: a required file cannot be a PDF — a PDF needs its binary`);
+      if (UNSCAFFOLDABLE_TYPES.has(file.type)) {
+        throw new ConfigError(
+          `${fileKey}.type: a required file cannot be a "${file.type}" — it needs data a template cannot supply (a PDF binary, a source or skill block)`,
+        );
       }
     }
     rule.files[leaf] = {
@@ -433,32 +468,42 @@ function compileRule(
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
-/** Top-level folders that hold system files, never knowledge nodes. */
+/**
+ * Vault-ROOT folders that hold system files, never knowledge nodes. Only the
+ * root ones: `nodes/packs/` is an ordinary folder like any other, or closed
+ * rules would have a door anyone could walk through.
+ */
 const SYSTEM_ROOTS = new Set(["packs", "_suggestions"]);
+
+/** Types a scaffolded required file cannot be: each needs data beyond a body. */
+const UNSCAFFOLDABLE_TYPES = new Set(["pdf", "source", "skill"]);
+
+const rawSegments = (path: string) =>
+  path
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((s) => s && s !== ".");
 
 /** Folder segments of a path, `nodes/` dropped; null when it is exempt. */
 function folderSegments(folder: string): string[] | null {
-  const segs = folder.replace(/\\/g, "/").split("/").filter((s) => s && s !== ".");
-  if (segs[0] === "nodes") segs.shift();
-  if (segs.some((s) => s.startsWith("."))) return null;
-  if (segs.length > 0 && (SYSTEM_ROOTS.has(segs[0]) || segs[0] === "sources")) return null;
-  return segs;
+  const raw = rawSegments(folder);
+  if (raw.length > 0 && (SYSTEM_ROOTS.has(raw[0]) || raw[0] === "sources")) return null;
+  return raw[0] === "nodes" ? raw.slice(1) : raw;
 }
 
-/** A document id split into folder segments and leaf; null when exempt. */
-function docPath(id: string): { folder: string[]; leaf: string } | null {
-  const segs = id
-    .replace(/\\/g, "/")
-    .replace(/\.md$/i, "")
-    .split("/")
-    .filter((s) => s && s !== ".");
-  if (segs[0] === "nodes") segs.shift();
+/**
+ * A document id split into folder segments and leaf; null when exempt. An id
+ * is taken as it is — never extension-stripped — because storage writes
+ * `<id>.md`, so `adr-1-x.md` is a file named `adr-1-x.md.md`.
+ */
+function docPath(id: string): { folder: string[]; leaf: string; sourcesRoot: boolean } | null {
+  const raw = rawSegments(id);
+  if (raw.length === 0 || SYSTEM_ROOTS.has(raw[0])) return null;
+  if (raw.length === 1 && raw[0] === "CONTEXT") return null; // the vault's CONTEXT.md
+  const segs = raw[0] === "nodes" ? raw.slice(1) : raw;
   const leaf = segs.pop();
   if (!leaf) return null;
-  if (leaf.startsWith(".") || segs.some((s) => s.startsWith("."))) return null;
-  if (segs.length > 0 && SYSTEM_ROOTS.has(segs[0])) return null;
-  if (leaf === "INDEX" || (segs.length === 0 && leaf.toLowerCase() === "context")) return null;
-  return { folder: segs, leaf };
+  return { folder: segs, leaf, sourcesRoot: raw[0] === "sources" };
 }
 
 const display = (segs: string[]) => segs.join("/");
@@ -504,6 +549,9 @@ function shapesPrefix(rule: CompiledRule, folder: string[], n = folder.length): 
   return true;
 }
 
+/** Code-unit order — never the host locale, so every machine sorts alike. */
+const byCodeUnit = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
 /** At the first differing segment a literal beats a placeholder. */
 function moreSpecific(a: CompiledRule, b: CompiledRule): number {
   const n = Math.min(a.segments.length, b.segments.length);
@@ -512,7 +560,7 @@ function moreSpecific(a: CompiledRule, b: CompiledRule): number {
     const lb = !isPlaceholder(b.segments[i]);
     if (la !== lb) return la ? -1 : 1;
   }
-  return a.pattern.localeCompare(b.pattern);
+  return byCodeUnit(a.pattern, b.pattern);
 }
 
 /** The rule declared for exactly this folder, most specific first. */
@@ -522,7 +570,7 @@ function ruleAt(rules: CompiledStructure, folder: string[]): CompiledRule | null
 }
 
 function allowedList(rules: CompiledStructure): string {
-  const patterns = rules.rules.map((r) => shown(r.pattern)).sort();
+  const patterns = rules.rules.map((r) => shown(r.pattern)).sort(byCodeUnit);
   const listed = patterns.slice(0, MAX_LISTED).join(", ");
   return patterns.length > MAX_LISTED ? `${listed}, … (${patterns.length} in all)` : listed;
 }
@@ -568,35 +616,6 @@ function folderViolations(rules: CompiledStructure, folder: string[]): Violation
 
 // ─── Sections ───────────────────────────────────────────────────────────────
 
-const normHeading = (s: string) => s.toLowerCase().split(/\s+/).filter(Boolean).join(" ");
-
-/** The ATX headings of a markdown body, normalized; fenced code is skipped. */
-function headings(body: string): Set<string> {
-  const out = new Set<string>();
-  let fence: string | null = null;
-  for (const raw of body.split(/\r?\n/)) {
-    const line = raw.trimStart();
-    const marker = /^(`{3,}|~{3,})/.exec(line)?.[1];
-    if (marker) {
-      if (!fence) fence = marker[0];
-      else if (marker[0] === fence) fence = null;
-      continue;
-    }
-    if (fence) continue;
-    let i = 0;
-    while (i < line.length && line[i] === "#") i++;
-    if (i === 0 || i > 6 || (i < line.length && line[i] !== " " && line[i] !== "\t")) continue;
-    let text = line.slice(i).trim();
-    let j = text.length;
-    while (j > 0 && text[j - 1] === "#") j--;
-    if (j < text.length && (j === 0 || text[j - 1] === " " || text[j - 1] === "\t")) {
-      text = text.slice(0, j).trim();
-    }
-    out.add(normHeading(text));
-  }
-  return out;
-}
-
 /** The template governing a document's sections: its required-file entry's, else its folder's. */
 function governingTemplate(rule: CompiledRule, leaf: string): string | undefined {
   return Object.hasOwn(rule.files, leaf) ? rule.files[leaf].template : rule.template;
@@ -614,7 +633,7 @@ export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Viol
   const p = docPath(doc.id);
   if (!p) return [];
   const type = doc.type ?? "document";
-  if (p.folder[0] === "sources" && type === "source") return [];
+  if (p.sourcesRoot && type === "source") return [];
   const path = display([...p.folder, p.leaf]);
 
   const chain = folderViolations(rules, p.folder);
@@ -638,6 +657,15 @@ export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Viol
   const out: Violation[] = [];
   const isRequiredFile = Object.hasOwn(rule.files, p.leaf);
   const where = p.folder.length ? `"${display(p.folder)}/"` : "the top level";
+  const declared = isRequiredFile ? rule.files[p.leaf].type : undefined;
+  if (declared && type !== declared) {
+    out.push({
+      code: "TYPE_NOT_ALLOWED",
+      path,
+      rule: shown(rule.pattern),
+      message: `"${p.leaf}" in ${where} is a required ${declared}, not a "${type}" (rule ${shown(rule.pattern)}).`,
+    });
+  }
   if (rule.types && !isRequiredFile && !rule.types.includes(type)) {
     out.push({
       code: "TYPE_NOT_ALLOWED",
@@ -668,10 +696,10 @@ export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Viol
       });
     }
   }
-  const have = headings(doc.body ?? "");
+  const have = headingAnchors(doc.body ?? "");
   const template = governingTemplate(rule, p.leaf);
   for (const section of requiredSections(rules, rule, p.leaf)) {
-    if (!have.has(normHeading(section))) {
+    if (!have.has(headingAnchor(section))) {
       out.push({
         code: "MISSING_SECTION",
         path,
@@ -708,11 +736,11 @@ export function checkUpdate(
   }
   const rule = ruleAt(rules, p.folder);
   if (rule) {
-    const was = headings(before.body ?? "");
-    const now = headings(after.body ?? "");
+    const was = headingAnchors(before.body ?? "");
+    const now = headingAnchors(after.body ?? "");
     const path = display([...p.folder, p.leaf]);
     for (const section of requiredSections(rules, rule, p.leaf)) {
-      const key = normHeading(section);
+      const key = headingAnchor(section);
       if (was.has(key) && !now.has(key)) {
         out.push({
           code: "MISSING_SECTION",
@@ -733,10 +761,14 @@ export function checkFolder(rules: CompiledStructure, folder: string): Violation
   return folderViolations(rules, segs);
 }
 
-/** A required file cannot be deleted on its own. */
-export function checkDeleteDocument(rules: CompiledStructure, id: string): Violation[] {
+/**
+ * A required file goes with its folder: it cannot be deleted while the folder
+ * (subfolders included) still holds `others` documents. Once it is the last
+ * one it may go, so a folder can be emptied without a folder-delete operation.
+ */
+export function checkDeleteDocument(rules: CompiledStructure, id: string, others = 1): Violation[] {
   const p = docPath(id);
-  if (!p) return [];
+  if (!p || others === 0) return [];
   const rule = ruleAt(rules, p.folder);
   if (!rule || !Object.hasOwn(rule.files, p.leaf)) return [];
   return [
@@ -744,7 +776,7 @@ export function checkDeleteDocument(rules: CompiledStructure, id: string): Viola
       code: "MISSING_FILE",
       path: display([...p.folder, p.leaf]),
       rule: shown(rule.pattern),
-      message: `"${p.leaf}" is required in "${display(p.folder)}/" (rule ${shown(rule.pattern)}) — delete the folder instead.`,
+      message: `"${p.leaf}" is required in "${display(p.folder)}/" (rule ${shown(rule.pattern)}) — delete the folder, or its other documents first.`,
     },
   ];
 }
@@ -882,7 +914,13 @@ export function auditStructure(
       }
     }
   }
-  return out;
+  const seen = new Set<string>();
+  return out.filter((v) => {
+    const key = `${v.code}\u0000${v.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function viewOf(rule: CompiledRule): FolderRuleView {
@@ -916,7 +954,7 @@ export function describeStructure(rules: CompiledStructure): StructureView {
   return {
     enforce: rules.enforce,
     closed: rules.closed,
-    folders: rules.rules.map(viewOf).sort((a, b) => a.pattern.localeCompare(b.pattern)),
+    folders: rules.rules.map(viewOf).sort((a, b) => byCodeUnit(a.pattern, b.pattern)),
     templates: structuredClone(rules.templates),
   };
 }

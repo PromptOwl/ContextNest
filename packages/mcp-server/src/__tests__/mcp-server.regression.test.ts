@@ -1550,6 +1550,33 @@ describe("[regression] MCP server e2e — structure rules", () => {
     expect(raw).toContain("Postgres.");
   });
 
+  it("the deprecated delete_document cannot delete a required file on its own", async () => {
+    await setStructure(new NestStorage(vault), {
+      structure: { enforce: true, closed: true },
+      folders: {
+        "/": {},
+        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr", files: { index: {} } },
+      },
+      templates: { adr: { body: "## Context\n## Decision\n", required_sections: ["Decision"] } },
+    });
+    await callJson(client, "context_create", { id: "nodes/decisions/index", title: "Index", content: "## Decision\nx\n" });
+    const { text, isError } = await callText(client, "delete_document", { path: "nodes/decisions/index" });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/delete the folder/);
+    await access(join(vault, "nodes", "decisions", "index.md"));
+  });
+
+  it("the deprecated create_document scaffolds a new folder like context_create", async () => {
+    await setStructure(new NestStorage(vault), {
+      structure: { enforce: true, closed: true },
+      folders: { "/": {}, "teams/{team}": { files: { charter: { template: "c" } } } },
+      templates: { c: { body: "## Mission\n" } },
+    });
+    const { isError } = await callText(client, "create_document", { path: "nodes/teams/platform/roadmap", title: "Roadmap" });
+    expect(isError).toBe(false);
+    expect(await readFile(join(vault, "nodes", "teams", "platform", "charter.md"), "utf-8")).toContain("## Mission");
+  });
+
   it("context_import cannot rewrite .context/config.yaml", async () => {
     const before = await readFile(join(vault, ".context", "config.yaml"), "utf-8");
     const { json } = await callJson(client, "context_import", {

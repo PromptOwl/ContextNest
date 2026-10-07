@@ -529,20 +529,13 @@ templates:
     body: "## Summary\n## Contacts\n"
 ```
 
-- Every write surface enforces them: `ctx add/update/delete/import`, every MCP
-  write tool (the deprecated ones too), and `context_import_pdf`. A refusal
-  names the rule and the expected format.
-- Existing content is grandfathered: an edit is refused only for what it newly
-  breaks (a re-type into a refused type, a dropped required heading).
-- Creating a folder creates its required subfolders and files (drafts from
-  their templates). `ctx add` without `--body` starts from the folder's template.
-- File names come from titles (lowercased, words joined by `-`), so a rule like
-  `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
-- A regex is anchored and refused if it could backtrack badly (nested or
-  alternating repetition, lookaround, backreferences, more than 3 unbounded
-  repetitions, over 200 characters).
-- `context_import` never writes `.context/` — an import cannot rewrite the
-  rules or the review gate.
+- With `enforce: true`, every write surface refuses what breaks a rule: `ctx add/update/delete/import/pull`, every MCP write tool (the deprecated ones too), `context_import_pdf`, and approving a held edit or drift suggestion. A refusal names the rule and the expected format. Report-only rules (`enforce: false`) write and refuse nothing.
+- Existing content is grandfathered: an edit is refused only for what it newly breaks (a re-type into a refused type, a dropped required heading).
+- An enforced write that creates a folder also creates its required subfolders and files (drafts from their templates). A required file can be deleted only as the last document in its folder. `ctx add` without `--body` starts from the folder's template.
+- File names come from titles (lowercased, words joined by `-`), so a rule like `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
+- A `/regex/` must stay inside a small grammar that cannot backtrack badly: single-atom quantifiers (at most 3 variable-width), un-repeated groups with at most 4 `|`, no lookaround or backreferences, at most 200 characters.
+- Existing `folders:` blocks keep working: a `template` naming no entry under `templates` is a label, and folder names are matched literally.
+- No write puts a document under `.context/`, and `context_import` never writes there — an import cannot rewrite the rules or the review gate.
 
 | Command | Effect |
 |---|---|

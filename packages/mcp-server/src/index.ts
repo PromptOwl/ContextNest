@@ -46,10 +46,13 @@ import {
   approveReview,
   rejectReview,
   reviewHeldMessage,
-  compileStructure,
+  enforcedStructure,
   enforceStructure,
   checkDocument,
   checkUpdate,
+  checkDeleteDocument,
+  missingFolders,
+  scaffoldFolders,
   currentReviewProposal,
   stageReviewHold,
   NODE_TYPES,
@@ -927,11 +930,13 @@ const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
  * would be a way around every rule. Returns the error result, or null to go on.
  */
 async function structureRefusal(
-  check: (rules: ReturnType<typeof compileStructure>) => ReturnType<typeof checkDocument>,
+  check: (
+    rules: NonNullable<Awaited<ReturnType<typeof enforcedStructure>>>,
+  ) => ReturnType<typeof checkDocument> | Promise<ReturnType<typeof checkDocument>>,
 ) {
   try {
-    const rules = compileStructure(await storage.readConfig());
-    enforceStructure(rules, check(rules));
+    const rules = await enforcedStructure(storage);
+    if (rules) enforceStructure(rules, await check(rules));
     return null;
   } catch (err) {
     return toolError(err);
@@ -1095,6 +1100,10 @@ tool(
       }
 
       const content = serializeDocument(node);
+      // Folders this write creates get their required contents, as with
+      // context_create (a held create above is scaffolded by no one).
+      const rules = await enforcedStructure(storage);
+      const created = rules ? await missingFolders(storage, id) : null;
       await storage.writeDocument(id, content);
 
       // Auto-publish: bump version, create version entry & checkpoint.
@@ -1119,6 +1128,7 @@ tool(
       }
 
       await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
+      if (rules && created) await scaffoldFolders(storage, rules, created);
 
       return {
         content: [
@@ -1432,6 +1442,17 @@ tool(
   async ({ path }) =>
     lockedHandler(async () => {
       const id = normalizeDocumentId(path);
+
+      // A required file goes last, as with context_delete (§11.1.1).
+      const refused = await structureRefusal(async (rules) => {
+        if (checkDeleteDocument(rules, id).length === 0) return [];
+        const folder = id.split("/").slice(0, -1).join("/");
+        const others = (await storage.discoverDocuments({ folder, includeRetired: true })).filter(
+          (d) => d.id !== id,
+        ).length;
+        return checkDeleteDocument(rules, id, others);
+      });
+      if (refused) return refused;
 
       // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
       // id, and appends an audit-only record (§6.3.4). Additive: the path

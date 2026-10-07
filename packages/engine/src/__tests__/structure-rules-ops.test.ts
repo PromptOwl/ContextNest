@@ -13,7 +13,14 @@ import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { serializeDocument } from "../parser.js";
-import { setStructure, type StructureConfig } from "../index.js";
+import {
+  setStructure,
+  approveReview,
+  approveSuggestion,
+  stageSuggestion,
+  type RbacHook,
+  type StructureConfig,
+} from "../index.js";
 import { createEngineApi, getOperation, listOperations, type OperationContext } from "../api/index.js";
 import { textPdf, toBase64 } from "./fixtures/pdf-fixtures.js";
 
@@ -179,6 +186,25 @@ describe("context_create under enforced rules", () => {
     expect(overview.body).toContain("Edited.");
   });
 
+  it("a held-for-review create is not scaffolded — nothing beyond the held write lands before approval", async () => {
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(false);
+  });
+
+  it.each([
+    [{ title: "Evil", content: "x", folder: "packs" }],
+    [{ title: "Evil", content: "x", folder: "_suggestions" }],
+    [{ id: "nodes/context", title: "Evil", content: "x" }],
+    [{ id: "nodes/forbidden/INDEX", title: "Evil", content: "x" }],
+  ])("look-alikes of system paths are not a way around closed rules: %j", async (input) => {
+    const err = await refusal("context_create", input);
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+
   it("a trusted host's skip flag bypasses the rules", async () => {
     const res = await api.run<{ id: string }>(
       "context_create",
@@ -195,6 +221,23 @@ describe("context_create under enforced rules", () => {
   });
 });
 
+describe(".context/ is never a document path", () => {
+  it.each([".context/evil", ".CONTEXT/evil", "nodes/.context/evil", ".context./evil"])(
+    "context_create refuses id %s even with no rules",
+    async (id) => {
+      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+      expect(err.code).toBe("VALIDATION_FAILED");
+      expect(err.message).toMatch(/\.context/);
+    },
+  );
+
+  it("context_import_pdf refuses it too (documents[] takes no id, and its folder is slugified)", async () => {
+    const err = await refusal("context_import_pdf", { bytes_base64: toBase64(textPdf()), id: ".context/evil" });
+    expect(err.message).toMatch(/\.context/);
+    expect(await exists(".context/evil.md")).toBe(false);
+  });
+});
+
 describe("report-only and absent rules", () => {
   it("enforce: false lets every write through", async () => {
     await writeConfig({ ...RULES, structure: { enforce: false, closed: true } });
@@ -207,10 +250,26 @@ describe("report-only and absent rules", () => {
     expect(res.id).toBe("nodes/notes/idea");
   });
 
-  it("templates still scaffold required files in report-only mode", async () => {
+  it("report-only mode writes nothing beyond the document — no scaffolding", async () => {
     await writeConfig({ ...RULES, structure: { enforce: false } });
     await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
-    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(false);
+    expect(await exists("nodes/clients/acme-042/contracts")).toBe(false);
+  });
+
+  it("the spec's own §11.1 config (template label, legacy keys, no structure) keeps every write working", async () => {
+    await writeConfig({ folders: { decisions: { template: "adr" }, Engineering: { description: "x" }, _drafts: {} } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+    const out = await api.run<any>("context_structure", { folder: "decisions" }, ctx);
+    expect(out.error).toBeUndefined();
+    expect(out.resolved).toMatchObject({ template: "adr" });
+  });
+
+  it("a bad rule in report-only mode refuses nothing", async () => {
+    await writeConfig({ folders: { d: { file_name: "/(a+)+/" } } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x" }, ctx);
+    expect(res.id).toBe("nodes/idea");
   });
 
   it("a bad rule refuses writes with CONFIG_ERROR but reads keep working", async () => {
@@ -269,8 +328,14 @@ describe("context_delete", () => {
 
   it("refuses to delete a required file on its own", async () => {
     const err = await refusal("context_delete", { id: "nodes/clients/acme-042/overview" });
-    expect(err.message).toMatch(/delete the folder instead/);
+    expect(err.message).toMatch(/delete the folder/);
     expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it("the required file goes last: once the folder holds nothing else it can be deleted", async () => {
+    await api.run("context_delete", { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" }, ctx);
+    const res = await api.run<{ deleted: boolean }>("context_delete", { id: "nodes/clients/acme-042/overview" }, ctx);
+    expect(res.deleted).toBe(true);
   });
 
   it("deletes an ordinary document", async () => {
@@ -323,6 +388,42 @@ describe("context_import", () => {
     expect(await exists("nodes/decisions/adr-2-x.md")).toBe(true);
   });
 
+  it("files[]: a refused document takes its history and its folder's other files with it", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/notes/stray.md", content: "---\ntitle: Stray\n---\nx\n" },
+          { path: "nodes/notes/.versions/stray/history.yaml", content: "document_id: x\nversions: []\n" },
+          { path: "nodes/notes/diagram.png", content: "png" },
+          { path: "assets/logo.png", content: "png" },
+        ],
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id).sort()).toEqual([
+      "nodes/notes/.versions/stray/history.yaml",
+      "nodes/notes/diagram.png",
+      "nodes/notes/stray.md",
+    ]);
+    expect(await exists("nodes/notes")).toBe(false);
+    // A structured vault's root-level folders are not content: not judged.
+    expect(await exists("assets/logo.png")).toBe(true);
+  });
+
+  it("files[] with overwrite re-imports a grandfathered document (judged as an update)", async () => {
+    await writeConfig({});
+    await api.run("context_create", { title: "Old note", content: "legacy", folder: "notes" }, ctx);
+    await writeConfig(RULES);
+    const raw = await readFile(join(dir, "nodes", "notes", "old-note.md"), "utf-8");
+    const res = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/old-note.md", content: raw.replace("legacy", "relinked") }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed).toEqual([]);
+  });
+
   it("files[]: .context/ cannot be written — rules and the review gate stay the owner's", async () => {
     const before = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
     const res = await api.run<{ failed: { id?: string; error: string }[] }>(
@@ -365,6 +466,57 @@ describe("context_import", () => {
     );
     expect(res.failed).toEqual([]);
     expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toMatch(/restored/);
+  });
+});
+
+// ─── Approvals re-check the rules ───────────────────────────────────────────
+
+describe("approvals are judged against the rules in force", () => {
+  const MEETING_RULES: StructureConfig = {
+    structure: { enforce: true },
+    folders: { meetings: { types: ["document"], template: "m" } },
+    templates: { m: { body: "## Decisions\n", required_sections: ["Decisions"] } },
+  };
+  const ALLOW: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+
+  it("approveReview refuses a held edit that drops a required heading", async () => {
+    const id = "nodes/meetings/kickoff";
+    await api.run("context_create", { title: "Kickoff", content: "## Decisions\nShip.\n", folder: "meetings" }, ctx);
+    const held = await api.run<{ held_for_review?: boolean }>(
+      "context_update",
+      { id, content: "## Notes\nnone\n", review: true },
+      ctx,
+    );
+    expect(held.held_for_review).toBe(true);
+    await writeConfig(MEETING_RULES);
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/Decisions/);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).toContain("Ship.");
+  });
+
+  it("approveSuggestion refuses a drift edit that re-types the node into a refused type", async () => {
+    const id = "nodes/meetings/kickoff";
+    await api.run("context_create", { title: "Kickoff", content: "## Decisions\nShip.\n", folder: "meetings" }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    const staged = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: raw,
+      proposedRawContent: raw.replace("type: document", "type: glossary"),
+      source: "out-of-band-edit",
+      actor: "user",
+      docTier: "standard",
+    });
+    await writeConfig(MEETING_RULES);
+    await expect(
+      approveSuggestion({
+        storage,
+        rbac: ALLOW,
+        documentId: id,
+        suggestionId: staged.meta.suggestion_id,
+        actor: "owner",
+        zone: "default",
+      }),
+    ).rejects.toThrow(/glossary/);
   });
 });
 
@@ -430,11 +582,19 @@ describe("context_structure", () => {
     expect(out.violations).toBeUndefined();
   });
 
-  it("a bad rule is reported as CONFIG_ERROR naming the key", async () => {
-    await writeConfig({ folders: { d: { types: ["memo"] } } });
-    const err = await refusal("context_structure", {});
-    expect(err.code).toBe("CONFIG_ERROR");
-    expect(err.message).toMatch(/memo/);
+  it("a bad rule is reported in the output, not thrown — reading the rules is a read", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { d: { types: ["memo"] } } });
+    const out = await api.run<any>("context_structure", { report: true }, ctx);
+    expect(out.error).toMatch(/memo/);
+    expect(out.folders).toEqual([]);
+  });
+
+  it("the report judges only content folders: a structured vault's root-level folders are not nodes", async () => {
+    await writeConfig(RULES);
+    await writeFile(join(dir, "README-assets.txt"), "x");
+    await api.run("context_import", { files: [{ path: "assets/diagram.png", content: "x" }] }, ctx);
+    const out = await api.run<any>("context_structure", { report: true }, ctx);
+    expect(out.violations.filter((v: any) => v.path.startsWith("assets"))).toEqual([]);
   });
 });
 
@@ -497,6 +657,32 @@ describe("setStructure", () => {
     await setStructure(storage, RULES);
     const raw = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
     expect(raw.replace(/\r\n/g, "")).not.toContain("\n");
+  });
+
+  it("a column-0 comment inside a rule block does not split it", async () => {
+    const cfg = "version: 1\nname: t\ndefaults:\n  status: draft\nfolders:\n  a: {}\n# a note\n  b:\n    types: [glossary]\nreview: 'on'\n";
+    await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
+    await setStructure(storage, RULES);
+    const parsed = yaml.load(await readFile(join(dir, ".context", "config.yaml"), "utf-8")) as any;
+    expect(parsed.defaults).toEqual({ status: "draft" });
+    expect(parsed.review).toBe("on");
+    expect(Object.keys(parsed.folders)).not.toContain("b");
+  });
+
+  it("keeps a BOM and each line's own ending in a mixed-EOL file", async () => {
+    const cfg = "\uFEFFversion: 1\r\nname: t\n# keep\r\nfolders:\n  a: {}\n";
+    await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
+    await setStructure(storage, RULES);
+    const raw = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
+    expect(raw.startsWith("\uFEFFversion: 1\r\nname: t\n# keep\r\n")).toBe(true);
+    expect((await storage.readConfig())?.structure?.enforce).toBe(true);
+  });
+
+  it("refuses with CONFIG_ERROR, writing nothing, when it cannot rewrite safely", async () => {
+    const cfg = "version: 1\nname: t\n...\n";
+    await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
+    await expect(setStructure(storage, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toBe(cfg);
   });
 
   it("refuses a directory that is not a vault", async () => {
