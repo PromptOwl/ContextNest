@@ -99,6 +99,7 @@ import {
   assertStructureDelete,
   enforcedStructure,
   missingFolders,
+  scaffoldApprovedCreate,
   scaffoldFolders,
 } from "../structure-store.js";
 import { NON_DOCUMENT_BASENAMES } from "../storage.js";
@@ -565,8 +566,8 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // a path a forget retired, or a body matching erased
   // content, never takes content again (§6.3.4).
   await assertNotForgotten(ctx.storage, node);
-  // A held create is scaffolded by no one: nothing beyond the held write lands
-  // before a human approves it; the compliance report names what is missing.
+  // A held create is not scaffolded now — nothing beyond the held write lands
+  // before a human approves it; its first publish scaffolds (see `publish`).
   const created = rules && !hold ? await missingFolders(ctx.storage, node.id) : null;
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
@@ -772,6 +773,25 @@ const update: OperationExecutor = async (ctx, input: any) => {
 
 const publish: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
+  // Every approval surface ends in a publish (Community's review approve
+  // included), so the rules in force judge it here (§11.1.1): a first publish
+  // in full, a later one for what the live file newly breaks against the
+  // last sealed version (an out-of-band edit, say).
+  const rules = await structureRules(ctx);
+  let firstPublish = false;
+  if (rules) {
+    const live = await ctx.storage.readDocument(id);
+    const history = await ctx.storage.readHistory(id);
+    const head = history?.versions.at(-1);
+    if (history && head) {
+      const raw = await ctx.versions.reconstructVersion(id, head.version, history);
+      const sealed = parseDocument(`${id}.md`, raw, id);
+      enforceStructure(rules, checkUpdate(rules, structureDoc(sealed), structureDoc(live)));
+    } else {
+      firstPublish = true;
+      enforceStructure(rules, checkDocument(rules, structureDoc(live)));
+    }
+  }
   // publishDocument guards rejected docs and seals a checkpoint; regenerate the
   // index so graph-mode reads see the freshly-published node (same as create/update).
   const result = await publishDocument(ctx.storage, id, {
@@ -780,6 +800,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
     ...(input.client ? { client: input.client } : {}),
   });
   await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
+  if (rules && firstPublish) await scaffoldApprovedCreate(ctx.storage, rules, id);
   return {
     id,
     version: result.versionEntry.version,
@@ -1336,8 +1357,10 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         if (refusal) throw new ForgottenDocumentError(f.raw, `refused: ${refusal}`);
         const verdict = refused.get(f.raw);
         if (verdict) throw new ContextNestError(verdict, "VALIDATION_FAILED");
-        const doc = rules ? importedDoc(f.path, f.content) : null;
-        if (doc) await noteFolders(doc.id);
+        const doc = importedDoc(f.path, f.content);
+        // Reserved paths (root packs/ …) hold no documents, rules or not.
+        if (doc && ctx.structure !== "skip") assertWritableDocumentId(doc.id);
+        if (doc && rules) await noteFolders(doc.id);
         // Into the file's OWN warning list: `mapInBatches` finishes in
         // whatever order the writes complete, and the report is per input file.
         await writeImportedFile(ctx, f, f.warnings);

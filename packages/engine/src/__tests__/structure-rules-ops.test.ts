@@ -264,6 +264,26 @@ describe("reserved paths are never document paths, in any layout", () => {
   );
 });
 
+describe("context_import files[] honours the reserved paths too", () => {
+  it.each([["structured"], ["obsidian"]])("a %s vault refuses a document under the root packs/", async (layout) => {
+    const vdir = await mkdtemp(join(tmpdir(), "cn-structure-import-packs-"));
+    const v = new NestStorage(vdir);
+    await v.init("v", layout as "structured" | "obsidian");
+    const vctx = { ...ctx, storage: v, query: new GraphQueryEngine(v), versions: new VersionManager(v) };
+    try {
+      const res = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        { files: [{ path: "packs/evil.md", content: "---\ntitle: Evil\ntype: persona\n---\nx\n" }] },
+        vctx,
+      );
+      expect(res.failed.map((f) => f.id)).toEqual(["packs/evil.md"]);
+      expect((await v.discoverDocuments()).map((d) => d.id)).not.toContain("packs/evil");
+    } finally {
+      await rm(vdir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("report-only and absent rules", () => {
   it("enforce: false lets every write through", async () => {
     await writeConfig({ ...RULES, structure: { enforce: false, closed: true } });
@@ -546,6 +566,36 @@ describe("context_import", () => {
 });
 
 // ─── Approvals re-check the rules ───────────────────────────────────────────
+
+describe("context_publish is judged against the rules in force (every approval surface publishes)", () => {
+  it("refuses publishing a never-published draft the rules now refuse", async () => {
+    await api.run("context_create", { title: "Old", content: "x", folder: "notes", publish: false }, ctx);
+    await writeConfig(RULES);
+    const err = await refusal("context_publish", { id: "nodes/notes/old" });
+    expect(err.message).toMatch(/not an allowed folder/);
+  });
+
+  it("refuses publishing an out-of-band edit that drops a required heading", async () => {
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    await writeFile(join(dir, `${id}.md`), raw.replace("## Decisions\nShip.\n", ""), "utf-8");
+    await writeConfig(RULES);
+    const err = await refusal("context_publish", { id });
+    expect(err.message).toMatch(/Decisions/);
+  });
+
+  it("first publish of a held create scaffolds the folders it alone occupies", async () => {
+    await writeConfig(RULES);
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+    await api.run("context_publish", { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" }, ctx);
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+});
 
 describe("approvals are judged against the rules in force", () => {
   const MEETING_RULES: StructureConfig = {

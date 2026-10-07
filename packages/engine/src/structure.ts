@@ -124,13 +124,20 @@ export const MAX_MATCHED_NAME = 128;
 /** Longest owner-written regex accepted. */
 const MAX_REGEX_LENGTH = 200;
 /**
- * Variable-length repetitions (`*`, `+`, `?`, `{m,}`, `{m,n}` with m < n)
- * allowed in one format — regex quantifiers and `{slug}`/`{n}` tokens alike.
- * With no repeated groups, a failing match explores about n³/6 splits of a
- * name of length n per alternation path (≤ 16 paths) — ~5.7M steps at the
- * 128-character cap, tens of milliseconds.
+ * Variable-length quantifiers (`*`, `+`, `?`, `{m,}`, `{m,n}` with m < n)
+ * allowed in one owner-written regex. With no repeated groups, a failing
+ * match explores about n²/2 splits of a name of length n per alternation path
+ * (≤ 16 paths): ~130k steps at the 128-character cap, well under a
+ * millisecond — so even 256 distinct rules meeting one name stay fast.
+ * (Three allowed n³/6 per path; 256 such rules held a write for ~3 s.)
  */
-const MAX_VARIABLE = 3;
+const MAX_VARIABLE = 2;
+/**
+ * `{slug}`/`{n}` tokens per token pattern. Tokens compile to unambiguous
+ * expressions (each `{slug}` repetition starts with "-", `{n}` is digits and
+ * two never touch), so three cost microseconds.
+ */
+const MAX_VARIABLE_TOKENS = 3;
 /** Folder rules allowed in one vault: bounds the rules a single check walks. */
 const MAX_RULES = 256;
 /** `|` alternatives allowed in one regex (at most 2⁴ branch combinations). */
@@ -339,8 +346,8 @@ function compileFormat(spelling: string, key: string): Matcher {
             `${key}: {${previous}}{${token}} — two variable-width tokens need a literal between them (e.g. "-")`,
           );
         }
-        if (++variable > MAX_VARIABLE) {
-          throw new ConfigError(`${key}: at most ${MAX_VARIABLE} {slug}/{n} tokens per format`);
+        if (++variable > MAX_VARIABLE_TOKENS) {
+          throw new ConfigError(`${key}: at most ${MAX_VARIABLE_TOKENS} {slug}/{n} tokens per format`);
         }
       }
       previous = token;
@@ -370,9 +377,13 @@ function isPlaceholder(seg: Segment): seg is { label: string; matcher: Matcher }
   return "label" in seg;
 }
 
-/** Placeholders as `{}` — two patterns with different labels are one shape. */
+/**
+ * Placeholders as `{}` and literals case-folded — two patterns with different
+ * labels, or literals differing only in case, are one shape (literals match
+ * case-insensitively, see `sameName`).
+ */
 function shapeKey(segments: Segment[]): string {
-  return segments.map((s) => (isPlaceholder(s) ? "{}" : s.literal)).join("/");
+  return segments.map((s) => (isPlaceholder(s) ? "{}" : s.literal.toLowerCase())).join("/");
 }
 
 function assertType(type: string, key: string): void {

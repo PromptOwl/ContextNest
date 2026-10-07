@@ -1109,7 +1109,7 @@ tool(
 
       const content = serializeDocument(node);
       // Folders this write creates get their required contents, as with
-      // context_create (a held create above is scaffolded by no one).
+      // context_create (a held create above is scaffolded when it is approved).
       const rules = await enforcedStructure(storage);
       const created = rules ? await missingFolders(storage, id) : null;
       await storage.writeDocument(id, content);

@@ -107,6 +107,17 @@ describe("compileStructure", () => {
     expect(scaffoldPlan(r, ["notes"]).documents[0].body).toBe("");
   });
 
+  it("two keys that differ only in case are one folder — refused as a duplicate", () => {
+    expectConfigError({ folders: { Notes: {}, notes: {} } }, /declare each pattern once/);
+  });
+
+  it("a placeholder's format is found whatever the case of its owner's literals", () => {
+    const r = compileStructure({
+      folders: { "Clients/{c}": { folder_name: "/[a-z]+-[0-9]{3}/" }, "clients/{c}/meetings": {} },
+    });
+    expect(codes(checkDocument(r, { id: "nodes/clients/acme/meetings/x", type: "document", body: "" }))).toEqual(["FOLDER_NAME"]);
+  });
+
   it("literal folder names match case-insensitively (case-insensitive filesystems put NOTES/ in notes/)", () => {
     const r = compileStructure({ structure: { closed: true }, folders: { notes: { types: ["document"] } } });
     expect(codes(checkDocument(r, { id: "nodes/NOTES/x", type: "glossary", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
@@ -196,6 +207,8 @@ describe("compileStructure", () => {
       ["an unescaped }", "/a}/"],
       ["an escaped non-ASCII character", "/a\\é/"],
       ["an escaped space", "/a\\ b/"],
+      // Round 4: 3 variable quantifiers × 256 distinct rules took ~3s per write.
+      ["three variable-width quantifiers", "/a*a*a*b/"],
     ])("refuses %s", (_label, src) => {
       expectConfigError({ folders: { d: { file_name: src } } }, /folders\.d\.file_name/);
     });
@@ -204,7 +217,7 @@ describe("compileStructure", () => {
       ["/[a-z]+-[0-9]{3}/", "acme-042", "acme-42"],
       ["/(foo|bar)-[a-z]+/", "foo-x", "baz-x"],
       ["/adr-[0-9]{4}-[a-z0-9-]+/", "adr-0001-use-pg", "adr-1-use-pg"],
-      ["/a*a*a*b/", "aaab", "aaaa"],
+      ["/a*a*b/", "aab", "aaaa"],
     ])("accepts %s (matches %s, not %s)", (src, yes, no) => {
       const r = compileStructure({ folders: { d: { file_name: src } } });
       expect(checkDocument(r, { id: `d/${yes}`, type: "document", body: "" })).toEqual([]);
@@ -212,9 +225,9 @@ describe("compileStructure", () => {
     });
 
     it.each([
-      ["/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*a*b/", "a".repeat(127) + "c"],
-      ["/.*.*.*x/", "a".repeat(128)],
-      ["/[a-z]{0,60}[a-z]{0,60}[a-z]{0,60}0/", "a".repeat(128)],
+      ["/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*b/", "a".repeat(127) + "c"],
+      ["/.*.*x/", "a".repeat(128)],
+      ["/[a-z]{0,99}[a-z]{0,99}0/", "a".repeat(128)],
     ])("the worst shape the whitelist accepts stays fast: %s", (src, name) => {
       const r = compileStructure({ folders: { d: { file_name: src } } });
       const started = Date.now();
@@ -226,8 +239,23 @@ describe("compileStructure", () => {
       expect(() => compileStructure({ folders: { d: { file_name: "/v\\{[0-9]{2}\\}/" } } })).not.toThrow();
     });
 
+    it("256 distinct deep rules, each with the slowest allowed regex, still check fast", () => {
+      // Every rule shape-matches the path, so the last segment meets 256
+      // distinct matchers — the round-3 amplification.
+      const worst = "/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*!/";
+      const folders: Record<string, object> = {};
+      for (let i = 0; i < 256; i++) {
+        const segs = Array.from({ length: 8 }, (_, j) => ((i >> j) & 1 ? "a" : "{p}"));
+        folders[[...segs, "{t}"].join("/")] = { folder_name: worst };
+      }
+      const r = compileStructure({ folders: folders as never });
+      const started = Date.now();
+      checkDocument(r, { id: `${"a/".repeat(8)}${"a".repeat(127)}c/doc`, type: "document", body: "" });
+      expect(Date.now() - started).toBeLessThan(1000);
+    });
+
     it("the cost of a check stays bounded however many rules reuse a slow pattern", () => {
-      const worst = "/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*a*b/";
+      const worst = "/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*b/";
       const folders: Record<string, object> = { "{a}": { folder_name: worst } };
       for (let i = 0; i < 200; i++) folders[`{a}/x${i}`] = {};
       const r = compileStructure({ structure: { closed: true }, folders: folders as never });
@@ -254,7 +282,7 @@ describe("compileStructure", () => {
     });
 
     it("an over-long name is refused without running the pattern (no backtracking on attacker input)", () => {
-      const r = compileStructure({ folders: { d: { file_name: "/a*a*a*b/" } } });
+      const r = compileStructure({ folders: { d: { file_name: "/a*a*b/" } } });
       const started = Date.now();
       const v = checkDocument(r, { id: `d/${"a".repeat(5000)}`, type: "document", body: "" });
       expect(Date.now() - started).toBeLessThan(1000);
