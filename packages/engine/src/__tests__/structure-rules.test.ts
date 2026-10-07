@@ -22,6 +22,7 @@ import {
   type Violation,
 } from "../structure.js";
 import { comparableSegment } from "../structure.js";
+import { headingAnchors } from "../inline.js";
 import { ContextNestError } from "../errors.js";
 
 /** The worked example from the PRD — reused across most cases. */
@@ -164,6 +165,12 @@ describe("compileStructure", () => {
       expect(codes(checkDocument(r, { id, type: "document", body: "" })), id).toContain("FOLDER_NOT_ALLOWED");
     }
     expect(checkDocument(r, { id: "nodes/docs/x", type: "document", body: "" })).toEqual([]);
+  });
+
+  it("a lone CR ends a line in heading and section parsing (CommonMark)", () => {
+    expect(headingAnchors("##\rSummary\n").has("summary")).toBe(false);
+    expect(headingAnchors("intro\r## Summary\rok").has("summary")).toBe(true);
+    expect(headingAnchors("a\r\n## Next\r\n").has("next")).toBe(true);
   });
 
   it("comparableSegment is linear on a long run of dots and spaces", () => {

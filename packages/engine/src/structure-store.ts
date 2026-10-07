@@ -13,6 +13,7 @@ import { isDeepStrictEqual } from "node:util";
 import { isAbsolute, join, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { parseConfig } from "./config.js";
+import { mapInBatches } from "./concurrency.js";
 import { ConfigError } from "./errors.js";
 import { assertNotForgotten } from "./forget.js";
 import { generateIndexMd } from "./index-md-generator.js";
@@ -111,10 +112,8 @@ export async function sealedHead(
   if (segment.some((e) => e.tombstone)) return null;
   try {
     // Read, verify, then replay exactly what was verified — the segment alone.
-    const contents = await Promise.all(
-      segment.map(async (e) =>
-        e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null),
-      ),
+    const contents = await mapInBatches(segment, async (e) =>
+      e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null),
     );
     if (contents.some((c, i) => c === null || computeContentHash(c) !== segment[i].content_hash)) return null;
     const byVersion = new Map(segment.map((e, i) => [e.version, contents[i] as string]));

@@ -323,8 +323,9 @@ export async function assertResolvesOutsideMachinery(root: string, id: string): 
 }
 
 export function assertSafeDocumentId(raw: string): void {
-  // No file system holds more; refused here so an error never names the vault path.
-  assertFitsFileSystem(raw, 255, 4096, true);
+  // No file system holds more; refused here so an error never names the vault
+  // path. Measured on the file the id names: its leaf carries `.md`.
+  assertFitsFileSystem(`${raw}.md`, 255, 4096, true);
   const segments = raw.split(/[/\\]/);
   if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(
@@ -1647,10 +1648,14 @@ export class NestStorage {
     // Encrypted vault: an import lands sealed like any other write. Verbatim
     // still holds for the PLAINTEXT — it is what gets sealed, byte for byte, so
     // every hash the source recorded keeps verifying.
-    let onDisk = content;
+    let onDisk: string | Uint8Array = content;
     if ((await this.isEncrypted()) && !isArmoredText(content)) {
       const target = kindForVaultPath(relPath);
-      if (target) {
+      if (/\.pdf$/i.test(relPath)) {
+        // A sidecar or its archive: sealed as bytes, as writeVaultBinary does.
+        const bytes = Buffer.from(content, "utf-8");
+        if (!isSealedBinary(bytes)) onDisk = await this.sealBytes(relPath.replace(/\.[^./\\]+$/, ""), bytes);
+      } else if (target) {
         onDisk = await this.sealText(target.docId, target.kind, content);
       } else if (/(^|\/)\.versions\/[^/]+\/history\.yaml$/.test(relPath.replace(/\\/g, "/"))) {
         const norm = relPath.replace(/\\/g, "/");
@@ -1665,7 +1670,7 @@ export class NestStorage {
         }
       }
     }
-    await writeFile(filePath, onDisk, "utf-8");
+    await writeFile(filePath, onDisk, typeof onDisk === "string" ? "utf-8" : undefined);
   }
 
   /**

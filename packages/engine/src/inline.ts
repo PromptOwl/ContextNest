@@ -186,10 +186,9 @@ export function buildBacklinks(documents: ContextNode[]): Map<string, string[]> 
  * Returns the content from the matched heading to the next heading of same or higher level.
  */
 export function extractSection(body: string, anchor: string): string | null {
-  // Slice from the raw lines so the returned section keeps its original line
-  // endings; scan a CR-stripped copy so the patterns still anchor (see above).
-  const lines = body.split("\n");
-  const headings = topLevelHeadings(lines.map((l) => l.replace(/\r$/, "")));
+  // One line model with the checker (splitLines); the section comes back LF-joined.
+  const lines = splitLines(body);
+  const headings = topLevelHeadings(lines);
 
   const start = headings.findIndex((h) => h.anchor === anchor);
   if (start === -1) return null;
@@ -206,12 +205,22 @@ export function extractSection(body: string, anchor: string): string | null {
 }
 
 /**
+ * A body's lines as CommonMark reads them: CRLF, LF and a lone CR each end a
+ * line. One model for every parser here — and the same view content hashes
+ * cover (§8 normalization) — so "this heading exists" means one thing whether
+ * a body is judged raw or normalized, read or checked.
+ */
+function splitLines(body: string): string[] {
+  return body.split(/\r\n|\r|\n/);
+}
+
+/**
  * Anchors of a body's top-level headings — the same parser section links
  * (`#section`) resolve against, so "this heading exists" means the same thing
  * everywhere. Text inside an HTML comment is not a heading.
  */
 export function headingAnchors(body: string): Set<string> {
-  const lines = maskHtmlComments(body.split("\n").map((l) => l.replace(/\r$/, "")));
+  const lines = maskHtmlComments(splitLines(body));
   return new Set(topLevelHeadings(lines).map((h) => h.anchor));
 }
 

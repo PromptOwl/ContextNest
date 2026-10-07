@@ -1345,10 +1345,32 @@ async function assertSidecarKept(
   const owner = f.path.slice(0, -".pdf".length);
   const node = await readIfExists(ctx, owner);
   if (!node) return; // no document here: an ordinary file, not a sidecar
+  // What the vault sealed for this node: its verified head's pdf block — never
+  // the live .md, which this call or an earlier one may have rewritten.
+  const sealedPdf = await (async () => {
+    const history = await ctx.storage.readHistory(owner).catch(() => null);
+    const raw = history
+      ? await sealedHead(owner, history, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n))
+      : null;
+    if (raw === null) return undefined;
+    try {
+      const head = parseDocument(`${owner}.md`, normalizeForHash(raw), owner);
+      return head.frontmatter.type === "pdf" ? (head.frontmatter.pdf?.sha256 ?? null) : null;
+    } catch {
+      return undefined;
+    }
+  })();
+  // An ordinary document with a companion PDF (`paper.md` + `paper.pdf`) is no
+  // pdf node: the companion is an ordinary file.
+  if (node.frontmatter.type !== "pdf" && !sealedPdf) return;
+  let onDisk: Uint8Array | null = null;
+  try {
+    onDisk = await ctx.storage.readVaultBinary(f.path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
   // Judged against the bytes on disk, which nothing in this import has touched
-  // yet — never against the .md, which this call or an earlier one may have
-  // rewritten to name other bytes.
-  const onDisk = await ctx.storage.readVaultBinary(f.path).catch(() => null);
+  // yet; with none there, against the sealed head.
   if (onDisk) {
     if (sha256Bytes(onDisk) !== bytes) {
       throw new ContextNestError(
@@ -1358,9 +1380,11 @@ async function assertSidecarKept(
     }
     return;
   }
-  const sealed = node.frontmatter.type === "pdf" ? node.frontmatter.pdf?.sha256 : undefined;
-  if (sealed && bytes !== sealed) {
-    throw new ContextNestError(`${f.raw}: is not the PDF ${owner} records`, "VALIDATION_FAILED");
+  if (bytes !== sealedPdf) {
+    throw new ContextNestError(
+      `${f.raw}: is not the PDF ${owner}'s sealed version records — restore it with the same bytes, or import a new version with context_import_pdf`,
+      "VALIDATION_FAILED",
+    );
   }
 }
 
@@ -1390,27 +1414,47 @@ async function historySetVerdict(
   const refuse = (refusal: string) => ({ refusal, head: null });
   let history: DocumentHistory | null = null;
   const text = set.get("history.yaml");
+  const onDisk = await ctx.storage.readHistory(owner).catch(() => null);
   try {
     if (text !== undefined) {
       const parsed = documentHistorySchema.safeParse(yaml.load(text));
       history = parsed.success ? (parsed.data as DocumentHistory) : null;
     } else {
-      history = await ctx.storage.readHistory(owner);
+      history = onDisk;
     }
   } catch {
     history = null;
   }
   if (text !== undefined && !history) return refuse(`${owner}'s history.yaml is not a valid history`);
+  const keyframe = (n: number) => set.get(`v${n}.md`) ?? ctx.storage.readKeyframe(owner, n);
+  const diff = (n: number) => set.get(`v${n}.diff`) ?? ctx.storage.readDiff(owner, n);
+  // The history.yaml this call brings is written last and may not land (a file
+  // of its set fails): the history already here, over these files, is a head
+  // the vault may then hold too — and must pass as well.
+  if (text !== undefined && onDisk) {
+    const kept = await sealedHead(owner, onDisk, keyframe, diff);
+    if (kept !== null) {
+      const node = (() => {
+        try {
+          const n = parseDocument(`${owner}.md`, normalizeForHash(kept), owner);
+          return { id: owner, type: n.frontmatter.type, body: n.body };
+        } catch {
+          return { id: owner, body: normalizeForHash(kept) };
+        }
+      })();
+      const violations = checkDocument(rules, node);
+      if (violations.length > 0) {
+        return refuse(
+          `${owner}'s history, kept with these files, ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`,
+        );
+      }
+    }
+  }
   // No history, no head, or a forgotten one: nothing to rebuild, nothing that
   // could make a later check lenient.
   const last = history?.versions.at(-1);
   if (!history || !last || last.tombstone) return { refusal: null, head: null };
-  const raw = await sealedHead(
-    owner,
-    history,
-    (n) => set.get(`v${n}.md`) ?? ctx.storage.readKeyframe(owner, n),
-    (n) => set.get(`v${n}.diff`) ?? ctx.storage.readDiff(owner, n),
-  );
+  const raw = await sealedHead(owner, history, keyframe, diff);
   // Refused, not waved through: the bytes judged here are pinned to their
   // content hashes, so if a file then fails to land the head on disk no
   // longer verifies and is judged in full — but only if the head judged here
@@ -1529,8 +1573,17 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       const md = plan.find((p) => p.path === `${f.path.slice(0, -".pdf".length)}.md`);
       if (md && !preRefused.has(md.raw)) preRefused.set(md.raw, `${md.raw}: its PDF ${f.raw} was refused`);
     }
-    // A history with any refused file is refused whole.
-    const brokenSets = new Set(plan.flatMap((f) => (preRefused.has(f.raw) ? (versionsArtifact(f.path)?.owner ?? []) : [])));
+    // A history with any refused file is refused whole — and so is the history
+    // of a refused document or sidecar, which would otherwise land without it.
+    const brokenSets = new Set(
+      plan.flatMap((f) => {
+        if (!preRefused.has(f.raw)) return [];
+        const v = versionsArtifact(f.path);
+        if (v) return [v.owner];
+        const m = /^(.*)\.(md|pdf)$/i.exec(f.path);
+        return m && !storeOwner(f.path) ? [m[1]] : [];
+      }),
+    );
     for (const f of plan) {
       const v = versionsArtifact(f.path);
       if (v && brokenSets.has(v.owner) && !preRefused.has(f.raw)) {

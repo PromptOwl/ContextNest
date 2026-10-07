@@ -11,6 +11,8 @@ import { dirname, join } from "node:path";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { computeContentHash, sha256Bytes } from "../integrity.js";
 import { sealedHead } from "../structure-store.js";
+import { MemoryKeyStore, setDefaultVaultKeyStore } from "../encryption/key-store.js";
+import { encryptVault } from "../encryption/migrate.js";
 import yaml from "js-yaml";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
@@ -1979,5 +1981,162 @@ describe("QA round 10: duplicate spellings of a history file, sidecars against t
     const id = `nodes/${"漢".repeat(86)}`;
     const err = await refusal("context_get", { id });
     expect(err.code).not.toBe("INVALID_DOCUMENT_ID");
+  });
+});
+
+describe("architecture round 12: one line model, old histories, sidecar fallbacks", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("a lone CR ends a line for the rules as it does for readers (CommonMark): ##\\rSummary is no heading", async () => {
+    await writeConfig(SUMMARY);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/x.md", content: "---\ntitle: X\n---\n##\rSummary\nok\n" }] },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/notes/x.md"]);
+    const ok = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/y.md", content: "---\ntitle: Y\n---\nintro\r## Summary\rok\n" }] },
+      ctx,
+    );
+    expect(ok.failed).toEqual([]);
+  });
+
+  it("a history set that would reinstate a refused legacy head under the old history.yaml is refused", async () => {
+    // A legacy note (no Summary), sealed before the rules; its keyframe is lost.
+    await api.run("context_create", { id: "nodes/notes/r", title: "R", content: "## Notes\nold\n" }, ctx);
+    const V = "nodes/notes/.versions/r";
+    const legacy = await readFile(join(dir, V, "v1.md"), "utf-8");
+    await rm(join(dir, V, "v1.md"));
+    await writeConfig(SUMMARY);
+    const G = "---\ntitle: R\n---\n## Summary\nok\n";
+    const decoy = yaml.dump({
+      versions: [{ version: 5, keyframe: true, edited_by: "a", edited_at: "2026-01-01T00:00:00Z", content_hash: computeContentHash(G), chain_hash: `sha256:${"0".repeat(64)}` }],
+    });
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/history.yaml`, content: decoy },
+          { path: `${V}/v5.md`, content: G },
+          { path: `${V}/v1.md`, content: legacy },
+          { path: `${V}/history.yaml/z`, content: "fails to land" },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toContain(`${V}/v1.md`);
+    expect(await exists(`${V}/v1.md`)).toBe(false);
+  });
+
+  it("a missing sidecar is restored only with the bytes the sealed head records, never the live .md", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    await rm(join(dir, `${res.id}.pdf`));
+    const evil = "%PDF-1.4 evil";
+    const md = (await readFile(join(dir, `${res.id}.md`), "utf-8")).replace(/sha256:[0-9a-f]{64}/, sha256Bytes(Buffer.from(evil, "utf-8")));
+    await writeFile(join(dir, `${res.id}.md`), md, "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: evil }], overwrite: true },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual([`${res.id}.pdf`]);
+  });
+
+  it("a companion PDF beside an ordinary document is an ordinary file", async () => {
+    await api.run("context_create", { id: "nodes/papers/paper", title: "Paper", content: "x" }, ctx);
+    await writeFile(join(dir, "nodes", "papers", "paper.pdf"), "old", "utf-8");
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/papers/paper.pdf", content: "new" }], overwrite: true },
+      ctx,
+    );
+    expect(imp.failed).toEqual([]);
+  });
+
+  it("a document refused with its PDF takes its history with it", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const name = res.id.split("/").pop()!;
+    const folder = res.id.split("/").slice(0, -1).join("/");
+    const history = await readFile(join(dir, folder, ".versions", name, "history.yaml"), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${res.id}.pdf`, content: "%PDF-1.4 evil" },
+          { path: `${res.id}.md`, content: await readFile(join(dir, `${res.id}.md`), "utf-8") },
+          { path: `${folder}/.versions/${name}/history.yaml`, content: history },
+        ],
+        overwrite: true,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain(`${folder}/.versions/${name}/history.yaml`);
+  });
+
+  it("a read of a leaf no .md file could carry fails without naming the vault path", async () => {
+    const err = await refusal("context_get", { id: `nodes/${"q".repeat(253)}` });
+    expect(err.message).not.toContain(dir);
+  });
+
+  it("an imported PDF lands sealed in an encrypted vault", async () => {
+    const store = new MemoryKeyStore();
+    setDefaultVaultKeyStore(store);
+    try {
+      await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+      await api.run("context_import", { files: [{ path: "nodes/decks/p.pdf", content: "%PDF-1.4 SECRET-PDF-TOKEN" }] }, ctx);
+      expect(await readFile(join(dir, "nodes", "decks", "p.pdf"), "latin1")).not.toContain("SECRET-PDF-TOKEN");
+    } finally {
+      setDefaultVaultKeyStore(null);
+    }
+  });
+
+  it("a segment longer than 1000 entries is not trusted, and not even read", async () => {
+    const entry = (version: number) => ({
+      version,
+      keyframe: version === 1,
+      edited_by: "a",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: computeContentHash("x"),
+      chain_hash: `sha256:${"0".repeat(64)}`,
+    });
+    const history = (n: number) => ({ versions: Array.from({ length: n }, (_, i) => entry(i + 1)) }) as never;
+    let reads = 0;
+    const read = () => {
+      reads++;
+      return null;
+    };
+    expect(await sealedHead("d", history(1001), read, read)).toBeNull();
+    expect(reads).toBe(0);
+    await sealedHead("d", history(1000), read, read);
+    expect(reads).toBeGreaterThan(0);
+  });
+
+  it("a history file that fails to land on disk keeps its set's history.yaml out too", async () => {
+    await api.run("context_create", { id: "nodes/notes/f", title: "F", content: "body\n" }, ctx);
+    const V = "nodes/notes/.versions/f";
+    const before = await readFile(join(dir, V, "history.yaml"), "utf-8");
+    const res = await api.run<{ failed: { id?: string; error?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          // history.yaml is a file, so nothing can land beneath it: a real I/O failure.
+          { path: `${V}/history.yaml/z`, content: "x" },
+          { path: `${V}/history.yaml`, content: yaml.dump({ versions: [] }) },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.find((f) => f.id === `${V}/history.yaml`)?.error).toMatch(/did not land/);
+    expect(await readFile(join(dir, V, "history.yaml"), "utf-8")).toBe(before);
   });
 });
