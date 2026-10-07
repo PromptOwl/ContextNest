@@ -50,9 +50,10 @@ import {
   enforceStructure,
   checkDocument,
   checkUpdate,
-  checkDeleteDocument,
   missingFolders,
   scaffoldFolders,
+  assertStructureDelete,
+  assertWritableDocumentId,
   currentReviewProposal,
   stageReviewHold,
   NODE_TYPES,
@@ -1002,6 +1003,13 @@ tool(
       // lands in the same place as one created via `ctx add` (single source of
       // truth — normalizeDocumentId in the engine).
       const id = normalizeDocumentId(path);
+      // Never under .context/, .versions/, _suggestions/ or the root packs/ —
+      // the same guard every catalog write runs.
+      try {
+        assertWritableDocumentId(id);
+      } catch (err) {
+        return toolError(err);
+      }
 
       // Check if document already exists
       try {
@@ -1444,15 +1452,11 @@ tool(
       const id = normalizeDocumentId(path);
 
       // A required file goes last, as with context_delete (§11.1.1).
-      const refused = await structureRefusal(async (rules) => {
-        if (checkDeleteDocument(rules, id).length === 0) return [];
-        const folder = id.split("/").slice(0, -1).join("/");
-        const others = (await storage.discoverDocuments({ folder, includeRetired: true })).filter(
-          (d) => d.id !== id,
-        ).length;
-        return checkDeleteDocument(rules, id, others);
-      });
-      if (refused) return refused;
+      try {
+        await assertStructureDelete(storage, id);
+      } catch (err) {
+        return toolError(err);
+      }
 
       // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
       // id, and appends an audit-only record (§6.3.4). Additive: the path

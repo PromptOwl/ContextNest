@@ -1577,6 +1577,13 @@ describe("[regression] MCP server e2e — structure rules", () => {
     expect(await readFile(join(vault, "nodes", "teams", "platform", "charter.md"), "utf-8")).toContain("## Mission");
   });
 
+  it("the deprecated create_document cannot write a document under a reserved path", async () => {
+    for (const path of ["nodes/.context/evil", "nodes/x/.versions/y/v9", "_suggestions/evil"]) {
+      const { isError } = await callText(client, "create_document", { path, title: "Evil" });
+      expect(isError).toBe(true);
+    }
+  });
+
   it("context_import cannot rewrite .context/config.yaml", async () => {
     const before = await readFile(join(vault, ".context", "config.yaml"), "utf-8");
     const { json } = await callJson(client, "context_import", {

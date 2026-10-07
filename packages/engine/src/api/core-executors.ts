@@ -42,7 +42,7 @@ import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } fro
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
-import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
+import { normalizeDocumentId, assertSafeDocumentId, assertWritableDocumentId } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
@@ -95,7 +95,12 @@ import {
   type StructureDoc,
   type Violation,
 } from "../structure.js";
-import { enforcedStructure, missingFolders, scaffoldFolders } from "../structure-store.js";
+import {
+  assertStructureDelete,
+  enforcedStructure,
+  missingFolders,
+  scaffoldFolders,
+} from "../structure-store.js";
 import { NON_DOCUMENT_BASENAMES } from "../storage.js";
 import type { OperationContext, OperationExecutor } from "./context.js";
 import { isDeepStrictEqual } from "node:util";
@@ -269,15 +274,6 @@ function isSettingsPath(path: string): boolean {
   return String(path)
     .split(/[\\/]+/)
     .some((segment) => segment.replace(/[. ]+$/, "").toLowerCase() === ".context");
-}
-
-function assertNotSettingsPath(id: string): void {
-  if (isSettingsPath(id)) {
-    throw new ContextNestError(
-      `${id}: .context/ holds this vault's own settings and cannot hold documents`,
-      "VALIDATION_FAILED",
-    );
-  }
 }
 
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
@@ -561,7 +557,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
   if (!publish && !hold) node.frontmatter.version = 1;
   const createdStatus = node.frontmatter.status;
   assertValid(node);
-  assertNotSettingsPath(node.id);
+  assertWritableDocumentId(node.id);
   // Structure rules (§11.1.1), before anything is written — held writes too.
   const rules = await structureRules(ctx);
   if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
@@ -795,14 +791,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
 const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // A required file (§11.1.1) goes last: not while its folder holds anything else.
-  const rules = await structureRules(ctx);
-  if (rules && checkDeleteDocument(rules, id).length > 0) {
-    const folder = id.split("/").slice(0, -1).join("/");
-    const others = (await ctx.storage.discoverDocuments({ folder, includeRetired: true })).filter(
-      (d) => d.id !== id,
-    ).length;
-    enforceStructure(rules, checkDeleteDocument(rules, id, others));
-  }
+  if (ctx.structure !== "skip") await assertStructureDelete(ctx.storage, id);
   // Reads the title BEFORE removing the file (callers report what they
   // deleted) and throws DOCUMENT_NOT_FOUND when the id doesn't exist. Unless
   // `purge` is set, leaves an audit-only record of who deleted it and why
@@ -1171,8 +1160,11 @@ function importedDoc(relPath: string, content: string): StructureDoc | null {
   const last = norm.split("/").pop() ?? norm;
   // What discovery will read as a node: a lowercase `.md`, not history, not a
   // dot-file, not an INDEX.md / README.md-style scaffold file.
-  if (isVersionArtifactPath(norm) || !last.endsWith(".md") || last.startsWith(".")) return null;
+  // Any case: a `.MD` file is written as it came, and on a case-insensitive
+  // filesystem discovery reads it as a node.
+  if (isVersionArtifactPath(norm) || !/\.md$/i.test(last) || last.startsWith(".")) return null;
   if (NON_DOCUMENT_BASENAMES.has(last)) return null;
+  if (norm.split("/").includes("_suggestions")) return null;
   const id = norm.slice(0, -".md".length);
   try {
     const node = parseDocument(`${id}.md`, content, id);
@@ -1182,10 +1174,18 @@ function importedDoc(relPath: string, content: string): StructureDoc | null {
   }
 }
 
-/** The document a `.versions/` artifact belongs to (`a/.versions/x/…` → `a/x`), or null. */
-function versionOwner(relPath: string): string | null {
+/** Where a document's history and staged edits live: `<dir>/<store>/<doc>/…`. */
+const PER_DOCUMENT_STORES = [".versions", "_suggestions"];
+
+/** The index of the per-document store segment in a path, or -1. */
+function storeIndex(segs: string[]): number {
+  return segs.findIndex((seg) => PER_DOCUMENT_STORES.includes(seg));
+}
+
+/** The document a `.versions/` or `_suggestions/` file belongs to (`a/.versions/x/…` → `a/x`), or null. */
+function storeOwner(relPath: string): string | null {
   const segs = relPath.replace(/\\/g, "/").split("/");
-  const k = segs.indexOf(".versions");
+  const k = storeIndex(segs);
   return k === -1 || k + 1 >= segs.length - 1 ? null : [...segs.slice(0, k), segs[k + 1]].join("/");
 }
 
@@ -1207,26 +1207,37 @@ async function importVerdicts(
   const refusedDocs = new Set<string>();
   const structured = (await ctx.storage.detectLayout()) === "structured";
   const message = (v: Violation[]) => v.map((x) => x.message).join(" ");
-  for (const f of plan) {
-    const doc = importedDoc(f.path, f.content);
+  // Documents an overwrite replaces, read in parallel: grandfathering judges
+  // the replacement against them.
+  const docs = plan.map((f) => importedDoc(f.path, f.content));
+  const existing = new Map<string, ContextNode>();
+  if (overwrite) {
+    await mapInBatches(docs, async (doc) => {
+      const found = doc ? await readIfExists(ctx, doc.id) : null;
+      if (doc && found) existing.set(doc.id, found);
+    });
+  }
+  plan.forEach((f, i) => {
+    const doc = docs[i];
     let violations: Violation[];
     if (doc) {
-      const existing = overwrite ? await readIfExists(ctx, doc.id) : null;
-      violations = existing ? checkUpdate(rules, structureDoc(existing), doc) : checkDocument(rules, doc);
+      const before = existing.get(doc.id);
+      violations = before ? checkUpdate(rules, structureDoc(before), doc) : checkDocument(rules, doc);
       if (violations.length > 0) refusedDocs.add(doc.id);
     } else {
       const norm = f.path.replace(/\\/g, "/");
-      if (structured && !norm.startsWith("nodes/")) continue;
+      if (structured && !norm.startsWith("nodes/")) return;
       const segs = norm.split("/");
-      const k = segs.indexOf(".versions");
+      const k = storeIndex(segs);
       violations = checkFolder(rules, (k === -1 ? segs.slice(0, -1) : segs.slice(0, k)).join("/"));
     }
     if (violations.length > 0) refused.set(f.raw, `${f.raw}: ${message(violations)}`);
-  }
+  });
   for (const f of plan) {
-    const owner = versionOwner(f.path);
+    // A document's history, staged edits and PDF sidecar go where it goes.
+    const owner = storeOwner(f.path) ?? (/\.pdf$/i.test(f.path) ? f.path.slice(0, -".pdf".length) : null);
     if (owner && refusedDocs.has(owner) && !refused.has(f.raw)) {
-      refused.set(f.raw, `${f.raw}: history of ${owner}, which the structure rules refused`);
+      refused.set(f.raw, `${f.raw}: belongs to ${owner}, which the structure rules refused`);
     }
   }
   return refused;
@@ -1335,7 +1346,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
       }
     });
-    for (const p of plan) warnings.push(...p.warnings);
+    // A refused file landed nowhere, so its "written as …" rename warning would mislead.
+    const failedRaw = new Set(failed.map((f) => f.id));
+    for (const p of plan) if (!failedRaw.has(p.raw)) warnings.push(...p.warnings);
   }
   if (tombstones && incomingEvents.length > 0) {
     try {
@@ -1353,7 +1366,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
-      assertNotSettingsPath(node.id);
+      assertWritableDocumentId(node.id);
       if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
       // Same guard as context_create (§6.3.4): a retired path or erased body
       // must not land even as a draft (`publish: false` returns before Stage 3).
@@ -1677,7 +1690,7 @@ async function importPdfLocked(
     }
   }
   assertSafeDocumentId(id);
-  assertNotSettingsPath(id);
+  assertWritableDocumentId(id);
 
   // Anti-resurrection (§6.3.4): a path a forget retired (stub since deleted)
   // or a binary a forget erased never comes back through a PDF import.

@@ -1410,6 +1410,10 @@ const structureOp: OperationDescriptor = {
       )
       .optional()
       .describe("With `report`: what breaks the rules today (grandfathered content stays editable)"),
+    warnings: z
+      .array(z.string())
+      .optional()
+      .describe("Rules that compile but are probably mistakes, e.g. a template name not defined under templates"),
     error: z
       .string()
       .optional()

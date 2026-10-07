@@ -57,6 +57,12 @@ interface Matcher {
   /** As the owner wrote it — what messages and the wire shape show. */
   spelling: string;
   re: RegExp;
+  /**
+   * name → result. A check runs the same matcher against the same name once
+   * per rule and folder depth; memoizing keeps one write's regex work to one
+   * run per distinct (matcher, name), however many rules share a pattern.
+   */
+  memo: Map<string, boolean>;
 }
 
 type Segment = { literal: string } | { label: string; matcher: Matcher };
@@ -79,6 +85,8 @@ export interface CompiledStructure {
   closed: boolean;
   rules: CompiledRule[];
   templates: Record<string, { body: string; required_sections: string[] }>;
+  /** Things that compile but are probably mistakes (an unresolved template name). */
+  warnings: string[];
 }
 
 /** The wire shape of one folder rule (`context_structure`). */
@@ -103,6 +111,7 @@ export interface StructureView {
   closed: boolean;
   folders: FolderRuleView[];
   templates: Record<string, { body: string; required_sections: string[] }>;
+  warnings?: string[];
 }
 
 // ─── Limits ─────────────────────────────────────────────────────────────────
@@ -117,9 +126,13 @@ const MAX_REGEX_LENGTH = 200;
 /**
  * Variable-length repetitions (`*`, `+`, `?`, `{m,}`, `{m,n}` with m < n)
  * allowed in one format — regex quantifiers and `{slug}`/`{n}` tokens alike.
- * With no repeated groups, a match tries at most ~n² splits per alternative.
+ * With no repeated groups, a failing match explores about n³/6 splits of a
+ * name of length n per alternation path (≤ 16 paths) — ~5.7M steps at the
+ * 128-character cap, tens of milliseconds.
  */
 const MAX_VARIABLE = 3;
+/** Folder rules allowed in one vault: bounds the rules a single check walks. */
+const MAX_RULES = 256;
 /** `|` alternatives allowed in one regex (at most 2⁴ branch combinations). */
 const MAX_BARS = 4;
 /** Patterns listed in a "not an allowed folder" message before eliding. */
@@ -138,10 +151,20 @@ const TOKEN_LIST = Object.keys(TOKENS).map((t) => `{${t}}`).join(", ");
 const VARIABLE_TOKENS = new Set(["slug", "n"]);
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const LABEL = /^\{([a-z][a-z0-9_-]*)\}$/i;
-const SLUG_MATCHER: Matcher = { spelling: "{slug}", re: new RegExp(`^${TOKENS.slug}$`) };
+const matcher = (spelling: string, re: RegExp): Matcher => ({ spelling, re, memo: new Map() });
+const slugMatcher = () => matcher("{slug}", new RegExp(`^${TOKENS.slug}$`));
+const tokenMatcher = (token: string) => matcher(`{${token}}`, new RegExp(`^${TOKENS[token]}$`));
 
-function tokenMatcher(token: string): Matcher {
-  return { spelling: `{${token}}`, re: new RegExp(`^${TOKENS[token]}$`) };
+/** Whether `name` fits, never running a pattern on an over-long name. */
+function fits(m: Matcher, name: string): boolean {
+  if (name.length > MAX_MATCHED_NAME) return false;
+  let hit = m.memo.get(name);
+  if (hit === undefined) {
+    hit = m.re.test(name);
+    if (m.memo.size >= 4096) m.memo.clear();
+    m.memo.set(name, hit);
+  }
+  return hit;
 }
 
 // ─── Regex safety ───────────────────────────────────────────────────────────
@@ -149,8 +172,8 @@ function tokenMatcher(token: string): Matcher {
 /** Escapes a regex may use: the class shorthands, and escaped punctuation. */
 function escapeProblem(e: string | undefined): string | null {
   if (e === undefined) return "ends with a lone backslash";
-  if (/[A-Za-z0-9]/.test(e) && !"dDwWsS".includes(e)) {
-    return `uses the escape \\${e} (allowed: \\d \\w \\s, their negations, and escaped punctuation)`;
+  if (!"dDwWsS".includes(e) && !/[!-/:-@[-`{-~]/.test(e)) {
+    return `uses the escape \\${e} (allowed: \\d \\w \\s, their negations, and escaped ASCII punctuation)`;
   }
   return null;
 }
@@ -231,7 +254,9 @@ function regexProblem(src: string): string | null {
       last = null;
       continue;
     }
+    if (c === "}" || c === "]") return `has an unescaped ${c} (write \\${c} for the character)`;
     const q = quantifierAt(src, i);
+    if (q && "problem" in q) return q.problem;
     if (q) {
       if (last === null) return "has a quantifier with nothing to repeat";
       if (last === "group") {
@@ -252,13 +277,25 @@ function regexProblem(src: string): string | null {
   return null;
 }
 
-/** A quantifier starting at `i`, or null if `src[i]` is not one. */
-function quantifierAt(src: string, i: number): { length: number; variable: boolean } | null {
+const BRACE_QUANTIFIER = /\{(\d+)(?:(,)(\d*))?\}/y;
+
+/**
+ * The quantifier starting at `i`, null if `src[i]` starts none, or why a `{`
+ * there is refused. Parsed over the whole source: a window would read a
+ * zero-padded bound (`{0,000…099}`) as literal text while the regex engine
+ * runs it as a repetition.
+ */
+function quantifierAt(
+  src: string,
+  i: number,
+): { length: number; variable: boolean } | { problem: string } | null {
   const c = src[i];
   if (c === "*" || c === "+" || c === "?") return { length: 1, variable: true };
   if (c !== "{") return null;
-  const m = /^\{(\d+)(,(\d*))?\}/.exec(src.slice(i, i + 24));
-  if (!m) return null;
+  BRACE_QUANTIFIER.lastIndex = i;
+  const m = BRACE_QUANTIFIER.exec(src);
+  if (!m) return { problem: "has an unescaped { that is not a quantifier (write \\{ for the character)" };
+  if (m[1].length > 3 || (m[3]?.length ?? 0) > 3) return { problem: "has a quantifier bound longer than 3 digits" };
   const min = Number(m[1]);
   const max = m[2] === undefined ? min : m[3] === "" ? Infinity : Number(m[3]);
   return { length: m[0].length, variable: max !== min };
@@ -279,7 +316,7 @@ function compileFormat(spelling: string, key: string): Matcher {
     } catch (err) {
       throw new ConfigError(`${key}: ${spelling} is not a valid regex (${(err as Error).message})`);
     }
-    return { spelling, re };
+    return matcher(spelling, re);
   }
   if (!spelling) throw new ConfigError(`${key}: the format is empty`);
   let source = "";
@@ -318,7 +355,7 @@ function compileFormat(spelling: string, key: string): Matcher {
       source += part;
     }
   }
-  return { spelling, re: new RegExp(`^${source}$`) };
+  return matcher(spelling, new RegExp(`^${source}$`));
 }
 
 /** `"/nodes/a/b/"` → `"a/b"`; `"/"`, `""` and `"nodes"` → `""` (the root). */
@@ -350,23 +387,49 @@ function assertType(type: string, key: string): void {
  * compiles to an empty, report-only rule set.
  */
 export function compileStructure(config: StructureConfig | null | undefined): CompiledStructure {
-  const templates: CompiledStructure["templates"] = {};
+  // Null prototype: a template named `constructor` or `toString` must never
+  // resolve to an inherited Object property.
+  const templates: CompiledStructure["templates"] = Object.create(null);
   for (const [name, t] of Object.entries(config?.templates ?? {})) {
-    templates[name] = { body: t?.body ?? "", required_sections: [...(t?.required_sections ?? [])] };
+    const sections = [...(t?.required_sections ?? [])];
+    // Sections are compared by heading anchor (§4: a-z, 0-9, "-"), so each
+    // must have one, and no two may share one — or one heading would satisfy
+    // several requirements.
+    const seen = new Map<string, string>();
+    for (const section of sections) {
+      const anchor = headingAnchor(String(section));
+      const key = `templates.${name}.required_sections`;
+      if (!anchor) {
+        throw new ConfigError(
+          `${key}: "${section}" has no a-z or 0-9 characters, so no heading can be matched to it (section anchors are ASCII)`,
+        );
+      }
+      if (seen.has(anchor)) {
+        throw new ConfigError(`${key}: "${section}" and "${seen.get(anchor)}" are the same heading anchor (#${anchor})`);
+      }
+      seen.set(anchor, String(section));
+    }
+    templates[name] = { body: t?.body ?? "", required_sections: sections };
   }
+
+  const entries = Object.entries(config?.folders ?? {});
+  if (entries.length > MAX_RULES) {
+    throw new ConfigError(`folders: at most ${MAX_RULES} folder rules (found ${entries.length})`);
+  }
+  const warnings: string[] = [];
 
   const rules: CompiledRule[] = [];
   const seen = new Map<string, string>();
   const placeholders: Array<{ rule: CompiledRule; index: number; key: string }> = [];
 
-  for (const [rawKey, spec] of Object.entries(config?.folders ?? {})) {
+  for (const [rawKey, spec] of entries) {
     const key = `folders.${rawKey}`;
     const pattern = normalizeKey(rawKey);
     const segments: Segment[] = [];
     for (const part of pattern ? pattern.split("/") : []) {
       const label = LABEL.exec(part)?.[1];
       if (label) {
-        segments.push({ label, matcher: label in TOKENS ? tokenMatcher(label) : SLUG_MATCHER });
+        segments.push({ label, matcher: label in TOKENS ? tokenMatcher(label) : slugMatcher() });
       } else if (part && !part.startsWith(".") && !/[{}]/.test(part)) {
         // Any folder name, not just a slug: engine-written folders are always
         // slugs, but a vault's own (`Engineering`, `my notes`) are matched
@@ -385,6 +448,15 @@ export function compileStructure(config: StructureConfig | null | undefined): Co
     seen.set(shape, rawKey);
 
     const rule = compileRule(spec ?? {}, pattern, segments, key, templates);
+    const named: Array<[string, string | undefined]> = [
+      [`${key}.template`, rule.template],
+      ...Object.entries(rule.files).map(([leaf, f]): [string, string | undefined] => [`${key}.files.${leaf}.template`, f.template]),
+    ];
+    for (const [where, name] of named) {
+      if (name !== undefined && !templates[name]) {
+        warnings.push(`${where}: "${name}" is not defined under templates — it adds no body and requires no sections`);
+      }
+    }
     segments.forEach((s, index) => {
       if (isPlaceholder(s) && !(s.label in TOKENS)) placeholders.push({ rule, index, key });
     });
@@ -406,6 +478,7 @@ export function compileStructure(config: StructureConfig | null | undefined): Co
     closed: config?.structure?.closed === true,
     rules,
     templates,
+    warnings: [...new Set(warnings)],
   };
 }
 
@@ -527,9 +600,14 @@ export function documentFolders(id: string): { root: string; folders: string[] }
 
 // ─── Matching ───────────────────────────────────────────────────────────────
 
+/**
+ * Literal names compare case-insensitively: on a case-insensitive filesystem
+ * (macOS, Windows) `NOTES/x` lands in `notes/`, so the `notes` rule must judge it.
+ */
+const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
 function segmentFits(seg: Segment, name: string): boolean {
-  if (!isPlaceholder(seg)) return seg.literal === name;
-  return name.length <= MAX_MATCHED_NAME && seg.matcher.re.test(name);
+  return isPlaceholder(seg) ? fits(seg.matcher, name) : sameName(seg.literal, name);
 }
 
 /** The first `n` segments of `rule` fit `folder` (formats included). */
@@ -544,7 +622,7 @@ function shapesPrefix(rule: CompiledRule, folder: string[], n = folder.length): 
   if (rule.segments.length < n) return false;
   for (let i = 0; i < n; i++) {
     const seg = rule.segments[i];
-    if (!isPlaceholder(seg) && seg.literal !== folder[i]) return false;
+    if (!isPlaceholder(seg) && !sameName(seg.literal, folder[i])) return false;
   }
   return true;
 }
@@ -685,7 +763,7 @@ export function checkDocument(rules: CompiledStructure, doc: StructureDoc): Viol
         rule: shown(rule.pattern),
         message: `File name "${p.leaf.slice(0, 24)}…" is longer than ${MAX_MATCHED_NAME} characters, the most a name rule checks.`,
       });
-    } else if (!rule.fileName.re.test(p.leaf)) {
+    } else if (!fits(rule.fileName, p.leaf)) {
       out.push({
         code: "FILE_NAME",
         path,
@@ -886,10 +964,18 @@ export function auditStructure(
     folderSet.add(display(segs));
     segsList.push(segs);
   }
+  // A folder no document lives under is an emptied shell (there is no folder
+  // delete to remove it): it is judged as a folder, but its required contents
+  // are not reported missing.
+  const occupied = new Set<string>();
+  for (const path of docPaths) {
+    const segs = path.split("/");
+    for (let k = 1; k < segs.length; k++) occupied.add(segs.slice(0, k).join("/"));
+  }
   for (const segs of segsList) {
     const chain = folderViolations(rules, segs);
     out.push(...chain);
-    if (chain.length > 0) continue;
+    if (chain.length > 0 || !occupied.has(display(segs))) continue;
     const rule = ruleAt(rules, segs);
     for (const child of requiredChildren(rules, segs)) {
       const path = display([...segs, child]);
@@ -956,6 +1042,7 @@ export function describeStructure(rules: CompiledStructure): StructureView {
     closed: rules.closed,
     folders: rules.rules.map(viewOf).sort((a, b) => byCodeUnit(a.pattern, b.pattern)),
     templates: structuredClone(rules.templates),
+    ...(rules.warnings.length > 0 ? { warnings: [...rules.warnings] } : {}),
   };
 }
 

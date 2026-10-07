@@ -238,6 +238,32 @@ describe(".context/ is never a document path", () => {
   });
 });
 
+describe("a backslash is never part of a written id", () => {
+  it.each(["nodes/notes\\evil", "notes\\evil"])("context_create refuses %s", async (id) => {
+    const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+    expect(err.code).toMatch(/VALIDATION_FAILED|INVALID_DOCUMENT_ID/);
+  });
+});
+
+describe("reserved paths are never document paths, in any layout", () => {
+  it.each(["_suggestions/evil", "packs/evil", "nodes/x/.versions/y/v1", "nodes/x/_suggestions/evil"])(
+    "context_create refuses id %s in a flat vault, rules or not",
+    async (id) => {
+      const flatDir = await mkdtemp(join(tmpdir(), "cn-structure-flat-"));
+      const flat = new NestStorage(flatDir);
+      await flat.init("flat", "obsidian");
+      const flatCtx = { ...ctx, storage: flat, query: new GraphQueryEngine(flat), versions: new VersionManager(flat) };
+      try {
+        const err = await refusal("context_create", { id, title: "Evil", content: "x" }, flatCtx);
+        expect(err.code).toBe("VALIDATION_FAILED");
+        expect((await flat.discoverDocuments()).map((d) => d.id)).not.toContain(id);
+      } finally {
+        await rm(flatDir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
 describe("report-only and absent rules", () => {
   it("enforce: false lets every write through", async () => {
     await writeConfig({ ...RULES, structure: { enforce: false, closed: true } });
@@ -411,6 +437,56 @@ describe("context_import", () => {
     expect(await exists("assets/logo.png")).toBe(true);
   });
 
+  it("files[]: a file is judged where the importer lands it (it renames _suggestions/ to suggestions/)", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/decisions/adr-3-x.md", content: "---\ntitle: ADR 3\n---\nx\n" },
+          { path: "nodes/decisions/_suggestions/adr-3-x/s1.patch", content: "p" },
+        ],
+      },
+      ctx,
+    );
+    // decisions/suggestions/ is not a declared folder, so under closed rules
+    // the patch is refused while its document lands.
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/decisions/_suggestions/adr-3-x/s1.patch"]);
+    expect(await exists("nodes/decisions/adr-3-x.md")).toBe(true);
+  });
+
+  it("files[]: a refused document's PDF sidecar is refused with it", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/decisions/bad.md", content: "---\ntitle: Bad\n---\nx\n" },
+          { path: "nodes/decisions/bad.pdf", content: "%PDF" },
+        ],
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id).sort()).toEqual(["nodes/decisions/bad.md", "nodes/decisions/bad.pdf"]);
+    expect(await exists("nodes/decisions/bad.pdf")).toBe(false);
+  });
+
+  it("files[]: no rename warning for a file that was refused", async () => {
+    const res = await api.run<{ warnings?: string[] }>(
+      "context_import",
+      { files: [{ path: ".context/config.yaml", content: "version: 1\nname: x\n" }] },
+      ctx,
+    );
+    expect((res.warnings ?? []).join(" ")).not.toMatch(/config-2/);
+  });
+
+  it("files[]: an uppercase .MD file is judged as a document", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/Stray.MD", content: "---\ntitle: Stray\n---\nx\n" }] },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/notes/Stray.MD"]);
+  });
+
   it("files[] with overwrite re-imports a grandfathered document (judged as an update)", async () => {
     await writeConfig({});
     await api.run("context_create", { title: "Old note", content: "legacy", folder: "notes" }, ctx);
@@ -491,6 +567,20 @@ describe("approvals are judged against the rules in force", () => {
     await writeConfig(MEETING_RULES);
     await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/Decisions/);
     expect(await readFile(join(dir, `${id}.md`), "utf-8")).toContain("Ship.");
+  });
+
+  it("approving a held create scaffolds the folders that document alone occupies", async () => {
+    await writeConfig(RULES);
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(false);
+    await approveReview(storage, id, { actor: "owner" });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+    expect(await exists("nodes/clients/acme-042/contracts")).toBe(true);
   });
 
   it("approveSuggestion refuses a drift edit that re-types the node into a refused type", async () => {
@@ -580,6 +670,12 @@ describe("context_structure", () => {
     expect(out).toMatchObject({ enforce: false, closed: false, folders: [], templates: {} });
     expect(out.resolved).toBeUndefined();
     expect(out.violations).toBeUndefined();
+  });
+
+  it("reports an unresolved template name as a warning", async () => {
+    await writeConfig({ folders: { decisions: { template: "ADR" } }, templates: { adr: { body: "x" } } });
+    const out = await api.run<any>("context_structure", {}, ctx);
+    expect(out.warnings).toEqual([expect.stringMatching(/ADR/)]);
   });
 
   it("a bad rule is reported in the output, not thrown — reading the rules is a read", async () => {

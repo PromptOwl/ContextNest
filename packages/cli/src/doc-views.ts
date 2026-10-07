@@ -213,6 +213,8 @@ export interface StructureOutput {
   violations?: Array<{ code: string; path: string; rule?: string; message: string }>;
   /** The rules do not compile: why (writes are refused only when enforced). */
   error?: string;
+  /** Rules that compile but are probably mistakes (an unresolved template name). */
+  warnings?: string[];
 }
 
 function describeRule(f: StructureFolderView): string {
@@ -261,6 +263,7 @@ export function printStructure(out: StructureOutput, opts: { json?: boolean; fol
       }
     }
   }
+  for (const w of out.warnings ?? []) console.log(chalk.yellow(`⚠ ${w}`));
   if (opts.folder !== undefined) {
     console.log(chalk.bold(`\n${opts.folder}`));
     if (!out.resolved) {

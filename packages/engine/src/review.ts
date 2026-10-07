@@ -40,7 +40,7 @@ import { publishDocument } from "./publish.js";
 import { listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { assertStructureUpdate, enforcedStructure } from "./structure-store.js";
+import { assertStructureUpdate, enforcedStructure, scaffoldApprovedCreate } from "./structure-store.js";
 import { checkDocument, enforceStructure } from "./structure.js";
 import { assertSafeDocumentId } from "./storage.js";
 import type { NestStorage } from "./storage.js";
@@ -363,6 +363,7 @@ export async function approveReview(
       editedBy: opts.actor,
       note: opts.note ?? "Approved in review",
     });
+    if (rules) await scaffoldApprovedCreate(storage, rules, id);
     await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
     return { id, version: result.versionEntry.version, checkpoint: result.checkpointNumber };
   });

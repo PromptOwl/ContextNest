@@ -88,6 +88,30 @@ describe("compileStructure", () => {
     expect(checkDocument(r, { id: "nodes/engineering/Anything", type: "prompt", body: "" })).toEqual([]);
   });
 
+  it("a required section must have a distinct, non-empty anchor (§4 anchors are ASCII)", () => {
+    expectConfigError({ templates: { t: { required_sections: ["背景"] } } }, /templates\.t\.required_sections/);
+    expectConfigError({ templates: { t: { required_sections: ["C++ API", "C API"] } } }, /templates\.t\.required_sections/);
+  });
+
+  it("an unresolved template name is reported as a warning (a typo would silently enforce nothing)", () => {
+    const r = compileStructure({ folders: { decisions: { template: "ADR" } }, templates: { adr: {} } });
+    expect(describeStructure(r).warnings).toEqual([expect.stringMatching(/folders\.decisions\.template.*ADR/)]);
+    expect(describeStructure(compileStructure({ folders: { d: {} } })).warnings).toBeUndefined();
+  });
+
+  it("template names that are Object built-ins are labels like any other (no inherited lookups)", () => {
+    const r = compileStructure({ folders: { notes: { template: "constructor", files: { o: { template: "toString" } } } } });
+    expect(resolveFolder(r, "notes")).toMatchObject({ template: "constructor" });
+    expect(resolveFolder(r, "notes")?.template_body).toBeUndefined();
+    expect(checkDocument(r, { id: "nodes/notes/x", type: "document", body: "" })).toEqual([]);
+    expect(scaffoldPlan(r, ["notes"]).documents[0].body).toBe("");
+  });
+
+  it("literal folder names match case-insensitively (case-insensitive filesystems put NOTES/ in notes/)", () => {
+    const r = compileStructure({ structure: { closed: true }, folders: { notes: { types: ["document"] } } });
+    expect(codes(checkDocument(r, { id: "nodes/NOTES/x", type: "glossary", body: "" }))).toEqual(["TYPE_NOT_ALLOWED"]);
+  });
+
   it("the spec's own §11.1 example still compiles: an unresolved template is a legacy label", () => {
     const r = compileStructure({ folders: { decisions: { template: "adr" }, engineering: { description: "x" } } });
     expect(resolveFolder(r, "decisions")).toMatchObject({ pattern: "decisions", template: "adr" });
@@ -105,7 +129,8 @@ describe("compileStructure", () => {
     for (const id of ["Engineering/x", "my notes/x", "_drafts/x"]) {
       expect(checkDocument(r, { id, type: "document", body: "" })).toEqual([]);
     }
-    expect(codes(checkDocument(r, { id: "engineering/x", type: "document", body: "" }))).toEqual(["FOLDER_NOT_ALLOWED"]);
+    expect(checkDocument(r, { id: "engineering/x", type: "document", body: "" })).toEqual([]); // case-insensitive
+    expect(codes(checkDocument(r, { id: "other/x", type: "document", body: "" }))).toEqual(["FOLDER_NOT_ALLOWED"]);
   });
 
   it("normalizes pattern keys: leading nodes/, slashes, and / for the root", () => {
@@ -163,6 +188,14 @@ describe("compileStructure", () => {
       ["a named group", "/(?<x>a)b/"],
       ["an unknown letter escape", "/\\x41/"],
       ["more than 4 alternation bars", "/(a|b|c|d|e|f)/"],
+      // Round 3: a zero-padded bound hid the quantifier from a 24-char window.
+      ["a zero-padded quantifier on a group", `/(?:a|aa){0,${"0".repeat(22)}99}!/`],
+      ["zero-padded quantifiers past the budget", `/[a-z]*[a-z]*[a-z]*[a-z]{0,${"0".repeat(22)}9}[a-z]{0,${"0".repeat(22)}9}!/`],
+      ["a quantifier bound over 3 digits", "/a{1000}/"],
+      ["an unescaped { that is not a quantifier", "/a{x/"],
+      ["an unescaped }", "/a}/"],
+      ["an escaped non-ASCII character", "/a\\é/"],
+      ["an escaped space", "/a\\ b/"],
     ])("refuses %s", (_label, src) => {
       expectConfigError({ folders: { d: { file_name: src } } }, /folders\.d\.file_name/);
     });
@@ -187,6 +220,26 @@ describe("compileStructure", () => {
       const started = Date.now();
       checkDocument(r, { id: `d/${name}`, type: "document", body: "" });
       expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    it("escaped braces are literal text", () => {
+      expect(() => compileStructure({ folders: { d: { file_name: "/v\\{[0-9]{2}\\}/" } } })).not.toThrow();
+    });
+
+    it("the cost of a check stays bounded however many rules reuse a slow pattern", () => {
+      const worst = "/(?:a|a)(?:a|a)(?:a|a)(?:a|a)a*a*a*b/";
+      const folders: Record<string, object> = { "{a}": { folder_name: worst } };
+      for (let i = 0; i < 200; i++) folders[`{a}/x${i}`] = {};
+      const r = compileStructure({ structure: { closed: true }, folders: folders as never });
+      const started = Date.now();
+      checkDocument(r, { id: `${"a".repeat(127)}c/x199/doc`, type: "document", body: "" });
+      expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    it("refuses more than 256 folder rules", () => {
+      const folders: Record<string, object> = {};
+      for (let i = 0; i < 257; i++) folders[`f${i}`] = {};
+      expectConfigError({ folders: folders as never }, /256/);
     });
 
     it("parses [] and [^] the way JavaScript does", () => {
@@ -601,6 +654,13 @@ describe("auditStructure", () => {
     expect(byCode("FOLDER_NOT_ALLOWED")).toEqual(["notes"]); // one finding per code and path
     expect(byCode("MISSING_FOLDER")).toEqual(["clients/acme-042/contracts"]);
     expect(byCode("MISSING_FILE")).toEqual(["clients/acme-042/overview"]);
+  });
+});
+
+describe("auditStructure — emptied folders", () => {
+  it("a folder with no documents left is a shell: its required contents are not reported missing", () => {
+    const v = auditStructure(rules(), [], ["clients", "clients/acme-042", "clients/acme-042/meetings"]);
+    expect(v.filter((x) => x.code === "MISSING_FILE" || x.code === "MISSING_FOLDER")).toEqual([]);
   });
 });
 

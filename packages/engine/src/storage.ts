@@ -134,6 +134,39 @@ export function normalizeDocumentId(raw: string): string {
  * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
  * needs the traversal check WITHOUT the rewrite.
  */
+/** Segments that hold vault machinery at any depth — never a document. */
+const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
+
+/**
+ * Refuse a document id a WRITE must never create: anything under `.context/`
+ * (the vault's settings — structure rules, review gate), `.versions/` (sealed
+ * history), `_suggestions/` (staged edits), or the vault-root `packs/`.
+ * Case-insensitive, with trailing dots and spaces dropped, because Windows
+ * drops them: `.context.` IS `.context` there. Reads keep going through
+ * {@link assertSafeDocumentId} alone.
+ */
+export function assertWritableDocumentId(raw: string): void {
+  assertSafeDocumentId(raw);
+  // A backslash is a separator on Windows but a literal file-name character
+  // on POSIX, so the path a check judges and the file storage writes would
+  // differ. Ids use "/".
+  if (raw.includes("\\")) {
+    throw new ContextNestError(`Invalid document id "${raw}": use "/" between folders, not "\\"`, "INVALID_DOCUMENT_ID");
+  }
+  const segments = raw
+    .split(/[/\\]+/)
+    .map((seg) => seg.replace(/[. ]+$/, "").toLowerCase())
+    .filter((seg) => seg !== "");
+  const reserved =
+    segments.find((seg) => RESERVED_SEGMENTS.has(seg)) ?? (segments[0] === "packs" ? "packs" : undefined);
+  if (reserved) {
+    throw new ContextNestError(
+      `${raw}: "${reserved}" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
 export function assertSafeDocumentId(raw: string): void {
   const segments = raw.split(/[/\\]/);
   if (segments.some((seg) => seg === "..")) {

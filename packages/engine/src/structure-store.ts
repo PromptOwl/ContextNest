@@ -8,7 +8,7 @@
  * these, so none of them re-implements scaffolding or the enforce gate.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import yaml from "js-yaml";
@@ -18,6 +18,7 @@ import { assertNotForgotten } from "./forget.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { parseDocument, serializeDocument, validateDocument } from "./parser.js";
 import {
+  checkDeleteDocument,
   checkUpdate,
   compileStructure,
   enforceStructure,
@@ -62,6 +63,35 @@ export async function assertStructureUpdate(
     return { id, type: node.frontmatter.type, body: node.body };
   };
   enforceStructure(rules, checkUpdate(rules, view(beforeRaw), view(afterRaw)));
+}
+
+/**
+ * Document files under a vault-relative folder, subfolders included, counted
+ * from directory listings — no document is read. Every status counts
+ * (rejected, forgotten stubs): they are files in the folder, and each can be
+ * deleted.
+ */
+async function documentsUnder(storage: NestStorage, folder: string): Promise<number> {
+  const below = (await storage.listFolders({ folder })).reduce((sum, f) => sum + f.count, 0);
+  if (!folder) {
+    return below + (await storage.discoverDocuments({ folder: "", recursive: false, includeRetired: true })).length;
+  }
+  const parent = folder.split("/").slice(0, -1).join("/");
+  const own = (await storage.listFolders({ folder: parent, recursive: false })).find((f) => f.path === folder);
+  return below + (own?.count ?? 0);
+}
+
+/**
+ * Refuse deleting a required file (§11.1.1) while its folder holds any other
+ * document. Every delete surface — `context_delete`, the legacy MCP tool,
+ * Community's own delete — calls this, so the counting lives in one place.
+ */
+export async function assertStructureDelete(storage: NestStorage, id: string): Promise<void> {
+  const rules = await enforcedStructure(storage);
+  if (!rules || checkDeleteDocument(rules, id).length === 0) return;
+  const folder = id.split("/").slice(0, -1).join("/");
+  const others = Math.max(0, (await documentsUnder(storage, folder)) - 1);
+  enforceStructure(rules, checkDeleteDocument(rules, id, others));
 }
 
 // ─── Scaffolding ────────────────────────────────────────────────────────────
@@ -138,6 +168,24 @@ export async function scaffoldFolders(
     await storage.regenerateIndex({ changedIds: written }).catch(() => undefined);
   }
   return written;
+}
+
+/**
+ * Scaffold for a held create that was just approved. Nothing was scaffolded
+ * when the write was held; the folders it created are the ones it still
+ * occupies alone, so those get their required contents now.
+ */
+export async function scaffoldApprovedCreate(
+  storage: NestStorage,
+  rules: CompiledStructure,
+  id: string,
+): Promise<string[]> {
+  const { root, folders } = documentFolders(id);
+  const alone: string[] = [];
+  for (const folder of folders) {
+    if ((await documentsUnder(storage, root ? `${root}/${folder}` : folder)) <= 1) alone.push(folder);
+  }
+  return scaffoldFolders(storage, rules, { root, folders: alone });
 }
 
 // ─── Writing the rules ──────────────────────────────────────────────────────
@@ -249,5 +297,9 @@ async function writeStructure(storage: NestStorage, rules: StructureConfig): Pro
     );
   }
   compileStructure(parseConfig(next));
-  await writeFile(path, `${bom}${next}`, "utf-8");
+  // Temp file + rename: a crash mid-write never leaves a half-written config,
+  // which every later read and write of the vault would trip over.
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, `${bom}${next}`, "utf-8");
+  await rename(tmp, path);
 }

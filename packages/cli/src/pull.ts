@@ -31,7 +31,9 @@ import {
   enforcedStructure,
   checkDocument,
   checkUpdate,
-  checkFolder,
+  missingFolders,
+  scaffoldFolders,
+  assertWritableDocumentId,
 } from "@promptowl/contextnest-engine";
 import type { ContextNode, Frontmatter, NestStorage, Violation } from "@promptowl/contextnest-engine";
 
@@ -102,6 +104,12 @@ function safeRelPath(value: string, where: string): string {
 function localDocId(value: string, where: string): string {
   const id = normalizeDocumentId(safeRelPath(value, where));
   if (!id.startsWith("nodes/")) throw invalid(`${where} "${value}" must be a document under nodes/`);
+  // The engine's write guard: never under .context/, .versions/ or _suggestions/.
+  try {
+    assertWritableDocumentId(id);
+  } catch (err) {
+    throw invalid(`${where} "${value}": ${(err as Error).message}`);
+  }
   return id;
 }
 
@@ -494,21 +502,18 @@ async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise
           continue;
         }
       }
+      const created = rules && !local ? await missingFolders(storage, step.to) : null;
       try {
         await storage.writeDocument(step.to, step.content, { exclusive: step.action === "create" });
+        if (rules && created) await scaffoldFolders(storage, rules, created);
       } catch (err) {
         if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) throw err;
         changed();
         continue;
       }
     } else {
-      if (rules && step.to.startsWith("nodes/")) {
-        const violations = checkFolder(rules, step.to.split("/").slice(0, -1).join("/"));
-        if (violations.length > 0) {
-          refuse(step, violations);
-          continue;
-        }
-      }
+      // Not judged by the structure rules: parseRecipeManifest keeps template
+      // files out of nodes/ (and packs/, dot-folders), where the rules apply.
       // Re-checked at write time: a file that appeared since planning is kept.
       if (await storage.hasVaultFile(step.to)) continue;
       await storage.writeVaultFile(step.to, step.content);

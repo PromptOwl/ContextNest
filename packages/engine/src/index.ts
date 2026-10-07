@@ -255,7 +255,13 @@ export {
 export type { RemoteNestConnection } from "./remote-nest.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId, normalizeFolder } from "./storage.js";
+export {
+  NestStorage,
+  UNSTAGED_DRIFT_SENTINEL,
+  normalizeDocumentId,
+  normalizeFolder,
+  assertWritableDocumentId,
+} from "./storage.js";
 export type {
   LayoutMode,
   ReadDocumentOptions,
@@ -525,6 +531,8 @@ export {
   missingFolders,
   scaffoldFolders,
   assertStructureUpdate,
+  assertStructureDelete,
+  scaffoldApprovedCreate,
 } from "./structure-store.js";
 
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
