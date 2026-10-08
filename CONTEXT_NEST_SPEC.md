@@ -258,8 +258,9 @@ Every document has a `type` that classifies its content:
 | `table` | Tabular data | A pricing matrix, a feature comparison |
 | `pdf` | A PDF document: the body is the text extracted from it, and the PDF itself is kept beside the node as a binary sidecar | A contract, a board deck, a research paper |
 | `task` | A unit of work tracked on a project board. Board fields (`assignee`, `due`, `priority`, `parent`) live in `metadata` | "Ship the onboarding email", a bug to fix |
+| `view` | A governed composition of other nodes: the `view` block lays out blocks that pull in nodes, selector results and (via the serving implementation) summaries, HTML and bound data | A monthly board pack, a team dashboard |
 
-The `source` type is described in detail in §1.9, the `skill` type in §1.10, and the `pdf` type in §1.11. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`. `task` likewise carries no type-specific validation rules; its board fields are ordinary `metadata` keys, and whether a task goes through review is an implementation's governance decision, not a validation rule.
+The `source` type is described in detail in §1.9, the `skill` type in §1.10, the `pdf` type in §1.11, and the `view` type in §1.12. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`. `task` likewise carries no type-specific validation rules; its board fields are ordinary `metadata` keys, and whether a task goes through review is an implementation's governance decision, not a validation rule.
 
 ### 1.7 Inline Syntax
 
@@ -758,6 +759,68 @@ Because `pdf.sha256` is frontmatter, it is part of every version's content (§6)
 - A sidecar replaced on disk without a new version no longer hashes to `pdf.sha256`; verification (§8.4) MUST report it (`sidecar_drift`), and a missing sidecar likewise (`sidecar_missing`).
 - Any operation that commits a version of a PDF node — including a rollback to an earlier version — MUST leave the live sidecar holding the binary that version records, archiving whatever it replaces. A commit whose binary no longer exists MUST be refused. Commits other than a PDF import or a rollback (a suggestion approval, a direct edit) MUST NOT change the body or the `pdf` block.
 - Deleting a PDF node MUST delete its sidecar along with its `.md` and version history.
+
+---
+
+### 1.12 View Nodes
+
+A view node composes other content into one page. It holds no content of its own beyond an optional introduction in its body: its `view` frontmatter block is a **layout** — an ordered list of blocks naming what to show and where it comes from. Content is resolved when the view is read.
+
+Because the layout is frontmatter, it is inside every version's `content_hash` (§6, §8). Approving a version of a view therefore approves *what it may show and from where*; the content behind its blocks can move without a new version of the view, and changing a block, selector, reference or pin is a new version.
+
+```yaml
+---
+title: "Monthly Board Pack"
+type: view
+tags: ["#finance", "#board"]
+status: published
+version: 4
+view:
+  render: live-approved
+  audience: [human, agent]
+  layout: stack
+  blocks:
+    - md: { ref: nodes/finance/commentary-oct }
+    - id: metrics
+      list: { select: "#board-metric", fields: [title, status] }
+    - summary: { select: "#customer-risk", style: brief }
+    - table: { from: metrics }
+---
+
+The pack the board reads before each meeting.
+```
+
+#### 1.12.1 View Frontmatter
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `view.blocks` | array | Yes | Ordered blocks (§1.12.2). At least one |
+| `view.render` | string | No | `live-approved` (default): `md` blocks serve the latest published version unless they pin one. `pinned`: every `md` block MUST pin a `version`, so the view replays exactly. Selector-based blocks (`list`, `summary`) always resolve against current content |
+| `view.audience` | array | No | Who the view may be served to: `human`, `agent` (default: both). An implementation decides what each audience reaches it through |
+| `view.layout` | string | No | `stack` (default) or `grid` — a presentation hint |
+
+The `view` block MUST be present when `type` is `view`. It MUST NOT be present on other node types. It MUST NOT carry keys beyond those this section defines, at any depth.
+
+#### 1.12.2 Blocks
+
+A block is an object with an optional `id` (letters, digits, `_`, `-`; starting with a letter) and **exactly one** kind:
+
+| Kind | Fields | Resolves to |
+|------|--------|-------------|
+| `md` | `ref`, `version?` | The body of the node `ref` names |
+| `list` | `select`, `fields?` (any of `id`, `title`, `version`, `status`, `tags`), `limit?` | The nodes the selector (§2) `select` matches |
+| `summary` | `select`, `style?` (`brief`\|`detailed`), `max_nodes?` | A generated summary of the nodes `select` matches |
+| `html` | `ref`, `data_from?` | The artifact node `ref` names, rendered in isolation, fed the output of the blocks `data_from` names |
+| `table`, `kpi`, `chart` | `from`, `title?` | A presentation of the output of block `from` |
+| `callout` | `text`, `tone?` (`info`\|`warning`) | Static text |
+| `metric` | `ref` | The governed metric node `ref` names |
+| `data` | `binding`, `as?` (`table`\|`json`) | Data fetched through the binding node `binding` names |
+
+`ref` and `binding` are **vault references** — a node path (`nodes/finance/arr`) or a `contextnest://` URI (§4) without a checkpoint pin (`@N`) or anchor (`#section`); an `md` block pins a node's version with its own `version` field. A view never names a URL, credential or code to run: live data enters a view only through a node its `data` or `metric` block references, and that node is governed on its own. `from` and `data_from` name the `id` of an **earlier** block, which keeps the blocks acyclic.
+
+#### 1.12.3 Resolution
+
+Reading a view resolves each block. `md`, `list` and `callout` need nothing but the vault, and implementations MUST resolve them under the same visibility rules as retrieval: an `md` block whose node is not currently published — whether or not the block pins a version — and a `list` member that is not published resolve to nothing unless the reader asked for drafts, and forgotten nodes (§6.3) never resolve to content. A pinned version is thus served only while its node is still visible — rejecting or retracting a node stops every view serving any of its versions — and only if it was itself published when it was cut. A failure to read history is an error, not an unavailable block. Status visibility is not access control: an implementation resolves a view over only the nodes the reader may see, and decides whether the reader is in the view's `audience`. A view referenced from an `md` block is served as its body and is not expanded. The remaining kinds need a model, a renderer, an isolated execution context or a binding resolver; this specification defines their fields, not how they are resolved. Implementations SHOULD record, for each read they serve, enough to replay it — each `md` block's `ref@version` and content hash, each `list` block's members and a hash over them, and the hash of the layout itself.
 
 ---
 
@@ -1914,7 +1977,7 @@ A valid Context Nest document:
 3. Body is valid markdown (GitHub Markdown spec 0.29-gfm)
 4. Context links use valid `contextnest://` URIs
 5. Tags match the allowed pattern: `^#?[a-zA-Z][a-zA-Z0-9_-]*$`
-6. If `type` is present, it MUST be one of the 13 defined node types (§1.6)
+6. If `type` is present, it MUST be one of the 15 defined node types (§1.6)
 7. If `status` is present, it MUST be one of: `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (after alias normalization, §1.5.1)
 8. If `checksum` is present, it MUST match the pattern `sha256:<64 hex chars>`
 
@@ -1958,6 +2021,20 @@ In addition to the base validation rules, `type: pdf` nodes MUST satisfy (rules 
 29. The `pdf` block MUST NOT be present on nodes where `type` is not `pdf`
 
 That the sidecar's bytes hash to `pdf.sha256` is an integrity property, checked by verification (§8.4), not a validation rule: validation reads the document alone.
+
+### 13.5 View Node Validation
+
+In addition to the base validation rules, `type: view` nodes MUST satisfy (rules 30–36):
+
+30. The `view` block MUST be present in frontmatter
+31. The `view` block MUST NOT be present on nodes where `type` is not `view` (an untyped node is a `document`)
+32. `view.blocks` MUST be a non-empty array, and each block MUST declare exactly one kind from §1.12.2
+33. Every `ref` and `binding` MUST be a vault reference — a node path or a `contextnest://` URI, with no other scheme, no leading `/` or `//`, no `\`, no `@` pin or `#` anchor, and no empty, `.` or `..` segments — and no part of the `view` block may carry keys beyond those §1.12 defines
+34. Every `select` MUST parse as a selector (§2)
+35. Block `id`s MUST be unique within the view, and every `from` / `data_from` entry MUST name the `id` of an earlier block
+36. When `view.render` is `pinned`, every `md` block MUST carry a `version`
+
+Whether a reference resolves is not a validation rule: a view may name a node that does not exist yet, and resolution (§1.12.3) reports it.
 
 **Suggested MIME type**: `text/markdown; variant=context-nest`
 
@@ -2023,6 +2100,7 @@ The following components remain proprietary:
 
 ### 1.2 — draft
 
+- **New node type `view`** (§1.12): a governed composition of other nodes. The required `view` block is a layout of `md`, `list`, `summary`, `html`, `table`, `kpi`, `chart`, `callout`, `metric` and `data` blocks whose references are vault references, never URLs. `md`, `list` and `callout` resolve from the vault under retrieval visibility; the rest are resolved by the serving implementation. Validation rules 30–36 (§13.5). §13 rule 6 corrected to 15 node types.
 - **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and an audit-only record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
 
 ### 1.1 — 2026-09

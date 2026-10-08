@@ -19,6 +19,7 @@ import type {
   PdfMeta,
   SkillMeta,
   SourceMeta,
+  ViewMeta,
 } from "../types.js";
 import {
   serializeDocument,
@@ -434,6 +435,7 @@ function buildDraftNode(input: {
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
   source?: SourceMeta;
+  view?: ViewMeta;
 }): ContextNode {
   const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
@@ -458,12 +460,13 @@ function buildDraftNode(input: {
     // updated_at until its first edit, and every surface renders it blank.
     updated_at: now,
   };
-  // `source` and `skill` are required by one type and forbidden on the others,
+  // `source`, `skill` and `view` are required by one type and forbidden on the others,
   // so they cannot ride along inside `metadata` and cannot be added afterwards
   // — a source node written without its block fails every later update.
   applyTypedBlocks(frontmatter, {
     type,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -636,6 +639,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   applyTypedBlocks(frontmatter, {
     type: nextType,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),

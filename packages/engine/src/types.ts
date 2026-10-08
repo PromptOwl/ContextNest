@@ -18,7 +18,8 @@ export type NodeType =
   | "artifact"
   | "table"
   | "pdf"
-  | "task";
+  | "task"
+  | "view";
 
 /** Document status (§1.5)
  *
@@ -143,6 +144,39 @@ export interface SkillMeta {
   guard_rails?: string[];
 }
 
+/** How a view resolves its `md` refs (§1.12): the latest published version, or the versions each block pins. */
+export type ViewRenderMode = "live-approved" | "pinned";
+
+/** Who a view may be served to (§1.12). An implementation decides what each audience reaches it through. */
+export type ViewAudience = "human" | "agent";
+
+/** One block of a view (§1.12.2): an optional `id` plus exactly one kind. */
+export type ViewBlock = { id?: string } & (
+  | { md: { ref: string; version?: number } }
+  | { list: { select: string; fields?: Array<"id" | "title" | "version" | "status" | "tags">; limit?: number } }
+  | { summary: { select: string; style?: "brief" | "detailed"; max_nodes?: number } }
+  | { html: { ref: string; data_from?: string[] } }
+  | { table: { from: string; title?: string } }
+  | { kpi: { from: string; title?: string } }
+  | { chart: { from: string; title?: string } }
+  | { callout: { text: string; tone?: "info" | "warning" } }
+  | { metric: { ref: string } }
+  | { data: { binding: string; as?: "table" | "json" } }
+);
+
+/**
+ * The `view` block (§1.12) — present iff `type: view`. A declarative layout over
+ * other nodes: it names what the view may show and from where, never the
+ * content itself. Being frontmatter, it is inside every version's content_hash,
+ * so approving a view version approves its layout.
+ */
+export interface ViewMeta {
+  render?: ViewRenderMode;
+  audience?: ViewAudience[];
+  layout?: "stack" | "grid";
+  blocks: ViewBlock[];
+}
+
 /**
  * PDF metadata block — present only on type: pdf nodes (§1.11).
  *
@@ -187,6 +221,8 @@ export interface Frontmatter {
   skill?: SkillMeta;
   /** PDF block — present only on type: pdf nodes (§1.11). */
   pdf?: PdfMeta;
+  /** View block — present only on type: view nodes (§1.12). */
+  view?: ViewMeta;
   /** Zone ID (zone-classification-rbac-spec §2.1 Level 2 metadata override) */
   zone?: string;
   /** Governance tier (zone-classification-rbac-spec §1) */

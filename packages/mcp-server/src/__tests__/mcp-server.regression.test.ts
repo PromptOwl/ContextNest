@@ -435,6 +435,30 @@ describe("[regression] MCP server e2e — mutation tools", () => {
     expect(json.frontmatter.skill.trigger).toBe("when asked to do the thing");
   });
 
+  it("create_document round-trips a view node's block, refuses one without it, and update_document re-types it away", async () => {
+    const view = { blocks: [{ md: { ref: "nodes/created" } }, { list: { select: "#alpha" } }] };
+    const { json } = await callJson(client, "create_document", {
+      path: "nodes/my-view",
+      title: "My View",
+      type: "view",
+      view,
+    });
+    expect(json.frontmatter.type).toBe("view");
+    expect(json.frontmatter.view).toEqual(view);
+    expect(await isToolError(client, "create_document", { path: "nodes/no-view", title: "No View", type: "view" })).toBe(true);
+    expect(
+      await isToolError(client, "create_document", {
+        path: "nodes/bad-view",
+        title: "Bad View",
+        type: "view",
+        view: { blocks: [{ md: { ref: "https://evil.example" } }] },
+      }),
+    ).toBe(true);
+    const updated = await callJson(client, "update_document", { path: "nodes/my-view", type: "document" });
+    expect(updated.json.frontmatter.type).toBe("document");
+    expect(updated.json.frontmatter.view).toBeUndefined();
+  });
+
   it("create_document round-trips a source node's block, and refuses one without it", async () => {
     const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
     const { json } = await callJson(client, "create_document", {
