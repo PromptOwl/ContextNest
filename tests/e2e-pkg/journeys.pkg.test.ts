@@ -15,7 +15,7 @@
  */
 
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
-import { rmSync, readFileSync, writeFileSync } from "node:fs";
+import { rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { packCli, freshInstall, runJourney, type Journey } from "./journey-harness.js";
 
@@ -325,6 +325,156 @@ const J2: Journey = {
   ],
 };
 
+/** The documents a `ctx query --json` payload resolved to, by id. */
+type QueryDoc = { id: string; title: string; body: string };
+const queryDocs = (data: unknown) => (data as { documents: QueryDoc[] }).documents;
+const queryDocIds = (data: unknown) => queryDocs(data).map((d) => d.id).sort();
+
+/**
+ * J3 — "I curate a reusable bundle of nodes and load it back by name."
+ * The team-lead promise: group a hand-picked set of nodes into a saved pack so
+ * anyone pulls the whole set with one name instead of re-typing a selector —
+ * and the pack keeps working as the underlying nodes change.
+ *
+ * A pack is authored as a `packs/<id>.yml` file (spec §3) — there is no
+ * `ctx pack create` command, so "save a pack" is writing that file, done here
+ * via the harness `mutate` hook. The selector is deliberately narrower than the
+ * vault (`#onboarding`, not everything): a third `#other` node must stay OUT of
+ * the pack, proving the bundle is curated rather than "all nodes".
+ *
+ * The review gate is turned OFF (like J2): the nodes should be published
+ * knowledge the pack resolves, not drafts held behind a gate.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J3: Journey = {
+  id: "J3",
+  title: "Curated bundles / packs (team lead)",
+  cases: [
+    {
+      id: "J3-01",
+      title: "Save a named pack from a selection of nodes",
+      actions: [
+        { args: ["init", "--name", "onboarding-packs"], stdout: ["Initialized"] },
+        // Published knowledge, not drafts behind the gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        // Two nodes belong in the bundle...
+        {
+          args: [
+            "add", "nodes/welcome",
+            "--type", "document",
+            "--title", "Welcome",
+            "--tags", "#onboarding",
+            "--body", "Welcome to the team.",
+            "-y",
+          ],
+          files: [{ path: "nodes/welcome.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/setup",
+            "--type", "document",
+            "--title", "Setup",
+            "--tags", "#onboarding",
+            "--body", "Install the tools.",
+            "-y",
+          ],
+          files: [{ path: "nodes/setup.md", exists: true }],
+        },
+        // ...and one deliberately does NOT — it proves the pack is a curated
+        // selection, not "every node in the vault".
+        {
+          args: [
+            "add", "nodes/misc",
+            "--type", "document",
+            "--title", "Misc",
+            "--tags", "#other",
+            "--body", "Unrelated note.",
+            "-y",
+          ],
+          files: [{ path: "nodes/misc.md", exists: true }],
+        },
+        // Save the pack: author packs/onboarding.yml over the #onboarding
+        // selection, then confirm the CLI now knows it. (`#` must be quoted in
+        // YAML or it's read as a comment.)
+        {
+          mutate: (vault) => {
+            // `init` creates packs/, but don't depend on that — a clear write
+            // beats an opaque ENOENT if the scaffold ever changes.
+            mkdirSync(join(vault, "packs"), { recursive: true });
+            writeFileSync(
+              join(vault, "packs", "onboarding.yml"),
+              [
+                "id: onboarding",
+                "label: Onboarding Pack",
+                "description: Everything a new hire needs.",
+                'query: "#onboarding"',
+                "",
+              ].join("\n"),
+            );
+          },
+          args: ["pack", "list"],
+          stdout: ["pack:onboarding", "Onboarding Pack"],
+        },
+        {
+          args: ["pack", "list", "--json"],
+          json: (data) => {
+            const packs = data as Array<{ id: string; query: string }>;
+            expect(packs).toHaveLength(1);
+            expect(packs[0].id).toBe("onboarding");
+            expect(packs[0].query).toBe("#onboarding");
+          },
+        },
+      ],
+    },
+    {
+      id: "J3-02",
+      title: "Load the pack by name and get every node in it back",
+      actions: [
+        // Loading by name returns the two bundled nodes — and not the #other one.
+        {
+          args: ["query", "pack:onboarding"],
+          // Word-bounded count so it can't be satisfied by "12 nodes" etc.
+          stdout: ["nodes/welcome", "nodes/setup", /\b2 nodes\b/],
+          stdoutNot: ["nodes/misc"],
+        },
+        {
+          args: ["query", "pack:onboarding", "--json"],
+          json: (data) => {
+            expect(queryDocIds(data)).toEqual(["nodes/setup", "nodes/welcome"]);
+          },
+        },
+        // `pack show` reports the saved bundle's definition.
+        {
+          args: ["pack", "show", "onboarding"],
+          stdout: ["Onboarding Pack", "Query: #onboarding"],
+        },
+      ],
+    },
+    {
+      id: "J3-03",
+      title:
+        "Edit one node in the pack, then load the pack again — it still resolves and reflects the edit",
+      actions: [
+        {
+          args: ["update", "nodes/welcome", "--body", "Welcome aboard, friend.", "-y"],
+          stdout: ["Version: 2"],
+        },
+        // The pack still resolves the same set, and the edited node's body is
+        // the current one — the saved selector tracks the nodes, not a snapshot.
+        {
+          args: ["query", "pack:onboarding", "--json"],
+          json: (data) => {
+            expect(queryDocIds(data)).toEqual(["nodes/setup", "nodes/welcome"]);
+            const welcome = queryDocs(data).find((d) => d.id === "nodes/welcome");
+            expect(welcome?.body).toContain("Welcome aboard, friend.");
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -332,5 +482,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J2 — time-travel through a node's history", () => {
     runJourney({ installDir: INSTALL, scratch }, J2);
+  });
+
+  it("J3 — curate and reuse a pack of nodes", () => {
+    runJourney({ installDir: INSTALL, scratch }, J3);
   });
 });
