@@ -12,11 +12,27 @@
 
 Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) — turn scattered knowledge into a structured, queryable brain your AI agents can use. Same instinct as the Obsidian-brain pattern, but with typed graph structure, ~100× cheaper queries (~500 tokens vs 50k), a sharing path, and governed change history when you need it.
 
+> **New in 2.1** — no command writes to your working directory without saying so: `--dry-run` on every write command, an action log of what changed, and confirmation prompts on the destructive ones. See [File safety](#file-safety). The install also drops from 104 packages to 2.
+>
+> **New in 2.0** — `ctx` now runs on the engine's shared operation catalog, so the CLI, the MCP server and the PromptOwl cloud all execute the same code for the same action. New: `ctx info`, `ctx publish --all`, `ctx vault describe`, `ctx history --diff`, `--limit` on `list` and `search`. See [Upgrading to 2.0](#upgrading-to-20).
+
 ## Install
 
 ```bash
 npm install -g @promptowl/contextnest-cli
 ```
+
+**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install.
+For a lean install without terminal colour:
+
+```bash
+npm install -g @promptowl/contextnest-cli --omit=optional
+```
+
+That leaves exactly one package, with every command, flag and output format unchanged. The rest of
+the code is compiled into the published bundle rather than resolved from npm, so the install is
+deterministic — and every bundled package is listed with its version and licence in
+[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
 
 ## Quick Start
 
@@ -64,30 +80,141 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 
 ## Commands
 
+### Vault
+- `ctx info` — Show a vault's instructions, configuration and contents (`--nodes` to list them, `--json` for the raw payload). This *opens* an existing vault; `ctx init` *creates* one
+- `ctx vault list` — List registered vaults (`*` marks the default)
+- `ctx vault add <alias> [path]` — Register a vault
+- `ctx vault describe <alias> [description]` — Set or clear a registry description; omit the text to remove it
+- `ctx vault default <alias>` / `ctx vault remove <alias>` / `ctx vault which`
+
 ### Document Management
-- `ctx add <path>` — Create a new document
+- `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)
 - `ctx add <path> --type skill` — Create a skill node with trigger, inputs, and guard rails
 - `ctx read <path>` — Read and display a document in the terminal
 - `ctx read <path> --html` — Render as styled HTML and open in browser
 - `ctx read <path> --html --out file.html` — Save rendered HTML to file
+- `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
+- `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
 - `ctx update <path>` — Update a document
-- `ctx delete <path>` — Delete a document
+- `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
+- `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
+- `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
 - `ctx publish <path>` — Publish (bump version, create checkpoint)
+- `ctx publish --all` — Publish every unpublished document in one batch, with a live counter. Seals one checkpoint and regenerates the index once, instead of once per document
 - `ctx validate [path]` — Validate against the spec
-- `ctx list` — List documents (filter by `--type`, `--status`, `--tag`)
-- `ctx search <query>` — Full-text search
+- `ctx list` — List documents (filter by `--type`, `--status`, `--tag`; cap with `--limit`)
+- `ctx search <query>` — Full-text search, best match first (documents matching every term, then partial matches, each by relevance score). Prints the top 10; `--limit <n>` to change, `--limit 0` for all; `--json` carries each hit's `score`. When combining with selector filters in `ctx query`, put the search term first (`contextnest://search/foo + type:document`) to keep ranked order — only the leftmost operand's order survives an AND/OR
 
 ### Context Queries
 - `ctx query <selector>` — Query context with graph traversal (default: 2 hops)
 - `ctx query <selector> --hops 4` — Deeper traversal for more context
 - `ctx query <selector> --full` — Load all documents (legacy full mode)
+- `ctx query <selector> --include-drafts` — Include drafts (default: published only)
 - `ctx query @org/pack` — Query from a cloud-hosted pack
 - `ctx resolve <selector>` — Execute a selector query
 
 ### Versioning & Integrity
 - `ctx history <path>` — Show version history
-- `ctx reconstruct <path> <version>` — Reconstruct a specific version
-- `ctx verify` — Verify all hash chains
+- `ctx history <path> --diff` — Include each version's unified diff from the one before
+- `ctx reconstruct <path> <version>` — Reconstruct a specific version. A version the history does not contain is now refused rather than answered with a neighbouring version's content
+- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it; forgotten versions verify hash-only)
+- `ctx forget-log [path]` — The forget audit trail (never the forgotten content)
+
+### File Safety
+
+No command writes to your working directory without telling you. Three global
+flags govern every write:
+
+| Flag | Effect |
+|------|--------|
+| `--dry-run` | Runs the command against a throwaway copy of the vault, prints the exact files it *would* touch, and leaves your vault untouched |
+| `-y, --yes` | Skips confirmation prompts — the "prior explicit consent" for scripts and CI |
+| `--force`   | Overwrites an existing file, repoints a taken vault alias, or allows a plaintext-HTTP push |
+
+```bash
+ctx add nodes/spec --title "Spec" --dry-run   # preview, writes nothing
+ctx delete nodes/spec --yes                   # destructive, so it needs the flag
+ctx read nodes/spec --html --out out.html     # refuses to clobber out.html without --force
+```
+
+**Action log.** Every write command ends with the list of files it created
+(`+`), modified (`~`) or deleted (`-`), computed by comparing the vault before
+and after — so it reflects what actually happened, not what was intended. The
+log goes to **stderr**, leaving `--json` output and redirected stdout clean.
+
+`--dry-run` covers the vault registry too: `ctx vault add|remove|default|describe`
+run against a throwaway copy of `~/.contextnest/`, so a preview fails on an
+alias collision or an unregistered alias exactly where the real command would,
+rather than promising something that can't happen.
+
+**Confirmation.** On a terminal, write commands ask before proceeding.
+Destructive ones (`delete`, `checkpoint rebuild`, `drift approve`,
+`vault remove`, re-running `init` over an existing vault, overwriting an
+`--out` file, `push`) default to *no*. Without a TTY nothing blocks on stdin:
+additive commands take their own argv as consent, destructive ones **refuse**
+unless `--yes` or `--force` was passed.
+
+**Network egress.** `ctx push` lists the documents leaving your machine and
+asks before sending them. Plaintext HTTP to a non-loopback host is refused —
+it would put both the documents and your API key on the wire in the clear.
+Prefer `CONTEXTNEST_API_KEY` over `--key`: command-line arguments are visible
+to other processes and land in shell history.
+
+**Confirmation gate.** A nest can require a human to confirm a push in the web
+UI before it is applied. When it does, `ctx push` prints a `Confirm in the UI:`
+link and waits for the decision, exiting `0` once the push is applied and
+non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
+submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
+defaults to the server's window, else 15 minutes). Ungated nests apply
+immediately, exactly as before. A push that runs straight through lists any
+document it skipped (already exists — never overwritten) or failed, and exits
+non-zero if one failed. On such a nest, `ctx add` against the remote vault is
+held the same way: it prints the nest's message and exits `0`, and the document
+does not exist until a reviewer confirms it.
+
+### Caller attribution
+
+Three global flags record *who is calling* on every read and write
+(spec §9.4):
+
+| Flag | Effect |
+|------|--------|
+| `--agent <name>` | Name of the calling agent (env: `CONTEXTNEST_AGENT`) |
+| `--session <id>` | Calling session id (env: `CONTEXTNEST_SESSION_ID`) |
+| `--client <key=value>` | Extra caller metadata, repeatable |
+
+```bash
+ctx add nodes/spec --title "Spec" --agent claude-code --session s-9f2
+ctx history nodes/spec
+#   v1 [keyframe] published
+#     By: you@example.com at 2026-08-22T15:54:47.356Z
+#     Client: claude-code (session s-9f2)
+```
+
+A write that publishes records the block on its version-history entry, so
+`ctx history` shows which agent produced each version — distinct from `By:`,
+which is the authoring identity. Reads carry it too; nothing is persisted for
+them locally, but a governed backend receives it.
+
+The env vars are the reason this is practical for agents: a plugin that shells
+out to `ctx` exports them once for a session instead of threading flags through
+every call. A flag beats the env var per key, so `--agent` on one command
+overrides the ambient agent while keeping the ambient session.
+
+Values from `--client` are recorded as **strings** — a shell argument is text,
+and coercing `version=1.0` to `1` would quietly lose characters from an audit
+record. Attribution is a label, never an identity claim: nothing authenticates
+it, and it is never used to authorize.
+
+### Errors
+
+Every failure prints as a single line — `Error [CODE]: message` for engine
+errors, a plain `Error: message` for everything else. No stack traces leak into
+normal output.
+
+```bash
+CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
+```
 
 ### Packs & Checkpoints
 - `ctx pack list` — List context packs
@@ -98,9 +225,33 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 ### Index & Agent Configs
 - `ctx index` — Regenerate context.yaml, INDEX.md, and agent config files (CLAUDE.md, GEMINI.md, .cursorrules, .windsurfrules, .github/copilot-instructions.md)
 
+## Upgrading to 2.0
+
+Your vault files are untouched — no migration to run. Behaviour that changes:
+
+- **A brand-new document now starts at v1.** `ctx add` used to write `version: 1`
+  into frontmatter and let publish bump it, so a new document's history began at
+  **v2 with no v1 keyframe**. Publish owns version assignment; existing documents
+  are unaffected.
+- **`ctx vault list` shows a vault's description** where it previously fell back
+  to its `name`. Vaults whose `.context/config.yaml` carries a `description` now
+  display it. Precedence: registry description → the vault's own config
+  description → its `name`.
+- **`ctx reconstruct` refuses a version that does not exist** instead of
+  returning the nearest keyframe's content as though it were the version asked
+  for.
+- **`ctx update --tags` replaces the tag set** rather than merging into it. Pass
+  the full set you want.
+- **`ctx list --type document` and `--status rejected` now actually match.**
+  Both silently returned nothing before — `--type` compared against an optional
+  field with no default, and rejected documents were dropped before the status
+  filter ran. Tags match with or without a leading `#`, and case-insensitively.
+- **`ctx init --description` reaches the vault's own config**, not just its
+  registry entry.
+
 ## Graph Traversal
 
-Queries use `context.yaml` as a lightweight graph index. Instead of loading all documents into memory, the engine evaluates selectors against metadata, traverses relationship edges for N hops via BFS, and only loads bodies for reached nodes.
+Queries use `context.yaml` as a lightweight graph index. Instead of loading all documents into memory, the engine evaluates selectors against metadata, traverses relationship edges for N hops via BFS, and only loads bodies for reached nodes. `[[wikilinks]]` in document bodies become `reference` edges when the vault is indexed (`ctx index` reports how many, and how many failed to resolve), so wiki-style vaults traverse the same as ones linked with `contextnest://` URIs.
 
 ```bash
 ctx query "#engineering"           # Default: 2 hops from matched docs
@@ -120,8 +271,10 @@ Edge priorities:
 Grammar, one line:
 
 ```
-#tag  type:X  status:X  pack:id  contextnest://path   ·   combine with + (AND)  | (OR)  - (NOT)  ( ) to group
+Atoms: #tag  type:X  status:X  pack:id  nodes/<id>  sources/<id>   Operators: space or + = AND, | = OR, - = NOT, ( ) to group
 ```
+
+`nodes/<id>` is a bare node id — `ctx query "nodes/gtm/foo"` selects that one node (the long form `contextnest://nodes/gtm/foo` still works); `sources/<id>` does the same for a source node. A bare word without the `nodes/` prefix is an error, with a hint. `tag:#x`, `transport:X` and `server:X` are also accepted.
 
 ```bash
 ctx query "#engineering"                   # All docs with a tag
@@ -130,8 +283,12 @@ ctx query "type:skill"                     # All skill nodes
 ctx query "type:skill + #engineering"      # Engineering skills only
 ctx query "pack:engineering-essentials"    # All docs in a pack
 ctx query "status:published"              # By status
-ctx query "#api + #v2"                    # Union
-ctx query "#api + status:published"       # Intersection
+ctx query "nodes/gtm/foo"                 # One node by id
+ctx query "sources/jira"                  # One source node by id
+ctx query "#api + #v2"                    # Intersection (AND): both tags
+ctx query "#api | #v2"                    # Union (OR): either tag
+ctx query "#api - #deprecated"            # Difference (NOT)
+ctx query "(#api | #v2) + status:published"  # Group, then AND
 ```
 
 ## Cloud Packs
@@ -140,6 +297,38 @@ Query context from cloud-hosted packs without downloading source files:
 
 ```bash
 ctx query @promptowl/executive-ai-strategy
+```
+
+## Recipes (`ctx pull`)
+
+A recipe is a node in a remote nest (slug `recipe-<id>`) whose body holds one fenced block that opens with ```` ```yaml recipe ````. It names the remote nodes to copy and where they land, the skills to bring in, the template files to write at the vault root, and the pack to generate. Because the recipe is a node, it is stewarded and versioned like everything it describes.
+
+```bash
+ctx pull <remote-alias> --recipe org-essentials --dry-run   # show the plan, write nothing
+ctx pull <remote-alias> --recipe org-essentials             # pull
+ctx pull <remote-alias> --recipe org-essentials --update    # take newer upstream versions
+```
+
+- Every pulled document lands as a **draft** with `derived_from: contextnest://<nest>/<id>` and `metadata.pulled_from` recording the upstream version. Review it, then `ctx publish`.
+- A later pull skips what is current, reports newer upstream versions (applied only with `--update`), and **never overwrites** a document or file it did not pull, nor a pulled one you have since edited or published.
+- Skills land as `type: skill`. Install one with `ctx skill install <path> --mode loader --write`.
+- Pulls write into a **local vault** for now; use `ctx push` to send the result to a hosted nest.
+
+```yaml recipe
+id: org-essentials
+includes:
+  - from: nodes/org/spine/the-accountability-method   # remote node id
+    to: nodes/methodologies/accountability-method      # local document id
+    tags: [prime-document]                             # optional, added to the source's tags
+skills:
+  - from: nodes/org/skills/distill-capture             # lands at nodes/skills/<slug> unless `to` is set
+files:
+  - from: nodes/org/templates/stewards-example         # first ```yaml block in the node; `to` must be .yaml/.yml, outside nodes/, packs/ and dot-folders
+    to: stewards.example.yaml
+pack:
+  id: org-essentials
+  include: [nodes/methodologies/accountability-method]
+  agent_instructions: Load these first.
 ```
 
 ## AI Agent Integration
@@ -158,7 +347,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **19 tools** over stdio (resolve, search, read/create/update/publish documents, drift governance, integrity verification, and more):
+For direct AI agent access via the Model Context Protocol — **41 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -177,7 +366,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 19 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 41 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 

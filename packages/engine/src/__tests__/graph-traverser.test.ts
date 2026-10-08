@@ -91,6 +91,29 @@ describe("GraphTraverser", () => {
     expect(result.nodeIds).not.toContain("G");
   });
 
+  it("walking back from a hub is not free", () => {
+    // X, Y, Z all link to hub H. Seeding H at 0 hops must return H alone:
+    // the free rule is for reaching a hub, not for leaving one.
+    const docs = [doc("H"), doc("X"), doc("Y"), doc("Z")];
+    const edges = [edge("X", "H"), edge("Y", "H"), edge("Z", "H")];
+    const hubs: HubEntry[] = [{ id: "H", degree: 3 }];
+    const traverser = new GraphTraverser(docs, edges, hubs);
+    expect(traverser.traverse(new Set(["H"]), { maxHops: 0 }).nodeIds).toEqual(new Set(["H"]));
+    // One hop back from the hub still reaches its backlinkers.
+    expect(traverser.traverse(new Set(["H"]), { maxHops: 1 }).nodeIds).toEqual(
+      new Set(["H", "X", "Y", "Z"]),
+    );
+    // Reaching the hub from a backlinker stays free.
+    expect(traverser.traverse(new Set(["X"]), { maxHops: 0 }).nodeIds).toEqual(new Set(["X", "H"]));
+  });
+
+  it("walking back along depends_on (to a dependent) costs a hop", () => {
+    const traverser = new GraphTraverser(documents, relationships, []);
+    // A --dep--> F. From F at 0 hops, A (which depends on F) is not pulled in.
+    expect(traverser.traverse(new Set(["F"]), { maxHops: 0 }).nodeIds).toEqual(new Set(["F"]));
+    expect(traverser.traverse(new Set(["F"]), { maxHops: 1 }).nodeIds).toContain("A");
+  });
+
   it("explicit priority 0 makes an edge free", () => {
     const customEdges: RelationshipEdge[] = [
       edge("A", "B", "reference", 0), // explicitly free

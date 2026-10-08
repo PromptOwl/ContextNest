@@ -3,39 +3,104 @@
  * Supports both structured and Obsidian-compatible layouts (§1.1).
  */
 
-import { readFile, writeFile, mkdir, stat, unlink, rm, rename } from "node:fs/promises";
-import { join, dirname, basename } from "node:path";
-import fg from "fast-glob";
+import {
+  access,
+  readFile,
+  writeFile,
+  mkdir,
+  open,
+  stat,
+  unlink,
+  rm,
+  rename,
+  readdir,
+} from "node:fs/promises";
+import { join, dirname, basename, isAbsolute } from "node:path";
 import yaml from "js-yaml";
+import { globFiles } from "./glob.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
+  INTEGRITY_WARNING,
   detectDrift,
+  sha256,
+  sha256Bytes,
   verifyDocumentChain,
   verifyCheckpointChain,
 } from "./integrity.js";
+import { reconstructFromHistory } from "./reconstruct.js";
 import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+import { mapInBatches } from "./concurrency.js";
+import { resolveIdCasing } from "./id-casing.js";
+import {
+  buildTombstoneIndex,
+  carriesForgottenBody,
+  isPathForgotten,
+  type TombstoneIndex,
+} from "./tombstones.js";
 import type {
   ContextNode,
   NestConfig,
+  ReviewMode,
   DocumentHistory,
+  VersionEntry,
+  Checkpoint,
   CheckpointHistory,
   Pack,
   ContextYaml,
   PendingChange,
   VerificationReport,
+  IntegrityFailure,
 } from "./types.js";
-import { ContextNestError, DocumentNotFoundError } from "./errors.js";
+import {
+  ContextNestError,
+  CorruptHistoryError,
+  DocumentNotFoundError,
+  VersionArtifactExistsError,
+} from "./errors.js";
 import {
   packSchema,
   documentHistorySchema,
+  checkpointSchema,
   checkpointHistorySchema,
 } from "./schemas.js";
+import {
+  VaultCrypto,
+  VaultLockedError,
+  WrongVaultKeyError,
+  type VaultCryptoOptions,
+} from "./encryption/vault-crypto.js";
+import {
+  DecryptionFailedError,
+  isArmoredText,
+  isSealedBinary,
+  isSealedField,
+  type SealKind,
+} from "./encryption/envelope.js";
 
 /** Sentinel suggestion_id used before a drift has been staged into `_suggestions/`. */
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
+
+/**
+ * What a read of `.versions/context_history.yaml` found.
+ *
+ * Deliberately four cases, not a nullable checkpoint. The publish seal
+ * quarantines a chain it cannot read, so "unreadable" has to be separable from
+ * "absent" and from "valid but holds nothing" — and a transient I/O failure has
+ * to be neither, which is why {@link NestStorage.readCheckpointChainState}
+ * throws rather than reporting one.
+ */
+export type CheckpointChainState =
+  /** No chain file yet. */
+  | { kind: "absent" }
+  /** Valid, with no checkpoints — what a rebuild writes over an empty vault. */
+  | { kind: "empty" }
+  /** The newest checkpoint, to link the next one onto. */
+  | { kind: "head"; checkpoint: Checkpoint }
+  /** Present and genuinely unparseable. The only state that licenses a quarantine. */
+  | { kind: "unreadable"; reason: string };
 
 /**
  * Normalize a user-supplied document path/slug into a canonical document id.
@@ -57,16 +122,133 @@ export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
  */
 export function normalizeDocumentId(raw: string): string {
   const trimmed = raw.replace(/\.md$/, "").replace(/^\/+/, "");
-  // A legitimate document id never contains a `..` segment; treating one as a
-  // path would let it escape the vault root. Reject it at this single choke
-  // point that every CLI/MCP path conversion flows through.
-  if (trimmed.split(/[/\\]/).some((seg) => seg === "..")) {
+  assertSafeDocumentId(trimmed);
+  return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
+}
+
+/**
+ * Reject an id that would escape the vault root, or that names no document.
+ * Callers join ids against the root verbatim, so every id arriving from outside
+ * must clear this.
+ *
+ * Split out of `normalizeDocumentId` because that also re-roots a bare slug
+ * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
+ * needs the traversal check WITHOUT the rewrite.
+ */
+export function assertSafeDocumentId(raw: string): void {
+  const segments = raw.split(/[/\\]/);
+  if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(
       `Invalid document id "${raw}": path traversal ("..") is not allowed.`,
       "INVALID_DOCUMENT_ID",
     );
   }
-  return trimmed.includes("/") ? trimmed : `nodes/${trimmed}`;
+  // A segment with no letter or digit anywhere means a caller derived this id
+  // from a title that carries none — "###", "...", "   ". Empty lands the write
+  // at `nodes/.md`: a dotfile discovery never lists, no id can address, and the
+  // next such title collides with. Punctuation-only segments are addressable but
+  // just as unusable. Reject the id rather than store the ghost.
+  //
+  // Any script counts (\p{L}/\p{N}), NOT the a-z0-9 slug rule: ids for existing
+  // documents get read back through here, and a vault may hold "nodes/日本語".
+  if (segments.some((seg) => !/[\p{L}\p{N}]/u.test(seg))) {
+    throw new ContextNestError(
+      `Invalid document id "${raw}": every path segment needs at least one letter or number.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+}
+
+/**
+ * Normalize a folder path used to scope discovery: drops empty segments,
+ * accepts either separator, and rejects `..` — the path is joined against the
+ * vault root to start the crawl, so a traversal sequence would read outside it.
+ *
+ * `""` is the vault root, which is why this cannot reuse `assertSafeDocumentId`
+ * (that requires every segment to name something).
+ *
+ * Splitting on the separator rather than trimming with an anchored `\/+` also
+ * keeps this linear: that pattern retries at every position of a long run of
+ * slashes, which is quadratic on a hostile path (CodeQL js/polynomial-redos).
+ */
+export function normalizeFolder(raw: string): string {
+  const segments = raw.split(/[/\\]/).filter(Boolean);
+  if (segments.includes("..")) {
+    throw new ContextNestError(
+      `Invalid folder "${raw}": path traversal ("..") is not allowed.`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  return segments.join("/");
+}
+
+/**
+ * Markdown that lives in the vault but is not a knowledge node: version
+ * artifacts, generated indexes, agent-config scaffold. Shared by document
+ * discovery and folder listing so the two can never disagree about which files
+ * count — a folder holding only these is not a folder of documents.
+ */
+export const NON_DOCUMENT_BASENAMES = new Set([
+  "INDEX.md",
+  // Agent-config / scaffold files are not knowledge nodes.
+  "CLAUDE.md",
+  "GEMINI.md",
+  "AGENTS.md",
+  "README.md",
+]);
+
+/**
+ * Globs matching every file an encrypted vault seals. ONE list on purpose:
+ * migrate's `sensitiveFiles` (what gets sealed) and verify's
+ * `findUnencryptedFiles` (what must be sealed) both build on it, so a new
+ * sensitive artifact cannot be added to one and silently missed by the other.
+ */
+export const SENSITIVE_FILE_GLOBS = [
+  "**/*.md",
+  "**/.versions/*/*.md",
+  "**/.versions/*/*.diff",
+  "**/.versions/*/*.pdf",
+  "**/_suggestions/**/*.patch",
+  "**/_suggestions/**/*.meta.yaml",
+  "**/*.pdf",
+  "context.yaml",
+];
+
+/**
+ * Run a write; only if its directory is missing, create it and write once more.
+ * The directory almost always exists, and an up-front `mkdir -p` is a round
+ * trip per write on a network mount.
+ */
+async function writeInDir<T>(dir: string, write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    await mkdir(dir, { recursive: true });
+    return write();
+  }
+}
+
+/** Largest chain_events.yaml whose parsed events `readTombstones` keeps in memory. */
+export const CHAIN_EVENT_CACHE_MAX_BYTES = 256 * 1024;
+
+const NON_DOCUMENT_FILES = [
+  "**/node_modules/**",
+  "**/.versions/**",
+  "**/.context/**",
+  // Root-only, unlike the basenames below: a CONTEXT.md nested in a folder is
+  // an authored document, the one at the vault root is the vault's preamble.
+  "CONTEXT.md",
+  "context.yaml",
+  ...[...NON_DOCUMENT_BASENAMES].map((name) => `**/${name}`),
+];
+
+/** A folder of documents, and how many sit directly in it. */
+export interface FolderEntry {
+  /** Path relative to the vault root — the id prefix, e.g. `nodes/gtm`. */
+  path: string;
+  /** Documents directly in this folder, not counting its subfolders. */
+  count: number;
 }
 
 /** Options for `NestStorage.readDocument`. */
@@ -96,14 +278,349 @@ export interface ReadDocumentOptions {
 
 export type LayoutMode = "structured" | "obsidian";
 
+/**
+ * `rename` onto an existing target is atomic on POSIX but contended on Windows:
+ * if any other handle has the destination open — a concurrent replace of the
+ * same file, an antivirus scanner, the search indexer — MoveFileEx fails with
+ * EPERM/EACCES/EBUSY rather than waiting. The contention is transient, so retry
+ * briefly before giving up.
+ *
+ * Tradeoff: fixed backoff schedule, ~500ms total across 10 attempts. If a real
+ * workload starts losing writes here, the fix is a per-path write queue, not a
+ * longer sleep.
+ */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  const RETRYABLE = new Set(["EPERM", "EACCES", "EBUSY"]);
+  const MAX_ATTEMPTS = 10;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      if (attempt >= MAX_ATTEMPTS - 1 || !RETRYABLE.has(code)) throw err;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2 ** attempt, 250)));
+    }
+  }
+}
+
+/**
+ * Move an unreadable integrity file aside and return where it went.
+ *
+ * The hash-chain files are the only record of what a document's history was, so
+ * a caller that cannot parse one must never be the caller that deletes it.
+ * Renaming keeps every byte for forensics and repair while freeing the canonical
+ * name, which is what lets a write proceed instead of failing on a file nobody
+ * can read. `.corrupt-<ts>` sits outside every glob the engine crawls
+ * (`history.yaml`, `**\/.versions/*\/history.yaml`), so a quarantined file is
+ * inert rather than re-read on the next pass.
+ */
+async function quarantine(path: string): Promise<string> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.replace(/\.yaml$/, "") + `.corrupt-${stamp}.yaml`;
+  await renameWithRetry(path, dest);
+  return dest;
+}
+
+/** Options for {@link NestStorage}. */
+export interface NestStorageOptions {
+  /**
+   * Key material for an encrypted vault (see `encryption/`). Omitted, the
+   * storage finds the key itself — `CONTEXTNEST_VAULT_KEY`, then the default
+   * key store. Ignored for a plain vault.
+   */
+  encryption?: VaultCryptoOptions;
+}
+
+/** Artifact kind a vault-relative path holds, for sealing on import. */
+function kindForVaultPath(relPath: string): { kind: SealKind; docId: string } | null {
+  const norm = relPath.replace(/\\/g, "/");
+  const version = /^(?:(.*)\/)?\.versions\/([^/]+)\/v\d+\.(md|diff)$/.exec(norm);
+  if (version) {
+    const docId = version[1] ? `${version[1]}/${version[2]}` : version[2];
+    return { kind: version[3] === "md" ? "keyframe" : "diff", docId };
+  }
+  if (norm.endsWith(".md") && !norm.split("/").some((seg) => seg.startsWith("."))) {
+    const base = norm.split("/").pop()!;
+    if (NON_DOCUMENT_BASENAMES.has(base) || norm === "CONTEXT.md") return null;
+    return { kind: "doc", docId: norm.slice(0, -3) };
+  }
+  return null;
+}
+
 export class NestStorage {
-  constructor(public readonly root: string) {}
+  constructor(
+    public readonly root: string,
+    private readonly options: NestStorageOptions = {},
+  ) {}
+
+  /**
+   * Encryption state: a VaultCrypto for an encrypted vault, null for a plain
+   * one. Loading reads `.context/encryption.yaml` only; the key itself is
+   * fetched on the first seal/open.
+   *
+   * Re-validated against the config file's mtime at most once per second, so
+   * a long-lived process (the MCP server) notices a `ctx vault encrypt` /
+   * `decrypt` run from another terminal instead of writing plaintext into a
+   * vault that just became encrypted (or ciphertext into one that stopped).
+   */
+  private cryptoLoad: Promise<VaultCrypto | null> | undefined;
+  private cryptoStamp = { checkedAt: 0, mtimeMs: -1 as number };
+  private cryptoPinned = false;
+  /** In-flight re-check, shared so a batch of parallel reads loads once. */
+  private cryptoRefresh: Promise<VaultCrypto | null> | undefined;
+
+  /** The vault's encryption handle, or null for a plain (default) vault. */
+  async getVaultCrypto(): Promise<VaultCrypto | null> {
+    if (this.cryptoLoad && (this.cryptoPinned || Date.now() - this.cryptoStamp.checkedAt <= 1000)) {
+      return this.cryptoLoad;
+    }
+    this.cryptoRefresh ??= this.refreshVaultCrypto().finally(() => {
+      this.cryptoRefresh = undefined;
+    });
+    return this.cryptoRefresh;
+  }
+
+  private async refreshVaultCrypto(): Promise<VaultCrypto | null> {
+    const now = Date.now();
+    const mtimeMs = await stat(VaultCrypto.configPath(this.root)).then(
+      (st) => st.mtimeMs,
+      () => -1,
+    );
+    if (this.cryptoPinned && this.cryptoLoad) return this.cryptoLoad;
+    if (!this.cryptoLoad || mtimeMs !== this.cryptoStamp.mtimeMs) {
+      // Verdicts computed under a different encryption state are stale.
+      if (this.cryptoLoad) this.historyVerdicts.clear();
+      this.cryptoLoad = VaultCrypto.load(this.root, this.options.encryption);
+    }
+    this.cryptoStamp = { checkedAt: now, mtimeMs };
+    return this.cryptoLoad;
+  }
+
+  /**
+   * Pin the encryption handle, bypassing the on-disk config — for the vault
+   * encrypt/decrypt operations only, which run under the vault lock and move
+   * the config themselves.
+   */
+  setVaultCrypto(crypto: VaultCrypto | null): void {
+    this.cryptoLoad = Promise.resolve(crypto);
+    this.cryptoPinned = true;
+    this.historyVerdicts.clear();
+  }
+
+  async isEncrypted(): Promise<boolean> {
+    return (await this.getVaultCrypto()) !== null;
+  }
+
+  /**
+   * Read a text artifact, decrypting in memory when it is sealed. A plaintext
+   * file inside an encrypted vault (an editor dropped it in, a migration was
+   * interrupted) still reads — `ctx verify` reports it as `unencrypted_file`
+   * and the next write through the engine seals it.
+   */
+  private async readText(absPath: string, kind: SealKind | SealKind[], what: string): Promise<string> {
+    const raw = await readFile(absPath, "utf-8");
+    return this.openText(raw, kind, what);
+  }
+
+  private async openText(raw: string, kind: SealKind | SealKind[], what: string): Promise<string> {
+    if (!isArmoredText(raw)) return raw;
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) {
+      throw new ContextNestError(
+        `${what} is encrypted, but this vault has no .context/encryption.yaml — the file came from an encrypted vault, or the config was deleted.`,
+        "VAULT_LOCKED",
+      );
+    }
+    return crypto.openText(raw, kind, what);
+  }
+
+  /**
+   * Seal text for disk when the vault is encrypted; identity otherwise.
+   * `docId` is unused while one vault key seals everything — it is the seam
+   * where per-document keys (crypto-shred for forget) plug in.
+   */
+  private async sealText(docId: string, kind: SealKind, plaintext: string): Promise<string> {
+    const crypto = await this.getVaultCrypto();
+    return crypto ? crypto.sealText(kind, plaintext) : plaintext;
+  }
+
+  private async sealBytes(docId: string, bytes: Uint8Array): Promise<Uint8Array> {
+    const crypto = await this.getVaultCrypto();
+    return crypto ? crypto.sealBytes(bytes) : bytes;
+  }
+
+  private async openBytes(bytes: Buffer, what: string): Promise<Buffer> {
+    if (!isSealedBinary(bytes)) return bytes;
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) throw new ContextNestError(`${what} is encrypted, but this vault has no encryption config.`, "VAULT_LOCKED");
+    return crypto.openBytes(bytes, what);
+  }
+
+  /** Seal the free-text fields of a history entry (`note`, legacy inline `diff`). */
+  private async sealEntry(docId: string, entry: VersionEntry): Promise<VersionEntry> {
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) return entry;
+    const out = { ...entry };
+    if (typeof out.note === "string" && !isSealedField(out.note)) out.note = await crypto.sealNote(out.note);
+    if (typeof out.diff === "string" && !isSealedField(out.diff)) out.diff = await crypto.sealNote(out.diff);
+    return out;
+  }
+
+  /**
+   * Open a history's sealed fields. Locked, they stay sealed rather than
+   * failing the read: nothing hashed lives in them (`note` is not a chain
+   * input), and leaving the ciphertext in place means a read-modify-write can
+   * never replace it with a placeholder.
+   */
+  private async openHistoryFields(docId: string, history: DocumentHistory): Promise<DocumentHistory> {
+    if (!history.versions.some((v) => isSealedField(v.note) || isSealedField(v.diff))) return history;
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) return history;
+    try {
+      await crypto.unlock();
+    } catch (err) {
+      if (err instanceof VaultLockedError || err instanceof WrongVaultKeyError) return history;
+      throw err;
+    }
+    // A field that will not open stays sealed: a tampered note is not a chain
+    // input, and a tampered legacy inline diff then re-hashes as ciphertext,
+    // which verify reports as a content_hash_mismatch rather than crashing.
+    const tryOpen = async (value: string, what: string): Promise<string> => {
+      try {
+        return await crypto.openNote(value, what);
+      } catch (err) {
+        if (err instanceof ContextNestError) return value;
+        throw err;
+      }
+    };
+    const versions = await Promise.all(
+      history.versions.map(async (v) => {
+        const out = { ...v };
+        if (isSealedField(out.note)) out.note = await tryOpen(out.note, `${docId} v${v.version} note`);
+        if (isSealedField(out.diff)) out.diff = await tryOpen(out.diff, `${docId} v${v.version} diff`);
+        return out;
+      }),
+    );
+    return { ...history, versions };
+  }
+
+  /**
+   * The key-less half of a chain check: `chain_hash` linkage over the stored
+   * `content_hash`es, with every content re-hash skipped (keyframes and diffs
+   * are ciphertext; a sealed legacy inline diff would hash as a false
+   * mismatch). Never a substitute for a full verify — callers pair it with an
+   * `encrypted_key_required` finding.
+   */
+  verifyChainLinkage(docId: string, history: DocumentHistory): VerificationReport["errors"] {
+    const stripped = { ...history, versions: history.versions.map(({ diff: _diff, ...v }) => v) };
+    return verifyDocumentChain(docId, stripped, () => null).errors;
+  }
+
+  /**
+   * Null when content can be verified; otherwise why not (encrypted vault, no
+   * key or the wrong one). Verification treats non-null as a hard failure.
+   */
+  async encryptionLockState(): Promise<string | null> {
+    const crypto = await this.getVaultCrypto();
+    if (!crypto) return null;
+    try {
+      await crypto.unlock();
+      return null;
+    } catch (err) {
+      if (err instanceof VaultLockedError) return "encrypted, key required — content hashes cannot be checked without the vault key";
+      if (err instanceof WrongVaultKeyError) return `encrypted, key rejected — ${err.message}`;
+      throw err;
+    }
+  }
+
+  /**
+   * Sensitive files in an encrypted vault that are NOT sealed: documents,
+   * keyframes, diffs, suggestion files, context.yaml, pdf binaries. Empty for
+   * a plain vault. Reported by verify as `unencrypted_file`.
+   */
+  async findUnencryptedFiles(): Promise<VerificationReport["errors"]> {
+    if (!(await this.isEncrypted())) return [];
+    const files = await globFiles(
+      this.root,
+      SENSITIVE_FILE_GLOBS,
+      ["**/node_modules/**", "**/.context/**", "CONTEXT.md", ...[...NON_DOCUMENT_BASENAMES].map((n) => `**/${n}`)],
+    );
+    const errors: VerificationReport["errors"] = [];
+    for (const file of [...new Set(files)].sort()) {
+      const abs = join(this.root, file);
+      let sealed: boolean;
+      if (file.endsWith(".pdf")) {
+        sealed = isSealedBinary(await readFile(abs));
+      } else {
+        const text = await readFile(abs, "utf-8");
+        // A root-level scaffold file (README-like, no front matter) is not a
+        // node and is not sealed; only files the engine would treat as content.
+        if (file.endsWith(".md") && !file.includes("/") && !text.startsWith("---")) continue;
+        sealed = isArmoredText(text);
+      }
+      if (!sealed) {
+        errors.push({ type: "unencrypted_file", document: file, expected: "sealed", actual: "plaintext" });
+      }
+    }
+    return errors;
+  }
 
   /**
    * In-process serialization chain for the checkpoint history
    * read-modify-write. See `withCheckpointLock`.
    */
   private checkpointWriteChain: Promise<unknown> = Promise.resolve();
+
+  /** Disambiguates concurrent `writeFileDurable` temp files. See that method. */
+  private tmpWriteCounter = 0;
+
+  /** chain_events.yaml as last parsed, keyed by its stat. See `readTombstones`. */
+  private chainEventCache?: { size: number; mtimeMs: number; ino: number; events: readonly unknown[] };
+
+  /**
+   * Per-document history verdicts for the serve path, keyed by doc id and
+   * stamped with the digest of the history.yaml bytes they were computed from.
+   * A new version rewrites history.yaml, so the stamp changes and the chain is
+   * re-verified; an unchanged history is not re-hashed on every read. See
+   * `verifyServedDocument`.
+   */
+  private historyVerdicts = new Map<
+    string,
+    { digest: string; errors: VerificationReport["errors"] }
+  >();
+
+  /**
+   * Documents whose history.yaml this instance wrote, rewrote, moved aside or
+   * deleted since the last checkpoint. A checkpoint reuses the previous head's
+   * chain hash only for a document NOT in here whose version is unchanged — a
+   * rewrite (`repairLatestVersion`) can re-hash a version without renumbering
+   * it, and a delete + re-create can reuse a version number. See
+   * `CheckpointManager.createCheckpointFromVault`.
+   */
+  private touchedHistories = new Map<string, number>();
+  private touchSeq = 0;
+
+  private markHistoryTouched(docId: string): void {
+    this.touchedHistories.set(docId, ++this.touchSeq);
+  }
+
+  /** Which histories were touched since the last seal, each with its mark. */
+  touchedHistorySnapshot(): ReadonlyMap<string, number> {
+    return new Map(this.touchedHistories);
+  }
+
+  /**
+   * Clear the marks a seal consumed. A mark set again after the snapshot (a
+   * write that landed during the seal) has a new number, so it stays for the
+   * next seal.
+   */
+  clearTouchedHistories(snapshot: ReadonlyMap<string, number>): void {
+    for (const [id, seq] of snapshot) {
+      if (this.touchedHistories.get(id) === seq) this.touchedHistories.delete(id);
+    }
+  }
 
   /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
@@ -155,14 +672,33 @@ export class NestStorage {
    *
    * Back-compat: `includeSuperseded` is accepted as a deprecated alias for
    * `includeRetired`. Either flag opens the filter.
+   *
+   * `folder` scopes the crawl to one directory (a path relative to the vault
+   * root, i.e. the id prefix — `nodes/gtm`, not `gtm`). This narrows the READ,
+   * not just the result: a caller browsing one folder of a large vault never
+   * opens the rest of it. With `recursive: false` only that folder's own
+   * documents are read, so its subfolders cost nothing either.
    */
   async discoverDocuments(
-    options: { includeRetired?: boolean; includeSuperseded?: boolean } = {},
+    options: {
+      includeRetired?: boolean;
+      includeSuperseded?: boolean;
+      folder?: string;
+      recursive?: boolean;
+    } = {},
   ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
     let patterns: string[];
 
-    if (layout === "structured") {
+    const folder = options.folder === undefined ? undefined : normalizeFolder(options.folder);
+    if (folder !== undefined) {
+      // One directory. An empty folder means the vault root itself, whose
+      // own *.md files are the root-level nodes.
+      const prefix = folder ? `${folder}/` : "";
+      patterns = options.recursive === false
+        ? [`${prefix}*.md`]
+        : [`${prefix}**/*.md`];
+    } else if (layout === "structured") {
       // Include root-level *.md so a node is discoverable wherever it lives,
       // not only under nodes/ or sources/. Agent-config and scaffold files at
       // the root are excluded via the ignore list below.
@@ -171,31 +707,12 @@ export class NestStorage {
       patterns = ["**/*.md"];
     }
 
-    const files = await fg(patterns, {
-      cwd: this.root,
-      ignore: [
-        "**/node_modules/**",
-        "**/.versions/**",
-        "**/.context/**",
-        "**/INDEX.md",
-        "CONTEXT.md",
-        "context.yaml",
-        // Agent-config / scaffold files are not knowledge nodes.
-        "**/CLAUDE.md",
-        "**/GEMINI.md",
-        "**/AGENTS.md",
-        "**/README.md",
-      ],
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const files = await globFiles(this.root, patterns, NON_DOCUMENT_FILES);
 
-    const nodes: ContextNode[] = [];
-    for (const file of files.sort()) {
+    const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
-      const content = await readFile(filePath, "utf-8");
       const id = file.replace(/\.md$/, "");
+      const content = await this.readText(filePath, "doc", id);
       const node = parseDocument(filePath, content, id);
       // Root-level discovery (structured layout) globs *.md at the vault root so
       // a node can live anywhere. But a vault root commonly holds scaffold files
@@ -209,14 +726,87 @@ export class NestStorage {
       const isRootLevel = !file.includes("/");
       const authoredKeys = Object.keys(node.frontmatter).filter((k) => k !== "status");
       if (layout === "structured" && isRootLevel && authoredKeys.length === 0) {
-        continue;
+        return null;
       }
-      nodes.push(node);
-    }
+      return node;
+    });
+    const nodes = parsed.filter((n): n is ContextNode => n !== null);
 
     const includeRetired = options.includeRetired || options.includeSuperseded;
     if (includeRetired) return nodes;
     return nodes.filter((n) => n.frontmatter.status !== "rejected");
+  }
+
+  /**
+   * The vault's folders, WITHOUT reading a single document.
+   *
+   * Discovery's cost is not the directory walk, it is opening and parsing every
+   * markdown file it finds. A caller that only needs the shape of the vault — a
+   * navigable tree, a folder picker, per-folder counts — pays none of that here:
+   * the walk yields paths, and paths alone answer the question.
+   *
+   * Counts are of files, so they include retired documents; a status is only
+   * knowable by reading the file, which is the thing this avoids. Ancestors are
+   * included even when they hold no document of their own, so a tree built from
+   * this is fully navigable. `folder` and `recursive` scope it exactly as they
+   * scope `discoverDocuments`.
+   */
+  async listFolders(
+    options: { folder?: string; recursive?: boolean } = {},
+  ): Promise<FolderEntry[]> {
+    const base = options.folder === undefined ? "" : normalizeFolder(options.folder);
+    const found: FolderEntry[] = [];
+
+    // Directories are read, not inferred from the documents inside them: a
+    // folder holding nothing but subfolders is still a folder, and inferring
+    // from files would silently drop it.
+    const scan = async (rel: string, depth: number): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(join(this.root, rel), { withFileTypes: true });
+      } catch {
+        return; // unreadable subtree — same tolerance as the vault crawl
+      }
+      let count = 0;
+      const children: string[] = [];
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          // Dot-directories (.versions, .context, .git, .obsidian), package
+          // installs, and staged-suggestion stores hold no knowledge nodes.
+          if (entry.name.startsWith(".")) continue;
+          if (entry.name === "node_modules" || entry.name === "_suggestions") continue;
+          children.push(rel ? `${rel}/${entry.name}` : entry.name);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (!NON_DOCUMENT_BASENAMES.has(entry.name)) count++;
+        }
+      }
+      if (rel !== base) found.push({ path: rel, count });
+      // Sibling directories are independent reads, and on a network mount each
+      // one is a round trip — the very cost this function exists to avoid.
+      // Batched rather than unbounded so a wide vault can't exhaust file
+      // handles. Push order stops being deterministic; the caller sorts.
+      if (depth > 0) {
+        await mapInBatches(children, (child) => scan(child, depth - 1));
+      }
+    };
+
+    await scan(base, options.recursive === false ? 1 : Infinity);
+    return found.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * The id of an existing document as it is spelled on disk (issue #117).
+   *
+   * `readDocument` returns the id it was given. On a case-insensitive
+   * filesystem that may not be the spelling discovery reports (`nodes/report`
+   * reads `nodes/Report.md`), so a caller about to derive paths from the id —
+   * a pdf sidecar, `pdf.file`, version history — resolves it here first.
+   * Unchanged on a case-sensitive filesystem, and for an id with no file.
+   */
+  async resolveDocumentIdCasing(id: string): Promise<string> {
+    return resolveIdCasing(id, (relDir) =>
+      readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root),
+    );
   }
 
   /**
@@ -241,15 +831,16 @@ export class NestStorage {
     // nodes remain discoverable via list/search; they are addressed by their own
     // (root) id, not by a normalized `nodes/` slug.
     const filePath = join(this.root, `${id}.md`);
-    let liveContent: string;
+    let raw: string;
     try {
-      liveContent = await readFile(filePath, "utf-8");
+      raw = await readFile(filePath, "utf-8");
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         throw new DocumentNotFoundError(id);
       }
       throw err;
     }
+    const liveContent = await this.openText(raw, "doc", id);
 
     const liveNode = parseDocument(filePath, liveContent, id);
     if (!options.verifyChecksum) {
@@ -292,15 +883,16 @@ export class NestStorage {
     id: string,
   ): Promise<ReturnType<typeof detectDrift> | null> {
     const filePath = join(this.root, `${id}.md`);
-    let liveContent: string;
+    let raw: string;
     try {
-      liveContent = await readFile(filePath, "utf-8");
+      raw = await readFile(filePath, "utf-8");
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return null;
       }
       throw err;
     }
+    const liveContent = await this.openText(raw, "doc", id);
     const liveNode = parseDocument(filePath, liveContent, id);
     return detectDrift(liveContent, liveNode.frontmatter.checksum);
   }
@@ -313,38 +905,58 @@ export class NestStorage {
    * Single source for mcp-server, cli, and desktop. Each agent-config file
    * is merged with its existing on-disk content so user-authored sections
    * outside engine-managed blocks are preserved.
+   *
+   * `changedIds` scopes the INDEX.md rewrite to the folders holding those docs
+   * (a folder's INDEX.md lists only its own docs). context.yaml is always rebuilt.
+   * The ids must not have changed folder — a move needs the full rebuild.
+   * `latestCheckpoint` is the head the caller just sealed, saving its re-read.
+   * `docs` is a crawl (includeRetired) the caller took after its last document
+   * write — the checkpoint's — saving a second full crawl.
    */
-  async regenerateIndex(): Promise<void> {
+  async regenerateIndex(
+    opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint; docs?: ContextNode[] } = {},
+  ): Promise<void> {
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
-    const docs = await this.discoverDocuments({ includeRetired: true });
+    const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
     const config = await this.readConfig();
-    const checkpointHistory = await this.readCheckpointHistory();
-    const latestCheckpoint = checkpointHistory?.checkpoints?.at(-1) ?? null;
+    // Only the LATEST checkpoint reaches context.yaml, so this must not load the
+    // whole chain: regenerateIndex runs after every single write, and
+    // context_history.yaml grows by one entry per published doc per checkpoint.
+    // Parsing it here is what made writes time out on a mature vault while reads
+    // — which never come through this path — stayed instant.
+    const latestCheckpoint = opts.latestCheckpoint ?? (await this.readLatestCheckpoint());
     const published = docs.filter((d) => d.frontmatter.status === "published");
     const packs = await this.readPacks();
 
     const contextYaml = generateContextYaml(published, config, latestCheckpoint);
     await this.writeContextYaml(contextYaml);
 
+    const folderOf = (id: string) => {
+      const parts = id.split("/");
+      return parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+    };
     const folders = new Map<string, ContextNode[]>();
     for (const doc of docs) {
-      const parts = doc.id.split("/");
-      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+      const folder = folderOf(doc.id);
       if (!folders.has(folder)) folders.set(folder, []);
       folders.get(folder)!.push(doc);
     }
+    const scope = opts.changedIds ? new Set(opts.changedIds.map(folderOf)) : null;
 
-    for (const [folder, folderDocs] of folders) {
-      if (folder === ".") continue;
-      const title = folder
-        .split("/")
-        .pop()!
-        .replace(/-/g, " ")
-        .replace(/\b\w/g, (c) => c.toUpperCase());
-      const indexMd = generateIndexMd(folder, title, folderDocs);
-      await this.writeIndexMd(folder, indexMd);
-    }
+    // Distinct folders write distinct INDEX.md files, so the writes are
+    // independent — batch them (an imported vault can carry hundreds).
+    await mapInBatches(
+      [...folders].filter(([folder]) => folder !== "." && (!scope || scope.has(folder))),
+      async ([folder, folderDocs]) => {
+        const title = folder
+          .split("/")
+          .pop()!
+          .replace(/-/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+        await this.writeIndexMd(folder, generateIndexMd(folder, title, folderDocs));
+      },
+    );
 
     const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
     const agentConfigs = generateAgentConfigs({
@@ -356,7 +968,6 @@ export class NestStorage {
 
     for (const file of agentConfigs) {
       const filePath = join(this.root, file.path);
-      await mkdir(dirname(filePath), { recursive: true });
 
       let existing: string | null = null;
       try {
@@ -366,7 +977,10 @@ export class NestStorage {
       }
 
       const merged = mergeAgentConfig(existing, file.content);
-      await writeFile(filePath, merged, "utf-8");
+      // Usually unchanged between writes — skip the rewrite.
+      if (merged !== existing) {
+        await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
+      }
     }
   }
 
@@ -378,30 +992,50 @@ export class NestStorage {
    *   - content_hash_mismatch / chain_hash_mismatch in version history
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
+   *   - unreadable_history when a history.yaml exists but cannot be parsed
+   *   - version_unreconstructable when a recorded version no longer rebuilds
+   *     from its keyframe+diff chain (see verifyHistoryChain)
+   *   - sidecar_drift / sidecar_missing for pdf nodes (see verifyPdfSidecars)
    */
   async verifyVaultIntegrity(): Promise<VerificationReport> {
-    const allHistories = await this.findAllHistories();
-    const checkpointHistory = await this.readCheckpointHistory();
     const errors: VerificationReport["errors"] = [];
-
-    for (const [docId, history] of allHistories) {
-      // Pre-load keyframe bytes so the (synchronous) verifyDocumentChain
-      // callback can re-hash them. Without this the keyframe content check is
-      // skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
-      // left intact — goes undetected. Keyframe files are small; the reads are
-      // cheap, and the chain check below still works when one is missing.
-      const keyframeContent = new Map<number, string>();
-      for (const entry of history.versions) {
-        if (!entry.keyframe) continue;
-        const content = await this.readKeyframe(docId, entry.version);
-        if (content !== null) keyframeContent.set(entry.version, content);
+    // Encrypted and no usable key: the content hashes cannot be recomputed, so
+    // this can NEVER be a pass. Chain linkage (history.yaml is plaintext) and
+    // the checkpoint chain are still checked, and reported alongside.
+    const lock = await this.encryptionLockState();
+    if (lock) {
+      errors.push({ type: "encrypted_key_required", document: undefined, expected: null, actual: lock });
+      const histories = await this.findAllHistories((docId, reason) => {
+        errors.push({ type: "unreadable_history", document: docId, expected: null, actual: reason });
+      });
+      for (const [docId, history] of histories) {
+        errors.push(...this.verifyChainLinkage(docId, history));
       }
-      const report = verifyDocumentChain(
-        docId,
-        history,
-        (version) => keyframeContent.get(version) ?? null,
-      );
-      if (!report.valid) errors.push(...report.errors);
+      const cps = await this.readCheckpointHistory();
+      if (cps) {
+        const report = verifyCheckpointChain(cps.checkpoints, histories);
+        if (!report.valid) errors.push(...report.errors);
+      }
+      return { valid: false, errors };
+    }
+    // A history we cannot parse is an unverifiable document, not a clean one —
+    // report it instead of letting the crawl skip it into a silent pass.
+    const allHistories = await this.findAllHistories((docId, reason) => {
+      errors.push({
+        type: "unreadable_history",
+        document: docId,
+        expected: null,
+        actual: reason,
+      });
+    });
+    const checkpointHistory = await this.readCheckpointHistory();
+
+    const tombstoned: NonNullable<VerificationReport["tombstoned"]> = [];
+    for (const [docId, history] of allHistories) {
+      errors.push(...(await this.verifyHistoryChain(docId, history)));
+      for (const entry of history.versions) {
+        if (entry.tombstone) tombstoned.push({ document: docId, version: entry.version });
+      }
     }
 
     if (checkpointHistory) {
@@ -412,8 +1046,14 @@ export class NestStorage {
       if (!report.valid) errors.push(...report.errors);
     }
 
+    errors.push(...(await this.findUnencryptedFiles()));
+
     // Integrity check must verify every doc on disk, including retired ones.
     const liveDocs = await this.discoverDocuments({ includeRetired: true });
+    errors.push(...(await this.verifyPdfSidecars(liveDocs)));
+    // Forget protocol (§6.3): erased content must stay erased, and every
+    // tombstone must be accounted for by a recorded forget.
+    errors.push(...(await this.verifyTombstones(allHistories, liveDocs)));
     for (const doc of liveDocs) {
       const drift = await this.detectDocumentDrift(doc.id);
       if (drift && drift.drifted) {
@@ -426,7 +1066,337 @@ export class NestStorage {
       }
     }
 
-    return { valid: errors.length === 0, errors };
+    return {
+      valid: errors.length === 0,
+      errors,
+      ...(tombstoned.length > 0 ? { tombstoned } : {}),
+    };
+  }
+
+  /**
+   * Forget-protocol checks (§6.3) over every history and live document:
+   *
+   *   - `forgotten_content_present` — an artifact (or inline diff) still on
+   *     disk for a tombstoned version; a NON-tombstoned entry whose
+   *     content_hash a recorded forget erased (a pre-forget history restored
+   *     over the tombstones); a forgotten stub that carries a body; a live
+   *     document at a forgotten path, or whose body matches an erased one.
+   *   - `unrecorded_tombstone` — a tombstone, forget stub or
+   *     `status: forgotten` node that no recorded forget accounts for. A
+   *     tombstone is hash-only by design, so without this an entry could be
+   *     "forgotten" by hand to hide a tampered version.
+   *
+   * Read-only, like the rest of verification.
+   */
+  async verifyTombstones(
+    histories: Map<string, DocumentHistory>,
+    docs?: ContextNode[],
+  ): Promise<VerificationReport["errors"]> {
+    const errors: VerificationReport["errors"] = [];
+    const index = await this.readTombstones();
+
+    for (const [docId, history] of histories) {
+      for (const entry of history.versions) {
+        if (entry.tombstone) {
+          const leftovers: string[] = [];
+          if (entry.diff) leftovers.push("inline diff");
+          if ((await this.readKeyframe(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.md`);
+          if ((await this.readDiff(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.diff`);
+          if (leftovers.length > 0) {
+            errors.push({
+              type: "forgotten_content_present",
+              document: docId,
+              version: entry.version,
+              expected: null,
+              actual: `erased version still has ${leftovers.join(", ")}`,
+            });
+          }
+          if (!index.contentHashes.has(entry.content_hash)) {
+            errors.push({
+              type: "unrecorded_tombstone",
+              document: docId,
+              version: entry.version,
+              expected: "a document.forgotten event recording this content_hash",
+              actual: entry.content_hash,
+            });
+          }
+        } else if (index.contentHashes.has(entry.content_hash)) {
+          errors.push({
+            type: "forgotten_content_present",
+            document: docId,
+            version: entry.version,
+            expected: "tombstone",
+            actual: `version recorded as forgotten is no longer tombstoned (${entry.content_hash})`,
+          });
+        }
+        if (entry.forget_stub && !isPathForgotten(index, docId)) {
+          errors.push({
+            type: "unrecorded_tombstone",
+            document: docId,
+            version: entry.version,
+            expected: "a node-level document.forgotten event",
+            actual: "forget_stub",
+          });
+        }
+      }
+    }
+
+    for (const doc of docs ?? (await this.discoverDocuments({ includeRetired: true }))) {
+      if (doc.frontmatter.status !== "forgotten") {
+        if (index.records.length === 0) continue;
+        // A live document back at a path a forget retired,
+        // or carrying an erased revision's body anywhere: restored content.
+        if (isPathForgotten(index, doc.id) || carriesForgottenBody(index, doc.rawContent)) {
+          errors.push({
+            type: "forgotten_content_present",
+            document: doc.id,
+            expected: "no live content for forgotten material",
+            actual: isPathForgotten(index, doc.id)
+              ? "a live document holds a forgotten path"
+              : "the body matches a forgotten revision",
+          });
+        }
+        continue;
+      }
+      if (doc.body.trim() !== "") {
+        errors.push({
+          type: "forgotten_content_present",
+          document: doc.id,
+          expected: "empty body",
+          actual: `forgotten stub carries ${doc.body.trim().length} characters of body`,
+        });
+      }
+      if (!isPathForgotten(index, doc.id)) {
+        errors.push({
+          type: "unrecorded_tombstone",
+          document: doc.id,
+          expected: "a node-level document.forgotten event",
+          actual: "status: forgotten",
+        });
+      }
+    }
+    return errors;
+  }
+
+  /**
+   * Every forget recorded in this vault's chain-event log, indexed for the
+   * anti-resurrection checks (see tombstones.ts). Empty when nothing was ever
+   * forgotten.
+   */
+  async readTombstones(): Promise<TombstoneIndex> {
+    // Every publish consults the log, and the engine only ever appends to it
+    // (each append changes its size), so its parsed events are reused until a
+    // stat says the file changed — by this process or any other on the same
+    // mount. The inode catches a same-size replacement by rename (a restore,
+    // a sync tool, an editor); an in-place same-size rewrite within one mtime
+    // tick would still be missed. The stat is taken BEFORE the read, so a
+    // write racing the read leaves a stale key and only forces a re-read.
+    // A fresh index is built per call because callers fold records into it.
+    const info = await stat(this.chainEventLogPath()).catch(() => null);
+    const cached = this.chainEventCache;
+    if (
+      info &&
+      cached &&
+      cached.size === info.size &&
+      cached.mtimeMs === info.mtimeMs &&
+      cached.ino === info.ino
+    ) {
+      return buildTombstoneIndex(cached.events);
+    }
+    this.chainEventCache = undefined;
+    let events: unknown[];
+    try {
+      events = await this.readChainEventLog();
+      // Bounded: a log past the cap is read per check, as before, rather than
+      // pinned in memory for the life of the process.
+      if (info && info.size <= CHAIN_EVENT_CACHE_MAX_BYTES) {
+        this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, events };
+      }
+    } catch (err) {
+      // Every publish consults this, so an unparseable log must not lock the
+      // vault. The per-node records (forgotten stubs, tombstoned history
+      // entries) still refuse what they cover; the log-only checks lapse
+      // until it is repaired — say so rather than fail silently.
+      console.warn(
+        `[forget] .versions/chain_events.yaml is unreadable (${err instanceof Error ? err.message : String(err)}); ` +
+          "vault-wide anti-resurrection checks are degraded until it is repaired",
+      );
+      events = [];
+    }
+    return buildTombstoneIndex(events);
+  }
+
+  /**
+   * Verify one document's version chain (§8.4 steps 2-3), re-hashing its
+   * keyframe and diff files. Returns the errors; empty means intact.
+   *
+   * Keyframe bytes are pre-loaded so the (synchronous) verifyDocumentChain
+   * callback can re-hash them. Without this the keyframe content check is
+   * skipped, and a tampered v{N}.md keyframe — canonical file + history.yaml
+   * left intact — goes undetected. Keyframe files are small; the reads are
+   * cheap, and the chain check still works when one is missing.
+   *
+   * Non-keyframe entries hash their change log, which now lives in a
+   * v{N}.diff file rather than inline on the entry — pre-load those too, or
+   * a tampered diff file goes unchecked exactly the way a tampered keyframe
+   * used to.
+   */
+  async verifyHistoryChain(
+    docId: string,
+    history: DocumentHistory,
+  ): Promise<VerificationReport["errors"]> {
+    const keyframeContent = new Map<number, string>();
+    const diffContent = new Map<number, string>();
+    const cryptoErrors: VerificationReport["errors"] = [];
+    for (const entry of history.versions) {
+      try {
+        if (entry.keyframe) {
+          const content = await this.readKeyframe(docId, entry.version);
+          if (content !== null) keyframeContent.set(entry.version, content);
+        } else {
+          const diff = await this.readDiff(docId, entry.version);
+          if (diff !== null) diffContent.set(entry.version, diff);
+        }
+      } catch (err) {
+        // A sealed artifact that fails GCM authentication was tampered with (or
+        // sealed under another key): a finding for that version, and never a
+        // silent skip — the artifact is also withheld from the chain check, so
+        // it cannot count as verified.
+        if (!(err instanceof ContextNestError)) throw err;
+        if (err instanceof VaultLockedError || err instanceof WrongVaultKeyError) throw err;
+        cryptoErrors.push({
+          type: "decryption_failed",
+          document: docId,
+          version: entry.version,
+          expected: entry.content_hash,
+          actual: err.message,
+        });
+      }
+    }
+    const report = verifyDocumentChain(
+      docId,
+      history,
+      (version) => keyframeContent.get(version) ?? null,
+      (version) => diffContent.get(version) ?? null,
+    );
+
+    // The hash checks above prove each artifact matches what the history
+    // RECORDS — not that the chain still REPLAYS. An import that overwrote
+    // artifacts and rewrote their fingerprints to match (a grafted chain)
+    // passes every hash check, yet applying its diffs breaks partway and the
+    // version reads as empty. So: rebuild every recorded version from the
+    // same pre-loaded bytes and report each one that cannot be rebuilt.
+    // Tombstoned versions are skipped — their content was erased on purpose
+    // (§6.3.2), which is not damage. A grafted history can record the same
+    // version number twice; audit each number once.
+    const rebuildErrors: VerificationReport["errors"] = [];
+    const audited = new Set<number>();
+    for (const entry of history.versions) {
+      if (entry.tombstone || audited.has(entry.version)) continue;
+      audited.add(entry.version);
+      try {
+        await reconstructFromHistory(
+          docId,
+          history,
+          entry.version,
+          (version) => keyframeContent.get(version) ?? null,
+          (version) => diffContent.get(version) ?? null,
+        );
+      } catch (err) {
+        rebuildErrors.push({
+          type: "version_unreconstructable",
+          document: docId,
+          version: entry.version,
+          expected: null,
+          actual: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return [...cryptoErrors, ...report.errors, ...rebuildErrors];
+  }
+
+  /**
+   * Integrity verdict for ONE document about to be served to an agent: the
+   * per-document subset of `verifyVaultIntegrity` — `body_drift` (live body vs
+   * its frontmatter checksum), and `content_hash_mismatch` /
+   * `chain_hash_mismatch` / `unreadable_history` in its own version chain.
+   *
+   * Returns `undefined` when nothing failed — including a document with no
+   * checksum or no history yet, which is unverified rather than tampered.
+   * Never throws for an integrity problem: a failing document is still served
+   * (it is the document asked about); the verdict rides along so the agent is
+   * told not to trust its values.
+   *
+   * Cost: the drift check hashes the body already in memory. The chain check
+   * reads history.yaml and is cached against the digest of its bytes, so the
+   * keyframe/diff re-hash runs once per document version, not once per read.
+   * Limitation: a keyframe/diff file tampered AFTER its version was verified
+   * in this process is caught by `ctx verify`, not here, until history.yaml
+   * next changes. Checkpoint cross-chain checks stay vault-level (`ctx verify`).
+   */
+  async verifyServedDocument(
+    doc: ContextNode,
+    options: {
+      /**
+       * false = chain check only. For content served FROM the history (a
+       * reconstructed past version) rather than from the live file, whose
+       * body is not what is being served.
+       */
+      checkBody?: boolean;
+    } = {},
+  ): Promise<IntegrityFailure | undefined> {
+    const checks = new Set<string>();
+
+    // rawContent is empty on synthesized nodes (e.g. a CLI rebuild of a get
+    // payload); no bytes means nothing to compare, not a mismatch.
+    if (
+      options.checkBody !== false &&
+      doc.rawContent &&
+      detectDrift(doc.rawContent, doc.frontmatter.checksum).drifted
+    ) {
+      checks.add("body_drift");
+    }
+
+    // Deliberately NOT readHistory(): the cache is keyed on the raw bytes,
+    // which readHistory does not expose. The failure mapping mirrors it —
+    // ENOENT = no history (unverified, not failed); any other read error, a
+    // YAML error or a schema failure (readHistory's CorruptHistoryError cases)
+    // = unreadable_history, which is also what verifyVaultIntegrity reports.
+    // Keep the two in step if readHistory gains a new failure case.
+    let historyText: string | null = null;
+    try {
+      historyText = await readFile(this.historyPath(doc.id), "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") checks.add("unreadable_history");
+    }
+    if (historyText !== null) {
+      const digest = sha256(historyText);
+      let cached = this.historyVerdicts.get(doc.id);
+      if (!cached || cached.digest !== digest) {
+        let errors: VerificationReport["errors"];
+        const parsed = (() => {
+          try {
+            return documentHistorySchema.safeParse(yaml.load(historyText!));
+          } catch {
+            return null;
+          }
+        })();
+        if (!parsed || !parsed.success) {
+          errors = [
+            { type: "unreadable_history", document: doc.id, expected: null, actual: "unparseable" },
+          ];
+        } else {
+          errors = await this.verifyHistoryChain(doc.id, parsed.data as DocumentHistory);
+        }
+        cached = { digest, errors };
+        this.historyVerdicts.set(doc.id, cached);
+      }
+      for (const e of cached.errors) checks.add(e.type);
+    }
+
+    if (checks.size === 0) return undefined;
+    return { status: "failed", checks: [...checks], warning: INTEGRITY_WARNING };
   }
 
   /**
@@ -453,18 +1423,309 @@ export class NestStorage {
 
   /**
    * Write a document to disk.
+   *
+   * With `{ exclusive: true }` the write is fail-if-exists (O_EXCL) so a
+   * create-and-write is atomic: two concurrent creates for the same id can't
+   * both pass a separate exists-check and clobber each other (TOCTOU). The
+   * loser gets DOCUMENT_ALREADY_EXISTS. Default (overwrite) is unchanged.
    */
-  async writeDocument(id: string, content: string): Promise<void> {
+  async writeDocument(
+    id: string,
+    content: string,
+    options: { exclusive?: boolean } = {},
+  ): Promise<void> {
     const filePath = join(this.root, `${id}.md`);
-    await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, content, "utf-8");
+    const onDisk = await this.sealText(id, "doc", content);
+    try {
+      await writeInDir(dirname(filePath), () =>
+        writeFile(filePath, onDisk, {
+          encoding: "utf-8",
+          ...(options.exclusive ? { flag: "wx" } : {}),
+        }),
+      );
+    } catch (err) {
+      if (options.exclusive && (err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new ContextNestError(`Document "${id}" already exists`, "DOCUMENT_ALREADY_EXISTS");
+      }
+      throw err;
+    }
   }
 
   /**
-   * Delete a document and its version history from the vault.
+   * Write a file into the vault VERBATIM at a caller-given relative path.
+   *
+   * For ingesting an existing vault — a folder or archive a user is importing.
+   * Those bytes must land exactly as they arrived: the frontmatter is the
+   * source's own (`version`, `checksum`, custom keys a synthesized draft would
+   * drop), and not every file is a document — `.versions/<doc>/history.yaml`
+   * is what makes an imported version chain reconstruct at all. So this writes
+   * what it is given and parses nothing.
+   *
+   * Path safety is the whole risk surface here, since the path comes from
+   * outside: `..` and absolute paths are rejected so an import cannot write
+   * outside the vault root.
+   */
+  async writeVaultFile(relPath: string, content: string): Promise<void> {
+    const filePath = this.vaultFilePath(relPath);
+    await mkdir(dirname(filePath), { recursive: true });
+    // Encrypted vault: an import lands sealed like any other write. Verbatim
+    // still holds for the PLAINTEXT — it is what gets sealed, byte for byte, so
+    // every hash the source recorded keeps verifying.
+    let onDisk = content;
+    if ((await this.isEncrypted()) && !isArmoredText(content)) {
+      const target = kindForVaultPath(relPath);
+      if (target) {
+        onDisk = await this.sealText(target.docId, target.kind, content);
+      } else if (/(^|\/)\.versions\/[^/]+\/history\.yaml$/.test(relPath.replace(/\\/g, "/"))) {
+        const norm = relPath.replace(/\\/g, "/");
+        const m = /^(?:(.*)\/)?\.versions\/([^/]+)\/history\.yaml$/.exec(norm)!;
+        const docId = m[1] ? `${m[1]}/${m[2]}` : m[2];
+        const parsed = documentHistorySchema.safeParse(yaml.load(content));
+        if (parsed.success) {
+          const history = parsed.data as DocumentHistory;
+          const versions: VersionEntry[] = [];
+          for (const v of history.versions) versions.push(await this.sealEntry(docId, v));
+          onDisk = yaml.dump({ ...history, versions }, { lineWidth: -1, noRefs: true });
+        }
+      }
+    }
+    await writeFile(filePath, onDisk, "utf-8");
+  }
+
+  /**
+   * Whether a vault-relative path already holds a file. Same path guard as
+   * `writeVaultFile`, so an import can plan where a batch lands before it
+   * writes anything, and never overwrites what it did not write.
+   *
+   * A path that escapes the vault reads as absent rather than throwing —
+   * planning must not sink a whole batch over one bad path. `writeVaultFile`
+   * is the guard that actually refuses it, so the caller sees that path fail
+   * on its own. Do not read a `false` here as "safe to write".
+   */
+  async hasVaultFile(relPath: string): Promise<boolean> {
+    try {
+      await access(this.vaultFilePath(relPath));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Write BYTES into the vault at a vault-relative path — the binary twin of
+   * {@link writeVaultFile}, behind the same path guard (`..` and absolute
+   * paths refused). Durable: written to a temp file, flushed, then renamed
+   * over the target, so a crash never leaves a torn file that a `pdf.sha256`
+   * would then report as tampering.
+   *
+   * For declared binary sidecars (a pdf node's `<id>.pdf`, §1.11). Nothing
+   * here makes a binary a node — discovery reads `.md` only.
+   */
+  async writeVaultBinary(relPath: string, bytes: Uint8Array): Promise<void> {
+    const filePath = this.vaultFilePath(relPath);
+    await mkdir(dirname(filePath), { recursive: true });
+    const docId = relPath.replace(/\\/g, "/").replace(/\.[^./]+$/, "");
+    await this.writeFileDurable(filePath, await this.sealBytes(docId, bytes));
+  }
+
+  /**
+   * Read a vault file's bytes — decrypted in memory for a sealed sidecar in an
+   * encrypted vault. Same path guard as {@link writeVaultBinary}.
+   */
+  async readVaultBinary(relPath: string): Promise<Buffer> {
+    return this.openBytes(await readFile(this.vaultFilePath(relPath)), relPath);
+  }
+
+  /**
+   * Remove a vault file. Same path guard. Returns false when there was nothing
+   * to remove rather than throwing — removal is idempotent.
+   */
+  async removeVaultFile(relPath: string): Promise<boolean> {
+    try {
+      await unlink(this.vaultFilePath(relPath));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+  }
+
+  /** Directory holding a document's version artifacts. */
+  private versionsDir(docId: string): string {
+    return join(this.root, dirname(docId), ".versions", basename(docId));
+  }
+
+  /**
+   * Preserve a pdf node's binary in its version history, content-addressed:
+   * `.versions/<doc>/<sha256-hex>.pdf` (§6.1, §1.11). Called with the PRIOR
+   * sidecar before a new one replaces it, so every version's `pdf.sha256`
+   * still names bytes that exist.
+   *
+   * Idempotent: a file already at that name is left alone — same name, same
+   * bytes, unless it was tampered with, which verification reports instead of
+   * this call silently repairing. Returns the archived file's absolute path.
+   */
+  async archivePdfBinary(docId: string, bytes: Uint8Array): Promise<string> {
+    const hex = sha256Bytes(bytes).slice("sha256:".length);
+    const dir = this.versionsDir(docId);
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, `${hex}.pdf`);
+    try {
+      await access(path);
+      return path;
+    } catch {
+      // Not archived yet.
+    }
+    await this.writeFileDurable(path, await this.sealBytes(docId, bytes));
+    return path;
+  }
+
+  /**
+   * Bytes of an archived pdf binary by its `sha256:<hex>` (or bare hex), or
+   * null when the history holds no such binary.
+   */
+  async readArchivedPdf(docId: string, sha256: string): Promise<Buffer | null> {
+    const hex = sha256.replace(/^sha256:/, "");
+    if (!/^[a-f0-9]{64}$/.test(hex)) return null;
+    try {
+      const raw = await readFile(join(this.versionsDir(docId), `${hex}.pdf`));
+      return await this.openBytes(raw, `${docId} archived pdf ${hex}`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  /**
+   * Re-hash every pdf node's binaries (§8.4): the live sidecar against the
+   * `pdf.sha256` in the node's frontmatter, and each archived prior binary
+   * against the hash that names it. A sidecar swapped on disk without a new
+   * version therefore surfaces as `sidecar_drift`; one that is gone as
+   * `sidecar_missing`.
+   *
+   * `docs` lets a caller that already discovered the vault skip a second walk.
+   */
+  async verifyPdfSidecars(docs?: ContextNode[]): Promise<VerificationReport["errors"]> {
+    const errors: VerificationReport["errors"] = [];
+    const nodes = docs ?? (await this.discoverDocuments({ includeRetired: true }));
+    for (const doc of nodes) {
+      const pdf = doc.frontmatter.pdf;
+      if (doc.frontmatter.type !== "pdf" || !pdf || typeof pdf.file !== "string") continue;
+      // A forgotten pdf node's binaries were erased with the rest of its
+      // content (§6.3); the stub keeps the block only as a record of hashes.
+      if (doc.frontmatter.status === "forgotten") continue;
+      let bytes: Buffer | null = null;
+      try {
+        bytes = await this.readVaultBinary(pdf.file);
+      } catch (err) {
+        errors.push({
+          type: "sidecar_missing",
+          document: doc.id,
+          expected: typeof pdf.sha256 === "string" ? pdf.sha256 : null,
+          actual:
+            (err as NodeJS.ErrnoException).code === "ENOENT"
+              ? `no file at ${pdf.file}`
+              : `unreadable ${pdf.file}: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      if (bytes) {
+        const actual = sha256Bytes(bytes);
+        if (actual !== pdf.sha256) {
+          errors.push({
+            type: "sidecar_drift",
+            document: doc.id,
+            expected: typeof pdf.sha256 === "string" ? pdf.sha256 : null,
+            actual,
+          });
+        }
+      }
+
+      let archived: string[] = [];
+      try {
+        archived = (await readdir(this.versionsDir(doc.id))).filter((n) =>
+          /^[a-f0-9]{64}\.pdf$/.test(n),
+        );
+      } catch {
+        // No version history yet.
+      }
+      for (const name of archived.sort()) {
+        const expected = `sha256:${name.slice(0, 64)}`;
+        let actual: string;
+        try {
+          actual = sha256Bytes(
+            await this.openBytes(await readFile(join(this.versionsDir(doc.id), name)), `${doc.id} archived ${name}`),
+          );
+        } catch (err) {
+          // One unreadable entry is a finding about that entry, not a reason
+          // to abandon verifying the rest of the vault.
+          errors.push({
+            type: "sidecar_missing",
+            document: doc.id,
+            expected,
+            actual: `unreadable archived binary ${name}: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          continue;
+        }
+        if (actual !== expected) {
+          errors.push({ type: "sidecar_drift", document: doc.id, expected, actual });
+        }
+      }
+    }
+    return errors;
+  }
+
+  /** Resolve a caller-given vault-relative path, refusing anything that escapes. */
+  private vaultFilePath(relPath: string): string {
+    const segments = String(relPath ?? "")
+      .split(/[/\\]/)
+      .filter(Boolean);
+    if (
+      segments.length === 0 ||
+      isAbsolute(relPath) ||
+      segments.some((seg) => seg === "..")
+    ) {
+      throw new ContextNestError(
+        `Invalid vault file path "${relPath}": must be a relative path inside the vault.`,
+        "INVALID_DOCUMENT_ID",
+      );
+    }
+    return join(this.root, ...segments);
+  }
+
+  /**
+   * Delete a document and its version history from the vault — and, for a pdf
+   * node, its binary sidecar (archived prior binaries go with `.versions/`).
    */
   async deleteDocument(id: string): Promise<void> {
+    // Drop the cached serve-path verdict with the document it describes.
+    this.historyVerdicts.delete(id);
+    this.markHistoryTouched(id);
     const filePath = join(this.root, `${id}.md`);
+    // A pdf node owns the binary beside it (§1.11): find it BEFORE the .md —
+    // the only record of it — is gone. Only the node's own `<id>.pdf` is ever
+    // removed; a block naming some other path is invalid (§13 rule 26), and
+    // deleting a file on the say-so of an invalid block is how a node would
+    // delete another node's binary.
+    let sidecar: string | null = null;
+    try {
+      const raw = await this.readText(filePath, "doc", id);
+      const fm = parseDocument(filePath, raw, id).frontmatter;
+      if (fm.type === "pdf" && fm.pdf?.file) {
+        // Compared against the on-disk spelling: on a case-insensitive
+        // filesystem the caller may have reached `nodes/Report.md` as
+        // `nodes/report` (#117). The caller's spelling still counts, for a
+        // node written before #117 that recorded it — both name this node's
+        // own file. Never a case-folded compare: on a case-sensitive
+        // filesystem that could name another node's binary.
+        const onDisk = await this.resolveDocumentIdCasing(id);
+        if (fm.pdf.file === `${onDisk}.pdf` || fm.pdf.file === `${id}.pdf`) {
+          sidecar = fm.pdf.file;
+        }
+      }
+    } catch {
+      // Missing or unparseable: the unlink below reports the former, and an
+      // unparseable file declares no sidecar.
+    }
     try {
       await unlink(filePath);
     } catch (err: unknown) {
@@ -483,6 +1744,8 @@ export class NestStorage {
     } catch {
       // No version history to clean up
     }
+
+    if (sidecar) await this.removeVaultFile(sidecar);
   }
 
   /**
@@ -490,16 +1753,24 @@ export class NestStorage {
    * Parallelizes reads for performance. Missing documents are silently skipped.
    */
   async readDocuments(ids: string[]): Promise<Map<string, ContextNode>> {
+    // Reads run in parallel, but the map is filled afterwards in `ids` order:
+    // inserting as each read settles made result order depend on filesystem
+    // timing, so the same query could return the same set in a different order.
+    const docs = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          return await this.readDocument(id);
+        } catch {
+          // Skip missing documents (may have been deleted since index was built)
+          return null;
+        }
+      }),
+    );
     const results = new Map<string, ContextNode>();
-    const reads = ids.map(async (id) => {
-      try {
-        const doc = await this.readDocument(id);
-        results.set(id, doc);
-      } catch {
-        // Skip missing documents (may have been deleted since index was built)
-      }
+    ids.forEach((id, i) => {
+      const doc = docs[i];
+      if (doc) results.set(id, doc);
     });
-    await Promise.all(reads);
     return results;
   }
 
@@ -537,15 +1808,20 @@ export class NestStorage {
    */
   async readContextYaml(): Promise<ContextYaml | null> {
     try {
-      const content = await readFile(
+      const raw = await readFile(
         join(this.root, "context.yaml"),
         "utf-8",
       );
+      const content = await this.openText(raw, "index", "context.yaml");
       return yaml.load(content) as ContextYaml;
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return null;
       }
+      // An index that will not open (sealed under a key this vault does not
+      // hold) is just stale: report "no index" so the caller regenerates it,
+      // exactly as for a missing file.
+      if (err instanceof DecryptionFailedError) return null;
       throw err;
     }
   }
@@ -559,42 +1835,245 @@ export class NestStorage {
       noRefs: true,
       sortKeys: false,
     });
-    await writeFile(join(this.root, "context.yaml"), content, "utf-8");
+    await writeFile(join(this.root, "context.yaml"), await this.sealText("", "index", content), "utf-8");
   }
 
   /**
    * Read document history from .versions/{docName}/history.yaml (§6.2).
+   *
+   * `null` means "this document has no history yet" and nothing else. A file
+   * that is present but unreadable raises {@link CorruptHistoryError}.
+   *
+   * The distinction is load-bearing. Every write path reads this, and each one
+   * treats `null` as a brand-new document; because history.yaml is rewritten
+   * whole rather than appended to, a corrupt file that read as `null` was
+   * silently replaced by a two-entry history on the next publish — orphaning the
+   * recorded versions' keyframe/diff files and taking `reconstruct` with them.
    */
   async readHistory(docId: string): Promise<DocumentHistory | null> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const historyPath = join(
-      this.root,
-      docDir,
-      ".versions",
-      docName,
-      "history.yaml",
-    );
+    let content: string;
     try {
-      const content = await readFile(historyPath, "utf-8");
-      const raw = yaml.load(content);
-      const result = documentHistorySchema.safeParse(raw);
-      return result.success ? (result.data as DocumentHistory) : null;
-    } catch {
-      return null;
+      content = await readFile(this.historyPath(docId), "utf-8");
+    } catch (err) {
+      // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
+      // an I/O error) must not read as a fresh document either.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new CorruptHistoryError(
+        docId,
+        err instanceof Error ? err.message : String(err),
+      );
     }
+
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      throw new CorruptHistoryError(
+        docId,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
+    const result = documentHistorySchema.safeParse(raw);
+    if (!result.success) {
+      throw new CorruptHistoryError(
+        docId,
+        `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
+      );
+    }
+    return this.openHistoryFields(docId, result.data as DocumentHistory);
   }
 
   /**
-   * Write document history to .versions/{docName}/history.yaml.
+   * Move a document's unreadable history.yaml aside, returning its new name.
+   *
+   * Frees the canonical name so the next write can start a readable chain,
+   * without destroying the only record of the old one. Pair it with
+   * {@link maxRecordedVersion}: numbering must still clear whatever the
+   * quarantined chain sealed, or the fresh chain reuses version numbers and
+   * collides with the artifacts already on disk.
+   */
+  async quarantineHistory(docId: string): Promise<string> {
+    this.markHistoryTouched(docId);
+    return quarantine(this.historyPath(docId));
+  }
+
+  /**
+   * Highest version this document has a sealed artifact for on disk.
+   *
+   * Read from the `v{N}.md` / `v{N}.diff` files rather than history.yaml, so it
+   * still answers when the history is missing or unparseable — which is exactly
+   * when it is needed. Returns 0 for a document with no artifacts.
+   */
+  async maxRecordedVersion(docId: string): Promise<number> {
+    const dir = join(this.root, dirname(docId), ".versions", basename(docId));
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return 0;
+    }
+    let max = 0;
+    for (const name of entries) {
+      const match = /^v(\d+)\.(md|diff)$/.exec(name);
+      if (match) max = Math.max(max, Number(match[1]));
+    }
+    return max;
+  }
+
+  /**
+   * Durable write for the hash-chain files: write a sibling temp file, flush it
+   * to disk, then rename over the target.
+   *
+   * A plain `writeFile` truncates and extends in place. If the process dies (or
+   * the machine loses power) after the metadata grows but before the data is
+   * flushed, the file comes back zero-filled — the "null byte is not allowed in
+   * input" YAMLException seen from `findAllHistories`. Reserved for
+   * history.yaml / context_history.yaml: they are the integrity anchors, and a
+   * torn one is unrecoverable, unlike a regenerable index.
+   *
+   * The temp name is unique per call. A shared `{path}.tmp` would make
+   * concurrent writers to the same target collide: both open and truncate the
+   * same temp file, the first rename consumes it, and the second fails ENOENT.
+   * That is not hypothetical — `rebuildCheckpointHistory` deliberately writes
+   * context_history.yaml outside `withCheckpointLock` (holding it would deadlock
+   * against the publishes it retries around), so it can overlap a publish's
+   * write. Unique temps keep the old last-write-wins semantics instead of
+   * turning that overlap into a throw.
+   */
+  private async writeFileDurable(path: string, content: string | Uint8Array): Promise<void> {
+    const tmp = `${path}.${process.pid}.${++this.tmpWriteCounter}.tmp`;
+    const handle = await open(tmp, "w");
+    try {
+      if (typeof content === "string") await handle.writeFile(content, "utf-8");
+      else await handle.writeFile(content);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await renameWithRetry(tmp, path);
+    } catch (err) {
+      // Never leave the temp behind if the rename itself failed.
+      await unlink(tmp).catch(() => {});
+      throw err;
+    }
+  }
+
+  /** Absolute path of a document's history.yaml. */
+  private historyPath(docId: string): string {
+    return join(
+      this.root,
+      dirname(docId),
+      ".versions",
+      basename(docId),
+      "history.yaml",
+    );
+  }
+
+  /**
+   * Rewrite a document's history.yaml in full.
+   *
+   * Only for the paths that genuinely MUTATE existing entries — re-anchoring a
+   * version, moving inline patches into files. Recording a NEW version goes
+   * through {@link appendVersionEntry}, which cannot touch the bytes of the
+   * entries already on disk. Prefer that: a full rewrite is only ever as correct
+   * as the object handed to it, and an object built from a bad read is how a
+   * corrupt history silently became a two-entry one.
+   *
+   * `versions` is forced last so the serialized list stays open at the end of
+   * the file for appending. Anything else here is a latent break in append.
    */
   async writeHistory(docId: string, history: DocumentHistory): Promise<void> {
-    const docName = basename(docId);
-    const docDir = dirname(docId);
-    const historyDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(historyDir, { recursive: true });
-    const content = yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(historyDir, "history.yaml"), content, "utf-8");
+    this.markHistoryTouched(docId);
+    const { versions: plainVersions, ...rest } = history;
+    const versions: VersionEntry[] = [];
+    for (const v of plainVersions) versions.push(await this.sealEntry(docId, v));
+    await mkdir(dirname(this.historyPath(docId)), { recursive: true });
+    const content = yaml.dump(
+      { ...rest, versions },
+      { lineWidth: -1, noRefs: true },
+    );
+    await this.writeFileDurable(this.historyPath(docId), content);
+  }
+
+  /**
+   * Record one new version by APPENDING it to history.yaml.
+   *
+   * The bytes of every previously recorded version are never reopened for
+   * writing, so no bug in a caller — and no failed read — can drop them. That is
+   * the difference between "we check before rewriting" and "there is nothing to
+   * rewrite": the old full-rewrite path lost v1–v4 whenever the read that fed it
+   * came back empty, and a guard on the read is only as good as the next code
+   * path that forgets it.
+   *
+   * The file's header (`keyframe_interval` + the `versions:` key) belongs to
+   * whichever caller CREATES the file, and it is written in the same operation
+   * as that caller's own entry. Deciding on the header from an observed size
+   * would be a check-then-act race: concurrent first-time appends each see an
+   * empty file and each prepend a header, leaving two `versions:` keys and an
+   * unparseable history (measured: ~70% of documents corrupted under load).
+   * Exclusive create is what makes it exact — the OS picks one winner, and it
+   * holds across processes, which an in-process lock would not.
+   *
+   * Every write goes out under O_APPEND and is fsynced. `writeHistory` keeps
+   * `versions` last so the list stays open at EOF for these appends.
+   */
+  async appendVersionEntry(
+    docId: string,
+    entry: VersionEntry,
+    keyframeInterval: number,
+  ): Promise<void> {
+    this.markHistoryTouched(docId);
+    const path = this.historyPath(docId);
+
+    // One list item, indented to sit under `versions:`. Indenting a whole YAML
+    // document by a fixed amount keeps it valid, including multi-line scalars.
+    const block = yaml
+      .dump([await this.sealEntry(docId, entry)], { lineWidth: -1, noRefs: true })
+      .split("\n")
+      .map((line) => (line.length > 0 ? `  ${line}` : line))
+      .join("\n");
+    const header = `keyframe_interval: ${keyframeInterval}\nversions:\n`;
+
+    // Create-and-write in one shot. Exactly one caller can win `wx`, so exactly
+    // one header is ever written — and it lands together with its entry, so the
+    // file is never left as a header with no versions under it.
+    try {
+      const created = await writeInDir(dirname(path), () => open(path, "wx"));
+      try {
+        await created.write(header + block);
+        await created.sync();
+      } finally {
+        await created.close();
+      }
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+
+    const handle = await open(path, "a");
+    try {
+      // The file exists. A zero-length one normally means an external
+      // truncation, so write the header rather than append into a headerless
+      // file.
+      //
+      // Known residual window: the winner's `wx` open creates a 0-byte file and
+      // resolves BEFORE its write lands, so a loser that gets EEXIST, reopens
+      // and stats inside that gap would also see 0 and also write a header,
+      // giving two `versions:` keys. Not closed here because it needs the loser
+      // to complete three threadpool round-trips inside the winner's single
+      // queued write, and it did not occur in 60 rounds of 32-way contention on
+      // a single new file (nor 1200 docs of 3-way). If it ever does, the result
+      // is an unparseable history — loud (CorruptHistoryError), not silent — and
+      // the fix is to have the loser re-stat with a bounded wait instead of
+      // trusting the first observation.
+      const { size } = await handle.stat();
+      await handle.write(size === 0 ? header + block : block);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -610,26 +2089,200 @@ export class NestStorage {
       docName,
       `v${version}.md`,
     );
+    let raw: string;
     try {
-      return await readFile(keyframePath, "utf-8");
+      raw = await readFile(keyframePath, "utf-8");
     } catch {
       return null;
+    }
+    // Decryption errors propagate on purpose: a keyframe that cannot be opened
+    // must never read as "no keyframe" — that is how a verify passes silently.
+    return this.openText(raw, "keyframe", `${docId} v${version} keyframe`);
+  }
+
+  /**
+   * Write a version artifact (`v{N}.md` / `v{N}.diff`).
+   *
+   * Sealed versions are immutable: the artifact's bytes are hashed into
+   * `content_hash` and chained, so overwriting one destroys the only copy of
+   * that version's content AND silently breaks the chain. The default refuses,
+   * via an exclusive create rather than an exists-check, so two writers cannot
+   * race past the guard. Repair paths that must genuinely re-anchor an artifact
+   * opt in with `overwrite`.
+   */
+  private async writeVersionArtifact(
+    docId: string,
+    version: number,
+    fileName: string,
+    content: string,
+    overwrite: boolean,
+  ): Promise<void> {
+    const docName = basename(docId);
+    const docDir = dirname(docId);
+    const dir = join(this.root, docDir, ".versions", docName);
+    const path = join(dir, fileName);
+    content = await this.sealText(docId, fileName.endsWith(".diff") ? "diff" : "keyframe", content);
+
+    if (overwrite) {
+      await writeInDir(dir, () => this.writeFileDurable(path, content));
+      return;
+    }
+
+    let handle;
+    try {
+      handle = await writeInDir(dir, () => open(path, "wx"));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new VersionArtifactExistsError(docId, version, fileName);
+      }
+      throw err;
+    }
+    try {
+      await handle.writeFile(content, "utf-8");
+      // Flush before the history entry that hashes this content is recorded.
+      // history.yaml is fsynced; without this the artifact it points at could
+      // still be in the page cache, so a power loss could leave a durable entry
+      // referencing truncated or missing content.
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
   }
 
   /**
-   * Write a keyframe version file.
+   * Write a keyframe version file. Refuses to overwrite a sealed one unless
+   * `options.overwrite` is set — see {@link writeVersionArtifact}.
    */
   async writeKeyframe(
     docId: string,
     version: number,
     content: string,
+    options: { overwrite?: boolean } = {},
   ): Promise<void> {
+    await this.writeVersionArtifact(
+      docId,
+      version,
+      `v${version}.md`,
+      content,
+      options.overwrite ?? false,
+    );
+  }
+
+  /**
+   * Read the change log for a non-keyframe version — the unified diff taking
+   * v{version-1} to v{version}, stored beside the keyframes as v{version}.diff.
+   *
+   * Returns null when there is no diff file. Histories written before diffs
+   * were externalized carry the patch inline on the version entry instead, so
+   * callers fall back to `entry.diff` (see VersionManager.reconstructVersion) —
+   * that fallback is what keeps pre-existing nests readable without migration.
+   */
+  async readDiff(docId: string, version: number): Promise<string | null> {
     const docName = basename(docId);
     const docDir = dirname(docId);
-    const keyframeDir = join(this.root, docDir, ".versions", docName);
-    await mkdir(keyframeDir, { recursive: true });
-    await writeFile(join(keyframeDir, `v${version}.md`), content, "utf-8");
+    const diffPath = join(
+      this.root,
+      docDir,
+      ".versions",
+      docName,
+      `v${version}.diff`,
+    );
+    let raw: string;
+    try {
+      raw = await readFile(diffPath, "utf-8");
+    } catch {
+      return null;
+    }
+    return this.openText(raw, "diff", `${docId} v${version} diff`);
+  }
+
+  /**
+   * Write the change log for a non-keyframe version.
+   *
+   * Content is the unified diff exactly as produced by `createPatch` — hunk
+   * headers included — so the file is readable on its own and applies with
+   * standard patch tooling.
+   *
+   * Refuses to overwrite a sealed change log unless `options.overwrite` is set
+   * — see {@link writeVersionArtifact}.
+   */
+  async writeDiff(
+    docId: string,
+    version: number,
+    diff: string,
+    options: { overwrite?: boolean } = {},
+  ): Promise<void> {
+    await this.writeVersionArtifact(
+      docId,
+      version,
+      `v${version}.diff`,
+      diff,
+      options.overwrite ?? false,
+    );
+  }
+
+  /**
+   * Erase a version's stored content — its `v{N}.md` keyframe and/or
+   * `v{N}.diff` change log (§6.3.2). The ONE path allowed to remove a sealed
+   * artifact: the forget protocol, which keeps the entry's hashes so the
+   * chain still verifies. `only` narrows it to one of the two files (a
+   * re-keyed version keeps its new keyframe and loses its diff). Returns the
+   * file names removed.
+   */
+  async removeVersionArtifacts(
+    docId: string,
+    version: number,
+    only?: "keyframe" | "diff",
+  ): Promise<string[]> {
+    const removed: string[] = [];
+    const names =
+      only === "keyframe"
+        ? [`v${version}.md`]
+        : only === "diff"
+          ? [`v${version}.diff`]
+          : [`v${version}.md`, `v${version}.diff`];
+    for (const name of names) {
+      try {
+        await unlink(join(this.versionsDir(docId), name));
+        removed.push(name);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Erase archived pdf binaries (`.versions/<doc>/<sha256-hex>.pdf`) for a
+   * forget (§6.3). With `hashes`, only those (`sha256:<hex>`); without, all.
+   * Returns the hashes removed.
+   */
+  async removeArchivedPdfs(docId: string, hashes?: ReadonlySet<string>): Promise<string[]> {
+    let names: string[];
+    try {
+      names = (await readdir(this.versionsDir(docId))).filter((n) => /^[a-f0-9]{64}\.pdf$/.test(n));
+    } catch {
+      return [];
+    }
+    const removed: string[] = [];
+    for (const name of names) {
+      const hash = `sha256:${name.slice(0, 64)}`;
+      if (hashes && !hashes.has(hash)) continue;
+      await unlink(join(this.versionsDir(docId), name)).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+      removed.push(hash);
+    }
+    return removed;
+  }
+
+  /**
+   * Erase every staged suggestion for a document (`_suggestions/<doc>/`) —
+   * their patches carry the document's content, so a node-level forget takes
+   * them too (§6.3).
+   */
+  async removeSuggestions(docId: string): Promise<void> {
+    await rm(this.suggestionDir(docId), { recursive: true, force: true });
   }
 
   /**
@@ -655,7 +2308,7 @@ export class NestStorage {
     const dir = this.suggestionDir(docId);
     await mkdir(dir, { recursive: true });
     const path = join(dir, `${suggestionId}.patch`);
-    await writeFile(path, patch, "utf-8");
+    await writeFile(path, await this.sealText(docId, "suggestion", patch), "utf-8");
     return path;
   }
 
@@ -669,7 +2322,7 @@ export class NestStorage {
     await mkdir(dir, { recursive: true });
     const path = join(dir, `${suggestionId}.meta.yaml`);
     const content = yaml.dump(meta, { lineWidth: -1, noRefs: true });
-    await writeFile(path, content, "utf-8");
+    await writeFile(path, await this.sealText(docId, "suggestion", content), "utf-8");
     return path;
   }
 
@@ -678,14 +2331,16 @@ export class NestStorage {
     docId: string,
     suggestionId: string,
   ): Promise<string | null> {
+    let raw: string;
     try {
-      return await readFile(
+      raw = await readFile(
         join(this.suggestionDir(docId), `${suggestionId}.patch`),
         "utf-8",
       );
     } catch {
       return null;
     }
+    return this.openText(raw, "suggestion", `${docId} suggestion ${suggestionId}`);
   }
 
   /** Read a staged suggestion's parsed meta, or null when absent. */
@@ -693,12 +2348,18 @@ export class NestStorage {
     docId: string,
     suggestionId: string,
   ): Promise<unknown | null> {
+    let raw: string;
     try {
-      const raw = await readFile(
+      raw = await readFile(
         join(this.suggestionDir(docId), `${suggestionId}.meta.yaml`),
         "utf-8",
       );
-      return yaml.load(raw);
+    } catch {
+      return null;
+    }
+    const text = await this.openText(raw, "suggestion", `${docId} suggestion ${suggestionId} meta`);
+    try {
+      return yaml.load(text);
     } catch {
       return null;
     }
@@ -707,9 +2368,8 @@ export class NestStorage {
   /** List all suggestion IDs staged for a document, sorted by file name. */
   async listSuggestionIds(docId: string): Promise<string[]> {
     const dir = this.suggestionDir(docId);
-    const files = await fg("*.meta.yaml", { cwd: dir, dot: false }).catch(
-      () => [] as string[],
-    );
+    // A missing suggestions directory yields no matches rather than throwing.
+    const files = await globFiles(dir, "*.meta.yaml");
     return files
       .map((f) => f.replace(/\.meta\.yaml$/, ""))
       .sort();
@@ -739,15 +2399,33 @@ export class NestStorage {
     return destDir;
   }
 
+  /** Absolute path of the checkpoint chain file. */
+  private checkpointHistoryPath(): string {
+    return join(this.root, ".versions", "context_history.yaml");
+  }
+
+  /**
+   * Absolute path of the latest-checkpoint pointer.
+   *
+   * A cache, never an authority: it is validated against the size of
+   * context_history.yaml before use and can be deleted at any time without
+   * losing anything — see {@link readLatestCheckpoint}.
+   */
+  private latestCheckpointPath(): string {
+    return join(this.root, ".versions", "context_latest.yaml");
+  }
+
   /**
    * Read checkpoint history from .versions/context_history.yaml (§7.2).
+   *
+   * Loads and validates the WHOLE chain, which is O(checkpoints × published
+   * docs). Only the paths that genuinely need every checkpoint — verify, the
+   * §7.3 rebuild — should call it. To link a new checkpoint onto the chain, or
+   * to stamp the latest one into context.yaml, use {@link readLatestCheckpoint}.
    */
   async readCheckpointHistory(): Promise<CheckpointHistory | null> {
     try {
-      const content = await readFile(
-        join(this.root, ".versions", "context_history.yaml"),
-        "utf-8",
-      );
+      const content = await readFile(this.checkpointHistoryPath(), "utf-8");
       const raw = yaml.load(content);
       const result = checkpointHistorySchema.safeParse(raw);
       return result.success ? (result.data as CheckpointHistory) : null;
@@ -757,7 +2435,293 @@ export class NestStorage {
   }
 
   /**
+   * The state of the checkpoint chain, read without loading it.
+   *
+   * Four outcomes, because collapsing them is a data-loss bug: the seal
+   * quarantines a chain it cannot read, so "unreadable" MUST be distinguishable
+   * from "absent", from "readable but holds nothing", and above all from a
+   * transient I/O failure — on the network-backed mounts this whole change
+   * exists for, one flaky read would otherwise rename a healthy multi-megabyte
+   * chain aside and restart numbering at 1.
+   *
+   * Mirrors how {@link readHistory} discriminates for a single document: only a
+   * file that is present and genuinely unparseable is corrupt. Any other error
+   * propagates, so the write fails loudly and is retried rather than silently
+   * discarding the chain.
+   *
+   * The head itself comes from three sources, cheapest first: the pointer file,
+   * a bounded tail read, then a full read for a file too small to have a usable
+   * tail. None of the three grows with the chain.
+   */
+  async readCheckpointChainState(): Promise<CheckpointChainState> {
+    let info: { size: number; mtimeMs: number };
+    try {
+      const s = await stat(this.checkpointHistoryPath());
+      info = { size: s.size, mtimeMs: s.mtimeMs };
+    } catch (err) {
+      // Absent is the only benign case; a permission or I/O failure here must
+      // not read as "no chain", which is what would license a quarantine.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      throw err;
+    }
+
+    const pointed = await this.readLatestCheckpointPointer(info);
+    if (pointed) return { kind: "head", checkpoint: pointed };
+
+    const tailed = await this.readLatestCheckpointFromTail(info.size);
+    if (tailed) return { kind: "head", checkpoint: tailed };
+
+    // Neither shortcut resolved a head, so the file has to be read properly —
+    // and this read is the one that decides corrupt vs merely empty.
+    let content: string;
+    try {
+      content = await readFile(this.checkpointHistoryPath(), "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      throw err;
+    }
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      return { kind: "unreadable", reason: err instanceof Error ? err.message : String(err) };
+    }
+    const result = checkpointHistorySchema.safeParse(raw);
+    if (!result.success) {
+      return {
+        kind: "unreadable",
+        reason: `failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})`,
+      };
+    }
+    const head = (result.data as CheckpointHistory).checkpoints.at(-1);
+    // Valid YAML with no checkpoints — what rebuildCheckpointHistory writes for
+    // a vault with nothing published. Empty is not broken.
+    return head ? { kind: "head", checkpoint: head } : { kind: "empty" };
+  }
+
+  /**
+   * The most recent checkpoint, or null when there is none to link onto.
+   *
+   * Convenience over {@link readCheckpointChainState} for callers that only
+   * want to stamp the head somewhere (regenerateIndex). An unreadable chain
+   * reads as "no checkpoint yet" here rather than failing the caller's write;
+   * a transient I/O failure still propagates.
+   */
+  async readLatestCheckpoint(): Promise<Checkpoint | null> {
+    const state = await this.readCheckpointChainState();
+    return state.kind === "head" ? state.checkpoint : null;
+  }
+
+  /**
+   * The newest checkpoint's number, or 0 when there is none.
+   *
+   * For READ paths, which want the number only to stamp it onto an audit
+   * record. Never throws: a retrieval query must not fail because the chain
+   * file hiccuped, and a trace entry recording checkpoint 0 is a far smaller
+   * harm than a query that errors.
+   *
+   * Write paths take {@link readCheckpointChainState} instead, where a
+   * transient failure MUST surface rather than be mistaken for "no chain" —
+   * that mistake is what licenses a quarantine.
+   */
+  async readLatestCheckpointNumber(): Promise<number> {
+    try {
+      return (await this.readLatestCheckpoint())?.checkpoint ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Pointer-file half of {@link readCheckpointChainState}.
+   *
+   * Validated against the chain file's size AND mtime. That is a cheap staleness
+   * check, not a proof of identity: an external rewrite that lands on the same
+   * byte count within the same mtime tick would still validate. It closes the
+   * realistic cases — a rebuild, a restored backup, an append from another
+   * process — and the chain's own hash linkage remains what `verify` checks.
+   */
+  private async readLatestCheckpointPointer(
+    info: { size: number; mtimeMs: number },
+  ): Promise<Checkpoint | null> {
+    try {
+      const raw = yaml.load(await readFile(this.latestCheckpointPath(), "utf-8"));
+      const pointer = raw as {
+        history_bytes?: unknown;
+        history_mtime_ms?: unknown;
+        checkpoint?: unknown;
+      };
+      if (pointer?.history_bytes !== info.size) return null;
+      if (pointer?.history_mtime_ms !== info.mtimeMs) return null;
+      const parsed = checkpointSchema.safeParse(pointer.checkpoint);
+      return parsed.success ? (parsed.data as Checkpoint) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Tail-read half of {@link readCheckpointChainState}.
+   *
+   * Finds the last list item by scanning for a two-space-indented
+   * `- checkpoint:` line. That is exact for files this class writes, and only
+   * for those: every writer dumps with `lineWidth: -1` so no scalar wraps, and
+   * a `Checkpoint`'s own values cannot contain a newline — `triggered_by` is a
+   * document id or a generated label, and the map keys are document ids, which
+   * `assertSafeDocumentId` constrains. Storing free text on a Checkpoint would
+   * break that assumption, so this must be revisited if the shape gains one.
+   * A wrong slice is not silent corruption: it fails to parse or fails the
+   * schema, and the caller falls back to a full read.
+   */
+  private async readLatestCheckpointFromTail(
+    historyBytes: number,
+  ): Promise<Checkpoint | null> {
+    const TAIL_BYTES = 64 * 1024;
+    const start = Math.max(0, historyBytes - TAIL_BYTES);
+    let text: string;
+    try {
+      const handle = await open(this.checkpointHistoryPath(), "r");
+      try {
+        const buf = Buffer.alloc(historyBytes - start);
+        // A short read is normal on network-backed mounts. Decoding the
+        // untouched remainder would splice NUL bytes onto the text and send an
+        // otherwise-fine chain down the slow path.
+        const { bytesRead } = await handle.read(buf, 0, buf.length, start);
+        text = buf.subarray(0, bytesRead).toString("utf-8");
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return null;
+    }
+    // A window that starts mid-file almost certainly starts mid-line; drop the
+    // partial one rather than feeding it to the parser.
+    if (start > 0) {
+      const firstBreak = text.indexOf("\n");
+      if (firstBreak === -1) return null;
+      text = text.slice(firstBreak + 1);
+    }
+    const marker = "\n  - checkpoint:";
+    const at = text.lastIndexOf(marker);
+    const item = at === -1
+      ? (text.startsWith("  - checkpoint:") ? text : null)
+      : text.slice(at + 1);
+    if (item === null) return null;
+    try {
+      const dedented = item
+        .split("\n")
+        .map((line) => (line.startsWith("  ") ? line.slice(2) : line))
+        .join("\n");
+      const raw = yaml.load(dedented);
+      const parsed = checkpointSchema.safeParse(
+        Array.isArray(raw) ? raw[0] : raw,
+      );
+      return parsed.success ? (parsed.data as Checkpoint) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Re-point the cache at `checkpoint`, stamped with the chain file's identity. */
+  private async writeLatestCheckpointPointer(
+    checkpoint: Checkpoint,
+  ): Promise<void> {
+    let info: { size: number; mtimeMs: number };
+    try {
+      const s = await stat(this.checkpointHistoryPath());
+      info = { size: s.size, mtimeMs: s.mtimeMs };
+    } catch {
+      return; // nothing to point at; the read path falls back cleanly
+    }
+    // Not writeFileDurable: this file is a cache. A torn one fails its staleness
+    // check and costs one tail read, so paying an fsync per write to protect it
+    // would trade away the thing being fixed for nothing.
+    await writeFile(
+      this.latestCheckpointPath(),
+      "# Auto-generated cache of the newest checkpoint. Safe to delete.\n" +
+        yaml.dump(
+          {
+            history_bytes: info.size,
+            history_mtime_ms: info.mtimeMs,
+            checkpoint,
+          },
+          { lineWidth: -1, noRefs: true },
+        ),
+      "utf-8",
+    );
+  }
+
+  /**
+   * Append one checkpoint to the chain (§7.2).
+   *
+   * APPEND, not read-modify-write. Sealing used to load the entire chain, push
+   * one entry and dump it back, so every publish cost O(chain size) in parse,
+   * serialize and fsync — on a network-backed mount, a full re-upload of a file
+   * that grows by one entry per published document per checkpoint. The bytes
+   * written are identical either way: `yaml.dump({checkpoints: [...]})` emits
+   * exactly `checkpoints:\n` followed by each item indented two spaces.
+   *
+   * Only valid when the file already ends in a non-empty `checkpoints:` list —
+   * i.e. when {@link readLatestCheckpoint} returned an entry. Callers with no
+   * previous checkpoint use {@link startCheckpointHistory}.
+   */
+  async appendCheckpoint(checkpoint: Checkpoint): Promise<void> {
+    // No mkdir: this only extends a chain file that exists (see above).
+    const path = this.checkpointHistoryPath();
+    const block = yaml
+      .dump([checkpoint], { lineWidth: -1, noRefs: true })
+      .split("\n")
+      .map((line) => (line.length > 0 ? `  ${line}` : line))
+      .join("\n");
+    const handle = await open(path, "a");
+    try {
+      await handle.write(block);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await this.writeLatestCheckpointPointer(checkpoint);
+  }
+
+  /**
+   * Begin a fresh chain with `checkpoint` as its first entry.
+   *
+   * For the states {@link appendCheckpoint} cannot extend: no chain file, or one
+   * holding no checkpoint to link onto.
+   *
+   * `quarantineExisting` is the CALLER's finding, never inferred here. Deciding
+   * from the file's size would conflate "unreadable" with "valid and empty" and
+   * — far worse — with a transient read failure, so a flaky mount could rename a
+   * healthy chain aside and restart numbering at 1. Only
+   * {@link readCheckpointChainState} can tell those apart, so only it decides.
+   */
+  async startCheckpointHistory(
+    checkpoint: Checkpoint,
+    options: { quarantineExisting?: string } = {},
+  ): Promise<void> {
+    const path = this.checkpointHistoryPath();
+    await mkdir(dirname(path), { recursive: true });
+    if (options.quarantineExisting !== undefined) {
+      try {
+        const quarantined = await quarantine(path);
+        console.warn(
+          `[checkpoint] ${path} is unreadable (${options.quarantineExisting}); ` +
+            `preserved as ${basename(quarantined)} and starting a new chain`,
+        );
+      } catch (err) {
+        // Another process moved it first. Losing that race is fine — the file
+        // is preserved either way, and failing the publish over it is not.
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+    await this.writeCheckpointHistory({ checkpoints: [checkpoint] });
+  }
+
+  /**
    * Write checkpoint history.
+   *
+   * Rewrites the file whole — for the rebuild path (§7.3) and for starting a
+   * fresh chain. The publish path appends instead; see {@link appendCheckpoint}.
    */
   async writeCheckpointHistory(history: CheckpointHistory): Promise<void> {
     const dir = join(this.root, ".versions");
@@ -765,7 +2729,13 @@ export class NestStorage {
     const content =
       "# Auto-generated. Do not edit manually.\n" +
       yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await writeFile(join(dir, "context_history.yaml"), content, "utf-8");
+    await this.writeFileDurable(this.checkpointHistoryPath(), content);
+    // Keep the pointer in step with the file it caches. Without this a rebuild
+    // would leave it naming a checkpoint the rewritten chain no longer ends
+    // with; the size check would catch that, but re-pointing is exact and free.
+    const latest = history.checkpoints.at(-1);
+    if (latest) await this.writeLatestCheckpointPointer(latest);
+    else await unlink(this.latestCheckpointPath()).catch(() => {});
   }
 
   /**
@@ -818,12 +2788,7 @@ export class NestStorage {
    * Read all packs from packs/ directory (§3).
    */
   async readPacks(): Promise<Pack[]> {
-    const packFiles = await fg("packs/**/*.yml", {
-      cwd: this.root,
-      dot: false,
-      // Skip unreadable directories rather than failing the whole crawl.
-      suppressErrors: true,
-    });
+    const packFiles = await globFiles(this.root, "packs/**/*.yml");
     const packs: Pack[] = [];
     for (const file of packFiles.sort()) {
       const content = await readFile(join(this.root, file), "utf-8");
@@ -841,8 +2806,7 @@ export class NestStorage {
    */
   async writeIndexMd(folder: string, content: string): Promise<void> {
     const indexPath = join(this.root, folder, "INDEX.md");
-    await mkdir(dirname(indexPath), { recursive: true });
-    await writeFile(indexPath, content, "utf-8");
+    await writeInDir(dirname(indexPath), () => writeFile(indexPath, content, "utf-8"));
   }
 
   /**
@@ -865,31 +2829,56 @@ export class NestStorage {
   /**
    * Find all document history files across the nest.
    * Used for checkpoint rebuild (§7.3).
+   *
+   * A history file that cannot be parsed (truncated / null-byte-padded by an
+   * interrupted write, hand-edited into invalid YAML, failing the schema) is
+   * SKIPPED rather than thrown from: one corrupt file used to abort the whole
+   * crawl, taking `ctx verify`, `ctx publish`'s checkpoint seal and the §7.3
+   * rebuild down with it. Skipping alone would be a silent green though —
+   * `verifyCheckpointChain` treats a missing history as "nothing to check" — so
+   * callers that verify pass `onUnreadable` and report the file as an
+   * `unreadable_history` integrity error.
    */
-  async findAllHistories(): Promise<Map<string, DocumentHistory>> {
-    const historyFiles = await fg("**/.versions/*/history.yaml", {
-      cwd: this.root,
-      dot: true,
-      // Skip unreadable directories instead of crashing checkpoint rebuild
-      // on a single permission-denied dir under the vault root.
-      suppressErrors: true,
-    });
+  async findAllHistories(
+    onUnreadable?: (docId: string, reason: string) => void,
+  ): Promise<Map<string, DocumentHistory>> {
+    const historyFiles = await globFiles(
+      this.root,
+      "**/.versions/*/history.yaml",
+    );
 
-    const histories = new Map<string, DocumentHistory>();
-    for (const file of historyFiles) {
+    // Read in batches, then fold in input order so the map's iteration order
+    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
+    const read = await mapInBatches(historyFiles, async (file) => {
       // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
       const parts = file.split("/");
       const versionsIdx = parts.indexOf(".versions");
-      if (versionsIdx === -1) continue;
+      if (versionsIdx === -1) return null;
       const docDir = parts.slice(0, versionsIdx).join("/");
       const docName = parts[versionsIdx + 1];
       const docId = docDir ? `${docDir}/${docName}` : docName;
+      try {
+        const raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
+        return { docId, raw, error: null as string | null };
+      } catch (err) {
+        return { docId, raw: null, error: err instanceof Error ? err.message : String(err) };
+      }
+    });
 
-      const content = await readFile(join(this.root, file), "utf-8");
-      const raw = yaml.load(content);
-      const result = documentHistorySchema.safeParse(raw);
+    const histories = new Map<string, DocumentHistory>();
+    for (const entry of read) {
+      if (!entry) continue;
+      if (entry.error !== null) {
+        onUnreadable?.(entry.docId, entry.error);
+        continue;
+      }
+      const result = documentHistorySchema.safeParse(entry.raw);
       if (result.success) {
-        histories.set(docId, result.data as DocumentHistory);
+        // Sealed free-text fields are opened when the key is at hand, so a
+        // legacy inline `diff` re-hashes as its plaintext during verify.
+        histories.set(entry.docId, await this.openHistoryFields(entry.docId, result.data as DocumentHistory));
+      } else {
+        onUnreadable?.(entry.docId, `history.yaml failed schema validation`);
       }
     }
 
@@ -902,6 +2891,8 @@ export class NestStorage {
   async init(
     name: string,
     layout: LayoutMode = "structured",
+    description?: string,
+    options: { review?: ReviewMode } = {},
   ): Promise<void> {
     await mkdir(this.root, { recursive: true });
 
@@ -914,11 +2905,17 @@ export class NestStorage {
     await mkdir(join(this.root, ".context"), { recursive: true });
     await mkdir(join(this.root, ".versions"), { recursive: true });
 
-    // Write default config
+    // Write default config. The description is the nest's OWN (spec §11.1) — it
+    // travels with the vault, unlike the registry entry's machine-local label.
     const config: NestConfig = {
       version: 1,
       name,
+      ...(description?.trim() ? { description } : {}),
       defaults: { status: "draft" },
+      // Only when asked: `ctx init` passes `on` so new vaults hold agent
+      // writes for review. Embedders calling init() directly keep the
+      // pre-gate config (no key → publish by default).
+      ...(options.review ? { review: options.review } : {}),
     };
     await this.writeConfig(config);
 

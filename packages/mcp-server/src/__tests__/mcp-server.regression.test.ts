@@ -3,7 +3,7 @@
  *
  * Unlike mcp-server.test.ts (which re-implements handler logic against the engine
  * layer), this suite spawns the *real built server* (dist/index.js) and drives it
- * through a genuine MCP SDK Client over stdio. It exercises every one of the 19
+ * through a genuine MCP SDK Client over stdio. It exercises every one of the 20
  * registered tools across their meaningful use cases and asserts both the tool
  * responses AND the internal vault files the server writes to disk
  * (context.yaml, per-folder INDEX.md, .versions/.../history.yaml, checkpoint
@@ -27,25 +27,54 @@ const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.ur
 const FIXTURES = fileURLToPath(new URL("../../../../fixtures/minimal-vault", import.meta.url));
 
 const EXPECTED_TOOLS = [
+  // Catalog-driven: name, description and schema come from the engine's
+  // operation catalog rather than being declared here, so this surface cannot
+  // drift from the CLI's. The legacy twin of a catalog tool (e.g.
+  // create_document) stays registered but is deprecated.
+  "context_get",
+  "context_query",
+  "context_resolve",
+  "context_list",
+  "context_folders",
+  "context_search",
+  "context_create",
+  "context_update",
+  "context_publish",
+  "context_delete",
+  "context_versions",
+  "context_reconstruct",
+  "context_verify",
+  "context_forget",
+  "context_forget_log",
+  "context_init",
+  "context_packs",
+  "context_import",
+  "context_import_pdf",
+  "context_nests",
+  "context_skill",
+  "context_skill_install",
+  // Hand-written, still current.
+  "document_format",
+  "read_index",
+  "read_pack",
+  "list_checkpoints",
+  "stage_drift_suggestion",
+  "list_suggestions",
+  "approve_suggestion",
+  "reject_suggestion",
+  "context_review",
+  // Legacy names — kept as deprecated aliases for the migration window.
   "vault_info",
   "resolve",
   "read_document",
   "list_documents",
-  "document_format",
-  "read_index",
-  "read_pack",
   "search",
   "verify_integrity",
-  "list_checkpoints",
   "read_version",
   "create_document",
   "update_document",
   "delete_document",
   "publish_document",
-  "stage_drift_suggestion",
-  "list_suggestions",
-  "approve_suggestion",
-  "reject_suggestion",
 ] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -62,10 +91,17 @@ async function connect(vaultPath: string): Promise<Client> {
   // StdioClientTransport replaces (not merges) the child env when `env` is set,
   // so forward the current environment plus the vault override. Filter out
   // undefined values to satisfy the Record<string, string> contract.
-  const env: Record<string, string> = { CONTEXTNEST_VAULT_PATH: vaultPath };
+  //
+  // The override is applied AFTER the copy: a developer who has
+  // CONTEXTNEST_VAULT_PATH or CTX_NEST_HOME exported for their own vault would
+  // otherwise have it copied over the throwaway one, and the suite would run —
+  // and write — against their real vault.
+  const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
+  delete env.CTX_NEST_HOME;
+  env.CONTEXTNEST_VAULT_PATH = vaultPath;
 
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -145,7 +181,7 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
     await rm(vault, { recursive: true, force: true });
   });
 
-  it("exposes exactly the 19 expected tools, each with a description and input schema", async () => {
+  it(`exposes exactly the ${EXPECTED_TOOLS.length} expected tools, each with a description and input schema`, async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual([...EXPECTED_TOOLS].sort());
@@ -154,6 +190,33 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
       expect((t.description ?? "").length).toBeGreaterThan(0);
       expect(t.inputSchema).toBeDefined();
     }
+  });
+
+  // A catalog tool is registered from `op.input.shape`, which is undefined on
+  // any descriptor whose input is a ZodEffects (i.e. one carrying a `.refine`).
+  // The SDK accepts that and publishes a tool advertising NO parameters at all,
+  // so a client cannot tell what to send — and asserting only that inputSchema
+  // "is defined" above sails straight past it.
+  it.each([
+    ["context_create", ["title", "content"]],
+    ["context_update", ["id", "content", "status"]],
+    ["context_list", ["type", "tag", "status", "limit"]],
+    ["context_versions", ["id", "title", "include_diff"]],
+    ["context_get", ["uri", "id", "title", "include_raw", "allow_rejected"]],
+    ["context_init", ["include_nodes", "limit"]],
+    ["context_search", ["query", "limit"]],
+    ["context_query", ["query", "hops", "full", "include_drafts"]],
+    ["context_resolve", ["selector", "max_tokens", "hops"]],
+    ["context_import", ["documents", "ids"]],
+    ["context_import_pdf", ["bytes_base64", "id", "title", "folder", "tags", "publish"]],
+  ])("%s advertises its declared inputs", async (name, expected) => {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === name);
+    expect(tool).toBeDefined();
+    const props = Object.keys(
+      (tool!.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
+    );
+    expect(props).toEqual(expect.arrayContaining(expected));
   });
 
   it("vault_info returns identity and the configured servers", async () => {
@@ -250,7 +313,7 @@ describe("[regression] MCP server e2e — read tools", () => {
   it("document_format describes node types and status values", async () => {
     const { json } = await callJson(client, "document_format");
     expect(json.frontmatter_fields.type.values).toEqual(
-      expect.arrayContaining(["document", "skill", "source", "snippet", "glossary", "persona", "prompt", "tool", "reference"]),
+      expect.arrayContaining(["document", "skill", "source", "snippet", "glossary", "persona", "prompt", "tool", "reference", "pdf"]),
     );
     expect(json.frontmatter_fields.status.values).toEqual(
       expect.arrayContaining(["draft", "pending_review", "approved", "published", "rejected"]),
@@ -372,6 +435,52 @@ describe("[regression] MCP server e2e — mutation tools", () => {
     expect(json.frontmatter.skill.trigger).toBe("when asked to do the thing");
   });
 
+  it("create_document round-trips a source node's block, and refuses one without it", async () => {
+    const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
+    const { json } = await callJson(client, "create_document", {
+      path: "nodes/my-source",
+      title: "My Source",
+      type: "source",
+      source,
+    });
+    expect(json.frontmatter.type).toBe("source");
+    expect(json.frontmatter.source).toEqual(source);
+
+    // Rule 9: without a block the create fails outright and leaves nothing behind.
+    const bare = await callText(client, "create_document", {
+      path: "nodes/no-block",
+      title: "No Block",
+      type: "source",
+    });
+    expect(bare.isError).toBe(true);
+    expect(bare.text).toContain("rule 9");
+    expect(await exists(join(vault, "nodes", "no-block.md"))).toBe(false);
+  });
+
+  it("update_document can edit a source block and re-type a node", async () => {
+    const replacement = { transport: "rest", server: "bigearnie", tools: ["get_estimate"] };
+    const edited = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      source: replacement,
+    });
+    expect(edited.json.frontmatter.source).toEqual(replacement);
+
+    // Rule 17 both ways: the block goes when the type does, and comes back with it.
+    const plain = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      type: "document",
+    });
+    expect(plain.json.frontmatter.type).toBe("document");
+    expect(plain.json.frontmatter.source).toBeUndefined();
+
+    const back = await callJson(client, "update_document", {
+      path: "nodes/my-source",
+      type: "source",
+      source: replacement,
+    });
+    expect(back.json.frontmatter.source).toEqual(replacement);
+  });
+
   it("create_document rejects a duplicate path", async () => {
     const dup = await callText(client, "create_document", { path: "nodes/created", title: "Dup" });
     expect(dup.isError).toBe(true);
@@ -468,6 +577,24 @@ describe("[regression] MCP server e2e — mutation tools", () => {
     expect(JSON.stringify(await storage.readContextYaml())).not.toContain("nodes/disposable");
 
     expect(await isToolError(client, "delete_document", { path: "nodes/disposable" })).toBe(true);
+  });
+
+  it("publish and delete rewrite only the touched folder's INDEX.md", async () => {
+    for (const path of ["nodes/scope-a/one", "nodes/scope-a/two", "nodes/scope-b/three"]) {
+      await callJson(client, "create_document", { path, title: path.split("/").pop() });
+    }
+    const otherIndex = join(vault, "nodes", "scope-b", "INDEX.md");
+    const before = await readFile(otherIndex, "utf-8");
+    await new Promise((r) => setTimeout(r, 5));
+
+    await callJson(client, "publish_document", { path: "nodes/scope-a/one", author: "t@example.com" });
+    await callJson(client, "delete_document", { path: "nodes/scope-a/two" });
+
+    expect(await readFile(otherIndex, "utf-8")).toBe(before);
+    const touched = await readFile(join(vault, "nodes", "scope-a", "INDEX.md"), "utf-8");
+    expect(touched).toContain("nodes/scope-a/one");
+    expect(touched).not.toContain("nodes/scope-a/two");
+    expect(JSON.stringify(await storage.readContextYaml())).not.toContain("nodes/scope-a/two");
   });
 });
 
@@ -648,6 +775,37 @@ describe("[regression] MCP server e2e — integrity failure", () => {
     const tampered = await callJson(client, "verify_integrity");
     expect(tampered.json.valid).toBe(false);
   });
+
+  it("context_get still serves the tampered document, flagged with the integrity warning (NestBench T10)", async () => {
+    // Runs after the tamper above: nodes/sealed no longer matches its checksum.
+    const { json } = await callJson(client, "context_get", { id: "nodes/sealed" });
+    expect(json.body).toContain("tampered out of band");
+    expect(json.integrity?.status).toBe("failed");
+    expect(json.integrity?.checks).toContain("body_drift");
+    expect(json.integrity?.warning).toMatch(/^⚠ Integrity check failed/);
+  });
+
+  it("context_list full flags the tampered body; read_version flags a broken chain in its text", async () => {
+    const { json } = await callJson(client, "context_list", { full: true });
+    const sealed = json.documents.find((d: any) => d.id === "nodes/sealed");
+    expect(sealed.integrity?.status).toBe("failed");
+
+    // A doc whose keyframe is altered before anything read it in this server.
+    await callJson(client, "create_document", { path: "nodes/chained", title: "Chained", body: "v1 bytes" });
+    const versionsDir = join(vault, "nodes", ".versions", "chained");
+    const keyframe = (await readdir(versionsDir)).find((f) => /^v\d+\.md$/.test(f))!;
+    const kfPath = join(versionsDir, keyframe);
+    await writeFile(kfPath, (await readFile(kfPath, "utf-8")).replace("v1 bytes", "forged"), "utf-8");
+    const version = Number(keyframe.slice(1, -3));
+    const { text } = await callText(client, "read_version", { path: "nodes/chained", version });
+    expect(text).toMatch(/^⚠ Integrity check failed/);
+  });
+
+  it("an intact document is served with no integrity key", async () => {
+    await callJson(client, "create_document", { path: "nodes/clean", title: "Clean", body: "fine" });
+    const { json } = await callJson(client, "context_get", { id: "nodes/clean" });
+    expect(json).not.toHaveProperty("integrity");
+  });
 });
 
 // ─── selector operators ──────────────────────────────────────────────────────
@@ -758,5 +916,606 @@ describe("[regression] MCP server e2e — selector operators", () => {
     const ids = json.documents.map((d: any) => d.id);
     expect(ids).toContain("nodes/op-auth");
     expect(ids).not.toContain("nodes/op-billing");
+  });
+});
+
+describe("[regression] MCP server e2e — misnamed parameters cannot silently drop a write", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("advertises additionalProperties:false and actually enforces it", async () => {
+    const { tools } = await client.listTools();
+    const update = tools.find((t) => t.name === "update_document")!;
+    expect((update.inputSchema as any).additionalProperties).toBe(false);
+
+    await callJson(client, "create_document", {
+      path: "nodes/strict-doc",
+      title: "Strict Doc",
+      body: "the original body",
+    });
+
+    // `contents` is not a parameter. Previously zod stripped it, the tool
+    // answered "Document updated and published successfully", the version
+    // bumped, and the body on disk was untouched.
+    const rejected = await callText(client, "update_document", {
+      path: "nodes/strict-doc",
+      contents: "the rewrite",
+    });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toMatch(/contents/);
+
+    const { json } = await callJson(client, "read_document", { uri: "nodes/strict-doc" });
+    expect(json.body).toContain("the original body");
+    expect(json.body).not.toContain("the rewrite");
+  });
+
+  it("accepts `content` as an alias for `body` on create and update", async () => {
+    await callJson(client, "create_document", {
+      path: "nodes/alias-doc",
+      title: "Alias Doc",
+      content: "created through content",
+    });
+    let doc = await callJson(client, "read_document", { uri: "nodes/alias-doc" });
+    expect(doc.json.body).toContain("created through content");
+
+    await callJson(client, "update_document", {
+      path: "nodes/alias-doc",
+      content: "updated through content",
+    });
+    doc = await callJson(client, "read_document", { uri: "nodes/alias-doc" });
+    expect(doc.json.body).toContain("updated through content");
+  });
+
+  it("refuses `body` and `content` carrying different text rather than picking one", async () => {
+    const { isError, json } = await callJson(client, "create_document", {
+      path: "nodes/alias-conflict",
+      title: "Conflict",
+      body: "one",
+      content: "two",
+    });
+    expect(isError).toBe(true);
+    expect(json.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("sets and clears a description through create_document and update_document", async () => {
+    await callJson(client, "create_document", {
+      path: "nodes/described-doc",
+      title: "Described Doc",
+      description: "what this document is for",
+      body: "body",
+    });
+    let doc = await callJson(client, "read_document", { uri: "nodes/described-doc" });
+    expect(doc.json.frontmatter.description).toBe("what this document is for");
+
+    await callJson(client, "update_document", {
+      path: "nodes/described-doc",
+      description: "a sharper summary",
+    });
+    doc = await callJson(client, "read_document", { uri: "nodes/described-doc" });
+    expect(doc.json.frontmatter.description).toBe("a sharper summary");
+
+    await callJson(client, "update_document", { path: "nodes/described-doc", description: "" });
+    doc = await callJson(client, "read_document", { uri: "nodes/described-doc" });
+    expect(doc.json.frontmatter.description).toBeUndefined();
+  });
+
+  it("filters list_documents by path, on segment boundaries", async () => {
+    await callJson(client, "create_document", { path: "nodes/history/q1", title: "Q1" });
+    await callJson(client, "create_document", { path: "nodes/history/q2", title: "Q2" });
+    await callJson(client, "create_document", { path: "nodes/historic-note", title: "Historic" });
+
+    const { json } = await callJson(client, "list_documents", { path: "nodes/history" });
+    const ids = json.map((d: any) => d.id);
+    expect(ids).toContain("nodes/history/q1");
+    expect(ids).toContain("nodes/history/q2");
+    // "nodes/historic-note" shares the prefix but not the segment.
+    expect(ids).not.toContain("nodes/historic-note");
+  });
+
+  it("composes the path filter with the other list filters", async () => {
+    const { json } = await callJson(client, "list_documents", {
+      path: "nodes/history",
+      status: "published",
+    });
+    expect(json.length).toBeGreaterThan(0);
+    for (const doc of json) {
+      expect(doc.id.startsWith("nodes/history/")).toBe(true);
+      expect(doc.status).toBe("published");
+    }
+  });
+
+  it("refuses a misnamed key INSIDE a source block, on create and on update", async () => {
+    // The tool() helper's strictness stops at the top level, so this holds only
+    // because the nested source schema is strict too. A dropped `server` would
+    // write a block missing the field rule 12 wants, and seal it into the chain.
+    const typo = { transport: "mcp", servers: "TYPO", tools: ["list_projects"] };
+    const badCreate = await callText(client, "create_document", {
+      path: "nodes/typo-source",
+      title: "Typo Source",
+      type: "source",
+      source: typo,
+    });
+    expect(badCreate.isError).toBe(true);
+    expect(badCreate.text).toMatch(/servers/);
+    expect(await exists(join(vault, "nodes", "typo-source.md"))).toBe(false);
+
+    const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
+    await callJson(client, "create_document", {
+      path: "nodes/good-source",
+      title: "Good Source",
+      type: "source",
+      source,
+    });
+    const badUpdate = await callText(client, "update_document", {
+      path: "nodes/good-source",
+      source: typo,
+    });
+    expect(badUpdate.isError).toBe(true);
+    expect(badUpdate.text).toMatch(/servers/);
+
+    const { json } = await callJson(client, "read_document", { uri: "nodes/good-source" });
+    expect(json.frontmatter.source).toEqual(source);
+  });
+});
+
+// ─── context_import_pdf (CU-wdqcq02pmg) ──────────────────────────────────────
+
+describe("[regression] MCP server e2e — context_import_pdf", () => {
+  let vault: string;
+  let client: Client;
+  const PDF = fileURLToPath(new URL("../../../../fixtures/pdf/report.pdf", import.meta.url));
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("imports a PDF over the wire: node + sidecar on disk, verify clean", async () => {
+    const bytes = await readFile(PDF);
+    const { json, isError } = await callJson(client, "context_import_pdf", {
+      bytes_base64: bytes.toString("base64"),
+      folder: "reports",
+    });
+    expect(isError).toBe(false);
+    expect(json.created).toBe(true);
+    expect(json.id).toBe("nodes/reports/quarterly-report");
+    expect(json.text_layer).toBe(true);
+    expect(json.pdf.pages).toBe(2);
+    expect(await readFile(join(vault, json.pdf.file))).toEqual(bytes);
+
+    const got = await callJson(client, "context_get", { id: json.id });
+    expect(got.json.frontmatter.type).toBe("pdf");
+    expect(got.json.body).toContain("Revenue grew 12 percent.");
+
+    const verify = await callJson(client, "context_verify", {});
+    expect(verify.json.valid).toBe(true);
+  });
+});
+
+// ─── Review gate ──────────────────────────────────────────────────────────────
+
+describe("[regression] MCP server e2e — review gate", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    // The fixture predates the gate (no key); turn it on the way `ctx init` does.
+    const cfg = join(vault, ".context", "config.yaml");
+    await writeFile(cfg, `${await readFile(cfg, "utf-8")}\nreview: 'on'\n`);
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("holds context_create and tells the agent the user can turn review off", async () => {
+    const { json, isError } = await callJson(client, "context_create", {
+      title: "Held Note",
+      content: "agent-written",
+    });
+    expect(isError).toBe(false);
+    expect(json.held_for_review).toBe(true);
+    expect(json.status).toBe("pending_review");
+    expect(json.checkpoint).toBeNull();
+    expect(json.review).toMatch(/pending review/);
+    expect(json.review).toMatch(/turn off review/);
+    // First-run trap: a held node is invisible to search, so say so.
+    expect(json.review).toMatch(/not searchable/);
+  });
+
+  it("context_review approve publishes the held node", async () => {
+    const { json } = await callJson(client, "context_review", { action: "approve", id: "nodes/held-note" });
+    expect(json.id).toBe("nodes/held-note");
+    expect(json.version).toBeGreaterThanOrEqual(1);
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toMatch(/status:\s*published/);
+  });
+
+  it("an edit to a published node is staged; the published body keeps serving", async () => {
+    const { json } = await callJson(client, "context_update", { id: "nodes/held-note", content: "edited" });
+    expect(json.held_for_review).toBe(true);
+    expect(typeof json.suggestion_id).toBe("string");
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toContain("agent-written");
+    expect(raw).not.toContain("edited");
+  });
+
+  it("a create that names a status is still held — status alone never stops a create publishing", async () => {
+    const { json } = await callJson(client, "context_create", { title: "Named Status", content: "x", status: "draft" });
+    expect(json.held_for_review).toBe(true);
+    expect(json.status).toBe("pending_review");
+    expect(json.checkpoint).toBeNull();
+  });
+
+  it("the deprecated create_document is held too — the legacy tool is no way around the gate", async () => {
+    const { json, isError } = await callJson(client, "create_document", { path: "nodes/legacy-held", title: "Legacy Held" });
+    expect(isError).toBe(false);
+    expect(json.held_for_review).toBe(true);
+    expect(json.review).toMatch(/turn off review/);
+    const raw = await readFile(join(vault, "nodes", "legacy-held.md"), "utf-8");
+    expect(raw).toMatch(/status:\s*pending_review/);
+    expect(await new NestStorage(vault).readHistory("nodes/legacy-held")).toBeNull();
+  });
+
+  it("the deprecated update_document stages an edit to a published node and builds on the prior hold", async () => {
+    const { json } = await callJson(client, "update_document", { path: "nodes/held-note", body: "legacy edit" });
+    expect(json.held_for_review).toBe(true);
+    expect(typeof json.suggestion_id).toBe("string");
+    const raw = await readFile(join(vault, "nodes", "held-note.md"), "utf-8");
+    expect(raw).toContain("agent-written");
+    // One hold per node: this one superseded context_update's.
+    const list = await callJson(client, "context_review", { action: "list" });
+    expect(list.json.filter((i: { id: string }) => i.id === "nodes/held-note")).toHaveLength(1);
+    await callJson(client, "context_review", { action: "approve", id: "nodes/held-note" });
+    expect(await readFile(join(vault, "nodes", "held-note.md"), "utf-8")).toContain("legacy edit");
+  });
+
+  it("context_review off turns the gate off; the next write publishes", async () => {
+    const off = await callJson(client, "context_review", { action: "off" });
+    expect(off.json.review).toBe("off");
+    const { json } = await callJson(client, "context_create", { title: "After Off", content: "x" });
+    expect(json.held_for_review).toBeUndefined();
+    expect(json.status).toBe("published");
+  });
+});
+
+// ─── context_search & context_query ───────────────────────────────────────────
+//
+// Fixture statuses: api-design, architecture-overview and both sources are
+// published; onboarding-guide is a draft, schema-migration approved,
+// legacy-soap-bridge rejected. Only the published ones may ever be served.
+
+const NEVER_SERVED = ["nodes/onboarding-guide", "nodes/schema-migration", "nodes/legacy-soap-bridge"];
+
+describe("[regression] MCP server e2e — context_search", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  const search = async (args: Record<string, unknown>) => {
+    const { json, isError } = await callJson(client, "context_search", args);
+    expect(isError, JSON.stringify(args)).toBe(false);
+    return json as { results: Array<{ id: string; title: string; score?: number }>; count: number; total: number };
+  };
+  const ids = async (query: string) => (await search({ query })).results.map((r) => r.id);
+
+  it("finds a published doc by body text, scored, best hit first", async () => {
+    const res = await search({ query: "authentication" });
+    expect(res.results[0].id).toBe("nodes/api-design");
+    expect(res.results[0].title).toBe("API Design Guidelines");
+    const scores = res.results.map((r) => r.score!);
+    expect(scores.every((s) => typeof s === "number")).toBe(true);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+    expect(res.total).toBe(res.results.length);
+  });
+
+  it("matches title, tags and source nodes, case-insensitively", async () => {
+    expect((await ids("Architecture Overview"))[0]).toBe("nodes/architecture-overview");
+    expect(await ids("guidelines")).toContain("nodes/api-design");
+    expect(await ids("sprint")).toContain("sources/sprint-tickets");
+    expect((await ids("AUTHENTICATION"))[0]).toBe("nodes/api-design");
+  });
+
+  it("ranks a doc matching every term above partial matches", async () => {
+    expect((await ids("API gateway"))[0]).toBe("nodes/architecture-overview");
+  });
+
+  it("never returns draft, approved or rejected docs", async () => {
+    for (const q of ["Onboarding", "migration", "SOAP", "engineering"]) {
+      const got = await ids(q);
+      for (const hidden of NEVER_SERVED) expect(got, q).not.toContain(hidden);
+    }
+  });
+
+  it("limit caps results while count still counts every match", async () => {
+    const all = await search({ query: "API" });
+    expect(all.count).toBeGreaterThan(1);
+    expect(all.count).toBe(all.results.length);
+    const one = await search({ query: "API", limit: 1 });
+    expect(one.results).toHaveLength(1);
+    expect(one.results[0].id).toBe(all.results[0].id);
+    expect(one.count).toBe(all.count);
+    // Deprecated alias, same value.
+    expect(one.total).toBe(one.count);
+  });
+
+  it("no match and a whitespace-only query return empty results, not an error", async () => {
+    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], count: 0, total: 0 });
+    expect(await search({ query: "   " })).toEqual({ results: [], count: 0, total: 0 });
+  });
+
+  it("special characters in the query never break the search", async () => {
+    const queries = ["c++", "\"quoted phrase\"", "API-design", "#engineering", "contextnest://nodes/x", "(", "a|b -c", "50%", "ünïcödé"];
+    for (const q of queries) {
+      const { json, isError } = await callJson(client, "context_search", { query: q });
+      expect(isError, q).toBe(false);
+      expect(Array.isArray(json.results), q).toBe(true);
+    }
+  });
+
+  it("rejects a missing or empty query, a non-positive limit and unknown keys", async () => {
+    expect(await isToolError(client, "context_search", {})).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "" })).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "API", limit: 0 })).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "API", limit: -1 })).toBe(true);
+    expect(await isToolError(client, "context_search", { query: "API", hops: 2 })).toBe(true);
+  });
+
+  it("sees a create at once, an update's new text only, and nothing after a delete", async () => {
+    const { json: created } = await callJson(client, "context_create", {
+      title: "Search Freshness",
+      content: "The token PAPAYAUNIQUE marks this note.",
+    });
+    expect(await ids("PAPAYAUNIQUE")).toContain(created.id);
+
+    await callJson(client, "context_update", { id: created.id, content: "Now it says GUAVAUNIQUE instead." });
+    expect(await ids("PAPAYAUNIQUE")).not.toContain(created.id);
+    expect(await ids("GUAVAUNIQUE")).toContain(created.id);
+
+    await callJson(client, "context_delete", { id: created.id });
+    expect(await ids("GUAVAUNIQUE")).not.toContain(created.id);
+  });
+
+  it("does not return an unpublished draft or a forgotten node", async () => {
+    const { json: draft } = await callJson(client, "context_create", {
+      title: "Search Draft",
+      content: "Draft text with KIWIDRAFTUNIQUE inside.",
+      publish: false,
+    });
+    expect(await ids("KIWIDRAFTUNIQUE")).not.toContain(draft.id);
+
+    const { json: gone } = await callJson(client, "context_create", {
+      title: "Search Forgotten",
+      content: "Erasable text with MANGOFORGETUNIQUE inside.",
+    });
+    expect(await ids("MANGOFORGETUNIQUE")).toContain(gone.id);
+    const forgot = await callText(client, "context_forget", { id: gone.id, reason_code: "user_request" });
+    expect(forgot.isError, forgot.text).toBe(false);
+    expect(await ids("MANGOFORGETUNIQUE")).toEqual([]);
+  });
+
+  it("the deprecated `search` alias still finds documents", async () => {
+    const { json, isError } = await callJson(client, "search", { query: "authentication" });
+    expect(isError).toBe(false);
+    expect(json.documents.map((d: any) => d.id)).toContain("nodes/api-design");
+  });
+});
+
+describe("[regression] MCP server e2e — context_query", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  type QueryResult = {
+    documents: Array<{ id: string; type: string; status: string; body?: string }>;
+    source_nodes?: Array<{ id: string; type: string }>;
+    traversal: { mode: string; hops_used: number; nodes_traversed: number };
+  };
+  const query = async (args: Record<string, unknown>) => {
+    const { json, isError } = await callJson(client, "context_query", args);
+    expect(isError, JSON.stringify(args)).toBe(false);
+    return json as QueryResult;
+  };
+  const docIds = async (q: string, extra: Record<string, unknown> = {}) =>
+    (await query({ query: q, ...extra })).documents.map((d) => d.id).sort();
+
+  it("a tag selector returns matching docs with bodies and traversal stats", async () => {
+    const res = await query({ query: "#api" });
+    expect(res.documents.map((d) => d.id)).toContain("nodes/api-design");
+    expect(typeof res.documents[0].body).toBe("string");
+    expect(res.traversal.mode).toBe("graph");
+    expect(typeof res.traversal.hops_used).toBe("number");
+    expect(typeof res.traversal.nodes_traversed).toBe("number");
+  });
+
+  it("type:source returns sources under source_nodes, not documents", async () => {
+    const res = await query({ query: "type:source", hops: 0 });
+    expect(res.source_nodes!.map((d) => d.id).sort()).toEqual([
+      "sources/active-project-config",
+      "sources/sprint-tickets",
+    ]);
+    expect(res.documents.filter((d) => d.type === "source")).toEqual([]);
+  });
+
+  it("serves only published docs, whatever the selector or mode", async () => {
+    for (const q of ["#engineering", "type:document", "status:published", "#onboarding", "#database", "#legacy"]) {
+      for (const full of [false, true]) {
+        const got = await docIds(q, { full, hops: 3 });
+        for (const hidden of NEVER_SERVED) expect(got, `${q} full=${full}`).not.toContain(hidden);
+      }
+    }
+    const published = await query({ query: "status:published", hops: 0 });
+    expect(published.documents.every((d) => d.status === "published")).toBe(true);
+  });
+
+  it("AND by space and by + agree", async () => {
+    const spaced = await docIds("#engineering type:document", { hops: 0 });
+    expect(spaced).toEqual(["nodes/api-design", "nodes/architecture-overview"]);
+    expect(await docIds("#engineering + type:document", { hops: 0 })).toEqual(spaced);
+  });
+
+  it("| unions, - excludes and parentheses group", async () => {
+    expect(await docIds("#api | #architecture", { hops: 0 })).toEqual([
+      "nodes/api-design",
+      "nodes/architecture-overview",
+    ]);
+    expect(await docIds("#engineering -#api", { hops: 0 })).toEqual(["nodes/architecture-overview"]);
+    expect(await docIds("(#api | #architecture) -#api", { hops: 0 })).toEqual(["nodes/architecture-overview"]);
+  });
+
+  it("a pack selector expands its query and includes", async () => {
+    const got = await docIds("pack:onboarding.basics", { hops: 0 });
+    expect(got).toContain("nodes/architecture-overview");
+    expect(got).not.toContain("nodes/onboarding-guide"); // draft
+  });
+
+  it("URI, bare node id and search URI selectors resolve", async () => {
+    expect(await docIds("contextnest://nodes/api-design", { hops: 0 })).toEqual(["nodes/api-design"]);
+    expect(await docIds("nodes/api-design", { hops: 0 })).toEqual(["nodes/api-design"]);
+    expect(await docIds("contextnest://search/authentication", { hops: 0 })).toContain("nodes/api-design");
+  });
+
+  it("hops widens the result along links; hops 0 returns only the seed", async () => {
+    expect(await docIds("contextnest://nodes/api-design", { hops: 0 })).toEqual(["nodes/api-design"]);
+    expect(await docIds("contextnest://nodes/api-design", { hops: 1 })).toEqual([
+      "nodes/api-design",
+      "nodes/architecture-overview",
+    ]);
+  });
+
+  it("full:true runs full mode and serves the same seed", async () => {
+    const res = await query({ query: "#api", full: true });
+    expect(res.traversal.mode).toBe("full");
+    expect(res.documents.map((d) => d.id)).toContain("nodes/api-design");
+  });
+
+  it("include_drafts surfaces a draft but never an approved or rejected doc", async () => {
+    expect(await docIds("#onboarding")).toEqual([]);
+    expect(await docIds("#onboarding", { include_drafts: true })).toContain("nodes/onboarding-guide");
+    expect(await docIds("#database", { include_drafts: true })).not.toContain("nodes/schema-migration");
+    expect(await docIds("#legacy", { include_drafts: true })).not.toContain("nodes/legacy-soap-bridge");
+  });
+
+  it("a selector matching nothing returns an empty list, not an error", async () => {
+    expect(await docIds("#no-such-tag-anywhere")).toEqual([]);
+  });
+
+  it("refuses a malformed selector, an empty query, negative hops and unknown keys", async () => {
+    expect(await isToolError(client, "context_query", { query: "#api +" })).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "(#api" })).toBe(true);
+    expect(await isToolError(client, "context_query", {})).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "" })).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "#api", hops: -1 })).toBe(true);
+    expect(await isToolError(client, "context_query", { query: "#api", limit: 5 })).toBe(true);
+  });
+
+  it("sees a create and a retag at once in graph mode", async () => {
+    const { json: created } = await callJson(client, "context_create", {
+      title: "Query Freshness",
+      content: "fresh body",
+      tags: ["#freshtag"],
+    });
+    expect(await docIds("#freshtag")).toEqual([created.id]);
+    await callJson(client, "context_update", { id: created.id, tags: ["#retagged"] });
+    expect(await docIds("#freshtag")).toEqual([]);
+    expect(await docIds("#retagged")).toEqual([created.id]);
+  });
+
+  it("hides a forgotten node unless status:forgotten is asked for by name", async () => {
+    const { json: created } = await callJson(client, "context_create", {
+      title: "Query Forgotten",
+      content: "content that will be erased by a forget",
+      tags: ["#forgetme"],
+    });
+    const forgot = await callText(client, "context_forget", { id: created.id, reason_code: "user_request" });
+    expect(forgot.isError, forgot.text).toBe(false);
+    expect(await docIds("#forgetme")).toEqual([]);
+    expect(await docIds("#forgetme", { full: true })).toEqual([]);
+    const stub = await query({ query: "status:forgotten" });
+    expect(stub.documents.map((d) => d.id)).toEqual([created.id]);
+    expect(stub.documents[0].body?.trim()).toBe("");
+  });
+
+  it("the deprecated `resolve` alias returns what context_query returns", async () => {
+    const { json, isError } = await callJson(client, "resolve", { selector: "#engineering", hops: 1 });
+    expect(isError).toBe(false);
+    expect(json.documents.map((d: any) => d.id).sort()).toEqual(await docIds("#engineering", { hops: 1 }));
+  });
+});
+
+// ─── Onboarding: placement outside discovered folders ─────────────────────────
+
+describe("[regression] MCP server e2e — writes outside nodes/ are re-rooted", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("create_document with a path outside nodes/ lands under nodes/ and says so", async () => {
+    const { json, isError } = await callJson(client, "create_document", { path: "projects/plan", title: "Plan" });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/projects/plan");
+    expect(json.placement).toMatch(/outside nodes\//);
+    expect(await exists(join(vault, "nodes", "projects", "plan.md"))).toBe(true);
+    expect(await exists(join(vault, "projects", "plan.md"))).toBe(false);
+  });
+
+  it("context_create with an explicit id outside nodes/ is re-rooted and listable", async () => {
+    const { json, isError } = await callJson(client, "context_create", { title: "Alpha", id: "projects/alpha", content: "a" });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/projects/alpha");
+    expect(json.placement).toMatch(/outside nodes\//);
+    const list = await callText(client, "context_list", {});
+    expect(list.text).toContain("nodes/projects/alpha");
+  });
+
+  it("an id already under nodes/ is untouched and carries no placement note", async () => {
+    const { json } = await callJson(client, "context_create", { title: "Beta", id: "nodes/beta", content: "b" });
+    expect(json.id).toBe("nodes/beta");
+    expect(json.placement).toBeUndefined();
   });
 });

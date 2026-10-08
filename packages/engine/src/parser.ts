@@ -1,9 +1,9 @@
 /**
  * Document parsing and serialization.
- * Uses gray-matter for frontmatter extraction and Zod for validation.
+ * Splits YAML frontmatter with js-yaml and validates it with Zod.
  */
 
-import matter from "gray-matter";
+import yaml from "js-yaml";
 import { frontmatterSchema, STATUSES, STATUS_ALIASES } from "./schemas.js";
 import type { ContextNode, Frontmatter, Status, ValidationError, ValidationResult } from "./types.js";
 
@@ -43,7 +43,7 @@ export function normalizeTags(tags?: unknown[]): string[] | undefined {
 /**
  * Coerce a frontmatter date-field value to an ISO-8601 string.
  *
- * js-yaml (used by gray-matter) auto-parses unquoted ISO timestamps into
+ * js-yaml auto-parses unquoted ISO timestamps into
  * JavaScript `Date` objects. The Frontmatter TypeScript type declares
  * `created_at`/`updated_at` as `string`, so downstream code (e.g.
  * `generateIndexMd` calling `.split("T")[0]`) crashes when given a Date.
@@ -86,6 +86,46 @@ export function isRejected(node: ContextNode): boolean {
 }
 
 /**
+ * Predicate: document was erased by the forget protocol (§6.3.3) — the live
+ * file is an empty stub and MUST NOT be treated as content. Excluded from
+ * every retrieval path; selectors surface it only for an explicit
+ * `status:forgotten`.
+ */
+export function isForgotten(node: ContextNode): boolean {
+  return node.frontmatter.status === "forgotten";
+}
+
+/**
+ * The EXPLICIT lifecycle status the source author wrote, canonicalized, or
+ * `null` when the frontmatter carried no `status:` at all.
+ *
+ * `parseDocument` defaults a missing status to `draft`, so
+ * `node.frontmatter.status` cannot tell an author's deliberate draft from a
+ * status-less hand-authored file. Folder import needs that distinction: a
+ * status-less file is fair game to publish, an explicit `draft` or
+ * `pending_review` must stay unpublished. Aliases (`review`, `submitted`,
+ * `in_review`, …) are collapsed to their canonical status, so an import cannot
+ * smuggle a not-yet-approved document past the hold by spelling it differently.
+ *
+ * Reads what the YAML parser already produced (`authoredStatus`) rather than
+ * re-scanning the raw source. A second, hand-rolled frontmatter parse is a
+ * second thing to get wrong, and it was: `status: draft  # not reviewed` — an
+ * ordinary line js-yaml handles fine — did not match the pattern, so the
+ * document read as status-less and published against its author's wishes.
+ *
+ * A node built in memory has no `authoredStatus`, which reads as "not stated".
+ * That is the safe direction for every caller today: import only ever asks this
+ * about documents it parsed off disk.
+ */
+export function explicitStatus(node: ContextNode): Status | null {
+  const authored = node.authoredStatus;
+  if (authored === undefined || authored === null || authored.trim() === "") {
+    return null;
+  }
+  return normalizeStatus(authored);
+}
+
+/**
  * @deprecated The `superseded` status was removed. `parseDocument` normalizes
  * legacy `superseded` values to `draft`, so this predicate always returns
  * `false` for parsed nodes. Use `isRejected` for the terminal-hide state.
@@ -97,7 +137,7 @@ export function isSuperseded(node: ContextNode): boolean {
 /**
  * Retrieval predicate — true when the node may surface to LLMs / context
  * APIs under any retrieval setting. Excludes `pending_review`, `approved`,
- * and `rejected`:
+ * `rejected` and `forgotten` (an erased stub, §6.3):
  *   - `rejected` is terminal hide (steward retired the doc).
  *   - `approved` is reviewer-signed-off but not yet live.
  *   - `pending_review` is submitted-for-review; reviewer has not signed off.
@@ -112,12 +152,53 @@ export function isRetrievable(node: ContextNode): boolean {
  * Parse a Context Nest document from its file content.
  * Returns the parsed ContextNode with validated frontmatter.
  */
+const DELIMITER = "---";
+
+/**
+ * Split `---`-delimited YAML frontmatter from a markdown body.
+ *
+ * Deliberately narrow: YAML only, no excerpts, no sections, no language tag.
+ * The delimiter handling mirrors what gray-matter did (which this replaced),
+ * including tolerating CRLF and treating an all-comment block as empty.
+ */
+function splitFrontmatter(raw: string): { data: Record<string, unknown>; body: string } {
+  const content = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+
+  // `----` and friends are a thematic break, not an opening delimiter.
+  if (!content.startsWith(DELIMITER) || content.charAt(DELIMITER.length) === "-") {
+    return { data: {}, body: content };
+  }
+
+  const rest = content.slice(DELIMITER.length);
+  const close = "\n" + DELIMITER;
+  const closeIndex = rest.indexOf(close);
+
+  const block = rest.slice(0, closeIndex === -1 ? rest.length : closeIndex);
+
+  // A block of nothing but YAML comments carries no data. The indent is matched
+  // with `[ \t]*` rather than `\s*` because `\s` spans newlines, which under
+  // the `m` flag lets the match start at any preceding line — ambiguous, and
+  // quadratic on a run of blank lines (CodeQL js/polynomial-redos).
+  const stripped = block.replace(/^[ \t]*#[^\n]*$/gm, "").trim();
+  const data = stripped === "" ? {} : ((yaml.load(block) as Record<string, unknown>) ?? {});
+
+  if (closeIndex === -1) return { data, body: "" };
+
+  let body = rest.slice(closeIndex + close.length);
+  // Drop the line break that terminates the closing delimiter's own line.
+  if (body[0] === "\r") body = body.slice(1);
+  if (body[0] === "\n") body = body.slice(1);
+
+  return { data, body };
+}
+
 export function parseDocument(
   filePath: string,
   content: string,
   id: string,
 ): ContextNode {
-  const parsed = matter(content);
+  const { data, body } = splitFrontmatter(content);
+  const parsed = { data: data as Record<string, any>, content: body };
 
   // Normalize tags to include # prefix
   if (parsed.data.tags) {
@@ -132,6 +213,21 @@ export function parseDocument(
   if (parsed.data.created_at !== undefined) {
     parsed.data.created_at = normalizeDateField(parsed.data.created_at);
   }
+  // Same for the pdf block's timestamp: a hand-written, unquoted
+  // `extracted_at` loads as a Date and would fail the string schema.
+  const pdfBlock = parsed.data.pdf as Record<string, unknown> | undefined;
+  if (pdfBlock && typeof pdfBlock === "object" && pdfBlock.extracted_at !== undefined) {
+    parsed.data.pdf = { ...pdfBlock, extracted_at: normalizeDateField(pdfBlock.extracted_at) };
+  }
+
+  // Capture what the author wrote BEFORE the line below overwrites it. A
+  // missing status normalizes to `draft`, so this is the only point where an
+  // explicit draft and a status-less file are still distinguishable — see
+  // ContextNode.authoredStatus.
+  const authoredStatus =
+    parsed.data.status === undefined || parsed.data.status === null
+      ? null
+      : String(parsed.data.status);
 
   // Normalize status to canonical before downstream consumers see it.
   // Aliases (`cancelled`, `superseded`, `active`, …) and unknown values are
@@ -143,10 +239,8 @@ export function parseDocument(
   // draft — making the doc visible in listings but invisible to query/resolve.
   parsed.data.status = normalizeStatus(parsed.data.status);
 
-  // Copy frontmatter so callers mutating returned node don't leak back into
-  // gray-matter's internal parse state (gray-matter caches by input string;
-  // reusing identical content across tests would otherwise share the same
-  // object).
+  // Copy so callers mutating the returned node cannot write back through the
+  // object the YAML load produced.
   const frontmatter = { ...parsed.data } as Frontmatter;
 
   return {
@@ -155,6 +249,7 @@ export function parseDocument(
     frontmatter,
     body: parsed.content,
     rawContent: content,
+    authoredStatus,
   };
 }
 
@@ -167,7 +262,7 @@ export function validateDocument(
 ): ValidationResult {
   const errors: ValidationError[] = [];
 
-  // Rule 1: Valid YAML frontmatter (gray-matter handles this; if it parsed, it's valid)
+  // Rule 1: Valid YAML frontmatter (the parse already enforced this; if it loaded, it's valid)
   // Rule 3: Body is valid markdown (we trust the content is markdown)
 
   // Rules 2, 5-17: Zod schema validation
@@ -190,6 +285,11 @@ export function validateDocument(
       else if (field.startsWith("source.depends_on")) rule = 13;
       else if (field === "source.cache_ttl") rule = 16;
       else if (field === "source" && issue.message.includes("must not")) rule = 17;
+      else if (field === "pdf" && issue.message.includes("required")) rule = 25;
+      else if (field === "pdf.file") rule = 26;
+      else if (field === "pdf.sha256") rule = 27;
+      else if (field.startsWith("pdf.")) rule = 28;
+      else if (field === "pdf" && issue.message.includes("must not")) rule = 29;
 
       errors.push({
         rule,
@@ -200,8 +300,31 @@ export function validateDocument(
     }
   }
 
-  // Rule 4: Context links use valid contextnest:// URIs
-  const linkPattern = /\]\(contextnest:\/\/([^)]*)\)/g;
+  // Rule 26: a pdf node's sidecar is its OWN — `<id>.pdf`, beside the .md.
+  // Checked here rather than in the schema because it needs the node id. Without
+  // it a node could declare another node's binary (or any vault file) as its
+  // sidecar, and deleting the node would delete that file.
+  const pdf = node.frontmatter.pdf;
+  if (
+    node.frontmatter.type === "pdf" &&
+    pdf &&
+    typeof pdf.file === "string" &&
+    node.id &&
+    pdf.file !== `${node.id}.pdf`
+  ) {
+    errors.push({
+      rule: 26,
+      path: node.id,
+      message: `pdf.file must be the node's own sidecar "${node.id}.pdf", got "${pdf.file}" (§13 rule 26)`,
+      field: "pdf.file",
+    });
+  }
+
+  // Rule 4: Context links use valid contextnest:// URIs.
+  // The URI capture is length-bounded so the pattern stays linear on adversarial
+  // bodies (many `](contextnest://` prefixes without a closing `)` would otherwise
+  // backtrack polynomially — CodeQL js/polynomial-redos). Real URIs are far shorter.
+  const linkPattern = /\]\(contextnest:\/\/([^)]{0,2048})\)/g;
   let match;
   while ((match = linkPattern.exec(node.body)) !== null) {
     const uri = match[1];
@@ -229,11 +352,33 @@ export function validateDocument(
  * even when a caller bypasses the parser (e.g. assembles a node literal).
  */
 export function serializeDocument(node: ContextNode): string {
-  const fm: Frontmatter =
+  const normalized: Frontmatter =
     node.frontmatter.status !== undefined
       ? { ...node.frontmatter, status: normalizeStatus(node.frontmatter.status) }
-      : node.frontmatter;
-  return matter.stringify(node.body, fm);
+      : { ...node.frontmatter };
+  // Drop undefined-valued keys before dumping. js-yaml throws
+  // "unacceptable kind of an object to dump [object Undefined]" on an undefined
+  // value — and these arise from our OWN parser (e.g. normalizeTags() returns
+  // undefined for empty tags, which parseDocument writes back into frontmatter).
+  // The serializer must not choke on what parseDocument produces. Dropping an
+  // undefined key is roundtrip-safe: an absent key and an undefined value parse
+  // identically.
+  //
+  // NOTE: this is a SHALLOW strip — it only drops undefined values at the top
+  // level of frontmatter. An undefined nested inside a frontmatter value (e.g.
+  // `metadata: { x: undefined }`) would still reach the YAML dump and throw.
+  // No current parser path produces that (normalizeTags is the only undefined
+  // source and it sits top-level), so a deep strip is deliberately out of scope
+  // here; revisit if a nested-optional frontmatter field is ever added.
+  const fm = Object.fromEntries(
+    Object.entries(normalized).filter(([, v]) => v !== undefined),
+  ) as Frontmatter;
+
+  const body = node.body.endsWith("\n") ? node.body : node.body + "\n";
+  const block = yaml.dump(fm).trim();
+  // Empty frontmatter is written as a bare body, with no delimiters at all.
+  if (block === "{}") return body;
+  return `${DELIMITER}\n${block}\n${DELIMITER}\n${body}`;
 }
 
 /**

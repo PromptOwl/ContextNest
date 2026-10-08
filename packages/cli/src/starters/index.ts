@@ -56,7 +56,7 @@ const developer: Starter = {
       path: "nodes/architecture/architecture-overview",
       content: `---
 title: Architecture Overview
-type: context
+type: document
 tags: [architecture, overview, tech-stack]
 priority: high
 status: draft
@@ -121,7 +121,7 @@ _Replace with your actual architecture._
       path: "nodes/onboarding/getting-started",
       content: `---
 title: Developer Getting Started Guide
-type: context
+type: document
 tags: [onboarding, setup, getting-started]
 priority: high
 status: draft
@@ -188,7 +188,7 @@ Good first issues for getting familiar with the codebase:
       path: "nodes/standards/coding-conventions",
       content: `---
 title: Coding Conventions
-type: context
+type: document
 tags: [standards, conventions, code-quality]
 priority: high
 status: published
@@ -282,7 +282,7 @@ const executive: Starter = {
       path: "nodes/strategy/strategic-priorities",
       content: `---
 title: Strategic Priorities
-type: context
+type: document
 tags: [strategy, priorities, planning]
 priority: high
 status: draft
@@ -335,7 +335,7 @@ Equally important as priorities — what have we explicitly decided NOT to pursu
       path: "nodes/operations/decision-framework",
       content: `---
 title: Decision-Making Framework
-type: context
+type: document
 tags: [operations, decisions, framework, governance]
 priority: high
 status: published
@@ -394,7 +394,7 @@ status: published
       path: "nodes/leadership/alignment-playbook",
       content: `---
 title: Stakeholder Alignment Playbook
-type: context
+type: document
 tags: [leadership, alignment, communication, stakeholders]
 priority: medium
 status: published
@@ -490,7 +490,7 @@ const analyst: Starter = {
       path: "nodes/methodologies/research-framework",
       content: `---
 title: Research Framework
-type: context
+type: document
 tags: [methodology, research, framework, analysis]
 priority: high
 status: published
@@ -554,7 +554,7 @@ status: published
       path: "nodes/reporting/report-template",
       content: `---
 title: Report Template
-type: context
+type: document
 tags: [reporting, template, deliverable]
 priority: medium
 status: published
@@ -629,7 +629,7 @@ _Supporting data, source list, methodology details_
       path: "nodes/sources/source-catalog",
       content: `---
 title: Source Catalog
-type: context
+type: document
 tags: [sources, data, catalog, reliability]
 priority: high
 status: draft
@@ -715,7 +715,7 @@ const team: Starter = {
       path: "nodes/processes/how-we-work",
       content: `---
 title: How We Work
-type: context
+type: document
 tags: [processes, team, norms, rituals]
 priority: high
 status: draft
@@ -766,7 +766,7 @@ status: draft
       path: "nodes/onboarding/first-30-days",
       content: `---
 title: First 30 Days
-type: context
+type: document
 tags: [onboarding, new-hire, checklist]
 priority: high
 status: published
@@ -825,7 +825,7 @@ status: published
       path: "nodes/knowledge/team-faq",
       content: `---
 title: Team FAQ
-type: context
+type: document
 tags: [knowledge, faq, team, questions]
 priority: medium
 status: draft
@@ -918,7 +918,7 @@ const sales: Starter = {
       path: "nodes/playbooks/objection-handling",
       content: `---
 title: Objection Handling Playbook
-type: context
+type: document
 tags: [playbook, objections, sales, responses]
 priority: high
 status: draft
@@ -982,7 +982,7 @@ When you hear an objection on a call, search this document or ask your AI to pul
       path: "nodes/competitive/battlecard-template",
       content: `---
 title: Competitive Battlecard Template
-type: context
+type: document
 tags: [competitive, battlecard, positioning]
 priority: high
 status: draft
@@ -1051,7 +1051,7 @@ _Questions to ask early that expose the competitor's weaknesses:_
       path: "nodes/enablement/product-knowledge",
       content: `---
 title: Product Knowledge Guide
-type: context
+type: document
 tags: [enablement, product, knowledge, features]
 priority: high
 status: draft

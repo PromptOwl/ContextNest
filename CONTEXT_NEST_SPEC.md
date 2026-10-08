@@ -1,9 +1,10 @@
 # Context Nest Specification
 
-**Version**: 1.0
+**Version**: 1.1
 **Author**: ContextNest — PromptOwl, LLC
 **Compatible with**: Obsidian, PromptOwl, any markdown editor
 **File Extension**: `.md` (standard markdown)
+**License**: Apache-2.0 (see [LICENSE-SPEC](LICENSE-SPEC)) — this specification only; the reference implementation in this repository is AGPL-3.0
 
 ---
 
@@ -33,6 +34,7 @@ This specification is intended for developers building tools, integrations, or i
 14. [Extension Points](#14-extension-points)
 15. [Open Source Components](#15-open-source-components)
 16. [References](#16-references)
+17. [Changelog](#17-changelog)
 
 ---
 
@@ -54,9 +56,15 @@ my-context-nest/
 │   ├── api-design.md
 │   ├── brand-guidelines.md
 │   ├── onboarding-overview.md
+│   ├── q3-board-report.md       # A `type: pdf` node — extracted text (see §1.11)
+│   ├── q3-board-report.pdf      # …and its binary sidecar, bound by pdf.sha256
 │   └── .versions/               # Version history (see §6)
-│       └── api-design/
+│       ├── api-design/
+│       │   ├── v1.md
+│       │   └── history.yaml
+│       └── q3-board-report/
 │           ├── v1.md
+│           ├── <sha256-hex>.pdf # Prior binary, content-addressed (§1.11.3)
 │           └── history.yaml
 ├── sources/                     # Context source nodes (see §1.6, §1.9)
 │   ├── current-sprint-tickets.md
@@ -95,6 +103,8 @@ my-context-nest/
 ```
 
 In Obsidian mode, any `.md` file anywhere in the vault is treated as a context node. Hidden directories (`.`-prefixed) and `node_modules` are skipped.
+
+In either layout, only `.md` files are nodes. A `.pdf` beside a node is the binary sidecar of a `type: pdf` node (§1.11) and is never discovered as a node itself.
 
 Every document is standard Markdown with YAML frontmatter. Documents follow the GitHub Markdown spec (version 0.29-gfm). The raw content is never mutated — all editor features (context links, tags, mentions, task checkboxes) are rendered via decoration, not transformation. This ensures documents round-trip without loss between any Markdown-compatible tool (VS Code, Obsidian, any text editor).
 
@@ -185,7 +195,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `description` | string | — | Brief document summary (1-500 characters) |
 | `type` | NodeType | `"document"` | Content classification (see §1.6) |
 | `tags` | string[] | `[]` | Tags with `#` prefix: `["#api", "#guide"]` |
-| `status` | Status | `"draft"` | One of `draft`, `pending_review`, `approved`, `published`, `rejected` (see §1.5.1) |
+| `status` | Status | `"draft"` | One of `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (see §1.5.1; `forgotten` is set only by a forget, §6.3) |
 | `version` | integer | `1` | Version number (>= 1) |
 | `author` | string | — | Author identifier (e.g., email address) |
 | `created_at` | ISO 8601 | file creation time | Creation timestamp |
@@ -195,10 +205,11 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `metadata` | object | `{}` | Extensible metadata (word_count, etc.) |
 | `source` | object | — | Source metadata block. Present only on `type: source` nodes (see §1.9) |
 | `skill` | object | — | Skill metadata block. Present only on `type: skill` nodes (see §1.10) |
+| `pdf` | object | — | PDF metadata block. Present only on `type: pdf` nodes (see §1.11) |
 
 ### 1.5.1 Status Lifecycle
 
-`status` is a five-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
+`status` is a six-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
 
 | Canonical | Meaning | Surfaces to retrieval? |
 |-----------|---------|-----------------------|
@@ -207,6 +218,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `approved` | Reviewer signed off; awaiting publish ceremony. | No — hidden until promoted to `published`. |
 | `published` | Live, retrievable. | Yes — the only canonical status surfaced by default. |
 | `rejected` | Terminal hide. The steward retired the document. | No — implementations MUST refuse `publishDocument` on a rejected document to prevent silent resurrection. |
+| `forgotten` | Erased by the forget protocol (§6.3). The file is an empty stub; only hashes remain. | No — excluded from every retrieval path; selectors return it only for an explicit `status:forgotten`. Set only by a forget, never by a write. |
 
 **Aliases.** Implementations SHOULD accept synonyms from other systems and normalize them to canonical values at parse time. Lookup is case-insensitive. Unknown values fall back to `draft`. The reference implementation ships with:
 
@@ -221,6 +233,8 @@ Maintained by @jane.smith with oversight from @team:engineering.
 The on-disk format always stores canonical values. Aliased values found on disk are auto-canonicalized the next time the document round-trips through a write or through the implementation's index-regeneration command (e.g. `ctx index`).
 
 **Transitions.** No state machine is enforced. Any status may transition to any other (subject to the `rejected → *` revival path requiring an explicit status change before content edits land). Metadata-only transitions (e.g. `published → rejected`) MUST NOT cut a new version; only content-publishing operations bump `version` and emit a checkpoint.
+
+**`forgotten` and older readers.** `forgotten` has no aliases. An implementation that predates it normalizes the unknown value to `draft`, which keeps the empty stub out of default retrieval: the failure mode of an old reader is a hidden empty draft, not resurrected content.
 
 **Legacy `superseded`.** Earlier drafts of this spec defined `superseded` as a fifth canonical value. It is no longer canonical. Implementations MUST treat a raw `status: superseded` value as an alias for `draft` per the table above.
 
@@ -239,8 +253,13 @@ Every document has a `type` that classifies its content:
 | `tool` | Tool documentation and usage guides | API integration guide, deployment workflow |
 | `reference` | External references, links, citations | Research papers, industry standards |
 | `skill` | Reusable agent procedures with triggers, inputs, and guard rails | PR review workflow, bug triage, RFC drafting |
+| `agent` | Agent definitions, as other tools in the ecosystem store them | An agent's role and configuration notes |
+| `artifact` | Generated outputs kept for reference | A produced report, a generated spec |
+| `table` | Tabular data | A pricing matrix, a feature comparison |
+| `pdf` | A PDF document: the body is the text extracted from it, and the PDF itself is kept beside the node as a binary sidecar | A contract, a board deck, a research paper |
+| `task` | A unit of work tracked on a project board. Board fields (`assignee`, `due`, `priority`, `parent`) live in `metadata` | "Ship the onboarding email", a bug to fix |
 
-The `source` type is described in detail in §1.9. The `skill` type is described in detail in §1.10.
+The `source` type is described in detail in §1.9, the `skill` type in §1.10, and the `pdf` type in §1.11. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`. `task` likewise carries no type-specific validation rules; its board fields are ordinary `metadata` keys, and whether a task goes through review is an implementation's governance decision, not a validation rule.
 
 ### 1.7 Inline Syntax
 
@@ -249,6 +268,7 @@ Documents support the following inline constructs:
 | Construct | Syntax | Description |
 |-----------|--------|-------------|
 | Context link | `[Title](contextnest://path)` or `[Title](contextnest://path#section)` | Reference to another document or section (see §4) |
+| Wikilink | `[[Title]]`, `[[Title|alias]]`, `[[Title#anchor]]` or `[[nodes/id]]` | Reference to another document by title or path (Obsidian-compatible) |
 | Tag | `#tag` | Shared taxonomy label |
 | Mention | `@user` or `@team:name` | Attribution or team reference |
 | Task checkbox | `- [ ]` or `- [x]` | Embedded work item (GFM syntax) |
@@ -262,7 +282,15 @@ See [v2 snapshot](contextnest://engineering/api-design@7) for the pinned version
 See [Current Sprint Tickets](contextnest://sources/current-sprint-tickets) for live data.
 ```
 
-**Backlinks** — automatic tracking of what documents reference a given document — are maintained by the implementation by scanning all `contextnest://` hrefs across the nest. Backlinks apply equally to all node types including source nodes.
+**Wikilinks** use Obsidian's `[[...]]` syntax and resolve to the same `reference` edges as `contextnest://` links. A target resolves against document titles first (case-insensitively), then document paths; an alias after `|` and an anchor after `#` are display-only and do not affect resolution. A target that matches no published document produces no edge. Wikilinks inside fenced code blocks or inline code are ignored.
+
+```markdown
+See [[Architecture Overview]] for context.
+See [[API Design#Error Handling]] for the specific section.
+See [[nodes/api-design-guidelines|the guidelines]] for the same document by path.
+```
+
+**Backlinks** — automatic tracking of what documents reference a given document — are maintained by the implementation by scanning all `contextnest://` hrefs and `[[wikilinks]]` across the nest. Backlinks apply equally to all node types including source nodes.
 
 **Tags** in frontmatter use the `#` prefix: `tags: ["#api", "#security"]`. Obsidian users may omit the `#` in frontmatter — tools SHOULD normalize both formats.
 
@@ -660,6 +688,77 @@ Both `type: prompt` and `type: skill` contain instructions for agents, but they 
 
 Use `prompt` for text generation templates. Use `skill` for multi-step procedures that may involve tool calls, have safety constraints, and produce structured output.
 
+### 1.11 PDF Nodes
+
+A PDF node is a markdown document that stands for a PDF. The PDF itself is the source of truth; the node's **body is the text extracted from it**, so the PDF participates in search, selectors, packs and context injection like any other node, while the original file travels with it. The binary is stored beside the node as a **sidecar** and bound to it by SHA-256 in the `pdf` frontmatter block.
+
+```
+nodes/
+├── q3-board-report.md     # type: pdf — frontmatter + extracted text
+└── q3-board-report.pdf    # the PDF, byte for byte
+```
+
+#### 1.11.1 PDF Frontmatter
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `pdf.file` | string | Yes | Vault-relative path of the sidecar, forward slashes. MUST be the node's own path with a `.pdf` extension: node `nodes/q3-board-report` → `nodes/q3-board-report.pdf` |
+| `pdf.sha256` | string | Yes | SHA-256 of the sidecar's exact bytes, `sha256:<64 lowercase hex>`. Binaries are hashed as stored, with none of the text normalization of §8.5 |
+| `pdf.bytes` | integer | Yes | Size of the sidecar in bytes |
+| `pdf.pages` | integer | Yes | Page count |
+| `pdf.text_layer` | boolean | Yes | `false` when no page yielded any text (a scanned PDF). The body is then empty |
+| `pdf.extractor` | string | Yes | The text extractor that produced the body, e.g. `unpdf` |
+| `pdf.extractor_version` | string | Yes | Importer and extractor version — the same bytes may extract differently under another extractor, so the record names the one that ran |
+| `pdf.extracted_at` | ISO 8601 | Yes | When the text was extracted |
+
+The `pdf` block MUST be present when `type` is `pdf`. It MUST NOT be present on other node types.
+
+```yaml
+---
+title: "Q3 Board Report"
+type: pdf
+tags: ["#finance", "#board"]
+status: published
+version: 2
+pdf:
+  file: nodes/q3-board-report.pdf
+  sha256: sha256:9f2c…
+  bytes: 482113
+  pages: 14
+  text_layer: true
+  extractor: unpdf
+  extractor_version: ctx-import-pdf/1 (unpdf 1.7.0)
+  extracted_at: "2026-09-22T14:02:11.000Z"
+checksum: sha256:1b7e…
+---
+
+<!-- page 1 -->
+
+Q3 Board Report
+…
+
+<!-- page 2 -->
+
+…
+```
+
+#### 1.11.2 Body
+
+The body is the extracted text as GitHub Flavored Markdown. Each page's text is preceded by a `<!-- page N -->` marker (1-based), so an agent can cite a page. Implementations SHOULD make extraction deterministic — the same bytes and extractor version always produce the same body — and SHOULD neutralize text in the PDF that would otherwise be read as markup (an `<!--` that would hide the rest of the body, a `contextnest://` link). A PDF with no text layer yields an empty body and `text_layer: false`; this specification does not define OCR.
+
+The body is derived data. Implementations SHOULD refuse direct edits to it: the way to change a PDF node's text is to import a new PDF, which re-extracts it. Frontmatter-only edits (title, tags, description, metadata, status) are permitted and version normally.
+
+#### 1.11.3 Versions and Integrity
+
+Because `pdf.sha256` is frontmatter, it is part of every version's content (§6) and therefore of its `content_hash` and `chain_hash` (§8). The binary is bound into the version chain without any change to the chain itself.
+
+- Importing a different PDF to an existing PDF node creates a new version. Before the new sidecar replaces the old one, the old binary MUST be preserved in the node's version history, content-addressed: `.versions/<doc>/<sha256-hex>.pdf`. Every version's `pdf.sha256` therefore names bytes that still exist — the live sidecar or an archived binary.
+- Importing the same bytes again is not a new version.
+- A PDF node MUST NOT be published unless its sidecar is present and hashes to `pdf.sha256`: publishing seals that hash into the chain, and a hash with no matching bytes behind it is an unbacked claim. The provenance guarantee therefore attaches to *published* versions: an unpublished draft's `pdf` block (for instance one arriving through a bulk import of files) is an assertion until publication checks it, and verification (§8.4) reports a draft whose sidecar is missing or different.
+- A sidecar replaced on disk without a new version no longer hashes to `pdf.sha256`; verification (§8.4) MUST report it (`sidecar_drift`), and a missing sidecar likewise (`sidecar_missing`).
+- Any operation that commits a version of a PDF node — including a rollback to an earlier version — MUST leave the live sidecar holding the binary that version records, archiving whatever it replaces. A commit whose binary no longer exists MUST be refused. Commits other than a PDF import or a rollback (a suggestion approval, a direct edit) MUST NOT change the body or the `pdf` block.
+- Deleting a PDF node MUST delete its sidecar along with its `.md` and version history.
+
 ---
 
 ## 2. Selector Grammar
@@ -672,6 +771,8 @@ Context Nest defines a composable query language for selecting documents. Select
 |--------|------|---------|
 | `#tag` | Tag | Nodes where `tags` array contains `#tag` |
 | `contextnest://path` | URI | Node at the given path (see §4) |
+| `nodes/<id>` | Bare node id | The node at `nodes/<id>` — shorthand for `contextnest://nodes/<id>` |
+| `sources/<id>` | Bare source id | The source node at `sources/<id>` — shorthand for `contextnest://sources/<id>` |
 | `contextnest://tag/{name}` | Tag URI | All nodes carrying the given tag |
 | `contextnest://folder/` | Folder URI | All nodes within the given folder |
 | `contextnest://search/{query}` | Search URI | Nodes matching a full-text search query |
@@ -708,6 +809,10 @@ ctx resolve "contextnest://tag/onboarding"
 
 # By document path
 ctx resolve "contextnest://engineering/api-design"
+
+# By bare node id — the same atom without the scheme
+ctx resolve "nodes/gtm/foo"
+ctx resolve "sources/jira"
 
 # By folder
 ctx resolve "contextnest://engineering/"
@@ -1084,10 +1189,23 @@ Each edge in the `relationships` list carries a `type` field:
 
 | Edge Type | Meaning | Derived From |
 |-----------|---------|-------------|
-| `reference` | One document links to another via a `contextnest://` href in its body | Inline context links (§1.7) |
+| `reference` | One document links to another via a `contextnest://` href or a `[[wikilink]]` in its body | Inline context links and wikilinks (§1.7) |
 | `depends_on` | A source node requires another source to be hydrated first | `source.depends_on` frontmatter (§1.9.1) |
 
 The `reference` type is the default. The `depends_on` type is automatically generated when a source node declares dependencies. A single pair of nodes may have both edge types if the source body also contains an inline link to its dependency (which is the recommended pattern per §1.9.4).
+
+### 5.1.1 Graph Traversal (hops)
+
+A query MAY expand the documents a selector matches by walking `relationships` edges in either direction, up to a budget of `hops`. Each step costs hops according to the direction of travel:
+
+| Step | Cost |
+|------|------|
+| Along an edge with an explicit `priority` | the `priority` value |
+| Along `depends_on`, from a source to its dependency | 0 |
+| To a document listed in `hubs` | 0 |
+| Anything else, including backwards along `depends_on` and away from a hub | 1 |
+
+With `hops: 0` the result is therefore the selected documents plus what is reachable at zero cost: their source dependencies and any hub they link to. Walking away from a hub is never free, so selecting a hub does not pull in the documents that link to it. When a traversal reaches fewer documents than the implementation's minimum, it MAY retry with a larger budget; `hopsUsed` reports the deepest hop actually reached. Results are returned in a deterministic order: repeating the same query against the same index returns the same documents in the same order. A query that must return exactly the selector's matches, with no expansion, uses full mode (`--full`).
 
 ### 5.2 External Dependencies
 
@@ -1109,7 +1227,7 @@ For tools that support versioning, version history is stored in `.versions/{docu
 
 Version history uses a **keyframe + diff model** for efficiency:
 
-- **Keyframe versions** (version 1, and every `keyframe_interval` versions thereafter, default 10): stored as a full Markdown snapshot file (`v1.md`, `v10.md`, ...).
+- **Keyframe versions** (version 1, and every version *n* where (*n* − 1) is a multiple of `keyframe_interval`, default 10, i.e. versions 1, 11, 21, ...): stored as a full Markdown snapshot file (`v1.md`, `v11.md`, ...). An implementation also writes a keyframe whenever the previous version cannot be reconstructed, so a diff is never recorded against unknown content.
 - **All other versions**: stored as a unified diff from the previous version, recorded inline in `history.yaml`.
 - **Reconstruction**: apply diffs forward from the nearest keyframe to reach any target version.
 
@@ -1120,7 +1238,7 @@ my-context-nest/
 │   └── .versions/
 │       └── api-design/
 │           ├── v1.md              # Keyframe snapshot of version 1
-│           ├── v10.md             # Keyframe snapshot of version 10
+│           ├── v11.md             # Keyframe snapshot of version 11
 │           └── history.yaml       # Version metadata + inline diffs
 ├── sources/
 │   ├── current-sprint-tickets.md  # Current version (always latest)
@@ -1131,6 +1249,8 @@ my-context-nest/
 ```
 
 The live document is always the authoritative latest version; the `.versions/` folder is history only.
+
+For `type: pdf` nodes the folder also holds each prior binary, named by its SHA-256 (`<sha256-hex>.pdf`, see §1.11.3). These are content-addressed rather than numbered: a version finds its binary through the `pdf.sha256` in its own frontmatter.
 
 Implementations MUST be able to reconstruct any version by applying diffs forward from the nearest keyframe. Keyframe files are self-contained and safe to read without the diff chain.
 
@@ -1147,8 +1267,14 @@ Each version entry in `history.yaml` records:
 - `note` — reason for change (optional)
 - `content_hash` — SHA-256 of the entry's content (see §8)
 - `chain_hash` — SHA-256 linking this entry to all previous entries (see §8)
+- `client` — caller metadata supplied with the write (see §9.4); omitted when the caller supplied none
 
 `published_at` is the authoritative record used to reconstruct checkpoint history (see §7.3).
+
+`client` is an annotation, NOT chained evidence: it MUST NOT be an input to
+`chain_hash` (§8.2). A history recorded before any caller sent one therefore
+keeps verifying unchanged, and a `client` block proves only what the caller
+asserted about itself — `edited_by` remains the authoritative authoring record.
 
 ```yaml
 # .versions/api-design/history.yaml
@@ -1162,6 +1288,9 @@ versions:
     note: "Initial draft"
     content_hash: sha256:3a7bd3e2360a3d29aa625ddc5b74dac9f9b5b393f7d1e6b5a0c4f2e8d1a3c5b7
     chain_hash:   sha256:f4c2b3a1d9e8f7c6b5a4d3e2f1c0b9a8d7e6f5c4b3a2d1e0f9c8b7a6d5e4f3c2
+    client:
+      agent: claude-code
+      session_id: sess-9f2c41
   - version: 2
     diff: |
       --- v1
@@ -1184,7 +1313,7 @@ versions:
     note: "WIP rate limiting section"
     content_hash: sha256:c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
     chain_hash:   sha256:2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6
-  - version: 10
+  - version: 11
     keyframe: true
     edited_by: jane.smith@example.com
     edited_at: 2024-03-01T10:00:00Z
@@ -1193,6 +1322,40 @@ versions:
     content_hash: sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2
     chain_hash:   sha256:b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3
 ```
+
+### 6.3 Forget
+
+A **forget** erases a document's content while leaving its hash chain verifiable. This is the right to be forgotten for an append-only, hash-chained history: deleting a version would break every chain hash after it, and deleting only the live file would leave the content in keyframes and diffs.
+
+**Operation.** `forget` takes a document path and a `reason_code` from a closed set: `user_request`, `legal`, `retention_expiry`, `error`. It never takes free text. The reason for forgetting is not itself stored in the nest. It MAY take a `requested_by` identity.
+
+**Tombstones.** For every version entry of the document, the implementation MUST delete the stored content (the `v{N}.md` keyframe, the `v{N}.diff` change log or inline `diff`, the free-text `note`, archived binaries, staged suggestions) and MUST keep `content_hash` and `chain_hash` unchanged. The entry gains `tombstone: true`, `forgotten_at`, `forgotten_by` and `reason_code`. `chain_hash[n]` is computed from `content_hash[n]`, not from the content, so every later entry and every checkpoint binding still verifies.
+
+**Stub.** The live file is replaced by a stub that carries `title`, `type`, `tags`, `created_at`, `updated_at`, `version`, `checksum` (plus any block its `type` requires, and access-scoping keys), with `status: forgotten` and an empty body. The stub is sealed as a new **keyframe** version marked `forget_stub: true`, and the forget cuts a checkpoint, as a publish does (§7.1). The forgotten document is not published, so it drops out of that checkpoint's maps. Rebuild (§7.3) likewise removes the document from the running maps when it replays a `forget_stub` entry.
+
+**Resolution.** Any `contextnest://` URI for a forgotten path resolves to the stub (`status: forgotten`, empty body), not to null. This applies to floating URIs and pinned `@N` URIs, including a checkpoint that names a now-forgotten version. Consumers MUST NOT treat the stub as content. Reconstructing a forgotten version MUST fail with a distinct error (reference implementation: `VERSION_FORGOTTEN`), never with a neighbouring version's content. Existing checkpoints are not rewritten.
+
+**Audit event.** Every forget appends a `document.forgotten` event to `.versions/chain_events.yaml`. The event records `actor`, `timestamp`, `document_id`, and in `action_metadata` the `reason_code`, `requested_by`, the erased `versions`, the `stub_version` and `checkpoint`, and, as hashes only, the erased content: `content_hashes` (each erased entry's chained hash), `body_hashes` (the body checksum of each erased revision) and `pdf_hashes`. It MUST NOT contain forgotten content.
+
+**Anti-resurrection.** The forget record travels with the nest, because `chain_events.yaml` is part of the directory (§6.2 export). Implementations MUST refuse:
+
+- to publish, create or update a document with `status: forgotten`;
+- to publish or create a document at a path a forget retired, even after the stub was deleted. Content that is meant to exist again is published under a new path, which gives it a new identity and a new chain;
+- to publish, or import, a body whose checksum matches a recorded `body_hash`. Bodies shorter than 16 characters (trimmed) are never recorded, so trivial text does not collide;
+- to import a version artifact, archived binary or `history.yaml` that restores a recorded `content_hash` (an un-tombstoned entry), under any path.
+
+An importing implementation MUST honor tombstones carried by the incoming nest. It merges the incoming forget events into its own log, never overwriting that log, and re-applies them to any pre-forget copy it already holds.
+
+**Delete.** Deleting a document SHOULD append an audit record of the same shape with `mode: delete` (actor, time, reason code, the deleted entries' `content_hashes`). A delete record is audit-only: it MUST NOT retire the path, refuse any content or cause an importing implementation to delete a local document. Anti-resurrection applies to forgets only. Unlike a forget, a delete also removes the history. An implementation MAY offer an explicit purge that records nothing. The reference implementation provides it as `ctx delete --purge`.
+
+**Verification** of a tombstoned entry is hash-only: the chain check runs, the content check is skipped, and the entry is reported as tombstoned rather than as `content_hash_mismatch`. See §8.4 for the forget-specific checks.
+
+**Not yet implemented** in the reference implementation. These parts of the forget protocol proposed to the Open Memory Protocol are deferred:
+
+- **Version-range forget.** Forgetting a range of a document's versions requires re-keyframing the first retained version so that no diff context line from the range survives.
+- **Lineage flags.** Documents whose `derived_from` names a forgotten one would be flagged `review_required`.
+- **Lifespan keys.** `expires_at` would trigger an automatic forget, and `retain_until` would block a non-`legal` forget until its date.
+- **Legal redaction.** Under reason `legal`, `edited_by` would be replaced with its hash.
 
 ---
 
@@ -1310,6 +1473,8 @@ For each version entry in `history.yaml`:
 
 Format: `sha256:<64-character lowercase hex>`.
 
+Before hashing, content is normalized: a leading UTF-8 byte-order mark is removed and CRLF and lone CR line endings become LF. This keeps hashes stable when a sync tool or editor rewrites line endings, and every implementation MUST apply the same normalization to produce matching hashes. The normalization applies to `content_hash` inputs and to the frontmatter `checksum`; `chain_hash` and `checkpoint_hash` inputs are built from already-normalized values.
+
 #### chain_hash
 
 ```
@@ -1384,6 +1549,7 @@ contextnest:genesis:v1
 - Implementations MUST compute and append `checkpoint_hash` when writing new checkpoint entries.
 - Implementations MUST populate `document_chain_hashes` by reading the `chain_hash` of each document's recorded version from its `history.yaml` at write time.
 - A verifier MUST confirm that each value in `document_chain_hashes` matches the `chain_hash` stored in the corresponding document's `history.yaml` at the recorded version. A mismatch indicates that a document's history was rewritten after the checkpoint was created, and MUST be reported as `cross_chain_mismatch`.
+- **Exception: delete and recreate.** When a document is deleted and a new document is later created at the same path, its new history restarts at version 1 and no longer matches what older checkpoints sealed. A verifier MUST NOT report `cross_chain_mismatch` for an entry whose `edited_at` is later than the checkpoint's `at`, **provided** the entry's own `chain_hash` recomputes correctly from its fields and the preceding entry. An entry that is later than the checkpoint but does not recompute is a tamper (for example, a rewritten hash with a forward-dated timestamp) and MUST be reported.
 - Implementations MAY verify the checkpoint chain on read; failures MUST be surfaced to the caller.
 
 ### 8.4 Verification
@@ -1395,7 +1561,11 @@ Implementations MAY expose a verification command or API that:
 3. Re-computes the `chain_hash` sequence from the genesis sentinel and compares each value to the stored entry.
 4. Reads `.versions/context_history.yaml` and for each checkpoint entry, confirms that each value in `document_chain_hashes` matches the `chain_hash` of the corresponding version in the document's `history.yaml`.
 5. Re-computes the `checkpoint_hash` sequence (incorporating `canonical_chain_hashes`) and compares each value to the stored entry.
-6. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, or `checkpoint_hash_mismatch`).
+6. For every `type: pdf` node, re-hashes the sidecar at `pdf.file` and compares it to `pdf.sha256`, and re-hashes each archived binary under `.versions/<doc>/` against the hash in its file name (§1.11.3).
+7. For the forget protocol (§6.3), treats a `tombstone: true` entry as hash-only: its content check is skipped and its chain check runs. The implementation also reports:
+   - `forgotten_content_present` when erased content is back on disk. That is a keyframe, diff or inline diff for a tombstoned entry; an un-tombstoned entry whose `content_hash` a recorded forget erased; a stub with a body; or a live document at a forgotten path, or with a forgotten body.
+   - `unrecorded_tombstone` when a tombstone, a `forget_stub` entry or a `status: forgotten` document is not accounted for by any recorded forget.
+8. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, `checkpoint_hash_mismatch`, `sidecar_drift`, `sidecar_missing`, `forgotten_content_present` or `unrecorded_tombstone`), plus the list of versions it verified hash-only.
 
 Verification is idempotent and read-only. A clean verification result produces no file changes.
 
@@ -1406,7 +1576,7 @@ All hashes in this section use SHA-256 (FIPS 180-4).
 | Property | Value |
 |----------|-------|
 | Algorithm | SHA-256 |
-| Input encoding | UTF-8 |
+| Input encoding | UTF-8 (binary sidecars, §1.11: the raw bytes) |
 | Output format | `sha256:<64-character lowercase hex>` |
 
 The `sha256:` prefix identifies the algorithm and reserves space for future algorithm agility. When a future version of this specification adds support for additional algorithms, the prefix will change (e.g., `sha3-256:`). Verifiers MUST reject unknown prefixes rather than silently passing verification.
@@ -1458,6 +1628,95 @@ The trace records `result_hash`, not `result_content`. The trace proves *what wa
 This extends the provenance chain from knowledge through to action: "The agent resolved `pack:sprint.standup` → read 3 static docs at checkpoint 12 → hydrated `sources/current-sprint-tickets` via Jira MCP (cache miss, result hash `sha256:9f1b...`) → hydrated `sources/recent-pr-activity` via GitHub MCP (cache hit, 4m old) → generated summary."
 
 Note: Audit logging format, storage, and analytics are implementation-defined. This section defines the fields that SHOULD be captured, not the storage format.
+
+### 9.4 Client Metadata
+
+§9.2 answers *what* was read and §6.2 answers *what* was written. Neither says
+*who was calling*. A vault serving several agents, or one agent across many
+sessions, cannot attribute either from the record alone: `edited_by` names a
+person or a service account, and a read leaves no author at all.
+
+Every read and every write operation SHOULD therefore accept an optional
+`client` object describing the CALL. Every part of it is optional — the object,
+and each field within it. An implementation MUST NOT require `agent`,
+`session_id`, or the object itself, and MUST NOT reject a call that omits them:
+attribution is evidence a caller offers, not a toll it pays. An unattributed
+call is a valid call.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent` | string | Name of the calling agent, e.g. `claude-code` |
+| `session_id` | string | Identifier of the calling session, opaque to the implementation |
+| *(other keys)* | string \| number \| boolean | Custom metadata, recorded verbatim |
+
+Where it is recorded:
+
+- A write that publishes SHOULD record it on the version entry it seals as
+  `client` (§6.2), so history answers "which agent wrote v7, in which session".
+- A read SHOULD stamp it on the access traces it emits (§9.2), so provenance
+  names the reader as well as the document.
+- An operation that records neither SHOULD still make it available to whatever
+  audit or authorization layer the implementation wraps around the call.
+
+Three constraints are normative:
+
+1. `client` is a **label, not an identity claim.** Implementations MUST NOT
+   authorize from it and MUST NOT treat it as authenticated. Any caller that
+   can set it can set it to anything; authorization belongs to the
+   implementation's identity layer, not to this field.
+2. It MUST NOT be an input to any hash (§8). It annotates a record; it does not
+   seal one.
+3. It MUST be bounded — key count and value size — because it is written to an
+   append-only audit trail by an untrusted caller. Values are scalars.
+   Implementations SHOULD reject an oversized or non-scalar payload rather than
+   truncating it silently.
+
+`client` is distinct from a node's `metadata` frontmatter (§1.5): `metadata`
+describes the document, `client` describes the call that touched it.
+
+#### 9.4.1 Reserved and custom keys
+
+`agent` and `session_id` are RESERVED. An implementation accepting custom keys
+alongside them MUST NOT silently accept a near-miss on a reserved key
+(`sessionId`, `session-id`, `Agent`) as a custom key: the write is then recorded
+but not in the slot readers look in, so it is silently unattributed while
+appearing to succeed. Reject it and name the intended key.
+
+Custom keys and reserved keys share one namespace and travel together in the
+same object. An implementation SHOULD bound the number of custom keys and the
+length of every key and every value, and SHOULD restrict values to scalars.
+
+#### 9.4.2 Binding conventions
+
+A caller will often not populate `client` — an agent has no reason to know the
+field exists — so a binding SHOULD supply what its transport already knows, and
+MUST merge those defaults per KEY, under anything the caller sent. A caller that
+names its agent but no session keeps its agent and still gains a session id.
+
+| Binding | `agent` | `session_id` |
+|---|---|---|
+| MCP | The `clientInfo.name` from the `initialize` handshake | An identifier for the connection. Over stdio one process is one session, so a value minted per process is an accurate statement |
+| CLI | An explicit flag, falling back to an environment variable so a wrapping agent sets it once per session rather than per invocation | Same |
+| REST / other | Whatever the transport authenticates or correlates by | The transport's own session or request-correlation id |
+
+A binding MUST NOT invent a value it cannot stand behind. Where the transport
+knows nothing — a REST call with no session concept — the field is better absent
+than filled with a placeholder, because a reader cannot tell a synthesized value
+from a real one.
+
+For the same reason, a record with no attribution MUST omit `client` rather than
+store an empty object: "not attributed" and "attributed to nobody" are different
+claims, and only the first is true.
+
+A binding that derives defaults SHOULD let an operator turn that off. What a
+binding derives is written to an append-only history, so consent has to be
+available before the first write — there is no later pass to remove it. Turning
+derivation off MUST NOT discard a `client` a caller sent explicitly; that is the
+caller's own record to make.
+
+Defaults do not change the trust level of anything in §9.4: `clientInfo.name` is
+a client's self-report, exactly like a caller-supplied `agent`, and neither is
+authenticated.
 
 ---
 
@@ -1550,6 +1809,9 @@ description: "Technical documentation and decisions"
 defaults:
   status: draft
 
+# Human review gate for agent/tool writes (see below). Optional.
+review: 'on'
+
 # Folder configurations (Obsidian-compatible layout)
 folders:
   engineering:
@@ -1590,6 +1852,13 @@ sync:
 
 The `servers` block is the authoritative registry of external services available to source nodes. When a source node declares `source.server: jira`, the runtime resolves the connection URL from this registry. The `external_dependencies` section in `context.yaml` (§5) is auto-generated from the intersection of this registry and the servers actually referenced by published source nodes.
 
+The optional `review` key (`on` | `off`; YAML 1.1 booleans `true`/`false` are accepted as `on`/`off`) is the human review gate. It is read by write surfaces (CLI, MCP server), not enforced by the storage layer. When `on`, a write that would publish is **held** instead:
+
+- A node that is not yet published is written in place with `status: pending_review` and no version; approving it publishes v1.
+- An edit to a published node is staged as a suggestion under `_suggestions/` with `source: manual-suggestion` and a note beginning `review-hold`. The canonical file and hash chain are untouched, so the published version keeps serving. A later held edit to the same node builds on the earlier one and supersedes it.
+
+No version or checkpoint is created until the hold is approved; approval performs exactly the write and publish the hold deferred. A hold whose base is no longer the node's latest version is stale and MUST NOT be approved. A vault without the key predates the gate and publishes immediately.
+
 ### 11.2 syntax.yml (Optional)
 
 Allows customization of selector token syntax per vault:
@@ -1627,7 +1896,7 @@ When imported to PromptOwl:
 
 ### 12.3 Git Compatibility
 
-- All files are plain text, diff-friendly
+- All files are plain text, diff-friendly — with one exception: the binary sidecar of a `type: pdf` node (§1.11), and the prior binaries archived under `.versions/`. Binaries are permitted ONLY as declared sidecars of `pdf` nodes; the node's extracted-text body is what diffs between versions. Mark them binary for git (`*.pdf binary` in `.gitattributes`) so line-ending conversion never alters bytes that are bound by hash
 - `.context/` folder should be committed
 - `.versions/` folder optional (PromptOwl can reconstruct from git history)
 - CONTEXT.md should be committed (vault identity)
@@ -1645,8 +1914,8 @@ A valid Context Nest document:
 3. Body is valid markdown (GitHub Markdown spec 0.29-gfm)
 4. Context links use valid `contextnest://` URIs
 5. Tags match the allowed pattern: `^#?[a-zA-Z][a-zA-Z0-9_-]*$`
-6. If `type` is present, it MUST be one of the 8 defined node types
-7. If `status` is present, it MUST be one of: `draft`, `published`
+6. If `type` is present, it MUST be one of the 13 defined node types (§1.6)
+7. If `status` is present, it MUST be one of: `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (after alias normalization, §1.5.1)
 8. If `checksum` is present, it MUST match the pattern `sha256:<64 hex chars>`
 
 ### 13.1 Source Node Validation
@@ -1678,6 +1947,18 @@ In addition to the base validation rules, `type: skill` nodes MUST satisfy:
 23. If a `type: source` node declares `depends_on` referencing source X, and the node's body contains an inline `contextnest://` link to X, implementations SHOULD NOT flag this as redundant — it is the recommended pattern (§1.9.4)
 24. If a `type: source` node's body contains inline `contextnest://` links to other source nodes that are NOT listed in `depends_on`, implementations SHOULD emit a warning suggesting the dependency be declared in frontmatter
 
+### 13.4 PDF Node Validation
+
+In addition to the base validation rules, `type: pdf` nodes MUST satisfy (rules 25–29):
+
+25. The `pdf` block MUST be present in frontmatter
+26. `pdf.file` MUST be the node's own path with a `.pdf` extension (`<node path>.pdf`), vault-relative, with forward slashes and no `..` segments
+27. `pdf.sha256` MUST match the pattern `sha256:<64 hex chars>`
+28. `pdf.bytes` and `pdf.pages` MUST be non-negative integers, `pdf.text_layer` MUST be a boolean, and `pdf.extractor`, `pdf.extractor_version` and `pdf.extracted_at` MUST be non-empty strings
+29. The `pdf` block MUST NOT be present on nodes where `type` is not `pdf`
+
+That the sidecar's bytes hash to `pdf.sha256` is an integrity property, checked by verification (§8.4), not a validation rule: validation reads the document alone.
+
 **Suggested MIME type**: `text/markdown; variant=context-nest`
 
 ---
@@ -1696,6 +1977,7 @@ Tools MAY extend the spec with:
 - Additional relationship edge types beyond `reference` and `depends_on`
 - Additional trace types beyond the three defined in §9.3
 - Additional entries in the `servers` registry in `.context/config.yaml`
+- Additional fields within the `pdf` block (prefixed with tool name: `pdf.promptowl_ocr: true`)
 
 ---
 
@@ -1705,7 +1987,7 @@ The following components are intended to be released as open source:
 
 | Component | License | Description |
 |-----------|---------|-------------|
-| Specification (this document) | CC-BY-4.0 | Open protocol specification |
+| Specification (this document) | Apache-2.0 | Open protocol specification |
 | Context Engine (`@promptowl/context-engine`) | AGPL-3.0 | Reference implementation of selectors, versioning, storage, and source node resolution |
 | MCP Server (`@contextnest/mcp-server`) | AGPL-3.0 | Model Context Protocol server for vault access, including source dependency resolution and hydration relay |
 | CLI (`contextnest-cli`) | AGPL-3.0 | Command-line tools for vault operations |
@@ -1737,4 +2019,23 @@ The following components remain proprietary:
 
 ---
 
-*ContextNest is a product of PromptOwl, LLC This specification covers components intended for open release under CC-BY-4.0. Proprietary components are identified in §15.*
+## 17. Changelog
+
+### 1.2 — draft
+
+- **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and an audit-only record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
+
+### 1.1 — 2026-09
+
+- **New node type `pdf`** (§1.11): a PDF as a first-class document. The body is the extracted text with `<!-- page N -->` markers; the PDF is a binary sidecar beside the node (`<node path>.pdf`), bound by the new `pdf` frontmatter block (`file`, `sha256`, `bytes`, `pages`, `text_layer`, `extractor`, `extractor_version`, `extracted_at`). Prior binaries are archived content-addressed under `.versions/<doc>/`. Validation rules 25–29 (§13.4); verification re-hashes sidecars and reports `sidecar_drift` / `sidecar_missing` (§8.4).
+- §12.3: binaries are permitted in a vault only as declared sidecars of `pdf` nodes.
+- §1.6 lists `agent`, `artifact` and `table`, which conforming implementations already accept, and `pdf`.
+- §13 rule 6 corrected to the full type list (it said "8 types"); rule 7 corrected to the five canonical statuses of §1.5.1 (it listed only `draft` and `published`).
+
+### 1.0
+
+- Initial published specification.
+
+---
+
+*ContextNest is a product of PromptOwl, LLC This specification is released under Apache-2.0. Other open components are licensed as listed in §15; proprietary components are identified there too.*

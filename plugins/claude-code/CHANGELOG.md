@@ -1,5 +1,234 @@
 # Changelog
 
+## 0.6.0
+
+One registered server stands for every nest behind it.
+
+- **`<server>/<nest>` targets.** A Community server's all-nests endpoint is
+  registered once. `ctx vault list` (CLI with nest rows) lists each nest as
+  `<server>/<nest>` with its own description. The pinned vault may name one.
+- **Retrieval spans the server in one call.** Auto-retrieval searches the
+  server row, not each nest row, so dozens of partner nests don't exhaust the
+  fan-out cap. Each hit is cited as `<server>/<nest>:id`, the vault an edit
+  must target.
+- **Writes land in the right nest.** Capture and the curator edit a node in
+  the nest it was cited from. A new node goes to the nest whose description
+  fits.
+- **New setting: `unclear_nest`** (`ask` | `default`, default `ask`). It decides
+  what capture does when no nest clearly fits a new note: ask which nest, or
+  write to the pinned vault, else the registry default. It is shown in the
+  session overview and carried in every capture directive.
+- **The sweep-check follows nests.** It parses `--vault <server>/<nest>`,
+  reads each straggler in its own nest, and cites it there.
+
+## 0.5.5
+
+The curator knows how to refile on a remote nest.
+
+- **`ctx move` is in the curator's toolkit.** After the user approves a
+  restructure, the curator moves a node with `ctx move <id> <folder> --vault
+  <alias>` (needs a CLI with `ctx move`; remote Community nests only). It is told that a rename
+  (`ctx update --title`) is not available on a remote nest and to hand that
+  back to the user. `ctx update --tags` now works on remote nests, and
+  replaces the set there as it does locally, so the existing retag guidance holds.
+
+## 0.5.4
+
+The registry default vault is always searched, and no single vault can
+monopolize the auto-retrieval block.
+
+- **The default vault is always a target.** `vaultTargets()` fanned out across
+  the registry in registration order, capped at five, and never looked at
+  which entry was the default. With a handful of demo vaults registered
+  before the real one, the default was sliced off and never searched — every
+  prompt was answered with six nodes from the first demo vault instead.
+  Targets now resolve as: pinned alias (if registered) → the cwd vault →
+  the registry **default** → the rest of the registry, capped at five in
+  total. The default is a deliberate choice like the cwd vault and a pin, so
+  it is exempt from the tmp filter (a default missing on disk is still
+  skipped), and it counts once when it is also the cwd vault.
+- **Hit slots are shared round-robin.** `searchAll()` took the first target's
+  hits until `MAX_HITS` was reached before the next target was even
+  consulted. On a stopword-heavy query against an older, unranked CLI that
+  meant one vault's alphabetical head filled the whole block. The six slots
+  are now handed out one hit per vault per round, and the survivors are
+  listed grouped in target order — the primary vault still leads, but every
+  vault with hits is represented.
+
+## 0.5.3
+
+Keep the sweep-check whole now that `ctx search` caps its output.
+
+- **The sweep no longer under-reports.** `ctx search` returns 10 hits by
+  default since CLI 2.5.0, so the sweep-check's full-text channel saw at most
+  ten candidates while still reporting `truncated: false`. It now passes an
+  explicit `--limit` covering the whole scan budget.
+- The retrieval prompt and the curator agent describe the new ranked, capped
+  search, so the agent knows to raise `--limit` itself.
+
+## 0.5.2
+
+Auto-retrieval searches the vault you are standing in first, and stops
+injecting nodes from vaults you never meant to search.
+
+- **The working-directory vault is searched first.** `vaultTargets()` fanned
+  out across the first five registry entries, in registry order, and never
+  looked at the vault in the working directory once the registry was
+  non-empty. A session inside an unregistered vault got every prompt answered
+  with six nodes from a demo vault instead. Targets now resolve as: pinned
+  alias (if registered) → the vault `ctx vault which` finds from the cwd → the
+  registry, capped at five in total. The cwd vault is searched with no
+  `--vault` flag, so ctx resolves it locally and its hits are cited as a bare
+  `id`. When that same directory is also registered, it is searched once, by
+  its alias, still first — a hit keeps a citable `alias:id` and is never
+  listed twice.
+- **Missing and scratch vaults are skipped.** Registry entries whose path is
+  gone (`exists: false`) or lives under the OS temp directory — the throwaway
+  vaults agents `ctx init` while testing — are no longer fanned out to. A cwd
+  vault or a pin is a deliberate choice and is never filtered.
+- **SessionStart names the working-directory vault** and whether it is
+  registered, so "which vault is this session using?" is answered up front.
+- Needs a CLI that knows `ctx vault which --json` (any release after
+  2.3.0); an older CLI simply behaves as before, minus the cwd-first step.
+
+## 0.5.1
+
+Retrieval worked on paper and returned nothing on Windows, and returned too
+little from any hosted nest. Both are fixed.
+
+- **The plugin can reach `ctx` on Windows.** Every hook shelled out with
+  `execFileSync("ctx", ...)` and no shell. npm installs `ctx` as a `.cmd` shim
+  there, and Node refuses to `execFile` one without a shell — it throws
+  `EINVAL`, which the `npx` fallback did not treat as "not found" either. The
+  result was silent: no error surfaced, hooks simply injected nothing, and the
+  SessionStart notice claimed the CLI was unavailable while `ctx` sat on PATH.
+  Windows now spawns through the shell, quoting each argument itself because
+  `cmd.exe` does not. macOS and Linux are untouched — `ctx` is a shebang symlink
+  there, so the branch never runs.
+- **A remote nest is no longer read 50 documents at a time.** The whole-vault
+  `ctx list` scans passed no `--limit`, and a hosted nest pages `list` at 50 by
+  default. A 166-document nest was seen as its first 50: the `query` tier built
+  its id→tag map from that slice and fell back to flat search whenever a seed
+  sat outside it, and the straggler sweep's tag channel missed anything past the
+  cut — the exact half-swept vault the sweep exists to prevent. Both scans now
+  ask for what they need. Local vaults were never affected.
+
+## 0.5.0
+
+An update now lands in every node that carries the fact, across every nest that
+carries it — however you phrased it, with the work fanned out in parallel.
+
+- **A `PostToolUse` sweep-check catches incomplete updates at the write.** The
+  old guard was a regex over your phrasing, which missed almost every
+  declarative update ("we moved to Postgres") — so the model fixed one node and
+  stopped. The new hook is mechanical: after any successful `ctx update` it
+  diffs the node against its previous version, finds which terms the edit
+  removed, searches **every registered nest** for them, reads each candidate to
+  confirm, and hands the model the list of nodes still asserting the old value
+  — mid-turn, so it finishes the sweep immediately. Tunables:
+  `CONTEXTNEST_SWEEP_MAX_CANDIDATES` (default 24), `CONTEXTNEST_SWEEP_CHECK=off`.
+- **Entity tags make that sweep deterministic.** The capture and curator agents
+  now tag nodes with the concrete entities they assert (`#infra, #redis` for
+  "Sessions live in Redis") and retag when an edit changes what a node claims.
+  The sweep-check consults the tag index (`ctx list --tag`) alongside full-text
+  search — exact, and it sees drafts — so a node that *paraphrases* a changed
+  fact is still found, and a tag whose body no longer backs it is reported for
+  repair instead of silently rotting. No new storage: tags and `context.yaml`
+  already exist, are versioned, and are visible to selectors.
+- **Correction dispatch is now route → scout → fan out.** The retriever agent
+  gained a scout mode (the same setup retrieval uses) that returns an occurrence
+  map across candidate nests; the dispatcher partitions the map and launches
+  curators **in parallel — as many as the work needs**, at least one per nest,
+  more for a large nest, each owning a disjoint slice. Retrieval hits from the
+  turn where you stated the fact are stashed as warm seeds for the scout.
+- **Concurrent writes are now safe (engine).** Parallel writers used to corrupt
+  the vault's hash chain silently — measured: 6 concurrent updates lost seals
+  and broke `ctx verify`. A per-vault write lock in the engine's mutating
+  operations serializes the checkpoint seal across processes, which also covers
+  remote nests: the MCP server runs the same operations on its own disk.
+- The capture agent may now propose into more than one nest when a fact
+  genuinely belongs in both — one node per nest, the secondary referencing the
+  primary, never duplicated prose.
+- Curators are scoped by contract: given a nest (and optionally a node list),
+  they stay inside it and report anything beyond it instead of chasing.
+- Two correction-pattern repairs: unabbreviated "no, it is" and bare
+  "not X, Y" are now recognized.
+
+## 0.4.0
+
+The end-of-turn vault work no longer blocks you.
+
+- **The `Stop` hook stopped blocking.** It used to return `decision: "block"` —
+  the documented way to force one more action before a turn can end — so every
+  time the gate fired you waited while a subagent read the vault. It now parks
+  the job in the session ledger and returns only a `systemMessage`
+  (`Context Nest: queued a correction sweep`), so the turn ends immediately.
+- **The next prompt dispatches it.** `UserPromptSubmit` drains the queue and
+  hands the directive to the model as `additionalContext`. That drain runs before
+  every early return, so a queued job survives `retrieval_mode: off` and an empty
+  prompt. A job is handed over exactly once and never re-offered.
+- **`contextnest-capture` and `contextnest-curator` are now `background: true`**,
+  so the dispatched work runs alongside your next request rather than ahead of
+  it. The read-only `contextnest-retriever` stays in the foreground — its answer
+  is needed inline.
+- The tradeoff: parked work runs when you send your next message, so if you walk
+  away mid-session the capture does not happen. `/contextnest:capture` still
+  captures on demand.
+
+## 0.3.0
+
+The plugin now decides *whether* to touch the vault before deciding *what* to
+write, and a correction lands everywhere rather than in the first node it finds.
+
+- **New `capture_mode` setting: `off` | `propose` (default) | `auto`.** In
+  `propose` the capture agent is read-only — it proposes in one line and waits
+  for you. `auto` is the old unattended behaviour. `auto_capture` is deprecated
+  but still honoured (`true`→`propose`, `false`→`off`) so existing installs keep
+  working; `capture_mode` wins when both are set.
+- **The `Stop` gate is far quieter.** It used to fire whenever any tool ran,
+  which in a coding session is every turn. It now fires on explicit intent
+  ("remember this"), on a correction, or — for an ambient pass — only once the
+  session is out of a cooldown window tracked per session in
+  `~/.contextnest/plugin-state/`. Short sessions are never interrupted at all.
+  Tune with `CONTEXTNEST_CAPTURE_MIN_TURNS` (default 5).
+- **New `contextnest-curator` agent**, invoked when you correct something. It
+  sweeps for *every* node carrying the stale fact — `ctx search` is ranked and
+  published-only, so it also lists drafts and reads candidates — then changes
+  them together, or reports that the vault never asserted it. Structural changes
+  (a concept renamed, a decision reversed, a node that should split or be
+  retyped) stop and ask instead of proceeding. When the same fact turns out to
+  live in several nodes, the curator names the duplication as the root cause and
+  offers to make one node canonical with the rest linking to it — offered, never
+  done unasked.
+- **The change ladder is injected up front** on correction-shaped prompts, not
+  just at end of turn, so the sweep happens before the edit rather than after.
+- **Capture is gated by a ladder that defaults to no.** A candidate must be
+  statable as a headline plus one "why it matters" sentence, must not already be
+  in the vault, and must not fit as one more sentence on an existing node before
+  a new node is created. Time-bound facts (a price, a metric, a version) are
+  captured with an as-of date and a `#time-bound` tag rather than dropped.
+- The capture prompt no longer assumes a codebase: it calibrates what counts as
+  durable from the target vault's own `description`, so a positioning vault and
+  a security vault are judged on their own terms.
+- **New `/contextnest:capture`** for capturing on purpose, including when
+  `capture_mode` is `off`.
+
+## 0.2.0
+
+Settings are no longer frozen at enable time (CU-wdqcpzw825).
+
+- New `/contextnest:config` command to view and change `retrieval_mode`,
+  `auto_capture`, `vault`, and `ctx_command` at any time. Bare invocation
+  drives the change through interactive pickers (setting, value, scope) instead
+  of requiring the user to type an exact value; the pinned-vault choices are
+  populated from the registered vault aliases. A `<setting> <value>` pair still
+  works for scripting.
+- Settings override files, read by every hook and beating the enable-time
+  values: project `.claude/contextnest.local.json` > user
+  `~/.contextnest/plugin-settings.json` > `CLAUDE_PLUGIN_OPTION_*` >
+  `CONTEXTNEST_*` > defaults. An explicit `"vault": ""` unpins.
+- Missing/malformed override files are ignored — hooks never break a session.
+
 ## 0.1.0
 
 Initial release.

@@ -9,6 +9,7 @@
  */
 
 import type {
+  ClientMetadata,
   ContextNode,
   ContextYaml,
   GraphQueryResult,
@@ -20,11 +21,35 @@ import { ContextInjector } from "./injection.js";
 import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
 import { isPublished, isRetrievable } from "./parser.js";
-import { getLatestCheckpoint, getLatestCheckpointNumber } from "./checkpoint.js";
 import { parseSelector } from "./selector/parser.js";
+import { asksForForgotten } from "./selector/evaluator.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
+import { isVaultRoot } from "./registry.js";
+import { mapInBatches } from "./concurrency.js";
+
+/**
+ * Stamp `integrity` on each served document that fails verification (and
+ * clear a stale one on a document that now passes). Mutates and returns the
+ * same array. For consumers that assemble served documents themselves — e.g.
+ * a server that loads bodies outside `GraphQueryEngine.query` — so every
+ * serve path flags a tampered document the same way.
+ */
+export async function annotateIntegrity<T extends ContextNode>(
+  storage: NestStorage,
+  docs: T[],
+): Promise<T[]> {
+  // Batched like every other vault-wide scan: one history read per document
+  // (plus keyframe/diff reads on a cache miss) must not open a file handle per
+  // document at once on a wide `context_list full` / full-mode query.
+  await mapInBatches(docs, async (doc) => {
+    const verdict = await storage.verifyServedDocument(doc);
+    if (verdict) doc.integrity = verdict;
+    else delete doc.integrity;
+  });
+  return docs;
+}
 
 export interface GraphQueryOptions {
   /** Number of hops from seed nodes (default: 2) */
@@ -33,6 +58,12 @@ export interface GraphQueryOptions {
   full?: boolean;
   /** Include draft documents (default: false) */
   includeDrafts?: boolean;
+  /**
+   * Caller metadata (§9.4) — agent name, session id, custom keys — stamped on
+   * every access trace this query emits, so a §9.2 provenance record says which
+   * agent read the document, not just which document was read.
+   */
+  client?: ClientMetadata;
 }
 
 export class GraphQueryEngine {
@@ -50,17 +81,36 @@ export class GraphQueryEngine {
     selector: string,
     options: GraphQueryOptions = {},
   ): Promise<GraphQueryResult> {
+    const result = await this.run(selector, options);
+    // Every document this query serves carries an integrity verdict when it
+    // fails verification, so a tampered body reaches the agent flagged rather
+    // than as trusted fact. Per served doc, cached per version — not a vault
+    // re-hash per request.
+    await annotateIntegrity(this.storage, [...result.documents, ...result.sourceNodes]);
+    return result;
+  }
+
+  private async run(
+    selector: string,
+    options: GraphQueryOptions,
+  ): Promise<GraphQueryResult> {
     const { hops = 2, full = false, includeDrafts = false } = options;
 
     // Graph mode reads from context.yaml, which is published-only by design
     // (see `ctx index` and `autoIndex` below). Drafts therefore never appear
     // as seed candidates and graph mode cannot honor `includeDrafts`. Force
     // full mode so draft documents actually surface when callers opt in.
-    if (!full && !includeDrafts) {
+    // context.yaml is published-only, so it has no forgotten stubs: an explicit
+    // `status:forgotten` (§6.3.3) can only be answered by a full query.
+    const wantsForgotten = asksForForgotten(parseSelector(selector), true);
+    if (!full && !includeDrafts && !wantsForgotten) {
       let contextYaml = await this.storage.readContextYaml();
 
-      // Auto-generate context.yaml if missing
-      if (!contextYaml) {
+      // Auto-generate context.yaml if missing — but only inside a real vault.
+      // A storage rooted at an arbitrary directory (the CLI's bare-cwd
+      // fallback, a mistyped path) must not have a context.yaml written into
+      // it: that is how a folder of repos ends up "indexed" as documents.
+      if (!contextYaml && isVaultRoot(this.storage.root)) {
         console.error("[ctx] No context.yaml found. Auto-indexing vault...");
         contextYaml = await this.autoIndex();
       }
@@ -90,6 +140,13 @@ export class GraphQueryEngine {
     const ast = parseSelector(selector);
     const seedIds = await evaluateFromIndex(ast, contextYaml.documents, {
       packLoader: (id) => packLoader.get(id),
+      // context.yaml has no bodies, so a search URI would only match titles,
+      // tags and descriptions. Search full text, as context_search does.
+      search: async (query) =>
+        new Resolver({ documents: await this.storage.discoverDocuments() })
+          .search(query)
+          .filter((h) => isPublished(h.document))
+          .map((h) => h.document.id),
     });
 
     // 2. Traverse graph from seeds
@@ -132,9 +189,10 @@ export class GraphQueryEngine {
     // 5. Order source nodes topologically
     const orderedSourceNodes = orderSourceNodesTopologically(sourceNodes);
 
-    // 6. Log traces
-    const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
+    // 6. Log traces. Head only — a query runs on every retrieval, and loading
+    // the whole chain for one number made the hottest READ path pay the same
+    // O(chain size) cost the write path was just freed from.
+    const currentCheckpoint = await this.storage.readLatestCheckpointNumber();
 
     for (const doc of [...regularDocs, ...orderedSourceNodes]) {
       traceLogger.logAccess({
@@ -143,6 +201,7 @@ export class GraphQueryEngine {
         checkpoint: currentCheckpoint,
         author: doc.frontmatter.author,
         editedAt: doc.frontmatter.updated_at,
+        client: options.client,
       });
     }
 
@@ -164,8 +223,11 @@ export class GraphQueryEngine {
     try {
       const docs = await this.storage.discoverDocuments();
       const config = await this.storage.readConfig();
-      const checkpointHistory = await this.storage.readCheckpointHistory();
-      const latestCheckpoint = getLatestCheckpoint(checkpointHistory);
+      // Throwing variant deliberately: this one PERSISTS the number into
+      // context.yaml, so a transient read must abandon the auto-index (the
+      // catch below) and retry on the next query, rather than baking in a
+      // checkpoint of 0 that survives until something else regenerates.
+      const latestCheckpoint = await this.storage.readLatestCheckpoint();
       const published = docs.filter(isPublished);
 
       const contextYaml = generateContextYaml(published, config, latestCheckpoint);
@@ -187,8 +249,8 @@ export class GraphQueryEngine {
     // never sees retired docs (parity with the graph-mode filter above).
     const docs = await this.storage.discoverDocuments();
     const packs = await this.storage.readPacks();
-    const checkpointHistory = await this.storage.readCheckpointHistory();
-    const currentCheckpoint = getLatestCheckpointNumber(checkpointHistory);
+    // Head only — same as graph mode; this is a read path stamping a trace.
+    const currentCheckpoint = await this.storage.readLatestCheckpointNumber();
 
     const resolver = new Resolver({ documents: docs });
     const packLoader = new PackLoader(packs);
@@ -196,22 +258,23 @@ export class GraphQueryEngine {
       resolver,
       packLoader,
       currentCheckpoint,
+      client: options.client,
     });
 
     const result = await injector.inject(selector);
 
     // Apply the same retrieval gates as graphQuery so approved/rejected
     // never leak to LLMs, and drafts surface only when explicitly opted in.
-    const filteredDocs = result.documents.filter((doc) => {
+    // A forgotten stub is returned only when the selector asked for it by name.
+    const wantsForgotten = asksForForgotten(parseSelector(selector), true);
+    const keep = (doc: ContextNode): boolean => {
+      if (wantsForgotten && doc.frontmatter.status === "forgotten") return true;
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;
-    });
-    const filteredSources = result.sourceNodes.filter((doc) => {
-      if (!isRetrievable(doc)) return false;
-      if (!options.includeDrafts && !isPublished(doc)) return false;
-      return true;
-    });
+    };
+    const filteredDocs = result.documents.filter(keep);
+    const filteredSources = result.sourceNodes.filter(keep);
 
     return {
       ...result,

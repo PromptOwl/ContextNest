@@ -1,18 +1,23 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addVault,
+  addRemote,
+  pruneVaults,
   removeVault,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   readRegistry,
   getRegistryDir,
   getRegistryPath,
   resolveVaultPath,
+  assertVaultRoot,
 } from "../registry.js";
-import { ConfigError } from "../errors.js";
+import { NestStorage } from "../storage.js";
+import { ConfigError, NoVaultError } from "../errors.js";
 
 /** Create a directory that looks like a vault (has .context/config.yaml). */
 function makeVault(root: string, name = "Test Vault"): string {
@@ -62,10 +67,64 @@ describe("vault registry", () => {
     expect(list[0].description).toBe("Test Vault");
   });
 
+  it("sets, replaces and clears an alias description after the fact", () => {
+    const v = makeVault(join(tmp, "alpha"));
+    addVault("alpha", v);
+    setVaultDescription("alpha", "first");
+    expect(listVaults()[0].description).toBe("first");
+    setVaultDescription("alpha", "second");
+    expect(listVaults()[0].description).toBe("second");
+    // Cleared (and blank counts as cleared): the key goes away, so the vault's
+    // own config label takes over again rather than an empty string winning.
+    setVaultDescription("alpha", "   ");
+    expect(readRegistry().vaults.alpha.description).toBeUndefined();
+    expect(listVaults()[0].description).toBe("Test Vault");
+    expect(() => setVaultDescription("nope", "x")).toThrow(ConfigError);
+  });
+
+  it("round-trips an init description through .context/config.yaml", async () => {
+    const root = join(tmp, "described");
+    await new NestStorage(root).init("Described Vault", "structured", "The nest's own purpose");
+    expect((await new NestStorage(root).readConfig())?.description).toBe("The nest's own purpose");
+
+    // Tier 2 of the precedence chain: no registry description, so the config's
+    // travels-with-the-vault description is what listVaults reports.
+    addVault("described", root);
+    expect(listVaults()[0].description).toBe("The nest's own purpose");
+
+    // Tier 1: the registry entry is a machine-local override and outranks it.
+    addVault("described", root, { description: "local label", force: true });
+    expect(listVaults()[0].description).toBe("local label");
+  });
+
+  it("leaves description out of config.yaml when init gets none", async () => {
+    const root = join(tmp, "plain");
+    await new NestStorage(root).init("Plain Vault");
+    expect((await new NestStorage(root).readConfig())?.description).toBeUndefined();
+  });
+
   it("rejects a non-vault path", () => {
     const notVault = join(tmp, "empty");
     mkdirSync(notVault, { recursive: true });
     expect(() => addVault("bad", notVault)).toThrow(ConfigError);
+  });
+
+  it("refuses prototype-chain names as aliases, on every path", () => {
+    const v = makeVault(join(tmp, "proto"));
+    addVault("real", v);
+    for (const bad of ["__proto__", "constructor", "prototype"]) {
+      // Writing: `vaults[bad] = entry` would hijack the prototype or shadow a
+      // built-in; `vaults["__proto__"]` reads back truthy and slips past a
+      // `if (!entry)` guard, so the assignment lands on Object.prototype.
+      expect(() => addVault(bad, v)).toThrow(ConfigError);
+      expect(() => setVaultDescription(bad, "pwned")).toThrow(ConfigError);
+      expect(() => setDefaultVault(bad)).toThrow(ConfigError);
+      expect(() => removeVault(bad)).toThrow(ConfigError);
+      // Reading: an unknown alias, not a match — and no throw from the env path.
+      expect(() => resolveVaultPath({ vaultAlias: bad })).toThrow();
+    }
+    expect(({} as Record<string, unknown>).description).toBeUndefined();
+    expect(listVaults().map((x) => x.alias)).toEqual(["real"]);
   });
 
   it("rejects an alias with disallowed characters", () => {
@@ -124,6 +183,56 @@ describe("vault registry", () => {
     setDefaultVault("b");
     expect(readRegistry().default).toBe("b");
     expect(() => setDefaultVault("nope")).toThrow(/No vault registered/);
+  });
+
+  describe("pruneVaults", () => {
+    it("removes local aliases whose path is gone, clears a pruned default, leaves remotes alone", () => {
+      const a = makeVault(join(tmp, "a"));
+      const b = makeVault(join(tmp, "b"));
+      addVault("a", a);
+      addVault("b", b, { setDefault: true });
+      addRemote("far", { transport: "http", url: "https://nest.example.com/mcp" });
+      rmSync(b, { recursive: true, force: true });
+
+      const result = pruneVaults();
+      expect(result.removed).toEqual([{ alias: "b", path: b, wasDefault: true }]);
+      expect(result.defaultCleared).toBe(true);
+
+      const reg = readRegistry();
+      expect(Object.keys(reg.vaults)).toEqual(["a"]);
+      expect(reg.default).toBeUndefined();
+      expect(reg.remotes?.far).toBeDefined();
+    });
+
+    it("keeps a default that still exists", () => {
+      const a = makeVault(join(tmp, "a"));
+      const b = makeVault(join(tmp, "b"));
+      addVault("a", a, { setDefault: true });
+      addVault("b", b);
+      rmSync(b, { recursive: true, force: true });
+
+      const result = pruneVaults();
+      expect(result.removed.map((r) => r.alias)).toEqual(["b"]);
+      expect(result.defaultCleared).toBe(false);
+      expect(readRegistry().default).toBe("a");
+    });
+
+    it("treats a directory that lost its .context/config.yaml as missing (same rule as `vault list`)", () => {
+      const a = makeVault(join(tmp, "a"));
+      addVault("a", a);
+      rmSync(join(a, ".context"), { recursive: true, force: true });
+      expect(listVaults()[0].exists).toBe(false);
+      expect(pruneVaults().removed.map((r) => r.alias)).toEqual(["a"]);
+    });
+
+    it("is a no-op that does not rewrite the file when nothing is missing", () => {
+      addVault("a", makeVault(join(tmp, "a")));
+      const before = readFileSync(getRegistryPath(), "utf-8");
+      const result = pruneVaults();
+      expect(result.removed).toEqual([]);
+      expect(result.defaultCleared).toBe(false);
+      expect(readFileSync(getRegistryPath(), "utf-8")).toBe(before);
+    });
   });
 
   describe("readRegistry rejects corrupt config", () => {
@@ -270,6 +379,67 @@ describe("vault registry", () => {
       mkdirSync(outside, { recursive: true });
       const r = resolveVaultPath({ cwd: outside });
       expect(r).toMatchObject({ path: outside, source: "cwd" });
+    });
+
+    it("6b. assertVaultRoot refuses the bare-cwd fallback when the dir is not a vault", () => {
+      // Register two, remove the (auto-promoted) default: "registered, but no
+      // default" is the shape where the cwd fallback is reached with aliases
+      // worth naming in the error.
+      removeVault("alpha");
+      removeVault("beta");
+      addVault("gamma", alpha);
+      addVault("delta", beta);
+      removeVault("gamma");
+      const outside = join(tmp, "outside3");
+      mkdirSync(outside, { recursive: true });
+      const r = resolveVaultPath({ cwd: outside });
+      expect(r.source).toBe("cwd");
+      let caught: unknown;
+      try {
+        assertVaultRoot(r);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(NoVaultError);
+      expect((caught as NoVaultError).code).toBe("NO_VAULT");
+      expect((caught as Error).message).toContain(`${outside} is not a Context Nest vault`);
+      expect((caught as Error).message).toContain("registered: delta");
+      // Remotes share the alias namespace, so a registered remote must be
+      // named too — otherwise a user whose nests are all remote is told to
+      // pass an alias and shown none. (A remote can only be reached here when
+      // it is not the default: a default remote fails earlier, in
+      // resolveVaultPath, as "local-only operation".)
+      addVault("epsilon", alpha);
+      addRemote("hosted", { transport: "http", url: "https://example.com/mcp" });
+      removeVault("epsilon");
+      let withRemote: unknown;
+      try {
+        assertVaultRoot(resolveVaultPath({ cwd: outside }));
+      } catch (err) {
+        withRemote = err;
+      }
+      expect((withRemote as Error).message).toContain("registered: delta, hosted");
+      removeVault("hosted");
+      // A bare context.yaml is not a vault either — that is the residue the
+      // old auto-index bug left behind, and must not re-admit the folder.
+      writeFileSync(join(outside, "context.yaml"), "version: 1\n");
+      expect(() => assertVaultRoot(resolveVaultPath({ cwd: outside }))).toThrow(NoVaultError);
+    });
+
+    it("6c. assertVaultRoot passes every real resolution through unchanged", () => {
+      const local = resolveVaultPath({ cwd: alpha });
+      expect(assertVaultRoot(local)).toBe(local);
+      // Even a cwd-sourced result is fine when the directory IS a vault root.
+      const cwdVault = { path: alpha, source: "cwd" as const };
+      expect(assertVaultRoot(cwdVault)).toBe(cwdVault);
+      // Empty registry → no alias list, point at `ctx vault list` instead.
+      removeVault("alpha");
+      removeVault("beta");
+      const outside = join(tmp, "outside4");
+      mkdirSync(outside, { recursive: true });
+      expect(() => assertVaultRoot(resolveVaultPath({ cwd: outside }))).toThrow(
+        /see "ctx vault list"/,
+      );
     });
 
     it("throws on an unknown alias", () => {

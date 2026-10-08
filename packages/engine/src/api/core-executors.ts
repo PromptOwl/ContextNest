@@ -1,0 +1,1760 @@
+/**
+ * Executors for the `core` namespace — the SINGLE implementation of each core
+ * operation, bound to the engine primitives. These replace the copy of this
+ * logic currently living in Community MCP (`tools.ts`), Community REST
+ * (`query-routes.ts`), OSS mcp-server, and OSS CLI.
+ *
+ * Everything here is **ungated mechanics**. No commercial governance: the only
+ * policy seam is the identity-agnostic `RbacHook` on the context. Stewardship
+ * enforcement is layered by a Community extension's `authorize` hook (see
+ * `extension.ts`). Behaviour is reconciled against CONTEXT_NEST_SPEC.md and the
+ * existing surfaces (published-only search, index regeneration after publish,
+ * status/tag normalization, document validation before write).
+ */
+import type {
+  ClientMetadata,
+  ContextNode,
+  Frontmatter,
+  IntegrityFailure,
+  PdfMeta,
+  SkillMeta,
+  SourceMeta,
+} from "../types.js";
+import {
+  serializeDocument,
+  validateDocument,
+  normalizeTags,
+  normalizeStatus,
+  isRejected,
+  isPublished,
+  isForgotten,
+  explicitStatus,
+  parseDocument,
+} from "../parser.js";
+import {
+  forgetDocument,
+  forgetLog,
+  deleteDocumentWithTombstone,
+  applyImportedTombstones,
+  assertNotForgotten,
+} from "../forget.js";
+import { addTombstone, buildTombstoneIndex, importVerdict, isPathForgotten } from "../tombstones.js";
+import yaml from "js-yaml";
+import { Resolver } from "../resolver.js";
+import { annotateIntegrity } from "../graph-query-engine.js";
+import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
+import { filterDocuments } from "../filters.js";
+import { listVaults } from "../registry.js";
+import { publishDocument, publishDocuments } from "../publish.js";
+import { VersionManager } from "../versioning.js";
+import { parseUri } from "../uri.js";
+import {
+  ContextNestError,
+  DocumentNotFoundError,
+  ForgottenDocumentError,
+  RejectedDocumentError,
+} from "../errors.js";
+import { sha256Bytes } from "../integrity.js";
+import {
+  DEFAULT_PDF_MAX_BYTES,
+  PDF_EXTRACTOR,
+  extractPdf,
+  pdfExtractorVersion,
+  type PdfExtraction,
+} from "../importers/pdf.js";
+import { pdfSidecarPath } from "../pdf-nodes.js";
+import {
+  buildInstallManifest,
+  renderSkill,
+  NotASkillNodeError,
+  type Harness,
+  type InstallMode,
+  type InstallScope,
+} from "../skills.js";
+import { applyTypedBlocks } from "../typed-blocks.js";
+import { mapInBatches } from "../concurrency.js";
+import { withVaultLock } from "../vault-lock.js";
+import { currentReviewProposal, stageReviewHold } from "../review.js";
+import { TITLE_MAX_LENGTH } from "../schemas.js";
+import {
+  isVersionArtifactPath,
+  planImportPaths,
+  sanitizeImportedFrontmatter,
+} from "../import-hygiene.js";
+import type { OperationContext, OperationExecutor } from "./context.js";
+import { isDeepStrictEqual } from "node:util";
+
+/** Community/engine cap on graph traversal depth (community MAX_HOPS). */
+const MAX_HOPS = 10;
+
+/** ContextNode → the wire `nodeSummary` shape. Source nodes keep their block. */
+function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = false) {
+  return {
+    id: node.id,
+    title: node.frontmatter.title,
+    ...(node.frontmatter.description !== undefined
+      ? { description: node.frontmatter.description }
+      : {}),
+    type: node.frontmatter.type ?? "document",
+    status: node.frontmatter.status ?? "draft",
+    tags: node.frontmatter.tags,
+    ...(node.frontmatter.description ? { description: node.frontmatter.description } : {}),
+    ...(node.frontmatter.type === "source" && node.frontmatter.source
+      ? { source: node.frontmatter.source }
+      : {}),
+    ...(node.frontmatter.type === "pdf" && node.frontmatter.pdf
+      ? { pdf: node.frontmatter.pdf }
+      : {}),
+    // Before the body, so an agent reading the payload top-down meets the
+    // warning first. Present only when verification failed.
+    ...(node.integrity ? { integrity: node.integrity } : {}),
+    ...(includeBody ? { body: node.body } : {}),
+    ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
+  };
+}
+
+/** Lowercase, hyphenate — used to derive a slug from a title/folder segment. */
+function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-") // collapse each non-alphanumeric run to ONE dash
+    .replace(/^-|-$/g, ""); // runs are already collapsed, so trim a single edge dash
+  // (linear — avoids the `-+$` polynomial-backtracking ReDoS CodeQL flags)
+}
+
+/** Clamp a caller-supplied hop count into [0, MAX_HOPS]. */
+function clampHops(hops: unknown): number {
+  const n = typeof hops === "number" ? hops : 2;
+  return Math.max(0, Math.min(MAX_HOPS, n));
+}
+
+/**
+ * Slugify a title, rejecting titles with no slug-able characters (all-CJK,
+ * all-emoji, all-punctuation) rather than producing a degenerate `nodes/.md`.
+ */
+function requireSlug(title: string): string {
+  const slug = slugify(title);
+  if (!slug) {
+    throw new ContextNestError(
+      `Title "${title}" has no slug-able (a-z0-9) characters; supply an explicit id/folder`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return slug;
+}
+
+/**
+ * Reject a title that carries no usable character at all — "###", "...", "   ".
+ *
+ * Same `\p{L}`/`\p{N}` rule as `assertSafeDocumentId`, NOT `requireSlug`: this
+ * runs where the title does not derive an id, and a document created with an
+ * explicit id may legitimately be titled "日本語" — which slugifies to nothing.
+ */
+function assertUsableTitle(title: string): void {
+  if (!/[\p{L}\p{N}]/u.test(title)) {
+    throw new ContextNestError(
+      `Title "${title}" has no letter or number; it cannot be read back by search or wiki links`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
+/** Normalize (#-prefix) and de-duplicate a tag list. */
+function normalizeUniqueTags(tags?: unknown[]): string[] | undefined {
+  const normalized = normalizeTags(tags);
+  return normalized ? [...new Set(normalized)] : normalized;
+}
+
+/**
+ * Resolve a document id from an id / uri / title selector. Title resolves to
+ * the *actual* frontmatter title across discovered docs (matches how every
+ * surface resolves title→id), falling back to a slugified id under nodes/.
+ */
+async function resolveId(
+  ctx: OperationContext,
+  sel: { id?: string; uri?: string; title?: string },
+): Promise<string> {
+  // Enforced here rather than as a `.refine` on the descriptors: a refine turns
+  // the input into a ZodEffects with no `.shape`, and an MCP tool registered
+  // from that advertises no parameters at all. Same error, raised a moment
+  // later, and every transport reports it the same way.
+  if (!sel.id && !sel.uri && !sel.title) {
+    throw new ContextNestError(
+      "One of uri, id, or title is required",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (sel.id) return sanitizeId(sel.id);
+  if (sel.uri) return sanitizeId(parseUri(sel.uri).path);
+  // includeRetired, or a title lookup cannot see a rejected document at all and
+  // falls through to the slug guess below — which quietly resolves to whatever
+  // sits at that slug, or to nothing for a doc created with a custom id. The
+  // ops that let a steward read and revive a retired doc need this to work.
+  const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
+  const match = docs.find(
+    (d) => d.frontmatter.title.toLowerCase() === String(sel.title).toLowerCase(),
+  );
+  if (match) return match.id;
+  return normalizeDocumentId(requireSlug(String(sel.title)));
+}
+
+/**
+ * Clean a caller-supplied id without re-rooting it.
+ *
+ * `normalizeDocumentId` also prepends `nodes/` to any id with no slash, which
+ * silently redirects every id from a flat-layout vault (they carry no prefix)
+ * to a document that does not exist. The tidying half is still wanted: callers
+ * naturally build an id from a file path, and storage appends `.md` itself, so
+ * an un-stripped suffix resolves to `<id>.md.md`.
+ */
+function sanitizeId(raw: string): string {
+  const cleaned = raw.replace(/\.md$/, "").replace(/^\/+/, "");
+  assertSafeDocumentId(cleaned);
+  return cleaned;
+}
+
+/** Validate a node against the spec (§13) before it is written/published. */
+function assertValid(node: ContextNode): void {
+  const result = validateDocument(node);
+  if (!result.valid) {
+    throw new ContextNestError(
+      `Document validation failed: ${result.errors.map((e) => e.message).join("; ")}`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
+/** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
+async function publishAndIndex(
+  ctx: OperationContext,
+  id: string,
+  note?: string,
+  client?: ClientMetadata,
+): Promise<{ version: number; checkpoint: number }> {
+  const res = await publishDocument(ctx.storage, id, {
+    editedBy: ctx.actor ?? "engine",
+    ...(note ? { note } : {}),
+    ...(client ? { client } : {}),
+  });
+  // publishDocument does NOT touch context.yaml; graph-mode reads (the default
+  // context_query) seed from it, so a stale index would hide the write. OSS
+  // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
+  // INDEX.md needs rewriting.
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
+  return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
+}
+
+const query: OperationExecutor = async (ctx, input: any) => {
+  const result = await ctx.query.query(input.query, {
+    hops: clampHops(input.hops),
+    full: input.full ?? false,
+    includeDrafts: input.include_drafts ?? false,
+    // Every access trace this query emits is stamped with the caller (§9.4),
+    // so provenance records which agent read the node, not just which node.
+    client: input.client,
+  });
+  return {
+    documents: result.documents.map((d) => toSummary(d, true)),
+    source_nodes: result.sourceNodes?.map((d) => toSummary(d, true)),
+    traversal: {
+      mode: result.mode,
+      hops_used: result.hopsUsed,
+      nodes_traversed: result.nodesTraversed,
+    },
+    trace_count: result.traces.length,
+  };
+};
+
+const resolve: OperationExecutor = async (ctx, input: any) => {
+  // Honour `hops` — graph mode traverses the neighbourhood; forcing full mode
+  // would make the advertised hops a no-op (fullQuery reports hopsUsed:0).
+  const result = await ctx.query.query(input.selector, {
+    hops: clampHops(input.hops),
+    full: false,
+    client: input.client,
+  });
+  const budget = input.max_tokens ?? 8000;
+  const documents: Array<{
+    id: string;
+    frontmatter: Frontmatter;
+    integrity?: IntegrityFailure;
+    body: string;
+  }> = [];
+  let tokens = 0;
+  let truncated = false;
+  for (const d of result.documents) {
+    const cost = Math.ceil((d.body?.length ?? 0) / 4); // ~4 chars/token
+    if (tokens + cost > budget && documents.length > 0) {
+      truncated = true;
+      break;
+    }
+    tokens += cost;
+    documents.push({
+      id: d.id,
+      frontmatter: d.frontmatter,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
+      body: d.body,
+    });
+  }
+  return { documents, tokens_used: tokens, truncated };
+};
+
+const search: OperationExecutor = async (ctx, input: any) => {
+  // Go straight to the engine's ranked, published-only full-text index
+  // (Resolver.search: title/description/body/tags, MiniSearch) rather than
+  // through `ctx.query.query("contextnest://search/…")`. The selector route
+  // had two problems: the query had to be slugified into a single lexer-safe
+  // URI token, and the selector evaluator collapsed the hits into a Set and
+  // re-filtered the discovery list, so the score — and the order — were gone
+  // by the time results reached a caller. Here the raw text goes to
+  // MiniSearch as-is and every hit carries its score.
+  // discoverDocuments() drops rejected nodes and the resolver indexes only
+  // published ones; the isPublished filter is belt-and-braces so this
+  // surface can never leak unpublished content.
+  // Note for the selector route (`context_query`): the evaluator keeps the
+  // order of a search URI only when it is the LEFTMOST operand — set
+  // intersection/union walk the left side first, so
+  // `type:document + contextnest://search/foo` comes back in discovery order.
+  const query = String(input.query).trim();
+  if (!query) return { results: [], count: 0, total: 0 };
+  const docs = await ctx.storage.discoverDocuments();
+  const hits = new Resolver({ documents: docs })
+    .search(query)
+    .filter((h) => isPublished(h.document));
+  const kept = input.limit ? hits.slice(0, input.limit) : hits;
+  return {
+    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    // Counted before the `limit` slice. `total` is the deprecated alias.
+    count: hits.length,
+    total: hits.length,
+  };
+};
+
+const get: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const node = await ctx.storage.readDocument(
+    id,
+    input.verify_checksum ? { verifyChecksum: true } : undefined,
+  );
+  // Consistent rejected handling (the descriptor advertises REJECTED_DOCUMENT).
+  // Surfaces that let a steward see and revive a retired document opt out —
+  // reading one is not the same as republishing it.
+  if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  // Served, never refused: a document that fails verification is still the one
+  // asked for. The verdict tells the agent not to trust its values.
+  //
+  // Runs on the verify_checksum path too. There, a drifted live file is
+  // replaced by the last-approved keyframe (+ pendingChange); the verdict then
+  // checks what is actually served: the body check runs on the keyframe's own
+  // bytes (clean unless the keyframe itself was altered), and the chain check
+  // still catches a corrupted history behind it. With no keyframe to fall back
+  // to, the drifted live node is served and body_drift is reported.
+  const integrity = await ctx.storage.verifyServedDocument(node);
+  return {
+    id: node.id,
+    frontmatter: node.frontmatter,
+    ...(integrity ? { integrity } : {}),
+    body: node.body,
+    ...(input.include_raw ? { raw: node.rawContent } : {}),
+    ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
+  };
+};
+
+const list: OperationExecutor = async (ctx, input: any) => {
+  // includeRetired, or `status: "rejected"` matches nothing: discovery drops
+  // retired documents before the filter ever sees them. filterDocuments hides
+  // them again whenever no status was asked for.
+  // `folder` goes to discovery, not to filterDocuments: it decides which files
+  // are read at all, so narrowing afterwards would save nothing.
+  const docs = await ctx.storage.discoverDocuments({
+    includeRetired: true,
+    ...(input.folder !== undefined ? { folder: input.folder } : {}),
+    ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
+  });
+  const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  // `full` serves bodies, so it gets the same integrity verdict as every other
+  // body-serving path. Summary mode (no body) stays cheap: nothing is hashed.
+  if (input.full === true) await annotateIntegrity(ctx.storage, kept);
+  return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
+};
+
+const folders: OperationExecutor = async (ctx, input: any) => {
+  // Reads directory entries only — the shape of the vault is answerable
+  // without opening a single document.
+  return {
+    folders: await ctx.storage.listFolders({
+      ...(input?.folder !== undefined ? { folder: input.folder } : {}),
+      ...(input?.recursive !== undefined ? { recursive: input.recursive } : {}),
+    }),
+  };
+};
+
+/**
+ * Collapse the `content` / `body` pair to one value.
+ *
+ * They name the same field: `content` is the op's parameter, `body` is what
+ * the frontmatter, the legacy create_document/update_document tools, and
+ * therefore most agents call it. Accepting both is what stops a caller's text
+ * from going nowhere; disagreeing values are refused rather than silently
+ * picking one, because either choice discards work the caller sent.
+ */
+function resolveContentAlias(input: { content?: unknown; body?: unknown }): string | undefined {
+  const { content, body } = input;
+  if (typeof content === "string" && typeof body === "string" && content !== body) {
+    throw new ContextNestError(
+      "`content` and `body` are aliases for the same field but were given different text — pass only one.",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (typeof content === "string") return content;
+  if (typeof body === "string") return body;
+  return undefined;
+}
+
+/**
+ * Build a fresh draft node from create/import input. Slugifies each folder
+ * segment and always roots under nodes/ so the doc is discoverable
+ * (normalizeDocumentId only prepends nodes/ when there is no slash — a raw
+ * "gtm/deals/x" would escape the discoverable tree). Shared by `create` and
+ * the bulk `import` executor so their node shape stays identical.
+ */
+function buildDraftNode(input: {
+  id?: string;
+  title: string;
+  content: string;
+  type?: string;
+  tags?: unknown[];
+  folder?: string;
+  metadata?: Record<string, unknown>;
+  status?: Frontmatter["status"];
+  description?: string;
+  trigger?: string;
+  tools_required?: string[];
+  output_format?: SkillMeta["output_format"];
+  inputs?: SkillMeta["inputs"];
+  guard_rails?: string[];
+  source?: SourceMeta;
+}): ContextNode {
+  const now = new Date().toISOString();
+  const folderSegments = String(input.folder ?? "")
+    .split("/")
+    .map(slugify)
+    .filter(Boolean);
+  // An explicit id wins outright — callers that mint their own ids (system
+  // nodes, path-addressed tools) still get the traversal/prefix normalization.
+  const id = input.id
+    ? normalizeDocumentId(input.id)
+    : normalizeDocumentId(["nodes", ...folderSegments, requireSlug(input.title)].join("/"));
+  const type = (input.type as Frontmatter["type"]) ?? "document";
+  const frontmatter: Frontmatter = {
+    title: input.title,
+    type,
+    ...(input.description !== undefined ? { description: input.description } : {}),
+    ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+    status: (input.status as Frontmatter["status"]) ?? "draft",
+    created_at: now,
+    // A node is "updated" at birth; without this a draft carries no
+    // updated_at until its first edit, and every surface renders it blank.
+    updated_at: now,
+  };
+  // `source` and `skill` are required by one type and forbidden on the others,
+  // so they cannot ride along inside `metadata` and cannot be added afterwards
+  // — a source node written without its block fails every later update.
+  applyTypedBlocks(frontmatter, {
+    type,
+    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
+    ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
+    ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
+    ...(input.inputs !== undefined ? { inputs: input.inputs } : {}),
+    ...(input.guard_rails !== undefined ? { guard_rails: input.guard_rails } : {}),
+  });
+  return { id, filePath: "", rawContent: "", frontmatter, body: input.content };
+}
+
+const create: OperationExecutor = async (ctx, input: any) => {
+  const content = resolveContentAlias(input);
+  if (content === undefined) {
+    throw new ContextNestError(
+      "A node needs a body: pass `content` (or its alias `body`).",
+      "VALIDATION_FAILED",
+    );
+  }
+  // Held for review (review.ts): an unpublished node is simply written as
+  // pending_review. An explicit publish:true wins — the flag is the caller's
+  // per-call override (`ctx add --publish`).
+  // A create publishes whatever `status` it names, so any status is held — as
+  // pending_review, the one status approval releases (an explicit `published`
+  // left in would land marked published with no version). A rejected create
+  // never publishes, so there is nothing to hold.
+  const hold = input.review === true && input.publish !== true && input.status !== "rejected";
+  const node = buildDraftNode({
+    ...input,
+    content,
+    ...(hold ? { status: "pending_review" } : {}),
+  });
+  // A rejected node cannot be published — publish refuses one by design. Left
+  // to fall through, the write below lands and publish then throws, stranding a
+  // file on disk with no version and no history, and making the caller's retry
+  // fail with DOCUMENT_ALREADY_EXISTS for a create it believes never happened.
+  // Refuse before anything is written.
+  const publish = node.frontmatter.status === "rejected" || hold ? false : input.publish !== false;
+  // Publish assigns the version (spec §6), so a published node must go to disk
+  // WITHOUT one — pre-setting it makes the first published version 2 and leaves
+  // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
+  // A held node is left unversioned instead, so approving it publishes v1.
+  if (!publish && !hold) node.frontmatter.version = 1;
+  const createdStatus = node.frontmatter.status;
+  assertValid(node);
+  // Refused BEFORE the write, for the same stranded-file reason as rejected:
+  // a path a forget retired, or a body matching erased
+  // content, never takes content again (§6.3.4).
+  await assertNotForgotten(ctx.storage, node);
+  // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
+  // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
+  // the way the pre-check + separate write could race.
+  await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
+  // Governed callers create the node WITHOUT publishing: the write has to clear
+  // review before it becomes retrievable. Still regenerate the index so the
+  // draft is discoverable to the surfaces that list drafts.
+  if (!publish) {
+    await ctx.storage.regenerateIndex();
+    return {
+      id: node.id,
+      version: node.frontmatter.version ?? 1,
+      status: createdStatus,
+      checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
+    };
+  }
+  const result = await publishAndIndex(ctx, node.id, input.note, input.client);
+  return {
+    id: node.id,
+    version: result.version,
+    status: "published",
+    checkpoint: result.checkpoint,
+  };
+};
+
+/**
+ * Statuses that describe where a node sits in review, not a content release.
+ * Setting one is a metadata transition, so it doesn't publish by default — the
+ * rule CLI and mcp-server each hand-rolled before this op absorbed it.
+ */
+const UNPUBLISHED_STATUSES = new Set(["draft", "pending_review", "approved", "rejected"]);
+
+const update: OperationExecutor = async (ctx, input: any) => {
+  // Vetted, NOT normalized: normalizeDocumentId re-roots a bare slug under
+  // `nodes/`, which silently redirects every id from a flat-layout vault (they
+  // carry no prefix) to a document that doesn't exist. The storage layer
+  // already resolves an id for its own layout — all this has to do is refuse
+  // one that would escape the vault root.
+  const id: string = input.id;
+  assertSafeDocumentId(id);
+  const live = await ctx.storage.readDocument(id);
+  // Held for review (review.ts). An edit to a PUBLISHED node must not touch
+  // the canonical file — it is staged as a suggestion instead — and it builds
+  // on the node's current held proposal, if any, so a second held edit carries
+  // the first rather than silently dropping it on approval.
+  const hold = input.review === true && input.publish !== true;
+  const holdAsSuggestion = hold && isPublished(live);
+  const proposal = holdAsSuggestion ? await currentReviewProposal(ctx.storage, id) : null;
+  const existing = proposal ? parseDocument(live.filePath, proposal.proposedRaw, id) : live;
+  // Guard BEFORE any write: republishing a rejected doc would flip it back into
+  // retrieval, and writing first would mutate the file even though publish then
+  // rejects (no version/checksum/history). Reviving one — moving it to some
+  // OTHER status — is allowed; re-asserting `rejected` is not, or a client that
+  // echoes the current status back alongside an edit silently rewrites the body
+  // of a document that stays rejected.
+  if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
+    throw new RejectedDocumentError(id);
+  }
+  // A forgotten stub never takes content again, under any status (§6.3.4).
+  if (isForgotten(existing)) throw new ForgottenDocumentError(id);
+  // A pdf node's body is the text extracted from its binary; hand-editing it
+  // would leave the two disagreeing under one sealed version. The binary is the
+  // source of truth, so the way to change the text is a new PDF.
+  if (
+    existing.frontmatter.type === "pdf" &&
+    (resolveContentAlias(input) !== undefined || typeof input.append === "string")
+  ) {
+    throw new ContextNestError(
+      `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. ` +
+        "Import a new version of the PDF instead (context_import_pdf with this id / `ctx import pdf <file> --id <id>`).",
+      "VALIDATION_FAILED",
+    );
+  }
+  const frontmatter: Frontmatter = { ...existing.frontmatter };
+  // A rename leaves the id alone, so this is the id-free rule, not create's
+  // slug rule: a title with no letter or number anywhere is unusable everywhere
+  // it is read back (search, wiki links), but "日本語" is fine — create accepts
+  // it too whenever the caller supplies the id.
+  if (input.title) {
+    assertUsableTitle(String(input.title));
+    frontmatter.title = input.title;
+  }
+  // Under a hold an explicit `published` is what the hold defers, not a status
+  // to write — applied, an unpublished node would read published, unversioned.
+  if (input.status && !(hold && input.status === "published")) {
+    frontmatter.status = input.status as Frontmatter["status"];
+  }
+  // An unpublished node held for review is marked as such (a staged edit to a
+  // published node keeps its status: the proposal is what approval publishes).
+  // A rejected node stays rejected unless the caller asked to revive it.
+  else if (hold && !holdAsSuggestion && (input.status === "published" || frontmatter.status !== "rejected")) {
+    frontmatter.status = "pending_review";
+  }
+  // An empty string CLEARS the description, the same convention `metadata`
+  // uses for null: over a JSON wire an absent key cannot be told apart from
+  // "leave this alone", so without it a caller has no way to remove one.
+  if (typeof input.description === "string") {
+    if (input.description === "") delete frontmatter.description;
+    else frontmatter.description = input.description;
+  }
+  if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
+  if (input.metadata) {
+    const merged: Record<string, unknown> = {
+      ...(frontmatter.metadata ?? {}),
+      ...input.metadata,
+    };
+    // A null value CLEARS the key. Over a JSON wire an absent key is
+    // indistinguishable from "leave this alone", so a merge with no null
+    // convention gives callers no way to remove metadata at all. Only keys the
+    // caller named are considered — a null already on disk is left alone.
+    for (const [key, value] of Object.entries(input.metadata)) {
+      if (value === null) delete merged[key];
+    }
+    frontmatter.metadata = merged;
+  }
+  // The typed blocks are settled against the node's POST-write type — the one
+  // passed in this call, or the one it already carries. Without this an
+  // existing type:source node has no way to gain the block rule 9 demands, and
+  // every update it is ever given fails validation.
+  const nextType = (input.type as Frontmatter["type"]) ?? frontmatter.type ?? "document";
+  if (input.type !== undefined) frontmatter.type = nextType;
+  applyTypedBlocks(frontmatter, {
+    type: nextType,
+    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
+    ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
+    ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
+    ...(input.inputs !== undefined ? { inputs: input.inputs } : {}),
+    ...(input.guard_rails !== undefined ? { guard_rails: input.guard_rails } : {}),
+  });
+  frontmatter.updated_at = new Date().toISOString();
+  const newContent = resolveContentAlias(input);
+  let body = existing.body;
+  if (newContent !== undefined) body = newContent;
+  if (typeof input.append === "string") body = `${body}\n${input.append}`;
+  // The checksum describes the PUBLISHED body, so any body change invalidates
+  // it — including one whose publish then fails, which would otherwise leave a
+  // stale checksum on disk and make the next verified read cry external drift.
+  // Frontmatter-only edits keep it: the checksum covers the body alone.
+  if (newContent !== undefined || typeof input.append === "string") {
+    delete frontmatter.checksum;
+  }
+
+  // A rejected result never publishes, whatever the caller asked for: publish
+  // refuses a rejected doc, so an explicit `publish: true` alongside
+  // `status: "rejected"` would write the edit and then throw, leaving the file
+  // mutated and its checksum dropped. The derived default already lands here;
+  // this makes it true of the explicit flag too.
+  const publish =
+    frontmatter.status === "rejected" || hold
+      ? false
+      : (input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status)));
+  // Only an unpublished write may carry a caller-assigned version: publish
+  // assigns its own, and stamping one first would put the node a version ahead
+  // of its history (the same trap context_create avoids).
+  if (!publish && input.version !== undefined) frontmatter.version = input.version;
+  const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
+  assertValid(node);
+  if (holdAsSuggestion && frontmatter.status !== "rejected") {
+    const staged = await stageReviewHold(ctx.storage, {
+      documentId: id,
+      proposedRawContent: serializeDocument(node),
+      actor: ctx.actor ?? "engine",
+      ...(live.frontmatter.zone ? { zone: live.frontmatter.zone } : {}),
+      docTier: live.frontmatter.governance ?? "standard",
+      ...(input.note ? { note: input.note } : {}),
+      supersedes: proposal ? [proposal.suggestionId] : [],
+    });
+    if (staged) {
+      return {
+        id,
+        version: live.frontmatter.version ?? 1,
+        status: "pending_review",
+        checkpoint: null,
+        held_for_review: true,
+        suggestion_id: staged.suggestionId,
+      };
+    }
+    // No version history to diff against (a hand-marked "published" file that
+    // was never sealed): fall back to an in-place pending write.
+    node.frontmatter.status = "pending_review";
+  }
+  await ctx.storage.writeDocument(id, serializeDocument(node));
+  if (!publish) {
+    await ctx.storage.regenerateIndex();
+    return {
+      id,
+      version: frontmatter.version ?? 1,
+      status: frontmatter.status ?? "draft",
+      checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
+    };
+  }
+  const result = await publishAndIndex(ctx, id, input.note, input.client);
+  return { id, version: result.version, status: "published", checkpoint: result.checkpoint };
+};
+
+const publish: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  // publishDocument guards rejected docs and seals a checkpoint; regenerate the
+  // index so graph-mode reads see the freshly-published node (same as create/update).
+  const result = await publishDocument(ctx.storage, id, {
+    editedBy: ctx.actor ?? "engine",
+    ...(input.note ? { note: input.note } : {}),
+    ...(input.client ? { client: input.client } : {}),
+  });
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
+  return {
+    id,
+    version: result.versionEntry.version,
+    checkpoint: result.checkpointNumber,
+    chain_hash: result.versionEntry.chain_hash,
+  };
+};
+
+const del: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  // Reads the title BEFORE removing the file (callers report what they
+  // deleted) and throws DOCUMENT_NOT_FOUND when the id doesn't exist. Unless
+  // `purge` is set, leaves an audit-only record of who deleted it and why
+  // (§6.3.4) — it refuses nothing; use forget to erase.
+  const result = await deleteDocumentWithTombstone(ctx.storage, id, {
+    reasonCode: input.reason_code ?? "user_request",
+    deletedBy: ctx.actor ?? "engine",
+    ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
+    ...(input.purge ? { purge: true } : {}),
+  });
+  await ctx.storage.regenerateIndex();
+  return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
+};
+
+const forget: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const result = await forgetDocument(ctx.storage, id, {
+    reasonCode: input.reason_code,
+    forgottenBy: ctx.actor ?? "engine",
+    ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
+    ...(input.client ? { client: input.client } : {}),
+  });
+  await ctx.storage.regenerateIndex();
+  return {
+    id: result.id,
+    versions: result.versions,
+    stub_version: result.stubVersion,
+    checkpoint: result.checkpoint,
+  };
+};
+
+const forgetLogExec: OperationExecutor = async (ctx, input: any) => {
+  const id = input?.id ? sanitizeId(String(input.id)) : undefined;
+  const records = await forgetLog(ctx.storage, id);
+  return {
+    events: records.map((r) => ({
+      event_id: r.event_id,
+      document_id: r.document_id,
+      scope: r.scope,
+      mode: r.mode,
+      versions: r.versions,
+      reason_code: r.reason_code,
+      forgotten_by: r.forgotten_by,
+      forgotten_at: r.forgotten_at,
+      ...(r.requested_by ? { requested_by: r.requested_by } : {}),
+      ...(r.stub_version !== undefined ? { stub_version: r.stub_version } : {}),
+      ...(r.checkpoint !== undefined ? { checkpoint: r.checkpoint } : {}),
+      erased_hashes: r.content_hashes.length + r.body_hashes.length + r.pdf_hashes.length,
+    })),
+  };
+};
+
+const versions: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const history = await ctx.storage.readHistory(id);
+  if (!history) {
+    // No history yet (never published). Confirm the doc exists so a bogus
+    // id/title still surfaces DOCUMENT_NOT_FOUND rather than an empty list.
+    await ctx.storage.readDocument(id);
+    return { id, keyframe_interval: 0, versions: [] };
+  }
+  // Change logs are opt-in — see the `include_diff` note on the descriptor.
+  const versionManager = input?.include_diff
+    ? new VersionManager(ctx.storage)
+    : null;
+  return {
+    id,
+    keyframe_interval: history.keyframe_interval,
+    versions: await Promise.all(
+      history.versions.map(async (v) => ({
+        version: v.version,
+        keyframe: v.keyframe ?? false,
+        edited_by: v.edited_by,
+        edited_at: v.edited_at,
+        published_at: v.published_at,
+        note: v.note,
+        content_hash: v.content_hash,
+        chain_hash: v.chain_hash,
+        ...(v.client ? { client: v.client } : {}),
+        ...(v.tombstone
+          ? {
+              tombstone: true,
+              ...(v.forgotten_at ? { forgotten_at: v.forgotten_at } : {}),
+              ...(v.forgotten_by ? { forgotten_by: v.forgotten_by } : {}),
+              ...(v.reason_code ? { reason_code: v.reason_code } : {}),
+            }
+          : {}),
+        ...(v.forget_stub ? { forget_stub: true } : {}),
+        ...(versionManager
+          ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
+          : {}),
+      })),
+    ),
+  };
+};
+
+
+const reconstruct: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  // Surface DOCUMENT_NOT_FOUND for a bogus id/title (the descriptor advertises it).
+  const live = await ctx.storage.readDocument(id);
+  try {
+    const content = await ctx.versions.reconstructVersion(id, input.version);
+    // A past version is rebuilt from the history, so only the chain speaks
+    // for it — the live body's drift says nothing about v{N}.
+    const integrity = await ctx.storage.verifyServedDocument(live, { checkBody: false });
+    return { id, version: input.version, ...(integrity ? { integrity } : {}), content };
+  } catch (err) {
+    // reconstructVersion codes its own failures (VERSION_NOT_FOUND,
+    // RECONSTRUCTION_FAILED) — pass those through. Anything uncoded that leaks
+    // from the storage layer still gets a code so callers can dispatch on the
+    // advertised error contract.
+    if (err instanceof ContextNestError) throw err;
+    throw new ContextNestError(
+      err instanceof Error ? err.message : String(err),
+      "VALIDATION_FAILED",
+    );
+  }
+};
+
+const verify: OperationExecutor = async (ctx) => {
+  const report = await ctx.storage.verifyVaultIntegrity();
+  return {
+    valid: report.valid,
+    errors: report.errors,
+    ...(report.tombstoned ? { tombstoned: report.tombstoned } : {}),
+  };
+};
+
+const init: OperationExecutor = async (ctx, input: any) => {
+  // includeRetired so `by_status` can report `rejected` at all — discovery drops
+  // retired documents otherwise, and a manifest that silently omits a whole
+  // status is worse than one that reports zero.
+  const [context_md, config, docs] = await Promise.all([
+    ctx.storage.readContextMd(),
+    ctx.storage.readConfig(),
+    ctx.storage.discoverDocuments({ includeRetired: true }),
+  ]);
+  const byType: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const tags = new Set<string>();
+  for (const d of docs) {
+    const t = d.frontmatter.type ?? "document";
+    byType[t] = (byType[t] ?? 0) + 1;
+    const s = d.frontmatter.status ?? "draft";
+    byStatus[s] = (byStatus[s] ?? 0) + 1;
+    for (const tag of d.frontmatter.tags ?? []) tags.add(tag);
+  }
+  const listed = input?.limit ? docs.slice(0, input.limit) : docs;
+  return {
+    context_md,
+    vault_path: ctx.storage.root,
+    config: config
+      ? {
+          name: config.name,
+          ...(config.description ? { description: config.description } : {}),
+          servers: config.servers ? Object.keys(config.servers) : [],
+          ...(config.skills?.bootstrap ? { skill_bootstrap: config.skills.bootstrap } : {}),
+        }
+      : null,
+    total: docs.length,
+    by_type: byType,
+    by_status: byStatus,
+    tags: [...tags].sort(),
+    // Counts and tags answer most opening questions; a large vault's node list
+    // dwarfs them, so it is opt-in.
+    ...(input?.include_nodes ? { nodes: listed.map((d) => toSummary(d)) } : {}),
+  };
+};
+
+/**
+ * Shared preamble for the two skill operations: load the node, and settle the
+ * caller-supplied names. `server_alias` falls back to the vault's own name
+ * because a caller that omits it usually configured the server under that name;
+ * a wrong-but-plausible prefix is at least recognizable, where an empty one
+ * renders `mcp____context_skill`.
+ */
+async function loadSkillNode(ctx: OperationContext, input: any) {
+  const id = normalizeDocumentId(String(input.id ?? ""));
+  assertSafeDocumentId(id);
+  const [live, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
+
+  // A rejected node does not dead-end: it falls back to the last APPROVED version,
+  // so an agent keeps working from the last steps a steward signed off on while the
+  // author fixes the live file (which update/publish still accept — being rejected
+  // is what you edit your way out of). Rendering the rejected text itself is what
+  // is refused: an installed skill is matched on and executed, not just displayed.
+  // Only a rejected node with nothing approved behind it has nothing safe to serve.
+  // A forgotten stub is not a skill anyone may run (§6.3.3).
+  if (isForgotten(live)) throw new ForgottenDocumentError(id);
+  let node = live;
+  let servedVersion: number | null = null;
+  if (isRejected(live)) {
+    const history = await ctx.versions.getHistory(id);
+    // published_at is the local marker of an approved version — the approval
+    // publish path is the only writer. Highest wins; history is append-only.
+    const approved = [...(history?.versions ?? [])].reverse().find((v) => v.published_at);
+    if (!approved) throw new RejectedDocumentError(id);
+    node = parseDocument(id, await ctx.versions.reconstructVersion(id, approved.version), id);
+    servedVersion = approved.version;
+  }
+  const vaultName = config?.name;
+  // A skill is matched on and EXECUTED, so a tampered one matters most. Live
+  // node: full check; approved version rebuilt from history: chain only.
+  const integrity = await ctx.storage.verifyServedDocument(live, {
+    checkBody: servedVersion === null,
+  });
+  return {
+    doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    integrity,
+    servedVersion,
+    vaultName,
+    serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
+    harness: (input.harness ?? "claude-code") as Harness,
+    scope: (input.scope ?? "user") as InstallScope,
+    mode: (input.mode ?? "loader") as InstallMode,
+  };
+}
+
+/** NotASkillNodeError carries a caller-actionable message; keep it, drop the class. */
+function asValidationError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof NotASkillNodeError) {
+      throw new ContextNestError(err.message, "VALIDATION_FAILED");
+    }
+    throw err;
+  }
+}
+
+const skill: OperationExecutor = async (ctx, input: any) => {
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope } =
+    await loadSkillNode(ctx, input);
+  const rendered = asValidationError(() =>
+    renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
+  );
+  return {
+    name: rendered.name,
+    description: rendered.description,
+    ...(integrity ? { integrity } : {}),
+    content: rendered.content,
+    relative_path: rendered.relativePath,
+    base: rendered.base,
+    harness,
+    source_path: doc.id,
+    version: doc.frontmatter.version ?? null,
+    ...(servedVersion === null ? {} : { served_version: servedVersion, notes: rejectedNote(doc.id, servedVersion) }),
+  };
+};
+
+/** Said out loud on both ops: what you got is not what is on disk right now. */
+function rejectedNote(id: string, version: number): string {
+  return `${id} is rejected; serving approved version ${version}.`;
+}
+
+const skillInstall: OperationExecutor = async (ctx, input: any) => {
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope, mode } =
+    await loadSkillNode(ctx, input);
+  const manifest = asValidationError(() =>
+    buildInstallManifest(doc, {
+      harness,
+      serverAlias,
+      vaultName,
+      vaultId: vaultName ?? serverAlias,
+      scope,
+      mode,
+    }),
+  );
+  // The installed files are written verbatim; the verdict rides on the result
+  // (and leads `notes`, the text an installing agent relays) so whoever
+  // installs a tampered skill is told before it runs.
+  const flagged = integrity
+    ? { ...manifest, integrity, notes: `${integrity.warning} ${manifest.notes}` }
+    : manifest;
+  if (servedVersion === null) return flagged;
+  // The integrity warning stays FIRST even on the rejected fallback: it is
+  // the caveat that must not be lost if only the first sentence is shown.
+  return {
+    ...flagged,
+    served_version: servedVersion,
+    notes: integrity
+      ? `${integrity.warning} ${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`
+      : `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
+  };
+};
+
+const packs: OperationExecutor = async (ctx) => {
+  const all = await ctx.storage.readPacks();
+  return {
+    packs: all.map((p) => ({
+      id: p.id,
+      label: p.label,
+      description: p.description,
+      query: p.query,
+      agent_instructions: p.agent_instructions,
+      ...(p.includes ? { includes: p.includes } : {}),
+      ...(p.excludes ? { excludes: p.excludes } : {}),
+    })),
+  };
+};
+
+// Registry-scoped: no `ctx` use. Deliberate — see context_nests in api/README.md.
+const nests: OperationExecutor = () => ({ nests: listVaults() });
+
+/**
+ * Land one imported file at the path `planImportPaths` chose for it — the
+ * slugified id (`nodes/Dr. Smith.md` → `nodes/dr-smith.md`), disambiguated
+ * against the rest of the batch and the vault. A markdown document that
+ * would not validate as it arrived — no title, a type outside the spec, tags
+ * with spaces — is repaired on the way in, each repair reported as a warning.
+ * A file that is already valid, and every non-document file (version
+ * histories, indexes), is written byte for byte: the source's frontmatter is
+ * its own.
+ *
+ * The title falls back to the ORIGINAL filename, human casing intact: after
+ * the rename only the slug survives, and `dr-smith` is a worse title than
+ * `Dr. Smith`.
+ */
+async function writeImportedFile(
+  ctx: OperationContext,
+  f: { raw: string; path: string; content?: string },
+  warnings: string[],
+): Promise<void> {
+  const { raw, path: relPath } = f;
+  let content = f.content ?? "";
+  const lastSegment = raw.split(/[/\\]/).filter(Boolean).pop() ?? raw;
+  // A keyframe under `.versions/` is a whole document, so `v1.md` passes every
+  // test a live node passes — but its bytes are hashed into that version's
+  // `content_hash`. Repairing one would make `ctx verify` report a version the
+  // import itself rewrote as tampered. Sealed history travels verbatim.
+  if (
+    !isVersionArtifactPath(relPath) &&
+    /\.md$/i.test(lastSegment) &&
+    !lastSegment.startsWith(".")
+  ) {
+    const id = relPath.replace(/\.md$/i, "");
+    let node: ContextNode | undefined;
+    try {
+      node = parseDocument(`${id}.md`, content, id);
+    } catch {
+      // Unparseable frontmatter is the author's to fix; land it as it came so
+      // nothing is lost, and let validate report it.
+    }
+    if (node) {
+      const { patch, warnings: repairs } = sanitizeImportedFrontmatter(
+        node,
+        lastSegment.replace(/\.md$/i, ""),
+      );
+      warnings.push(...repairs);
+      if (Object.keys(patch).length > 0) {
+        content = serializeDocument({ ...node, frontmatter: { ...node.frontmatter, ...patch } });
+      }
+    }
+  }
+  await ctx.storage.writeVaultFile(relPath, content);
+}
+
+const importDocs: OperationExecutor = async (ctx, input: any) => {
+  const failed: { id?: string; title?: string; error: string }[] = [];
+  const titleById = new Map<string, string>();
+  // Every repair the import made to something it did not author — a renamed
+  // path, a coerced type, a dropped tag. Reported, never fatal.
+  const warnings: string[] = [];
+
+  // Ids of documents already in the vault publish as-is — their paths ARE their
+  // ids, and the caller owns their frontmatter. Nothing is rewritten here.
+  const batch: string[] = [...(input.ids ?? [])];
+
+  // Stage 0: land an existing vault's files verbatim. Bounded-parallel because
+  // a vault may sit on a network mount where each write is a round trip, and a
+  // serial loop then costs one full latency per file.
+  let incoming: { path: string; content: string }[] = input.files ?? [];
+  let written = 0;
+
+  // Forget protocol (§6.3.4): an exported nest carries its tombstones, and an
+  // import MUST honor them — and this vault's own. The incoming chain-event
+  // log is not landed verbatim (it would overwrite this vault's audit trail);
+  // its forget records are merged in, checked against, and re-applied to any
+  // pre-forget copy this vault already holds.
+  const tombstones =
+    incoming.length > 0 || (input.documents?.length ?? 0) > 0 ? await ctx.storage.readTombstones() : null;
+  const incomingEvents: unknown[] = [];
+  if (tombstones) {
+    incoming = incoming.filter((f) => {
+      const p = String(f.path ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
+      if (p !== ".versions/chain_events.yaml") return true;
+      try {
+        const parsed = yaml.load(f.content ?? "");
+        const list = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray((parsed as { events?: unknown[] } | null)?.events)
+            ? (parsed as { events: unknown[] }).events
+            : [];
+        incomingEvents.push(...list);
+      } catch (err) {
+        failed.push({
+          id: String(f.path),
+          error: `unreadable chain-event log: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      return false;
+    });
+    for (const rec of buildTombstoneIndex(incomingEvents).records) addTombstone(tombstones, rec);
+  }
+
+  if (incoming.length > 0) {
+    // Targets are settled for the WHOLE batch BEFORE the parallel write: two
+    // files whose names slugify alike must not race for one path, and a
+    // renamed document has to take its `.versions/` history with it — neither
+    // is decidable one file at a time. By default a file already in the vault
+    // is never overwritten; `overwrite` opts back into replacing it, which is
+    // what makes re-running the same batch idempotent instead of duplicating.
+    // A path the guard refuses (`../`) reads as absent here and fails at its
+    // own write below, so it is reported per file rather than sinking the batch.
+    const plan = (
+      await planImportPaths(
+        incoming.map((f) => String(f.path ?? "")),
+        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+      )
+    ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
+    await mapInBatches(plan, async (f) => {
+      try {
+        // A pre-forget copy is refused wherever it lands (§6.3.4).
+        const refusal = tombstones ? importVerdict(tombstones, f.path, f.content) : null;
+        if (refusal) throw new ForgottenDocumentError(f.raw, `refused: ${refusal}`);
+        // Into the file's OWN warning list: `mapInBatches` finishes in
+        // whatever order the writes complete, and the report is per input file.
+        await writeImportedFile(ctx, f, f.warnings);
+        written++;
+      } catch (err) {
+        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+    for (const p of plan) warnings.push(...p.warnings);
+  }
+  if (tombstones && incomingEvents.length > 0) {
+    try {
+      await applyImportedTombstones(ctx.storage, incomingEvents, tombstones);
+    } catch (err) {
+      failed.push({
+        id: ".versions/chain_events.yaml",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
+  for (const doc of input.documents ?? []) {
+    try {
+      const node = buildDraftNode(doc);
+      assertValid(node);
+      // Same guard as context_create (§6.3.4): a retired path or erased body
+      // must not land even as a draft (`publish: false` returns before Stage 3).
+      await assertNotForgotten(ctx.storage, node, tombstones!);
+      await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
+      batch.push(node.id);
+      titleById.set(node.id, doc.title);
+    } catch (err) {
+      failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // A staging call — files written, publishing deferred to the caller's final
+  // `discover` pass so a chunked upload seals ONE checkpoint, not one per chunk.
+  if (input.publish === false) {
+    return {
+      published: [],
+      failed,
+      checkpoint: null,
+      written,
+      ...(warnings.length ? { warnings } : {}),
+    };
+  }
+
+  // Stage 2 (discover): the vault itself is the input. The scan, the metadata
+  // stamp and the publish-vs-hold decision all live here so a folder importer
+  // does not have to walk the vault and rewrite every file before handing the
+  // ids back — that pass cost a second full round trip per document.
+  let held: ContextNode[] = [];
+  let scanned: ContextNode[] = [];
+  // Frontmatter repairs for the documents the scan owns, by id. A caller that
+  // wrote the files itself and only asks the engine to discover them gets the
+  // same hygiene as one that sent them through `files`: without it a note
+  // with no title or a `type: note` is published as-is and fails validate.
+  const repairs = new Map<string, Partial<Frontmatter>>();
+  if (input.discover) {
+    const exclude = new Set<string>(input.exclude_ids ?? []);
+    // Ids the caller supplied itself, via `ids` or staged from `documents`.
+    // The scan walks the whole vault, so it sees those documents too — but they
+    // are the caller's, already in the batch, and carry frontmatter it chose.
+    // Claiming them here would publish them under the scan's rules and stamp
+    // over the author it set.
+    const callerIds = new Set(batch);
+    for (const doc of await ctx.storage.discoverDocuments()) {
+      if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      // A forgotten stub is neither published nor held: it is not content.
+      if (isForgotten(doc)) continue;
+      const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
+        doc,
+        doc.id.split("/").pop() ?? doc.id,
+      );
+      warnings.push(...repaired);
+      if (Object.keys(patch).length > 0) repairs.set(doc.id, patch);
+      // Publishing is opt-in. Only a file that EXPLICITLY says it is published
+      // or approved gets published; everything else is held as a draft for a
+      // human to approve, including a file that states no status at all.
+      //
+      // Saying nothing is not consent. A vault of hand-authored notes carries
+      // no governance state, and importing it should not decide on the author's
+      // behalf that every note is fit to serve to an AI. Held is recoverable —
+      // approve what belongs — where published-by-default is not: the exposure
+      // has already happened by the time anyone reviews it.
+      const status = explicitStatus(doc);
+      if (status === "published" || status === "approved") scanned.push(doc);
+      else held.push(doc);
+    }
+    batch.push(...scanned.map((d) => d.id));
+  }
+  // Which ids the scan claimed, so the metadata stamp below can leave a
+  // caller's own staged documents alone.
+  const discovered = new Set(scanned.map((d) => d.id));
+
+  // An empty call is a caller bug, not an empty result — but a batch where every
+  // document failed to stage is a legitimate (fully-failed) result, and a
+  // `discover` over a folder with nothing new in it is simply done.
+  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0 && incomingEvents.length === 0) {
+    throw new ContextNestError(
+      "context_import requires documents[], ids[], files[] or discover",
+      "VALIDATION_FAILED",
+    );
+  }
+
+  // Stage 3: ONE bulk publish for every mode — one checkpoint + one index regen
+  // for the whole batch (the O(N) path), instead of a checkpoint per document.
+  let published: { id: string; version: number }[] = [];
+  let checkpoint: number | null = null;
+  if (batch.length > 0) {
+    const result = await publishDocuments(ctx.storage, batch, {
+      editedBy: ctx.actor ?? "engine",
+      onProgress: ctx.onProgress,
+      ...(input.note ? { note: input.note } : {}),
+      ...(input.client ? { client: input.client } : {}),
+      // Ids-only (e.g. a bulk approval) writes nothing but these docs, so only
+      // their folders' INDEX.md can change. Other modes write files too.
+      indexOnlyBatchFolders:
+        !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
+      // The importer's metadata rides along with the publish write instead of
+      // costing its own pass. Title falls back to the filename; the author is
+      // the importing user, since the source's own `author:` names someone who
+      // need not exist on this host.
+      //
+      // Scoped to the ids the SCAN found. A single call may mix modes — nothing
+      // stops `discover` arriving alongside `ids`/`documents` — and a caller
+      // that staged its own documents chose their frontmatter deliberately.
+      // Stamping the whole batch would silently overwrite the author it set.
+      frontmatter: discovered.size
+        ? (node) =>
+            discovered.has(node.id)
+              ? {
+                  title: node.frontmatter.title ?? node.id.split("/").pop() ?? node.id,
+                  ...repairs.get(node.id),
+                  ...(input.author ? { author: input.author } : {}),
+                }
+              : null
+        : undefined,
+    });
+    published = result.published.map((p) => ({ id: p.id, version: p.version }));
+    checkpoint = result.checkpointNumber;
+    for (const f of result.failed) {
+      const title = titleById.get(f.id);
+      failed.push(title ? { title, error: f.error } : { id: f.id, error: f.error });
+    }
+  }
+
+  if (!input.discover) {
+    return {
+      published,
+      failed,
+      checkpoint,
+      ...(incoming.length ? { written } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    };
+  }
+
+  // Stage 3b: held documents never reach the publish write, so this is their
+  // only chance to be stamped. Two things must land.
+  //
+  // An explicit `status: draft` — a held document that states no status reads
+  // back as a draft in memory (the parser's default) but says nothing on disk,
+  // so anything reading the file itself, here or in another tool, is left to
+  // guess. Write the status down rather than leave it implied.
+  //
+  // And the importing user as `author`, for the same reason the publish path
+  // stamps it: the source vault's own `author:` names someone who need not
+  // exist on this host, and carrying it over invents a collaborator.
+  // This is the only write these documents get, so it is not extra work: it
+  // replaces the far heavier publish they used to receive. A document that
+  // already carries everything it needs is skipped outright, which makes a
+  // re-import of an already-stamped vault free.
+  await mapInBatches(held, async (doc) => {
+    const authored = explicitStatus(doc);
+    const stamp: Record<string, unknown> = { ...repairs.get(doc.id) };
+
+    const title = stamp.title ?? doc.frontmatter.title ?? doc.id.split("/").pop() ?? doc.id;
+    if (doc.frontmatter.title !== title) stamp.title = title;
+    if (input.author && doc.frontmatter.author !== input.author) stamp.author = input.author;
+    // Only when the author stated nothing — an explicit `pending_review` or
+    // `rejected` is theirs to keep, not ours to flatten into `draft`.
+    if (authored === null) stamp.status = "draft";
+
+    if (Object.keys(stamp).length === 0) return;
+    try {
+      await ctx.storage.writeDocument(
+        doc.id,
+        serializeDocument({ ...doc, frontmatter: { ...doc.frontmatter, ...stamp } }),
+      );
+    } catch (err) {
+      failed.push({ id: doc.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Stage 4 (discover): report every document the scan owned, published or not,
+  // so a governance layer can record the import without re-reading the vault.
+  // A doc that failed to publish is reported at its own version, not dropped —
+  // its imported history is intact and it simply stays a draft.
+  const publishedVersion = new Map(published.map((p) => [p.id, p.version]));
+  const asRecord = (doc: ContextNode) => {
+    const version = publishedVersion.get(doc.id);
+    const own = Number(doc.frontmatter.version);
+    // Report what was written, repairs included, not what was found.
+    const frontmatter = { ...doc.frontmatter, ...repairs.get(doc.id) };
+    return {
+      id: doc.id,
+      title: frontmatter.title ?? doc.id.split("/").pop() ?? doc.id,
+      version: version ?? (Number.isInteger(own) && own > 0 ? own : 1),
+      status: version !== undefined ? ("published" as const) : ("draft" as const),
+      tags: normalizeTags(frontmatter.tags) ?? [],
+      content: doc.body ?? "",
+    };
+  };
+  return {
+    published,
+    failed,
+    checkpoint,
+    ...(incoming.length ? { written } : {}),
+    ...(warnings.length ? { warnings } : {}),
+    documents: [...scanned, ...held].map(asRecord),
+  };
+};
+
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/**
+ * Base64 (standard or URL-safe alphabet, optional padding), tested AFTER
+ * whitespace is stripped. The character class and the padding share no
+ * characters, so the match is linear — a class that also admitted `\s`
+ * followed by a trailing `\s*` backtracks quadratically on a long whitespace
+ * run ending in an invalid character.
+ */
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]*={0,2}$/;
+
+/** Decode the op's `bytes_base64`, refusing malformed input and anything over the cap. */
+function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
+  // Refuse an obviously oversized payload before allocating its decoded copy.
+  // Base64 is 4 chars per 3 bytes, so a payload within the cap is at most
+  // ceil(maxBytes * 4 / 3) chars. The ×1.1 is slack for the line breaks MIME
+  // encoders insert (76-char lines + CRLF ≈ 2.6% overhead, rounded up well
+  // past it), the +1024 for padding and small-file rounding. Only a coarse
+  // pre-filter: the exact byteLength check after decoding is the real limit.
+  if (b64.length > Math.ceil((maxBytes * 4) / 3) * 1.1 + 1024) {
+    throw new ContextNestError(
+      `PDF exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // Line-wrapped (MIME-style) base64 is common; the wrapping is not data.
+  const compact = b64.replace(/\s+/g, "");
+  if (!BASE64_PATTERN.test(compact)) {
+    throw new ContextNestError("bytes_base64 is not valid base64.", "VALIDATION_FAILED");
+  }
+  const bytes = new Uint8Array(Buffer.from(compact, "base64"));
+  if (bytes.byteLength === 0) {
+    throw new ContextNestError("bytes_base64 decoded to an empty file.", "VALIDATION_FAILED");
+  }
+  if (bytes.byteLength > maxBytes) {
+    throw new ContextNestError(
+      `PDF is ${bytes.byteLength} bytes, which exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return bytes;
+}
+
+/** Read a node, or null when there is none at that id. */
+async function readIfExists(ctx: OperationContext, id: string): Promise<ContextNode | null> {
+  try {
+    return await ctx.storage.readDocument(id);
+  } catch (err) {
+    if (err instanceof DocumentNotFoundError) return null;
+    throw err;
+  }
+}
+
+/** A file name without directory or `.pdf` extension, for a fallback title. */
+function filenameStem(name: unknown): string | undefined {
+  if (typeof name !== "string") return undefined;
+  const base = name.split(/[/\\]/).pop() ?? "";
+  const stem = base.replace(/\.pdf$/i, "").trim();
+  return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, TITLE_MAX_LENGTH) : undefined;
+}
+
+/**
+ * `context_import_pdf`. Decoding and text extraction run BEFORE the vault
+ * lock is taken: they touch no vault state, and parsing a large PDF is real
+ * work that would otherwise hold every other writer on the vault behind it
+ * (VAULT_LOCK_TIMEOUT for a concurrent `ctx update`). A bad PDF also fails
+ * here without ever queueing for the lock. Everything that reads or writes
+ * the vault runs under the lock, in {@link importPdfLocked}.
+ */
+const importPdf: OperationExecutor = async (ctx, input: any) => {
+  const maxBytes = ctx.limits?.pdfMaxBytes ?? DEFAULT_PDF_MAX_BYTES;
+  const bytes = decodePdfInput(String(input.bytes_base64), maxBytes);
+  // Extract BEFORE anything is written: a file that is not a PDF, or one pdf.js
+  // cannot read, fails here with nothing on disk.
+  const extraction = await extractPdf(bytes);
+  return withVaultLock(ctx.storage.root, () => importPdfLocked(ctx, input, bytes, extraction));
+};
+
+async function importPdfLocked(
+  ctx: OperationContext,
+  input: any,
+  bytes: Uint8Array,
+  extraction: PdfExtraction,
+) {
+  // ── Where it lands ──
+  // An explicit id is used as stored if a node is there (flat-layout ids carry
+  // no nodes/ prefix, and re-rooting would miss them), otherwise normalized
+  // the way context_create normalizes one.
+  let id: string;
+  let existing: ContextNode | null;
+  if (input.id) {
+    const raw = sanitizeId(String(input.id));
+    existing = await readIfExists(ctx, raw);
+    id = existing ? raw : normalizeDocumentId(raw);
+    if (!existing && id !== raw) existing = await readIfExists(ctx, id);
+    // On a case-insensitive filesystem `nodes/report` reads `nodes/Report.md`,
+    // and the read hands back the caller's spelling. Every path below — the
+    // sidecar, `pdf.file`, the version history — must use the spelling
+    // discovery reports, or rule 26 fails and delete misses the sidecar (#117).
+    if (existing) {
+      id = await ctx.storage.resolveDocumentIdCasing(id);
+      existing = { ...existing, id };
+    }
+  } else {
+    const title =
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF";
+    const slug =
+      slugify(String(title)) ||
+      slugify(filenameStem(input.filename) ?? "") ||
+      `pdf-${extraction.sha256.slice("sha256:".length, "sha256:".length + 12)}`;
+    const folderSegments = String(input.folder ?? "")
+      .split("/")
+      .map(slugify)
+      .filter(Boolean);
+    id = normalizeDocumentId(["nodes", ...folderSegments, slug].join("/"));
+    existing = await readIfExists(ctx, id);
+    if (existing) {
+      throw new ContextNestError(
+        `Document "${id}" already exists. Pass id: "${id}" to import this PDF as its next version, or a different title/folder.`,
+        "DOCUMENT_ALREADY_EXISTS",
+      );
+    }
+  }
+  assertSafeDocumentId(id);
+
+  // Anti-resurrection (§6.3.4): a path a forget retired (stub since deleted)
+  // or a binary a forget erased never comes back through a PDF import.
+  const tombstones = await ctx.storage.readTombstones();
+  if (!existing && isPathForgotten(tombstones, id)) {
+    throw new ForgottenDocumentError(id, "was forgotten — its path cannot take content again; import under a new path");
+  }
+  if (tombstones.pdfHashes.has(extraction.sha256)) {
+    throw new ForgottenDocumentError(id, "carries a PDF binary a forget erased");
+  }
+
+  if (existing) {
+    if (existing.frontmatter.type !== "pdf") {
+      throw new ContextNestError(
+        `${id} is a "${existing.frontmatter.type ?? "document"}" node, not a PDF; a PDF can only be imported as a new node or as a new version of a pdf node.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    if (isRejected(existing)) throw new RejectedDocumentError(id);
+    if (isForgotten(existing)) throw new ForgottenDocumentError(id);
+  }
+
+  const sidecar = pdfSidecarPath(id);
+
+  // A new node must not land on a file already sitting at its sidecar path —
+  // that file is someone's, not this import's to overwrite (or, on a failed
+  // import, to delete).
+  if (!existing && (await ctx.storage.hasVaultFile(sidecar))) {
+    throw new ContextNestError(
+      `A file already exists at ${sidecar}, where this node's PDF would go. Move it, or import under another title/folder/id.`,
+      "DOCUMENT_ALREADY_EXISTS",
+    );
+  }
+
+  // Whatever is on disk at the sidecar path now — archived (content-addressed,
+  // so harmless) before it is replaced, and put back if this import fails.
+  // ALL bytes, not only ones matching the current frontmatter: after a
+  // rollback, or a hand swap, the file on disk may be a binary some other
+  // version records, and overwriting it unarchived would lose that version.
+  let priorOnDisk: Uint8Array | null = null;
+  if (existing) {
+    try {
+      priorOnDisk = await ctx.storage.readVaultBinary(sidecar);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+
+  const publish = input.publish !== false;
+  const existingPdf = existing?.frontmatter.pdf;
+  const sameBytes = existingPdf?.sha256 === extraction.sha256;
+
+  if (existing && existingPdf && sameBytes) {
+    // Same PDF as the current version. A missing or swapped sidecar is put
+    // back — these bytes hash to what the chain records, so that restores the
+    // record rather than rewriting it. Anything the caller ASKED for besides
+    // the bytes (publish a draft, a new title/tags/description) still happens
+    // below; with nothing asked for, this is a no-op.
+    if (!priorOnDisk || sha256Bytes(priorOnDisk) !== existingPdf.sha256) {
+      if (priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+    }
+    const fm = existing.frontmatter;
+    const wantsPublish = publish && fm.status !== "published";
+    const wantsTitle = input.title !== undefined && input.title !== fm.title;
+    // Tags are a set: the same tags in another order are not a change.
+    const wantsTags =
+      input.tags !== undefined &&
+      !isDeepStrictEqual(
+        [...(normalizeUniqueTags(input.tags) ?? [])].sort(),
+        [...new Set(fm.tags ?? [])].sort(),
+      );
+    const wantsDescription =
+      typeof input.description === "string" && input.description !== (fm.description ?? "");
+    // A node written before #117 may record `pdf.file` in the caller's
+    // casing; rewriting it to the on-disk spelling repairs rule 26.
+    const wantsRepair = existingPdf.file !== sidecar;
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription && !wantsRepair) {
+      return {
+        id,
+        version: fm.version ?? 1,
+        created: false,
+        unchanged: true,
+        status: fm.status ?? "draft",
+        checkpoint: null,
+        pdf: existingPdf,
+        text_layer: existingPdf.text_layer,
+      };
+    }
+  }
+
+  // Same bytes keep the recorded block and text (re-extracting would only
+  // restamp extracted_at); new bytes get both fresh.
+  const pdf: PdfMeta =
+    sameBytes && existingPdf
+      ? { ...existingPdf, file: sidecar }
+      : {
+          file: sidecar,
+          sha256: extraction.sha256,
+          bytes: extraction.bytes,
+          pages: extraction.pages,
+          text_layer: extraction.textLayer,
+          extractor: PDF_EXTRACTOR,
+          extractor_version: pdfExtractorVersion(),
+          extracted_at: new Date().toISOString(),
+        };
+  const now = new Date().toISOString();
+  const body =
+    sameBytes && existing ? existing.body : extraction.text ? `\n${extraction.text}` : "";
+  let frontmatter: Frontmatter;
+  if (existing) {
+    frontmatter = { ...existing.frontmatter };
+    if (input.title) {
+      assertUsableTitle(String(input.title));
+      frontmatter.title = input.title;
+    }
+    if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
+    if (typeof input.description === "string") {
+      if (input.description === "") delete frontmatter.description;
+      else frontmatter.description = input.description;
+    }
+    frontmatter.pdf = pdf;
+    frontmatter.updated_at = now;
+    // The checksum describes the published body, which this may replace.
+    if (!sameBytes) delete frontmatter.checksum;
+    if (!publish) frontmatter.status = "draft";
+  } else {
+    const title = String(
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF",
+    );
+    assertUsableTitle(title);
+    frontmatter = {
+      title,
+      type: "pdf",
+      ...(input.description ? { description: input.description } : {}),
+      ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
+      status: "draft",
+      created_at: now,
+      updated_at: now,
+      pdf,
+    };
+    // Publish assigns the version; a draft needs its own v1 (see context_create).
+    if (!publish) frontmatter.version = 1;
+  }
+  const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
+  assertValid(node);
+
+  // ── Write: archive what is on disk, sidecar, then the node, then publish ──
+  // The sidecar goes first so the node never points at a binary that is not
+  // there. On failure everything this call wrote is put back.
+  const replacing = !sameBytes;
+  if (replacing && priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+  // A failure AFTER publish sealed a version (say, at the checkpoint) must not
+  // be rolled back: the history already vouches for the new binary and text.
+  const sealedBefore = await ctx.storage.maxRecordedVersion(id);
+  let wroteSidecar = false;
+  let wroteNode = false;
+  try {
+    if (replacing) {
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+      wroteSidecar = true;
+    }
+    await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: !existing });
+    wroteNode = true;
+    if (!publish) {
+      await ctx.storage.regenerateIndex();
+      return {
+        id,
+        version: frontmatter.version ?? 1,
+        created: !existing,
+        unchanged: false,
+        status: frontmatter.status ?? "draft",
+        checkpoint: null,
+        pdf,
+        text_layer: pdf.text_layer,
+      };
+    }
+    const result = await publishAndIndex(
+      ctx,
+      id,
+      input.note ?? (!existing ? "Imported PDF" : replacing ? "New PDF version" : "PDF metadata update"),
+      input.client,
+    );
+    return {
+      id,
+      version: result.version,
+      created: !existing,
+      unchanged: false,
+      status: "published",
+      checkpoint: result.checkpoint,
+      pdf,
+      text_layer: pdf.text_layer,
+    };
+  } catch (err) {
+    const sealedAfter = await ctx.storage.maxRecordedVersion(id).catch(() => sealedBefore);
+    if (sealedAfter > sealedBefore) throw err;
+    if (existing) {
+      if (wroteNode) await ctx.storage.writeDocument(id, existing.rawContent).catch(() => undefined);
+      if (wroteSidecar) {
+        if (priorOnDisk) {
+          await ctx.storage.writeVaultBinary(sidecar, priorOnDisk).catch(() => undefined);
+        } else {
+          await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+        }
+      }
+    } else if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) {
+      // A create that lost the exclusive-write race must not delete the
+      // winner's files; otherwise the sidecar is this call's own (a file
+      // already at that path was refused above).
+      if (wroteNode) await ctx.storage.deleteDocument(id).catch(() => undefined);
+      if (wroteSidecar) await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Serialize a mutating executor on the vault's write lock. Every mutation
+ * read-modify-writes the nest-level checkpoint chain; without this, concurrent
+ * writers (parallel agents, two terminals, N remote clients on one server)
+ * silently lose seals and break `ctx verify`. Applied at the binding so each
+ * operation locks exactly once, at its outer edge.
+ */
+const locked =
+  (executor: OperationExecutor): OperationExecutor =>
+  (ctx, input) =>
+    withVaultLock(ctx.storage.root, () => Promise.resolve(executor(ctx, input)));
+
+/** name → executor for the built-in `core` namespace. */
+export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({
+  context_query: query,
+  context_resolve: resolve,
+  context_search: search,
+  context_get: get,
+  context_list: list,
+  context_folders: folders,  
+  context_create: locked(create),
+  context_update: locked(update),
+  context_publish: locked(publish),
+  context_delete: locked(del),
+  context_versions: versions,
+  context_reconstruct: reconstruct,
+  context_verify: verify,
+  context_forget: locked(forget),
+  context_forget_log: forgetLogExec,
+  context_init: init,
+  context_packs: packs,
+  context_nests: nests,
+  context_import: locked(importDocs),
+  // Locks internally, AFTER extraction — see importPdf.
+  context_import_pdf: importPdf,
+  context_skill: skill,
+  context_skill_install: skillInstall,
+});

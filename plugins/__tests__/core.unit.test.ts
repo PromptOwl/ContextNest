@@ -2,29 +2,100 @@
  * Tier 1 — pure unit tests for the shared core. Each run() is called with a
  * fake `exec` returning canned ctx JSON; no subprocess, no real vault.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { run as retrieve } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
-import { run as captureGate, isSubstantive } from "../shared/core/capture-gate.js";
+import {
+  run as captureGate,
+  captureReason,
+  captureSignal,
+  CHANGE_REASON,
+  isSubstantive,
+} from "../shared/core/capture-gate.js";
+import {
+  correctionIntent,
+  countUserTurns,
+  explicitCaptureIntent,
+  lastUserMessage,
+} from "../shared/core/signals.js";
+import {
+  run as sweepCheck,
+  bodyOf,
+  droppedTerms,
+  findStragglers,
+  parseUpdate,
+  parseUpdates,
+  sweepMessage,
+  sweepTargets,
+} from "../shared/core/sweep-check.js";
+import {
+  clearPending,
+  inCooldown,
+  loadLedger,
+  parkJob,
+  saveLedger,
+  sessionFileName,
+} from "../shared/core/ledger.js";
 import {
   getConfig,
   vaultTargets,
+  isVaultRegistered,
   withVault,
   ctxJson,
   squish,
+  VALID_CAPTURE_MODES,
+  VALID_RETRIEVAL_MODES,
+  makeExec,
+  winQuote,
+  MAX_FANOUT_VAULTS,
+  MAX_HITS,
+  MAX_LIST_SCAN,
 } from "../shared/core/lib.js";
 
-/** Build a fake exec from a list of [substringMatch, jsonValue]. */
+/** Transcript stub in the shape the gate's reader returns. */
+const tx = (lines: string[], userTurns = countUserTurns(lines)) => () => ({ lines, userTurns });
+
+/** A user message line as Claude Code actually writes it. */
+const userLine = (text: string) =>
+  JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } });
+
+/** In-memory ledger IO so no test ever touches a real home directory. */
+function fakeLedgerIo(seed: Record<string, string> = {}) {
+  const files = { ...seed };
+  return {
+    homedir: "/fake-home",
+    read: (p: string) => {
+      if (!(p in files)) throw new Error("ENOENT");
+      return files[p];
+    },
+    write: (p: string, data: string) => {
+      files[p] = data;
+    },
+    mkdir: () => undefined,
+    files,
+  };
+}
+
+/**
+ * Build a fake exec from a list of [substringMatch, value]. Non-string values
+ * are emitted as JSON (what `--json` commands print); string values pass
+ * through raw, matching commands like `read --raw`/`reconstruct` whose stdout
+ * is a document, not JSON.
+ */
 function fakeExec(routes: [string, unknown][], fallback: unknown = []) {
+  const render = (val: unknown) => (typeof val === "string" ? val : JSON.stringify(val));
   return (args: string[]) => {
     const key = args.join(" ");
     for (const [match, val] of routes) {
       if (key.includes(match)) {
-        return { status: 0, stdout: JSON.stringify(val), stderr: "" };
+        return { status: 0, stdout: render(val), stderr: "" };
       }
     }
-    return { status: 0, stdout: JSON.stringify(fallback), stderr: "" };
+    return { status: 0, stdout: render(fallback), stderr: "" };
   };
 }
 
@@ -32,12 +103,67 @@ function additional(out: any): string | undefined {
   return out?.hookSpecificOutput?.additionalContext;
 }
 
+// getConfig() reads real override files when the caller doesn't inject
+// cwd/homedir (sessionStart never does). Point the home dir at an empty temp
+// dir so a developer's own ~/.contextnest/plugin-settings.json can't leak into
+// these assertions. os.homedir() reads $HOME on POSIX and %USERPROFILE% on
+// Windows — setting only HOME leaves Windows unisolated, where a real pinned
+// vault turns eight of these into failures.
+//
+// Mutating process.env.CLAUDE_PROJECT_DIR does NOT isolate the project dir the
+// same way: getConfig(env, opts) resolves cwd as
+// `opts.cwd || env.CLAUDE_PROJECT_DIR || process.cwd()`, reading it off the
+// `env` PARAMETER, not off the process-global. Every call below passes its own
+// literal env object (to test one key in isolation), so the mutation here is
+// invisible to them and they fall through to the real process.cwd() — a
+// developer's actual checkout, .claude/contextnest.local.json included. Use
+// `cfg()`/`startSession()` below, which inject SANDBOX_DIR through that same
+// `env.CLAUDE_PROJECT_DIR` channel a real Claude Code hook invocation would
+// populate, instead of calling getConfig()/sessionStart() directly.
+let SANDBOX_DIR: string;
+const realEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR };
+beforeAll(() => {
+  SANDBOX_DIR = mkdtempSync(join(tmpdir(), "cn-no-settings-"));
+  process.env.HOME = SANDBOX_DIR;
+  process.env.USERPROFILE = SANDBOX_DIR;
+  process.env.CLAUDE_PROJECT_DIR = SANDBOX_DIR;
+});
+afterAll(() => {
+  for (const [key, value] of Object.entries(realEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+/**
+ * getConfig(), sandboxed against SANDBOX_DIR — every bare call below goes
+ * through this, not the raw import, so a real .claude/contextnest.local.json
+ * on the developer's own machine can never leak into an assertion (see the
+ * note above). Calls that already sandbox their own cwd/homedir via
+ * `tempSettings()`'s `opts` (the "settings override files" suite) call
+ * getConfig() directly and don't need this.
+ */
+function cfg(env: Record<string, string | undefined> = {}) {
+  return getConfig({ ...env, CLAUDE_PROJECT_DIR: SANDBOX_DIR });
+}
+
+/**
+ * sessionStart(), sandboxed the same way. `run({env})` has no opts parameter
+ * of its own to inject through — it calls getConfig(env) with none — so the
+ * only isolation channel available is env.CLAUDE_PROJECT_DIR itself, same as
+ * a real Claude Code invocation would provide.
+ */
+function startSession(args: Parameters<typeof sessionStart>[0]) {
+  return sessionStart({ ...args, env: { ...args.env, CLAUDE_PROJECT_DIR: SANDBOX_DIR } });
+}
+
 describe("getConfig", () => {
   it("defaults and Claude userConfig precedence", () => {
-    expect(getConfig({}).retrievalMode).toBe("search");
-    expect(getConfig({}).autoCapture).toBe(true);
-    expect(getConfig({}).vault).toBe("");
-    expect(getConfig({}).ctxCommand).toBe("ctx");
+    expect(cfg({}).retrievalMode).toBe("search");
+    expect(cfg({}).autoCapture).toBe(true);
+    expect(cfg({}).captureMode).toBe("propose");
+    expect(cfg({}).vault).toBe("");
+    expect(cfg({}).ctxCommand).toBe("ctx");
 
     const env = {
       CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE: "QUERY",
@@ -45,7 +171,7 @@ describe("getConfig", () => {
       CLAUDE_PLUGIN_OPTION_VAULT: "work",
       CLAUDE_PLUGIN_OPTION_CTX_COMMAND: "/bin/ctx",
     };
-    const c = getConfig(env);
+    const c = cfg(env);
     expect(c.retrievalMode).toBe("query");
     expect(c.autoCapture).toBe(false);
     expect(c.vault).toBe("work");
@@ -53,9 +179,216 @@ describe("getConfig", () => {
   });
 
   it("generic CONTEXTNEST_* fallbacks when no Claude option is set", () => {
-    const c = getConfig({ CONTEXTNEST_RETRIEVAL_MODE: "agent", CONTEXTNEST_VAULT_ALIAS: "p" });
+    const c = cfg({ CONTEXTNEST_RETRIEVAL_MODE: "agent", CONTEXTNEST_VAULT_ALIAS: "p" });
     expect(c.retrievalMode).toBe("agent");
     expect(c.vault).toBe("p");
+  });
+});
+
+describe("getConfig settings override files (CU-wdqcpzw825)", () => {
+  /**
+   * Build throwaway project/user dirs with optional override files.
+   *  - project: <cwd>/.claude/contextnest.local.json
+   *  - user:    <home>/.contextnest/plugin-settings.json
+   */
+  function tempSettings(project?: unknown, user?: unknown) {
+    const cwd = mkdtempSync(join(tmpdir(), "cn-proj-"));
+    const homedir = mkdtempSync(join(tmpdir(), "cn-home-"));
+    if (project !== undefined) {
+      mkdirSync(join(cwd, ".claude"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".claude", "contextnest.local.json"),
+        typeof project === "string" ? project : JSON.stringify(project),
+      );
+    }
+    if (user !== undefined) {
+      mkdirSync(join(homedir, ".contextnest"), { recursive: true });
+      writeFileSync(
+        join(homedir, ".contextnest", "plugin-settings.json"),
+        typeof user === "string" ? user : JSON.stringify(user),
+      );
+    }
+    return { cwd, homedir };
+  }
+
+  // Enable-time answers, frozen into env by Claude Code. The bug: these used
+  // to be the ONLY source, so settings could never be changed after enable.
+  const enableTimeEnv = {
+    CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE: "search",
+    CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE: "true",
+    CLAUDE_PLUGIN_OPTION_VAULT: "work",
+  };
+
+  it("project override file beats the stale enable-time env value", () => {
+    const opts = tempSettings({ retrieval_mode: "off" });
+    expect(getConfig(enableTimeEnv, opts).retrievalMode).toBe("off");
+  });
+
+  it("auto_capture:false in the project file disables capture despite env true", () => {
+    const opts = tempSettings({ auto_capture: false });
+    expect(getConfig(enableTimeEnv, opts).autoCapture).toBe(false);
+  });
+
+  describe("capture_mode supersedes the legacy auto_capture boolean", () => {
+    it("defaults to propose, and the legacy boolean maps onto off/propose", () => {
+      expect(getConfig({}, tempSettings()).captureMode).toBe("propose");
+      expect(getConfig(enableTimeEnv, tempSettings()).captureMode).toBe("propose");
+      expect(
+        getConfig({ CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE: "false" }, tempSettings()).captureMode,
+      ).toBe("off");
+    });
+
+    it("every accepted mode round-trips through a file override", () => {
+      for (const mode of VALID_CAPTURE_MODES) {
+        expect(getConfig(enableTimeEnv, tempSettings({ capture_mode: mode })).captureMode).toBe(mode);
+      }
+    });
+
+    it("an explicit mode in a file beats a legacy boolean in a higher layer", () => {
+      // The legacy key can only say on/off, so a considered mode wins wherever
+      // it was set — otherwise nobody with a frozen enable-time answer could
+      // ever reach `auto`.
+      const opts = tempSettings(undefined, { capture_mode: "auto" });
+      expect(getConfig({ ...enableTimeEnv, CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE: "true" }, opts).captureMode).toBe("auto");
+    });
+
+    it("a bogus mode is skipped per layer and cannot mask a valid lower one", () => {
+      const opts = tempSettings({ capture_mode: "aggressive" }, { capture_mode: "auto" });
+      expect(getConfig({}, opts).captureMode).toBe("auto");
+      expect(getConfig({}, tempSettings({ capture_mode: "aggressive" })).captureMode).toBe("propose");
+    });
+
+    it("normalizes whitespace and casing before validating", () => {
+      expect(getConfig({}, tempSettings({ capture_mode: "  AUTO " })).captureMode).toBe("auto");
+    });
+  });
+
+  it("user-level file beats env; project file beats user file", () => {
+    const fromUser = tempSettings(undefined, { retrieval_mode: "agent" });
+    expect(getConfig(enableTimeEnv, fromUser).retrievalMode).toBe("agent");
+
+    const both = tempSettings({ retrieval_mode: "query" }, { retrieval_mode: "agent" });
+    expect(getConfig(enableTimeEnv, both).retrievalMode).toBe("query");
+  });
+
+  it('an explicit vault:"" in the file unpins an enable-time pinned vault', () => {
+    const opts = tempSettings({ vault: "" });
+    expect(getConfig(enableTimeEnv, opts).vault).toBe("");
+  });
+
+  it("keys absent from the file fall through to env, then defaults", () => {
+    const opts = tempSettings({ retrieval_mode: "off" });
+    const c = getConfig(enableTimeEnv, opts);
+    expect(c.vault).toBe("work"); // untouched by file → env wins
+    expect(c.ctxCommand).toBe("ctx"); // nowhere → default
+  });
+
+  it("missing or malformed override files never throw and leave env in charge", () => {
+    const none = tempSettings(); // dirs exist, no files
+    expect(getConfig(enableTimeEnv, none).retrievalMode).toBe("search");
+
+    const broken = tempSettings("{not json", "[1,2,3]");
+    const c = getConfig(enableTimeEnv, broken);
+    expect(c.retrievalMode).toBe("search");
+    expect(c.autoCapture).toBe(true);
+  });
+
+  // retrieval_mode is the one setting with a fixed value set. A wrong value
+  // (typo, stale, wrong case) must never silently degrade to "search" while
+  // looking set — it is skipped per layer, so resolution falls through.
+  describe("invalid retrieval_mode is rejected, not silently mis-applied", () => {
+    it("a bogus value in the only layer falls back to the search default", () => {
+      const opts = tempSettings({ retrieval_mode: "aggressive" });
+      expect(getConfig({}, opts).retrievalMode).toBe("search");
+    });
+
+    it("a bogus project value is skipped so a valid env value still wins", () => {
+      const opts = tempSettings({ retrieval_mode: "turbo" });
+      // enable-time env is a valid "search"; the junk file must not mask it.
+      expect(getConfig(enableTimeEnv, opts).retrievalMode).toBe("search");
+    });
+
+    it("a bogus project value is skipped so a valid user-file value wins", () => {
+      const opts = tempSettings({ retrieval_mode: "nope" }, { retrieval_mode: "agent" });
+      expect(getConfig({}, opts).retrievalMode).toBe("agent");
+    });
+
+    it("normalizes surrounding whitespace and casing before validating", () => {
+      const opts = tempSettings({ retrieval_mode: "  AGENT  " });
+      expect(getConfig({}, opts).retrievalMode).toBe("agent");
+    });
+
+    it("every accepted mode round-trips through a file override", () => {
+      for (const mode of VALID_RETRIEVAL_MODES) {
+        const opts = tempSettings({ retrieval_mode: mode });
+        expect(getConfig({}, opts).retrievalMode).toBe(mode);
+      }
+    });
+
+    it("a non-string junk value (number) is rejected too", () => {
+      const opts = tempSettings({ retrieval_mode: 42 });
+      expect(getConfig({}, opts).retrievalMode).toBe("search");
+    });
+  });
+
+  describe("auto_capture accepts only boolean spellings", () => {
+    it("recognized truthy/falsy spellings resolve as expected", () => {
+      for (const v of ["true", "1", "yes", "on", "TRUE", " On "]) {
+        expect(getConfig({}, tempSettings({ auto_capture: v })).autoCapture).toBe(true);
+      }
+      for (const v of ["false", "0", "no", "off", "OFF", " No "]) {
+        expect(getConfig({}, tempSettings({ auto_capture: v })).autoCapture).toBe(false);
+      }
+    });
+
+    it("a JSON boolean (not a string) is honoured", () => {
+      expect(getConfig({}, tempSettings({ auto_capture: false })).autoCapture).toBe(false);
+      expect(getConfig({}, tempSettings({ auto_capture: true })).autoCapture).toBe(true);
+    });
+
+    it("a garbage value is skipped → default ON, and cannot mask a valid layer", () => {
+      // Junk in the only layer → default ON.
+      expect(getConfig({}, tempSettings({ auto_capture: "banana" })).autoCapture).toBe(true);
+      // Junk project value must not hide a valid "off" in the user file.
+      const both = tempSettings({ auto_capture: "2" }, { auto_capture: "off" });
+      expect(getConfig({}, both).autoCapture).toBe(false);
+    });
+  });
+
+  describe("vault accepts only the unpin sentinel or a shape-valid alias", () => {
+    it("a shape-valid alias passes through", () => {
+      expect(getConfig({}, tempSettings({ vault: "work-2_v1" })).vault).toBe("work-2_v1");
+    });
+
+    it("a malformed alias is skipped → default unpinned, cannot mask a valid layer", () => {
+      for (const bad of ["my vault", "a/b/c", "/b", "..", "work!"]) {
+        expect(getConfig({}, tempSettings({ vault: bad })).vault).toBe("");
+      }
+      // Junk project value must not hide a valid alias in the user file.
+      const both = tempSettings({ vault: "a/b/c" }, { vault: "home" });
+      expect(getConfig({}, both).vault).toBe("home");
+    });
+
+    it('an explicit "" still unpins (not treated as malformed)', () => {
+      const env = { CLAUDE_PLUGIN_OPTION_VAULT: "work" };
+      expect(getConfig(env, tempSettings({ vault: "" })).vault).toBe("");
+    });
+  });
+
+  describe("ctx_command is trimmed and must be non-empty", () => {
+    it("surrounding whitespace is trimmed; internal spaces are preserved", () => {
+      expect(getConfig({}, tempSettings({ ctx_command: "  /bin/ctx  " })).ctxCommand).toBe("/bin/ctx");
+      // A path with internal spaces is a legitimate argv[0] for execFileSync.
+      expect(getConfig({}, tempSettings({ ctx_command: "/opt/my ctx/ctx" })).ctxCommand).toBe(
+        "/opt/my ctx/ctx",
+      );
+    });
+
+    it("a blank value is skipped → default 'ctx', cannot mask a valid layer", () => {
+      expect(getConfig({}, tempSettings({ ctx_command: "   " })).ctxCommand).toBe("ctx");
+      const both = tempSettings({ ctx_command: "" }, { ctx_command: "/usr/local/bin/ctx" });
+      expect(getConfig({}, both).ctxCommand).toBe("/usr/local/bin/ctx");
+    });
   });
 });
 
@@ -77,11 +410,164 @@ describe("lib helpers", () => {
     expect(ctxJson(() => ({ status: 0, stdout: "[1,2]" }), ["x"], null)).toEqual([1, 2]);
   });
 
-  it("vaultTargets: pinned beats registry; empty registry → [null]", () => {
+  it("vaultTargets: a registered pin is honoured; unpinned fans out; empty registry → [null]", () => {
     const ex = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "b", exists: true }]]]);
-    expect(vaultTargets(getConfig({ CONTEXTNEST_VAULT_ALIAS: "pin" }), ex)).toEqual(["pin"]);
-    expect(vaultTargets(getConfig({}), ex)).toEqual(["a", "b"]);
-    expect(vaultTargets(getConfig({}), fakeExec([["vault list", []]]))).toEqual([null]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
+    expect(vaultTargets(cfg({}), ex)).toEqual(["a", "b"]);
+    expect(vaultTargets(cfg({}), fakeExec([["vault list", []]]))).toEqual([null]);
+  });
+
+  it("vaultTargets: a stale pin (not registered) falls back to auto-select, not a bad --vault", () => {
+    const twoVaults = fakeExec([["vault list", [{ alias: "a", exists: true }, { alias: "b", exists: true }]]]);
+    // "pin" isn't in the registry → behave as unpinned (fan out), never ["pin"].
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "pin" }), twoVaults)).toEqual(["a", "b"]);
+    // Registered but path missing (exists:false) is also not usable → fall back.
+    const missing = fakeExec([["vault list", [{ alias: "gone", exists: false }]]]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "gone" }), missing)).toEqual([null]);
+  });
+
+  // CU-wdqcq01c5v — the vault in the working directory used to be ignored
+  // whenever the registry was non-empty, and the fan-out happily hit demo/tmp
+  // vaults ahead of it.
+  it("vaultTargets: the cwd vault is searched first (as null), then the registry", () => {
+    const ex = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "crm", path: "/vaults/crm", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), ex)).toEqual([null, "demo", "crm"]);
+  });
+
+  it("vaultTargets: a cwd vault that is also registered is searched once, by alias, first", () => {
+    const ex = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "crm", path: "/vaults/crm", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/vaults/crm", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), ex)).toEqual(["crm", "demo"]);
+  });
+
+  it("vaultTargets: registry entries that are missing or live under os.tmpdir() are never targeted", () => {
+    const scratch = join(tmpdir(), "cn-scratch-vault");
+    const registry = [
+      { alias: "gone", path: "/vaults/gone", exists: false },
+      { alias: "scratch", path: scratch, exists: true },
+      { alias: "demo", path: "/vaults/demo", exists: true },
+    ];
+    // No cwd vault (ctx would fall back to the bare cwd) → only the real one.
+    const noCwd = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), noCwd)).toEqual(["demo"]);
+    // Nothing eligible and no cwd vault → let ctx resolve, as with an empty registry.
+    const nothing = fakeExec([
+      ["vault list", registry.slice(0, 2)],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), nothing)).toEqual([null]);
+    // A cwd vault that happens to live under tmp is a deliberate choice → kept.
+    const cwdInTmp = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: scratch, source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdInTmp)).toEqual(["scratch", "demo"]);
+  });
+
+  it("vaultTargets: the cwd vault counts against MAX_FANOUT_VAULTS", () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ alias: `v${i}`, path: `/vaults/v${i}`, exists: true }));
+    const ex = fakeExec([
+      ["vault list", many],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    const targets = vaultTargets(cfg({}), ex);
+    expect(targets).toHaveLength(MAX_FANOUT_VAULTS);
+    expect(targets[0]).toBeNull();
+    expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
+  });
+
+  // The registry default used to compete for the MAX_FANOUT_VAULTS slots in
+  // plain registry order. With a few demo vaults registered before it, the
+  // vault the user actually works in was sliced off and never searched, while
+  // the demos' nodes were injected into every prompt.
+  it("vaultTargets: the registry default is always targeted, even past the fan-out cap", () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ alias: `v${i}`, path: `/vaults/v${i}`, exists: true }));
+    const registry = many.map((v) => (v.alias === "v6" ? { ...v, isDefault: true } : v));
+    const ex = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    const targets = vaultTargets(cfg({}), ex);
+    expect(targets).toHaveLength(MAX_FANOUT_VAULTS);
+    expect(targets[0]).toBe("v6");
+    expect(targets.slice(1)).toEqual(["v0", "v1", "v2", "v3"]);
+  });
+
+  it("vaultTargets: order is cwd vault, then the default, then the registry — each once", () => {
+    const registry = [
+      { alias: "demo", path: "/vaults/demo", exists: true },
+      { alias: "crm", path: "/vaults/crm", exists: true },
+      { alias: "brain", path: "/vaults/brain", exists: true, isDefault: true },
+    ];
+    // Unregistered cwd vault (null) leads; the default comes next, not "demo".
+    const cwdElsewhere = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdElsewhere)).toEqual([null, "brain", "demo", "crm"]);
+    // cwd IS the default → targeted once, by alias, first.
+    const cwdIsDefault = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/vaults/brain", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdIsDefault)).toEqual(["brain", "demo", "crm"]);
+    // cwd is some other registered vault → cwd, then default, then the rest.
+    const cwdIsCrm = fakeExec([
+      ["vault list", registry],
+      ["vault which", { kind: "local", path: "/vaults/crm", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({}), cwdIsCrm)).toEqual(["crm", "brain", "demo"]);
+  });
+
+  it("vaultTargets: a default that is missing on disk is not targeted; one under tmp still is", () => {
+    const scratch = join(tmpdir(), "cn-default-scratch");
+    const gone = fakeExec([
+      ["vault list", [
+        { alias: "gone", path: "/vaults/gone", exists: false, isDefault: true },
+        { alias: "demo", path: "/vaults/demo", exists: true },
+      ]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), gone)).toEqual(["demo"]);
+    // Deliberately chosen as default → kept even though a plain tmp entry would be skipped.
+    const inTmp = fakeExec([
+      ["vault list", [
+        { alias: "demo", path: "/vaults/demo", exists: true },
+        { alias: "scratch", path: scratch, exists: true, isDefault: true },
+      ]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "cwd" }],
+    ]);
+    expect(vaultTargets(cfg({}), inTmp)).toEqual(["scratch", "demo"]);
+  });
+
+  it("vaultTargets: a registered pin still short-circuits, even with a cwd vault", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]],
+      ["vault which", { kind: "local", path: "/work/notes", source: "local" }],
+    ]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "a" }), ex)).toEqual(["a"]);
+  });
+
+  it("isVaultRegistered: true only for a registered, present alias", () => {
+    const vaults = [{ alias: "a", exists: true }, { alias: "gone", exists: false }];
+    expect(isVaultRegistered("a", vaults)).toBe(true);
+    expect(isVaultRegistered("gone", vaults)).toBe(false); // registered but missing on disk
+    expect(isVaultRegistered("nope", vaults)).toBe(false); // not registered
+    expect(isVaultRegistered("", vaults)).toBe(false); // unpinned
   });
 
   it("squish collapses whitespace and truncates", () => {
@@ -132,6 +618,67 @@ describe("retrieve", () => {
     expect(additional(out)).toContain("home:nodes/h");
   });
 
+  it("search → the cwd vault's hits come first and are cited without an alias prefix", () => {
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) return json([{ alias: "demo", path: "/vaults/demo", exists: true }]);
+      if (k.includes("vault which")) return json({ kind: "local", path: "/work/notes", source: "local" });
+      if (k.includes("--vault demo")) return json([{ id: "nodes/gi", title: "Gastro", type: "document" }]);
+      if (k.startsWith("search")) return json([{ id: "nodes/local", title: "Local Note", type: "document" }]);
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const text = additional(out)!;
+    expect(text).toContain("- nodes/local — Local Note");
+    expect(text).toContain("- demo:nodes/gi — Gastro");
+    expect(text.indexOf("nodes/local")).toBeLessThan(text.indexOf("demo:nodes/gi"));
+  });
+
+  // One vault with a long hit list used to fill every slot before the next
+  // target was searched — on an unranked search that meant a demo vault's
+  // alphabetical head, every prompt, with the real vault never shown.
+  it("search → hit slots are shared round-robin across vaults, primary vault listed first", () => {
+    const many = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i) => ({ id: `nodes/${prefix}${i}`, title: `${prefix}${i}`, type: "document" }));
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) {
+        return json([{ alias: "demo", path: "/vaults/demo", exists: true }, { alias: "brain", path: "/vaults/brain", exists: true }]);
+      }
+      if (k.includes("--vault demo")) return json(many("d", 20));
+      if (k.includes("--vault brain")) return json(many("b", 20));
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const lines = additional(out)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines).toHaveLength(MAX_HITS);
+    expect(lines.map((l) => l.slice(2).split(" ")[0])).toEqual([
+      "demo:nodes/d0", "demo:nodes/d1", "demo:nodes/d2",
+      "brain:nodes/b0", "brain:nodes/b1", "brain:nodes/b2",
+    ]);
+  });
+
+  it("search → a vault with few hits gives its unused slots back to the others", () => {
+    const ex = (args: string[]) => {
+      const k = args.join(" ");
+      if (k.includes("vault list")) {
+        return json([{ alias: "a", path: "/vaults/a", exists: true }, { alias: "b", path: "/vaults/b", exists: true }]);
+      }
+      if (k.includes("--vault a")) return json([{ id: "nodes/a0", title: "A0", type: "document" }]);
+      if (k.includes("--vault b")) {
+        return json(Array.from({ length: 10 }, (_, i) => ({ id: `nodes/b${i}`, title: `B${i}`, type: "document" })));
+      }
+      return json([]);
+    };
+    const out = retrieve({ input: { prompt: "topic" }, env: env("search"), exec: ex });
+    const lines = additional(out)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines).toHaveLength(MAX_HITS);
+    expect(lines[0]).toContain("a:nodes/a0");
+    expect(lines.slice(1).map((l) => l.slice(2).split(" ")[0])).toEqual(
+      ["b0", "b1", "b2", "b3", "b4"].map((x) => `b:nodes/${x}`),
+    );
+  });
+
   it("query → maps ids to tags via ctx list then injects graph documents", () => {
     const ex = (args: string[]) => {
       const k = args.join(" ");
@@ -150,6 +697,41 @@ describe("retrieve", () => {
     expect(additional(out)).toContain("JWT rotation.");
   });
 
+  it("a correction-shaped prompt also gets the change ladder", () => {
+    const exec = fakeExec([
+      ["vault list", []],
+      ["search", [{ id: "nodes/alpha", title: "Alpha Auth", type: "document" }]],
+    ]);
+    const out = retrieve({ input: { prompt: "actually the timeout is 30s not 60s" }, env: {}, exec });
+    const text = additional(out)!;
+    expect(text).toMatch(/nodes\/alpha/); // normal retrieval still happens
+    expect(text).toMatch(/find EVERY occurrence before editing/);
+    expect(text).toMatch(/stop, show the change-set, and ask/);
+    // Duplication is the root cause, and surfacing it is not licence to fix it.
+    expect(text).toMatch(/offer to make one node canonical/);
+    expect(text).toMatch(/offer, don't do it/);
+  });
+
+  it("the change ladder is injected even when retrieval finds nothing", () => {
+    // Search is ranked and published-only, so zero hits is not evidence the
+    // vault is silent — the sweep rule still has to reach the model.
+    const out = retrieve({
+      input: { prompt: "actually, rename that to Nest" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+    });
+    expect(additional(out)).toMatch(/find EVERY occurrence before editing/);
+  });
+
+  it("an ordinary prompt pays nothing for the change ladder", () => {
+    const exec = fakeExec([
+      ["vault list", []],
+      ["search", [{ id: "nodes/alpha", title: "Alpha Auth", type: "document" }]],
+    ]);
+    const out = retrieve({ input: { prompt: "how does auth work" }, env: {}, exec });
+    expect(additional(out)).not.toMatch(/change-set/);
+  });
+
   it("uses user_prompt field when prompt is absent", () => {
     const ex = fakeExec([
       ["vault list", []],
@@ -166,7 +748,7 @@ describe("retrieve", () => {
 
 describe("session-start", () => {
   it("warns when ctx is unavailable", () => {
-    const out = sessionStart({ input: {}, env: {}, exec: () => ({ status: 1, stdout: "", code: "ENOENT" }) });
+    const out = startSession({ input: {}, env: {}, exec: () => ({ status: 1, stdout: "", code: "ENOENT" }) });
     expect(additional(out)).toMatch(/not available/i);
   });
 
@@ -177,55 +759,842 @@ describe("session-start", () => {
         { alias: "home", description: "personal", exists: true },
       ]],
     ]);
-    const out = sessionStart({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec: ex });
+    const out = startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "home" }, exec: ex });
     const ctx = additional(out)!;
     expect(ctx).toContain("`work`");
     expect(ctx).toContain("default");
     expect(ctx).toContain("pinned");
   });
 
+  it("warns when the pinned vault is not registered (stale pin)", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", exists: true }, { alias: "home", exists: true }]],
+    ]);
+    const out = startSession({ input: {}, env: { CONTEXTNEST_VAULT_ALIAS: "ghost" }, exec: ex });
+    const ctx = additional(out)!;
+    expect(ctx).toMatch(/not a registered vault/i);
+    expect(ctx).toContain("`ghost`");
+    // Must NOT claim the ghost pin is in effect, and no vault is flagged pinned.
+    expect(ctx).not.toContain("all queries/captures use it");
+    expect(ctx).not.toContain("pinned");
+  });
+
+  it("mentions a working-directory vault when one is detected", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/proj/notes", source: "local" }],
+    ]);
+    const out = startSession({ input: { cwd: "/proj/notes" }, env: {}, exec: ex });
+    const ctx = additional(out)!;
+    expect(ctx).toMatch(/working-directory vault/i);
+    expect(ctx).toContain("/proj/notes");
+    expect(ctx).toMatch(/not registered/i);
+  });
+
+  it("names the alias when the working-directory vault is registered", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/vaults/work", source: "local" }],
+    ]);
+    const ctx = additional(startSession({ input: {}, env: {}, exec: ex }))!;
+    expect(ctx).toMatch(/working-directory vault/i);
+    expect(ctx).toContain("`work`");
+    expect(ctx).not.toMatch(/not registered/i);
+  });
+
+  it("does not mention a working-directory vault when the cwd is not a vault", () => {
+    const ex = fakeExec([
+      ["vault list", [{ alias: "work", path: "/vaults/work", exists: true }]],
+      ["vault which", { kind: "local", path: "/elsewhere", source: "default", alias: "work" }],
+    ]);
+    expect(additional(startSession({ input: {}, env: {}, exec: ex }))).not.toMatch(/working-directory vault/i);
+  });
+
   it("notes local resolution when no vaults are registered", () => {
-    const out = sessionStart({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
+    const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
     expect(additional(out)).toMatch(/No vaults are registered/i);
   });
 });
 
+describe("signals", () => {
+  it("lastUserMessage returns the newest human turn, skipping tool_result echoes", () => {
+    const lines = [
+      userLine("first thing"),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: "ok" } }),
+      // tool_result blocks are ALSO type:"user" — the classic false positive.
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", content: "42" }] },
+      }),
+    ];
+    expect(lastUserMessage(lines)).toBe("first thing");
+  });
+
+  it("lastUserMessage skips isMeta turns and survives unparseable lines", () => {
+    expect(lastUserMessage(["{not json", userLine("real")])).toBe("real");
+    expect(lastUserMessage([{ ...JSON.parse(userLine("x")), isMeta: true }].map((o) => JSON.stringify(o)))).toBe("");
+    expect(lastUserMessage([])).toBe("");
+  });
+
+  it("lastUserMessage handles a plain string content field", () => {
+    expect(
+      lastUserMessage([JSON.stringify({ type: "user", message: { role: "user", content: "hi" } })]),
+    ).toBe("hi");
+  });
+
+  it.each([
+    "remember that we use pnpm",
+    "save this for later",
+    "add that to the vault",
+    "we decided to drop the cache",
+    "from now on, use British spelling",
+    "write this down",
+  ])("explicitCaptureIntent: %s → true", (t) => {
+    expect(explicitCaptureIntent(t)).toBe(true);
+  });
+
+  it.each([
+    "can you run the tests",
+    "what does this function do",
+    "fix the failing build",
+    "",
+  ])("explicitCaptureIntent: %s → false", (t) => {
+    expect(explicitCaptureIntent(t)).toBe(false);
+  });
+
+  it.each([
+    "actually it's 30 seconds not 60",
+    "that's wrong, we dropped that",
+    "change the timeout to 5s",
+    "rename the auth module",
+    "no, it's the other way round",
+    "replace Redis with Postgres",
+    "we no longer support Node 18",
+    "the product is now called Nest",
+    "update the vault, that entry is stale",
+  ])("correctionIntent: %s → true", (t) => {
+    expect(correctionIntent(t)).toBe(true);
+  });
+
+  it.each(["add a new endpoint", "explain the caching layer", ""])(
+    "correctionIntent: %s → false",
+    (t) => {
+      expect(correctionIntent(t)).toBe(false);
+    },
+  );
+
+  it("countUserTurns counts human turns only", () => {
+    const lines = [
+      userLine("one"),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: "a" } }),
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", content: "r" }] },
+      }),
+      userLine("two"),
+    ];
+    expect(countUserTurns(lines)).toBe(2);
+  });
+});
+
+describe("ledger", () => {
+  it("rejects session ids that could escape the state directory", () => {
+    expect(sessionFileName("../../etc/passwd")).toBeNull();
+    expect(sessionFileName("a/b")).toBeNull();
+    expect(sessionFileName("")).toBeNull();
+    expect(sessionFileName(undefined as unknown as string)).toBeNull();
+    expect(sessionFileName("abc-123_DEF")).toBe("abc-123_DEF.json");
+  });
+
+  it("round-trips through save → load", () => {
+    const io = fakeLedgerIo();
+    expect(saveLedger("sess1", { lastGatedTurn: 7, captured: ["a"] }, io)).toBe(true);
+    expect(loadLedger("sess1", io)).toEqual({
+      lastGatedTurn: 7,
+      captured: ["a"],
+      pending: null,
+      lastHits: [],
+    });
+  });
+
+  it("parks and clears a pending job without losing the rest of the ledger", () => {
+    const io = fakeLedgerIo();
+    saveLedger("s", { lastGatedTurn: 3, captured: ["keep me"] }, io);
+    const job = { kind: "change", reason: "sweep it", turn: 4, seeds: ["eng:nodes/x"] };
+
+    parkJob("s", loadLedger("s", io), job, io);
+    const parked = loadLedger("s", io);
+    expect(parked.pending).toEqual(job);
+    // saveLedger writes an explicit projection, so this is the regression guard
+    // against a new field silently dropping the existing ones.
+    expect(parked.lastGatedTurn).toBe(3);
+    expect(parked.captured).toEqual(["keep me"]);
+
+    clearPending("s", parked, io);
+    expect(loadLedger("s", io).pending).toBeNull();
+    expect(loadLedger("s", io).lastGatedTurn).toBe(3);
+  });
+
+  it("a malformed pending job reads back as no job, not as a throw", () => {
+    const io = fakeLedgerIo();
+    for (const bad of [{ kind: "nonsense", reason: "x", turn: 1 }, { kind: "capture" }, "str", 7]) {
+      saveLedger("s", { lastGatedTurn: 1, pending: bad }, io);
+      expect(loadLedger("s", io).pending, JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it("an unusable session id persists nothing and loads empty", () => {
+    const io = fakeLedgerIo();
+    expect(saveLedger("../evil", { lastGatedTurn: 1 }, io)).toBe(false);
+    expect(Object.keys(io.files)).toHaveLength(0);
+    expect(loadLedger("../evil", io)).toEqual({
+      lastGatedTurn: null,
+      captured: [],
+      pending: null,
+      lastHits: [],
+    });
+  });
+
+  it("a missing or malformed file degrades to empty rather than throwing", () => {
+    const io = fakeLedgerIo({ "/fake-home/.contextnest/plugin-state/bad.json": "{oops" });
+    const empty = { lastGatedTurn: null, captured: [], pending: null, lastHits: [] };
+    expect(loadLedger("bad", io)).toEqual(empty);
+    expect(loadLedger("absent", io)).toEqual(empty);
+  });
+
+  it("inCooldown: the clock starts at session start, not at the first gate", () => {
+    // Never gated, but only two turns in — a short session earns no ambient pass.
+    expect(inCooldown({ lastGatedTurn: null, captured: [], pending: null }, 2, 5)).toBe(true);
+    expect(inCooldown({ lastGatedTurn: null, captured: [], pending: null }, 10, 5)).toBe(false);
+    expect(inCooldown({ lastGatedTurn: 8, captured: [], pending: null }, 10, 5)).toBe(true);
+    expect(inCooldown({ lastGatedTurn: 4, captured: [], pending: null }, 10, 5)).toBe(false);
+  });
+});
+
+describe("sweep-check", () => {
+  it("parseUpdate: accepts ctx update with/without --vault, rejects everything else", () => {
+    expect(parseUpdate("ctx update nodes/a --body x --yes")).toEqual({ id: "nodes/a", vault: null });
+    expect(parseUpdate('npx ctx update "nodes/my doc" --vault work --body x')).toEqual({
+      id: "nodes/my doc",
+      vault: "work",
+    });
+    for (const cmd of ["ls -la", "ctx add nodes/a --body x", "ctx read nodes/a", "git update-index", ""]) {
+      expect(parseUpdate(cmd), cmd).toBeNull();
+    }
+  });
+
+  it("bodyOf strips frontmatter and tolerates non-strings", () => {
+    expect(bodyOf("---\ntitle: X\n---\nThe body.")).toBe("The body.");
+    expect(bodyOf("no frontmatter")).toBe("no frontmatter");
+    expect(bodyOf(undefined)).toBe("");
+  });
+
+  it("droppedTerms: finds removed values, skips stopwords, empty for pure additions", () => {
+    expect(droppedTerms("Sessions live in Redis.", "Sessions live in Postgres.")).toEqual(["redis"]);
+    // "the"/"now" are stopwords; short tokens are skipped.
+    expect(droppedTerms("the x is 5s now", "the x is 9s")).toEqual([]);
+    expect(droppedTerms("value is X", "value is X and more detail")).toEqual([]);
+  });
+
+  it("findStragglers: confirms by read, spans nests, excludes only the written node in its own nest", () => {
+    const exec = fakeExec([
+      // eng: sibling still asserts redis; the written node does not any more.
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/written" }, { id: "nodes/sibling" }]],
+      ["read nodes/sibling --raw --vault eng", "---\nt: x\n---\nCounters kept in Redis."],
+      // mkt: fuzzy hit whose body does NOT contain the term → must be dropped.
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/fuzzy" }]],
+      ["read nodes/fuzzy --raw --vault mkt", "---\nt: x\n---\nNothing relevant here."],
+    ]);
+    const { found, truncated } = findStragglers(exec, ["redis"], "nodes/written", "eng", ["eng", "mkt"]);
+    expect(found).toEqual([{ ref: "eng:nodes/sibling", term: "redis", stale: false }]);
+    expect(truncated).toBe(false);
+  });
+
+  it("findStragglers: the tag channel catches a paraphrased node search cannot see", () => {
+    const exec = fakeExec([
+      // Tagged with the entity, body words the fact without the literal term.
+      ["list --tag redis", [{ id: "nodes/brand" }]],
+      ["read nodes/brand --raw --vault mkt", "---\nt: x\n---\nOur flagship in-memory engine."],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, []],
+    ]);
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", "eng", ["mkt"]);
+    // Reported as stale: the node either asserts the fact in other words (needs
+    // the change) or carries an outdated tag (needs retagging).
+    expect(found).toEqual([{ ref: "mkt:nodes/brand", term: "redis", stale: true }]);
+  });
+
+  it("findStragglers: a node hit by both channels is reported once, as a straggler", () => {
+    const exec = fakeExec([
+      ["list --tag redis", [{ id: "nodes/both" }]],
+      ["search redis --json", [{ id: "nodes/both" }]],
+      ["read nodes/both --raw", "---\nt: x\n---\nStill uses Redis."],
+    ]);
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", null, [null]);
+    expect(found).toEqual([{ ref: "nodes/both", term: "redis", stale: false }]);
+  });
+
+  it("sweepMessage words the stale-tag case as check-and-retag", () => {
+    const text = sweepMessage(
+      "eng:nodes/x",
+      [
+        { ref: "eng:nodes/a", term: "redis", stale: false },
+        { ref: "mkt:nodes/b", term: "redis", stale: true },
+      ],
+      false,
+    );
+    expect(text).toContain('eng:nodes/a still contains "redis"');
+    expect(text).toContain("mkt:nodes/b is tagged #redis but words it differently");
+    expect(text).toContain("retag it if the tag is outdated");
+  });
+
+  it("findStragglers: honours the candidate budget and reports truncation", () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({ id: `nodes/n${i}` }));
+    const exec = fakeExec([
+      ["search", many],
+      ["read", "---\nt: x\n---\nstill says redis"],
+    ]);
+    const { found, truncated } = findStragglers(exec, ["redis"], "nodes/x", null, [null], 5);
+    expect(truncated).toBe(true);
+    expect(found.length).toBeLessThanOrEqual(5);
+  });
+
+  it("run: a non-ctx Bash command returns null without a single exec call", () => {
+    let calls = 0;
+    const exec = () => {
+      calls++;
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    expect(sweepCheck({ input: { tool_input: { command: "npm test" } }, env: {}, exec })).toBeNull();
+    expect(calls).toBe(0);
+  });
+
+  it("run: reports cross-nest stragglers with vault-qualified refs after a real update", () => {
+    const history = { versions: [{ version: 1 }, { version: 2 }] };
+    const exec = fakeExec([
+      ["vault list", [{ alias: "eng", exists: true }, { alias: "mkt", exists: true }]],
+      ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+      ["history nodes/a --json --vault eng", history],
+      ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/a" }]],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault mkt`, [{ id: "nodes/pitch" }]],
+      ["read nodes/pitch --raw --vault mkt", "---\nt: x\n---\nWe brag about Redis speed."],
+    ]);
+    const out = sweepCheck({
+      input: { tool_input: { command: "ctx update nodes/a --vault eng --body whatever" } },
+      env: {},
+      exec,
+    });
+    const text = out?.hookSpecificOutput?.additionalContext ?? "";
+    expect(out?.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
+    expect(text).toContain("eng:nodes/a is incomplete");
+    expect(text).toContain('mkt:nodes/pitch still contains "redis"');
+    expect(text).toMatch(/contextnest-curator/);
+  });
+
+  it("run: a held update (review on) is not diffed — its last two versions are an older edit", () => {
+    const routes: [string, unknown][] = [
+      ["vault list", [{ alias: "eng", exists: true }]],
+      ["read a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+      ["history a --json --vault eng", { versions: [{ version: 1 }, { version: 2 }] }],
+      ["reconstruct a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/other" }]],
+      ["read nodes/other --raw --vault eng", "---\nt: x\n---\nRedis everywhere."],
+    ];
+    // The command names a bare slug; the review list reports it under nodes/.
+    const held = fakeExec([["review list --json --vault eng", [{ id: "nodes/a", kind: "edit", stale: false }]], ...routes]);
+    const cmd = { tool_input: { command: "ctx update a --vault eng --body whatever" } };
+    expect(sweepCheck({ input: cmd, env: {}, exec: held })).toBeNull();
+    // Control: the same update, published (nothing held), is swept.
+    expect(sweepCheck({ input: cmd, env: {}, exec: fakeExec(routes) })).not.toBeNull();
+  });
+
+  it("run: silent when nothing was dropped or no straggler survives the read check", () => {
+    const history = { versions: [{ version: 1 }, { version: 2 }] };
+    const exec = fakeExec([
+      ["vault list", []],
+      ["read nodes/a --raw", "---\nt: x\n---\nBody with extra detail added."],
+      ["history nodes/a --json", history],
+      ["reconstruct nodes/a 1", "---\nt: x\n---\nBody with"],
+    ]);
+    expect(
+      sweepCheck({ input: { tool_input: { command: "ctx update nodes/a --body x" } }, env: {}, exec }),
+    ).toBeNull();
+  });
+
+  it("parseUpdates: a chained command yields every updated node, prose yields none", () => {
+    expect(parseUpdates("ctx update nodes/a --vault w && ctx update nodes/b --vault w")).toEqual([
+      { id: "nodes/a", vault: "w" },
+      { id: "nodes/b", vault: "w" },
+    ]);
+    // The reviewer's false-positive shapes: prose containing "update", a path
+    // that merely ends in /ctx, and non-ctx binaries.
+    for (const cmd of [
+      'echo "remember to update later" && ctx read foo --raw',
+      'ctx add nodes/a --body "we should update nodes/legacy soon"',
+      "docs/ctx update notes",
+      "git update-index --add file",
+    ]) {
+      expect(parseUpdates(cmd), cmd).toEqual([]);
+    }
+    // Explicit binary paths and the npx package form are invocations.
+    expect(parseUpdates("/usr/local/bin/ctx update nodes/e --yes")).toHaveLength(1);
+    expect(parseUpdates("npx -y @promptowl/contextnest-cli update nodes/b")).toHaveLength(1);
+  });
+
+  it("run: sweeps every node of a chained update, not just the first", () => {
+    const history = { versions: [{ version: 1 }, { version: 2 }] };
+    const exec = fakeExec([
+      ["vault list", []],
+      ["read nodes/a --raw", "---\nt: x\n---\nNow says Postgres."],
+      ["history nodes/a --json", history],
+      ["reconstruct nodes/a 1", "---\nt: x\n---\nSays Redis."],
+      ["read nodes/b --raw", "---\nt: x\n---\nNow says Vercel."],
+      ["history nodes/b --json", history],
+      ["reconstruct nodes/b 1", "---\nt: x\n---\nSays Heroku."],
+      ["search redis", [{ id: "nodes/lag1" }]],
+      ["read nodes/lag1 --raw", "---\nt: x\n---\nStill on Redis."],
+      ["search heroku", [{ id: "nodes/lag2" }]],
+      ["read nodes/lag2 --raw", "---\nt: x\n---\nStill on Heroku."],
+    ]);
+    const out = sweepCheck({
+      input: { tool_input: { command: "ctx update nodes/a --body x && ctx update nodes/b --body y" } },
+      env: {},
+      exec,
+    });
+    const text = out?.hookSpecificOutput?.additionalContext ?? "";
+    // Both updates' dropped terms produce findings in ONE merged message.
+    expect(text).toContain('nodes/lag1 still contains "redis"');
+    expect(text).toContain('nodes/lag2 still contains "heroku"');
+  });
+
+  it("run: capture_mode off silences the sweep too, with zero exec calls", () => {
+    let calls = 0;
+    const exec = () => {
+      calls++;
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    expect(
+      sweepCheck({
+        input: { tool_input: { command: "ctx update nodes/a --body x" } },
+        env: { CONTEXTNEST_CAPTURE_MODE: "off" },
+        exec,
+      }),
+    ).toBeNull();
+    expect(calls).toBe(0);
+  });
+
+  it("sweepTargets: a pinned vault does NOT narrow the sweep", () => {
+    // vaultTargets() deliberately short-circuits to the pin for retrieval; the
+    // sweep's guarantee is per-registry, so it must not inherit that shortcut.
+    const exec = fakeExec([
+      ["vault list", [{ alias: "eng", exists: true }, { alias: "mkt", exists: true }]],
+    ]);
+    const { targets, capped } = sweepTargets(exec, "eng", {});
+    expect(targets.sort()).toEqual(["eng", "mkt"]);
+    expect(capped).toBe(false);
+  });
+
+  it("sweepTargets: signals when the registry exceeds the nest cap", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ alias: `v${i}`, exists: true }));
+    const exec = fakeExec([["vault list", many]]);
+    const { targets, capped } = sweepTargets(exec, "v0", {});
+    expect(capped).toBe(true);
+    expect(targets.length).toBeLessThanOrEqual(9); // cap + written alias
+  });
+
+  it("run: CONTEXTNEST_SWEEP_CHECK=off disables it", () => {
+    let calls = 0;
+    const exec = () => {
+      calls++;
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    expect(
+      sweepCheck({
+        input: { tool_input: { command: "ctx update nodes/a --body x" } },
+        env: { CONTEXTNEST_SWEEP_CHECK: "off" },
+        exec,
+      }),
+    ).toBeNull();
+    expect(calls).toBe(0);
+  });
+});
+
 describe("capture-gate", () => {
-  it("allows when auto-capture disabled", () => {
-    expect(captureGate({ input: {}, env: { CONTEXTNEST_AUTO_CAPTURE: "false" }, readTail: () => [] })).toBeNull();
+  const noLedger = { lastGatedTurn: null, captured: [], pending: null };
+
+  it("allows when capture is off, via capture_mode or the legacy boolean", () => {
+    for (const env of [{ CONTEXTNEST_CAPTURE_MODE: "off" }, { CONTEXTNEST_AUTO_CAPTURE: "false" }]) {
+      expect(captureGate({ input: {}, env, readTranscript: tx([]) })).toBeNull();
+    }
   });
 
   it("allows on the stop_hook_active loop guard", () => {
-    expect(captureGate({ input: { stop_hook_active: true }, env: {}, readTail: () => ["x"] })).toBeNull();
+    expect(
+      captureGate({ input: { stop_hook_active: true }, env: {}, readTranscript: tx(["x"]) }),
+    ).toBeNull();
   });
 
-  it("blocks on a substantive turn and names the capture agent", () => {
+  it("an ordinary tool-using turn no longer gates — the noise fix", () => {
+    // This is the exact input the old gate blocked on. Substantive alone is now
+    // a necessary condition, not a sufficient one.
     const out = captureGate({
-      input: { transcript_path: "t" },
+      input: { transcript_path: "t", session_id: "s1" },
       env: {},
-      readTail: () => ['{"role":"user"}', '{"role":"assistant","content":[{"tool_use":1}]}'],
-    });
-    expect(out?.decision).toBe("block");
-    expect(out?.reason).toMatch(/contextnest-capture/);
-  });
-
-  it("allows a trivial no-tool short turn", () => {
-    const out = captureGate({
-      input: { transcript_path: "t" },
-      env: {},
-      readTail: () => ['{"role":"user"}', '{"role":"assistant"} hi'],
+      readTranscript: tx([userLine("run the tests"), '{"role":"assistant","content":[{"tool_use":1}]}']),
+      ledgerIo: fakeLedgerIo(),
     });
     expect(out).toBeNull();
   });
 
-  it("CONTEXTNEST_CAPTURE_ALWAYS forces a block", () => {
-    const out = captureGate({ input: {}, env: { CONTEXTNEST_CAPTURE_ALWAYS: "1" }, readTail: () => [] });
-    expect(out?.decision).toBe("block");
+  it("a whole short session of tool-using turns stays silent", () => {
+    // The cooldown counts from session start, so nothing ambient fires until
+    // the conversation has actually run on for a while.
+    const io = fakeLedgerIo();
+    const lines = [userLine("do a thing"), '{"role":"assistant","content":[{"tool_use":1}]}'];
+    for (let turn = 1; turn <= 4; turn++) {
+      expect(
+        captureGate({
+          input: { transcript_path: "t", session_id: "s1" },
+          env: {},
+          readTranscript: tx(lines, turn),
+          ledgerIo: io,
+        }),
+        `turn ${turn}`,
+      ).toBeNull();
+    }
   });
 
-  it("isSubstantive: tool use → true, empty tail → true (favour capture)", () => {
+  it("never blocks the turn — it parks the job and notes it", () => {
+    const io = fakeLedgerIo();
+    const out = captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("remember that we use pnpm")]),
+      ledgerIo: io,
+    });
+    // The whole point: no `decision`, no `continue` — the turn ends now.
+    expect(out).not.toHaveProperty("decision");
+    expect(out).not.toHaveProperty("continue");
+    expect(out?.systemMessage).toMatch(/queued a capture pass/);
+
+    const parked = loadLedger("s1", io).pending;
+    expect(parked?.kind).toBe("capture");
+    expect(parked?.reason).toMatch(/contextnest-capture/);
+  });
+
+  it("parks a correction for the curator, not the capture agent", () => {
+    const io = fakeLedgerIo();
+    const out = captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("actually it's 30 seconds not 60")]),
+      ledgerIo: io,
+    });
+    expect(out).not.toHaveProperty("decision");
+    expect(out?.systemMessage).toMatch(/queued a correction sweep/);
+
+    const parked = loadLedger("s1", io).pending;
+    expect(parked?.kind).toBe("change");
+    // The dispatch is route → scout → fan out: the retriever scouts the
+    // occurrence map, then curators are fanned out over disjoint slices.
+    expect(parked?.reason).toMatch(/contextnest-retriever/);
+    expect(parked?.reason).toMatch(/contextnest-curator/);
+    expect(parked?.reason).toMatch(/parallel/);
+    expect(parked?.reason).toMatch(/disjoint/);
+    expect(parked?.reason).toMatch(/Pinned-first, never pinned-only/);
+  });
+
+  it("both dispatch directives ask for background execution", () => {
+    const t = { lines: [userLine("remember this")], userTurns: 1 };
+    for (const mode of ["propose", "auto"]) {
+      expect(
+        captureSignal({ transcript: t, ledger: noLedger, env: {}, captureMode: mode }).reason,
+      ).toMatch(/background/);
+    }
+    expect(CHANGE_REASON).toMatch(/background/);
+  });
+
+  it("does not re-park a job already queued for the same turn", () => {
+    // Stop fires again when a background agent reports back; the user must not
+    // get the same directive on two consecutive prompts.
+    const io = fakeLedgerIo();
+    const input = { transcript_path: "t", session_id: "s1" };
+    const read = tx([userLine("remember that we use pnpm")], 3);
+
+    expect(captureGate({ input, env: {}, readTranscript: read, ledgerIo: io })?.systemMessage)
+      .toBeTruthy();
+    expect(captureGate({ input, env: {}, readTranscript: read, ledgerIo: io })).toBeNull();
+  });
+
+  it("a correction outranks a capture phrase in the same message", () => {
+    const signal = captureSignal({
+      transcript: { lines: [userLine("remember: actually it's Y not X")], userTurns: 1 },
+      ledger: noLedger,
+      env: {},
+      captureMode: "propose",
+    });
+    expect(signal.kind).toBe("change");
+  });
+
+  it("propose mode tells the agent not to write; auto mode tells it to persist", () => {
+    const t = { lines: [userLine("remember this")], userTurns: 1 };
+    expect(
+      captureSignal({ transcript: t, ledger: noLedger, env: {}, captureMode: "propose" }).reason,
+    ).toMatch(/must NOT write/);
+    expect(
+      captureSignal({ transcript: t, ledger: noLedger, env: {}, captureMode: "auto" }).reason,
+    ).toMatch(/persist/);
+  });
+
+  it("an ambient gate stamps the cooldown, and the next one is suppressed", () => {
+    const io = fakeLedgerIo();
+    const lines = [userLine("go on"), '{"role":"assistant","content":[{"tool_use":1}]}'];
+    const input = { transcript_path: "t", session_id: "s1" };
+
+    // Far enough past the default cooldown that the first ambient pass fires.
+    const first = captureGate({
+      input,
+      env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5" },
+      readTranscript: tx(lines, 20),
+      ledgerIo: io,
+    });
+    expect(first?.systemMessage).toBeTruthy();
+    expect(loadLedger("s1", io).lastGatedTurn).toBe(20);
+
+    // One turn later: still inside the window, so nothing fires.
+    expect(
+      captureGate({
+        input,
+        env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5" },
+        readTranscript: tx(lines, 21),
+        ledgerIo: io,
+      }),
+    ).toBeNull();
+  });
+
+  it("explicit intent bypasses the cooldown and does not restamp it", () => {
+    const io = fakeLedgerIo();
+    saveLedger("s1", { lastGatedTurn: 20, captured: [] }, io);
+    const out = captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("remember that")], 21),
+      ledgerIo: io,
+    });
+    expect(out?.systemMessage).toBeTruthy();
+    // Asking twice in a row must both land, so an explicit pass leaves the
+    // window where it was rather than opening a new one.
+    expect(loadLedger("s1", io).lastGatedTurn).toBe(20);
+  });
+
+  it("CONTEXTNEST_CAPTURE_ALWAYS forces a block past both the heuristic and the cooldown", () => {
+    const io = fakeLedgerIo();
+    saveLedger("s1", { lastGatedTurn: 20, captured: [] }, io);
+    const out = captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: { CONTEXTNEST_CAPTURE_ALWAYS: "1" },
+      readTranscript: tx([userLine("hi")], 21),
+      ledgerIo: io,
+    });
+    expect(out?.systemMessage).toBeTruthy();
+  });
+
+  it("park → drain: the job reaches the model on the NEXT prompt, once", () => {
+    // The end-to-end contract of the non-blocking design. Stop parks; the next
+    // UserPromptSubmit hands it over as additionalContext and the queue empties.
+    const io = fakeLedgerIo();
+    const input = { transcript_path: "t", session_id: "s1" };
+
+    const stop = captureGate({
+      input,
+      env: {},
+      readTranscript: tx([userLine("actually it's Postgres not Redis")]),
+      ledgerIo: io,
+    });
+    expect(stop).not.toHaveProperty("decision");
+
+    const first = retrieve({
+      input: { prompt: "what next", session_id: "s1" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+      ledgerIo: io,
+    });
+    expect(additional(first)).toMatch(/contextnest-curator/);
+    expect(additional(first)).toMatch(/background/);
+
+    // Handed over exactly once — a dispatch the model ignores is not nagged.
+    expect(loadLedger("s1", io).pending).toBeNull();
+    const second = retrieve({
+      input: { prompt: "and again", session_id: "s1" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+      ledgerIo: io,
+    });
+    expect(additional(second) ?? "").not.toMatch(/contextnest-curator/);
+  });
+
+  it("a parked job surfaces even with retrieval_mode off", () => {
+    // The early-return trap: `off` bails before retrieval, but the queue is the
+    // only path the work has, so it must drain first.
+    const io = fakeLedgerIo();
+    captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("remember that we use pnpm")]),
+      ledgerIo: io,
+    });
+    const out = retrieve({
+      input: { prompt: "hello", session_id: "s1" },
+      env: { CONTEXTNEST_RETRIEVAL_MODE: "off" },
+      exec: fakeExec([], []),
+      ledgerIo: io,
+    });
+    expect(additional(out)).toMatch(/contextnest-capture/);
+    expect(loadLedger("s1", io).pending).toBeNull();
+  });
+
+  it("a parked job surfaces even when the prompt is empty", () => {
+    const io = fakeLedgerIo();
+    captureGate({
+      input: { transcript_path: "t", session_id: "s1" },
+      env: {},
+      readTranscript: tx([userLine("remember that we use pnpm")]),
+      ledgerIo: io,
+    });
+    const out = retrieve({
+      input: { prompt: "", session_id: "s1" },
+      env: {},
+      exec: fakeExec([["vault list", []]], []),
+      ledgerIo: io,
+    });
+    expect(additional(out)).toMatch(/contextnest-capture/);
+  });
+
+  it("isSubstantive: tool use → true; an unreadable tail is no longer a reason to capture", () => {
     expect(isSubstantive(['{"role":"assistant","tool_use":1}'])).toBe(true);
-    expect(isSubstantive([])).toBe(true);
+    expect(isSubstantive([])).toBe(false);
     expect(isSubstantive(['{"role":"user"}', '{"role":"assistant"} short'])).toBe(false);
+  });
+});
+
+describe("makeExec", () => {
+  // The Windows shim path is the whole reason this quoting exists: npm installs
+  // ctx as ctx.cmd there, Node refuses to execFile a .cmd without a shell, and
+  // cmd.exe does no quoting of its own. On mac/linux `ctx` is a shebang symlink
+  // that execve handles directly, so none of this is engaged.
+  it("winQuote leaves shell-safe argv entries untouched", () => {
+    expect(winQuote("search")).toBe("search");
+    expect(winQuote("--json")).toBe("--json");
+    expect(winQuote("nodes/backend/auth")).toBe("nodes/backend/auth");
+  });
+
+  it("winQuote wraps anything cmd.exe would split or interpret", () => {
+    expect(winQuote("public nest sharing")).toBe('"public nest sharing"');
+    expect(winQuote("#a | #b")).toBe('"#a | #b"');
+    expect(winQuote("")).toBe('""');
+  });
+
+  it("winQuote doubles backslash runs that would escape the closing quote", () => {
+    expect(winQuote("C:\\Program Files\\ctx\\")).toBe('"C:\\Program Files\\ctx\\\\"');
+    expect(winQuote('say "hi"')).toBe('"say \\"hi\\""');
+  });
+
+  it("runs a real command and returns its stdout on every platform", () => {
+    const exec = makeExec({ ctxCommand: process.execPath });
+    const res = exec(["--version"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe(process.version);
+  });
+
+  // Deliberately not "the command is missing": that path ENOENTs into the npx
+  // fallback, which resolves the real CLI off the network and legitimately
+  // succeeds. A command that runs and fails is the case worth pinning — hooks
+  // must never break a session, so a non-zero exit is reported, never thrown.
+  it("reports a failing command instead of throwing", () => {
+    const exec = makeExec({ ctxCommand: process.execPath });
+    const res = exec(["-e", "process.exit(3)"]);
+    expect(res.status).toBe(3);
+  });
+});
+
+
+// One server alias (`cn`, a Community server's all-nests /mcp) stands for every
+// nest behind it; `ctx vault list` adds a `cn/<nest>` row per nest.
+describe("server-level alias with <server>/<nest> rows", () => {
+  const rows = [
+    { alias: "cn", kind: "remote", description: "All 2 nest(s)" },
+    { alias: "cn/strategy", kind: "remote", parent: "cn", description: "GTM strategy" },
+    { alias: "cn/chameleon", kind: "remote", parent: "cn", description: "Partner: Chameleon" },
+  ];
+
+  it("auto-retrieval searches the server row once, not each nest row", () => {
+    expect(vaultTargets(cfg({}), fakeExec([["vault list", rows]]))).toEqual(["cn"]);
+  });
+
+  it("a <server>/<nest> pin is honoured", () => {
+    const ex = fakeExec([["vault list", rows]]);
+    expect(vaultTargets(cfg({ CONTEXTNEST_VAULT_ALIAS: "cn/chameleon" }), ex)).toEqual(["cn/chameleon"]);
+  });
+
+  it("retrieval cites each hit by the nest it came from", () => {
+    const ex = fakeExec([
+      ["vault list", rows],
+      ["search", [{ id: "nodes/p", title: "Partner pricing", vault: "cn/chameleon" }]],
+    ]);
+    const out = retrieve({ input: { prompt: "partner pricing tiers" }, env: { CLAUDE_PROJECT_DIR: SANDBOX_DIR }, exec: ex });
+    expect(additional(out)).toContain("cn/chameleon:nodes/p");
+  });
+
+  it("the sweep parses --vault <server>/<nest> and reads each hit in its own nest", () => {
+    expect(parseUpdates("ctx update nodes/x --vault cn/chameleon --tags a")).toEqual([
+      { id: "nodes/x", vault: "cn/chameleon" },
+    ]);
+    const reads: string[] = [];
+    const exec = (args: string[]) => {
+      const key = args.join(" ");
+      if (key.startsWith("list --tag")) return { status: 0, stdout: "[]", stderr: "" };
+      if (key.startsWith("search"))
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { id: "nodes/x", vault: "cn/chameleon" }, // the node just written: excluded
+            { id: "nodes/y", vault: "cn/strategy" },
+          ]),
+          stderr: "",
+        };
+      if (key.startsWith("read")) {
+        reads.push(key);
+        return { status: 0, stdout: "we use redis", stderr: "" };
+      }
+      return { status: 0, stdout: "[]", stderr: "" };
+    };
+    const { found } = findStragglers(exec, ["redis"], "nodes/x", "cn/chameleon", ["cn"]);
+    expect(found).toEqual([{ ref: "cn/strategy:nodes/y", term: "redis", stale: false }]);
+    expect(reads).toEqual(["read nodes/y --raw --vault cn/strategy"]);
+  });
+
+  it("sweepTargets skips nest rows (the server row covers them)", () => {
+    const { targets } = sweepTargets(fakeExec([["vault list", rows]]), "cn/chameleon", {});
+    // The server row already searches cn/chameleon — no second pass for it.
+    expect(targets).toEqual(["cn"]);
+  });
+});
+
+describe("unclear_nest setting", () => {
+  it("defaults to ask; accepts default; ignores garbage", () => {
+    expect(cfg({}).unclearNest).toBe("ask");
+    expect(cfg({ CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST: "default" }).unclearNest).toBe("default");
+    expect(cfg({ CONTEXTNEST_UNCLEAR_NEST: "Default " }).unclearNest).toBe("default");
+    expect(cfg({ CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST: "guess" }).unclearNest).toBe("ask");
+  });
+
+  it("travels in the capture directive", () => {
+    expect(captureReason("propose")).toMatch(/asks the user which nest/);
+    expect(captureReason("propose", "default")).toMatch(/pinned vault, else the registry default/);
+  });
+
+  it("a <server>/<nest> pin passes the alias-shape check", () => {
+    expect(cfg({ CONTEXTNEST_VAULT_ALIAS: "cn/chameleon" }).vault).toBe("cn/chameleon");
+    expect(cfg({ CONTEXTNEST_VAULT_ALIAS: "a/b/c" }).vault).toBe("");
   });
 });

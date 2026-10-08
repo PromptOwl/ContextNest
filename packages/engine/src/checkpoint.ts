@@ -10,9 +10,20 @@ import type {
   DocumentHistory,
   GovernanceTier,
   SuggestionMeta,
+  VersionEntry,
 } from "./types.js";
+
+/**
+ * The part of a document's history a seal reads: each version's number and
+ * chain hash. A full `DocumentHistory` fits; so does the one entry carried
+ * forward from the previous head.
+ */
+type SealHistory = {
+  versions: ReadonlyArray<Pick<VersionEntry, "version" | "chain_hash">>;
+};
 import { computeCheckpointHash, computeChainHash } from "./integrity.js";
-import { NestStorage } from "./storage.js";
+import { NestStorage, type CheckpointChainState } from "./storage.js";
+import { mapInBatches } from "./concurrency.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
 import { isPublished } from "./parser.js";
@@ -132,8 +143,19 @@ async function scanOneDocument(
     return { documentId, drifted: false };
   }
 
-  // Need a chain head to diff against — skip legacy unseeded docs.
-  const history = await input.storage.readHistory(documentId);
+  // Need a chain head to diff against — skip legacy unseeded docs. readHistory
+  // throws on a present-but-unreadable history; that is one document's problem,
+  // and this scan promises not to fail wholesale over one ill-formed file.
+  let history: DocumentHistory | null;
+  try {
+    history = await input.storage.readHistory(documentId);
+  } catch (err) {
+    return {
+      documentId,
+      drifted: true,
+      skippedReason: `unreadable-history: ${(err as Error).message.split("\n")[0]}`,
+    };
+  }
   if (!history || history.versions.length === 0) {
     return {
       documentId,
@@ -266,37 +288,101 @@ export class CheckpointManager {
    * read at different times and a concurrent publish slips between them, leaving
    * a freshly-published doc absent from the checkpoint it should have sealed.
    */
-  async createCheckpointFromVault(triggeredBy: string): Promise<Checkpoint> {
+  async createCheckpointFromVault(
+    triggeredBy: string,
+    /**
+     * Entries the caller just appended (id → version + chain hash). A doc whose
+     * on-disk version matches is sealed from this instead of re-reading its
+     * history.yaml; anything else is read as usual.
+     */
+    justSealed?: ReadonlyMap<string, Pick<VersionEntry, "version" | "chain_hash">>,
+    /** Receives the vault crawl, so the index rebuild after it need not crawl again. */
+    onCrawl?: (docs: ContextNode[]) => void,
+  ): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
-      const publishedDocuments = (
-        await this.storage.discoverDocuments()
-      ).filter(isPublished);
-      const documentHistories = await this.storage.findAllHistories();
-      return this.sealCheckpoint(
+      // includeRetired only adds rejected docs, which the published filter drops
+      // anyway — and it is the set regenerateIndex needs.
+      const crawled = await this.storage.discoverDocuments({ includeRetired: true });
+      onCrawl?.(crawled);
+      const publishedDocuments = crawled.filter(isPublished);
+      // Snapshot before the reads: a write that lands during the seal stays
+      // marked for the next one.
+      const touched = this.storage.touchedHistorySnapshot();
+      const chainState = await this.storage.readCheckpointChainState();
+      let documentHistories: Map<string, SealHistory>;
+      if (chainState.kind === "head") {
+        // Every publish seals, so the head already holds the chain hash of each
+        // document at the version it had then. Reading every history.yaml
+        // again made each publish cost one read per document in the vault —
+        // a full walk of a network-backed mount under the vault lock. Read
+        // only the documents the head cannot vouch for.
+        //
+        // A hash the head sealed is carried forward as is. If the head sealed
+        // a mismatched hash (the torn-snapshot fallback below), later seals at
+        // that version keep it, where a full re-read would have healed it.
+        // `verify` still flags it, and the next version bump re-reads the doc.
+        const head = chainState.checkpoint;
+        documentHistories = new Map();
+        const stale: string[] = [];
+        for (const doc of publishedDocuments) {
+          const hash = head.document_chain_hashes[doc.id];
+          const version = doc.frontmatter.version || 1;
+          const fresh = justSealed?.get(doc.id);
+          if (hash && head.document_versions[doc.id] === version && !touched.has(doc.id)) {
+            documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
+          } else if (fresh && fresh.version === version) {
+            documentHistories.set(doc.id, { versions: [fresh] });
+          } else {
+            stale.push(doc.id);
+          }
+        }
+        await mapInBatches(stale, async (id) => {
+          try {
+            const history = await this.storage.readHistory(id);
+            if (history) documentHistories.set(id, history);
+          } catch {
+            // Unreadable: no hash for this doc, the same as the full crawl
+            // (called without `onUnreadable`) skipping it. `verify` reports it.
+          }
+        });
+      } else {
+        documentHistories = await this.storage.findAllHistories();
+      }
+      const checkpoint = await this.sealCheckpoint(
         triggeredBy,
         publishedDocuments,
         documentHistories,
+        chainState,
       );
+      this.storage.clearTouchedHistories(touched);
+      return checkpoint;
     });
   }
 
   /**
-   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it re-reads
-   * context_history.yaml, appends one checkpoint, and writes it back.
+   * Core checkpoint seal. MUST run inside `withCheckpointLock`: it reads the
+   * chain's head, links one checkpoint onto it, and appends.
    */
   private async sealCheckpoint(
     triggeredBy: string,
     publishedDocuments: ContextNode[],
-    documentHistories: Map<string, DocumentHistory>,
+    documentHistories: ReadonlyMap<string, SealHistory>,
+    knownChainState?: CheckpointChainState,
   ): Promise<Checkpoint> {
     {
       // Re-read inside the lock so the checkpoint number and previous-hash
       // linkage are based on the latest committed write, not a stale snapshot.
-      const history = (await this.storage.readCheckpointHistory()) || {
-        checkpoints: [],
-      };
-
-      const previousCheckpoint = getLatestCheckpoint(history);
+      // Head only, not the whole chain: this runs on every publish, and the
+      // chain grows by one entry per published document per checkpoint, so
+      // loading it here made each publish cost O(chain size).
+      //
+      // The full state, not just the head: whether the existing file gets
+      // quarantined below turns on WHY there is no head, and a transient read
+      // failure throws out of here rather than being mistaken for one.
+      const chainState =
+        knownChainState ?? (await this.storage.readCheckpointChainState());
+      const previousCheckpoint =
+        chainState.kind === "head" ? chainState.checkpoint : null;
 
       const checkpointNumber = previousCheckpoint
         ? previousCheckpoint.checkpoint + 1
@@ -354,8 +440,21 @@ export class CheckpointManager {
         checkpoint_hash: checkpointHash,
       };
 
-      history.checkpoints.push(checkpoint);
-      await this.storage.writeCheckpointHistory(history);
+      // Extend the chain in place when there is one to extend. Otherwise start
+      // a new file — preserving the old one ONLY when it was genuinely
+      // unreadable. An absent or validly-empty chain has nothing to preserve,
+      // and calling either of those corrupt would litter the vault with
+      // `.corrupt-*` files and cry a break that never happened.
+      if (chainState.kind === "head") {
+        await this.storage.appendCheckpoint(checkpoint);
+      } else {
+        await this.storage.startCheckpointHistory(
+          checkpoint,
+          chainState.kind === "unreadable"
+            ? { quarantineExisting: chainState.reason }
+            : {},
+        );
+      }
 
       return checkpoint;
     }
@@ -443,10 +542,13 @@ export class CheckpointManager {
     // replaced by its correct recomputation rather than re-sealed.
     const recomputed = new Map<
       string,
-      Map<number, { hash: string; publishedAt: string }>
+      Map<number, { hash: string; publishedAt: string; forgotten: boolean }>
     >();
     for (const [docId, history] of allHistories) {
-      const perVersion = new Map<number, { hash: string; publishedAt: string }>();
+      const perVersion = new Map<
+        number,
+        { hash: string; publishedAt: string; forgotten: boolean }
+      >();
       let prevChainHash: string | null = null;
       for (const entry of history.versions) {
         const hash = computeChainHash(
@@ -459,7 +561,13 @@ export class CheckpointManager {
         prevChainHash = hash;
         // Only published versions seed checkpoints; keep the first occurrence.
         if (entry.published_at && !perVersion.has(entry.version)) {
-          perVersion.set(entry.version, { hash, publishedAt: entry.published_at });
+          perVersion.set(entry.version, {
+            hash,
+            publishedAt: entry.published_at,
+            // A node-level forget's stub (§6.3.3) is sealed like a publish —
+            // it cuts a checkpoint — but the node leaves the published set.
+            forgotten: entry.forget_stub === true,
+          });
         }
       }
       recomputed.set(docId, perVersion);
@@ -471,11 +579,12 @@ export class CheckpointManager {
       version: number;
       publishedAt: string;
       chainHash: string;
+      forgotten: boolean;
     }> = [];
 
     for (const [docId, perVersion] of recomputed) {
-      for (const [version, { hash, publishedAt }] of perVersion) {
-        tuples.push({ docId, version, publishedAt, chainHash: hash });
+      for (const [version, { hash, publishedAt, forgotten }] of perVersion) {
+        tuples.push({ docId, version, publishedAt, chainHash: hash, forgotten });
       }
     }
 
@@ -496,8 +605,14 @@ export class CheckpointManager {
 
     for (let i = 0; i < tuples.length; i++) {
       const tuple = tuples[i];
-      runningVersions[tuple.docId] = tuple.version;
-      runningChainHashes[tuple.docId] = tuple.chainHash;
+      if (tuple.forgotten) {
+        // The live seal leaves a forgotten node out of the map; so does this.
+        delete runningVersions[tuple.docId];
+        delete runningChainHashes[tuple.docId];
+      } else {
+        runningVersions[tuple.docId] = tuple.version;
+        runningChainHashes[tuple.docId] = tuple.chainHash;
+      }
 
       const checkpointNumber = i + 1;
       const documentVersions = { ...runningVersions };

@@ -8,7 +8,16 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **19 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **41 tools** over stdio transport.
+
+> **New in 2.2.1** — `context_folders` lists the vault's folders and their
+> document counts without opening a document, and `context_list` takes a
+> `folder` to read one folder instead of crawling the whole vault. Writes on a
+> large vault no longer slow down as its checkpoint chain grows.
+>
+> **New in 2.1** — the server now installs **zero dependencies**, down from 97 packages at depth 11. `context_import` also gained the whole folder-import flow, so an existing folder of markdown can be imported in one call.
+>
+> **New in 2.0** — sixteen canonical `context_*` tools are generated straight from the engine's operation catalog, so this server, the `ctx` CLI and the PromptOwl cloud now advertise the same names, schemas and error codes. The older tools still work and are marked deprecated. See [Upgrading to 2.0](#upgrading-to-20).
 
 ## Install
 
@@ -23,6 +32,12 @@ Or install globally:
 ```bash
 npm install -g @promptowl/contextnest-mcp-server
 ```
+
+**Zero dependencies, no install scripts.** Everything the server needs is compiled into the
+published bundle, so the install pulls one package and executes none of our code. A stdio server
+never touches the SDK's express, hono, ajv or jose transports, and they are no longer shipped. Every
+bundled package is listed with its version and licence in
+[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
 
 ## Usage
 
@@ -83,23 +98,111 @@ directory.
 
 ## Tools
 
+### Canonical tools (`context_*`)
+
+Name, description and input schema for each of these come from the engine's
+operation catalog, so this surface cannot drift from the CLI or the cloud. Prefer
+them over the legacy tools below.
+
 | Tool | Description |
 |------|-------------|
-| `vault_info` | Get vault identity and configuration summary |
-| `resolve` | Execute a selector query with graph traversal |
-| `read_document` | Read a single document by URI or path |
-| `list_documents` | List documents with optional type/status/tag filters |
-| `search` | Full-text search with graph traversal |
-| `read_pack` | Resolve and return a context pack |
+| `context_init` | Open a vault: its `CONTEXT.md` instructions, configuration, path, and what it holds (totals, counts by type and status, tag set). `include_nodes` to also list nodes |
+| `context_nests` | List every nest in the central registry — alias, path, description, which is default, whether it exists |
+| `context_skill` | Render a `type: skill` node for an agent harness (Claude Code, Cursor, Codex, raw) — trigger becomes the harness matcher |
+| `context_skill_install` | Build the file manifest that installs a vault skill. Loader mode (default) fetches at runtime and cannot drift; `full` embeds an offline copy that will |
+| `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
+| `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
+| `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |
+| `context_search` | Full-text search with graph traversal |
+| `context_query` | Selector query with graph traversal. `include_drafts` for authoring surfaces |
+| `context_resolve` | Resolve a selector to full bodies within a token budget |
+| `context_versions` | List a document's version history (new capability — nothing exposed this before) |
+| `context_reconstruct` | Reconstruct a specific version. Refuses a version the history does not contain, instead of returning a neighbour's content |
+| `context_packs` | List packs, each with its `includes` and `excludes` |
+| `context_verify` | Verify every hash chain in the vault and rebuild every recorded version (`version_unreconstructable` when one cannot be rebuilt). Forgotten versions verify hash-only (`tombstoned`) |
+| `context_forget` | Forget a node (spec §6.3): erase every version's content, keep the hashes so verify still passes, leave an empty `status: forgotten` stub every URI resolves to. `reason_code` is a closed set, never free text. Later republish/re-import of the content is refused |
+| `context_forget_log` | The forget audit trail: who, when, reason code, which versions. Never the content |
+| `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |
+| `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
+| `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |
+| `context_delete` | Delete a node and its version history, recorded in the forget audit log (`purge: true` for none); returns the deleted node's `title` |
+| `context_import_pdf` | Import a PDF (`bytes_base64`) as a `type: pdf` node: extracted text as the body (`<!-- page N -->` markers; empty + `text_layer: false` for a scan), the PDF stored beside it and bound by SHA-256. Pass `id` of an existing pdf node for a new version — the old binary is kept in history |
+| `context_import` | Bulk create-and-publish. Takes `documents` (title + content) and/or `ids` (files already in the vault, published as-is) — a mixed batch seals **one** checkpoint and regenerates the index **once** |
+
+#### `client` — attributing a call
+
+Every tool above takes an optional `client` object naming the calling agent and
+its session, plus any custom scalar keys:
+
+```jsonc
+context_create({
+  title: "API Design",
+  content: "…",
+  client: { agent: "claude-code", session_id: "s-9f2" }
+})
+```
+
+A write that publishes records it on the version-history entry it seals, so
+`context_versions` can answer *which agent wrote v7, in which session*; a graph
+read stamps it on the access traces it emits.
+
+**Every field is optional** — `client` itself, and `agent`/`session_id` within
+it. Send none, one, or all.
+
+**You usually do not need to send it.** The server fills both fields from what
+the connection already tells it: `agent` from the `clientInfo.name` in your
+`initialize` handshake, and `session_id` from a per-process id — over stdio one
+server process is one client connection, so every call sharing that id really
+did come from one session. Anything you send wins, merged **per key**: supply
+just `agent` and you keep it while still getting a session id.
+
+| Env var | Effect |
+|---------|--------|
+| `CONTEXTNEST_NO_ATTRIBUTION=1` | Server derives nothing; nothing is recorded unless a caller sends its own `client` |
+| `CONTEXTNEST_AGENT` | Overrides the `agent` the handshake reports |
+| `CONTEXTNEST_SESSION_ID` | Overrides the per-process session id |
+
+Precedence per key: **caller > env > connection.** With attribution off and no
+caller value, the `client` key is left off the record entirely rather than
+written as `{}` — "not attributed" and "attributed to nobody" are different
+claims, and history should only make the first. The opt-out matters because
+what gets derived lands in an append-only history: an operator who does not
+want their client's name recorded in a vault needs to say so before the first
+write, not scrub it after.
+
+It is a label, never an identity claim — `clientInfo.name` is your self-report,
+the server authenticates neither, and it never authorizes from either — and it
+is not an input to any hash chain. Note that `client` describes the CALL;
+`metadata` on `context_create` / `context_update` is frontmatter and describes
+the DOCUMENT. See spec §9.4.
+
+### Vault tools
+
+| Tool | Description |
+|------|-------------|
 | `document_format` | Get the document format spec (call before creating docs) |
-| `create_document` | Create a new document (supports all types including skill nodes) |
-| `update_document` | Update an existing document |
-| `delete_document` | Delete a document and its version history |
-| `publish_document` | Publish a document (bump version, checkpoint) |
 | `read_index` | Return the context.yaml graph index |
-| `read_version` | Reconstruct a specific version of a document |
-| `verify_integrity` | Verify all hash chains in the vault |
+| `read_pack` | Resolve and return a context pack |
 | `list_checkpoints` | List recent checkpoints |
+
+### Deprecated tools
+
+Registered and behaving exactly as before, so existing clients keep working. They
+will be removed in a future major.
+
+| Deprecated | Use instead |
+|------|-------------|
+| `vault_info` | `context_init` |
+| `read_document` | `context_get` |
+| `list_documents` | `context_list` |
+| `search` | `context_search` |
+| `resolve` | `context_resolve` |
+| `read_version` | `context_reconstruct` |
+| `verify_integrity` | `context_verify` |
+| `create_document` | `context_create` |
+| `update_document` | `context_update` |
+| `publish_document` | `context_publish` |
+| `delete_document` | `context_delete` |
 
 ### Drift Governance
 
@@ -136,10 +239,42 @@ The `resolve`, `search`, and `read_pack` tools support graph-aware queries:
 Agents can discover and use skill nodes — governed procedures with triggers, inputs, and guard rails:
 
 ```
-resolve({ selector: "type:skill + #engineering" })  → all engineering skills
-list_documents({ type: "skill" })                    → all skill nodes
-create_document({ type: "skill", trigger: "..." })   → create a new skill
+context_resolve({ selector: "type:skill + #engineering" })  → all engineering skills
+context_list({ type: "skill" })                             → all skill nodes
+context_create({ type: "skill", trigger: "..." })           → create a new skill
 ```
+
+## Upgrading to 2.0
+
+Nothing in your MCP client config changes. The old tools are all still
+registered. Four things do change:
+
+**`context_overview` is removed.** It returned counts and a node list.
+`context_init` now returns everything it did *plus* the vault's `CONTEXT.md`
+instructions, its configuration and its path — so opening a vault is one call
+instead of two. `vault_info` is an alias for `context_init` now, which is what
+that name always promised. Node lists are opt-in behind `include_nodes`.
+
+**Document ids are taken exactly as stored.** A bare slug is no longer re-rooted
+under `nodes/`. If you were passing `api-design` to `read_document` and relying on
+it finding `nodes/api-design`, pass the full id to `context_get`. This is what
+makes flat-layout vaults work at all — every id from one used to resolve to a
+document that does not exist. A trailing `.md` and leading slashes are still
+stripped.
+
+**`context_import` output changed:** `created` → `published`, and `checkpoint` is
+added. `failed` entries carry `id` (for the `ids` path) or `title` (for the
+`documents` path), not `title` unconditionally.
+
+**`context_update` semantics:** `title` now sets a *new* title rather than
+selecting the node to update — select by `id`. `tags` replaces the tag set rather
+than merging into it; send the merged set if you want the old behaviour. A `null`
+metadata value clears that key.
+
+Two long-standing filter bugs are fixed in `context_list`, which may return
+results where it previously returned nothing: `status: "rejected"` could never
+match, and `type: "document"` skipped every document that omitted the optional
+`type` field. Tags now match with or without a leading `#` and regardless of case.
 
 ## Ecosystem
 

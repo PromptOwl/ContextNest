@@ -31,6 +31,7 @@ import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { VersionManager } from "./versioning.js";
+import { withVaultLock } from "./vault-lock.js";
 import { readSuggestion } from "./suggestions.js";
 import {
   requireCzar,
@@ -42,6 +43,7 @@ import {
 } from "./errors.js";
 import type {
   ContextNode,
+  DocumentHistory,
   GovernanceTier,
   HashChainEvent,
   HashChainEventType,
@@ -49,6 +51,7 @@ import type {
   VersionEntry,
 } from "./types.js";
 import type { NestStorage } from "./storage.js";
+import { settlePdfForCommit } from "./pdf-nodes.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -81,7 +84,7 @@ export interface ApprovalResult {
  * Refuses if the suggestion's `target_hash` no longer equals the current
  * chain head (suggestion is stale; caller must re-stage).
  */
-export async function approveSuggestion(
+async function approveSuggestionImpl(
   input: ApproveSuggestionInput,
 ): Promise<ApprovalResult> {
   const sug = await readSuggestion(
@@ -119,6 +122,7 @@ export async function approveSuggestion(
     newRawContent: patched,
     actor: input.actor,
     note: input.comment,
+    knownHistory: approved.history,
   });
 
   const archivedAt = await input.storage.archiveSuggestion(
@@ -168,7 +172,7 @@ export interface RejectionResult {
  * are MOVED (not deleted) into `_archive/rejected/` — per spec, governance
  * history is permanently retained.
  */
-export async function rejectSuggestion(
+async function rejectSuggestionImpl(
   input: RejectSuggestionInput,
 ): Promise<RejectionResult> {
   if (!input.reason.trim()) {
@@ -247,7 +251,7 @@ export interface RollbackResult {
  * prior content. Prior versions are not erased; the chain reads cleanly
  * forward to the rollback entry, then to whatever comes after.
  */
-export async function rollbackDocument(
+async function rollbackDocumentImpl(
   input: RollbackInput,
 ): Promise<RollbackResult> {
   await gateForTier(input.rbac, input.docTier, {
@@ -258,9 +262,13 @@ export async function rollbackDocument(
   });
 
   const vm = new VersionManager(input.storage);
+  // One history read, shared by the reconstruct and the commit below. Plain
+  // read, as the reconstruct always did: a corrupt history fails the rollback.
+  const history = await input.storage.readHistory(input.documentId);
   const targetContent = await vm.reconstructVersion(
     input.documentId,
     input.targetVersion,
+    history ?? undefined,
   );
 
   const { versionEntry } = await commitNewVersion({
@@ -268,6 +276,8 @@ export async function rollbackDocument(
     documentId: input.documentId,
     newRawContent: targetContent,
     actor: input.actor,
+    knownHistory: history,
+    restoring: true,
     note: input.reason
       ? `rollback to v${input.targetVersion}: ${input.reason}`
       : `rollback to v${input.targetVersion}`,
@@ -313,7 +323,7 @@ export interface CzarDirectEditResult {
  * No suggestion layer. Czar's signature is auto-recorded. Subscribers see
  * it as a direct publication (chain event = `primary.approved`).
  */
-export async function czarDirectEdit(
+async function czarDirectEditImpl(
   input: CzarDirectEditInput,
 ): Promise<CzarDirectEditResult> {
   await requireCzar(input.rbac, input.actor, input.zone, "czarDirectEdit");
@@ -358,7 +368,7 @@ async function gateForTier(
 async function loadApprovedBase(
   storage: NestStorage,
   documentId: string,
-): Promise<{ version: number; content: string }> {
+): Promise<{ version: number; content: string; history: DocumentHistory }> {
   // The approved base is the EXACT current chain head — last keyframe plus
   // any diffs applied forward. `readLatestApprovedKeyframe` alone would
   // skip non-keyframe entries and let stale suggestions slip through.
@@ -370,8 +380,10 @@ async function loadApprovedBase(
   const content = await new VersionManager(storage).reconstructVersion(
     documentId,
     latest.version,
+    history,
   );
-  return { version: latest.version, content };
+  // Returned so the commit reuses this read instead of reading it again.
+  return { version: latest.version, content, history };
 }
 
 async function assertNotStale(
@@ -394,6 +406,13 @@ interface CommitInput {
   newRawContent: string;
   actor: string;
   note?: string;
+  /** True for a rollback — see `settlePdfForCommit`. */
+  restoring?: boolean;
+  /**
+   * History the caller already read under this lock; omit to read it here.
+   * `null` means the document has no history — not "unknown".
+   */
+  knownHistory?: DocumentHistory | null;
 }
 
 async function commitNewVersion(
@@ -402,7 +421,17 @@ async function commitNewVersion(
   const filePath = join(input.storage.root, `${input.documentId}.md`);
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
 
-  const newVersion = (parsed.frontmatter.version ?? 0) + 1;
+  const versionManager = new VersionManager(input.storage);
+  // Read once, shared by the numbering and the append below.
+  const knownHistory =
+    input.knownHistory !== undefined
+      ? input.knownHistory
+      : (await versionManager.historyOrRepair(input.documentId)).history;
+  const newVersion = await versionManager.nextVersion(
+    input.documentId,
+    parsed.frontmatter.version ?? 0,
+    knownHistory,
+  );
   const updatedAt = new Date().toISOString();
   const node: ContextNode = {
     ...parsed,
@@ -412,6 +441,12 @@ async function commitNewVersion(
       updated_at: updatedAt,
     },
   };
+
+  // A pdf node's text and binary move together: refuse an edit that would
+  // split them, and bring the sidecar in line with the version being sealed.
+  await settlePdfForCommit(input.storage, input.documentId, node, {
+    restoring: input.restoring ?? false,
+  });
 
   // Recompute body checksum on the body-as-it-will-be-serialized so the
   // checksum stored in frontmatter matches what later drift detection
@@ -423,14 +458,11 @@ async function commitNewVersion(
   const serialized = serializeDocument(node);
   const finalNode: ContextNode = { ...node, rawContent: serialized };
 
-  const versionEntry = await new VersionManager(input.storage).createVersion(
-    finalNode,
-    input.actor,
-    {
-      note: input.note,
-      publishedAt: updatedAt,
-    },
-  );
+  const versionEntry = await versionManager.createVersion(finalNode, input.actor, {
+    note: input.note,
+    publishedAt: updatedAt,
+    knownHistory,
+  });
 
   // Write the live canonical file last so a mid-flight crash leaves the
   // chain consistent (history wrote first, live file matches the chain
@@ -463,4 +495,43 @@ function buildChainEvent(args: {
 function makeEventId(...parts: Array<string | number>): string {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   return `evt_${ts}_${parts.join("_")}`;
+}
+
+// ─── Locked entry points ─────────────────────────────────────────────────────
+//
+// Every function above commits a version and appends hash-chain events — the
+// same critical section the catalog's mutating executors serialize with the
+// per-vault write lock. These are called DIRECTLY (not through the catalog) by
+// the CLI's `drift approve/reject`, the OSS MCP server's suggestion tools, and
+// Community's governance layer, so they must take the same lock themselves:
+// a `drift approve` racing a parallel curator's `ctx update` would otherwise
+// interleave chain writes and corrupt the checkpoint history silently.
+//
+// None of the implementations call each other or a locked catalog executor,
+// so acquiring here cannot deadlock (the lock is deliberately non-reentrant).
+
+/** Approve a staged suggestion: bumps version, writes canonical bytes, archives. */
+export async function approveSuggestion(
+  input: ApproveSuggestionInput,
+): Promise<ApprovalResult> {
+  return withVaultLock(input.storage.root, () => approveSuggestionImpl(input));
+}
+
+/** Reject a staged suggestion: archives it without merging. */
+export async function rejectSuggestion(
+  input: RejectSuggestionInput,
+): Promise<RejectionResult> {
+  return withVaultLock(input.storage.root, () => rejectSuggestionImpl(input));
+}
+
+/** Roll a document back to a prior version as a new version. */
+export async function rollbackDocument(input: RollbackInput): Promise<RollbackResult> {
+  return withVaultLock(input.storage.root, () => rollbackDocumentImpl(input));
+}
+
+/** Czar-tier direct edit: commit new content without the suggestion workflow. */
+export async function czarDirectEdit(
+  input: CzarDirectEditInput,
+): Promise<CzarDirectEditResult> {
+  return withVaultLock(input.storage.root, () => czarDirectEditImpl(input));
 }

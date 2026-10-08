@@ -39,6 +39,18 @@ export class InvalidUriError extends ContextNestError {
   }
 }
 
+/**
+ * Raised when a selector string fails to lex or parse (§2). Selectors are raw
+ * user input, so these are validation errors — not bugs — and callers (CLI,
+ * MCP) render them as one-line messages instead of stack traces.
+ */
+export class InvalidSelectorError extends ContextNestError {
+  constructor(message: string) {
+    super(message, "INVALID_SELECTOR", "§2");
+    this.name = "InvalidSelectorError";
+  }
+}
+
 export class CircularDependencyError extends ContextNestError {
   constructor(public readonly cycle: string[]) {
     super(
@@ -61,6 +73,66 @@ export class IntegrityError extends ContextNestError {
   ) {
     super(message, "INTEGRITY_ERROR", "§8");
     this.name = "IntegrityError";
+  }
+}
+
+/**
+ * Raised when a document's `history.yaml` is present but cannot be read as a
+ * valid history — truncated or null-byte-padded by an interrupted write,
+ * hand-edited into invalid YAML, or failing the schema.
+ *
+ * Deliberately NOT folded into "no history yet". `history.yaml` is rewritten
+ * whole on every version, from an object that falls back to `{ versions: [] }`
+ * when the read returns null. Conflating the two therefore makes the next
+ * publish replace a corrupt history with a two-entry one: the recorded versions
+ * vanish from the index, their keyframe/diff files are orphaned on disk,
+ * `reconstruct` can no longer reach them, and `verify` reports the vault clean
+ * afterwards because the evidence is gone.
+ *
+ * Fail loudly instead, before anything is written, and let a human decide:
+ * restore the file, or delete it to deliberately restart the chain.
+ */
+export class CorruptHistoryError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    public readonly reason: string,
+  ) {
+    super(
+      `Version history for "${documentId}" exists but could not be read: ${reason}\n` +
+        `Refusing to continue — writing a new history here would orphan the recorded versions.\n` +
+        `Restore the file from backup or version control, or delete it to deliberately ` +
+        `restart the chain (the already-recorded versions become unreachable if you do).`,
+      "CORRUPT_HISTORY",
+      "§6.2",
+    );
+    this.name = "CorruptHistoryError";
+  }
+}
+
+/**
+ * Raised on an attempt to overwrite the stored bytes of a version that is
+ * already sealed (`v{N}.md` / `v{N}.diff`).
+ *
+ * A sealed version's artifact is immutable: its `content_hash` is recorded in
+ * history.yaml and hash-chained, so rewriting the file silently invalidates the
+ * chain and destroys the only copy of that version's content. Repair paths that
+ * genuinely need to re-anchor an artifact pass `overwrite: true` explicitly.
+ */
+export class VersionArtifactExistsError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    public readonly version: number,
+    public readonly file: string,
+  ) {
+    super(
+      `Refusing to overwrite sealed version artifact ${file} for "${documentId}" (v${version}). ` +
+        `Version content is immutable once recorded; rewriting it would destroy the only copy ` +
+        `and break the hash chain. This usually means a version number was reused — check ` +
+        `whether the document's history.yaml is intact.`,
+      "VERSION_ARTIFACT_EXISTS",
+      "§6.1",
+    );
+    this.name = "VersionArtifactExistsError";
   }
 }
 
@@ -100,6 +172,33 @@ export class UnknownAliasError extends ConfigError {
       enumerable: true,
       configurable: true,
     });
+  }
+}
+
+/**
+ * Raised when vault resolution fell through to the bare working directory
+ * and that directory is not a vault root (no `.context/config.yaml`; a bare
+ * `context.yaml` does not count — that is the residue the old auto-index bug
+ * left behind). Reading it would report every `.md` under an arbitrary
+ * folder as a draft document, and the first query would auto-index it —
+ * writing a `context.yaml` into a directory the user never asked us to touch.
+ * Refuse instead, and say how to pick a real vault.
+ */
+export class NoVaultError extends ContextNestError {
+  constructor(
+    public readonly dir: string,
+    public readonly registered: readonly string[] = [],
+  ) {
+    const hint =
+      registered.length > 0
+        ? `(registered: ${registered.join(", ")})`
+        : `(see "ctx vault list")`;
+    super(
+      `${dir} is not a Context Nest vault. Run "ctx init" here, or name a vault — "ctx --vault <alias>", or CONTEXTNEST_VAULT=<alias> on any surface ${hint}.`,
+      "NO_VAULT",
+      "§11",
+    );
+    this.name = "NoVaultError";
   }
 }
 
@@ -213,5 +312,42 @@ export class ChainBreakError extends ContextNestError {
       "§367",
     );
     this.name = "ChainBreakError";
+  }
+}
+
+/**
+ * Raised when an operation would write content into a node the forget
+ * protocol erased (§6.3.4 anti-resurrection): publishing or editing a
+ * forgotten stub, publishing at a path a forget retired, publishing or
+ * importing content whose hash matches forgotten content, or forgetting a node
+ * that already is. A forgotten path is never revived — publish the content
+ * under a new path (a new identity) if it is genuinely meant to exist again.
+ */
+export class ForgottenDocumentError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    detail = "was forgotten — its content was erased and it cannot be republished",
+  ) {
+    super(`Document "${documentId}" ${detail}`, "FORGOTTEN_DOCUMENT", "§6.3");
+    this.name = "ForgottenDocumentError";
+  }
+}
+
+/**
+ * Raised when a caller asks to reconstruct a version whose content the forget
+ * protocol erased (§6.3.2). Distinct from VERSION_NOT_FOUND: the version
+ * existed — the chain still proves it — but what it said is gone on purpose.
+ */
+export class ForgottenVersionError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    public readonly version: number,
+  ) {
+    super(
+      `Version ${version} of ${documentId} was forgotten — its content was erased (hashes retained)`,
+      "VERSION_FORGOTTEN",
+      "§6.3",
+    );
+    this.name = "ForgottenVersionError";
   }
 }

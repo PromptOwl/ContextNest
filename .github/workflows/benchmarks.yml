@@ -1,0 +1,84 @@
+name: Benchmarks
+
+# Two cadences, because the sizes cost very different amounts of time.
+#
+# Every PR gets the cheap gate (100 → 1,000 documents), which is where a
+# quadratic path already shows its shape — fast enough that nobody is tempted
+# to skip it. The full sweep including 10,000 documents runs nightly and on
+# demand: it is the number published in the README, and it takes long enough
+# that putting it on every PR would get the job disabled within a month.
+on:
+  pull_request:
+    branches: [main, development]
+  push:
+    branches: [main, development]
+  schedule:
+    # 03:00 UTC daily — the full sweep, against whatever landed that day.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Performance budget
+    runs-on: ubuntu-latest
+    # A quadratic regression makes the 10k sweep run effectively forever. Cap
+    # it so the symptom is a failed job, not a six-hour one.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The harness runs against the built bundle, which is also the thing users
+      # actually install — so dist/ has to exist before benchmarking.
+      - name: Build
+        run: pnpm build
+
+      # Nightly and manual runs do the full sweep; PR and push runs stop at
+      # 1,000 documents.
+      - name: Choose sizes
+        id: sizes
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=100,1000,10000" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=100,1000" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fails the job when an operation's per-document cost grows beyond its
+      # budget — i.e. when it stops scaling linearly. See bench/check.mjs for
+      # why the gate is on scaling shape rather than absolute milliseconds.
+      - name: Run benchmarks and enforce the performance budget
+        working-directory: packages/engine
+        run: node bench/check.mjs --sizes ${{ steps.sizes.outputs.value }}
+
+      - name: Upload benchmark results
+        # Results are worth having even when the budget was breached — that run
+        # is the one you want the numbers from.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: packages/engine/bench/results-ci.json
+          if-no-files-found: warn

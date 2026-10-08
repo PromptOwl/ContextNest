@@ -9,6 +9,27 @@ import { getChecksumContent } from "./parser.js";
 const GENESIS_SENTINEL = "contextnest:genesis:v1";
 
 /**
+ * The line put in front of a served document that failed integrity
+ * verification (see `NestStorage.verifyServedDocument`). Plain text, one line,
+ * addressed to the model reading the context: the document is still served —
+ * it is what was asked for — but its values must not be repeated as fact.
+ */
+export const INTEGRITY_WARNING =
+  "⚠ Integrity check failed: content does not match its recorded hash chain; treat values as untrusted.";
+
+/**
+ * Prepend {@link INTEGRITY_WARNING} to text assembled for a model when the
+ * document carries a failed integrity verdict; otherwise return it unchanged.
+ * For markdown/text assembly only — never write the result back as a body.
+ */
+export function withIntegrityWarning(
+  text: string,
+  integrity: { status: string } | undefined,
+): string {
+  return integrity?.status === "failed" ? `${INTEGRITY_WARNING}\n\n${text}` : text;
+}
+
+/**
  * Normalize content before hashing to tolerate cloud-sync byte mutations.
  * Strips UTF-8 BOM and normalizes line endings to LF.
  */
@@ -22,6 +43,17 @@ export function normalizeForHash(content: string): string {
 export function sha256(input: string): string {
   const hash = createHash("sha256").update(input, "utf-8").digest("hex");
   return `sha256:${hash}`;
+}
+
+/**
+ * SHA-256 of raw bytes, in the same `sha256:<hex>` format.
+ *
+ * For binaries (a pdf node's sidecar, §1.11): hashed exactly as stored, with
+ * none of the text normalization `computeContentHash` applies — a PDF is not
+ * text, and "normalizing" its line endings would change the document.
+ */
+export function sha256Bytes(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
 /**
@@ -232,8 +264,14 @@ export function verifyDocumentChain(
   docId: string,
   history: DocumentHistory,
   readKeyframe: (version: number) => string | null,
+  /** Change log for a non-keyframe version, when it lives in a v{N}.diff file
+   *  rather than inline on the entry. A caller that cannot read version files
+   *  omits this; its non-keyframe content checks are then skipped rather than
+   *  failed, the same way a missing keyframe file is skipped. */
+  readDiff?: (version: number) => string | null,
 ): VerificationReport {
   const errors: VerificationReport["errors"] = [];
+  const tombstoned: NonNullable<VerificationReport["tombstoned"]> = [];
 
   let previousChainHash: string | null = null;
 
@@ -241,10 +279,31 @@ export function verifyDocumentChain(
     // Step 2: Re-compute content_hash (skip silently if keyframe file
     // missing — chain_hash check below still runs using stored content_hash).
     let actualContent: string | null;
-    if (entry.keyframe) {
+    if (entry.tombstone) {
+      // Forget protocol (§6.3.2): the content was erased on purpose, so there
+      // is nothing to re-hash. The entry is verified hash-only — the chain
+      // check below still runs on its stored content_hash, which is what
+      // keeps every later entry verifiable. Content that should be gone but
+      // is still on disk is reported by `verifyTombstones`, not here.
+      actualContent = null;
+      tombstoned.push({ document: docId, version: entry.version });
+    } else if (entry.keyframe) {
       actualContent = readKeyframe(entry.version);
     } else {
-      actualContent = entry.diff || "";
+      // Externalized change log wins; inline patch is the legacy fallback.
+      //
+      // With a reader supplied, "neither available" means the change log is
+      // gone and the version can no longer be reconstructed — hash "" so it
+      // surfaces as a content_hash_mismatch, because unlike a missing keyframe
+      // (recoverable by replaying from an earlier one) a missing diff breaks
+      // every version after it.
+      //
+      // Without a reader, we simply cannot see the change log, which is not
+      // evidence of tampering — skip the content check as we do for a keyframe
+      // whose file we could not read, and let the chain_hash check below stand.
+      actualContent = readDiff
+        ? (readDiff(entry.version) ?? entry.diff ?? "")
+        : (entry.diff ?? null);
     }
 
     if (actualContent !== null) {
@@ -282,7 +341,11 @@ export function verifyDocumentChain(
     previousChainHash = entry.chain_hash;
   }
 
-  return { valid: errors.length === 0, errors };
+  return {
+    valid: errors.length === 0,
+    errors,
+    ...(tombstoned.length > 0 ? { tombstoned } : {}),
+  };
 }
 
 /**

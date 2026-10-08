@@ -16,7 +16,7 @@ Claude-style hook lifecycle, so the adapter differs from the Claude Code plugin 
 2. **Reuse the shared core** — for any lifecycle automation Codex supports (e.g.
    pre/post hooks), invoke the vendored `core/*.js` scripts the same way Claude does;
    they read config from the `CONTEXTNEST_*` environment fallbacks
-   (`CONTEXTNEST_RETRIEVAL_MODE`, `CONTEXTNEST_AUTO_CAPTURE`, `CONTEXTNEST_VAULT_ALIAS`,
+   (`CONTEXTNEST_RETRIEVAL_MODE`, `CONTEXTNEST_CAPTURE_MODE`, `CONTEXTNEST_VAULT_ALIAS`,
    `CONTEXTNEST_CTX_COMMAND`) since Codex has no `userConfig` mechanism.
 3. **`AGENTS.md` guidance** — ship a snippet (generated via `ctx index`) telling Codex
    to query the vault before answering and to capture aggressively.

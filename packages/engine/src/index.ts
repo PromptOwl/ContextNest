@@ -7,16 +7,20 @@
 export type {
   NodeType,
   Status,
+  ForgetReasonCode,
   Transport,
   FederationMode,
   GovernanceTier,
   SuggestionSource,
+  ReviewMode,
   HashChainEventType,
   SourceMeta,
+  PdfMeta,
   SkillInput,
   SkillMeta,
   Frontmatter,
   ContextNode,
+  IntegrityFailure,
   PendingChange,
   SuggestionMeta,
   HashChainEvent,
@@ -33,6 +37,7 @@ export type {
   CheckpointHistory,
   NestConfig,
   AccessTrace,
+  ClientMetadata,
   SourceHydrationTrace,
   TraceEntry,
   ValidationError,
@@ -46,6 +51,8 @@ export type {
   GraphQueryResult,
   VaultRegistry,
   VaultRegistryEntry,
+  RemoteNestSpec,
+  RemoteNestAuth,
 } from "./types.js";
 
 // Errors
@@ -54,16 +61,22 @@ export {
   ValidationFailedError,
   DocumentNotFoundError,
   InvalidUriError,
+  InvalidSelectorError,
   CircularDependencyError,
   IntegrityError,
   FederationNotSupportedError,
   ConfigError,
   UnknownAliasError,
+  NoVaultError,
   ZoneChallengeError,
   QuarantineError,
   UnauthorizedActionError,
   ChainBreakError,
   RejectedDocumentError,
+  CorruptHistoryError,
+  VersionArtifactExistsError,
+  ForgottenDocumentError,
+  ForgottenVersionError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
@@ -132,21 +145,37 @@ export {
   packSchema,
   versionEntrySchema,
   documentHistorySchema,
+  clientMetadataSchema,
   checkpointSchema,
   checkpointHistorySchema,
   suggestionMetaSchema,
   hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
+  WRITABLE_STATUSES,
+  FORGET_REASON_CODES,
   STATUS_ALIASES,
   TRANSPORTS,
+  sourceMetaSchema,
+  pdfMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
+  REVIEW_MODES,
   HASH_CHAIN_EVENT_TYPES,
   TAG_PATTERN,
+  TITLE_MAX_LENGTH,
+  TAG_RULE,
+  describeInvalidTag,
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
+  CLIENT_METADATA_RESERVED_KEYS,
+  CLIENT_METADATA_MAX_CUSTOM_KEYS,
+  CLIENT_METADATA_MAX_VALUE_LENGTH,
 } from "./schemas.js";
+
+// Typed frontmatter blocks (source / skill) — see typed-blocks.ts
+export { applyTypedBlocks } from "./typed-blocks.js";
+export type { TypedBlockArgs } from "./typed-blocks.js";
 
 // Parser
 export {
@@ -157,15 +186,20 @@ export {
   stripTagPrefix,
   getChecksumContent,
   normalizeStatus,
+  explicitStatus,
   isDraft,
   isPendingReview,
   isApproved,
   isPublished,
   isRejected,
+  isForgotten,
   isRetrievable,
   /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
   isSuperseded,
 } from "./parser.js";
+
+// Engine version (baked in at build time; see version.ts).
+export { ENGINE_VERSION } from "./version.js";
 
 // Config
 export { parseConfig, parseSyntaxConfig } from "./config.js";
@@ -182,31 +216,67 @@ export {
   getRegistryPath,
   readRegistry,
   isVaultRoot,
+  isRefusedCwd,
+  assertVaultRoot,
   findLocalVault,
   addVault,
+  addRemote,
   removeVault,
+  pruneVaults,
   setDefaultVault,
+  setVaultDescription,
   listVaults,
   resolveVaultPath,
+  resolveNest,
+  describeRemoteEndpoint,
 } from "./registry.js";
 export type {
   AddVaultOptions,
+  AddRemoteOptions,
   RemoveVaultResult,
+  PrunedVault,
+  PruneVaultsResult,
   VaultListEntry,
   VaultResolutionSource,
   ResolveVaultOptions,
   ResolvedVault,
+  ResolvedNest,
 } from "./registry.js";
 
+// Remote nest client (MCP over stdio/http; lazy-loads the MCP SDK).
+export {
+  connectRemoteNest,
+  RemoteUnreachableError,
+  RemoteTimeoutError,
+  RemoteAuthError,
+  REMOTE_DEFAULT_TIMEOUT_MS,
+  REMOTE_HTTP_DEFAULT_TIMEOUT_MS,
+} from "./remote-nest.js";
+export type { RemoteNestConnection } from "./remote-nest.js";
+
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId } from "./storage.js";
-export type { LayoutMode, ReadDocumentOptions } from "./storage.js";
+export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId, normalizeFolder } from "./storage.js";
+export type {
+  LayoutMode,
+  ReadDocumentOptions,
+  CheckpointChainState,
+  FolderEntry,
+  NestStorageOptions,
+} from "./storage.js";
+
+// Encrypted vaults (opt-in; default vaults stay plain Markdown)
+export * from "./encryption/index.js";
+
+// Document filtering — shared by context_list and by surfaces that filter a
+// document list they already hold.
+export { filterDocuments } from "./filters.js";
+export type { DocumentFilters } from "./filters.js";
 
 // URI
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";
 
 // Resolver
-export { Resolver } from "./resolver.js";
+export { Resolver, forgottenView } from "./resolver.js";
 export type { ResolverOptions } from "./resolver.js";
 
 // Inline extraction
@@ -216,17 +286,42 @@ export {
   extractMentions,
   countTasks,
   buildRelationships,
+  buildRelationshipsWithStats,
   buildBacklinks,
   extractSection,
 } from "./inline.js";
+export type { RelationshipStats } from "./inline.js";
 
 // Selector grammar
 export { tokenize } from "./selector/lexer.js";
 export type { Token, TokenType } from "./selector/lexer.js";
 export { parseSelector } from "./selector/parser.js";
 export type { SelectorNode } from "./selector/parser.js";
+export { SELECTOR_GRAMMAR, SELECTOR_FILTERS } from "./selector/grammar.js";
 export { evaluate } from "./selector/evaluator.js";
 export type { EvaluatorOptions } from "./selector/evaluator.js";
+
+// Wiki-link seeds + ungated traversal (plumbing — the eligibility GATE stays
+// with the consumer; these primitives never gate by status/permission)
+export {
+  extractWikiLinks,
+  buildWikiTitleIndex,
+  resolveWikiSeeds,
+  resolveWikiTarget,
+  resolveContextLink,
+  contextLinkTarget,
+  extractLinkedIds,
+  traverseWikiGraph,
+} from "./wiki-graph.js";
+export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
+
+// Stewards format (parse/serialize only — enforcement stays with the consumer)
+export {
+  parseStewards,
+  serializeStewards,
+  STEWARDS_FILENAMES,
+} from "./stewards.js";
+export type { StewardRole, StewardEntry, StewardsConfig } from "./stewards.js";
 
 // Packs
 export { PackLoader } from "./packs.js";
@@ -238,6 +333,7 @@ export { VersionManager } from "./versioning.js";
 export {
   normalizeForHash,
   sha256,
+  sha256Bytes,
   computeContentHash,
   computeChainHash,
   computeCheckpointHash,
@@ -246,6 +342,8 @@ export {
   verifyCheckpointChain,
   detectDrift,
   verifyRemoteDelta,
+  INTEGRITY_WARNING,
+  withIntegrityWarning,
 } from "./integrity.js";
 export type {
   DriftReport,
@@ -275,8 +373,37 @@ export type {
 } from "./hygienist.js";
 
 // Publish
-export { publishDocument } from "./publish.js";
-export type { PublishOptions, PublishResult } from "./publish.js";
+export { publishDocument, publishDocuments } from "./publish.js";
+export type {
+  PublishOptions,
+  PublishResult,
+  BulkPublishOptions,
+  BulkPublishResult,
+} from "./publish.js";
+
+// Forget protocol (§6.3) — erasure that keeps verification intact
+export {
+  forgetDocument,
+  forgetLog,
+  deleteDocumentWithTombstone,
+  assertNotForgotten,
+  applyImportedTombstones,
+} from "./forget.js";
+export type {
+  ForgetOptions,
+  ForgetResult,
+  DeleteOptions,
+  DeleteResult,
+} from "./forget.js";
+export {
+  FORGET_EVENT_TYPE,
+  MIN_FORGETTABLE_BODY_LENGTH,
+  buildTombstoneIndex,
+  importVerdict,
+  isPathForgotten,
+  forgettableBodyHash,
+} from "./tombstones.js";
+export type { TombstoneIndex, TombstoneRecord } from "./tombstones.js";
 
 // Source graph
 export {
@@ -286,7 +413,8 @@ export {
 } from "./source-graph.js";
 
 // Index generation
-export { generateContextYaml } from "./index-generator.js";
+export { generateContextYaml, generateContextYamlWithStats } from "./index-generator.js";
+export type { GenerateContextYamlOptions } from "./index-generator.js";
 export { generateIndexMd } from "./index-md-generator.js";
 
 // Injection
@@ -295,13 +423,20 @@ export type { InjectorOptions } from "./injection.js";
 
 // Graph traversal
 export { GraphTraverser } from "./graph-traverser.js";
-export { GraphQueryEngine } from "./graph-query-engine.js";
+export { GraphQueryEngine, annotateIntegrity } from "./graph-query-engine.js";
 export type { GraphQueryOptions } from "./graph-query-engine.js";
 export { evaluateFromIndex } from "./selector/index-evaluator.js";
 export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
+export {
+  slugify,
+  slugifyImportPath,
+  isVersionArtifactPath,
+  sanitizeImportedFrontmatter,
+  sanitizeImportedTags,
+} from "./import-hygiene.js";
 export type { AgentConfigInput, AgentConfigFile } from "./agent-configs.js";
 
 // Tracing
@@ -309,3 +444,80 @@ export { TraceLogger } from "./tracing.js";
 
 // Chain event log (persistent governance audit trail)
 export { ChainEventLog } from "./chain-log.js";
+
+// Vault-hosted skills
+export {
+  HARNESSES,
+  INSTALL_SCOPES,
+  INSTALL_MODES,
+  NotASkillNodeError,
+  assertSkillNode,
+  skillNameFromPath,
+  substitutePlaceholders,
+  renderSkill,
+  buildInstallManifest,
+} from "./skills.js";
+export type {
+  Harness,
+  InstallScope,
+  InstallMode,
+  SkillSource,
+  RenderOptions,
+  RenderedSkill,
+  ManifestFile,
+  InstallManifest,
+} from "./skills.js";
+export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";
+
+// Human review gate — see review.ts
+export {
+  REVIEW_HOLD_NOTE_PREFIX,
+  REVIEW_OFF_COMMAND,
+  readReviewMode,
+  setReviewMode,
+  isReviewHold,
+  listReviewHolds,
+  currentReviewProposal,
+  stageReviewHold,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  reviewHeldMessage,
+} from "./review.js";
+export type {
+  ReviewHold,
+  PendingReviewItem,
+  ReviewDecisionOptions,
+  ApproveReviewResult,
+  RejectReviewResult,
+} from "./review.js";
+
+// PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
+export {
+  extractPdf,
+  isPdf,
+  pdfExtractorVersion,
+  PDF_IMPORTER_VERSION,
+  PDF_EXTRACTOR,
+  UNPDF_VERSION,
+  DEFAULT_PDF_MAX_BYTES,
+} from "./importers/pdf.js";
+export type { PdfExtraction } from "./importers/pdf.js";
+export { readPdfBinary, readPdfMeta, pdfSidecarPath } from "./pdf-nodes.js";
+export type { ReadPdfBinaryOptions } from "./pdf-nodes.js";
+
+// ─── Importers ───────────────────────────────────────────────────────────────
+export {
+  jatsToDocument,
+  linkCitations,
+  buildCitationIndex,
+  splitJatsArticles,
+  JATS_IMPORTER_VERSION,
+} from "./importers/jats.js";
+export type {
+  JatsImportOptions,
+  JatsImportResult,
+  JatsPaperMeta,
+  JatsRef,
+  CitationIndex,
+} from "./importers/jats.js";

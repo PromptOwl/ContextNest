@@ -3,7 +3,7 @@
  * See CONTEXT_NEST_SPEC-v3.md for the full specification.
  */
 
-/** Node types (§1.6) */
+/** Node types (§1.6). Keep in lockstep with `NODE_TYPES` in schemas.ts. */
 export type NodeType =
   | "document"
   | "snippet"
@@ -13,7 +13,12 @@ export type NodeType =
   | "source"
   | "tool"
   | "reference"
-  | "skill";
+  | "skill"
+  | "agent"
+  | "artifact"
+  | "table"
+  | "pdf"
+  | "task";
 
 /** Document status (§1.5)
  *
@@ -30,6 +35,10 @@ export type NodeType =
  *                     docs to prevent silent resurrection. Stewards revive
  *                     by setting status back to draft/pending_review/
  *                     approved/published.
+ *   forgotten       → erased by the forget protocol (§6.3). The live file is
+ *                     an empty stub; every version's content is gone from
+ *                     `.versions/`, only its hashes remain. Set only by
+ *                     `forgetDocument`, never by a write, and never revived.
  *
  * Aliases (e.g. `cancelled` → `rejected`, `superseded` → `draft`,
  * `review` → `pending_review`, `active` → `published`) are normalized to
@@ -41,7 +50,12 @@ export type Status =
   | "pending_review"
   | "approved"
   | "published"
-  | "rejected";
+  | "rejected"
+  | "forgotten";
+
+/** Closed set of forget reason codes (§6.3.1). Keep in lockstep with
+ *  `FORGET_REASON_CODES` in schemas.ts. */
+export type ForgetReasonCode = "user_request" | "legal" | "retention_expiry" | "error";
 
 /** Source transport protocol (§1.9.1) */
 export type Transport = "mcp" | "rest" | "cli" | "function";
@@ -51,6 +65,9 @@ export type FederationMode = "none" | "federated" | "scoped";
 
 /** Governance tier (zone-classification-rbac-spec §1, §2.2) */
 export type GovernanceTier = "primary" | "standard";
+
+/** Value of the vault-level `review` setting. */
+export type ReviewMode = "on" | "off";
 
 /** Origin of a staged suggestion (bridge-function-spec Story 3.1, Story 1.3) */
 export type SuggestionSource =
@@ -91,7 +108,8 @@ export type HashChainEventType =
   | "platform_admin.toggle_changed"
   | "platform_admin.session_opened"
   | "platform_admin.session_closed"
-  | "agent.zone_scope_assigned";
+  | "agent.zone_scope_assigned"
+  | "document.forgotten";
 
 /** Source metadata block — present only on type: source nodes (§1.9.1) */
 export interface SourceMeta {
@@ -125,6 +143,32 @@ export interface SkillMeta {
   guard_rails?: string[];
 }
 
+/**
+ * PDF metadata block — present only on type: pdf nodes (§1.11).
+ *
+ * Binds the node to the binary sidecar beside it. `sha256` is the hash of the
+ * sidecar's exact bytes; since the block is frontmatter, it is hashed into
+ * every version's content_hash, so the PDF is part of the version chain.
+ */
+export interface PdfMeta {
+  /** Vault-relative path of the sidecar — always `<node id>.pdf`, beside the `.md`. */
+  file: string;
+  /** SHA-256 of the sidecar bytes, `sha256:<64 hex>`. */
+  sha256: string;
+  /** Size of the sidecar in bytes. */
+  bytes: number;
+  /** Page count. */
+  pages: number;
+  /** False when no page yielded any text (a scanned PDF) — the body is then empty. */
+  text_layer: boolean;
+  /** Text extractor that produced the body, e.g. `unpdf`. */
+  extractor: string;
+  /** Importer + extractor version, so a re-extraction can be told apart. */
+  extractor_version: string;
+  /** ISO 8601 time the text was extracted. */
+  extracted_at: string;
+}
+
 /** YAML frontmatter for a Context Nest document (§1.3–1.5) */
 export interface Frontmatter {
   title: string;
@@ -141,10 +185,25 @@ export interface Frontmatter {
   metadata?: Record<string, unknown>;
   source?: SourceMeta;
   skill?: SkillMeta;
+  /** PDF block — present only on type: pdf nodes (§1.11). */
+  pdf?: PdfMeta;
   /** Zone ID (zone-classification-rbac-spec §2.1 Level 2 metadata override) */
   zone?: string;
   /** Governance tier (zone-classification-rbac-spec §1) */
   governance?: GovernanceTier;
+}
+
+/**
+ * Served-document integrity verdict, present ONLY when verification failed
+ * (see `NestStorage.verifyServedDocument`). An intact or not-yet-verifiable
+ * document carries no verdict, so its wire output is unchanged.
+ */
+export interface IntegrityFailure {
+  status: "failed";
+  /** Which checks failed — `VerificationReport` error types, e.g. `body_drift`. */
+  checks: string[];
+  /** One-line, model-facing warning (`INTEGRITY_WARNING`). */
+  warning: string;
 }
 
 /** A parsed Context Nest document */
@@ -159,6 +218,27 @@ export interface ContextNode {
   body: string;
   /** Full raw file content */
   rawContent: string;
+  /**
+   * Set by the serve paths (graph query, context_get) when this document
+   * failed integrity verification. Absent otherwise. Never serialized to disk.
+   */
+  integrity?: IntegrityFailure;
+  /**
+   * The `status` the author actually wrote, before normalization, or `null`
+   * when the frontmatter carried no `status:` key at all.
+   *
+   * `frontmatter.status` cannot answer that question: a missing status is
+   * normalized to `draft`, so an author's deliberate draft is indistinguishable
+   * from a status-less hand-authored note once parsed. Folder import needs the
+   * distinction — a status-less file is fair game to publish, an explicit
+   * `draft`/`pending_review` must be held back. Read it through
+   * `explicitStatus()`, which canonicalizes aliases.
+   *
+   * Taken from the same YAML load that produces `frontmatter`, so it sees
+   * whatever the author wrote, however they wrote it. Only `parseDocument` sets
+   * it; nodes built in memory leave it undefined.
+   */
+  authoredStatus?: string | null;
   /**
    * Set when live file bytes differ from the last-approved canonical content
    * (bridge-function-spec Story 3.1, hootie-inbox-spec §4.2). When present,
@@ -305,6 +385,27 @@ export interface VersionEntry {
   note?: string;
   content_hash: string;
   chain_hash: string;
+  /**
+   * Caller metadata supplied with the write that produced this version (§9.4)
+   * — which agent, in which session, plus any custom keys.
+   *
+   * Deliberately NOT an input to `chain_hash` (§8.2): the chain covers the
+   * content and the authoring facts the spec names, and every history written
+   * before this field existed must keep verifying byte-for-byte. Treat it as an
+   * annotation on the entry, not as sealed evidence.
+   */
+  client?: ClientMetadata;
+  /**
+   * Forget protocol (§6.3.2): this version's keyframe/diff was erased. The
+   * hashes are kept unchanged so the chain still verifies; verification
+   * treats the entry as hash-only.
+   */
+  tombstone?: boolean;
+  forgotten_at?: string;
+  forgotten_by?: string;
+  reason_code?: ForgetReasonCode;
+  /** The empty-stub version a node-level forget sealed. */
+  forget_stub?: boolean;
 }
 
 /** Document history file (§6.2) */
@@ -356,6 +457,17 @@ export interface NestConfig {
     auto_index?: boolean;
   };
   /**
+   * Vault-hosted skills (see `skills.ts`).
+   *
+   * `bootstrap` names the `type: skill` node an agent should install first —
+   * the entry point that teaches it how to use this particular vault. It is a
+   * pointer, not content: the node stays the source of truth, so the vault can
+   * change what onboarding means without anyone reinstalling anything.
+   */
+  skills?: {
+    bootstrap?: string;
+  };
+  /**
    * Agent maintenance directive — emitted into the managed section of
    * CLAUDE.md / GEMINI.md / .cursorrules / .windsurfrules /
    * .github/copilot-instructions.md by `ctx index`. Tells the agent
@@ -372,6 +484,14 @@ export interface NestConfig {
    * written (back-compat). `ctx index` honors this; `ctx init` overwrites it.
    */
   agent_tools?: string[];
+  /**
+   * Human review gate for agent/tool writes (`review.ts`). `on` holds writes
+   * for a human to approve instead of publishing them; `off` publishes.
+   * `ctx init` writes `on`. ABSENT means a vault that predates the gate: it
+   * keeps publishing by default (existing automations are not changed);
+   * `ctx config set review on` opts it in.
+   */
+  review?: ReviewMode;
 }
 
 /**
@@ -386,6 +506,47 @@ export interface VaultRegistryEntry {
 }
 
 /**
+ * Auth for an HTTP remote nest. Secrets are stored as environment-variable
+ * REFERENCES only (the *_env fields name the variable to read at connect
+ * time); the registry schema rejects raw secret values outright.
+ */
+export interface RemoteNestAuth {
+  /** Env var holding a bearer token, sent as `Authorization: Bearer <value>`. */
+  bearer_env?: string;
+  /** Custom header name, paired with header_env for its value. */
+  header_name?: string;
+  /** Env var holding the value for header_name. */
+  header_env?: string;
+}
+
+/**
+ * A registered remote nest — an MCP endpoint speaking the canonical operation
+ * catalog (`context_*` tools; legacy tool names accepted as aliases). Lives in
+ * the registry's top-level `remotes:` map, NEVER inside `vaults:`, so older
+ * CLIs (which strip unknown top-level keys) skip remotes instead of failing to
+ * parse the whole registry.
+ */
+export type RemoteNestSpec =
+  | {
+      transport: "stdio";
+      /** Executable to spawn (argv[0]); args are passed as an array, never a shell string. */
+      command: string;
+      args?: string[];
+      description?: string;
+      /** Per-call timeout in milliseconds (default 10000). */
+      timeout_ms?: number;
+    }
+  | {
+      transport: "http";
+      /** Streamable-HTTP MCP endpoint URL. */
+      url: string;
+      auth?: RemoteNestAuth;
+      description?: string;
+      /** Per-call timeout in milliseconds (default 10000). */
+      timeout_ms?: number;
+    };
+
+/**
  * Central vault registry. Maps short aliases to vault paths so the CLI and MCP
  * server can target any vault from any working directory (analogous to AWS
  * named profiles). Stored at ~/.contextnest/config.yaml.
@@ -396,6 +557,33 @@ export interface VaultRegistry {
   default?: string;
   /** Registered vaults, keyed by alias. */
   vaults: Record<string, VaultRegistryEntry>;
+  /** Registered remote nests, keyed by alias. Shares one alias namespace with `vaults`. */
+  remotes?: Record<string, RemoteNestSpec>;
+}
+
+/**
+ * Caller-supplied metadata attached to an API call (§9.4).
+ *
+ * `agent` and `session_id` are the two fields every caller is expected to send
+ * — they answer "which agent, in which session" for a read or a write. Any
+ * other key is custom, and travels verbatim.
+ *
+ * This is NOT identity: the engine never authenticates it, and never makes a
+ * decision from it. It is a label recorded alongside the action so an audit
+ * trail can attribute it. Authorization stays with the `RbacHook` and the
+ * `actor` on an operation context.
+ *
+ * Bounded by `clientMetadataSchema` (schemas.ts) — this is written into the
+ * append-only version history, so an unbounded payload would be a way to bloat
+ * a vault's audit trail.
+ */
+export interface ClientMetadata {
+  /** Name of the calling agent, e.g. "claude-code". */
+  agent?: string;
+  /** Identifier of the calling session, opaque to the engine. */
+  session_id?: string;
+  /** Custom keys, recorded verbatim. */
+  [key: string]: string | number | boolean | undefined;
 }
 
 /** Trace entry for document access (§9.2) */
@@ -407,6 +595,8 @@ export interface AccessTrace {
   author?: string;
   edited_at?: string;
   accessed_at: string;
+  /** Caller metadata supplied with the read that produced this trace (§9.4). */
+  client?: ClientMetadata;
 }
 
 /** Trace entry for source hydration (§9.3) */
@@ -511,11 +701,42 @@ export interface VerificationReport {
       | "chain_hash_mismatch"
       | "cross_chain_mismatch"
       | "checkpoint_hash_mismatch"
-      | "body_drift";
+      | "body_drift"
+      | "unreadable_history"
+      // A recorded version can no longer be rebuilt from its keyframe+diff
+      // chain (§6.1), even when every stored hash still agrees — e.g. an
+      // import overwrote version artifacts and rewrote their fingerprints
+      // to match, so the diffs no longer apply.
+      | "version_unreconstructable"
+      // A pdf node's sidecar (or an archived prior binary) no longer hashes
+      // to the sha256 its frontmatter records (§8.4).
+      | "sidecar_drift"
+      // A pdf node's declared sidecar is not on disk.
+      | "sidecar_missing"
+      // Encrypted vault, no usable key: content hashes could not be checked.
+      // Always makes the report invalid — verification never passes silently.
+      | "encrypted_key_required"
+      // A sealed artifact failed AES-GCM authentication (tampered, or sealed
+      // under a key this vault does not hold).
+      | "decryption_failed"
+      // A content file in an encrypted vault is stored as plaintext.
+      | "unencrypted_file"
+      // Forget protocol (§6.3): content a forget erased is back on disk — an
+      // artifact for a tombstoned version, a recorded forget whose entry is
+      // no longer tombstoned, or a forgotten stub with a body.
+      | "forgotten_content_present"
+      // A tombstone (or forgotten stub) no forget event accounts for.
+      | "unrecorded_tombstone";
     document?: string;
     version?: number;
     checkpoint?: number;
     expected: string | null;
     actual: string;
   }>;
+  /**
+   * Versions verified hash-only because the forget protocol erased their
+   * content (§6.3.2). Not errors: the chain proves they existed, not what
+   * they said. Present only when there are some.
+   */
+  tombstoned?: Array<{ document: string; version: number }>;
 }

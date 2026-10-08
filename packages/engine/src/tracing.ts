@@ -2,7 +2,12 @@
  * Audit trace logging (§9.2, §9.3).
  */
 
-import type { AccessTrace, SourceHydrationTrace, TraceEntry } from "./types.js";
+import type {
+  AccessTrace,
+  ClientMetadata,
+  SourceHydrationTrace,
+  TraceEntry,
+} from "./types.js";
 
 const DEFAULT_MAX_TRACES = 1000;
 
@@ -28,6 +33,8 @@ export class TraceLogger {
     checkpoint: number;
     author?: string;
     editedAt?: string;
+    /** Caller metadata from the read that triggered this access (§9.4). */
+    client?: ClientMetadata;
   }): AccessTrace {
     const trace: AccessTrace = {
       trace_type: "access",
@@ -37,6 +44,11 @@ export class TraceLogger {
       author: params.author,
       edited_at: params.editedAt,
       accessed_at: new Date().toISOString(),
+      // Omitted rather than set undefined when the caller sent none, so a trace
+      // serialized to an audit log carries no empty key.
+      ...(params.client && Object.keys(params.client).length > 0
+        ? { client: params.client }
+        : {}),
     };
     this.traces.push(trace);
     this.evictIfNeeded();

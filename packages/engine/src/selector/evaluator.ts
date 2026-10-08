@@ -24,7 +24,39 @@ export async function evaluate(
   const allDocs = options.resolver.getAllDocuments();
 
   const resultIds = await evaluateNode(node, allDocs, options);
-  return allDocs.filter((d) => resultIds.has(d.id));
+  // Walk the result set, not `allDocs`: a Set keeps insertion order, and for
+  // a `contextnest://search/…` URI that order is the resolver's relevance
+  // ranking. Filtering `allDocs` re-sorted every hit into discovery (id)
+  // order, which is how `ctx search` came to print alphabetically.
+  const byId = new Map(allDocs.map((d) => [d.id, d] as const));
+  // Forgotten nodes (§6.3.3) are excluded unless the selector asks for them by
+  // name — `status:forgotten` in a positive position. Every other operand
+  // (a URI, a tag, a type, a pack include) can match a stub, and a stub is not
+  // content.
+  const includeForgotten = asksForForgotten(node);
+  const out: ContextNode[] = [];
+  for (const id of resultIds) {
+    const doc = byId.get(id);
+    if (!doc) continue;
+    if (!includeForgotten && doc.frontmatter.status === "forgotten") continue;
+    out.push(doc);
+  }
+  return out;
+}
+
+/** True when `status:forgotten` appears in a positive (non-negated) position. */
+export function asksForForgotten(node: SelectorNode, positive = true): boolean {
+  switch (node.type) {
+    case "statusFilter":
+      return positive && normalizeStatus(node.value) === "forgotten";
+    case "and":
+    case "or":
+      return asksForForgotten(node.left, positive) || asksForForgotten(node.right, positive);
+    case "not":
+      return asksForForgotten(node.left, positive) || asksForForgotten(node.right, !positive);
+    default:
+      return false;
+  }
 }
 
 async function evaluateNode(

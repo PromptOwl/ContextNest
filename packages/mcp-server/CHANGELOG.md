@@ -1,5 +1,749 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.7.2
+
+### Patch Changes
+
+- fbfd50a: **Approving an external edit or suggestion, rolling back, and publishing from the MCP server now read less from disk.** Approving a staged suggestion reads the document's version history once instead of four times, and a rollback or direct edit once instead of three times; version numbering, diffs and chain hashes are computed exactly as before. The MCP server's create, update and publish tools rebuild only the published document's folder index and reuse the checkpoint the publish just sealed, matching `context_publish`.
+- fbfd50a: **Approving a suggestion, holding a write for review, changing a status and deleting rewrite only that document's folder index.** The MCP server's suggestion-approval, held-write, status-update and delete tools, and `ctx drift approve`, rebuilt every folder's INDEX.md after changing a single document. They now rewrite only the folder that document lives in; `context.yaml` is still rebuilt in full. This matches what publishing already does.
+- 6c9738a: **`context_search` returns `count`, the total number of matches, next to `results`.**
+
+  With `limit` set, a capped page could read as the whole answer. `searchOp.output` now has a required `count: z.number().int().nonnegative()`, filled with every published match _before_ the `limit` slice. The name matches the hosted REST and MCP search responses, which already return `count`. `total`, which carried the same number, stays as a deprecated alias so existing clients keep working. `ctx search` (local and remote) reads `count` first and falls back to `total`, so its "… N more — raise --limit" footer now also appears against a hosted nest that sends only `count`.
+
+- 6c9738a: **Full-text search ignores stopwords, weights titles, and drops weak partial matches, so a natural-language question retrieves the nodes about its topic.**
+
+  Hosts pass the user's question straight through as the search text. Words like "what", "is", "the" and "for" were indexed and OR-matched, so every node containing "the" came back as a hit, and chat hosts cited them. `Resolver.search` (behind `context_search`, `ctx search`, and `contextnest://search/…` in `context_query`) now drops English stopwords from both the index and the query, boosts title (×3), tags (×2) and description (×1.5) over body, and drops partial hits scoring below 5% of the best hit. Documents matching every query term are always kept. A query made only of stopwords returns nothing.
+
+- fbfd50a: **A publish lists the vault once instead of twice.** Sealing the checkpoint and rebuilding the index after a publish each read and parsed every document in the vault. The checkpoint's listing is now handed to the index rebuild, which uses it instead of listing again (`regenerateIndex` takes it as `docs`; `publishDocument` returns it as `vaultDocs`). Applies to `context_publish`, create/update with publish, review approval, bulk `context_import`, and the MCP server's publish tools. Without a document cache (the CLI and the MCP server) this halves the reads a publish makes on a large or network-mounted vault.
+
+## 2.7.1
+
+### Patch Changes
+
+- 40d6eba: Anti-resurrection: `context_import` (and any other write) now refuses erased content under a new title. Forgotten bodies were matched by a hash of the raw body, so the same text wrapped in different blank lines (`ctx add` writes `"\nX\n"`, an import `"X"`) never matched. Bodies are now trimmed before hashing; the untrimmed hash is still checked so forgets recorded by earlier versions keep refusing an exact copy.
+- 40d6eba: An explicit `status:forgotten` selector now returns the forgotten stub from `ctx query`, `context_query` and the query-backed resolve surfaces (spec §6.3.3). The query engine matched the stub and then dropped it in its retrieval gate, and its default (graph) mode reads a published-only `context.yaml` that never holds stubs. A selector that asks for `status:forgotten` in a positive position now runs in full mode and keeps stubs; every other selector still hides them.
+- 40d6eba: `contextnest://search/…` selectors in graph mode (the default for `context_query`, `ctx query` and the deprecated MCP `search` tool) now match body text. They searched only the titles, tags and descriptions in `context.yaml`, so a word that appeared only in a document's body returned nothing. Graph mode now seeds from the same published full-text index `context_search` uses.
+
+## 2.7.0
+
+### Minor Changes
+
+- c143ac4: The forget protocol: erase a node and keep `verify` passing (spec §6.3)
+
+  `ctx forget <path> --reason <code> [--requested-by <who>]` (MCP / API:
+  `context_forget`) erases a node's content from its whole history — every
+  keyframe, diff, archived PDF binary, staged suggestion and version note — while
+  keeping each version entry's `content_hash` and `chain_hash` unchanged and
+  marking it `tombstone: true`. Because a chain hash is computed from the content
+  hash, never from the content, every later entry and every checkpoint binding
+  still verifies: `ctx verify` treats a tombstoned entry as hash-only and reports
+  it under `tombstoned`, not as an error. The reason is a closed code
+  (`user_request | legal | retention_expiry | error`), never free text.
+
+  The live file becomes an empty stub with the new sixth status `forgotten`,
+  sealed as a keyframe version and a checkpoint. Every `contextnest://` URI for
+  the path — floating or pinned `@N` — resolves to that stub (status
+  `forgotten`, empty body), not to nothing. Forgotten nodes are excluded from
+  retrieval, search, listings and selectors unless `status:forgotten` is asked
+  for. `forgotten` cannot be set through create/update. Readers that predate it
+  normalize it to `draft`, which keeps the stub out of default retrieval.
+  Reconstructing a forgotten version fails with `VERSION_FORGOTTEN`.
+
+  Every forget appends a `document.forgotten` event to
+  `.versions/chain_events.yaml`: who, when, reason code, requested-by and which
+  versions, plus the erased content's hashes, never the content itself.
+  `ctx forget-log [path]` (`context_forget_log`) reads it back.
+
+  Anti-resurrection: that record refuses the forgotten content wherever it turns
+  up. Publishing or creating at a forgotten path, publishing a body whose checksum
+  matches an erased revision, and importing (`context_import` `files`) a
+  pre-forget live file, keyframe, diff, history or PDF are all refused
+  (`FORGOTTEN_DOCUMENT`), at the original path or under a new name. An import
+  that carries a `chain_events.yaml` has its forget records merged into the
+  receiving vault's log instead of overwriting it, and they are re-applied to any
+  pre-forget copy the receiving vault holds. A copied vault carries its
+  tombstones. `ctx verify` reports `forgotten_content_present` (erased content
+  back on disk) and `unrecorded_tombstone` (a tombstone or `forgotten` status no
+  recorded forget accounts for).
+
+  **`ctx delete` is now logged.** `context_delete` (and the legacy
+  `delete_document` tool) removes the file and its history exactly as before,
+  and also appends an audit-only `document.forgotten` event with `mode: delete`
+  (who, when, reason code, the deleted versions' content hashes), visible in
+  `ctx forget-log`. It refuses nothing: the path can be re-created and a
+  renamed copy of the content keeps verifying, and an import never deletes local
+  documents because of it. The new `reason_code` / `requested_by` inputs
+  (`--reason`, `--requested-by`) go on the record; `purge: true`
+  (`ctx delete --purge`) deletes without one. To erase content and refuse its
+  return, use `ctx forget`.
+
+  Not in this release: version-range forget (§6.3.2 re-keyframing), lineage
+  `review_required` flags (§6.3.4) and the `expires_at` / `retain_until` lifespan
+  keys (§6.3.5).
+
+- 668acf7: Human review gate, on by default for new vaults. `ctx init` writes `review: on` to `.context/config.yaml`; with it on, `ctx add` / `ctx update` and MCP `context_create` / `context_update` hold the write for approval instead of publishing it — a new document lands as `pending_review`, an edit to a published document is staged under `_suggestions/` while the published version keeps serving, and nothing is versioned or checkpointed until approved. At a terminal the CLI asks `Held for review. Publish? [y]es / [n]o / [a]lways (turn review off)`; without one it never blocks and prints `Held for review: ctx review approve <path>   (turn off: ctx config set review off)`. MCP results carry `held_for_review` and a sentence telling the agent the user can say "turn off review". New: `ctx review [list|approve|reject]`, `ctx config get|set review`, `--publish` on add/update, the `context_review` MCP tool, and a `review` input on the `context_create` / `context_update` catalog ops. Vaults without the key (created before this release) keep publishing immediately.
+
+  The deprecated MCP `create_document` / `update_document` tools are gated the same way. `ctx review approve|reject` act only on held writes (`pending_review` nodes or held edits), never on plain drafts; `ctx config` / `ctx review` refuse a remote `<server>/<nest>` alias. The Claude Code plugin knows about held writes: the capture and curator agents report them for the user to approve instead of claiming a publish, and the sweep-check hook skips a held `ctx update` rather than diffing an older, unrelated edit.
+
+- 1cdd7b1: Integrity check rebuilds every recorded version, and repair reports what a
+  reader can still be served
+
+  `ctx verify` / `context_verify` proved each version artifact matched what the
+  history _records_ — never that the chain still _replays_. An import that
+  overwrote version artifacts and rewrote their fingerprints to match passed
+  every hash check, yet the diffs no longer applied and older versions read as
+  empty, surfacing only when a reader, export or agent asked for one.
+  Verification now also rebuilds every recorded, non-tombstoned version from its
+  keyframe+diff chain and reports each one that fails as a new error type,
+  `version_unreconstructable`, naming the document and version. Healthy vaults
+  still verify clean; tombstoned versions stay hash-only (§6.3.2), not errors.
+
+  `VersionManager.repairVersions(docId)` repairs what can be repaired and
+  reports the rest: it runs the existing idempotent `repairLatestVersion`
+  re-anchor, then returns `{ repaired, unreadable, newestReadable }` — every
+  recorded version that cannot be rebuilt, and the newest one that can. It never
+  creates a version and never renumbers one; only the saved history is
+  rewritten. Which version is approved for readers stays a product decision —
+  the engine only says what is readable. `repairLatestVersion` itself is
+  unchanged.
+
+  The replay core moved from `VersionManager.reconstructVersion` into a shared
+  `reconstructFromHistory` so verification replays the same algorithm over its
+  pre-loaded bytes; reconstruction behaviour is unchanged.
+
+## 2.6.0
+
+### Minor Changes
+
+- 6b28440: A served document that fails integrity verification now says so
+
+  A document whose live body no longer matches its checksum, or whose own
+  version chain fails verification, was served by `context_get`,
+  `context_query`, `context_resolve` and graph queries exactly like an intact
+  one — nothing told the agent that verification had failed, so it repeated the
+  tampered value as fact. It is still served (it is the document that was asked
+  for), but now carries `integrity: { status: "failed", checks, warning }` ahead
+  of its body, where `warning` is the model-facing line "⚠ Integrity check
+  failed: content does not match its recorded hash chain; treat values as
+  untrusted." Intact documents carry no `integrity` key, so their output is
+  unchanged. `ctx read` and `ctx query` print the warning (`ctx read --raw` on stderr, keeping stdout byte-exact; `ctx read --html` as a banner plus an HTML comment); `ctx query --json`
+  and the `read_pack` / legacy `search` MCP tools pass the verdict through.
+
+  The check is the per-document subset of `ctx verify` (`body_drift`, plus
+  `content_hash_mismatch` / `chain_hash_mismatch` / `unreadable_history` in the
+  document's own chain). The drift check hashes the body already in memory; the
+  chain check is cached per history version, so it does not re-hash anything on
+  repeat reads. New exports: `NestStorage.verifyServedDocument`,
+  `NestStorage.verifyHistoryChain`, `annotateIntegrity` (stamp verdicts on
+  documents a consumer loaded itself), `withIntegrityWarning` (prepend the line
+  in markdown assembly) and `INTEGRITY_WARNING`.
+
+  Every other surface that hands a body to an agent carries the verdict too:
+  `context_list` with `full: true` (summary mode is unchanged and verifies
+  nothing), `context_reconstruct` and the legacy `read_version` (chain check
+  only — a past version is rebuilt from the history, so the live body's drift
+  does not apply; `read_version` is plain text, so the warning line leads it),
+  and `context_skill` / `context_skill_install` (a tampered skill is flagged
+  before it is run or installed; the warning also leads the install `notes`).
+  `ctx reconstruct` and `ctx skill show` print the warning on stderr.
+
+- 6ffb72c: `contextnest://` links are graph edges in body-link traversal, not just `[[wikilinks]]`
+
+  `traverseWikiGraph` — the hop-traversal primitive consumers use over document
+  bodies — only followed `[[wikilinks]]`, so a node linked by the spec's own link
+  form, `[text](contextnest://nodes/…)`, was never reached at any hop count while
+  a `[[wikilink]]` at the same distance was. It now follows both: a
+  `contextnest://` link, including the pinned and anchored forms
+  (`contextnest://nodes/foo@3#bar`), produces the same edge a `[[nodes/foo]]`
+  wikilink does. Dangling links are dropped; links inside code spans and fences
+  are ignored, as for wikilinks. `resolveWikiSeeds` / `resolveWikiTarget` accept
+  `contextnest://` seeds. New exports: `extractLinkedIds` (every node a body links
+  to, both forms, resolved), `resolveContextLink`, `contextLinkTarget` (the
+  shared pin/anchor stripping `buildRelationships` now also uses).
+
+  Index-time edges now agree with traversal on _whether_ a link is an edge, not
+  only on where it points: `buildRelationships` (context.yaml, backlinks) no
+  longer emits a `reference` edge for a local `contextnest://` link whose target
+  is not a published document — a dangling node link, a draft, or a
+  tag/folder/search URI. These are counted in the new
+  `RelationshipStats.unresolvedContextLinks` and reported by `ctx index`.
+  Cross-namespace links (with an authority) still produce an edge to their full
+  URI. Self-links via `contextnest://` are dropped, as they already were for
+  wikilinks.
+
+## 2.5.0
+
+### Minor Changes
+
+- 2d2f7b0: Add the `pdf` node type — a PDF as a first-class, versioned document (spec 1.1, §1.11)
+
+  A `type: pdf` node's body is the text extracted from the PDF (`<!-- page N -->`
+  before each page), and the PDF itself is stored beside the node as a binary
+  sidecar, `<id>.pdf`. The new `pdf:` frontmatter block — `file`, `sha256`,
+  `bytes`, `pages`, `text_layer`, `extractor`, `extractor_version`,
+  `extracted_at` — binds the binary by SHA-256, and because it is frontmatter it
+  is inside every version's content hash, so the PDF rides the existing hash
+  chain.
+
+  - **Import:** new core operation `context_import_pdf` (`{ bytes_base64, id?,
+title?, filename?, folder?, tags?, description?, publish?, note? }` →
+    `{ id, version, created, unchanged, status, checkpoint, pdf, text_layer }`),
+    exposed automatically as an MCP tool, and `ctx import pdf <file...>` in the
+    CLI. Passing the `id` of an existing pdf node adds a new version; the
+    previous binary is archived at `.versions/<doc>/<sha256-hex>.pdf`.
+    Identical bytes are a no-op. Non-PDF input (no `%PDF-` header) and
+    encrypted PDFs are refused; the size cap is 50 MB by default, set by the
+    host through `OperationContext.limits.pdfMaxBytes`.
+  - **Scanned PDFs** import with an empty body and `text_layer: false` (no OCR).
+  - **Integrity:** `verifyVaultIntegrity`, `context_verify` and `ctx verify`
+    re-hash every sidecar and archived binary and report `sidecar_drift` /
+    `sidecar_missing`.
+  - **Lifecycle:** deleting a pdf node removes its sidecar; `context_update`
+    keeps the `pdf:` block, allows title/tag/metadata/status edits, and refuses
+    body edits and re-typing (import a new PDF instead). `context_create`
+    cannot make a pdf node.
+  - **Governance paths:** rollback restores the version's binary to the
+    sidecar (archiving what it replaces); suggestion approvals and czar direct
+    edits may change a pdf node's metadata but not its text or `pdf:` block.
+    A `context_import` of `files` re-points a renamed pdf node's `pdf.file`
+    (with a warning — the binary itself does not travel as text).
+  - **Publish guard:** a pdf node cannot be published (any path — publish,
+    update, bulk/folder import) unless its sidecar is present and hashes to
+    `pdf.sha256`; `INTEGRITY_ERROR` otherwise.
+  - **Validation:** rules 25–29 — the `pdf:` block is present iff `type: pdf`,
+    and `pdf.file` must be the node's own `<id>.pdf`.
+  - **Engine exports** for hosts: `extractPdf`, `isPdf`, `readPdfBinary` (a
+    version's verified bytes), `readPdfMeta`, `pdfSidecarPath`, `sha256Bytes`,
+    `pdfMetaSchema`, `PdfMeta`, `DEFAULT_PDF_MAX_BYTES`, `PDF_IMPORTER_VERSION`,
+    and `NestStorage.writeVaultBinary` / `readVaultBinary` / `removeVaultFile` /
+    `archivePdfBinary` / `readArchivedPdf` / `verifyPdfSidecars`.
+  - **New dependency:** `unpdf` 1.7.0 (pdf.js for serverless runtimes, pure JS),
+    loaded lazily — only when a PDF is imported. Bundled into the CLI and MCP
+    server as before.
+  - Spec 1.1 also lists `agent`, `artifact` and `table` in §1.6 and corrects
+    §13 rules 6 and 7.
+
+  Plain documents are unaffected: their bytes, checksums and chain hashes are
+  identical, `.pdf` files are never discovered as nodes, and the `source:` /
+  `skill:` rules are unchanged.
+
+### Patch Changes
+
+- d55709f: Graph queries return the same documents in the same order every time, and a hub no longer pulls in everything that links to it
+
+  **Order.** `readDocuments` filled its result map as each parallel file read
+  settled, so the same `ctx query` against the same vault could return the same
+  set in a different order from run to run. It now returns documents in the order
+  requested, which makes graph-mode results stable run to run.
+
+  **Hub direction.** "Edges to a hub are free" was also applied when walking an
+  edge backwards, so seeding a hub (for example with a tag the hub carries) pulled
+  in every document that links to it at zero hop cost, even with `--hops 0`. The
+  free rule now follows the direction of travel: reaching a hub is free, leaving
+  one costs a hop, and walking back along `depends_on` (to a dependent rather than
+  a dependency) costs a hop.
+
+  The spec now documents behavior the engine already had: the keyframe cadence
+  (versions 1, 11, 21, …), hash-input normalization (BOM stripped, line endings
+  to LF), the delete-and-recreate exception to `cross_chain_mismatch`, and the
+  traversal cost rules for `hops` (new §5.1.1).
+
+## 2.4.0
+
+### Minor Changes
+
+- b4d44bc: Add `client` — caller attribution on every read and write
+
+  Every `core` operation now accepts an optional `client` object naming the
+  calling agent and its session, plus any custom scalar keys:
+
+  ```jsonc
+  {
+    "title": "API Design",
+    "content": "…",
+    "client": { "agent": "claude-code", "session_id": "s-9f2" }
+  }
+  ```
+
+  A write that publishes records it on the version-history entry it seals, so
+  `context_versions` answers "which agent wrote v7, in which session"; a graph
+  read stamps it on the §9.2 access traces it emits; every other operation hands
+  it to extension `authorize` / `onResult` hooks.
+
+  Everything about it is optional: the object, and each field within it. No
+  operation requires it, and an unattributed call is a valid call.
+
+  **MCP** fills both fields from the connection when the caller sends none —
+  `agent` from the `initialize` handshake's `clientInfo.name`, `session_id` from a
+  per-process id (over stdio, one process is one client connection). Caller values
+  win, merged per key, so supplying only `agent` still gains a session id. Set
+  `CONTEXTNEST_NO_ATTRIBUTION=1` to derive nothing, or `CONTEXTNEST_AGENT` /
+  `CONTEXTNEST_SESSION_ID` to override what the connection reports — precedence
+  per key is caller > env > connection. With nothing to record, `client` is left
+  off the record entirely rather than written as `{}`.
+
+  **CLI** gains three global flags: `--agent <name>`, `--session <id>` and a
+  repeatable `--client <key=value>`, with `CONTEXTNEST_AGENT` /
+  `CONTEXTNEST_SESSION_ID` as env fallbacks so a wrapping agent sets them once per
+  session. `ctx history` renders the recorded block on each version, distinct from
+  `By:`, which is the authoring identity. Values from `--client` are stored as
+  strings — coercing `version=1.0` to `1` would lose characters from an audit
+  record.
+
+  `client` is a label, not an identity claim: never authenticated, never used to
+  authorize, and deliberately not an input to any hash chain, so histories
+  recorded before the field existed keep verifying byte-for-byte. It is bounded
+  (scalar values ≤ 512 chars, ≤ 16 custom keys) because it lands in an append-only
+  audit trail, and a near-miss on a reserved key (`sessionId`) is rejected rather
+  than filed as a custom key, which would leave the write silently unattributed.
+  It is distinct from the `metadata` argument, which is frontmatter and describes
+  the document rather than the call.
+
+  Specified in `CONTEXT_NEST_SPEC.md` §9.4 (with §9.4.1 reserved/custom keys and
+  §9.4.2 binding conventions), and the `client` field on version entries in §6.2.
+
+## 2.3.1
+
+### Patch Changes
+
+- c3378c4: Refuse to auto-index or read a directory that is not a vault.
+
+  When nothing else resolved a vault (no `--vault`, no env override, no local vault above cwd, no registry default), `ctx` fell through to the bare working directory and treated it as one: `ctx query "#x"` in a plain folder printed "No context.yaml found. Auto-indexing vault..." and wrote a `context.yaml` there, and `ctx list` then reported every `.md` under the folder as a draft document. From `$HOME`, `ctx search` crashed on an unrelated YAML file.
+
+  - The CLI and the MCP server now refuse that bare-cwd fallback (via one shared engine helper, `assertVaultRoot`) unless the directory is a real vault root (`.context/config.yaml`; a bare `context.yaml` left behind by the old bug does not count). Both print `Error [NO_VAULT]: <dir> is not a Context Nest vault. Run "ctx init" here, or name a vault — "ctx --vault <alias>", or CONTEXTNEST_VAULT=<alias> on any surface (registered: a, b, c).` — exit 1, nothing written. Registered remote nests are named alongside local ones, and `contextnest-mcp` (which has no `--vault` flag) gets a hint that works there. The check lives in the shared vault-resolution helper, so every read command (`query`, `resolve`, `search`, `list`, `read`, `info`, `verify`, `validate`, `history`, `pack list`, `checkpoint list`, …) and, for free, the vault write commands (`add`, `update`, `index`, …) are covered. `ctx init` and the `ctx vault *` registry commands are exempt. `contextnest-mcp` started from a non-vault directory with nothing else resolving prints the same message and exits non-zero instead of serving the directory. The other resolution steps are unchanged: a local vault above cwd and a registry default still resolve as before.
+  - New `NoVaultError` (code `NO_VAULT`) in the engine, following the existing error-class pattern.
+  - `ctx vault which` marks a bare-cwd resolution that is not a vault as refused (`refused: true` in `--json`), instead of reporting a directory every other command now rejects.
+  - `GraphQueryEngine.query()` only auto-generates a missing `context.yaml` when the storage root is a real vault (`.context/config.yaml` present). A real vault whose `context.yaml` was deleted still regenerates it on the next query.
+
+## 2.3.0
+
+### Minor Changes
+
+- a061c4a: Refuse unknown write parameters instead of silently dropping them, and accept `body`/`content` as aliases.
+
+  A caller that misnamed a parameter — `content` where `update_document` takes `body` — got a success response for a write that never landed: zod's default object mode stripped the key, the handler saw no body, the version bumped, `updated_at` moved, and a checkpoint and chain hash were written over unchanged text. The only way to notice was to read the document back and compare.
+
+  - `EngineApi.run()` now rejects any key an operation's input schema does not declare (`VALIDATION_FAILED`, naming the unknown keys and listing the accepted ones).
+  - The MCP server registers every tool through `registerTool` with a strict ZodObject, so the schema it publishes (`additionalProperties: false`) is the one it enforces. Previously it advertised strictness and stripped instead.
+  - `context_create` / `context_update` accept `body` as an alias for `content`, and `create_document` / `update_document` accept `content` as an alias for `body`. Two values that disagree are refused rather than resolved by preference.
+  - `context_create`, `context_update`, `create_document` and `update_document` take a `description`. It is one of the three fields the metadata index matches on, so a node without one is markedly harder to retrieve; update clears it with an empty string, matching `metadata`'s null convention.
+  - `list_documents` gains the `path` filter its canonical twin `context_list` has as `folder`, matching on segment boundaries.
+
+  Also: make `type: source` nodes writable at all.
+
+  `create_document` built a `skill:` block for skill nodes but had no `source` equivalent, and skipped `validateDocument` entirely. A `type: source` node was therefore written and published with no `source:` block — which §13 rule 9 requires, but only enforces on the way out. Every subsequent update then failed validation, with no parameter able to supply the missing field: the node was write-once, recoverable only by `delete_document`, which destroys its version history. `context_create` was better behaved (it validates, so it failed loudly) but source nodes were simply uncreatable there.
+
+  - New `applyTypedBlocks` settles `source` and `skill` against a node's post-write `type` BEFORE anything is written, shared by `context_create`, `context_update`, `create_document` and `update_document`. Entering `source`/`skill` requires that block (rules 9 / 18); leaving it drops the old one (rules 17 / 19).
+  - `context_create` and `create_document` take a `source` block; `create_document` now validates before the write, so an invalid create leaves nothing on disk.
+  - `context_update` and `update_document` take `type`, `source`, `trigger`, `tools_required` and `output_format`, so a node broken by this bug can be repaired without losing its history, and a node can be re-typed with its block swapped in the same call.
+  - `sourceMetaSchema` is exported, so the write operations accept a source block against the same shape frontmatter validation enforces.
+
+- ca294a1: Vault-hosted skills: install a `type: skill` node into an agent harness
+
+  A skill node can now be rendered as a Claude Code `SKILL.md`, a Cursor rule, a
+  Codex skill, or raw markdown, and installed into the caller's project or home
+  directory. `skill.trigger` becomes the harness's local matcher — the one field
+  that must exist locally, since matching happens before anything can be fetched,
+  so a skill node without a trigger is refused rather than given a guessed one.
+
+  The default install writes a **loader**: the trigger plus an instruction to fetch
+  the procedure from the vault at runtime. A loader cannot go stale because it
+  never holds a copy. `mode: "full"` embeds an offline snapshot instead, and says
+  out loud that the copy will drift.
+
+  - New engine module `skills.ts` (`renderSkill`, `buildInstallManifest`).
+  - New catalog operations `context_skill` and `context_skill_install`, which the
+    MCP server registers automatically — 38 tools now.
+  - New CLI commands `ctx skill <path>` and `ctx skill install <path> [--write]`.
+    Writes land outside the vault, so they go through the same never-clobber guard
+    and dry-run accounting as `ctx read --out`.
+  - New `skills.bootstrap` key in `.context/config.yaml`, naming the skill that
+    teaches an agent to use this vault. `context_init` returns it as
+    `config.skill_bootstrap`.
+  - Node bodies can write `{{server_alias}}` / `{{vault_id}}` / `{{node_path}}`
+    instead of hardcoding an `mcp__…__` prefix that is only correct on one client.
+
+### Patch Changes
+
+- a061c4a: Refuse unknown keys inside nested write objects too, and let `context_import` carry typed blocks.
+
+  The unknown-key guard added alongside the strict MCP tool schemas reads an operation's OUTER shape only, so nested objects went on silently stripping — the same failure it was written to stop, one level down. A bulk import saying `body` instead of `content` published a node with the wrong text; a `source` block with a typo'd `server` was written incomplete and sealed into the chain.
+
+  - `importDoc` and `importFile` are strict. The `files[]` case was the sharper one: the executor writes `f.content ?? ""`, so a stripped key landed an EMPTY file and still counted itself in `written`.
+  - The `source` parameter of `context_create`, `context_update`, `create_document` and `update_document` is strict at each call site. `sourceMetaSchema` itself stays lenient by design — it also parses documents already on disk, where an unrecognized key is a file to keep reading rather than a caller to refuse. Making the base strict would start failing existing vault files.
+  - `context_import` accepts `description` and the typed-block fields (`source`, `trigger`, `tools_required`, `output_format`, `inputs`, `guard_rails`). `buildDraftNode` already forwarded them to `applyTypedBlocks`, but the schema dropped them first, so `type: source` and `type: skill` nodes could not be imported at all — import was the one write surface the source-node fix missed.
+  - `metadata` stays permissive; arbitrary keys are its purpose.
+
+  Also repairs two handlers mangled in the merge of the vault-lock and strict-schema branches: `create_document` and `update_document` had a block-bodied arrow around `lockedHandler(...)`, whose return value was therefore discarded — the tool resolved `undefined` and the write ran unawaited. Both are back to the concise form the other locked tools use.
+
+## 2.2.1
+
+### Patch Changes
+
+- e247037: Pick up the checkpoint-chain write fix, and stop `ctx index` reading the whole chain.
+
+  Both binaries compile the engine into `dist/` and declare it as a devDependency, so an engine-only release would leave installed copies still running the old code — the checkpoint fix reaches `ctx` and the OSS MCP server only when they are rebuilt and republished. Every write path in both already routes through `publishDocument` / `publishDocuments` / `storage.regenerateIndex()`, so no call-site change was needed for them to inherit it.
+
+  `ctx index` was the one exception. It reimplements `regenerateIndex` inline and carried its own copy of the whole-chain read for a single field (`checkpoints.at(-1)`); it now takes the head through `readLatestCheckpoint()` like the engine does. One-shot rather than per-write, so it was never part of the timeout, but it is the same O(chain size) cost.
+
+## 2.2.0
+
+### Minor Changes
+
+- Remote nests: point `ctx` at a nest served over MCP and use it like a local vault.
+
+  The vault registry grows a top-level `remotes:` map — stdio or HTTP specs, env-ref-only auth, sharing one alias namespace with local `vaults:`. Older CLIs strip the unknown key and keep working. `resolveNest()` resolves an alias to either a local path or a remote spec at the documented precedence; `resolveVaultPath()` wraps it and fails with a clear local-only error when an alias points at a remote.
+
+  `--vault <remote-alias>` then routes read and write commands through an MCP client (`connectRemoteNest()`, SDK loaded lazily) instead of the local engine, with JSON output shape-identical to the local path. Local-only commands fail fast on a remote alias rather than pretending to work, and an unreachable remote exits 3 naming the alias.
+
+  The wire contract is the engine's canonical operation catalog, so the MCP server now binds every core op under its canonical `context_*` name with catalog-sourced schemas, keeps the legacy tool names as deprecated aliases, and returns catalog output shapes and structured `{code, message}` errors. That closes the drift between engine, CLI and MCP server on the remote path.
+
+  Capability-aware behaviour on top of it:
+
+  - `ctx publish` against a remote that has no `context_publish` routes through the remote's review flow instead of failing — Community publishes via steward review.
+  - `ctx verify` refuses to report a verification the remote cannot perform, rather than fabricating a pass.
+
+## 2.1.0
+
+### Minor Changes
+
+- 6b6ffcb: Flatten the dependency tree and publish the dependency graph.
+
+  Installing the CLI now pulls **2 packages with no nesting** (1 with `--omit=optional`), down from 104 packages at depth 7. **The MCP server installs nothing at all**, down from 97 packages at depth 11.
+
+  The CLI and MCP server are binaries, not libraries, so their dependencies are now compiled into `dist/` and declared as devDependencies. Unused code is dropped in the process — the MCP server no longer ships the SDK's express, hono, ajv and jose transports, none of which a stdio server touches. Every bundled package is listed with its version and licence in `DEPENDENCIES.md`, so nothing is hidden by being bundled.
+
+  The engine is a library and keeps real dependencies — 7 packages at depth 2, down from 76. Four were removed outright without losing any behaviour:
+
+  - `unified` / `remark-parse` / `remark-gfm` (58 packages) — the markdown AST was used only to find `contextnest://` links and section headings, which a fence-aware line scanner does directly.
+  - `fast-glob` (18 packages) — replaced by a small `*` / `**` matcher over a `readdir` walk.
+  - `gray-matter` (11 packages) — frontmatter is split in-tree and parsed with the `js-yaml` the engine already depended on, instead of a second, older copy of it.
+  - `cli-table3` (7 packages) — declared but never imported.
+
+  Alongside that:
+
+  - **No install scripts.** The CLI's `postinstall` banner is gone; installing the package now executes none of our code. The same guidance is one `ctx` away in the top-level help.
+  - **Minimal install profile.** `chalk` moved to `optionalDependencies`, so `npm install -g @promptowl/contextnest-cli --omit=optional` installs a colour-free CLI — a single package — with every command, flag and output format unchanged.
+  - **Published dependency graph.** `DEPENDENCIES.md` records every installed and bundled package, why it is there, and its licence. CI regenerates it and fails on drift, verifies that every module a published bundle imports is a declared dependency, and uploads the machine-readable graph as a build artifact.
+
+## 2.0.0
+
+### Major Changes
+
+- f6e7bcb: `context_import` publishes documents already in the vault, and reports progress
+
+  Folder importers write files into the vault themselves — the file's path _is_
+  its document id, and its frontmatter is already authored. Until now
+  `context_import` could only create nodes from `title` + `content`, minting a new
+  `nodes/<folder>/<slug>` id for each, so those importers fell back to looping
+  `publishDocument` one document at a time. That loop is O(N²): every publish
+  seals its own checkpoint, and every checkpoint re-scans the entire vault.
+
+  `context_import` now takes an optional `ids` array alongside `documents`. Ids are
+  published as-is, with paths and frontmatter untouched. Both modes feed one
+  `publishDocuments` call, so a mixed batch still seals ONE checkpoint and
+  regenerates the index ONCE.
+
+  - `BulkPublishOptions.onProgress(done, total)` fires as each document settles,
+    published or failed.
+  - `OperationContext.onProgress` carries that sink to any operation. It lives on
+    the context rather than in an operation's input because inputs must stay
+    JSON-serializable for the MCP/REST wire; in-process callers supply it, wire
+    transports leave it undefined.
+  - `ctx publish --all` bulk-publishes every unpublished document in the vault
+    through the operation, with a live counter.
+  - The MCP server exposes `context_import` as its first catalog-driven tool —
+    description and schema come from the engine descriptor, so the surface cannot
+    drift from the CLI and Community ones.
+
+  **Breaking (`context_import` output):** `created` is renamed to `published`, and
+  `checkpoint` is added. `failed` entries now carry `id` (for the `ids` path) _or_
+  `title` (for the `documents` path) instead of `title` unconditionally. The
+  operation catalog shipped in 1.3.0 with no consumers on any surface, so nothing
+  in-tree depended on the old shape.
+
+- c86ba71: Opening a vault takes one call, and `context_overview` is gone
+
+  `context_init` returned only `CONTEXT.md`, `context_overview` returned counts and
+  a node list, and neither returned the vault's configuration — so an agent opening
+  a vault made two round trips and still could not see the config. Meanwhile the
+  `vault_info` alias sat on `context_overview`, an operation that returns none of
+  what `vault_info` returns.
+
+  `context_init` now answers both halves of "open this vault" in one call: its
+  `CONTEXT.md` instructions, its configuration (name, description, declared MCP
+  servers), its path, and what it holds — total, counts by type and status, and the
+  tag set. The node list itself is opt-in behind `include_nodes` (with `limit`),
+  because counts and tags answer most opening questions and a large vault's node
+  list dwarfs them. `vault_info` now aliases this operation, which actually returns
+  what that name promises.
+
+  `context_overview` is **removed**. Everything it returned, `context_init` returns.
+
+  `context_init` also counts retired nodes. It discovers with `includeRetired`, so
+  `by_status` can report `rejected` at all — the manifest previously omitted a whole
+  status rather than reporting zero, the same defect `context_list` carried.
+
+  `context_init`, `context_verify` and `context_packs` are registered as MCP tools;
+  `vault_info` and `verify_integrity` keep their exact behaviour and are deprecated
+  in favour of the first two.
+
+  New CLI command `ctx info` shows a vault's instructions, configuration and
+  contents (`--nodes` to list them, `--json` for the raw payload). It is
+  deliberately **not** called `ctx init`: that command _creates_ a vault, where this
+  one opens an existing one — same word, opposite meaning.
+
+  `ctx verify` deliberately does **not** move onto `context_verify`. It verifies
+  each document chain itself and reports unreadable histories per document, which is
+  strictly more than the operation's vault-level integrity check; routing it through
+  the catalog would have lost that.
+
+- c86ba71: `context_list`, `context_get` and `context_versions` become the shared browse path
+
+  The CLI, the MCP server and Community each grew a private copy of "filter a
+  document list", and each got a different subset of the rules right. The filter
+  now lives in one place — a new exported `filterDocuments(docs, filters)` — which
+  `context_list` wraps and which surfaces that filter a list they already hold can
+  call directly.
+
+  **Two bugs in `context_list`, both of which made a filter silently return
+  nothing:**
+
+  - `status: "rejected"` could never match. The executor discovered documents
+    without `includeRetired`, so retired ones were dropped before the status
+    filter ever saw them. The CLI and MCP server each worked around this
+    privately.
+  - `type` compared `frontmatter.type` literally, with no `document` default. The
+    field is optional, so `type: "document"` skipped every document that omits it
+    — which is most of them.
+
+  Also fixed, and previously inconsistent between surfaces: a tag now matches with
+  or without its leading `#` and regardless of case. Comparing a bare filter value
+  against `#`-prefixed frontmatter tags is a filter that always returns empty,
+  which is worse than one that errors.
+
+  `context_list` additionally accepts an **array of types**, so a caller browsing a
+  family of types (every runnable type, say) no longer has to list everything and
+  re-filter. Two more inputs let a governed surface adopt the operation rather than
+  keep its own copy of discovery:
+
+  - `include_retired` keeps retired nodes when no status filter is given. There a
+    rejected document is still something its stewards act on, not one removed from
+    the vault.
+  - `full` returns each node's whole frontmatter and body instead of a summary, for
+    callers that go on to gate and render the documents and would otherwise have to
+    read every file a second time.
+
+  **An operation whose input carried a `.refine()` could not be exposed over MCP at
+  all.** A refine makes the input a `ZodEffects`, which has no `.shape` — and that
+  shape is exactly what a tool is registered from. The SDK accepted the undefined
+  value and published a tool advertising **no parameters**, so a client had no way
+  to know what to send; `context_versions` shipped that way. The selector schemas
+  are plain objects now and `resolveId` raises the same `VALIDATION_FAILED` at
+  execution time. A regression test asserts each catalog tool advertises its
+  declared inputs, which the old "inputSchema is defined" check sailed past.
+
+  **Reading a node from a flat-layout vault returned NOT_FOUND.** `resolveId`
+  re-rooted a bare id under `nodes/`, so every id from a vault whose documents
+  carry no such prefix pointed at a document that does not exist — the same fix
+  `context_update` and `context_import` already took, now applied to every
+  selector-based operation.
+
+  An id is therefore taken **exactly as stored**: a bare slug is no longer
+  re-rooted under `nodes/`, so a caller migrating from `read_document` (which did
+  re-root) must pass the full id. A trailing `.md` and leading slashes are still
+  stripped, since callers build ids from file paths and storage appends `.md`
+  itself.
+
+  `context_get` gains three inputs, each one a thing a surface previously had to
+  bypass the operation to do: `include_raw` returns the exact stored bytes for
+  callers that re-serve the file verbatim, `verify_checksum` detects drift on read,
+  and `allow_rejected` returns a retired node instead of refusing — reading one is
+  not the same as republishing it. It is registered as an MCP tool, with
+  `read_document` deprecated in its favour.
+
+  `ctx read` runs through it. `ctx list` gains `--limit` and now runs through the
+  operation. `ctx history` runs
+  through `context_versions` and gains `--diff`, which it could not do at all
+  before. Both `context_list` and `context_versions` are registered as MCP tools;
+  `list_documents` keeps its exact behaviour and is marked deprecated in favour of
+  `context_list`. `context_versions` is a new capability there — nothing exposed
+  version history before, since `read_version` answers a different question.
+
+- c86ba71: `context_update` becomes the shared update path for every surface
+
+  The operation could not rename a node, could not set a status, and always
+  published — so no surface could adopt it, and the CLI, MCP server and Community
+  each kept a private copy of "edit a document". The copies drifted, and one rule
+  in particular ("a lifecycle status change is metadata, not a release") was
+  hand-rolled identically in two places and absent from a third.
+
+  `context_update` now accepts:
+
+  - `title` as the **new** title. It was previously a way to _select_ the node to
+    update — but every surface addresses a node by id or path and sends a title
+    only to rename, so selecting by title served no caller and collided with the
+    field they all wanted. Selection is by `id`.
+  - `status` — a canonical lifecycle status (normalize aliases with
+    `normalizeStatus` before calling).
+  - `publish` — defaults to true, and to **false** when `status` names a
+    non-published lifecycle value, because those are metadata transitions rather
+    than content releases. An explicit value always wins. This is the rule the CLI
+    and MCP server each carried privately.
+  - `note` — recorded against the publish in version history.
+  - `version` — an explicit version to stamp, for governed callers that assign
+    version numbers themselves for a revision awaiting review. Ignored when
+    publishing, which assigns its own.
+
+  Output gains `status` and `checkpoint`, mirroring `context_create`.
+
+  Three behaviour changes come with it:
+
+  - **`tags` replaces rather than merges**, matching the CLI, the MCP server and
+    `context_create`. A caller that wants the old merge sends the merged set.
+  - **`metadata` treats a null value as "clear this key".** A merge alone gave
+    callers no way to remove metadata at all: over a JSON wire an absent key is
+    indistinguishable from "leave this alone".
+  - **A rejected document is refused only when no `status` is given.** Naming a new
+    status is how a caller revives one, which the MCP server already allowed and
+    the operation previously blocked outright.
+  - **A body edit drops the stored checksum before writing.** The checksum
+    describes the published body, so an edit whose publish then fails used to
+    leave a stale one on disk and the next verified read reported the document as
+    externally modified. Frontmatter-only edits keep it — the checksum covers the
+    body alone.
+
+  **Bug fix — updating a flat-layout vault.** The operation re-rooted a bare
+  document id under `nodes/`, which silently redirected every id from a vault whose
+  documents don't carry that prefix. Ids are now vetted for traversal without being
+  rewritten, and the storage layer resolves them for its own layout — the same fix
+  `context_import` took for its `ids` input.
+
+  `ctx update` and a new `context_update` MCP tool both run through that one path.
+  `update_document` keeps its exact behaviour and registration (including its status
+  aliases) and is now marked deprecated in favour of `context_update`, so existing
+  MCP clients are unaffected.
+
+### Minor Changes
+
+- c86ba71: The rest of the core operations become the shared path
+
+  Search, selector query, resolution, publish, delete and version reconstruction were the last core operations each surface still implemented privately. They now run through the catalog, which completes the core namespace.
+
+  **A version that does not exist returned a different version's content.** Reconstruction starts at the nearest keyframe at or before the version asked for and replays change logs forward. Ask for a version the history does not contain and there is nothing to replay, so it returned the keyframe's content as though it were the version requested — silently, in the one place that must never give a silently wrong answer. It refuses now. This surfaced a regression test that had been passing on exactly that wrong content: it asked for version 2 of a document left at version 1 and matched on a title both versions share.
+
+  Three operations gained what a surface needed before it could adopt them:
+
+  - `context_query` takes `include_drafts`, for authoring surfaces where the point is finding the draft you are working on. Without it, adoption would have silently dropped `ctx query --include-drafts`.
+  - `context_publish` takes a version-history `note` and returns the `chain_hash`, both of which `ctx publish` reports.
+  - `context_delete` returns the deleted node's `title`, read before removal — after the delete there is nothing left to ask.
+
+  Node summaries now carry `description` when the document has one.
+
+  `ctx search`, `query`, `publish`, `delete` and `reconstruct` run through the catalog; `ctx search` gains `--limit`. Six more MCP tools are registered, with `search`, `resolve`, `publish_document`, `delete_document` and `read_version` kept, unchanged, and marked deprecated.
+
+  Two commands deliberately stay on their own implementations, and the reason is worth recording. `ctx verify` checks each document chain and reports unreadable histories per document, which is strictly more than the vault-level integrity operation. And `ctx resolve` evaluates a selector and lists what matches — despite the shared word, that is not `context_resolve`, which returns full bodies within a token budget.
+
+  `context_packs` also returns each pack's `includes` and `excludes`. Leaving them out made it a lossy view of what is on disk — a caller listing packs had to read the file itself to see what a pack actually selects. `ctx pack list` runs through the operation now.
+
+- 228c060: Nests carry a description, and agents can list every registered nest
+
+  An agent targeting a nest had only its alias to go on. Nests now carry a
+  human-readable description that says what the nest is _for_, and there is an
+  operation to enumerate them.
+
+  - `context_nests` lists every nest in the central registry:
+    `{}` → `{ nests: [{ alias, path, description?, isDefault, exists }] }`. It is
+    the first **registry-scoped** operation in the catalog — it reads
+    `~/.contextnest/config.yaml` rather than one vault, so it ignores its
+    `OperationContext`. The MCP server exposes it as a catalog-driven tool.
+  - `NestStorage.init()` takes an optional `description` and writes it into
+    `.context/config.yaml` (spec §11.1), so `ctx init --description` now reaches
+    the nest's own config and not just the registry entry. `ctx init` resolves its
+    interactive description prompt before creating the vault, so a prompted value
+    lands in the config too.
+  - `setVaultDescription(alias, description?)` and `ctx vault describe <alias>
+[description]` edit a registry description after the fact. Omitting the text
+    (or passing blank) removes the key rather than storing `""`, so the nest's own
+    config description takes over again.
+
+  **Description precedence**, applied wherever nest metadata is surfaced: the
+  registry entry's `description` (a machine-local label for _your_ alias), then
+  the nest's own `.context/config.yaml` `description` (travels with the vault),
+  then its `name`. Blank counts as unset at every tier.
+
+  **Behavior change (`ctx vault list`):** `listVaults()` previously fell back to
+  the config's `name`, skipping its `description` entirely. Vaults whose config
+  carries a `description` now show it instead of their `name`.
+
+- c86ba71: `context_create` becomes the shared create path for every surface
+
+  The operation could only derive an id from title + folder, always published, and
+  could not express a skill block — so no surface could actually adopt it, and the
+  CLI and MCP server each kept a private copy of "create a document". Those copies
+  drifted: the same action produced different version numbers depending on which
+  one you used.
+
+  `context_create` now accepts:
+
+  - `id` — mint your own instead of deriving from title + folder.
+  - `publish: false` — leave the node a draft, for governed callers whose writes
+    must clear review before becoming retrievable.
+  - `note` — recorded against the publish in version history.
+  - the `skill` block fields (`trigger`, `inputs`, `tools_required`,
+    `output_format`, `guard_rails`), without which the operation could not produce
+    a valid `type: skill` node at all.
+
+  Output gains `status` and `checkpoint`, and a created node now carries
+  `updated_at` instead of rendering blank until its first edit.
+
+  `ctx add` and a new `context_create` MCP tool both run through that one path.
+  Surface-specific authoring niceties — heading and step templates, default skill
+  triggers — stay with their surface. `create_document` keeps its exact behaviour
+  and registration and is now marked deprecated in favour of `context_create`, so
+  existing MCP clients are unaffected.
+
+  **Vocabulary now covers what the ecosystem actually stores.** Adopting the shared
+  create path made Community validate its documents against the engine schema for
+  the first time, and three shapes it has always written turned out to be invalid:
+
+  - `agent`, `artifact` and `table` join `NODE_TYPES`. Vaults holding them failed
+    `ctx validate` even though every surface reads and writes them.
+  - `TAG_PATTERN` accepts `:`, so namespaced tags (`#dept:engineering`) validate.
+    Strictly a widening — every previously valid tag still matches. Note the
+    selector lexer does not tokenize `:` inside a tag, so namespaced tags are not
+    yet addressable in a query.
+  - `context_create` accepts an initial `status`, for callers that create a node
+    directly into a lifecycle state other than draft (only meaningful alongside
+    `publish: false`).
+
+  **Behaviour fix — new-document version numbering.** `ctx add` wrote
+  `version: 1` into frontmatter and let publish bump it, so a brand-new document's
+  history began at **v2 with no v1 keyframe**. Publish owns version assignment
+  (spec §6); a newly created document is now v1. The MCP server already had this
+  fix, the CLI did not. Existing documents are unaffected.
+
+### Patch Changes
+
+- Updated dependencies [f6e7bcb]
+- Updated dependencies [c86ba71]
+- Updated dependencies [228c060]
+- Updated dependencies [c86ba71]
+- Updated dependencies [228c060]
+- Updated dependencies [c86ba71]
+- Updated dependencies [c86ba71]
+- Updated dependencies [c86ba71]
+  - @promptowl/contextnest-engine@2.0.0
+
+## 1.2.1
+
+### Patch Changes
+
+- Bump `@modelcontextprotocol/sdk` to `^1.29.0`.
+
+- Updated dependencies []:
+  - @promptowl/contextnest-engine@1.2.1
+
 ## 1.2.0
 
 ### Minor Changes

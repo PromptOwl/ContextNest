@@ -3,16 +3,20 @@
   "private": true,
   "scripts": {
     "build": "pnpm -r build",
+    "build:full": "pnpm build && pnpm deps:graph",
     "test": "vitest run",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
-    "test:regression": "pnpm --filter \"...@promptowl/contextnest-cli\" --filter \"...@promptowl/contextnest-mcp-server\" build && vitest run --config vitest.regression.config.ts",
+    "test:regression": "pnpm --filter \"...@promptowl/contextnest-cli\" --filter \"...@promptowl/contextnest-mcp-server\" --filter \"@promptowl/contextnest-engine\" build && vitest run --config vitest.regression.config.ts",
+    "test:pkg": "pnpm --filter \"@promptowl/contextnest-cli\" build && vitest run --config tests/e2e-pkg/vitest.config.ts",
     "lint": "pnpm -r lint",
     "clean": "pnpm -r clean",
     "plugins:sync": "node scripts/sync-plugins.mjs",
     "plugins:check": "node scripts/sync-plugins.mjs --check",
+    "deps:graph": "node scripts/dep-graph.mjs",
+    "deps:check": "node scripts/dep-graph.mjs --check",
     "prepublish": "pnpm -r build",
-    "version-packages": "changeset version && pnpm install --lockfile-only",
+    "version-packages": "changeset version && pnpm install --lockfile-only && pnpm build:full",
     "release": "pnpm prepublish && changeset publish"
   },
   "devDependencies": {

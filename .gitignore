@@ -8,8 +8,20 @@ local_vault
 fixtures/*
 # Keep the committed test vault tracked (it backs the engine test suite).
 !fixtures/minimal-vault/
+# Tiny PDFs for the `pdf` node type's CLI / MCP regression suites.
+!fixtures/pdf/
 .claude/agent-memory/*
+# Per-checkout Context Nest plugin overrides — personal, never shared.
+.claude/contextnest.local.json
 
 # Test coverage output
 coverage/
 
+
+# Benchmark output — machine-specific timings and V8 profiles. The committed
+# baseline is bench/budget.json, not any one run.
+packages/engine/bench/results-*.json
+packages/engine/bench/profiles/
+
+# Non-tmp sandbox used by init-register.test.ts (init must not auto-register under the OS temp dir)
+.tmp-test/

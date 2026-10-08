@@ -6,122 +6,112 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Context Nest is a structured second brain for AI agents — a governed, versioned knowledge base that agents can query. It provides typed graph structure, ~100x cheaper queries (~500 tokens vs 50k), and hash-chained audit trails.
 
+Requires Node >= 20 and pnpm >= 9. CI runs the full matrix on ubuntu/windows/macOS × Node 20/22, so **cross-platform correctness matters** — normalize CRLF, avoid POSIX-only path assumptions, and don't shell out to tools Windows lacks (`jq`, etc.).
+
 ## Build and Development Commands
 
 ```bash
-# Install dependencies (uses pnpm workspaces)
 pnpm install
-
-# Build all packages
-pnpm build
-
-# Run all tests
-pnpm test
-
-# Run tests in watch mode
-pnpm test:watch
-
-# Type-check without emitting
-pnpm lint
-
-# Clean all build artifacts
+pnpm build              # tsup, all packages
+pnpm lint               # tsc --noEmit, all packages
+pnpm test               # vitest — unit + structural (regression suites EXCLUDED)
+pnpm test:regression    # builds CLI + MCP server first, then runs *.regression.test.ts
 pnpm clean
 
-# Run a single test file
+# Single file / pattern / package
 pnpm test packages/engine/src/__tests__/engine.test.ts
-
-# Run tests for a specific package
+pnpm test -t "hash chain"
 pnpm --filter @promptowl/contextnest-engine test
+
+# Plugin vendoring (see "Plugins" below) — run after editing plugins/shared/
+pnpm plugins:sync
+pnpm plugins:check      # CI guard; fails on drift
 ```
+
+`pnpm test` and `pnpm test:regression` are separate on purpose: regression suites spawn the *built* `dist/index.js` of the CLI and MCP server against throwaway vaults, so they need a build first and are slow. Editing engine/CLI source and running only `pnpm test` will not exercise them.
 
 ## Architecture
 
-This is a **pnpm monorepo** with three packages:
+pnpm monorepo, two workspaces of interest:
 
 ```
-packages/
-├── engine/      # Core library — parsing, storage, versioning, integrity, selectors
-├── cli/         # Command-line tool (`ctx` / `contextnest`)
-└── mcp-server/  # MCP server exposing vault operations as tools for AI agents
+packages/       # published npm packages (engine ← cli, mcp-server)
+plugins/        # coding-agent plugins that drive the ctx CLI (not published to npm)
 ```
 
-### Package Dependencies
+`packages/governance/` is untracked local build residue — ignore it.
 
-- `cli` → depends on `engine`
-- `mcp-server` → depends on `engine`
-- `engine` → standalone core library
+### Engine (`@promptowl/contextnest-engine`)
 
-### Engine Package (`@promptowl/contextnest-engine`)
-
-The core library implementing the Context Nest specification:
+Standalone core implementing `CONTEXT_NEST_SPEC.md`. Notable modules beyond the obvious CRUD:
 
 | Module | Purpose |
 |--------|---------|
+| `parser.ts` / `schemas.ts` | Markdown + YAML frontmatter; Zod validation rules 1–17 (spec §13) |
 | `storage.ts` | Vault file operations, document CRUD |
-| `parser.ts` | Markdown + YAML frontmatter parsing |
-| `versioning.ts` | Keyframe + diff version history |
-| `checkpoint.ts` | Nest-level atomic snapshots |
-| `integrity.ts` | SHA-256 hash chain verification |
-| `selector/` | Query grammar parser and evaluator |
-| `graph-traverser.ts` | Relationship graph traversal |
-| `resolver.ts` | URI resolution (`contextnest://` scheme) |
-| `schemas.ts` | Zod schemas for frontmatter validation |
+| `versioning.ts` / `checkpoint.ts` | Keyframe+diff history; nest-level atomic snapshots |
+| `integrity.ts` / `chain-log.ts` | SHA-256 hash chains and their audit log |
+| `selector/` | `lexer` → `parser` → `evaluator` (+ `index-evaluator` for the fast path over `context.yaml`) |
+| `graph-traverser.ts` / `graph-query-engine.ts` / `wiki-graph.ts` | Relationship traversal and `[[wikilink]]` graph |
+| `registry.ts` | Central vault registry at `~/.contextnest/config.yaml` — see resolution order below |
+| `source-graph.ts` | Live `source` nodes (MCP/REST/CLI/function transports) |
+| `packs.ts` | Saved selector bundles (`pack:name`) |
+| `suggestions.ts` / `approval.ts` / `rbac.ts` / `stewards.ts` | Drift suggestions, approval workflow, role scoping |
+| `hygienist.ts` / `index-generator.ts` / `index-md-generator.ts` | Vault health checks; `context.yaml` and `INDEX.md` regeneration |
+| `agent-configs.ts` | Generates CLAUDE.md / agent config blocks into a target project |
+| `encryption/` | Opt-in encrypted vaults (`docs/encrypted-vaults.md`). `NestStorage` is the only caller: every sensitive read/write goes through its `readText`/`sealText` helpers. Never read or write a vault content file with raw `fs` outside storage, or you will get ciphertext, or write plaintext into an encrypted vault |
 
-### CLI Package (`@promptowl/contextnest-cli`)
+**Vault resolution** (`resolveVaultPath()`, highest precedence first) — a frequent source of "wrong vault" bugs:
+`--vault <alias>` → `CONTEXTNEST_VAULT` (alias) → `CONTEXTNEST_VAULT_PATH` (abs path) → positional arg → local `.context/config.yaml` found by walking up cwd → registry `default:` → cwd.
 
-Provides two binary commands: `ctx` and `contextnest`
+### CLI (`@promptowl/contextnest-cli`)
 
-Key commands: `init`, `add`, `update`, `delete`, `read`, `query`, `publish`, `verify`, `history`
+Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (commander). Command groups: document CRUD (`add`/`update`/`delete`/`read`/`publish`), query (`query`/`search`/`resolve`/`list`), integrity (`verify`/`history`/`reconstruct`/`checkpoint`), governance (`drift stage|list|approve|reject`), and multi-vault (`vault add|list|remove|default|which`). `init` scaffolds from `src/starters/` — the starter prompt bodies are the agent-facing onboarding text and have their own tests.
 
-### MCP Server Package (`@promptowl/contextnest-mcp-server`)
+### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-Exposes 19 tools over stdio transport for AI agents:
-- Read tools: `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`
-- Mutation tools: `create_document`, `update_document`, `delete_document`, `publish_document`
-- Governance tools: `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`
+42 tools over stdio, in three groups:
+
+- **Catalog-driven** (22, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`, `context_forget`, `context_forget_log`. **Add new tools here, not by hand.**
+- **Hand-written, still current** (9): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`, `context_review` (review gate — hand-written on purpose so hosted catalog bindings cannot toggle it).
+- **Deprecated** (11, backward-compatible for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`. Additive parity fixes are allowed here — `list_documents` takes `path` (the `folder` filter of `context_list`), `create_document`/`update_document` take `description` and accept `content` as an alias for `body` — but nothing already accepted may change meaning.
+
+Every tool is registered through the local `tool()` helper, NOT `server.tool()`. `server.tool()` takes a raw shape and wraps it in a non-strict `z.object()`, which STRIPS unknown keys while the JSON Schema it publishes claims `additionalProperties: false`: a client that misnames a parameter gets a success response for a write that silently dropped its text. `tool()` goes through `registerTool` with a `.strict()` ZodObject so the advertised contract is the enforced one. `EngineApi.run()` refuses unknown keys for the same reason, one layer down.
+
+### Plugins (`plugins/`)
+
+Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Only the Claude Code plugin is built; Codex/Gemini are README-only.
+
+**`plugins/shared/` is the single source of truth. Never edit `plugins/claude-code/core/` — it is a vendored byte-identical copy.** Installed Claude plugins can't read files outside their own directory, so `pnpm plugins:sync` copies `shared/core/*` into each agent plugin and fills the `<!-- BEGIN SHARED -->…<!-- END SHARED -->` regions of agent/skill markdown from `shared/prompts/*.md`. `pnpm plugins:check` fails CI on drift.
+
+Each `core/*.js` module exports a **pure** `run({ input, env, exec })` returning the hook-output object (or `null` to do nothing), plus a thin IO shell guarded by `isMain(import.meta.url)`. Tests call `run()` with a fake `exec` — no subprocess. Zero runtime deps, plain Node ESM.
+
+Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `CAPTURE_MODE` (`off`/`propose`/`auto`, default `propose`), `UNCLEAR_NEST` (`ask`/`default`, default `ask` — what capture does when no nest clearly fits a new note), `VAULT` (pinned alias; may be `<server>/<nest>`), `CTX_COMMAND` (default `ctx`). `AUTO_CAPTURE` is deprecated but still read (`true`→`propose`, `false`→`off`); an explicit `CAPTURE_MODE` wins at any layer.
+
+**Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
+
+Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retrieval **and dispatch of any parked job**, `Stop` → capture gate, `PostToolUse` (Bash) → sweep-check: after a `ctx update`, diff against the prior version and report every node in every registered nest still carrying the removed value (two channels: exact entity-tag lookup via `ctx list --tag` — agents tag nodes with the concrete values they assert and retag on edit — plus confirmed full-text search for untagged prose). The sweep-check keys on the write, not the phrasing — `correctionIntent()` misses declarative updates entirely, which is why it exists. Concurrent same-vault writes are serialized by a per-vault `mkdir` lock in the engine's mutating executors (`packages/engine/src/vault-lock.ts`); without it, parallel writers silently corrupt the checkpoint chain.
+
+**The Stop hook never blocks.** It used to return `decision: "block"`, which held the turn open while a subagent ran. It now parks `{kind, reason, turn}` in the session ledger and returns only a `systemMessage`; the next `UserPromptSubmit` drains the queue and hands the directive over as `additionalContext` (the field the model acts on — Stop's own `additionalContext` is transcript metadata it does not act on). `contextnest-capture` and `contextnest-curator` are `background: true` so the dispatched work overlaps the user's next request. Note `saveLedger` writes an explicit key projection: a new ledger field must be added to the `EMPTY` sentinel, the `loadLedger` projection **and** the `saveLedger` stringify, or it is dropped silently.
 
 ## Key Concepts
 
-**Node Types**: `document`, `snippet`, `glossary`, `persona`, `prompt`, `source`, `tool`, `reference`, `skill`
+**Node types**: `document`, `snippet`, `glossary`, `persona`, `prompt`, `source`, `tool`, `reference`, `skill`, `agent`, `artifact`, `table`, `pdf`, `task`
 
-**Selector Grammar**: Composable query language for selecting documents
-- Tags: `#engineering`
-- Types: `type:document`
-- Packs: `pack:onboarding.basics`
-- Operators: `+` (AND), `|` (OR), `-` (NOT)
+**PDF nodes** (spec §1.11): body = extracted text (`<!-- page N -->` markers), the PDF is a binary sidecar `<id>.pdf` beside the `.md`, bound by `pdf.sha256` in frontmatter (so it rides the version chain). Created only by `context_import_pdf` / `ctx import pdf` (`importers/pdf.ts`, unpdf); body edits are refused; prior binaries are archived as `.versions/<doc>/<sha256-hex>.pdf`; `verifyPdfSidecars` reports `sidecar_drift`/`sidecar_missing`; delete removes the sidecar.
 
-**URI Scheme**: `contextnest://path`, `contextnest://path@N` (pinned to checkpoint N), `contextnest://path#section`
+**Statuses**: `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (set only by `ctx forget`; spec §6.3 — erased content, hashes kept, anti-resurrection via `.versions/chain_events.yaml`; `ctx delete` only appends an audit-only record). Parse-time aliasing normalizes legacy/foreign values (case-insensitive; unknown → `draft`); disk always stores canonical values, re-canonicalized on round-trip through `serializeDocument` or `ctx index`.
 
-**Version Model**: Keyframe + diff storage (keyframes every 10 versions by default)
+**Selector grammar**: `#tag`, `type:document`, `status:published`, `pack:onboarding.basics`, `nodes/<id>` / `sources/<id>` (a bare node id — shorthand for `contextnest://nodes/<id>`), with a space or `+` (AND), `|` (OR), `-` (NOT), and `( )` to group. The one canonical line is `SELECTOR_GRAMMAR` in `packages/engine/src/selector/grammar.ts`; every surface that teaches the grammar renders it verbatim, so change it there and nowhere else.
 
-**Integrity**: SHA-256 hash chains for both document versions and nest checkpoints
+**URI scheme**: `contextnest://path`, `@N` (pinned to checkpoint N), `#section`.
 
-## Testing
+**Version model**: keyframe + diff (keyframe every 10 versions by default), SHA-256 hash-chained for both document versions and nest checkpoints.
 
-Tests use **Vitest** with workspace configuration. Each package has its own `__tests__/` directory.
+## Releasing
 
-```bash
-# Run all tests
-pnpm test
-
-# Run specific test file
-pnpm test packages/engine/src/__tests__/engine.test.ts
-
-# Run tests matching pattern
-pnpm test -- --grep "hash chain"
-```
-
-## TypeScript Configuration
-
-- Target: ES2022
-- Module: ESNext with bundler resolution
-- Strict mode enabled
-- Build tool: tsup
+Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together. `CONTEXT_NEST_SPEC.md` is the one exception in the repo: Apache-2.0, per `LICENSE-SPEC`.
 
 ## Specification
 
-The full technical specification is in `CONTEXT_NEST_SPEC.md`. Key sections:
-- §1: Document format and frontmatter
-- §2: Selector grammar
-- §4: URI scheme (`contextnest://`)
-- §6-8: Version history and integrity verification
+`CONTEXT_NEST_SPEC.md` is normative — §1 document format, §2 selectors, §3 packs, §4 URI scheme, §5 `context.yaml`, §6–8 versions/checkpoints/integrity, §9 injection & tracing, §10 INDEX.md, §13 validation rules.

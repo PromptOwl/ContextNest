@@ -1,0 +1,16 @@
+.git
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+*.tsbuildinfo
+.context
+local_vault
+.internal
+.env*
+.DS_Store
+# Not needed to build the server: test vaults and the agent plugins (not a
+# pnpm workspace member).
+fixtures
+plugins

@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<article xmlns:mml="http://www.w3.org/1998/Math/MathML" xmlns:xlink="http://www.w3.org/1999/xlink" dtd-version="1.4" article-type="research-article">
+  <front>
+    <journal-meta>
+      <journal-id journal-id-type="nlm-ta">J Synth Gastro</journal-id>
+      <journal-title-group>
+        <journal-title>Journal of Synthetic Gastroenterology</journal-title>
+      </journal-title-group>
+      <issn pub-type="ppub">0000-0001</issn>
+    </journal-meta>
+    <article-meta>
+      <article-id pub-id-type="pmid">99900001</article-id>
+      <article-id pub-id-type="pmc">PMC9990001</article-id>
+      <article-id pub-id-type="doi">10.9999/jsg.2024.001</article-id>
+      <title-group>
+        <article-title>Fecal Microbiota Transplantation for <italic>Clostridioides difficile</italic>: A Synthetic Trial</article-title>
+      </title-group>
+      <contrib-group>
+        <contrib contrib-type="author">
+          <name><surname>Doe</surname><given-names>Jane Q.</given-names></name>
+          <xref ref-type="aff" rid="aff1">1</xref>
+        </contrib>
+        <contrib contrib-type="author">
+          <name><surname>Roe</surname><given-names>Richard</given-names></name>
+          <xref ref-type="aff" rid="aff1">1</xref>
+        </contrib>
+        <aff id="aff1"><label>1</label>Department of Nowhere, Example University</aff>
+      </contrib-group>
+      <pub-date pub-type="ppub"><month>03</month><year>2024</year></pub-date>
+      <volume>12</volume>
+      <issue>3</issue>
+      <fpage>100</fpage>
+      <lpage>110</lpage>
+      <permissions>
+        <copyright-statement>© 2024 The Authors</copyright-statement>
+        <license license-type="open-access" xlink:href="http://creativecommons.org/licenses/by/4.0/">
+          <license-p>This is an open access article under the CC BY license.</license-p>
+        </license>
+      </permissions>
+      <related-article related-article-type="correction-forward" id="ra1" ext-link-type="doi" xlink:href="10.9999/jsg.2024.099"/>
+      <abstract>
+        <p>Background: recurrent infection is common. Methods: we did a thing with <italic>n</italic> = 40. Results: it worked
+          in 80% of cases. Conclusions: synthetic data render nicely.</p>
+      </abstract>
+      <kwd-group kwd-group-type="author">
+        <kwd>Fecal Microbiota Transplantation</kwd>
+        <kwd>Clostridioides difficile Infection</kwd>
+        <kwd>2-Step Protocol</kwd>
+      </kwd-group>
+      <custom-meta-group>
+        <custom-meta><meta-name>document_type</meta-name><meta-value>SRMA</meta-value></custom-meta>
+        <custom-meta><meta-name>voice</meta-name><meta-value>normative</meta-value></custom-meta>
+        <custom-meta><meta-name>enrich_version</meta-name><meta-value>nigel-enrich/v1</meta-value></custom-meta>
+      </custom-meta-group>
+    </article-meta>
+  </front>
+  <body>
+    <sec sec-type="nigel-editorial-summary" specific-use="nigel-envelope" id="EC0">
+      <title>Editorial summary</title>
+      <p specific-use="nigel-empty" content-type="not-applicable" id="EC0.p001" />
+    </sec>
+    <sec id="sec1" sec-type="intro">
+      <title>Introduction</title>
+      <p id="p_1_1" specific-use="nigel-labelable">Fecal microbiota transplantation (FMT) restores the gut community.<xref ref-type="bibr" rid="ref1">1</xref>,<xref ref-type="bibr" rid="ref2">2</xref> It is
+        used for <italic>C difficile</italic> infection (CDI) with <bold>high</bold> cure rates.</p>
+      <p id="p_1_2">Colony counts reach 10<sup>9</sup> CFU/g; H<sub>2</sub>O is the diluent (<xref ref-type="table" rid="tbl1">Table 1</xref>, <xref ref-type="fig" rid="fig1">Figure 1</xref>).</p>
+    </sec>
+    <sec id="sec2">
+      <title>Methods</title>
+      <sec id="sec2.1">
+        <title>Statistical Analysis</title>
+        <p id="p_2_1">Cure rate was modelled as <inline-formula><tex-math>p = \frac{k}{n}</tex-math></inline-formula> and pooled by</p>
+        <disp-formula id="eq1"><tex-math>\hat{p} = \frac{\sum k_i}{\sum n_i}</tex-math></disp-formula>
+        <p id="p_2_2">with a random-effects model.<xref ref-type="bibr" rid="ref3">3</xref></p>
+      </sec>
+      <table-wrap id="tbl1">
+        <label>Table 1</label>
+        <caption><p>Donor screening panel</p></caption>
+        <table>
+          <thead>
+            <tr><th>Test</th><th>Threshold</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Stool culture</td><td>Negative</td></tr>
+            <tr><td>Serum HIV | HBV</td><td>Negative</td></tr>
+          </tbody>
+        </table>
+      </table-wrap>
+      <fig id="fig1">
+        <label>Figure 1</label>
+        <caption><p>Study flow</p></caption>
+        <graphic xlink:href="fig1.tif"/>
+      </fig>
+    </sec>
+    <sec id="sec3">
+      <title>Results</title>
+      <p id="p_3_1">Clinical resolution occurred in 32 of 40 patients.</p>
+    </sec>
+  </body>
+  <back>
+    <ref-list>
+      <title>References</title>
+      <ref id="ref1">
+        <label>1</label>
+        <element-citation publication-type="journal">
+          <person-group person-group-type="author">
+            <name><surname>Vaughn</surname><given-names>B.P.</given-names></name>
+            <name><surname>Rank</surname><given-names>K.M.</given-names></name>
+            <name><surname>Khoruts</surname><given-names>A.</given-names></name>
+          </person-group>
+          <article-title>Fecal microbiota transplantation: current status</article-title>
+          <source>Clin Gastroenterol Hepatol</source>
+          <year>2019</year>
+          <volume>17</volume>
+          <fpage>353</fpage>
+          <lpage>361</lpage>
+          <pub-id pub-id-type="doi">10.1016/j.cgh.2018.07.026</pub-id>
+        </element-citation>
+      </ref>
+      <ref id="ref2">
+        <label>2</label>
+        <mixed-citation publication-type="journal">Smith A, Jones B. A mixed citation. <source>J Example</source>. 2020;1:1-2. <pub-id pub-id-type="pmid">12345678</pub-id></mixed-citation>
+      </ref>
+      <ref id="ref3">
+        <label>3</label>
+        <element-citation publication-type="book">
+          <person-group person-group-type="author"><collab>GBD Collaborators</collab></person-group>
+          <source>A Book Title</source>
+          <year>2018</year>
+        </element-citation>
+      </ref>
+    </ref-list>
+  </back>
+</article>
