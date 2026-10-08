@@ -1,5 +1,15 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.8.0
+
+### Minor Changes
+
+- 2c90a57: Add `task` to `NODE_TYPES`: a unit of work on a project board. The body is markdown, and board fields (`assignee`, `due`, `priority`, `parent`) are ordinary `metadata` keys. There are no type-specific validation rules (it validates like `document`), and whether a task goes through review is up to the server's governance. This only widens the vocabulary, so no existing document changes bytes or hashes. Spec §1.6 and the MCP `frontmatter_fields.type` enum list it.
+
+### Patch Changes
+
+- c840694: MCP writes no longer vanish on first run. `create_document` and `context_create` (with an explicit `id`) re-root a path outside `nodes/` and `sources/` under `nodes/`, so the document shows up in list, search and agent context, and the result carries a `placement` note saying where it went. A create held for review now also tells the agent it is not searchable, and agents won't see it, until approved. Mirrors the CLI's `ctx add` / `ctx search` hints.
+
 ## 2.7.2
 
 ### Patch Changes
