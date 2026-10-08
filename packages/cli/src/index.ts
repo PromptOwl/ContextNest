@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
@@ -115,9 +115,18 @@ import type {
 import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
-import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
+import {
+  emptyServerMap,
+  loadServerMap,
+  normalizeServerUrl,
+  removeServer,
+  saveServerMap,
+  savedTokenFor,
+  upsertServer,
+} from "./server-credentials.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
@@ -3271,6 +3280,156 @@ program
     }
   });
 
+// ─── ctx login / logout ──────────────────────────────────────────────────────
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Browser (device) login against a Community server — the same flow as the web
+ * UI's "Sign in with PromptOwl":
+ *   POST /auth/device → poll GET /auth/device/poll → POST /auth/promptowl
+ *   (session cookie) → POST /auth/keys (mint a key labelled for this machine).
+ * Accounts hold several keys, so this never replaces one already in use.
+ */
+async function deviceLogin(serverUrl: string): Promise<{ token: string; label?: string }> {
+  const startRes = await fetch(`${serverUrl}/auth/device`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceName: `ctx CLI (${hostname()})` }),
+  });
+  if (!startRes.ok) {
+    const e = (await startRes.json().catch(() => ({}))) as { error?: string };
+    throw new Error(
+      `This server doesn't offer browser login (${startRes.status})${e.error ? `: ${e.error}` : ""}.\n` +
+        `  Paste a key instead: ctx login ${serverUrl} --key-stdin  (create one in the web UI → Connect)`,
+    );
+  }
+  const start = (await startRes.json()) as {
+    deviceCode?: string;
+    clientSecret?: string;
+    verificationUrl?: string;
+    userCode?: string;
+  };
+  if (!start.deviceCode || !start.clientSecret || !start.verificationUrl) {
+    throw new Error("Server returned an incomplete device-login response.");
+  }
+  console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(start.verificationUrl)}`);
+  if (start.userCode) console.log(`  Code: ${chalk.bold(start.userCode)}`);
+  openUrlInBrowser(start.verificationUrl);
+  console.log(chalk.dim("\n  Waiting for approval… (Ctrl-C to cancel)"));
+
+  let poToken: string | null = null;
+  for (let i = 0; i < 180 && !poToken; i++) {
+    await sleep(2000);
+    const pr = await fetch(
+      `${serverUrl}/auth/device/poll?code=${encodeURIComponent(start.deviceCode)}&client_secret=${encodeURIComponent(start.clientSecret)}`,
+    );
+    const pd = (await pr.json().catch(() => ({}))) as { status?: string; token?: string; error?: string };
+    if (pd.status === "approved" && pd.token) poToken = pd.token;
+    else if (pd.status !== "pending") throw new Error(`Login ${pd.status || pd.error || `failed (${pr.status})`}. Try again.`);
+  }
+  if (!poToken) throw new Error("Login timed out waiting for approval.");
+
+  // Exchange the PromptOwl token for a session on this server, keeping the cookie.
+  const exRes = await fetch(`${serverUrl}/auth/promptowl`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: poToken }),
+  });
+  if (!exRes.ok) {
+    const e = (await exRes.json().catch(() => ({}))) as { error?: string };
+    throw new Error(`Sign-in was refused (${exRes.status})${e.error ? `: ${e.error}` : ""}.`);
+  }
+  const cookie = exRes.headers
+    .getSetCookie()
+    .map((c) => c.split(";")[0])
+    .join("; ");
+  if (!cookie) throw new Error("Server did not return a session cookie.");
+  const ex = (await exRes.json().catch(() => ({}))) as { user?: { email?: string } };
+
+  const mintRes = await fetch(`${serverUrl}/auth/keys`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ label: `ctx CLI (${hostname()})` }),
+  });
+  if (!mintRes.ok) {
+    const e = (await mintRes.json().catch(() => ({}))) as { error?: string };
+    throw new Error(`Could not create an API key (${mintRes.status})${e.error ? `: ${e.error}` : ""}.`);
+  }
+  const minted = (await mintRes.json()) as { api_key?: string };
+  if (!minted.api_key) throw new Error("Server did not return an API key.");
+  return { token: minted.api_key, label: ex.user?.email };
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString("utf-8").trim();
+}
+
+program
+  .command("login <server>")
+  .description("Sign in to a ContextNest server once; push and remote --vault aliases reuse the saved key")
+  .option("--key-stdin", "Read an existing API key (cnst_…) from stdin instead of the browser flow")
+  .option("--label <text>", "Label for this credential (default: your account email)")
+  .action(async (server: string, opts: { keyStdin?: boolean; label?: string }) => {
+    try {
+      assertSafeEndpoint(server, "<server>");
+      const url = normalizeServerUrl(server);
+      let token: string;
+      let label = opts.label;
+      if (opts.keyStdin) {
+        token = await readStdin();
+        if (!token) throw new Error("No key on stdin.");
+      } else {
+        const res = await deviceLogin(url);
+        token = res.token;
+        label ??= res.label;
+      }
+      const map = upsertServer(await loadServerMap(), url, {
+        token,
+        ...(label ? { label } : {}),
+        updatedAt: new Date().toISOString(),
+      });
+      const where = await saveServerMap(map);
+      console.log(
+        chalk.green(`\nLogged in to ${url}${label ? ` as ${label}` : ""}.`) +
+          (map.default === url ? chalk.dim("  (default)") : ""),
+      );
+      console.log(chalk.dim(`  Key saved to ${where}.`));
+      console.log(chalk.dim(`  Next: ctx vault add <alias> --url ${url}/mcp   (no --bearer-env needed)`));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout [server]")
+  .description("Forget the key saved for a server by `ctx login` (it stays valid on the server — revoke it in the web UI)")
+  .option("--all", "Forget every saved server key")
+  .action(async (server: string | undefined, opts: { all?: boolean }) => {
+    try {
+      if (opts.all) {
+        await saveServerMap(emptyServerMap());
+        console.log(chalk.green("Forgot all saved server keys."));
+        return;
+      }
+      if (!server) throw new Error("Name the <server> to log out of, or pass --all.");
+      const url = normalizeServerUrl(server);
+      const map = await loadServerMap();
+      if (!map.servers[url]) {
+        console.log(chalk.yellow(`No saved key for ${url}.`));
+        return;
+      }
+      await saveServerMap(removeServer(map, url));
+      console.log(chalk.green(`Logged out of ${url}.`));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
 /** Print the terminal result of a gated push. Success stays on stdout. */
@@ -3307,7 +3466,7 @@ program
   .description("Push the local vault to a hosted ContextNest server")
   .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
   .requiredOption("--nest <id>", "Target nest ID")
-  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer `ctx login` or the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .option(
     "--no-wait",
@@ -3328,9 +3487,12 @@ program
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
-    const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
+    const apiKey =
+      (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY ?? (await savedTokenFor(opts.server));
     if (!apiKey) {
-      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
       process.exit(1);
     }
     // Refuse to put documents and a bearer token on the wire in the clear.

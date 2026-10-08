@@ -38,6 +38,7 @@ import {
   titleFromId,
   parseTagsOption,
 } from "./doc-views.js";
+import { savedTokenFor } from "./server-credentials.js";
 
 export interface RemoteTarget {
   alias: string;
@@ -207,6 +208,40 @@ async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnectio
   return hit.id;
 }
 
+/** Env var name the saved `ctx login` key is handed to the engine under. */
+const LOGIN_TOKEN_ENV = "CONTEXTNEST_LOGIN_TOKEN";
+
+/**
+ * Connect to a remote. An HTTP remote registered without auth borrows the key
+ * `ctx login` saved for its server, so `ctx vault add <alias> --url <server>/mcp`
+ * needs no --bearer-env once you're logged in. Explicit registry auth wins.
+ */
+export async function connectTarget(target: RemoteTarget): Promise<RemoteNestConnection> {
+  const { spec } = target;
+  if (spec.transport === "http" && !spec.auth) {
+    const token = await savedTokenFor(spec.url);
+    if (token) {
+      try {
+        return await connectRemoteNest(
+          target.alias,
+          { ...spec, auth: { bearer_env: LOGIN_TOKEN_ENV } },
+          { ...process.env, [LOGIN_TOKEN_ENV]: token },
+        );
+      } catch (err) {
+        // The engine's message would point at our internal env var; point at the fix instead.
+        if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
+          throw new ContextNestError(
+            `Remote nest "${target.alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
+            "REMOTE_AUTH_FAILED",
+          );
+        }
+        throw err;
+      }
+    }
+  }
+  return connectRemoteNest(target.alias, spec);
+}
+
 /**
  * Connect, run, and always close — the standard remote command wrapper.
  * With a `<server>/<nest>` target, every call carries that nest's id.
@@ -215,7 +250,7 @@ async function withRemote<T>(
   target: RemoteTarget,
   fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
 ): Promise<T> {
-  const conn = await connectRemoteNest(target.alias, target.spec);
+  const conn = await connectTarget(target);
   try {
     if (!target.nest) return await fn(conn);
     const nestId = await resolveTargetNest(target, conn);
