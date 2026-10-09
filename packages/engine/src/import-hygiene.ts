@@ -13,6 +13,7 @@
  */
 
 import { NODE_TYPES, TAG_PATTERN } from "./schemas.js";
+import { mapInBatches } from "./concurrency.js";
 import type { ContextNode, Frontmatter, NodeType, PdfMeta } from "./types.js";
 
 const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES);
@@ -164,6 +165,12 @@ export async function planImportPaths(
         Number(versionPathParts(bases[a]) !== undefined) -
         Number(versionPathParts(bases[b]) !== undefined),
     );
+  // First-choice targets checked in parallel up front: on a network mount each
+  // check is a round trip, and asking one at a time made staging N latencies long.
+  const takenAtStart = new Map<string, boolean>();
+  await mapInBatches([...new Set(bases)], async (p) => {
+    takenAtStart.set(p, await isTaken(p));
+  });
 
   for (const i of order) {
     const raw = rawPaths[i];
@@ -187,7 +194,7 @@ export async function planImportPaths(
       const owner = claimed.get(target);
       if (owner !== undefined) {
         takenBy ??= owner;
-      } else if (await isTaken(target)) {
+      } else if (takenAtStart.get(target) ?? (await isTaken(target))) {
         takenBy ??= "an existing vault file";
       } else {
         break;

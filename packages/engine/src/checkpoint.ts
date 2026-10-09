@@ -309,45 +309,40 @@ export class CheckpointManager {
       // marked for the next one.
       const touched = this.storage.touchedHistorySnapshot();
       const chainState = await this.storage.readCheckpointChainState();
-      let documentHistories: Map<string, SealHistory>;
-      if (chainState.kind === "head") {
-        // Every publish seals, so the head already holds the chain hash of each
-        // document at the version it had then. Reading every history.yaml
-        // again made each publish cost one read per document in the vault —
-        // a full walk of a network-backed mount under the vault lock. Read
-        // only the documents the head cannot vouch for.
-        //
-        // A hash the head sealed is carried forward as is. If the head sealed
-        // a mismatched hash (the torn-snapshot fallback below), later seals at
-        // that version keep it, where a full re-read would have healed it.
-        // `verify` still flags it, and the next version bump re-reads the doc.
-        const head = chainState.checkpoint;
-        documentHistories = new Map();
-        const stale: string[] = [];
-        for (const doc of publishedDocuments) {
-          const hash = head.document_chain_hashes[doc.id];
-          const version = doc.frontmatter.version || 1;
-          const fresh = justSealed?.get(doc.id);
-          if (hash && head.document_versions[doc.id] === version && !touched.has(doc.id)) {
-            documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
-          } else if (fresh && fresh.version === version) {
-            documentHistories.set(doc.id, { versions: [fresh] });
-          } else {
-            stale.push(doc.id);
-          }
+      // Every publish seals, so the head already holds the chain hash of each
+      // document at the version it had then, and `justSealed` holds the ones
+      // this publish appended. Read history.yaml only for documents neither
+      // vouches for: a full walk of a network-backed mount under the vault lock
+      // is what every publish (and every first import, which has no head) paid.
+      //
+      // A hash the head sealed is carried forward as is. If the head sealed
+      // a mismatched hash (the torn-snapshot fallback below), later seals at
+      // that version keep it, where a full re-read would have healed it.
+      // `verify` still flags it, and the next version bump re-reads the doc.
+      const head = chainState.kind === "head" ? chainState.checkpoint : undefined;
+      const documentHistories = new Map<string, SealHistory>();
+      const stale: string[] = [];
+      for (const doc of publishedDocuments) {
+        const hash = head?.document_chain_hashes[doc.id];
+        const version = doc.frontmatter.version || 1;
+        const fresh = justSealed?.get(doc.id);
+        if (hash && head?.document_versions[doc.id] === version && !touched.has(doc.id)) {
+          documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
+        } else if (fresh && fresh.version === version) {
+          documentHistories.set(doc.id, { versions: [fresh] });
+        } else {
+          stale.push(doc.id);
         }
-        await mapInBatches(stale, async (id) => {
-          try {
-            const history = await this.storage.readHistory(id);
-            if (history) documentHistories.set(id, history);
-          } catch {
-            // Unreadable: no hash for this doc, the same as the full crawl
-            // (called without `onUnreadable`) skipping it. `verify` reports it.
-          }
-        });
-      } else {
-        documentHistories = await this.storage.findAllHistories();
       }
+      await mapInBatches(stale, async (id) => {
+        try {
+          const history = await this.storage.readHistory(id);
+          if (history) documentHistories.set(id, history);
+        } catch {
+          // Unreadable: no hash for this doc, the same as the full crawl
+          // (called without `onUnreadable`) skipping it. `verify` reports it.
+        }
+      });
       const checkpoint = await this.sealCheckpoint(
         triggeredBy,
         publishedDocuments,

@@ -110,15 +110,23 @@ describe("checkpoint seal — reads only the histories that changed", () => {
     await publish("nodes/b", "b2");
     await expectHeadMatchesDisk();
   });
-  it("reads every history when there is no head to build on", async () => {
+  it("seals every published doc when there is no head, without crawling every history", async () => {
     const findAll = vi.spyOn(storage, "findAllHistories");
     await publish("nodes/first", "v1"); // no chain file yet
-    expect(findAll).toHaveBeenCalledTimes(1);
 
-    // An unreadable chain file has no head either: same full read.
+    // An unreadable chain file has no head either: `first` is read from its
+    // history, `second` comes from the publish that just sealed it.
     await writeFile(join(root, ".versions", "context_history.yaml"), "versions: [unclosed");
     await publish("nodes/second", "v1");
-    expect(findAll).toHaveBeenCalledTimes(2);
+    expect(findAll).not.toHaveBeenCalled();
+    findAll.mockRestore();
+
+    const state = await storage.readCheckpointChainState();
+    if (state.kind !== "head") throw new Error(`no head: ${state.kind}`);
+    for (const id of ["nodes/first", "nodes/second"]) {
+      const entry = (await storage.readHistory(id))!.versions.at(-1)!;
+      expect(state.checkpoint.document_chain_hashes[id]).toBe(entry.chain_hash);
+    }
   });
 
   it("seals without a hash for a changed document whose history is unreadable", async () => {
