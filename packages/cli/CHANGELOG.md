@@ -1,5 +1,11 @@
 # @promptowl/contextnest-cli
 
+## 3.0.4
+
+### Patch Changes
+
+- Bundles `@promptowl/contextnest-engine` 2.12.0. `ctx` now validates, reads and imports `view` nodes (spec §1.12, rules 30–36), and `ctx import` of a folder does less storage I/O: existing-path checks run in parallel, the first checkpoint seal in a fresh nest no longer reads every `history.yaml`, and scanned documents are not re-read before publishing. No CLI command or flag changes.
+
 ## 3.0.3
 
 ### Patch Changes
