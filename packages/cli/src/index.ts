@@ -127,6 +127,7 @@ import {
   savedTokenFor,
   upsertServer,
 } from "./server-credentials.js";
+import { deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
@@ -3282,89 +3283,13 @@ program
 
 // ─── ctx login / logout ──────────────────────────────────────────────────────
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Browser (device) login against a Community server — the same flow as the web
- * UI's "Sign in with PromptOwl":
- *   POST /auth/device → poll GET /auth/device/poll → POST /auth/promptowl
- *   (session cookie) → POST /auth/keys (mint a key labelled for this machine).
- * Accounts hold several keys, so this never replaces one already in use.
- */
-async function deviceLogin(serverUrl: string): Promise<{ token: string; label?: string }> {
-  const startRes = await fetch(`${serverUrl}/auth/device`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ deviceName: `ctx CLI (${hostname()})` }),
-  });
-  if (!startRes.ok) {
-    const e = (await startRes.json().catch(() => ({}))) as { error?: string };
-    throw new Error(
-      `This server doesn't offer browser login (${startRes.status})${e.error ? `: ${e.error}` : ""}.\n` +
-        `  Paste a key instead: ctx login ${serverUrl} --key-stdin  (create one in the web UI → Connect)`,
-    );
-  }
-  const start = (await startRes.json()) as {
-    deviceCode?: string;
-    clientSecret?: string;
-    verificationUrl?: string;
-    userCode?: string;
-  };
-  if (!start.deviceCode || !start.clientSecret || !start.verificationUrl) {
-    throw new Error("Server returned an incomplete device-login response.");
-  }
-  console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(start.verificationUrl)}`);
-  if (start.userCode) console.log(`  Code: ${chalk.bold(start.userCode)}`);
-  openUrlInBrowser(start.verificationUrl);
-  console.log(chalk.dim("\n  Waiting for approval… (Ctrl-C to cancel)"));
-
-  let poToken: string | null = null;
-  for (let i = 0; i < 180 && !poToken; i++) {
-    await sleep(2000);
-    const pr = await fetch(
-      `${serverUrl}/auth/device/poll?code=${encodeURIComponent(start.deviceCode)}&client_secret=${encodeURIComponent(start.clientSecret)}`,
-    );
-    const pd = (await pr.json().catch(() => ({}))) as { status?: string; token?: string; error?: string };
-    if (pd.status === "approved" && pd.token) poToken = pd.token;
-    else if (pd.status !== "pending") throw new Error(`Login ${pd.status || pd.error || `failed (${pr.status})`}. Try again.`);
-  }
-  if (!poToken) throw new Error("Login timed out waiting for approval.");
-
-  // Exchange the PromptOwl token for a session on this server, keeping the cookie.
-  const exRes = await fetch(`${serverUrl}/auth/promptowl`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token: poToken }),
-  });
-  if (!exRes.ok) {
-    const e = (await exRes.json().catch(() => ({}))) as { error?: string };
-    throw new Error(`Sign-in was refused (${exRes.status})${e.error ? `: ${e.error}` : ""}.`);
-  }
-  const cookie = exRes.headers
-    .getSetCookie()
-    .map((c) => c.split(";")[0])
-    .join("; ");
-  if (!cookie) throw new Error("Server did not return a session cookie.");
-  const ex = (await exRes.json().catch(() => ({}))) as { user?: { email?: string } };
-
-  const mintRes = await fetch(`${serverUrl}/auth/keys`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Cookie: cookie },
-    body: JSON.stringify({ label: `ctx CLI (${hostname()})` }),
-  });
-  if (!mintRes.ok) {
-    const e = (await mintRes.json().catch(() => ({}))) as { error?: string };
-    throw new Error(`Could not create an API key (${mintRes.status})${e.error ? `: ${e.error}` : ""}.`);
-  }
-  const minted = (await mintRes.json()) as { api_key?: string };
-  if (!minted.api_key) throw new Error("Server did not return an API key.");
-  return { token: minted.api_key, label: ex.user?.email };
-}
-
 async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) {
+    console.error(chalk.dim("Paste the key, then press Enter and Ctrl-D (Ctrl-Z, Enter on Windows):"));
+  }
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks).toString("utf-8").trim();
+  return Buffer.concat(chunks).toString("utf-8");
 }
 
 program
@@ -3379,12 +3304,19 @@ program
       let token: string;
       let label = opts.label;
       if (opts.keyStdin) {
-        token = await readStdin();
-        if (!token) throw new Error("No key on stdin.");
+        token = parsePastedKey(await readStdin());
       } else {
-        const res = await deviceLogin(url);
+        const res = await deviceLogin(url, {
+          deviceName: `ctx CLI (${hostname()})`,
+          prompt: (verificationUrl, userCode) => {
+            console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(verificationUrl)}`);
+            if (userCode) console.log(`  Code: ${chalk.bold(userCode)}`);
+            openUrlInBrowser(verificationUrl);
+            console.log(chalk.dim("\n  Waiting for approval… (Ctrl-C to cancel)"));
+          },
+        });
         token = res.token;
-        label ??= res.label;
+        label ??= res.email ? `${res.email} · key "${res.keyLabel}"` : `key "${res.keyLabel}"`;
       }
       const map = upsertServer(await loadServerMap(), url, {
         token,
@@ -3393,7 +3325,7 @@ program
       });
       const where = await saveServerMap(map);
       console.log(
-        chalk.green(`\nLogged in to ${url}${label ? ` as ${label}` : ""}.`) +
+        chalk.green(`\nLogged in to ${url}${label ? ` (${label})` : ""}.`) +
           (map.default === url ? chalk.dim("  (default)") : ""),
       );
       console.log(chalk.dim(`  Key saved to ${where}.`));
@@ -3410,20 +3342,24 @@ program
   .option("--all", "Forget every saved server key")
   .action(async (server: string | undefined, opts: { all?: boolean }) => {
     try {
-      if (opts.all) {
-        await saveServerMap(emptyServerMap());
-        console.log(chalk.green("Forgot all saved server keys."));
-        return;
-      }
-      if (!server) throw new Error("Name the <server> to log out of, or pass --all.");
-      const url = normalizeServerUrl(server);
+      if (!opts.all && !server) throw new Error("Name the <server> to log out of, or pass --all.");
       const map = await loadServerMap();
-      if (!map.servers[url]) {
-        console.log(chalk.yellow(`No saved key for ${url}.`));
+      const forgotten = opts.all ? Object.entries(map.servers) : [];
+      if (!opts.all) {
+        const url = normalizeServerUrl(server!);
+        if (map.servers[url]) forgotten.push([url, map.servers[url]]);
+      }
+      if (forgotten.length === 0) {
+        console.log(chalk.yellow(opts.all ? "No saved server keys." : `No saved key for ${normalizeServerUrl(server!)}.`));
         return;
       }
-      await saveServerMap(removeServer(map, url));
-      console.log(chalk.green(`Logged out of ${url}.`));
+      await saveServerMap(opts.all ? emptyServerMap() : removeServer(map, forgotten[0][0]));
+      for (const [url, cred] of forgotten) {
+        console.log(chalk.green(`Logged out of ${url}.`));
+        console.log(
+          chalk.dim(`  The key still works until you revoke it in ${url}'s web UI${cred.label ? ` — ${cred.label}` : ""}.`),
+        );
+      }
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
@@ -3487,8 +3423,13 @@ program
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
-    const apiKey =
-      (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY ?? (await savedTokenFor(opts.server));
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(opts.server));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
     if (!apiKey) {
       console.error(
         chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),

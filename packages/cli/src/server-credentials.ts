@@ -7,8 +7,12 @@
  * (credentials.ts: OS keyring, else the encrypted file) — never plaintext.
  * Keyed by normalized server URL so one machine can hold keys for several
  * servers at once (hosted + self-hosted + a client's).
+ *
+ * Writes are read-modify-write on that one secret and not locked: two
+ * `ctx login` runs finishing at the same instant can drop one entry (re-run
+ * it). Logins are interactive and rare, so a lock isn't worth its failure modes.
  */
-import { CredentialStore, type CredentialStoreOptions } from "./credentials.js";
+import { CredentialStore, CredentialStoreError, type CredentialStoreOptions } from "./credentials.js";
 
 /** Secure-store account the server map lives under. */
 export const SERVERS_ACCOUNT = "contextnest-servers";
@@ -144,14 +148,17 @@ export async function saveServerMap(map: ServerMap, opts: CredentialStoreOptions
 }
 
 /**
- * Best-effort lookup for a fallback path: a saved token for `endpoint`, or
- * null when there is none OR the store can't be read (no keyring, no key).
- * Callers that need the reason should use loadServerMap directly.
+ * The saved token for `endpoint`, or null when nothing is saved for it. A store
+ * that holds keys but can't be read (locked keyring, missing or wrong
+ * CONTEXTNEST_CREDENTIALS_KEY, corrupt file) throws with the reason — it must
+ * not masquerade as "not logged in".
  */
 export async function savedTokenFor(endpoint: string, opts: CredentialStoreOptions = {}): Promise<string | null> {
+  let map: ServerMap;
   try {
-    return tokenForEndpoint(await loadServerMap(opts), endpoint);
-  } catch {
-    return null;
+    map = await loadServerMap(opts);
+  } catch (err) {
+    throw new CredentialStoreError(`Saved \`ctx login\` keys exist but couldn't be read: ${(err as Error).message}`);
   }
+  return tokenForEndpoint(map, endpoint);
 }

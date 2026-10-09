@@ -98,11 +98,19 @@ describe("server map (secure store)", () => {
     expect(await savedTokenFor(A, opts)).toBe("cnst_secret");
   });
 
-  it("refuses to save with no secure store, and lookups degrade to null", async () => {
+  it("refuses to save with no secure store; with nothing stored a lookup is just null", async () => {
     const opts = { home, env: {}, keyring: null };
     await expect(saveServerMap(upsertServer(emptyServerMap(), A, { token: "t" }), opts)).rejects.toThrow(
       /keyring/i,
     );
     expect(await savedTokenFor(A, opts)).toBeNull();
+  });
+
+  it("says saved keys are unreadable instead of pretending you're logged out", async () => {
+    const env = { CONTEXTNEST_CREDENTIALS_KEY: "right" };
+    await saveServerMap(upsertServer(emptyServerMap(), A, { token: "t" }), { home, env, keyring: null });
+    for (const bad of [{}, { CONTEXTNEST_CREDENTIALS_KEY: "wrong" }]) {
+      await expect(savedTokenFor(A, { home, env: bad, keyring: null })).rejects.toThrow(/couldn't be read/);
+    }
   });
 });

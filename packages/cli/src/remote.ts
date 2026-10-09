@@ -209,37 +209,54 @@ async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnectio
 }
 
 /** Env var name the saved `ctx login` key is handed to the engine under. */
-const LOGIN_TOKEN_ENV = "CONTEXTNEST_LOGIN_TOKEN";
+export const LOGIN_TOKEN_ENV = "CONTEXTNEST_LOGIN_TOKEN";
+
+/**
+ * Whether a remote should borrow the `ctx login` key: only an HTTP remote
+ * registered with NO auth. Explicit registry auth (bearer_env / header_env)
+ * always wins, and stdio remotes never carry a bearer.
+ */
+export function wantsLoginKey(spec: RemoteNestSpec): spec is Extract<RemoteNestSpec, { transport: "http" }> {
+  return spec.transport === "http" && !spec.auth;
+}
 
 /**
  * Connect to a remote. An HTTP remote registered without auth borrows the key
  * `ctx login` saved for its server, so `ctx vault add <alias> --url <server>/mcp`
- * needs no --bearer-env once you're logged in. Explicit registry auth wins.
+ * needs no --bearer-env once you're logged in.
  */
-export async function connectTarget(target: RemoteTarget): Promise<RemoteNestConnection> {
+export async function connectTarget(
+  target: RemoteTarget,
+  lookup: (url: string) => Promise<string | null> = savedTokenFor,
+  connect: typeof connectRemoteNest = connectRemoteNest,
+): Promise<RemoteNestConnection> {
   const { spec } = target;
-  if (spec.transport === "http" && !spec.auth) {
-    const token = await savedTokenFor(spec.url);
-    if (token) {
-      try {
-        return await connectRemoteNest(
-          target.alias,
-          { ...spec, auth: { bearer_env: LOGIN_TOKEN_ENV } },
-          { ...process.env, [LOGIN_TOKEN_ENV]: token },
-        );
-      } catch (err) {
-        // The engine's message would point at our internal env var; point at the fix instead.
-        if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
-          throw new ContextNestError(
-            `Remote nest "${target.alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
-            "REMOTE_AUTH_FAILED",
-          );
-        }
-        throw err;
-      }
-    }
+  if (!wantsLoginKey(spec)) return connect(target.alias, spec);
+  let token: string | null;
+  try {
+    token = await lookup(spec.url);
+  } catch (err) {
+    throw new ContextNestError((err as Error).message, "CONFIG_ERROR");
   }
-  return connectRemoteNest(target.alias, spec);
+  if (!token) return connect(target.alias, spec);
+  try {
+    // The engine reads bearers from env-var references only, so hand it the key
+    // under a private name rather than widening the registry format.
+    return await connect(
+      target.alias,
+      { ...spec, auth: { bearer_env: LOGIN_TOKEN_ENV } },
+      { ...process.env, [LOGIN_TOKEN_ENV]: token },
+    );
+  } catch (err) {
+    // The engine's message would point at our internal env var; point at the fix instead.
+    if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
+        "REMOTE_AUTH_FAILED",
+      );
+    }
+    throw err;
+  }
 }
 
 /**
