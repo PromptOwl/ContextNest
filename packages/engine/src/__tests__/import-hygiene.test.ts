@@ -128,6 +128,21 @@ describe("planImportPaths — distinct files never collapse onto one id", () => 
     expect(plan[0].warnings.join("\n")).toMatch(/already exists in the vault/);
   });
 
+  it("checks the vault for many files at once, not one round trip at a time", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const onDisk = new Set(["nodes/a.md"]);
+    const isTaken = async (p: string) => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return onDisk.has(p);
+    };
+    const plan = await planImportPaths(["nodes/a.md", "nodes/b.md", "nodes/c.md"], isTaken);
+    expect(peak).toBeGreaterThan(1);
+    expect(plan.map((p) => p.path)).toEqual(["nodes/a-2.md", "nodes/b.md", "nodes/c.md"]);
+  });
+
   it("keeps all-non-Latin names apart", async () => {
     const plan = await planImportPaths(["nodes/日本語.md", "nodes/Ελληνικά.md"], async () => false);
     expect(plan.map((p) => p.path)).toEqual(["nodes/untitled.md", "nodes/untitled-2.md"]);

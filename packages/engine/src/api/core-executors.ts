@@ -1299,6 +1299,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
                 }
               : null
         : undefined,
+      // The scan just read these under the same lock; reading each again cost
+      // one round trip per document on a network-backed mount.
+      preloaded: new Map(scanned.map((d) => [d.id, d])),
     });
     published = result.published.map((p) => ({ id: p.id, version: p.version }));
     checkpoint = result.checkpointNumber;
