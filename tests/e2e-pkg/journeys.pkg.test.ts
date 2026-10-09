@@ -475,6 +475,170 @@ const J3: Journey = {
   ],
 };
 
+/** The id/tag rows `ctx list --json` returns. */
+type NodeRow = { id: string };
+const idsOf = (data: unknown) => (data as NodeRow[]).map((r) => r.id).sort();
+
+/**
+ * J4 — "I govern my existing Obsidian vault in place."
+ * Context Nest supports two on-disk layouts (spec §1.1); this journey proves the
+ * Obsidian one end-to-end. An Obsidian user keeps plain-markdown nodes as flat
+ * files and wants them indexed, found, and audited without reshaping their vault.
+ *
+ * Obsidian authoring is flat `.md` files at the vault root — and `ctx add`
+ * deliberately does NOT do that (it always writes under `nodes/`, which would
+ * flip the vault to structured, since layout is detected by `nodes/` existing).
+ * So the nodes are written directly, the way Obsidian / the user would, via the
+ * harness `mutate` hook, and the CLI is driven over them from there.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const flatNodeLines = (id: string, title: string, tags: string, body: string) => [
+  "---",
+  `id: ${id}`,
+  `title: ${title}`,
+  "type: document",
+  "status: published",
+  `tags: [${tags}]`,
+  "---",
+  "",
+  body,
+  "",
+];
+
+const flatNode = (id: string, title: string, tags: string, body: string) =>
+  flatNodeLines(id, title, tags, body).join("\n");
+
+// Obsidian on Windows writes CRLF; the parser normalizes it, so a CRLF-authored
+// node must index, link, and query exactly like an LF one. Cheap cross-platform
+// coverage — one flat node in the journey is authored this way.
+const flatNodeCRLF = (id: string, title: string, tags: string, body: string) =>
+  flatNodeLines(id, title, tags, body).join("\r\n");
+
+const J4: Journey = {
+  id: "J4",
+  title: "Obsidian-layout vault (Obsidian user)",
+  cases: [
+    {
+      id: "J4-01",
+      title:
+        "Initialize a new vault in Obsidian layout and confirm it's ready without the structured folders",
+      actions: [
+        {
+          args: ["init", "--layout", "obsidian", "--name", "obsidian-vault"],
+          stdout: ["Initialized obsidian vault"],
+          files: [
+            { path: "CONTEXT.md", exists: true },
+            { path: ".context", exists: true },
+            // Obsidian layout is flat: the structured folders are NOT carved out.
+            { path: "nodes", exists: false },
+            { path: "sources", exists: false },
+            { path: "packs", exists: false },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J4-02",
+      title:
+        "Add two nodes as flat markdown files with a wikilink between them, then index the vault so the link is recognized",
+      actions: [
+        {
+          // Write the nodes the Obsidian way — flat files at the vault root — then
+          // index so the [[project-plan]] wikilink becomes a graph edge.
+          mutate: (vault) => {
+            // meeting-node is authored CRLF (Obsidian-on-Windows) — it must index
+            // and link identically to the LF project-plan below.
+            writeFileSync(
+              join(vault, "meeting-node.md"),
+              flatNodeCRLF(
+                "meeting-node",
+                "Weekly Sync",
+                "meetings, onboarding",
+                "Summary of the weekly sync. See [[project-plan]] for the roadmap.",
+              ),
+            );
+            writeFileSync(
+              join(vault, "project-plan.md"),
+              flatNode("project-plan", "Project Plan", "planning", "The Q4 roadmap and milestones."),
+            );
+          },
+          args: ["index"],
+          stdout: ["Generated context.yaml", /1 relationship edge/],
+          files: [
+            { path: "meeting-node.md", exists: true },
+            { path: "project-plan.md", exists: true },
+            // Still flat — indexing a flat vault must not create nodes/.
+            { path: "nodes", exists: false },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J4-03",
+      title: "Find a node by its tag and follow its wikilink through to the connected node",
+      actions: [
+        {
+          // First pin the direct match: with traversal off (--hops 0), #onboarding
+          // resolves to meeting-node ALONE — project-plan is NOT tagged it. This is
+          // the control, so the next step proves project-plan arrives via the edge,
+          // not via an implicit tag/expansion default.
+          args: ["query", "#onboarding", "--hops", "0"],
+          stdout: ["meeting-node", /\b1 nodes\b/],
+          stdoutNot: ["project-plan"],
+        },
+        {
+          // Now let traversal run: following meeting-node's [[project-plan]] wikilink
+          // pulls project-plan in (1 hop → 2 nodes). The delta vs. the step above is
+          // the edge being followed, so a regression in link-following fails here.
+          args: ["query", "#onboarding"],
+          stdout: ["meeting-node", "project-plan", /\b1 hops\b/, /\b2 nodes\b/],
+        },
+      ],
+    },
+    {
+      id: "J4-04",
+      title: "Run a full-text search and match a word inside a node's body",
+      actions: [
+        // "milestones" lives only in project-plan's body — a single exact hit.
+        { args: ["search", "milestones"], stdout: ["1 result(s)", "project-plan"] },
+      ],
+    },
+    {
+      id: "J4-05",
+      title: "List all nodes and resolve one by name to confirm they're tracked",
+      actions: [
+        {
+          // Flat nodes are tracked by their bare ids — no nodes/ prefix.
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(idsOf(data)).toEqual(["meeting-node", "project-plan"]);
+          },
+        },
+        {
+          args: ["resolve", "#planning", "--json"],
+          json: (data) => {
+            expect((data as NodeRow[])[0].id).toBe("project-plan");
+          },
+        },
+      ],
+    },
+    {
+      id: "J4-06",
+      title: "Run an integrity check and confirm the whole vault verifies clean",
+      actions: [
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -486,5 +650,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J3 — curate and reuse a pack of nodes", () => {
     runJourney({ installDir: INSTALL, scratch }, J3);
+  });
+
+  it("J4 — work with an Obsidian-layout vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J4);
   });
 });
