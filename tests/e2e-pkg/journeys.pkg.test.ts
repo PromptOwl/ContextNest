@@ -493,19 +493,27 @@ const idsOf = (data: unknown) => (data as NodeRow[]).map((r) => r.id).sort();
  *
  * Case ids + titles are the ticket's verbatim lines.
  */
+const flatNodeLines = (id: string, title: string, tags: string, body: string) => [
+  "---",
+  `id: ${id}`,
+  `title: ${title}`,
+  "type: document",
+  "status: published",
+  `tags: [${tags}]`,
+  "---",
+  "",
+  body,
+  "",
+];
+
 const flatNode = (id: string, title: string, tags: string, body: string) =>
-  [
-    "---",
-    `id: ${id}`,
-    `title: ${title}`,
-    "type: document",
-    "status: published",
-    `tags: [${tags}]`,
-    "---",
-    "",
-    body,
-    "",
-  ].join("\n");
+  flatNodeLines(id, title, tags, body).join("\n");
+
+// Obsidian on Windows writes CRLF; the parser normalizes it, so a CRLF-authored
+// node must index, link, and query exactly like an LF one. Cheap cross-platform
+// coverage — one flat node in the journey is authored this way.
+const flatNodeCRLF = (id: string, title: string, tags: string, body: string) =>
+  flatNodeLines(id, title, tags, body).join("\r\n");
 
 const J4: Journey = {
   id: "J4",
@@ -539,9 +547,11 @@ const J4: Journey = {
           // Write the nodes the Obsidian way — flat files at the vault root — then
           // index so the [[project-plan]] wikilink becomes a graph edge.
           mutate: (vault) => {
+            // meeting-node is authored CRLF (Obsidian-on-Windows) — it must index
+            // and link identically to the LF project-plan below.
             writeFileSync(
               join(vault, "meeting-node.md"),
-              flatNode(
+              flatNodeCRLF(
                 "meeting-node",
                 "Weekly Sync",
                 "meetings, onboarding",
@@ -569,10 +579,20 @@ const J4: Journey = {
       title: "Find a node by its tag and follow its wikilink through to the connected node",
       actions: [
         {
-          // #onboarding tags only meeting-node; graph traversal follows its
-          // wikilink to project-plan, so both come back (word-bounded count).
+          // First pin the direct match: with traversal off (--hops 0), #onboarding
+          // resolves to meeting-node ALONE — project-plan is NOT tagged it. This is
+          // the control, so the next step proves project-plan arrives via the edge,
+          // not via an implicit tag/expansion default.
+          args: ["query", "#onboarding", "--hops", "0"],
+          stdout: ["meeting-node", /\b1 nodes\b/],
+          stdoutNot: ["project-plan"],
+        },
+        {
+          // Now let traversal run: following meeting-node's [[project-plan]] wikilink
+          // pulls project-plan in (1 hop → 2 nodes). The delta vs. the step above is
+          // the edge being followed, so a regression in link-following fails here.
           args: ["query", "#onboarding"],
-          stdout: ["meeting-node", "project-plan", /\b2 nodes\b/],
+          stdout: ["meeting-node", "project-plan", /\b1 hops\b/, /\b2 nodes\b/],
         },
       ],
     },
