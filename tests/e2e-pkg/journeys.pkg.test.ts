@@ -475,6 +475,150 @@ const J3: Journey = {
   ],
 };
 
+/** The id/tag rows `ctx list --json` returns. */
+type NodeRow = { id: string };
+const idsOf = (data: unknown) => (data as NodeRow[]).map((r) => r.id).sort();
+
+/**
+ * J4 — "I govern my existing Obsidian vault in place."
+ * Context Nest supports two on-disk layouts (spec §1.1); this journey proves the
+ * Obsidian one end-to-end. An Obsidian user keeps plain-markdown nodes as flat
+ * files and wants them indexed, found, and audited without reshaping their vault.
+ *
+ * Obsidian authoring is flat `.md` files at the vault root — and `ctx add`
+ * deliberately does NOT do that (it always writes under `nodes/`, which would
+ * flip the vault to structured, since layout is detected by `nodes/` existing).
+ * So the nodes are written directly, the way Obsidian / the user would, via the
+ * harness `mutate` hook, and the CLI is driven over them from there.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const flatNode = (id: string, title: string, tags: string, body: string) =>
+  [
+    "---",
+    `id: ${id}`,
+    `title: ${title}`,
+    "type: document",
+    "status: published",
+    `tags: [${tags}]`,
+    "---",
+    "",
+    body,
+    "",
+  ].join("\n");
+
+const J4: Journey = {
+  id: "J4",
+  title: "Obsidian-layout vault (Obsidian user)",
+  cases: [
+    {
+      id: "J4-01",
+      title:
+        "Initialize a new vault in Obsidian layout and confirm it's ready without the structured folders",
+      actions: [
+        {
+          args: ["init", "--layout", "obsidian", "--name", "obsidian-vault"],
+          stdout: ["Initialized obsidian vault"],
+          files: [
+            { path: "CONTEXT.md", exists: true },
+            { path: ".context", exists: true },
+            // Obsidian layout is flat: the structured folders are NOT carved out.
+            { path: "nodes", exists: false },
+            { path: "sources", exists: false },
+            { path: "packs", exists: false },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J4-02",
+      title:
+        "Add two nodes as flat markdown files with a wikilink between them, then index the vault so the link is recognized",
+      actions: [
+        {
+          // Write the nodes the Obsidian way — flat files at the vault root — then
+          // index so the [[project-plan]] wikilink becomes a graph edge.
+          mutate: (vault) => {
+            writeFileSync(
+              join(vault, "meeting-node.md"),
+              flatNode(
+                "meeting-node",
+                "Weekly Sync",
+                "meetings, onboarding",
+                "Summary of the weekly sync. See [[project-plan]] for the roadmap.",
+              ),
+            );
+            writeFileSync(
+              join(vault, "project-plan.md"),
+              flatNode("project-plan", "Project Plan", "planning", "The Q4 roadmap and milestones."),
+            );
+          },
+          args: ["index"],
+          stdout: ["Generated context.yaml", /1 relationship edge/],
+          files: [
+            { path: "meeting-node.md", exists: true },
+            { path: "project-plan.md", exists: true },
+            // Still flat — indexing a flat vault must not create nodes/.
+            { path: "nodes", exists: false },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J4-03",
+      title: "Find a node by its tag and follow its wikilink through to the connected node",
+      actions: [
+        {
+          // #onboarding tags only meeting-node; graph traversal follows its
+          // wikilink to project-plan, so both come back (word-bounded count).
+          args: ["query", "#onboarding"],
+          stdout: ["meeting-node", "project-plan", /\b2 nodes\b/],
+        },
+      ],
+    },
+    {
+      id: "J4-04",
+      title: "Run a full-text search and match a word inside a node's body",
+      actions: [
+        // "milestones" lives only in project-plan's body — a single exact hit.
+        { args: ["search", "milestones"], stdout: ["1 result(s)", "project-plan"] },
+      ],
+    },
+    {
+      id: "J4-05",
+      title: "List all nodes and resolve one by name to confirm they're tracked",
+      actions: [
+        {
+          // Flat nodes are tracked by their bare ids — no nodes/ prefix.
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(idsOf(data)).toEqual(["meeting-node", "project-plan"]);
+          },
+        },
+        {
+          args: ["resolve", "#planning", "--json"],
+          json: (data) => {
+            expect((data as NodeRow[])[0].id).toBe("project-plan");
+          },
+        },
+      ],
+    },
+    {
+      id: "J4-06",
+      title: "Run an integrity check and confirm the whole vault verifies clean",
+      actions: [
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -486,5 +630,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J3 — curate and reuse a pack of nodes", () => {
     runJourney({ installDir: INSTALL, scratch }, J3);
+  });
+
+  it("J4 — work with an Obsidian-layout vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J4);
   });
 });
