@@ -55,10 +55,10 @@
     "bench:profile": "node --cpu-prof --cpu-prof-dir=bench/profiles bench/run.mjs --sizes 1000"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "diff": "^9.0.0",
-    "fast-xml-parser": "^4.5.7",
-    "js-yaml": "^4.3.2",
+    "fast-xml-parser": "^5.7.0",
+    "js-yaml": "^5.4.1",
     "minisearch": "^7.0.0",
     "toposort": "^2.0.2",
     "unpdf": "1.7.0",
