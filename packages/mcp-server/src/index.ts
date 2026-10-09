@@ -40,6 +40,7 @@ import {
   ContextNestError,
   applyTypedBlocks,
   sourceMetaSchema,
+  viewMetaSchema,
   readReviewMode,
   setReviewMode,
   listPendingReview,
@@ -597,7 +598,7 @@ tool(
           required: false,
           type: "string",
           default: "document",
-          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf", "task"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf", "task", "view"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -613,6 +614,7 @@ tool(
             table: "Tabular data, as stored by other tools (no type-specific rules)",
             pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
             task: "A unit of work on a project board; board fields (assignee, due, priority, parent) live in metadata (no type-specific rules)",
+            view: "A governed composition of other nodes: the view block lays out md/list/summary/html/table/kpi/chart/callout/metric/data blocks; refs and bindings are vault references, never URLs",
           },
         },
         tags: {
@@ -968,6 +970,11 @@ tool(
       .describe(
         "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
       ),
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required when type is 'view'): the layout of blocks this view composes. Refs and bindings must be vault references, never URLs.",
+      ),
   },
   async ({
     path,
@@ -981,6 +988,7 @@ tool(
     tools_required,
     output_format,
     source,
+    view,
   }) =>
     lockedHandler(async () => {
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
@@ -1029,6 +1037,7 @@ tool(
         applyTypedBlocks(frontmatter, {
           type,
           ...(source !== undefined ? { source } : {}),
+          ...(view !== undefined ? { view } : {}),
           ...(trigger !== undefined ? { trigger } : {}),
           ...(tools_required !== undefined ? { tools_required } : {}),
           ...(output_format !== undefined ? { output_format } : {}),
@@ -1170,7 +1179,7 @@ tool(
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill/view needs that type's block in the same call — `source` for a source node, `trigger` for a skill node, `view` for a view node.",
       ),
     source: sourceMetaSchema
       .strict()
@@ -1178,6 +1187,9 @@ tool(
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
       ),
+    view: viewMetaSchema
+      .optional()
+      .describe("Replacement view block, for a node that is (or is becoming) type:view. Replaces the block wholesale."),
     trigger: z
       .string()
       .optional()
@@ -1198,6 +1210,7 @@ tool(
     content: bodyAlias,
     type,
     source,
+    view,
     trigger,
     tools_required,
     output_format,
@@ -1270,6 +1283,7 @@ tool(
         applyTypedBlocks(doc.frontmatter, {
           type: nextType,
           ...(source !== undefined ? { source } : {}),
+          ...(view !== undefined ? { view } : {}),
           ...(trigger !== undefined ? { trigger } : {}),
           ...(tools_required !== undefined ? { tools_required } : {}),
           ...(output_format !== undefined ? { output_format } : {}),

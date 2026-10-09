@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-engine",
-  "version": "2.11.0",
+  "version": "2.12.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -72,7 +72,7 @@
     "@types/toposort": "^2.0.7",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.11"
   },
   "files": [
     "dist",

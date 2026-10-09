@@ -1,7 +1,7 @@
 /**
  * Reconciling a node's `type` with its typed frontmatter blocks.
  *
- * Three node types carry a required companion block, and the spec constrains
+ * Four node types carry a required companion block, and the spec constrains
  * them from both sides:
  *
  *   - `type: source` MUST have a `source:` block (§13 rule 9) and no other type
@@ -9,8 +9,10 @@
  *   - `type: skill` MUST have a `skill:` block (§1.10 rule 18) and no other type
  *     may have one (rule 19).
  *   - `type: pdf` MUST have a `pdf:` block (§1.11 rule 25) and no other type may
- *     have one (rule 29). Unlike the other two it is never supplied here — see
+ *     have one (rule 29). Unlike source and skill it is never supplied here — see
  *     the guard at the top of applyTypedBlocks.
+ *   - `type: view` MUST have a `view:` block (§1.12 rule 30) and no other type
+ *     may have one (rule 31).
  *
  * Enforced only at validation — on the way out — those rules produce write-once
  * nodes: a `type: source` node written without a block fails every subsequent
@@ -23,7 +25,7 @@
  */
 
 import { ContextNestError } from "./errors.js";
-import type { Frontmatter, SkillMeta, SourceMeta } from "./types.js";
+import type { Frontmatter, SkillMeta, SourceMeta, ViewMeta } from "./types.js";
 
 export interface TypedBlockArgs {
   /** The type the node will have AFTER this write. */
@@ -34,6 +36,8 @@ export interface TypedBlockArgs {
   output_format?: SkillMeta["output_format"];
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
+  /** The `view` block (§1.12), for a node that is (or is becoming) type: view. Replaces wholesale. */
+  view?: ViewMeta;
   /**
    * Trigger to fall back on when a skill node is being CREATED and the caller
    * named none. Update passes nothing: guessing a trigger for an existing node
@@ -79,6 +83,14 @@ export function applyTypedBlocks(frontmatter: Frontmatter, args: TypedBlockArgs)
     }
   }
 
+  if (args.view !== undefined && type !== "view") {
+    throw new ContextNestError(
+      `A view block is only valid on type: view (§13 rule 31), and this node is type: "${type}". ` +
+        `Pass type: "view" in the same call to convert it, or drop the view parameter.`,
+      "VALIDATION_FAILED",
+    );
+  }
+
   if (args.source !== undefined && type !== "source") {
     throw new ContextNestError(
       `A source block is only valid on type: source (§13 rule 17), and this node is type: "${type}". ` +
@@ -114,6 +126,7 @@ export function applyTypedBlocks(frontmatter: Frontmatter, args: TypedBlockArgs)
     }
     frontmatter.source = block;
     delete frontmatter.skill;
+    delete frontmatter.view;
     return;
   }
 
@@ -136,21 +149,40 @@ export function applyTypedBlocks(frontmatter: Frontmatter, args: TypedBlockArgs)
       ...pick("guard_rails", args.guard_rails ?? existing?.guard_rails),
     };
     delete frontmatter.source;
+    delete frontmatter.view;
     return;
   }
 
   if (type === "pdf") {
-    // Its block was settled at the top; a pdf node carries neither of the others.
+    // Its block was settled at the top; a pdf node carries none of the others.
+    delete frontmatter.source;
+    delete frontmatter.skill;
+    delete frontmatter.view;
+    return;
+  }
+
+  if (type === "view") {
+    const block = args.view ?? frontmatter.view;
+    if (!block) {
+      throw new ContextNestError(
+        'A view block is required when type is "view" (§13 rule 30), and this node has none. ' +
+          "Pass view: { blocks: [...] } — e.g. view: { blocks: [{ md: { ref: \"nodes/overview\" } }, " +
+          '{ list: { select: "#board-metric" } }] }.',
+        "VALIDATION_FAILED",
+      );
+    }
+    frontmatter.view = block;
     delete frontmatter.source;
     delete frontmatter.skill;
     return;
   }
 
-  // Every other type carries neither block. Dropping is what makes a re-type
-  // AWAY from source/skill possible at all — rules 17 and 19 would otherwise
-  // reject the node over a block the caller never asked to keep.
+  // Every other type carries none of these blocks. Dropping is what makes a
+  // re-type AWAY from source/skill/view possible at all — rules 17, 19 and 31
+  // would otherwise reject the node over a block the caller never asked to keep.
   delete frontmatter.source;
   delete frontmatter.skill;
+  delete frontmatter.view;
 }
 
 /** Include a key only when it has a value, so the block stays free of `undefined`s. */

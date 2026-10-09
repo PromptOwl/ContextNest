@@ -8,6 +8,7 @@ import type {
   Checkpoint,
   ClientMetadata,
   ContextNode,
+  DocumentHistory,
   Frontmatter,
   VersionEntry,
 } from "./types.js";
@@ -98,6 +99,7 @@ export async function publishDocument(
   // The history read above, reused below instead of re-read; a seed just
   // appended to it, so then it is read fresh.
   const knownHistory = seeded ? undefined : existingHistory;
+  const knownSealed = await listOnceWithoutHistory(storage, docId, knownHistory);
 
   // Bump version — past the recorded history too, not just frontmatter, so a
   // doc whose frontmatter lags its history.yaml (imported/copied vault) cannot
@@ -106,6 +108,7 @@ export async function publishDocument(
     docId,
     node.frontmatter.version || 0,
     knownHistory,
+    knownSealed,
   );
   node.frontmatter.version = newVersion;
   node.frontmatter.status = "published";
@@ -136,6 +139,7 @@ export async function publishDocument(
     publishedAt,
     client: options.client,
     knownHistory,
+    knownSealed,
   });
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
@@ -157,6 +161,18 @@ export async function publishDocument(
     checkpoint,
     vaultDocs,
   };
+}
+
+/**
+ * With no history, numbering and the restart check both list the doc's
+ * `.versions/` dir; list it once for both. Otherwise only numbering lists it.
+ */
+async function listOnceWithoutHistory(
+  storage: NestStorage,
+  docId: string,
+  knownHistory: DocumentHistory | null | undefined,
+): Promise<number | undefined> {
+  return knownHistory === null ? storage.maxRecordedVersion(docId) : undefined;
 }
 
 /** Parse a document from the plaintext just written, as readDocument would. */
@@ -195,6 +211,12 @@ export interface BulkPublishOptions extends PublishOptions {
    * after this and always win.
    */
   frontmatter?: (node: ContextNode) => Partial<Frontmatter> | null | undefined;
+  /**
+   * Documents the caller read from this vault under the same lock (an
+   * importer's discovery scan). Used instead of re-reading each one; ids not
+   * in the map are read as usual.
+   */
+  preloaded?: ReadonlyMap<string, ContextNode>;
 }
 
 export interface BulkPublishResult {
@@ -255,7 +277,11 @@ export async function publishDocuments(
 
   const publishOne = async (docId: string): Promise<void> => {
     try {
-      let node = await storage.readDocument(docId);
+      const pre = options.preloaded?.get(docId);
+      // Copied: the publish below mutates frontmatter, and the map is the caller's.
+      let node = pre
+        ? { ...pre, frontmatter: { ...pre.frontmatter } }
+        : await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
       await assertNotForgotten(storage, node, tombstones);
       await assertPdfSidecarIntact(storage, docId, node);
@@ -279,11 +305,13 @@ export async function publishDocuments(
         });
       }
       const knownHistory = seeded ? undefined : existingHistory;
+      const knownSealed = await listOnceWithoutHistory(storage, docId, knownHistory);
 
       const newVersion = await versionManager.nextVersion(
         docId,
         node.frontmatter.version || 0,
         knownHistory,
+        knownSealed,
       );
       node.frontmatter.version = newVersion;
       node.frontmatter.status = "published";
@@ -300,6 +328,7 @@ export async function publishDocuments(
         publishedAt: new Date().toISOString(),
         client: options.client,
         knownHistory,
+        knownSealed,
       });
       published.push({
         id: docId,
