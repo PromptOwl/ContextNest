@@ -1,0 +1,9 @@
+mode	domain	U	A	F	MGS	n
+mixed	medical	0.5857	0.0729	0.0226	53.1	579
+mixed	office	0.6104	0.1520	0.0225	50.6	547
+mixed	education	0.5667	0.0944	0.0000	51.3	540
+mixed	household	0.6522	0.0815	0.0054	59.6	552
+all	medical	0.9381	0.7760	0.6497	7.4	579
+all	office	0.7403	0.8012	0.4189	8.6	547
+all	education	0.8944	0.5722	0.7389	10.0	540
+all	household	0.7174	0.5109	0.5000	17.5	552
