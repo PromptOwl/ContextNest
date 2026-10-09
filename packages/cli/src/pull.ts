@@ -311,6 +311,15 @@ function bool(value: unknown, where: string): boolean {
  * secret, or whose value looks like a credential, is refused outright.
  */
 const SECRET_KEY = /secret|token|passw(?:or)?d|passphrase|api[_-]?key|private[_-]?key|credential|authorization|bearer|cookie/i;
+/** "token" as a quantity (an LLM budget), not a credential: max_tokens, tokenLimit, … */
+const TOKEN_QUANTITY = /(?:max|min|num)[_-]?tokens?|tokens?[_-]?(?:budget|limit|count)/gi;
+
+/** A setting NAME that says secret. Exported for tests. */
+export function secretSettingName(key: string): boolean {
+  return SECRET_KEY.test(key.replace(TOKEN_QUANTITY, ""));
+}
+
+const SECRET_HINT = " — set secrets on the server, never in a recipe (if it isn't a secret, rename the setting)";
 const SECRET_VALUE = [
   /^(?:cnst_|sk-|sk_(?:live|test)_|rk_(?:live|test)_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abposr]-|AKIA|ASIA|AIza|ya29\.)/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
@@ -328,7 +337,7 @@ function settingValue(value: unknown, where: string): KindSettingValue {
   const scalar = (v: unknown, w: string): string | number | boolean => {
     if (typeof v === "number" || typeof v === "boolean") return v;
     if (typeof v === "string") {
-      if (looksSecret(v)) throw invalid(`${w} looks like a secret — set secrets on the server, never in a recipe`);
+      if (looksSecret(v)) throw invalid(`${w} looks like a secret${SECRET_HINT}`);
       return v;
     }
     throw invalid(`${where} must be a string, number, boolean or a list of them`);
@@ -379,7 +388,7 @@ export function parseKindSection(raw: unknown): KindSection {
       settings = {};
       for (const [k, v] of Object.entries(obj(entry.settings, `${where}.settings`))) {
         const at = `${where}.settings.${k}`;
-        if (SECRET_KEY.test(k)) throw invalid(`${at} looks like a secret — set secrets on the server, never in a recipe`);
+        if (secretSettingName(k)) throw invalid(`${at} looks like a secret${SECRET_HINT}`);
         settings[k] = settingValue(v, at);
       }
     }
@@ -496,6 +505,13 @@ export function parseKindSection(raw: unknown): KindSection {
 
 /** Where a recipe's kind lands in the vault. */
 export function kindDocId(recipeId: string): string {
+  // Same rule the manifest id gets, so CLI input can't reach outside nodes/kinds/.
+  if (!PLAIN_NAME.test(recipeId)) {
+    throw new ContextNestError(
+      `Kind id "${recipeId}" must be a plain name (letters, digits, - and _), like the recipe id it came from.`,
+      "VALIDATION_FAILED",
+    );
+  }
   return `nodes/kinds/${recipeId}`;
 }
 

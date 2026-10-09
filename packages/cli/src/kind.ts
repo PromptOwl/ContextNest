@@ -48,8 +48,10 @@ export interface KindStep {
   action: "apply" | "exists" | "skip";
   request?: KindRequest;
   note?: string;
-  /** Set by executeKindPlan. */
-  result?: "created" | "updated" | "exists" | "failed";
+  /** Edge steps: the edge type this run also defines that the edge needs. */
+  requires?: string;
+  /** Set by executeKindPlan. `skipped` = not sent because a step it needs failed. */
+  result?: "created" | "updated" | "exists" | "failed" | "skipped";
   error?: string;
 }
 
@@ -89,6 +91,14 @@ async function call(target: KindTarget, method: string, path: string, body?: unk
   // kind's contents to a destination nobody checked.
   assertNotRedirected(res, "--server");
   const parsed = await res.json().catch(() => null);
+  // The plan reads state from GETs: an HTML 200 (a proxy or login page) must
+  // not read as "nothing defined yet".
+  if (method === "GET" && res.ok && (parsed === null || typeof parsed !== "object")) {
+    throw new ContextNestError(
+      `GET ${path} returned ${res.status} without a JSON body — is --server the nest's API, not a proxy or web page?`,
+      "INTERNAL",
+    );
+  }
   return { status: res.status, ok: res.ok, body: parsed };
 }
 
@@ -214,6 +224,7 @@ export async function planKindApply(
     );
   }
 
+  const definedTypes = new Set(kind.edge_types.map((t) => t.name.toLowerCase()));
   for (const e of kind.edges) {
     const label = `${e.from} -[${e.type}]-> ${e.to}${e.condition ? ` (${e.condition.mode} condition)` : ""}`;
     let condition: Record<string, unknown> = {};
@@ -227,6 +238,7 @@ export async function planKindApply(
             kind: "edge",
             label,
             action: "apply",
+            ...(definedTypes.has(e.type.toLowerCase()) ? { requires: e.type } : {}),
             request: {
               method: "POST",
               path: nestPath(target, "/edges"),
@@ -367,31 +379,47 @@ export async function planKindApply(
  * enough to be worth landing, and the report names what did not.
  */
 export async function executeKindPlan(plan: KindPlan, target: KindTarget): Promise<KindPlan> {
+  const failedTypes = new Set<string>();
   for (const step of plan.steps) {
     if (step.action !== "apply" || !step.request) continue;
-    const { method, path, body } = step.request;
-    let reply: Reply;
-    try {
-      reply = await call(target, method, path, body);
-    } catch (err) {
-      step.result = "failed";
-      step.error = (err as Error).message;
+    // An edge whose type failed to land would only add a cascade of 4xx.
+    if (step.requires && failedTypes.has(step.requires.toLowerCase())) {
+      step.result = "skipped";
+      step.note = `edge type ${step.requires} failed — rerun once it applies`;
       continue;
     }
-    if (reply.status === 201) step.result = "created";
-    else if (reply.ok) step.result = "updated";
-    else if (reply.status === 409) {
-      step.result = "exists";
-      step.error = serverError(reply);
-    } else {
-      step.result = "failed";
-      step.error =
-        reply.status === 404 && step.kind !== "steward"
-          ? `${serverError(reply)} — ${step.kind === "plugin" ? PLUGINS_OFF : WORKFLOW_PLANE_OFF}?`
-          : serverError(reply);
+    const outcome = await sendStep(step, target);
+    if (outcome === "failed" && step.kind === "edge-type") {
+      failedTypes.add(String(step.request.body.name).toLowerCase());
     }
   }
   return plan;
+}
+
+async function sendStep(step: KindStep, target: KindTarget): Promise<KindStep["result"]> {
+  const { method, path, body } = step.request!;
+  let reply: Reply;
+  try {
+    reply = await call(target, method, path, body);
+  } catch (err) {
+    step.result = "failed";
+    step.error = (err as Error).message;
+    return step.result;
+  }
+  if (reply.status === 201) step.result = "created";
+  else if (reply.ok) step.result = "updated";
+  else if (reply.status === 409) {
+    // Created since the plan was read (or by an edge's own uniqueness): benign.
+    step.result = "exists";
+    step.note = `already on the server (${serverError(reply)})`;
+  } else {
+    step.result = "failed";
+    step.error =
+      reply.status === 404 && step.kind !== "steward"
+        ? `${serverError(reply)} — ${step.kind === "plugin" ? PLUGINS_OFF : WORKFLOW_PLANE_OFF}?`
+        : serverError(reply);
+  }
+  return step.result;
 }
 
 // ─── Output ─────────────────────────────────────────────────────────────────
@@ -407,6 +435,7 @@ const RESULT_MARKS: Record<NonNullable<KindStep["result"]>, string> = {
   updated: chalk.green("✓ updated"),
   exists: chalk.dim("= exists "),
   failed: chalk.red("✗ failed "),
+  skipped: chalk.yellow("- skipped"),
 };
 
 /** The plan (or, once executed, the outcome) as printable lines. */

@@ -64,7 +64,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { parseRecipeManifest, planPull, applyPull, extractYamlBlock, skillBlockFromBody, parseKindDocument, kindDocId } = await import(
+const { parseRecipeManifest, planPull, applyPull, extractYamlBlock, skillBlockFromBody, parseKindDocument, kindDocId, secretSettingName } = await import(
   "../pull.js"
 );
 const { remoteFetchRecipe } = await import("../remote.js");
@@ -204,6 +204,22 @@ describe("helpers", () => {
       guard_rails: ["a", "b"],
     });
     expect(skillBlockFromBody("no markers", "fallback")).toEqual({ trigger: "fallback" });
+  });
+
+  it("secretSettingName: token as an LLM budget is a setting, token as a credential is a secret", () => {
+    for (const ok of ["max_tokens", "maxTokens", "min-tokens", "token_budget", "tokenLimit", "num_tokens", "repos"]) {
+      expect(secretSettingName(ok), ok).toBe(false);
+    }
+    for (const bad of ["token", "access_token", "accessToken", "api_key", "client_secret", "password", "max_tokens_secret"]) {
+      expect(secretSettingName(bad), bad).toBe(true);
+    }
+  });
+
+  it("kindDocId only accepts a plain recipe id", () => {
+    expect(kindDocId("seam")).toBe("nodes/kinds/seam");
+    for (const bad of ["../etc", "a/b", "..", "", "-x", "a b"]) {
+      expect(() => kindDocId(bad), bad).toThrow(/must be a plain name/);
+    }
   });
 });
 
@@ -524,6 +540,7 @@ describe("parseRecipeManifest — kind section", () => {
     ["a duplicate plugin", "  plugins:\n    - name: gh\n      mode: raw\n    - name: GH\n      mode: raw", /kind\.plugins\[1\]\.name "GH" is listed twice/],
     ["a secret-named setting", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        api_key: abc", /kind\.plugins\[0\]\.settings\.api_key looks like a secret/],
     ["a token-named setting", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        accessToken: abc", /settings\.accessToken looks like a secret/],
+    ["a token-named setting next to a budget", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        max_tokens_secret: abc", /settings\.max_tokens_secret looks like a secret/],
     ["a secret-looking value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        org: ghp_abcdefghijklmnopqrstuvwxyz0123456789", /kind\.plugins\[0\]\.settings\.org looks like a secret/],
     ["a ContextNest key value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        label: cnst_0123456789abcdef", /settings\.label looks like a secret/],
     ["a high-entropy value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        hint: Zx8q2LmN4pR7tV1wY5bC9dF3gH6jK0sA", /settings\.hint looks like a secret/],

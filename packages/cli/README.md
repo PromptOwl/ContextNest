@@ -374,6 +374,8 @@ ctx kind apply seam --server https://nest.example.com --nest <id> --steward @sea
 ```
 
 - **Dry run by default.** Without `--yes`, only GETs are sent: they check the key and the nest, and find out which planes are on.
+- **Published kinds only.** `--yes` refuses a kind that is still a draft — review and `ctx publish` it first, or pass `--allow-draft` to apply an unreviewed one deliberately (stewards switch governance on).
+- **Re-runs are safe.** Anything the server already has (a 409) is reported as `exists`; an edge whose edge type failed in the same run is `skipped`, not sent. `--steward` emails are lowercased.
 - Authentication works as it does for `ctx push`: `--key` or `CONTEXTNEST_API_KEY`, https (or localhost) only, and redirects are refused.
 - A plane the server has switched off answers 404. Its entries are skipped with a warning that names the flag (`FEATURE_WORKFLOW_PLANE`, `FEATURE_PLUGINS`). A plugin the server has not loaded is skipped too.
 - Plugins are configured but **never enabled**. Enable one on the server once its secrets are connected.

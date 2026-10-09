@@ -345,6 +345,41 @@ describe("executeKindPlan", () => {
   });
 });
 
+describe("review hardening", () => {
+  it("records a 409 as a note, not an error — including a schedule created since the plan", async () => {
+    const plan = await planKindApply("seam", kind(), target);
+    routes[key("POST", "/nests/n1/schedules")] = { status: 409, body: { error: "agent already scheduled" } };
+    await executeKindPlan(plan, target);
+    const schedule = plan.steps.find((s) => s.kind === "schedule")!;
+    expect(schedule.result).toBe("exists");
+    expect(schedule.error).toBeUndefined();
+    expect(schedule.note).toMatch(/already on the server.*409 agent already scheduled/);
+    expect(renderKindPlan(plan).join("\n")).not.toMatch(/failed/);
+  });
+
+  it("skips edges whose edge type failed, but still sends edges on pre-existing types", async () => {
+    const plan = await planKindApply("seam", kind(), target);
+    routes[key("POST", "/nests/n1/edge-types")] = { status: 400, body: { error: "bad condition_schema" } };
+    calls = [];
+    await executeKindPlan(plan, target);
+    const edges = plan.steps.filter((s) => s.kind === "edge");
+    // escalates-when is defined by this kind and failed; next already existed on the server.
+    expect(edges.map((s) => s.result)).toEqual(["skipped", "created"]);
+    expect(edges[0].note).toMatch(/edge type escalates-when failed/);
+    expect(mutations().filter((c) => c.path.endsWith("/edges"))).toHaveLength(1);
+  });
+
+  it("refuses a 2xx GET that isn't JSON instead of reading it as an empty server", async () => {
+    const htmlFetch: typeof fetch = async (input, init) => {
+      if (new URL(String(input)).pathname.endsWith("/edge-types")) {
+        return new Response("<html>login</html>", { status: 200, headers: { "Content-Type": "text/html" } });
+      }
+      return fakeFetch(input, init);
+    };
+    await expect(planKindApply("seam", kind(), { ...target, fetch: htmlFetch })).rejects.toThrow(/without a JSON body/);
+  });
+});
+
 // ─── Flags ──────────────────────────────────────────────────────────────────
 
 describe("parseStewardMappings", () => {

@@ -3924,6 +3924,7 @@ kindCommand
     [] as string[],
   )
   .option("--json", "Print the plan and result as JSON")
+  .option("--allow-draft", "With --yes, apply a kind that is not published yet (it has not been reviewed)")
   .addHelpText(
     "after",
     `
@@ -3936,12 +3937,14 @@ sent: set them on the server. Stewards apply only once each placeholder is
 mapped with --steward.
 
 Dry run by default: nothing but GETs leaves the machine until --yes is passed.
+--yes applies only a PUBLISHED kind — review and \`ctx publish\` it first, or
+pass --allow-draft to apply an unreviewed one deliberately.
 
 Example:
   ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com
   ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com --yes`,
   )
-  .action(async (kindId: string, opts: { server: string; nest: string; key?: string; steward: string[]; json?: boolean }, cmd: Command) => {
+  .action(async (kindId: string, opts: { server: string; nest: string; key?: string; steward: string[]; json?: boolean; allowDraft?: boolean }, cmd: Command) => {
     const apiKey = opts.key ?? process.env.CONTEXTNEST_API_KEY;
     if (!apiKey) {
       console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
@@ -3963,10 +3966,20 @@ Example:
     });
     const kind = parseKindDocument(node.body);
 
-    const target = { server: opts.server.replace(/\/$/, ""), nest: opts.nest, apiKey };
-    const plan = await planKindApply(kindId, kind, target, { stewards });
     const execute = cmd.optsWithGlobals().yes === true && !isDryRun();
     const draft = node.frontmatter.status !== "published";
+    // Applying creates edge types and schedules and can switch governance on
+    // (stewards): an unreviewed kind needs an explicit, separate yes.
+    if (execute && draft && !opts.allowDraft) {
+      console.error(
+        chalk.red(`${id} is ${node.frontmatter.status ?? "draft"}, not published — refusing to apply an unreviewed kind.`) +
+          `\n  Review and publish it (ctx publish ${id}), or pass --allow-draft to apply it anyway.`,
+      );
+      process.exit(1);
+    }
+
+    const target = { server: opts.server.replace(/\/$/, ""), nest: opts.nest, apiKey };
+    const plan = await planKindApply(kindId, kind, target, { stewards });
 
     if (execute) await executeKindPlan(plan, target);
     const failed = plan.steps.filter((s) => s.result === "failed");
