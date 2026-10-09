@@ -96,7 +96,7 @@ Hooks: `SessionStart` → vault overview injection, `UserPromptSubmit` → retri
 
 ## Key Concepts
 
-**Node types**: `document`, `snippet`, `glossary`, `persona`, `prompt`, `source`, `tool`, `reference`, `skill`, `agent`, `artifact`, `table`, `pdf`
+**Node types**: `document`, `snippet`, `glossary`, `persona`, `prompt`, `source`, `tool`, `reference`, `skill`, `agent`, `artifact`, `table`, `pdf`, `task`, `view`
 
 **PDF nodes** (spec §1.11): body = extracted text (`<!-- page N -->` markers), the PDF is a binary sidecar `<id>.pdf` beside the `.md`, bound by `pdf.sha256` in frontmatter (so it rides the version chain). Created only by `context_import_pdf` / `ctx import pdf` (`importers/pdf.ts`, unpdf); body edits are refused; prior binaries are archived as `.versions/<doc>/<sha256-hex>.pdf`; `verifyPdfSidecars` reports `sidecar_drift`/`sidecar_missing`; delete removes the sidecar.
 

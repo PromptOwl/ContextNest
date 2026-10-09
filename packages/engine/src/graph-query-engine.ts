@@ -22,6 +22,7 @@ import { GraphTraverser } from "./graph-traverser.js";
 import { generateContextYaml } from "./index-generator.js";
 import { isPublished, isRetrievable } from "./parser.js";
 import { parseSelector } from "./selector/parser.js";
+import { asksForForgotten } from "./selector/evaluator.js";
 import { evaluateFromIndex } from "./selector/index-evaluator.js";
 import { orderSourceNodesTopologically } from "./source-graph.js";
 import { TraceLogger } from "./tracing.js";
@@ -99,7 +100,10 @@ export class GraphQueryEngine {
     // (see `ctx index` and `autoIndex` below). Drafts therefore never appear
     // as seed candidates and graph mode cannot honor `includeDrafts`. Force
     // full mode so draft documents actually surface when callers opt in.
-    if (!full && !includeDrafts) {
+    // context.yaml is published-only, so it has no forgotten stubs: an explicit
+    // `status:forgotten` (§6.3.3) can only be answered by a full query.
+    const wantsForgotten = asksForForgotten(parseSelector(selector), true);
+    if (!full && !includeDrafts && !wantsForgotten) {
       let contextYaml = await this.storage.readContextYaml();
 
       // Auto-generate context.yaml if missing — but only inside a real vault.
@@ -136,6 +140,13 @@ export class GraphQueryEngine {
     const ast = parseSelector(selector);
     const seedIds = await evaluateFromIndex(ast, contextYaml.documents, {
       packLoader: (id) => packLoader.get(id),
+      // context.yaml has no bodies, so a search URI would only match titles,
+      // tags and descriptions. Search full text, as context_search does.
+      search: async (query) =>
+        new Resolver({ documents: await this.storage.discoverDocuments() })
+          .search(query)
+          .filter((h) => isPublished(h.document))
+          .map((h) => h.document.id),
     });
 
     // 2. Traverse graph from seeds
@@ -254,16 +265,16 @@ export class GraphQueryEngine {
 
     // Apply the same retrieval gates as graphQuery so approved/rejected
     // never leak to LLMs, and drafts surface only when explicitly opted in.
-    const filteredDocs = result.documents.filter((doc) => {
+    // A forgotten stub is returned only when the selector asked for it by name.
+    const wantsForgotten = asksForForgotten(parseSelector(selector), true);
+    const keep = (doc: ContextNode): boolean => {
+      if (wantsForgotten && doc.frontmatter.status === "forgotten") return true;
       if (!isRetrievable(doc)) return false;
       if (!options.includeDrafts && !isPublished(doc)) return false;
       return true;
-    });
-    const filteredSources = result.sourceNodes.filter((doc) => {
-      if (!isRetrievable(doc)) return false;
-      if (!options.includeDrafts && !isPublished(doc)) return false;
-      return true;
-    });
+    };
+    const filteredDocs = result.documents.filter(keep);
+    const filteredSources = result.sourceNodes.filter(keep);
 
     return {
       ...result,

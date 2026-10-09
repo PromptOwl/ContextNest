@@ -288,11 +288,23 @@ export class CheckpointManager {
    * read at different times and a concurrent publish slips between them, leaving
    * a freshly-published doc absent from the checkpoint it should have sealed.
    */
-  async createCheckpointFromVault(triggeredBy: string): Promise<Checkpoint> {
+  async createCheckpointFromVault(
+    triggeredBy: string,
+    /**
+     * Entries the caller just appended (id → version + chain hash). A doc whose
+     * on-disk version matches is sealed from this instead of re-reading its
+     * history.yaml; anything else is read as usual.
+     */
+    justSealed?: ReadonlyMap<string, Pick<VersionEntry, "version" | "chain_hash">>,
+    /** Receives the vault crawl, so the index rebuild after it need not crawl again. */
+    onCrawl?: (docs: ContextNode[]) => void,
+  ): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
-      const publishedDocuments = (
-        await this.storage.discoverDocuments()
-      ).filter(isPublished);
+      // includeRetired only adds rejected docs, which the published filter drops
+      // anyway — and it is the set regenerateIndex needs.
+      const crawled = await this.storage.discoverDocuments({ includeRetired: true });
+      onCrawl?.(crawled);
+      const publishedDocuments = crawled.filter(isPublished);
       // Snapshot before the reads: a write that lands during the seal stays
       // marked for the next one.
       const touched = this.storage.touchedHistorySnapshot();
@@ -315,8 +327,11 @@ export class CheckpointManager {
         for (const doc of publishedDocuments) {
           const hash = head.document_chain_hashes[doc.id];
           const version = doc.frontmatter.version || 1;
+          const fresh = justSealed?.get(doc.id);
           if (hash && head.document_versions[doc.id] === version && !touched.has(doc.id)) {
             documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
+          } else if (fresh && fresh.version === version) {
+            documentHistories.set(doc.id, { versions: [fresh] });
           } else {
             stale.push(doc.id);
           }

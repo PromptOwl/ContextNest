@@ -43,6 +43,7 @@ import {
 } from "./errors.js";
 import type {
   ContextNode,
+  DocumentHistory,
   GovernanceTier,
   HashChainEvent,
   HashChainEventType,
@@ -121,6 +122,7 @@ async function approveSuggestionImpl(
     newRawContent: patched,
     actor: input.actor,
     note: input.comment,
+    knownHistory: approved.history,
   });
 
   const archivedAt = await input.storage.archiveSuggestion(
@@ -260,9 +262,13 @@ async function rollbackDocumentImpl(
   });
 
   const vm = new VersionManager(input.storage);
+  // One history read, shared by the reconstruct and the commit below. Plain
+  // read, as the reconstruct always did: a corrupt history fails the rollback.
+  const history = await input.storage.readHistory(input.documentId);
   const targetContent = await vm.reconstructVersion(
     input.documentId,
     input.targetVersion,
+    history ?? undefined,
   );
 
   const { versionEntry } = await commitNewVersion({
@@ -270,6 +276,7 @@ async function rollbackDocumentImpl(
     documentId: input.documentId,
     newRawContent: targetContent,
     actor: input.actor,
+    knownHistory: history,
     restoring: true,
     note: input.reason
       ? `rollback to v${input.targetVersion}: ${input.reason}`
@@ -361,7 +368,7 @@ async function gateForTier(
 async function loadApprovedBase(
   storage: NestStorage,
   documentId: string,
-): Promise<{ version: number; content: string }> {
+): Promise<{ version: number; content: string; history: DocumentHistory }> {
   // The approved base is the EXACT current chain head — last keyframe plus
   // any diffs applied forward. `readLatestApprovedKeyframe` alone would
   // skip non-keyframe entries and let stale suggestions slip through.
@@ -373,8 +380,10 @@ async function loadApprovedBase(
   const content = await new VersionManager(storage).reconstructVersion(
     documentId,
     latest.version,
+    history,
   );
-  return { version: latest.version, content };
+  // Returned so the commit reuses this read instead of reading it again.
+  return { version: latest.version, content, history };
 }
 
 async function assertNotStale(
@@ -399,6 +408,11 @@ interface CommitInput {
   note?: string;
   /** True for a rollback — see `settlePdfForCommit`. */
   restoring?: boolean;
+  /**
+   * History the caller already read under this lock; omit to read it here.
+   * `null` means the document has no history — not "unknown".
+   */
+  knownHistory?: DocumentHistory | null;
 }
 
 async function commitNewVersion(
@@ -408,9 +422,15 @@ async function commitNewVersion(
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
 
   const versionManager = new VersionManager(input.storage);
+  // Read once, shared by the numbering and the append below.
+  const knownHistory =
+    input.knownHistory !== undefined
+      ? input.knownHistory
+      : (await versionManager.historyOrRepair(input.documentId)).history;
   const newVersion = await versionManager.nextVersion(
     input.documentId,
     parsed.frontmatter.version ?? 0,
+    knownHistory,
   );
   const updatedAt = new Date().toISOString();
   const node: ContextNode = {
@@ -441,6 +461,7 @@ async function commitNewVersion(
   const versionEntry = await versionManager.createVersion(finalNode, input.actor, {
     note: input.note,
     publishedAt: updatedAt,
+    knownHistory,
   });
 
   // Write the live canonical file last so a mid-flight crash leaves the

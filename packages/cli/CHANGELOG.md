@@ -1,5 +1,37 @@
 # @promptowl/contextnest-cli
 
+## 3.0.3
+
+### Patch Changes
+
+- 441c0af: First-run hints: `ctx add` re-roots a path outside `nodes/`/`sources/` (structured vaults) under `nodes/` and says so, instead of writing a file that list and search never see. The held-for-review notice now says the document is not visible to search or agents until approved, and an empty `ctx search` names held matches ("N matching documents are held for review…: ctx review list") instead of a bare "No results found."
+
+## 3.0.2
+
+### Patch Changes
+
+- fbfd50a: **Approving a suggestion, holding a write for review, changing a status and deleting rewrite only that document's folder index.** The MCP server's suggestion-approval, held-write, status-update and delete tools, and `ctx drift approve`, rebuilt every folder's INDEX.md after changing a single document. They now rewrite only the folder that document lives in; `context.yaml` is still rebuilt in full. This matches what publishing already does.
+- 6c9738a: **`context_search` returns `count`, the total number of matches, next to `results`.**
+
+  With `limit` set, a capped page could read as the whole answer. `searchOp.output` now has a required `count: z.number().int().nonnegative()`, filled with every published match _before_ the `limit` slice. The name matches the hosted REST and MCP search responses, which already return `count`. `total`, which carried the same number, stays as a deprecated alias so existing clients keep working. `ctx search` (local and remote) reads `count` first and falls back to `total`, so its "… N more — raise --limit" footer now also appears against a hosted nest that sends only `count`.
+
+- 6c9738a: **Full-text search ignores stopwords, weights titles, and drops weak partial matches, so a natural-language question retrieves the nodes about its topic.**
+
+  Hosts pass the user's question straight through as the search text. Words like "what", "is", "the" and "for" were indexed and OR-matched, so every node containing "the" came back as a hit, and chat hosts cited them. `Resolver.search` (behind `context_search`, `ctx search`, and `contextnest://search/…` in `context_query`) now drops English stopwords from both the index and the query, boosts title (×3), tags (×2) and description (×1.5) over body, and drops partial hits scoring below 5% of the best hit. Documents matching every query term are always kept. A query made only of stopwords returns nothing.
+
+## 3.0.1
+
+### Patch Changes
+
+- 40d6eba: Anti-resurrection: `context_import` (and any other write) now refuses erased content under a new title. Forgotten bodies were matched by a hash of the raw body, so the same text wrapped in different blank lines (`ctx add` writes `"\nX\n"`, an import `"X"`) never matched. Bodies are now trimmed before hashing; the untrimmed hash is still checked so forgets recorded by earlier versions keep refusing an exact copy.
+- 40d6eba: An explicit `status:forgotten` selector now returns the forgotten stub from `ctx query`, `context_query` and the query-backed resolve surfaces (spec §6.3.3). The query engine matched the stub and then dropped it in its retrieval gate, and its default (graph) mode reads a published-only `context.yaml` that never holds stubs. A selector that asks for `status:forgotten` in a positive position now runs in full mode and keeps stubs; every other selector still hides them.
+- 55e5b66: Harden the `ctx push` confirmation-gate poll.
+
+  - A redirect on the poll request now fails at once. It was refused but then retried, so the CLI kept polling until the timeout (15 minutes by default).
+  - A `202` envelope whose `poll_url` is not a path (e.g. `@evil.example/x`) is now treated as unrecognized ("not applied", exit 1). `poll_url` is appended to `--server` and the poll carries the API key, so a non-path value could send the key to another host.
+
+- 40d6eba: `contextnest://search/…` selectors in graph mode (the default for `context_query`, `ctx query` and the deprecated MCP `search` tool) now match body text. They searched only the titles, tags and descriptions in `context.yaml`, so a word that appeared only in a document's body returned nothing. Graph mode now seeds from the same published full-text index `context_search` uses.
+
 ## 3.0.0
 
 ### Major Changes

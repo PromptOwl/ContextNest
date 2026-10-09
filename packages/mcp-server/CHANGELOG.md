@@ -1,5 +1,39 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.8.0
+
+### Minor Changes
+
+- 2c90a57: Add `task` to `NODE_TYPES`: a unit of work on a project board. The body is markdown, and board fields (`assignee`, `due`, `priority`, `parent`) are ordinary `metadata` keys. There are no type-specific validation rules (it validates like `document`), and whether a task goes through review is up to the server's governance. This only widens the vocabulary, so no existing document changes bytes or hashes. Spec §1.6 and the MCP `frontmatter_fields.type` enum list it.
+
+### Patch Changes
+
+- c840694: MCP writes no longer vanish on first run. `create_document` and `context_create` (with an explicit `id`) re-root a path outside `nodes/` and `sources/` under `nodes/`, so the document shows up in list, search and agent context, and the result carries a `placement` note saying where it went. A create held for review now also tells the agent it is not searchable, and agents won't see it, until approved. Mirrors the CLI's `ctx add` / `ctx search` hints.
+
+## 2.7.2
+
+### Patch Changes
+
+- fbfd50a: **Approving an external edit or suggestion, rolling back, and publishing from the MCP server now read less from disk.** Approving a staged suggestion reads the document's version history once instead of four times, and a rollback or direct edit once instead of three times; version numbering, diffs and chain hashes are computed exactly as before. The MCP server's create, update and publish tools rebuild only the published document's folder index and reuse the checkpoint the publish just sealed, matching `context_publish`.
+- fbfd50a: **Approving a suggestion, holding a write for review, changing a status and deleting rewrite only that document's folder index.** The MCP server's suggestion-approval, held-write, status-update and delete tools, and `ctx drift approve`, rebuilt every folder's INDEX.md after changing a single document. They now rewrite only the folder that document lives in; `context.yaml` is still rebuilt in full. This matches what publishing already does.
+- 6c9738a: **`context_search` returns `count`, the total number of matches, next to `results`.**
+
+  With `limit` set, a capped page could read as the whole answer. `searchOp.output` now has a required `count: z.number().int().nonnegative()`, filled with every published match _before_ the `limit` slice. The name matches the hosted REST and MCP search responses, which already return `count`. `total`, which carried the same number, stays as a deprecated alias so existing clients keep working. `ctx search` (local and remote) reads `count` first and falls back to `total`, so its "… N more — raise --limit" footer now also appears against a hosted nest that sends only `count`.
+
+- 6c9738a: **Full-text search ignores stopwords, weights titles, and drops weak partial matches, so a natural-language question retrieves the nodes about its topic.**
+
+  Hosts pass the user's question straight through as the search text. Words like "what", "is", "the" and "for" were indexed and OR-matched, so every node containing "the" came back as a hit, and chat hosts cited them. `Resolver.search` (behind `context_search`, `ctx search`, and `contextnest://search/…` in `context_query`) now drops English stopwords from both the index and the query, boosts title (×3), tags (×2) and description (×1.5) over body, and drops partial hits scoring below 5% of the best hit. Documents matching every query term are always kept. A query made only of stopwords returns nothing.
+
+- fbfd50a: **A publish lists the vault once instead of twice.** Sealing the checkpoint and rebuilding the index after a publish each read and parsed every document in the vault. The checkpoint's listing is now handed to the index rebuild, which uses it instead of listing again (`regenerateIndex` takes it as `docs`; `publishDocument` returns it as `vaultDocs`). Applies to `context_publish`, create/update with publish, review approval, bulk `context_import`, and the MCP server's publish tools. Without a document cache (the CLI and the MCP server) this halves the reads a publish makes on a large or network-mounted vault.
+
+## 2.7.1
+
+### Patch Changes
+
+- 40d6eba: Anti-resurrection: `context_import` (and any other write) now refuses erased content under a new title. Forgotten bodies were matched by a hash of the raw body, so the same text wrapped in different blank lines (`ctx add` writes `"\nX\n"`, an import `"X"`) never matched. Bodies are now trimmed before hashing; the untrimmed hash is still checked so forgets recorded by earlier versions keep refusing an exact copy.
+- 40d6eba: An explicit `status:forgotten` selector now returns the forgotten stub from `ctx query`, `context_query` and the query-backed resolve surfaces (spec §6.3.3). The query engine matched the stub and then dropped it in its retrieval gate, and its default (graph) mode reads a published-only `context.yaml` that never holds stubs. A selector that asks for `status:forgotten` in a positive position now runs in full mode and keeps stubs; every other selector still hides them.
+- 40d6eba: `contextnest://search/…` selectors in graph mode (the default for `context_query`, `ctx query` and the deprecated MCP `search` tool) now match body text. They searched only the titles, tags and descriptions in `context.yaml`, so a word that appeared only in a document's body returned nothing. Graph mode now seeds from the same published full-text index `context_search` uses.
+
 ## 2.7.0
 
 ### Minor Changes

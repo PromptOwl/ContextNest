@@ -19,6 +19,7 @@ import type {
   PdfMeta,
   SkillMeta,
   SourceMeta,
+  ViewMeta,
 } from "../types.js";
 import {
   serializeDocument,
@@ -238,8 +239,9 @@ async function publishAndIndex(
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
-  // mcp-server/CLI both regenerate here.
-  await ctx.storage.regenerateIndex();
+  // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
+  // INDEX.md needs rewriting.
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
   return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
@@ -315,7 +317,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // intersection/union walk the left side first, so
   // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
-  if (!query) return { results: [], total: 0 };
+  if (!query) return { results: [], count: 0, total: 0 };
   const docs = await ctx.storage.discoverDocuments();
   const hits = new Resolver({ documents: docs })
     .search(query)
@@ -323,6 +325,8 @@ const search: OperationExecutor = async (ctx, input: any) => {
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
     results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    // Counted before the `limit` slice. `total` is the deprecated alias.
+    count: hits.length,
     total: hits.length,
   };
 };
@@ -431,6 +435,7 @@ function buildDraftNode(input: {
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
   source?: SourceMeta;
+  view?: ViewMeta;
 }): ContextNode {
   const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
@@ -455,12 +460,13 @@ function buildDraftNode(input: {
     // updated_at until its first edit, and every surface renders it blank.
     updated_at: now,
   };
-  // `source` and `skill` are required by one type and forbidden on the others,
+  // `source`, `skill` and `view` are required by one type and forbidden on the others,
   // so they cannot ride along inside `metadata` and cannot be added afterwards
   // — a source node written without its block fails every later update.
   applyTypedBlocks(frontmatter, {
     type,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -633,6 +639,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   applyTypedBlocks(frontmatter, {
     type: nextType,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -715,7 +722,7 @@ const publish: OperationExecutor = async (ctx, input: any) => {
     ...(input.note ? { note: input.note } : {}),
     ...(input.client ? { client: input.client } : {}),
   });
-  await ctx.storage.regenerateIndex();
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
   return {
     id,
     version: result.versionEntry.version,
@@ -1267,7 +1274,12 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       onProgress: ctx.onProgress,
+      ...(input.note ? { note: input.note } : {}),
       ...(input.client ? { client: input.client } : {}),
+      // Ids-only (e.g. a bulk approval) writes nothing but these docs, so only
+      // their folders' INDEX.md can change. Other modes write files too.
+      indexOnlyBatchFolders:
+        !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
@@ -1467,6 +1479,14 @@ async function importPdfLocked(
     existing = await readIfExists(ctx, raw);
     id = existing ? raw : normalizeDocumentId(raw);
     if (!existing && id !== raw) existing = await readIfExists(ctx, id);
+    // On a case-insensitive filesystem `nodes/report` reads `nodes/Report.md`,
+    // and the read hands back the caller's spelling. Every path below — the
+    // sidecar, `pdf.file`, the version history — must use the spelling
+    // discovery reports, or rule 26 fails and delete misses the sidecar (#117).
+    if (existing) {
+      id = await ctx.storage.resolveDocumentIdCasing(id);
+      existing = { ...existing, id };
+    }
   } else {
     const title =
       input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF";
@@ -1562,7 +1582,10 @@ async function importPdfLocked(
       );
     const wantsDescription =
       typeof input.description === "string" && input.description !== (fm.description ?? "");
-    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription) {
+    // A node written before #117 may record `pdf.file` in the caller's
+    // casing; rewriting it to the on-disk spelling repairs rule 26.
+    const wantsRepair = existingPdf.file !== sidecar;
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription && !wantsRepair) {
       return {
         id,
         version: fm.version ?? 1,
@@ -1580,7 +1603,7 @@ async function importPdfLocked(
   // restamp extracted_at); new bytes get both fresh.
   const pdf: PdfMeta =
     sameBytes && existingPdf
-      ? existingPdf
+      ? { ...existingPdf, file: sidecar }
       : {
           file: sidecar,
           sha256: extraction.sha256,

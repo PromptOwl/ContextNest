@@ -33,9 +33,10 @@ import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
+import { resolveIdCasing } from "./id-casing.js";
 import {
   buildTombstoneIndex,
-  forgettableBodyHash,
+  carriesForgottenBody,
   isPathForgotten,
   type TombstoneIndex,
 } from "./tombstones.js";
@@ -212,6 +213,24 @@ export const SENSITIVE_FILE_GLOBS = [
   "**/*.pdf",
   "context.yaml",
 ];
+
+/**
+ * Run a write; only if its directory is missing, create it and write once more.
+ * The directory almost always exists, and an up-front `mkdir -p` is a round
+ * trip per write on a network mount.
+ */
+async function writeInDir<T>(dir: string, write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    await mkdir(dir, { recursive: true });
+    return write();
+  }
+}
+
+/** Largest chain_events.yaml whose parsed events `readTombstones` keeps in memory. */
+export const CHAIN_EVENT_CACHE_MAX_BYTES = 256 * 1024;
 
 const NON_DOCUMENT_FILES = [
   "**/node_modules/**",
@@ -557,6 +576,9 @@ export class NestStorage {
   /** Disambiguates concurrent `writeFileDurable` temp files. See that method. */
   private tmpWriteCounter = 0;
 
+  /** chain_events.yaml as last parsed, keyed by its stat. See `readTombstones`. */
+  private chainEventCache?: { size: number; mtimeMs: number; ino: number; events: readonly unknown[] };
+
   /**
    * Per-document history verdicts for the serve path, keyed by doc id and
    * stamped with the digest of the history.yaml bytes they were computed from.
@@ -773,6 +795,21 @@ export class NestStorage {
   }
 
   /**
+   * The id of an existing document as it is spelled on disk (issue #117).
+   *
+   * `readDocument` returns the id it was given. On a case-insensitive
+   * filesystem that may not be the spelling discovery reports (`nodes/report`
+   * reads `nodes/Report.md`), so a caller about to derive paths from the id —
+   * a pdf sidecar, `pdf.file`, version history — resolves it here first.
+   * Unchanged on a case-sensitive filesystem, and for an id with no file.
+   */
+  async resolveDocumentIdCasing(id: string): Promise<string> {
+    return resolveIdCasing(id, (relDir) =>
+      readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root),
+    );
+  }
+
+  /**
    * Read a single document by its id (relative path without .md).
    *
    * Default behavior (no options): reads the live `.md` file and returns
@@ -868,36 +905,49 @@ export class NestStorage {
    * Single source for mcp-server, cli, and desktop. Each agent-config file
    * is merged with its existing on-disk content so user-authored sections
    * outside engine-managed blocks are preserved.
+   *
+   * `changedIds` scopes the INDEX.md rewrite to the folders holding those docs
+   * (a folder's INDEX.md lists only its own docs). context.yaml is always rebuilt.
+   * The ids must not have changed folder — a move needs the full rebuild.
+   * `latestCheckpoint` is the head the caller just sealed, saving its re-read.
+   * `docs` is a crawl (includeRetired) the caller took after its last document
+   * write — the checkpoint's — saving a second full crawl.
    */
-  async regenerateIndex(): Promise<void> {
+  async regenerateIndex(
+    opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint; docs?: ContextNode[] } = {},
+  ): Promise<void> {
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
-    const docs = await this.discoverDocuments({ includeRetired: true });
+    const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
     const config = await this.readConfig();
     // Only the LATEST checkpoint reaches context.yaml, so this must not load the
     // whole chain: regenerateIndex runs after every single write, and
     // context_history.yaml grows by one entry per published doc per checkpoint.
     // Parsing it here is what made writes time out on a mature vault while reads
     // — which never come through this path — stayed instant.
-    const latestCheckpoint = await this.readLatestCheckpoint();
+    const latestCheckpoint = opts.latestCheckpoint ?? (await this.readLatestCheckpoint());
     const published = docs.filter((d) => d.frontmatter.status === "published");
     const packs = await this.readPacks();
 
     const contextYaml = generateContextYaml(published, config, latestCheckpoint);
     await this.writeContextYaml(contextYaml);
 
+    const folderOf = (id: string) => {
+      const parts = id.split("/");
+      return parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+    };
     const folders = new Map<string, ContextNode[]>();
     for (const doc of docs) {
-      const parts = doc.id.split("/");
-      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+      const folder = folderOf(doc.id);
       if (!folders.has(folder)) folders.set(folder, []);
       folders.get(folder)!.push(doc);
     }
+    const scope = opts.changedIds ? new Set(opts.changedIds.map(folderOf)) : null;
 
     // Distinct folders write distinct INDEX.md files, so the writes are
     // independent — batch them (an imported vault can carry hundreds).
     await mapInBatches(
-      [...folders].filter(([folder]) => folder !== "."),
+      [...folders].filter(([folder]) => folder !== "." && (!scope || scope.has(folder))),
       async ([folder, folderDocs]) => {
         const title = folder
           .split("/")
@@ -918,7 +968,6 @@ export class NestStorage {
 
     for (const file of agentConfigs) {
       const filePath = join(this.root, file.path);
-      await mkdir(dirname(filePath), { recursive: true });
 
       let existing: string | null = null;
       try {
@@ -928,7 +977,10 @@ export class NestStorage {
       }
 
       const merged = mergeAgentConfig(existing, file.content);
-      await writeFile(filePath, merged, "utf-8");
+      // Usually unchanged between writes — skip the rewrite.
+      if (merged !== existing) {
+        await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
+      }
     }
   }
 
@@ -1094,8 +1146,7 @@ export class NestStorage {
         if (index.records.length === 0) continue;
         // A live document back at a path a forget retired,
         // or carrying an erased revision's body anywhere: restored content.
-        const bodyHash = forgettableBodyHash(doc.rawContent);
-        if (isPathForgotten(index, doc.id) || (bodyHash && index.bodyHashes.has(bodyHash))) {
+        if (isPathForgotten(index, doc.id) || carriesForgottenBody(index, doc.rawContent)) {
           errors.push({
             type: "forgotten_content_present",
             document: doc.id,
@@ -1133,9 +1184,34 @@ export class NestStorage {
    * forgotten.
    */
   async readTombstones(): Promise<TombstoneIndex> {
+    // Every publish consults the log, and the engine only ever appends to it
+    // (each append changes its size), so its parsed events are reused until a
+    // stat says the file changed — by this process or any other on the same
+    // mount. The inode catches a same-size replacement by rename (a restore,
+    // a sync tool, an editor); an in-place same-size rewrite within one mtime
+    // tick would still be missed. The stat is taken BEFORE the read, so a
+    // write racing the read leaves a stale key and only forces a re-read.
+    // A fresh index is built per call because callers fold records into it.
+    const info = await stat(this.chainEventLogPath()).catch(() => null);
+    const cached = this.chainEventCache;
+    if (
+      info &&
+      cached &&
+      cached.size === info.size &&
+      cached.mtimeMs === info.mtimeMs &&
+      cached.ino === info.ino
+    ) {
+      return buildTombstoneIndex(cached.events);
+    }
+    this.chainEventCache = undefined;
     let events: unknown[];
     try {
       events = await this.readChainEventLog();
+      // Bounded: a log past the cap is read per check, as before, rather than
+      // pinned in memory for the life of the process.
+      if (info && info.size <= CHAIN_EVENT_CACHE_MAX_BYTES) {
+        this.chainEventCache = { size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, events };
+      }
     } catch (err) {
       // Every publish consults this, so an unparseable log must not lock the
       // vault. The per-node records (forgotten stubs, tombstoned history
@@ -1359,13 +1435,14 @@ export class NestStorage {
     options: { exclusive?: boolean } = {},
   ): Promise<void> {
     const filePath = join(this.root, `${id}.md`);
-    await mkdir(dirname(filePath), { recursive: true });
     const onDisk = await this.sealText(id, "doc", content);
     try {
-      await writeFile(filePath, onDisk, {
-        encoding: "utf-8",
-        ...(options.exclusive ? { flag: "wx" } : {}),
-      });
+      await writeInDir(dirname(filePath), () =>
+        writeFile(filePath, onDisk, {
+          encoding: "utf-8",
+          ...(options.exclusive ? { flag: "wx" } : {}),
+        }),
+      );
     } catch (err) {
       if (options.exclusive && (err as NodeJS.ErrnoException).code === "EEXIST") {
         throw new ContextNestError(`Document "${id}" already exists`, "DOCUMENT_ALREADY_EXISTS");
@@ -1633,7 +1710,18 @@ export class NestStorage {
     try {
       const raw = await this.readText(filePath, "doc", id);
       const fm = parseDocument(filePath, raw, id).frontmatter;
-      if (fm.type === "pdf" && fm.pdf?.file === `${id}.pdf`) sidecar = fm.pdf.file;
+      if (fm.type === "pdf" && fm.pdf?.file) {
+        // Compared against the on-disk spelling: on a case-insensitive
+        // filesystem the caller may have reached `nodes/Report.md` as
+        // `nodes/report` (#117). The caller's spelling still counts, for a
+        // node written before #117 that recorded it — both name this node's
+        // own file. Never a case-folded compare: on a case-sensitive
+        // filesystem that could name another node's binary.
+        const onDisk = await this.resolveDocumentIdCasing(id);
+        if (fm.pdf.file === `${onDisk}.pdf` || fm.pdf.file === `${id}.pdf`) {
+          sidecar = fm.pdf.file;
+        }
+      }
     } catch {
       // Missing or unparseable: the unlink below reports the former, and an
       // unparseable file declares no sidecar.
@@ -1938,7 +2026,6 @@ export class NestStorage {
   ): Promise<void> {
     this.markHistoryTouched(docId);
     const path = this.historyPath(docId);
-    await mkdir(dirname(path), { recursive: true });
 
     // One list item, indented to sit under `versions:`. Indenting a whole YAML
     // document by a fixed amount keeps it valid, including multi-line scalars.
@@ -1953,7 +2040,7 @@ export class NestStorage {
     // one header is ever written — and it lands together with its entry, so the
     // file is never left as a header with no versions under it.
     try {
-      const created = await open(path, "wx");
+      const created = await writeInDir(dirname(path), () => open(path, "wx"));
       try {
         await created.write(header + block);
         await created.sync();
@@ -2033,18 +2120,17 @@ export class NestStorage {
     const docName = basename(docId);
     const docDir = dirname(docId);
     const dir = join(this.root, docDir, ".versions", docName);
-    await mkdir(dir, { recursive: true });
     const path = join(dir, fileName);
     content = await this.sealText(docId, fileName.endsWith(".diff") ? "diff" : "keyframe", content);
 
     if (overwrite) {
-      await this.writeFileDurable(path, content);
+      await writeInDir(dir, () => this.writeFileDurable(path, content));
       return;
     }
 
     let handle;
     try {
-      handle = await open(path, "wx");
+      handle = await writeInDir(dir, () => open(path, "wx"));
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") {
         throw new VersionArtifactExistsError(docId, version, fileName);
@@ -2580,8 +2666,8 @@ export class NestStorage {
    * previous checkpoint use {@link startCheckpointHistory}.
    */
   async appendCheckpoint(checkpoint: Checkpoint): Promise<void> {
+    // No mkdir: this only extends a chain file that exists (see above).
     const path = this.checkpointHistoryPath();
-    await mkdir(dirname(path), { recursive: true });
     const block = yaml
       .dump([checkpoint], { lineWidth: -1, noRefs: true })
       .split("\n")
@@ -2720,8 +2806,7 @@ export class NestStorage {
    */
   async writeIndexMd(folder: string, content: string): Promise<void> {
     const indexPath = join(this.root, folder, "INDEX.md");
-    await mkdir(dirname(indexPath), { recursive: true });
-    await writeFile(indexPath, content, "utf-8");
+    await writeInDir(dirname(indexPath), () => writeFile(indexPath, content, "utf-8"));
   }
 
   /**
