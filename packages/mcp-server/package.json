@@ -45,12 +45,12 @@
     "lint": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@promptowl/contextnest-engine": "workspace:^",
     "@types/node": "^22.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.11",
+    "vitest": "^5.0.3",
     "zod": "^3.24.0"
   },
   "files": [
