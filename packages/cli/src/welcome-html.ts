@@ -5,7 +5,7 @@
 
 import fs from "node:fs";
 import pathMod from "node:path";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import logoWhite from "./assets/logo-white.png";
 
 interface WelcomeNode {
@@ -386,6 +386,24 @@ export function openInBrowser(filePath: string): void {
     if (err && process.env.DEBUG) {
       console.error(`Could not open browser: ${err.message}`);
     }
+  });
+}
+
+/**
+ * Open an http(s) URL in the default browser. Arguments go to execFile, not a
+ * shell, so nothing in a server-supplied URL can be interpreted as a command.
+ */
+export function openUrlInBrowser(url: string): void {
+  if (process.env.CONTEXTNEST_NO_BROWSER) return;
+  if (!/^https?:\/\//i.test(url)) return;
+  const [cmd, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
+        : ["xdg-open", [url]];
+  execFile(cmd, args, (err) => {
+    if (err && process.env.DEBUG) console.error(`Could not open browser: ${err.message}`);
   });
 }
 
