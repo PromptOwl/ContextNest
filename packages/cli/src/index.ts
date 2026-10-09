@@ -120,12 +120,16 @@ import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
 import {
   emptyServerMap,
+  isNestScope,
+  keysUnderServer,
   loadServerMap,
+  nestScopeUrl,
   normalizeServerUrl,
   removeServer,
   saveServerMap,
   savedTokenFor,
   upsertServer,
+  type ServerCredential,
 } from "./server-credentials.js";
 import { deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
@@ -3293,14 +3297,40 @@ async function readStdin(): Promise<string> {
 }
 
 program
-  .command("login <server>")
+  .command("login [server]")
   .description("Sign in to a ContextNest server once; push and remote --vault aliases reuse the saved key")
   .option("--key-stdin", "Read an existing API key (cnst_…) from stdin instead of the browser flow")
+  .option("--nest <id>", "Save the key for this one nest only (with --key-stdin); it wins over the server-wide key")
   .option("--label <text>", "Label for this credential (default: your account email)")
-  .action(async (server: string, opts: { keyStdin?: boolean; label?: string }) => {
+  .option("--list", "Show the servers and nests you're logged into (never prints keys)")
+  .action(async (server: string | undefined, opts: { keyStdin?: boolean; nest?: string; label?: string; list?: boolean }) => {
     try {
+      if (opts.list) {
+        const map = await loadServerMap();
+        const keys = (server ? keysUnderServer(map, server) : Object.keys(map.servers)).sort();
+        if (keys.length === 0) {
+          console.log(chalk.yellow(server ? `No saved key for ${normalizeServerUrl(server)}.` : "Not logged in to any server."));
+          return;
+        }
+        for (const key of keys) {
+          const cred = map.servers[key];
+          const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
+          console.log(`${key}${scope}`);
+          const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
+          if (meta) console.log(chalk.dim(`  ${meta}`));
+        }
+        return;
+      }
+      if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
       assertSafeEndpoint(server, "<server>");
-      const url = normalizeServerUrl(server);
+      if (opts.nest && !opts.keyStdin) {
+        throw new Error(
+          "Browser login signs in to the whole server. To save a key for one nest, paste it:\n" +
+            `  ctx login ${server} --nest ${opts.nest} --key-stdin`,
+        );
+      }
+      const serverUrl = normalizeServerUrl(server);
+      const url = opts.nest ? nestScopeUrl(serverUrl, opts.nest) : serverUrl;
       let token: string;
       let label = opts.label;
       if (opts.keyStdin) {
@@ -3326,10 +3356,10 @@ program
       const where = await saveServerMap(map);
       console.log(
         chalk.green(`\nLogged in to ${url}${label ? ` (${label})` : ""}.`) +
-          (map.default === url ? chalk.dim("  (default)") : ""),
+          (opts.nest ? chalk.dim("  (this nest only)") : map.default === url ? chalk.dim("  (default)") : ""),
       );
       console.log(chalk.dim(`  Key saved to ${where}.`));
-      console.log(chalk.dim(`  Next: ctx vault add <alias> --url ${url}/mcp   (no --bearer-env needed)`));
+      console.log(chalk.dim(`  Next: ctx vault add <alias> --url ${url}${opts.nest ? "" : "/nests/<id>"}/mcp   (no --bearer-env needed)`));
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
@@ -3338,33 +3368,50 @@ program
 
 program
   .command("logout [server]")
-  .description("Forget the key saved for a server by `ctx login` (it stays valid on the server — revoke it in the web UI)")
+  .description(
+    "Forget keys saved by `ctx login` for a server, including its nest-scoped keys (they stay valid on the server — revoke them in the web UI)",
+  )
+  .option("--nest <id>", "Forget only the key saved for this nest")
   .option("--all", "Forget every saved server key")
-  .action(async (server: string | undefined, opts: { all?: boolean }) => {
+  .action(async (server: string | undefined, opts: { nest?: string; all?: boolean }) => {
     try {
-      if (!opts.all && !server) throw new Error("Name the <server> to log out of, or pass --all.");
-      const map = await loadServerMap();
-      const forgotten = opts.all ? Object.entries(map.servers) : [];
-      if (!opts.all) {
-        const url = normalizeServerUrl(server!);
-        if (map.servers[url]) forgotten.push([url, map.servers[url]]);
-      }
-      if (forgotten.length === 0) {
-        console.log(chalk.yellow(opts.all ? "No saved server keys." : `No saved key for ${normalizeServerUrl(server!)}.`));
+      if (opts.all) {
+        // Don't parse first: --all is the way out of a corrupt or newer-format map.
+        let forgotten: [string, ServerCredential][] = [];
+        try {
+          forgotten = Object.entries((await loadServerMap()).servers);
+        } catch {
+          /* unreadable — wipe it anyway */
+        }
+        await saveServerMap(emptyServerMap());
+        if (forgotten.length === 0) {
+          console.log(chalk.yellow("No saved server keys."));
+          return;
+        }
+        for (const [url, cred] of forgotten) printLoggedOut(url, cred);
         return;
       }
-      await saveServerMap(opts.all ? emptyServerMap() : removeServer(map, forgotten[0][0]));
-      for (const [url, cred] of forgotten) {
-        console.log(chalk.green(`Logged out of ${url}.`));
-        console.log(
-          chalk.dim(`  The key still works until you revoke it in ${url}'s web UI${cred.label ? ` — ${cred.label}` : ""}.`),
-        );
+      if (!server) throw new Error("Name the <server> to log out of, or pass --all.");
+      let map = await loadServerMap();
+      const targets = opts.nest ? [nestScopeUrl(server, opts.nest)].filter((k) => map.servers[k]) : keysUnderServer(map, server);
+      if (targets.length === 0) {
+        console.log(chalk.yellow(`No saved key for ${opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server)}.`));
+        return;
       }
+      const forgotten = targets.map((k) => [k, map.servers[k]] as const);
+      for (const k of targets) map = removeServer(map, k);
+      await saveServerMap(map);
+      for (const [url, cred] of forgotten) printLoggedOut(url, cred);
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
     }
   });
+
+function printLoggedOut(url: string, cred: ServerCredential): void {
+  console.log(chalk.green(`Logged out of ${url}.`));
+  console.log(chalk.dim(`  The key still works until you revoke it in the server's web UI${cred.label ? ` — ${cred.label}` : ""}.`));
+}
 
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
@@ -3425,7 +3472,7 @@ program
     // and lands in shell history. Accept it, but let the env var take over.
     let apiKey: string | null;
     try {
-      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(opts.server));
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);

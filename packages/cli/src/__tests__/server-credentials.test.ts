@@ -6,7 +6,10 @@ import type { KeyringBackend } from "../keyring.js";
 import {
   SERVERS_ACCOUNT,
   emptyServerMap,
+  isNestScope,
+  keysUnderServer,
   loadServerMap,
+  nestScopeUrl,
   normalizeServerUrl,
   parseServerMap,
   removeServer,
@@ -62,14 +65,50 @@ describe("server map (pure)", () => {
     expect(tokenForEndpoint(m, "garbage")).toBeNull();
   });
 
-  it("parses defensively", () => {
-    expect(parseServerMap("{nope")).toEqual(emptyServerMap());
+  it("parses defensively, but refuses corrupt or newer-format data instead of emptying it", () => {
     expect(parseServerMap(null)).toEqual(emptyServerMap());
+    expect(() => parseServerMap("{nope")).toThrow(/unreadable/);
+    expect(() => parseServerMap("[]")).toThrow(/unreadable/);
+    expect(() => parseServerMap(JSON.stringify({ version: 2, servers: {} }))).toThrow(/newer ctx/);
     const m = parseServerMap(
       JSON.stringify({ version: 1, default: "x", servers: { [A]: { token: "k", label: 3 }, [B]: { nope: 1 } } }),
     );
     expect(m.servers).toEqual({ [A]: { token: "k" } });
     expect(m.default).toBeUndefined();
+  });
+
+  // Qaish's case: the public hosted server, a self-hosted one, and a
+  // nest-scoped key on the hosted server, all at once.
+  const HOSTED = "https://nest.promptowl.ai";
+  const SELF = "https://nest.corp.internal/contextnest";
+
+  it("holds hosted, self-hosted and nest-scoped keys side by side", () => {
+    let m = upsertServer(emptyServerMap(), HOSTED, { token: "hosted" });
+    m = upsertServer(m, SELF, { token: "self" });
+    m = upsertServer(m, nestScopeUrl(HOSTED, "n1"), { token: "n1-only" });
+    expect(tokenForEndpoint(m, `${HOSTED}/nests/n1/mcp`)).toBe("n1-only");
+    expect(tokenForEndpoint(m, `${HOSTED}/nests/n10/mcp`)).toBe("hosted");
+    expect(tokenForEndpoint(m, `${HOSTED}/nests/n2/mcp`)).toBe("hosted");
+    expect(tokenForEndpoint(m, `${SELF}/nests/n1/mcp`)).toBe("self");
+    expect(tokenForEndpoint(m, "https://nest.corp.internal/mcp")).toBeNull();
+    expect(keysUnderServer(m, HOSTED).sort()).toEqual([HOSTED, `${HOSTED}/nests/n1`]);
+    expect(keysUnderServer(m, SELF)).toEqual([SELF]);
+  });
+
+  it("never makes a nest-scoped key the default server", () => {
+    let m = upsertServer(emptyServerMap(), nestScopeUrl(HOSTED, "n1"), { token: "n1" });
+    expect(m.default).toBeUndefined();
+    m = upsertServer(m, SELF, { token: "self" });
+    expect(m.default).toBe(SELF);
+    m = upsertServer(m, HOSTED, { token: "hosted" });
+    expect(removeServer(m, SELF).default).toBe(HOSTED);
+    expect(isNestScope(`${HOSTED}/nests/n1`)).toBe(true);
+    expect(isNestScope(HOSTED)).toBe(false);
+  });
+
+  it("validates nest ids", () => {
+    expect(nestScopeUrl(`${HOSTED}/`, " abc ")).toBe(`${HOSTED}/nests/abc`);
+    for (const bad of ["", "a/b", "a?b", "a b", "a\\b"]) expect(() => nestScopeUrl(HOSTED, bad)).toThrow(/nest id/);
   });
 });
 
@@ -112,5 +151,14 @@ describe("server map (secure store)", () => {
     for (const bad of [{}, { CONTEXTNEST_CREDENTIALS_KEY: "wrong" }]) {
       await expect(savedTokenFor(A, { home, env: bad, keyring: null })).rejects.toThrow(/couldn't be read/);
     }
+  });
+
+  it("a corrupt stored map fails loudly and is never overwritten by a lookup", async () => {
+    const keyring = memoryKeyring();
+    keyring.items.set(SERVERS_ACCOUNT, "{corrupt");
+    const opts = { home, env: {}, keyring };
+    await expect(loadServerMap(opts)).rejects.toThrow(/unreadable.*logout --all/);
+    await expect(savedTokenFor(A, opts)).rejects.toThrow(/^Saved `ctx login` keys are unreadable/);
+    expect(keyring.items.get(SERVERS_ACCOUNT)).toBe("{corrupt");
   });
 });
