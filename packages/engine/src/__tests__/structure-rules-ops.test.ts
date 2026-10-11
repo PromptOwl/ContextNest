@@ -3113,7 +3113,8 @@ describe("architecture round 21: headers bounded, reads sized everywhere, confor
     for (const f of files) f.content = await readFile(join(dir, f.path), "utf-8");
     // Room enough to rebuild the disk's head, so the set's own rebuild reads too.
     await api.run("context_import", { files, overwrite: true, publish: false }, { ...ctx, limits: { importReplayChars: 200_000 } });
-    expect(asked.length).toBeGreaterThan(1);
+    // The set's own rebuild reads the keyframe it lacks from disk, within its room.
+    expect(asked.length).toBeGreaterThan(0);
     for (const m of asked) expect(m).toBeLessThanOrEqual(5 * 200_000);
   });
 
@@ -3267,5 +3268,132 @@ describe("architecture round 22 review: the disk's head only when a verdict need
     const imp = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
     expect(imp.failed).toEqual([]);
     expect(reads).toBe(0);
+  });
+});
+
+describe("QA round 22: no shared read slots, one rebuild per restored history, held edits by what they propose", () => {
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("reads still pending for four documents do not hold up a fifth's", async () => {
+    const a = "---\ntitle: x\n---\nA\n";
+    const one = { versions: [entry(1, a, true)] } as never;
+    const releases: Array<(v: string | null) => void> = [];
+    const stuck = [1, 2, 3, 4].map((i) => sealedHead(`stuck${i}`, one, () => new Promise<string | null>((r) => releases.push(r)), () => null));
+    try {
+      const fifth = sealedHead("free", one, () => a, () => null);
+      const late = new Promise((r) => setTimeout(() => r("waiting"), 2000));
+      expect(await Promise.race([fifth, late])).toBe(a);
+    } finally {
+      for (const r of releases) r(null);
+      await Promise.all(stuck);
+    }
+  });
+
+  it("restoring a document's own history over itself rebuilds that history once, not twice", async () => {
+    const SUMMARY: StructureConfig = {
+      structure: { enforce: true },
+      folders: { notes: { types: ["document"], template: "n" } },
+      templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+    };
+    const id = "nodes/notes/r";
+    await api.run("context_create", { id, title: "r", content: `## Summary\n${"a".repeat(40_000)}\n` }, ctx);
+    for (const c of "bcde") await api.run("context_update", { id, content: `## Summary\n${c.repeat(40_000)}\n` }, ctx);
+    await writeConfig(SUMMARY);
+    // What one rebuild of this history costs.
+    const { sealedReaders } = await import("../structure-store.js");
+    const probe = { left: 1e12 };
+    const r = sealedReaders(storage, id);
+    expect(await sealedHead(id, (await storage.readHistory(id))!, r.keyframe, r.diff, probe)).not.toBeNull();
+    const once = 1e12 - probe.left;
+    const V = "nodes/notes/.versions/r";
+    const names = (await readdir(join(dir, V))).filter((n) => /^(history\.yaml|v\d+\.(md|diff))$/.test(n));
+    const files = await Promise.all(names.map(async (n) => ({ path: `${V}/${n}`, content: await readFile(join(dir, V, n), "utf-8") })));
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files, overwrite: true, publish: false },
+      { ...ctx, limits: { importReplayChars: Math.ceil(once * 1.5) } },
+    );
+    expect(imp.failed).toEqual([]);
+  });
+
+  it("a held edit on repetitive text that would land on another line after a frontmatter shift is stale, not misapplied", async () => {
+    const { listReviewHolds } = await import("../index.js");
+    const id = "nodes/notes/rep";
+    const lines = Array.from({ length: 40 }, () => "x");
+    await api.run("context_create", { id, title: "rep", content: `${lines.join("\n")}\n` }, ctx);
+    const edited = [...lines];
+    edited[21] = "HELD";
+    await api.run("context_update", { id, content: `${edited.join("\n")}\n`, review: true }, ctx);
+    await api.run("context_update", { id, description: "One more frontmatter line." }, ctx);
+    expect((await listReviewHolds(storage, id)).map((h) => h.stale)).toEqual([true]);
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/stale/i);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).not.toContain("HELD");
+  });
+
+  it("a suggestion on repetitive text that would land on another line is refused, not misapplied", async () => {
+    const ALLOW: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+    const id = "nodes/notes/rep2";
+    const lines = Array.from({ length: 40 }, () => "x");
+    await api.run("context_create", { id, title: "rep2", content: `${lines.join("\n")}\n` }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    const proposed = raw.split("\n");
+    proposed[proposed.length - 20] = "SUGGESTED";
+    const staged = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: raw,
+      proposedRawContent: proposed.join("\n"),
+      source: "out-of-band-edit",
+      actor: "user",
+      docTier: "standard",
+    });
+    await api.run("context_update", { id, description: "One more frontmatter line." }, ctx);
+    await expect(
+      approveSuggestion({ storage, rbac: ALLOW, documentId: id, suggestionId: staged.meta.suggestion_id, actor: "owner", zone: "default" }),
+    ).rejects.toThrow(/no longer applies/);
+  });
+
+  it.skipIf(process.platform === "win32")("a version file that is not a regular file is refused before it is read", async () => {
+    await api.run("context_create", { id: "nodes/notes/dev", title: "dev", content: "x\n" }, ctx);
+    const V = join(dir, "nodes/notes/.versions/dev");
+    await rm(join(V, "v1.md"), { force: true });
+    await symlink("/dev/zero", join(V, "v1.md"));
+    const started = performance.now();
+    await expect(storage.readKeyframe("nodes/notes/dev", 1, { maxBytes: 1024 })).rejects.toMatchObject({ code: "CORRUPT_HISTORY" });
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("any text, and an edit of it, round-trips through a patch applied only where it says", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    // Seeded, so a failure reproduces: line endings LF, CRLF and lone CR, mixed,
+    // no final newline, empty text, repeated lines.
+    let seed = 0x2f6e2b1;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const ends = ["\n", "\r\n", "\r", ""];
+    const words = ["a", "b", "x", "x", "x", "line", "", "# H", "  "];
+    const text = () => {
+      const n = rand(12);
+      let s = "";
+      for (let i = 0; i < n; i++) s += words[rand(words.length)] + ends[rand(ends.length - 1)];
+      return rand(4) === 0 ? s.replace(/[\r\n]$/, "") : s;
+    };
+    for (let i = 0; i < 3000; i++) {
+      const a = text();
+      const lines = a.split("\n");
+      for (let k = rand(4); k >= 0; k--) lines.splice(rand(lines.length + 1), rand(2), words[rand(words.length)]);
+      const b = rand(5) === 0 ? text() : lines.join(ends[rand(2)]);
+      const got = applyPatchBounded(a, createPatch("x", a, b)).result;
+      expect(got, JSON.stringify({ i, a, b })).toBe(b);
+    }
   });
 });

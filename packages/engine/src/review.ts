@@ -31,13 +31,12 @@
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applyPatchBounded } from "./reconstruct.js";
 import { parseConfig } from "./config.js";
 import { ConfigError, ContextNestError, IntegrityError } from "./errors.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent, isPublished, isRejected, serializeDocument } from "./parser.js";
 import { publishDocument } from "./publish.js";
-import { listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
+import { applyStagedEdit, listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
 import { assertStructureUpdate } from "./structure-store.js";
@@ -162,8 +161,7 @@ async function holdsWithHead(
   const applies = async (m: SuggestionMeta) => {
     if (head === null) return false;
     const sug = await readSuggestion(storage, id, m.suggestion_id);
-    const out = sug ? applyPatchBounded(head, sug.patch).result : false;
-    return typeof out === "string" && out !== "";
+    return sug !== null && applyStagedEdit(head, sug) !== null;
   };
   const holds: ReviewHold[] = [];
   for (const m of metas) holds.push({ ...m, stale: m.target_hash !== headHash || !(await applies(m)) });
@@ -190,8 +188,8 @@ export async function currentReviewProposal(
   const newest = holds[holds.length - 1];
   const sug = await readSuggestion(storage, id, newest.suggestion_id);
   if (!sug) return null;
-  const proposedRaw = applyPatchBounded(approvedRaw, sug.patch).result;
-  if (typeof proposedRaw !== "string" || proposedRaw === "") return null;
+  const proposedRaw = applyStagedEdit(approvedRaw, sug);
+  if (proposedRaw === null) return null;
   return { suggestionId: newest.suggestion_id, approvedRaw, proposedRaw };
 }
 
@@ -317,8 +315,8 @@ export async function approveReview(
           "content_hash_mismatch",
         );
       }
-      const proposedRaw = !chosen.stale && approvedRaw !== null ? applyPatchBounded(approvedRaw, sug.patch).result : false;
-      if (typeof proposedRaw !== "string" || proposedRaw === "") {
+      const proposedRaw = !chosen.stale && approvedRaw !== null ? applyStagedEdit(approvedRaw, sug) : null;
+      if (proposedRaw === null) {
         throw new IntegrityError(
           `The held edit ${chosen.suggestion_id} for ${id} is stale: the published node changed after it was staged, so the edit no longer applies. Reject it and make the edit again.`,
           "content_hash_mismatch",

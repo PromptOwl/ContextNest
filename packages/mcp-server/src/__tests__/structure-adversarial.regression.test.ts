@@ -80,7 +80,7 @@ describe("[regression] MCP server — structure adversarial probes", () => {
   // the server, so the bound is on time — generous: linear handling of the
   // request takes milliseconds. Repro: list_documents { path: "nodes/a" +
   // "/".repeat(120_000) + "x" }.
-  it.fails("r8 rx: a list_documents path of 120k slashes is refused for its length without a quadratic trim", async () => {
+  it("r8 rx: a list_documents path of 120k slashes is refused for its length without a quadratic trim", async () => {
     const started = performance.now();
     const { text, isError } = await callText(client, "list_documents", { path: `nodes/a${"/".repeat(120_000)}x` });
     const elapsed = performance.now() - started;

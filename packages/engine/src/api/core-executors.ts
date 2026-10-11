@@ -96,6 +96,7 @@ import {
   resolveFolder,
   type CompiledStructure,
   type StructureDoc,
+  comparableSegment,
 } from "../structure.js";
 import {
   assertStructureDelete,
@@ -1208,7 +1209,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incomingEvents: unknown[] = [];
   if (tombstones) {
     incoming = incoming.filter((f) => {
-      const p = String(f.path ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
+      // However it is spelled (`.Versions/`, `./`, `//`, a trailing dot): the
+      // planner folds it to the vault's own log, so it is judged as the log.
+      const p = String(f.path ?? "")
+        .split(/[\\/]+/)
+        .filter((seg) => seg !== "" && seg !== ".")
+        .map(comparableSegment)
+        .join("/");
       if (p !== ".versions/chain_events.yaml") return true;
       try {
         const parsed = yaml.load(f.content ?? "");

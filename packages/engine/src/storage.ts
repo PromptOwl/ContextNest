@@ -547,7 +547,13 @@ export interface ReadLimit {
  */
 async function assertWithinLimit(path: string, opts: ReadLimit, docId: string): Promise<void> {
   if (opts.maxBytes === undefined) return;
-  const { size } = await stat(path);
+  const st = await stat(path);
+  // A FIFO or a device reports no size worth trusting — and reading one could
+  // block or never end. Only a regular file is read under a limit.
+  if (!st.isFile()) {
+    throw new CorruptHistoryError(docId, `${basename(path)} is not a regular file`, "not-a-file");
+  }
+  const size = st.size;
   if (size > opts.maxBytes) {
     throw new CorruptHistoryError(docId, `${basename(path)} is ${size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
   }

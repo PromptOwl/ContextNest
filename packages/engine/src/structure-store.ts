@@ -127,9 +127,10 @@ export async function sealedHead(
   if (segment.some((e) => e.tombstone)) return null;
   try {
     if (budget?.spent) return null;
-    // Read (a few histories at a time, outside the replay queue), then
-    // verify and replay exactly what was read — one history at a time.
-    const contents = await withReadSlot(() => readSegment(segment, readKeyframe, readDiff, budget));
+    // Read (outside the replay queue — no shared slot a hung read could keep:
+    // the runtime's I/O threads are the only limit), then verify and replay
+    // exactly what was read, one history at a time.
+    const contents = await readSegment(segment, readKeyframe, readDiff, budget);
     if (contents === null) return null;
     return await oneAtATime(() => verifyAndReplay(segment, contents, budget));
   } catch {
@@ -181,27 +182,6 @@ async function readSegment(
 
 function isTooLarge(err: unknown): boolean {
   return err instanceof CorruptHistoryError && err.ioError === "too-large";
-}
-
-let readsInFlight = 0;
-const waitingForSlot: (() => void)[] = [];
-
-/**
- * At most READ_SLOTS histories being read at once, process-wide, so one call
- * judging many histories does not open them all at once. (Reads share the
- * runtime's I/O threads with every other vault: a hung mount still slows
- * them all, slots or not.)
- */
-async function withReadSlot<T>(task: () => Promise<T>): Promise<T> {
-  if (readsInFlight < READ_SLOTS) readsInFlight++;
-  else await new Promise<void>((resolve) => waitingForSlot.push(resolve));
-  try {
-    return await task();
-  } finally {
-    const next = waitingForSlot.shift();
-    if (next) next();
-    else readsInFlight--;
-  }
 }
 
 /**
@@ -298,9 +278,6 @@ const MAX_REPLAY_WORK = 128 * 2 ** 20;
  * Past it the history is not trusted (judged in full) — and never held whole.
  */
 const MAX_REPLAY_READ = 64 * 2 ** 20;
-
-/** Histories being read at once, process-wide. */
-const READ_SLOTS = 4;
 
 /**
  * Bytes a version file may hold per character of room: UTF-8 spends up to 3

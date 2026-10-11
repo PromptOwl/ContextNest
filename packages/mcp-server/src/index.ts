@@ -525,7 +525,12 @@ tool(
       // Segment boundary, not a bare startsWith: "nodes/his" must not match
       // "nodes/history". A trailing slash or .md from a caller pasting a file
       // path is tolerated rather than silently matching nothing.
-      const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
+      // Trailing slashes trimmed with a loop: an unanchored `\/+$` retries from
+      // every slash of a run, quadratic before any length check.
+      const bare = path.replace(/\.md$/, "");
+      let end = bare.length;
+      while (end > 0 && bare[end - 1] === "/") end--;
+      const prefix = normalizeDocumentId(bare.slice(0, end));
       docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
     }
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);

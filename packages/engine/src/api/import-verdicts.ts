@@ -497,7 +497,10 @@ async function historySetVerdict(
   // ones that history pinned — any other fails its hash — so this is the one
   // head it can ever rebuild. Refused only for what it changes: a head the
   // disk already holds grants nothing new.
-  if (text !== undefined && onDisk) {
+  // The same history as the one on disk: the head kept and the head brought
+  // are one head, rebuilt once below (a file of this call that does not match
+  // its pinned hash fails that rebuild, and the set with it).
+  if (text !== undefined && onDisk && !isDeepStrictEqual(history!.versions, onDisk.versions)) {
     const pinnedHash = new Map(onDisk.versions.map((e) => [e.version, e.content_hash]));
     const counts = (name: string, n: number) => {
       const m = set.get(name);

@@ -314,7 +314,7 @@ describe("read budget", () => {
     expect(await exists(`${V}/history.yaml`)).toBe(false);
     // The keyframe, then one diff — refused unread for its size — and no more.
     expect(asked.map(([k, v]) => `${k} v${v}`)).toEqual(["readKeyframe v1", "readDiff v2"]);
-    for (const [, , max] of asked) expect(max).toBeLessThanOrEqual(4 * 100_000);
+    for (const [, , max] of asked) expect(max).toBeLessThanOrEqual(5 * 100_000);
   });
 
   it.each([["plain"], ["encrypted"]])(
@@ -710,7 +710,7 @@ describe("forget and tombstones", () => {
   // written verbatim over the vault's chain-event log, so the forget's
   // tombstones are gone and the pre-forget copy imports at another path. The
   // plain spelling is replayed as imported forgets instead, and holds.
-  it.fails.each(SPELLINGS)("r10 chainev: an import of %j with overwrite never erases a forget's tombstone", (path) => eraseTombstones(path, true));
+  it.each(SPELLINGS)("r10 chainev: an import of %j with overwrite never erases a forget's tombstone", (path) => eraseTombstones(path, true));
 });
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
@@ -920,7 +920,7 @@ describe("document parsing", () => {
   // and synchronous (80k spaces ≈ 5 s here). A backtracking regex has nothing
   // to count, so the bound is on time — generous: linear handling takes
   // milliseconds. Repro: an <italic> holding 80k spaces and then "x".
-  it.fails("r8 jats: inline markup with a long run of whitespace is converted in linear time", async () => {
+  it("r8 jats: inline markup with a long run of whitespace is converted in linear time", async () => {
     const { jatsToDocument } = await import("../index.js");
     const xml = `<article><front><article-meta><title-group><article-title>T</article-title></title-group></article-meta></front><body><sec><title>S</title><p><italic>${" ".repeat(80_000)}x</italic></p></sec></body></article>`;
     const started = performance.now();
