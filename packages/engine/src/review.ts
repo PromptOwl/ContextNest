@@ -310,18 +310,17 @@ export async function approveReview(
     const chosen = holds.filter((h) => !h.stale).at(-1) ?? holds.at(-1);
 
     if (chosen) {
-      if (chosen.stale) {
+      const sug = await readSuggestion(storage, id, chosen.suggestion_id);
+      if (!sug) {
         throw new IntegrityError(
-          `The held edit ${chosen.suggestion_id} for ${id} is stale: the published node changed after it was staged. Reject it and make the edit again.`,
+          `The held edit ${chosen.suggestion_id} for ${id} could not be read. Reject it and make the edit again.`,
           "content_hash_mismatch",
         );
       }
-      const sug = await readSuggestion(storage, id, chosen.suggestion_id);
-      const proposedRaw =
-        approvedRaw !== null && sug ? applyPatchBounded(approvedRaw, sug.patch).result : false;
+      const proposedRaw = !chosen.stale && approvedRaw !== null ? applyPatchBounded(approvedRaw, sug.patch).result : false;
       if (typeof proposedRaw !== "string" || proposedRaw === "") {
         throw new IntegrityError(
-          `The held edit ${chosen.suggestion_id} for ${id} is stale: the document changed since it was staged, so it no longer applies. Reject it and make the edit again.`,
+          `The held edit ${chosen.suggestion_id} for ${id} is stale: the published node changed after it was staged, so the edit no longer applies. Reject it and make the edit again.`,
           "content_hash_mismatch",
         );
       }

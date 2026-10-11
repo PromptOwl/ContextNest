@@ -2921,13 +2921,19 @@ describe("architecture round 19: patch search priced per comparison, reads outsi
     expect(applyPatchBounded(kf, padded).result).toBe(false);
   });
 
-  it("a read that never settles for one document does not hold up another's", async () => {
+  it("a read still pending for one document does not hold up another's while read slots remain", async () => {
     const a = "---\ntitle: x\n---\nA\n";
     const one = { versions: [entry(1, a, true)] } as never;
-    void sealedHead("stuck", one, () => new Promise<string | null>(() => {}), () => null);
-    const start = performance.now();
-    expect(await sealedHead("free", one, () => a, () => null)).toBe(a);
-    expect(performance.now() - start).toBeLessThan(1000);
+    let release!: (v: string | null) => void;
+    const stuck = sealedHead("stuck", one, () => new Promise<string | null>((r) => (release = r)), () => null);
+    try {
+      const start = performance.now();
+      expect(await sealedHead("free", one, () => a, () => null)).toBe(a);
+      expect(performance.now() - start).toBeLessThan(1000);
+    } finally {
+      release(null);
+      await stuck;
+    }
   });
 
   it("a version artifact over the size a reader allows is refused before it is read", async () => {
@@ -3083,6 +3089,12 @@ describe("architecture round 21: headers bounded, reads sized everywhere, confor
     expect(applyPatchBounded(A, createPatch("x", A, "z\na\nb\n")).result).toBe("z\na\nb\n");
     expect(applyPatchBounded(A, createPatch("x", A, "a\nb\nz\n")).result).toBe("a\nb\nz\n");
     expect(applyPatchBounded("", createPatch("x", "", "first\n")).result).toBe("first\n");
+    // CRLF, several hunks, and a text without a final newline still apply where they say.
+    const C = "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\n";
+    const D = C.replace("two", "2").replace("nine", "9");
+    expect(applyPatchBounded(C, createPatch("x", C, D)).result).toBe(D);
+    expect(applyPatchBounded("a\nb", createPatch("x", "a\nb", "a\nb\n")).result).toBe("a\nb\n");
+    expect(applyPatchBounded("a\nb\n", createPatch("x", "a\nb\n", "a\nc")).result).toBe("a\nc");
   });
 
   it("an import's history verdicts read the disk only within the room left", async () => {
@@ -3109,7 +3121,7 @@ describe("architecture round 21: headers bounded, reads sized everywhere, confor
     await api.run("context_create", { id: "nodes/notes/ok", title: "ok", content: "## Summary\nfine\n" }, ctx);
     await api.run("context_update", { id: "nodes/notes/ok", content: "## Summary\nstill fine\n" }, ctx);
     await writeConfig(SUMMARY);
-    const r = await publishDocuments(storage, ["nodes/notes/ok"], { editedBy: "x", replayBudget: { left: 0, spent: true } });
+    const r = await publishDocuments(storage, ["nodes/notes/ok"], { editedBy: "x", replayBudget: { left: 10 } });
     expect(r.failed).toEqual([]);
   });
 
@@ -3145,7 +3157,7 @@ describe("architecture round 21: headers bounded, reads sized everywhere, confor
     await api.run("context_update", { id, tags: ["#one", "#two", "#three"] }, ctx);
     await expect(
       approveSuggestion({ storage, rbac: ALLOW, documentId: id, suggestionId: staged.meta.suggestion_id, actor: "owner", zone: "default" }),
-    ).rejects.toThrow(/stale/i);
+    ).rejects.toThrow(/no longer applies/);
   });
 });
 
@@ -3230,5 +3242,30 @@ describe("QA round 21: held edits stale alike everywhere, room for any script, o
     } finally {
       await rm(twin, { recursive: true, force: true });
     }
+  });
+});
+
+describe("architecture round 22 review: the disk's head only when a verdict needs it", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("restoring a conforming document's whole history reads none of the disk's artifacts", async () => {
+    await api.run("context_create", { id: "nodes/notes/c", title: "c", content: "## Summary\none\n" }, ctx);
+    await api.run("context_update", { id: "nodes/notes/c", content: "## Summary\ntwo\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/c";
+    const names = (await readdir(join(dir, V))).filter((n) => /^(history\.yaml|v\d+\.(md|diff))$/.test(n));
+    const files = await Promise.all(names.map(async (n) => ({ path: `${V}/${n}`, content: await readFile(join(dir, V, n), "utf-8") })));
+    let reads = 0;
+    const kf = storage.readKeyframe.bind(storage);
+    const df = storage.readDiff.bind(storage);
+    storage.readKeyframe = (...a: Parameters<typeof kf>) => (reads++, kf(...a));
+    storage.readDiff = (...a: Parameters<typeof df>) => (reads++, df(...a));
+    const imp = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+    expect(imp.failed).toEqual([]);
+    expect(reads).toBe(0);
   });
 });

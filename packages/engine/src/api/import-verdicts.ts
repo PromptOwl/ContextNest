@@ -479,14 +479,17 @@ async function historySetVerdict(
   const diff: ArtifactReader = (n, max) => set.get(`v${n}.diff`) ?? disk.diff(n, max);
   // The head the disk holds now, if it verifies: grandfathering already trusts
   // it, so a head this call brings is judged as an update over it — only for
-  // what it newly breaks, as any other write to this document is.
-  const here = onDisk
-    ? await sealedHeadView(owner, onDisk, disk.keyframe, disk.diff, budget)
-    : null;
+  // what it newly breaks, as any other write to this document is. Rebuilt
+  // only when a verdict needs it: a head that passes the full check needs no
+  // baseline, so a conforming restore never replays the disk's history.
+  let hereView: ReturnType<typeof sealedHeadView> | undefined;
+  const here = () => (hereView ??= onDisk ? sealedHeadView(owner, onDisk, disk.keyframe, disk.diff, budget) : Promise.resolve(null));
   // A head that does not parse is no baseline (as at publish): judged in full.
-  const judge = (head: StructureDoc) => {
+  const judge = async (head: StructureDoc) => {
     const full = checkDocument(rules, head);
-    return full.length > 0 && here?.node ? checkUpdate(rules, here.doc, head) : full;
+    if (full.length === 0) return full;
+    const base = await here();
+    return base?.node ? checkUpdate(rules, base.doc, head) : full;
   };
   // The history.yaml this call brings is written last and may not land (a file
   // of its set fails): the history already here, over these files, is a head
@@ -501,7 +504,8 @@ async function historySetVerdict(
       return m !== undefined && computeContentHash(m) === pinnedHash.get(n);
     };
     const pinned = (name: string, n: number, read: () => string | null | Promise<string | null>) => (counts(name, n) ? set.get(name)! : read());
-    // With no file of this call pinned there, the kept head is the head here.
+    // With no file of this call pinned there, the kept head is the head here:
+    // nothing new to judge.
     const anyPinned = onDisk.versions.some((e) => counts(`v${e.version}.md`, e.version) || counts(`v${e.version}.diff`, e.version));
     const kept = anyPinned
       ? await sealedHeadView(
@@ -511,9 +515,9 @@ async function historySetVerdict(
           (n, max) => pinned(`v${n}.diff`, n, () => disk.diff(n, max)),
           budget,
         )
-      : here;
-    if (kept && kept.raw !== here?.raw) {
-      const violations = judge(kept.doc);
+      : null;
+    if (kept && checkDocument(rules, kept.doc).length > 0 && kept.raw !== (await here())?.raw) {
+      const violations = await judge(kept.doc);
       if (violations.length > 0) {
         return refuse(
           `${owner}'s history, kept with these files, ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`,
@@ -528,10 +532,9 @@ async function historySetVerdict(
   // The same history as the one here, with no version file of this call in it,
   // rebuilds to the same head; a file this call brings is always replayed.
   const brings = [...set.keys()].some((n) => /^v\d+\.(md|diff)$/i.test(n));
+  const same = !brings && isDeepStrictEqual(history.versions, onDisk?.versions);
   const view =
-    here && !brings && isDeepStrictEqual(history.versions, onDisk?.versions)
-      ? here
-      : await sealedHeadView(owner, history, keyframe, diff, budget);
+    (same ? await here() : null) ?? (await sealedHeadView(owner, history, keyframe, diff, budget));
   // Refused, not waved through: the bytes judged here are pinned to their
   // content hashes, so if a file then fails to land the head on disk no
   // longer verifies and is judged in full — but only if the head judged here
@@ -542,7 +545,7 @@ async function historySetVerdict(
     );
   }
   const head = view.doc;
-  const violations = judge(head);
+  const violations = await judge(head);
   return violations.length === 0
     ? { refusal: null, head: view.node ? head : null }
     : refuse(`${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`);

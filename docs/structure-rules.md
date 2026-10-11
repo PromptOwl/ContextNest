@@ -208,7 +208,7 @@ These hold whether or not a vault has rules:
 - **Id shape:** ids use `/`, never `\`. They stay under 1024 characters, with no name over 251 bytes.
 - **Imports:** an import of a vault's own export restores over itself, including its version history, PDFs, forgotten documents and held revisions. An import is checked against what the vault will hold after the call, and a document's history may arrive before or after the document. Within one history, send `history.yaml` last, after the keyframes and diffs it needs.
 - **PDF sidecars:** import never replaces a PDF node's file on disk with different bytes. A new version of a PDF comes through `ctx import pdf` or `context_import_pdf`.
-- **Work per import:** reading and replaying version histories is bounded per call by `limits.importReplayChars` (default 512 Mi characters, set by the host). A call over the limit is refused with a request to split it into smaller calls.
+- **Work per import:** reading and replaying version histories is bounded per call by `limits.importReplayChars` (default 512 Mi characters, set by the host). Only documents that break a rule are replayed: one that passes the full check needs no history to excuse it. Over the limit, `files[]` are refused with a request to split the call, and a document the publish step could not judge is reported "not published — publish it in a separate call".
 
 ## Not covered yet
 

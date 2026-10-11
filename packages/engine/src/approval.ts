@@ -112,7 +112,7 @@ async function approveSuggestionImpl(
   const patched = applyPatchBounded(approved.content, sug.patch).result;
   if (typeof patched !== "string" || patched === "") {
     throw new IntegrityError(
-      `Suggestion "${input.suggestionId}" is stale: the document changed since it was staged, so it no longer applies — stage it again`,
+      `Suggestion "${input.suggestionId}" no longer applies to the current version — the document changed since it was staged, or the patch is damaged; stage it again`,
       "content_hash_mismatch",
     );
   }
