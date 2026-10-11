@@ -86,7 +86,6 @@ import {
   sanitizeImportedFrontmatter,
 } from "../import-hygiene.js";
 import {
-  auditStructure,
   checkDeleteDocument,
   checkDocument,
   checkUpdate,
@@ -105,6 +104,7 @@ import {
   assertStructurePublish,
   isEnforced,
   scaffoldFolders,
+  structureReport,
 } from "../structure-store.js";
 import { readIfExists, type OperationContext, type OperationExecutor } from "./context.js";
 import {
@@ -1866,20 +1866,7 @@ const structureExec: OperationExecutor = async (ctx, input: any) => {
   }
   const out: Record<string, unknown> = { ...describeStructure(rules) };
   if (input?.folder !== undefined) out.resolved = resolveFolder(rules, String(input.folder));
-  if (input?.report === true) {
-    const docs = await ctx.storage.discoverDocuments();
-    // In a structured vault only nodes/ holds content; root-level folders
-    // (sources/, packs/, assets/) are not judged against the folder rules.
-    const structured = (await ctx.storage.detectLayout()) === "structured";
-    const folders = (await ctx.storage.listFolders())
-      .map((f) => f.path)
-      .filter((p) => !structured || p === "nodes" || p.startsWith("nodes/"));
-    out.violations = auditStructure(
-      rules,
-      docs.map((d) => structureView(d.id, d)),
-      folders,
-    );
-  }
+  if (input?.report === true) out.violations = await structureReport(ctx.storage, rules);
   return out;
 };
 

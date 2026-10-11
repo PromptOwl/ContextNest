@@ -26,6 +26,7 @@ import {
   enforceStructure,
   documentFolders,
   scaffoldPlan,
+  auditStructure,
   type CompiledStructure,
   type StructureConfig,
   type StructureDoc,
@@ -63,6 +64,22 @@ export function isEnforced(config: { structure?: unknown } | null | undefined): 
   if (typeof structure !== "object" || Array.isArray(structure)) return true;
   const enforce = (structure as { enforce?: unknown }).enforce;
   return enforce !== undefined && enforce !== false;
+}
+
+/**
+ * The compliance report: every existing document and folder of the vault that
+ * breaks `rules` — the saved ones (`context_structure` with `report`) or a
+ * draft a host wants judged before it saves it. In a structured vault only
+ * nodes/ holds content; root-level folders (sources/, packs/, assets/) are not
+ * judged against the folder rules.
+ */
+export async function structureReport(storage: NestStorage, rules: CompiledStructure): Promise<Violation[]> {
+  const docs = await storage.discoverDocuments();
+  const structured = (await storage.detectLayout()) === "structured";
+  const folders = (await storage.listFolders())
+    .map((f) => f.path)
+    .filter((p) => !structured || p === "nodes" || p.startsWith("nodes/"));
+  return auditStructure(rules, docs.map((d) => structureView(d.id, d)), folders);
 }
 
 /**
@@ -110,8 +127,8 @@ export async function sealedHead(
   if (segment.some((e) => e.tombstone)) return null;
   try {
     if (budget?.spent) return null;
-    // Read (a few histories at a time, never stuck behind a stalled mount),
-    // then verify and replay exactly what was read — one history at a time.
+    // Read (a few histories at a time, outside the replay queue), then
+    // verify and replay exactly what was read — one history at a time.
     const contents = await withReadSlot(() => readSegment(segment, readKeyframe, readDiff, budget));
     if (contents === null) return null;
     return await oneAtATime(() => verifyAndReplay(segment, contents, budget));
@@ -130,10 +147,9 @@ function charge(budget: ReplayBudget | undefined, chars: number): boolean {
 
 /**
  * A segment's artifacts, read one at a time, each sized to the room left — the
- * history's read cap and the caller's budget — and refused unread past it:
- * every character charged as it arrives, and a segment that does not settle
- * in time read as "cannot be trusted" (judged in full). A read too large for
- * what the budget has left spends it, so the call is asked to split.
+ * history's read cap and the caller's budget — and refused unread past it,
+ * every character charged as it arrives. A read too large for what the
+ * budget has left spends it, so the call is asked to split.
  */
 async function readSegment(
   segment: DocumentHistory["versions"],
@@ -142,19 +158,15 @@ async function readSegment(
   budget: ReplayBudget | undefined,
 ): Promise<string[] | null> {
   const contents: string[] = [];
-  const deadline = Date.now() + READ_TIMEOUT_MS;
   let read = 0;
   for (const e of segment) {
     const room = Math.min(MAX_REPLAY_READ - read, budget ? budget.left : Infinity);
     const maxBytes = BYTES_PER_CHAR * Math.max(0, room);
     let c: string | null;
     try {
-      c = await withinTime(
-        Promise.resolve(
-          e.keyframe ? readKeyframe(e.version, maxBytes) : readDiff(e.version, maxBytes),
-        ).then((d) => d ?? (e.keyframe ? null : (e.diff ?? null))),
-        deadline - Date.now(),
-      );
+      c = await Promise.resolve(
+        e.keyframe ? readKeyframe(e.version, maxBytes) : readDiff(e.version, maxBytes),
+      ).then((d) => d ?? (e.keyframe ? null : (e.diff ?? null)));
     } catch (err) {
       if (budget && room === budget.left && isTooLarge(err)) charge(budget, room + 1);
       return null;
@@ -171,27 +183,14 @@ function isTooLarge(err: unknown): boolean {
   return err instanceof CorruptHistoryError && err.ioError === "too-large";
 }
 
-/** `task`'s result, or null once `ms` pass without it. */
-async function withinTime<T>(task: Promise<T>, ms: number): Promise<T | null> {
-  let timer: NodeJS.Timeout | undefined;
-  const late = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), Math.max(0, ms));
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([task, late]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 let readsInFlight = 0;
 const waitingForSlot: (() => void)[] = [];
 
 /**
- * At most READ_SLOTS histories being read at once, process-wide: memory stays
- * bounded (each history's read is capped), and a stalled mount holds one slot,
- * never every vault's writes.
+ * At most READ_SLOTS histories being read at once, process-wide, so one call
+ * judging many histories does not open them all at once. (Reads share the
+ * runtime's I/O threads with every other vault: a hung mount still slows
+ * them all, slots or not.)
  */
 async function withReadSlot<T>(task: () => Promise<T>): Promise<T> {
   if (readsInFlight < READ_SLOTS) readsInFlight++;
@@ -216,7 +215,7 @@ async function verifyAndReplay(
   contents: string[],
   budget: ReplayBudget | undefined,
 ): Promise<string | null> {
-  // Another history of this call spent the budget: the call is refused whole.
+  // Another history of this call spent the budget: this one is not rebuilt.
   if (budget?.spent) return null;
   let sinceYield = 0;
   const step = async (chars: number) => {
@@ -303,9 +302,6 @@ const MAX_REPLAY_READ = 64 * 2 ** 20;
 /** Histories being read at once, process-wide. */
 const READ_SLOTS = 4;
 
-/** How long one history's artifact reads may take before its head is not trusted. */
-const READ_TIMEOUT_MS = 10_000;
-
 /**
  * The most bytes one version file may hold to be read for a sealed head —
  * twice the read cap in characters, room for an encrypted artifact's armour.
@@ -313,8 +309,12 @@ const READ_TIMEOUT_MS = 10_000;
  */
 export const MAX_SEALED_ARTIFACT_BYTES = 2 * MAX_REPLAY_READ;
 
-/** Bytes a version file may hold per character of room: an encrypted artifact's armour. */
-const BYTES_PER_CHAR = 2;
+/**
+ * Bytes a version file may hold per character of room: UTF-8 spends up to 3
+ * bytes on a character (CJK text), and an encrypted artifact's armour a third
+ * more — so text of any script is read up to its character allowance.
+ */
+const BYTES_PER_CHAR = 4;
 
 /** The vault's own readers for a sealed head: no artifact over the size a head may read. */
 export function sealedReaders(storage: NestStorage, id: string): { keyframe: ArtifactReader; diff: ArtifactReader } {
@@ -364,11 +364,14 @@ export async function structurePublishViolations(
     known = null; // corrupt: judged in full below
   }
   const first = !known || known.versions.length === 0;
+  // A document that passes the full check needs no head to excuse it: it is
+  // never replayed, so the replay budget only ever touches what breaks a rule.
+  const full = checkDocument(rules, live);
+  if (full.length === 0 || !known) return { violations: full, first };
   // The view that was hashed: any bytes with this head's hashes get the same verdict.
-  const head = known
-    ? await sealedHeadView(id, known, sealedReaders(storage, id).keyframe, sealedReaders(storage, id).diff, budget)
-    : null;
-  if (!head?.node) return { violations: checkDocument(rules, live), first };
+  const readers = sealedReaders(storage, id);
+  const head = await sealedHeadView(id, known, readers.keyframe, readers.diff, budget);
+  if (!head?.node) return { violations: full, first };
   return { violations: checkUpdate(rules, head.doc, live), first };
 }
 

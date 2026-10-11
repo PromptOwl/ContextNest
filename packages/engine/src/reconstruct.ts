@@ -106,13 +106,17 @@ export async function reconstructFromHistory(
 }
 
 /**
- * `applyPatch`, each hunk applied only at the line its header names. Off
- * there, the library looks line by line across the whole text — lines × hunk
- * length in one synchronous call, added lines walked at every position
- * without a comparison — so a crafted patch could hold the process for as
- * long as it likes. Every patch the engine applies was made against exactly
- * the text it is applied to (a hash-verified replay, a suggestion or held edit
- * checked for staleness first), so it always fits where it says; anything
+ * `applyPatch`, each hunk applied only at the line its header names, in
+ * order, inside the text. Off there, the library looks line by line across
+ * the whole text — lines × hunk length in one synchronous call, added lines
+ * walked at every position without a comparison — and before applying a hunk
+ * it copies every line up to the start its header states, however far past
+ * the end that is: a crafted patch could hold the process, or its memory, for
+ * as long as it likes. The engine's own patches always fit where they say: a
+ * replayed diff was made against exactly the text it follows (createVersion
+ * falls back to a keyframe otherwise). A suggestion or held edit is checked
+ * for staleness by its body only, so one whose frontmatter moved on since it
+ * was staged does not apply here — its callers report it stale. Anything
  * else does not apply (`false`). `compared` is the work done, in the same
  * units as characters replayed.
  */
@@ -124,6 +128,16 @@ export function applyPatchBounded(content: string, patch: string): { result: str
     return { result: false, compared: 0 };
   }
   if (parsed.length !== 1) return { result: false, compared: 0 };
+  // Each hunk's stated lines inside the text (as the library splits it: on
+  // "\n"), and after the hunk before it.
+  let lines = 1;
+  for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) lines++;
+  let from = 0;
+  for (const hunk of parsed[0].hunks) {
+    const start = hunk.oldStart - 1;
+    if (!(start >= from && start + hunk.oldLines <= lines)) return { result: false, compared: 0 };
+    from = start + hunk.oldLines;
+  }
   let compared = 0;
   try {
     const result = applyPatch(content, parsed[0], {

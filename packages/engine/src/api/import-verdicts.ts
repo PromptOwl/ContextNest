@@ -26,6 +26,7 @@ import {
   type Violation,
 } from "../structure.js";
 import { sealedHeadView, sealedReaders, structurePublishViolations, type ReplayBudget } from "../structure-store.js";
+import type { ArtifactReader } from "../reconstruct.js";
 import { importVerdict, type TombstoneIndex } from "../tombstones.js";
 import type { ContextNode, DocumentHistory } from "../types.js";
 import { readIfExists, type OperationContext } from "./context.js";
@@ -92,7 +93,7 @@ export async function importRefusals(
   // Over budget, some verdict was cut short: none of this call is trusted.
   if (budget.spent) {
     for (const f of plan) {
-      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls, or run it again to continue`);
+      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls`);
     }
   }
   return refused;
@@ -236,10 +237,13 @@ async function importVerdicts(
     if (!doc) return;
     const brought = setVerdicts.get(doc.id);
     let violations: Violation[];
-    if (brought) violations = brought.head ? checkUpdate(rules, brought.head, doc) : checkDocument(rules, doc);
+    const full = checkDocument(rules, doc);
+    // A document that passes the full check needs no head to excuse it.
+    if (full.length === 0) violations = full;
+    else if (brought) violations = brought.head ? checkUpdate(rules, brought.head, doc) : full;
     else if (overwrite && (await readIfExists(ctx, doc.id))) {
       violations = (await structurePublishViolations(ctx.storage, rules, doc, undefined, budget)).violations;
-    } else violations = checkDocument(rules, doc);
+    } else violations = full;
     docVerdicts.set(doc.id, violations);
   });
   plan.forEach((f, i) => {
@@ -469,8 +473,10 @@ async function historySetVerdict(
   }
   if (text !== undefined && !history) return refuse(`${owner}'s history.yaml is not a valid history`);
   const disk = sealedReaders(ctx.storage, owner);
-  const keyframe = (n: number) => set.get(`v${n}.md`) ?? disk.keyframe(n);
-  const diff = (n: number) => set.get(`v${n}.diff`) ?? disk.diff(n);
+  // The room a read is given passes through to the disk: the call's own
+  // files are already in memory, and charged as they are replayed.
+  const keyframe: ArtifactReader = (n, max) => set.get(`v${n}.md`) ?? disk.keyframe(n, max);
+  const diff: ArtifactReader = (n, max) => set.get(`v${n}.diff`) ?? disk.diff(n, max);
   // The head the disk holds now, if it verifies: grandfathering already trusts
   // it, so a head this call brings is judged as an update over it — only for
   // what it newly breaks, as any other write to this document is.
@@ -478,7 +484,10 @@ async function historySetVerdict(
     ? await sealedHeadView(owner, onDisk, disk.keyframe, disk.diff, budget)
     : null;
   // A head that does not parse is no baseline (as at publish): judged in full.
-  const judge = (head: StructureDoc) => (here?.node ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
+  const judge = (head: StructureDoc) => {
+    const full = checkDocument(rules, head);
+    return full.length > 0 && here?.node ? checkUpdate(rules, here.doc, head) : full;
+  };
   // The history.yaml this call brings is written last and may not land (a file
   // of its set fails): the history already here, over these files, is a head
   // the vault may then hold too. A file counts there only if its bytes are the
@@ -498,8 +507,8 @@ async function historySetVerdict(
       ? await sealedHeadView(
           owner,
           onDisk,
-          (n) => pinned(`v${n}.md`, n, () => disk.keyframe(n)),
-          (n) => pinned(`v${n}.diff`, n, () => disk.diff(n)),
+          (n, max) => pinned(`v${n}.md`, n, () => disk.keyframe(n, max)),
+          (n, max) => pinned(`v${n}.diff`, n, () => disk.diff(n, max)),
           budget,
         )
       : here;

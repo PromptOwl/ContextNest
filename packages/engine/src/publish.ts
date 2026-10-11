@@ -303,7 +303,7 @@ export async function publishDocuments(
       // Judged before historyOrRepair: a refused publish quarantines nothing.
       const budget = options.replayBudget;
       const cutShort = () =>
-        new ContextNestError(`${docId}: this call replays more version history than one call allows — split it into smaller calls, or run it again to continue`, "VALIDATION_FAILED");
+        new ContextNestError(`${docId}: not published — this call replays more version history than one call allows; publish it in a separate call`, "VALIDATION_FAILED");
       let firstPublish = false;
       if (rules) {
         let known: DocumentHistory | null = null;
@@ -312,18 +312,16 @@ export async function publishDocuments(
         } catch {
           known = null; // corrupt: judged in full, as a first publish is
         }
-        // Only a head that is replayed can be cut short: a first publish needs none.
+        // Only a document that fails the full check is replayed (its head may
+        // excuse it), so only such a document — with a history — can be cut
+        // short: refused because the budget left no room to rebuild its head.
         const replays = !!known?.versions.length;
         const turn = turns?.get(docId);
         await turn?.after;
         try {
-          if (replays && budget?.spent) throw cutShort();
-          try {
-            firstPublish = await assertStructurePublish(storage, rules, node, known, budget);
-          } catch (err) {
-            throw replays && budget?.spent ? cutShort() : err;
-          }
-          if (replays && budget?.spent) throw cutShort();
+          firstPublish = await assertStructurePublish(storage, rules, node, known, budget);
+        } catch (err) {
+          throw replays && budget?.spent ? cutShort() : err;
         } finally {
           turn?.done();
         }

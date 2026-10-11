@@ -2077,6 +2077,8 @@ export class NestStorage {
       // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
       // an I/O error) must not read as a fresh document either.
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      // Already ours (over the read limit): one message, not wrapped twice.
+      if (err instanceof CorruptHistoryError) throw err;
       throw new CorruptHistoryError(
         docId,
         err instanceof Error ? err.message : String(err),

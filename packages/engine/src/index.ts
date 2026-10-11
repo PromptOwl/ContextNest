@@ -543,6 +543,7 @@ export {
   assertStructurePublish,
   structurePublishViolations,
   sealedHead,
+  structureReport,
   isEnforced,
 } from "./structure-store.js";
 

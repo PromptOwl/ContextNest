@@ -306,7 +306,7 @@ export async function approveReview(
         approvedRaw !== null && sug ? applyPatchBounded(approvedRaw, sug.patch).result : false;
       if (typeof proposedRaw !== "string" || proposedRaw === "") {
         throw new IntegrityError(
-          `Could not apply the held edit ${chosen.suggestion_id} to ${id}.`,
+          `The held edit ${chosen.suggestion_id} for ${id} is stale: the document changed since it was staged, so it no longer applies. Reject it and make the edit again.`,
           "content_hash_mismatch",
         );
       }
