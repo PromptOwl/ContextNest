@@ -120,7 +120,11 @@ async function writeReviewMode(storage: NestStorage, mode: ReviewMode): Promise<
 
 /** A staged review hold, with whether the node has moved on since. */
 export interface ReviewHold extends SuggestionMeta {
-  /** True when the published node changed after staging — approval is refused. */
+  /**
+   * True when the published node changed after staging — its body, or its
+   * frontmatter so that the held edit no longer applies where it was made.
+   * Approval is refused, and a later hold does not build on it.
+   */
   stale: boolean;
 }
 
@@ -152,7 +156,18 @@ async function holdsWithHead(
   if (metas.length === 0) return { holds: [], head: null };
   const head = await approvedHead(storage, id);
   const headHash = head === null ? null : computeContentHash(getChecksumContent(head));
-  return { holds: metas.map((m) => ({ ...m, stale: m.target_hash !== headHash })), head };
+  // The body hash is not the whole story: an edit that only changes the
+  // frontmatter can move every line a held patch names. One that no longer
+  // applies to the head is stale too — listed, proposed and approved alike.
+  const applies = async (m: SuggestionMeta) => {
+    if (head === null) return false;
+    const sug = await readSuggestion(storage, id, m.suggestion_id);
+    const out = sug ? applyPatchBounded(head, sug.patch).result : false;
+    return typeof out === "string" && out !== "";
+  };
+  const holds: ReviewHold[] = [];
+  for (const m of metas) holds.push({ ...m, stale: m.target_hash !== headHash || !(await applies(m)) });
+  return { holds, head };
 }
 
 /** Review holds staged for one node, oldest first. */

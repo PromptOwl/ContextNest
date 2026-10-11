@@ -311,10 +311,11 @@ export const MAX_SEALED_ARTIFACT_BYTES = 2 * MAX_REPLAY_READ;
 
 /**
  * Bytes a version file may hold per character of room: UTF-8 spends up to 3
- * bytes on a character (CJK text), and an encrypted artifact's armour a third
- * more — so text of any script is read up to its character allowance.
+ * bytes on a character (CJK text), and an encrypted artifact's armour about
+ * a third more (measured: 4.06 for CJK) — so text of any script is read up
+ * to its character allowance.
  */
-const BYTES_PER_CHAR = 4;
+const BYTES_PER_CHAR = 5;
 
 /** The vault's own readers for a sealed head: no artifact over the size a head may read. */
 export function sealedReaders(storage: NestStorage, id: string): { keyframe: ArtifactReader; diff: ArtifactReader } {

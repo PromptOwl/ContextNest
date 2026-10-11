@@ -2996,7 +2996,7 @@ describe("QA round 19: a patch applies where it says, ledger names stay files, r
     };
     expect(await sealedHead("d", { versions: [entry(1, big, true)] } as never, reader, () => null, budget)).toBeNull();
     expect(asked).toHaveLength(1);
-    expect(asked[0]).toBeLessThanOrEqual(4 * 1000);
+    expect(asked[0]).toBeLessThanOrEqual(5 * 1000);
     expect(budget).toMatchObject({ spent: true });
   });
 
@@ -3102,7 +3102,7 @@ describe("architecture round 21: headers bounded, reads sized everywhere, confor
     // Room enough to rebuild the disk's head, so the set's own rebuild reads too.
     await api.run("context_import", { files, overwrite: true, publish: false }, { ...ctx, limits: { importReplayChars: 200_000 } });
     expect(asked.length).toBeGreaterThan(1);
-    for (const m of asked) expect(m).toBeLessThanOrEqual(4 * 200_000);
+    for (const m of asked) expect(m).toBeLessThanOrEqual(5 * 200_000);
   });
 
   it("a document that passes the full check is not replayed, so a spent budget does not refuse it", async () => {
@@ -3146,5 +3146,89 @@ describe("architecture round 21: headers bounded, reads sized everywhere, confor
     await expect(
       approveSuggestion({ storage, rbac: ALLOW, documentId: id, suggestionId: staged.meta.suggestion_id, actor: "owner", zone: "default" }),
     ).rejects.toThrow(/stale/i);
+  });
+});
+
+describe("QA round 21: held edits stale alike everywhere, room for any script, one prefix", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("a held edit that no longer applies after a frontmatter-only edit is stale in the listing, the proposal and approval", async () => {
+    const { listReviewHolds, currentReviewProposal } = await import("../index.js");
+    const id = "nodes/notes/held";
+    await api.run("context_create", { id, title: "Held", content: "Line one.\nLine two.\n" }, ctx);
+    const held = await api.run<{ held_for_review?: boolean }>("context_update", { id, content: "Line one, edited.\nLine two.\n", review: true }, ctx);
+    expect(held.held_for_review).toBe(true);
+    expect((await listReviewHolds(storage, id)).map((h) => h.stale)).toEqual([false]);
+    // The owner adds a description: the body is the same, every body line moves down.
+    await api.run("context_update", { id, description: "A line the frontmatter did not have." }, ctx);
+    expect((await listReviewHolds(storage, id)).map((h) => h.stale)).toEqual([true]);
+    expect(await currentReviewProposal(storage, id)).toBeNull();
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/stale/i);
+  });
+
+  it("a second held edit after a frontmatter-only edit never silently drops the first: the first stays listed stale", async () => {
+    const { listReviewHolds } = await import("../index.js");
+    const id = "nodes/notes/two";
+    await api.run("context_create", { id, title: "Two", content: "Body.\n" }, ctx);
+    await api.run("context_update", { id, content: "Body, edited by the agent.\n", review: true }, ctx);
+    await api.run("context_update", { id, description: "Owner's description." }, ctx);
+    await api.run("context_update", { id, tags: ["#later"], review: true }, ctx);
+    const holds = await listReviewHolds(storage, id);
+    // Either the second carries the first (one live hold with both edits), or
+    // the first is listed stale — never a live hold that can no longer apply.
+    for (const h of holds.filter((x) => !x.stale)) {
+      const { currentReviewProposal } = await import("../index.js");
+      const p = await currentReviewProposal(storage, id);
+      expect(p, `live hold ${h.suggestion_id} must apply`).not.toBeNull();
+    }
+    expect(holds.some((h) => h.stale)).toBe(true);
+  });
+
+  it("an encrypted document in a non-Latin script gets its full character allowance", async () => {
+    const store = new MemoryKeyStore();
+    setDefaultVaultKeyStore(store);
+    try {
+      await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+      const text = `${"漢字".repeat(5_000)}\n`;
+      await api.run("context_create", { id: "nodes/cjk", title: "cjk", content: text }, ctx);
+      const { sealedReaders } = await import("../structure-store.js");
+      const history = await storage.readHistory("nodes/cjk");
+      const kf = await storage.readKeyframe("nodes/cjk", 1);
+      const budget = { left: kf!.length };
+      const r = sealedReaders(storage, "nodes/cjk");
+      expect(await sealedHead("nodes/cjk", history!, r.keyframe, r.diff, budget)).toBe(kf);
+      expect(budget).not.toMatchObject({ spent: true });
+    } finally {
+      setDefaultVaultKeyStore(null);
+    }
+  });
+
+  it("an over-budget bulk publish publishes the same prefix in two copies of the same vault", async () => {
+    const { cp } = await import("node:fs/promises");
+    const ids: string[] = [];
+    for (const n of ["a", "b", "c", "d", "e", "f"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `no summary ${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `still none ${"y".repeat(5000)}\n` }, ctx);
+      ids.push(`nodes/notes/${n}`);
+    }
+    // Grandfathered: they broke no rule when written, so each needs its head.
+    await writeConfig(SUMMARY);
+    const twin = `${dir}-twin`;
+    await cp(dir, twin, { recursive: true });
+    try {
+      const run = async (root: string) =>
+        (await publishDocuments(new NestStorage(root), ids, { editedBy: "x", replayBudget: { left: 70_000 } })).published.map((p) => p.id).sort();
+      const one = await run(dir);
+      const two = await run(twin);
+      expect(one.length).toBeGreaterThan(0);
+      expect(one.length).toBeLessThan(ids.length);
+      expect(two).toEqual(one);
+    } finally {
+      await rm(twin, { recursive: true, force: true });
+    }
   });
 });
