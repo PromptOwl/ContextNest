@@ -13,7 +13,7 @@ import { isDeepStrictEqual } from "node:util";
 import { isAbsolute, join, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { parseConfig } from "./config.js";
-import { ConfigError } from "./errors.js";
+import { ConfigError, CorruptHistoryError } from "./errors.js";
 import { assertNotForgotten } from "./forget.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { parseDocument, serializeDocument, validateDocument } from "./parser.js";
@@ -129,9 +129,11 @@ function charge(budget: ReplayBudget | undefined, chars: number): boolean {
 }
 
 /**
- * A segment's artifacts, read a batch at a time: every character charged to
- * the history's read cap and the caller's budget as it arrives, and a batch
- * that does not settle in time read as "cannot be trusted" (judged in full).
+ * A segment's artifacts, read one at a time, each sized to the room left — the
+ * history's read cap and the caller's budget — and refused unread past it:
+ * every character charged as it arrives, and a segment that does not settle
+ * in time read as "cannot be trusted" (judged in full). A read too large for
+ * what the budget has left spends it, so the call is asked to split.
  */
 async function readSegment(
   segment: DocumentHistory["versions"],
@@ -140,31 +142,40 @@ async function readSegment(
   budget: ReplayBudget | undefined,
 ): Promise<string[] | null> {
   const contents: string[] = [];
+  const deadline = Date.now() + READ_TIMEOUT_MS;
   let read = 0;
-  for (let i = 0; i < segment.length; i += READ_BATCH) {
-    const batch = await withinTime(
-      Promise.all(
-        segment
-          .slice(i, i + READ_BATCH)
-          .map(async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null))),
-      ),
-    );
-    if (batch === null) return null;
-    for (const c of batch) {
-      if (typeof c !== "string") return null;
-      read += c.length;
-      if (read > MAX_REPLAY_READ || !charge(budget, c.length)) return null;
-      contents.push(c);
+  for (const e of segment) {
+    const room = Math.min(MAX_REPLAY_READ - read, budget ? budget.left : Infinity);
+    const maxBytes = BYTES_PER_CHAR * Math.max(0, room);
+    let c: string | null;
+    try {
+      c = await withinTime(
+        Promise.resolve(
+          e.keyframe ? readKeyframe(e.version, maxBytes) : readDiff(e.version, maxBytes),
+        ).then((d) => d ?? (e.keyframe ? null : (e.diff ?? null))),
+        deadline - Date.now(),
+      );
+    } catch (err) {
+      if (budget && room === budget.left && isTooLarge(err)) charge(budget, room + 1);
+      return null;
     }
+    if (typeof c !== "string") return null;
+    read += c.length;
+    if (!charge(budget, c.length) || read > MAX_REPLAY_READ) return null;
+    contents.push(c);
   }
   return contents;
 }
 
-/** `task`'s result, or null once READ_TIMEOUT_MS pass without it. */
-async function withinTime<T>(task: Promise<T>): Promise<T | null> {
+function isTooLarge(err: unknown): boolean {
+  return err instanceof CorruptHistoryError && err.ioError === "too-large";
+}
+
+/** `task`'s result, or null once `ms` pass without it. */
+async function withinTime<T>(task: Promise<T>, ms: number): Promise<T | null> {
   let timer: NodeJS.Timeout | undefined;
   const late = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), READ_TIMEOUT_MS);
+    timer = setTimeout(() => resolve(null), Math.max(0, ms));
     timer.unref?.();
   });
   try {
@@ -289,13 +300,10 @@ const MAX_REPLAY_WORK = 128 * 2 ** 20;
  */
 const MAX_REPLAY_READ = 64 * 2 ** 20;
 
-/** Artifacts read at once: a few round trips in flight on a network mount. */
-const READ_BATCH = 4;
-
 /** Histories being read at once, process-wide. */
 const READ_SLOTS = 4;
 
-/** How long one batch of artifact reads may take before the head is not trusted. */
+/** How long one history's artifact reads may take before its head is not trusted. */
 const READ_TIMEOUT_MS = 10_000;
 
 /**
@@ -305,10 +313,16 @@ const READ_TIMEOUT_MS = 10_000;
  */
 export const MAX_SEALED_ARTIFACT_BYTES = 2 * MAX_REPLAY_READ;
 
+/** Bytes a version file may hold per character of room: an encrypted artifact's armour. */
+const BYTES_PER_CHAR = 2;
+
 /** The vault's own readers for a sealed head: no artifact over the size a head may read. */
 export function sealedReaders(storage: NestStorage, id: string): { keyframe: ArtifactReader; diff: ArtifactReader } {
-  const limit = { maxBytes: MAX_SEALED_ARTIFACT_BYTES };
-  return { keyframe: (n) => storage.readKeyframe(id, n, limit), diff: (n) => storage.readDiff(id, n, limit) };
+  const limit = (maxBytes = Infinity) => ({ maxBytes: Math.min(maxBytes, MAX_SEALED_ARTIFACT_BYTES) });
+  return {
+    keyframe: (n, maxBytes) => storage.readKeyframe(id, n, limit(maxBytes)),
+    diff: (n, maxBytes) => storage.readDiff(id, n, limit(maxBytes)),
+  };
 }
 
 /** Characters hashed or replayed between yields to the event loop. */

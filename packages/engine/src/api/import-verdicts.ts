@@ -110,7 +110,9 @@ export const DEFAULT_IMPORT_REPLAY_CHARS = 512 * 2 ** 20;
  * request cannot buy unbounded work from histories planted earlier.
  */
 export function importReplayBudget(ctx: OperationContext): ReplayBudget {
-  return { left: ctx.limits?.importReplayChars ?? DEFAULT_IMPORT_REPLAY_CHARS };
+  const limit = ctx.limits?.importReplayChars;
+  // `NaN` (an unparsed host setting) compares false to everything: never unlimited.
+  return { left: typeof limit === "number" && !Number.isNaN(limit) ? limit : DEFAULT_IMPORT_REPLAY_CHARS };
 }
 
 /**
@@ -296,6 +298,11 @@ async function assertImportable(
   const k = segs.findIndex((seg) => comparableSegment(seg) === ".versions");
   if (k !== -1 && k >= segs.length - 2 && !(k === 0 && ROOT_LEDGERS.has(segs[k + 1]))) {
     throw new ContextNestError(`${f.raw}: .versions/ holds a folder per document, not files`, "VALIDATION_FAILED");
+  }
+  // A folder in a root ledger's place would keep that ledger from ever being
+  // written — every checkpoint, or every forget, failing after it.
+  if (k === 0 && segs.length > 2 && ROOT_LEDGERS.has(comparableSegment(segs[1]))) {
+    throw new ContextNestError(`${f.raw}: .versions/${segs[1]} is the nest's own ledger, not a folder`, "VALIDATION_FAILED");
   }
   // No document is named with a leading dot: such an entry is machinery — the
   // vault's own write lock (`.versions/.lock`) among it.

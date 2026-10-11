@@ -17,6 +17,8 @@ import { ContextNestError, ForgottenVersionError } from "./errors.js";
 /** Artifact content for a version, or null when there is none to read. */
 export type ArtifactReader = (
   version: number,
+  /** Most bytes the file may hold to be read at all — larger is refused unread. */
+  maxBytes?: number,
 ) => string | null | Promise<string | null>;
 
 /**
@@ -104,14 +106,15 @@ export async function reconstructFromHistory(
 }
 
 /**
- * `applyPatch`, its position search bounded. A hunk that does not fit where its
- * header says is looked for line by line across the whole text — lines × hunk
- * length, in one synchronous call — so a crafted patch could hold the process
- * for as long as it likes. The patch is parsed once; its cap is the work its
- * own hunks do where they fit (one weighted comparison per line kept or
- * removed — junk ahead of the hunks buys nothing), twice over plus a little
- * slack for a nearby offset. Past it the patch does not apply (`false`).
- * `compared` is the work done, in the same units as characters replayed.
+ * `applyPatch`, each hunk applied only at the line its header names. Off
+ * there, the library looks line by line across the whole text — lines × hunk
+ * length in one synchronous call, added lines walked at every position
+ * without a comparison — so a crafted patch could hold the process for as
+ * long as it likes. Every patch the engine applies was made against exactly
+ * the text it is applied to (a hash-verified replay, a suggestion or held edit
+ * checked for staleness first), so it always fits where it says; anything
+ * else does not apply (`false`). `compared` is the work done, in the same
+ * units as characters replayed.
  */
 export function applyPatchBounded(content: string, patch: string): { result: string | false; compared: number } {
   let parsed: StructuredPatch[];
@@ -121,37 +124,30 @@ export function applyPatchBounded(content: string, patch: string): { result: str
     return { result: false, compared: 0 };
   }
   if (parsed.length !== 1) return { result: false, compared: 0 };
-  let own = 0;
-  for (const hunk of parsed[0].hunks) {
-    for (const line of hunk.lines) if (line[0] === " " || line[0] === "-") own += COMPARE_WEIGHT + line.length;
-  }
-  const cap = 2 * own + PATCH_SEARCH_SLACK;
   let compared = 0;
   try {
     const result = applyPatch(content, parsed[0], {
       compareLine: (_line, line, _op, want) => {
         compared += COMPARE_WEIGHT + Math.min(line?.length ?? 0, want.length);
-        if (compared > cap) throw PATCH_TOO_FAR;
-        return line === want;
+        // The first position tried is the stated one: a miss there is a miss.
+        if (line !== want) throw DOES_NOT_FIT;
+        return true;
       },
     });
     return { result, compared };
   } catch (err) {
-    if (err === PATCH_TOO_FAR) return { result: false, compared };
+    if (err === DOES_NOT_FIT) return { result: false, compared };
     throw err;
   }
 }
 
-const PATCH_TOO_FAR = new Error("the patch does not fit where it says");
+const DOES_NOT_FIT = new Error("the patch does not fit where it says");
 
 /**
- * What one line comparison costs, in characters replayed: trying a candidate
- * position is far dearer than walking one character of text.
+ * What one line comparison costs, in characters replayed: a comparison is
+ * dearer than walking one character of text.
  */
 const COMPARE_WEIGHT = 32;
-
-/** Comparison work a patch may spend beyond twice its own, for a nearby offset. */
-const PATCH_SEARCH_SLACK = 2 ** 20;
 
 /** A settled read's value, or its error rethrown. */
 function value<T>(r: PromiseSettledResult<T>): T {

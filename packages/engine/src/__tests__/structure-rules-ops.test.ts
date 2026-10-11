@@ -2936,3 +2936,118 @@ describe("architecture round 19: patch search priced per comparison, reads outsi
     expect(await storage.readKeyframe("nodes/big", 1, { maxBytes: 1_000_000 })).toContain("xxxx");
   });
 });
+
+describe("QA round 19: a patch applies where it says, ledger names stay files, reads sized to what is left", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("a hunk of added lines ahead of a context line that fits nowhere is given up on at once", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    const kf = "\n".repeat(100_000);
+    const patch = `--- x\n+++ x\n@@ -1,1 +1,2001 @@\n${"+a\n".repeat(2000)} nowhere\n`;
+    const { result, compared } = applyPatchBounded(kf, patch);
+    expect(result).toBe(false);
+    // One comparison — at the line the hunk names — not one per line of text.
+    expect(compared).toBeLessThan(1_000);
+  });
+
+  it("a hunk that fits only away from the line it names does not apply", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    expect(applyPatchBounded("a\nb\nc\n", "--- x\n+++ x\n@@ -1,1 +1,1 @@\n-c\n+d\n").result).toBe(false);
+    const A = "one\r\ntwo\r\nthree\r\n";
+    const B = "one\r\n2\r\nthree\r\n";
+    expect(applyPatchBounded(A, createPatch("x", A, B)).result).toBe(B);
+  });
+
+  it.each([
+    ".versions/context_history.yaml/x",
+    ".versions/chain_events.yaml/v1.md",
+    ".versions/context_latest.yaml/history.yaml",
+    ".versions/context_history.yaml./x",
+  ])("an import cannot put a folder at the root ledger path of %s", async (path) => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "x" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual([path]);
+    expect(await exists(path.split("/").slice(0, 2).join("/"))).toBe(false);
+    await api.run("context_create", { id: "nodes/after", title: "after", content: "y\n" }, ctx);
+  });
+
+  it("each read for a sealed head is sized to the room the budget has left", async () => {
+    const big = "x".repeat(5000);
+    const asked: (number | undefined)[] = [];
+    const budget = { left: 1000 };
+    const reader = (_v: number, maxBytes?: number) => {
+      asked.push(maxBytes);
+      return big;
+    };
+    expect(await sealedHead("d", { versions: [entry(1, big, true)] } as never, reader, () => null, budget)).toBeNull();
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toBeLessThanOrEqual(2 * 1000);
+    expect(budget).toMatchObject({ spent: true });
+  });
+
+  it("a sealed-head reader over its room spends the budget rather than reading", async () => {
+    await api.run("context_create", { id: "nodes/big", title: "Big", content: `${"x".repeat(50_000)}\n` }, ctx);
+    const { sealedReaders } = await import("../structure-store.js");
+    const history = await storage.readHistory("nodes/big");
+    const budget = { left: 1000 };
+    const r = sealedReaders(storage, "nodes/big");
+    expect(await sealedHead("nodes/big", history!, r.keyframe, r.diff, budget)).toBeNull();
+    expect(budget).toMatchObject({ spent: true });
+  });
+
+  it("documents an over-budget import brings need no replay: they publish, not linger as drafts", async () => {
+    const ids: string[] = [];
+    for (const n of ["a", "b", "c"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Notes\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Notes\n${"y".repeat(5000)}\n` }, ctx);
+      ids.push(`nodes/notes/${n}`);
+    }
+    await writeConfig(SUMMARY);
+    const tight = { ...ctx, limits: { importReplayChars: 12_000 } };
+    const r = await api.run<{ published: { id: string }[]; failed: { id?: string; title?: string; error: string }[] }>(
+      "context_import",
+      { ids, documents: [{ title: "New", content: "## Summary\nhi\n", folder: "notes" }] },
+      tight,
+    );
+    expect(r.failed.length).toBeGreaterThan(0);
+    for (const f of r.failed) expect(f.error).toMatch(/split/i);
+    expect(r.published.map((p) => p.id)).toContain("nodes/notes/new");
+  });
+
+  it("an over-budget bulk publish publishes a prefix of its ids, the same on every run", async () => {
+    const ids: string[] = [];
+    for (const n of ["a", "b", "c", "d", "e", "f"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Notes\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Notes\n${"y".repeat(5000)}\n` }, ctx);
+      ids.push(`nodes/notes/${n}`);
+    }
+    await writeConfig(SUMMARY);
+    const r = await publishDocuments(storage, ids, { editedBy: "x", replayBudget: { left: 70_000 } });
+    const done = r.published.map((p) => p.id).sort();
+    expect(done.length).toBeGreaterThan(0);
+    expect(r.failed.length).toBeGreaterThan(0);
+    expect(done).toEqual(ids.slice(0, done.length));
+    for (const f of r.failed) expect(f.error).toMatch(/split/i);
+  });
+
+  it("an unreadable replay limit is the default, not unlimited", async () => {
+    const { importReplayBudget, DEFAULT_IMPORT_REPLAY_CHARS } = await import("../api/import-verdicts.js");
+    expect(importReplayBudget({ ...ctx, limits: { importReplayChars: Number.NaN } }).left).toBe(DEFAULT_IMPORT_REPLAY_CHARS);
+    expect(importReplayBudget({ ...ctx, limits: { importReplayChars: 5 } }).left).toBe(5);
+  });
+});

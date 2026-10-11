@@ -8,6 +8,7 @@ import type {
   Checkpoint,
   ClientMetadata,
   ContextNode,
+  DocumentHistory,
   Frontmatter,
   VersionEntry,
 } from "./types.js";
@@ -277,6 +278,11 @@ export async function publishDocuments(
   const rules = options.structure === "skip" ? null : await enforcedStructure(storage);
   const firstPublished: string[] = [];
 
+  // Judged in the batch's order, whatever order the reads finish in, when a
+  // replay budget is shared: which documents an over-budget call publishes is
+  // the same on every run. Only the judging waits its turn; the writes overlap.
+  const turns = rules && options.replayBudget ? judgingTurns(ids) : null;
+
   const publishOne = async (docId: string): Promise<void> => {
     try {
       await assertWritableDocumentPath(storage.root, docId);
@@ -298,14 +304,30 @@ export async function publishDocuments(
       const budget = options.replayBudget;
       const cutShort = () =>
         new ContextNestError(`${docId}: this call replays more version history than one call allows — split it into smaller calls, or run it again to continue`, "VALIDATION_FAILED");
-      if (budget?.spent) throw cutShort();
       let firstPublish = false;
-      try {
-        firstPublish = rules ? await assertStructurePublish(storage, rules, node, undefined, budget) : false;
-      } catch (err) {
-        throw budget?.spent ? cutShort() : err;
+      if (rules) {
+        let known: DocumentHistory | null = null;
+        try {
+          known = await storage.readHistory(docId);
+        } catch {
+          known = null; // corrupt: judged in full, as a first publish is
+        }
+        // Only a head that is replayed can be cut short: a first publish needs none.
+        const replays = !!known?.versions.length;
+        const turn = turns?.get(docId);
+        await turn?.after;
+        try {
+          if (replays && budget?.spent) throw cutShort();
+          try {
+            firstPublish = await assertStructurePublish(storage, rules, node, known, budget);
+          } catch (err) {
+            throw replays && budget?.spent ? cutShort() : err;
+          }
+          if (replays && budget?.spent) throw cutShort();
+        } finally {
+          turn?.done();
+        }
       }
-      if (budget?.spent) throw cutShort();
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
@@ -347,6 +369,9 @@ export async function publishDocuments(
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
     } finally {
+      // A document that failed before its turn still hands the turn on.
+      const turn = turns?.get(docId);
+      if (turn) void turn.after.then(turn.done);
       // Counter increments are safe unsynchronized — JS runs them on one thread;
       // only the awaited I/O above overlaps.
       options.onProgress?.(++settled, ids.length);
@@ -383,4 +408,17 @@ export async function publishDocuments(
   const checkpointNumber = checkpoint?.checkpoint ?? null;
 
   return { published, failed, checkpointNumber };
+}
+
+/** Each id's turn to be judged: after the one before it in `ids` is done. */
+function judgingTurns(ids: string[]): Map<string, { after: Promise<void>; done: () => void }> {
+  const turns = new Map<string, { after: Promise<void>; done: () => void }>();
+  let after: Promise<void> = Promise.resolve();
+  for (const id of ids) {
+    let done!: () => void;
+    const next = new Promise<void>((resolve) => (done = resolve));
+    turns.set(id, { after, done });
+    after = next;
+  }
+  return turns;
 }
