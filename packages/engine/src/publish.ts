@@ -16,11 +16,11 @@ import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected, parseDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
-import { RejectedDocumentError } from "./errors.js";
+import { ContextNestError, RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
 import { assertPdfSidecarIntact } from "./pdf-nodes.js";
 import { assertNotForgotten } from "./forget.js";
-import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish } from "./structure-store.js";
+import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish, type ReplayBudget } from "./structure-store.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -189,6 +189,12 @@ export interface BulkPublishOptions extends PublishOptions {
   /** Regenerate context.yaml / INDEX.md once after the batch (default true). */
   regenerateIndex?: boolean;
   /**
+   * The replay work the batch's structure checks may share (an import's
+   * budget). Once spent, the documents still to be judged are refused —
+   * never published on a check cut short — and asked to come in smaller calls.
+   */
+  replayBudget?: ReplayBudget;
+  /**
    * Rewrite INDEX.md only for the folders of the batch's documents. Only safe
    * when nothing else in the vault changed in the same operation.
    */
@@ -289,7 +295,17 @@ export async function publishDocuments(
       // Same resilient read, the same seed skip on a restart, and the same
       // single history read — see the notes in publishDocument.
       // Judged before historyOrRepair: a refused publish quarantines nothing.
-      const firstPublish = rules ? await assertStructurePublish(storage, rules, node) : false;
+      const budget = options.replayBudget;
+      const cutShort = () =>
+        new ContextNestError(`${docId}: this call replays more version history than one call allows — split it into smaller calls`, "VALIDATION_FAILED");
+      if (budget?.spent) throw cutShort();
+      let firstPublish = false;
+      try {
+        firstPublish = rules ? await assertStructurePublish(storage, rules, node, undefined, budget) : false;
+      } catch (err) {
+        throw budget?.spent ? cutShort() : err;
+      }
+      if (budget?.spent) throw cutShort();
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;

@@ -48,12 +48,10 @@ export async function importRefusals(
   ctx: OperationContext,
   rules: CompiledStructure | null,
   plan: PlannedFile[],
-  opts: { overwrite: boolean; tombstones: TombstoneIndex | null },
+  opts: { overwrite: boolean; tombstones: TombstoneIndex | null; budget: ReplayBudget },
 ): Promise<Map<string, string>> {
   const refused = new Map<string, string>();
-  // Sealed heads this call replays share one budget: a small request must not
-  // buy unbounded work from histories planted earlier.
-  const budget: ReplayBudget = { left: ctx.limits?.importReplayChars ?? DEFAULT_IMPORT_REPLAY_CHARS };
+  const budget = opts.budget;
   const spellings = new Map<string, number>();
   for (const f of plan) spellings.set(folded(f.path), (spellings.get(folded(f.path)) ?? 0) + 1);
   await mapInBatches(plan, async (f) => {
@@ -105,6 +103,15 @@ const folded = (path: string) => path.split("/").map(comparableSegment).join("/"
 
 /** Most history characters one import may replay — see OperationLimits.importReplayChars. */
 export const DEFAULT_IMPORT_REPLAY_CHARS = 512 * 2 ** 20;
+
+/**
+ * The replay budget of one `context_import` call: the sealed heads it reads
+ * and replays — judging its files, then publishing — share it, so a small
+ * request cannot buy unbounded work from histories planted earlier.
+ */
+export function importReplayBudget(ctx: OperationContext): ReplayBudget {
+  return { left: ctx.limits?.importReplayChars ?? DEFAULT_IMPORT_REPLAY_CHARS };
+}
 
 /**
  * A name kept with its capitals (`README.md`) is never renamed to dodge a
@@ -283,6 +290,11 @@ async function assertImportable(
   const k = segs.findIndex((seg) => comparableSegment(seg) === ".versions");
   if (k !== -1 && k >= segs.length - 2 && !(k === 0 && ROOT_LEDGERS.has(segs[k + 1]))) {
     throw new ContextNestError(`${f.raw}: .versions/ holds a folder per document, not files`, "VALIDATION_FAILED");
+  }
+  // No document is named with a leading dot: such an entry is machinery — the
+  // vault's own write lock (`.versions/.lock`) among it.
+  if (k !== -1 && comparableSegment(segs[k + 1] ?? "").startsWith(".")) {
+    throw new ContextNestError(`${f.raw}: .versions/${segs[k + 1]} is the vault's own, not a document's history`, "VALIDATION_FAILED");
   }
   await assertNoCaseTwin(ctx, f);
   await assertSidecarKept(ctx, f, budget);

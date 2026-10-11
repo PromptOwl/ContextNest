@@ -112,6 +112,7 @@ import {
   historyMember,
   importedDoc,
   importRefusals,
+  importReplayBudget,
   storeOwner,
   versionsArtifact,
 } from "./import-verdicts.js";
@@ -1168,6 +1169,7 @@ async function writeImportedFile(
 
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
+  const replayBudget = importReplayBudget(ctx);
   const titleById = new Map<string, string>();
   // Every repair the import made to something it did not author — a renamed
   // path, a coerced type, a dropped tag. Reported, never fatal.
@@ -1240,7 +1242,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       )
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
     // Every verdict for the whole batch BEFORE anything lands (import-verdicts.ts).
-    const refusals = await importRefusals(ctx, rules, plan, { overwrite: input.overwrite === true, tombstones });
+    const refusals = await importRefusals(ctx, rules, plan, { overwrite: input.overwrite === true, tombstones, budget: replayBudget });
     // history.yaml goes last, and only if every other file of its history
     // landed: the files it names are the files that were judged.
     const isHistory = (f: { path: string }) => versionsArtifact(f.path)?.name === "history.yaml";
@@ -1386,6 +1388,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   if (batch.length > 0) {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
+      replayBudget,
       ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
       onProgress: ctx.onProgress,
       ...(input.note ? { note: input.note } : {}),

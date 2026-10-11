@@ -2824,3 +2824,70 @@ describe("architecture round 17: bounded patch search, the batch's own files, pa
     }
   });
 });
+
+describe("QA round 17: reads in the budget, bulk publish budgeted, the vault's own lock", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("reading and hashing a history is charged to the budget, not only replaying it", async () => {
+    const a = "---\ntitle: v\n---\n## Summary\nA\n";
+    const b = a.replace("\nA\n", "\nB\n");
+    // Junk ahead of the hunk header: costly to read and hash, free to replay.
+    const there = `${"J".repeat(50_000)}\n${createPatch("v", a, b)}`;
+    const back = `${"J".repeat(50_000)}\n${createPatch("v", b, a)}`;
+    const diff = (v: number) => (v % 2 === 0 ? there : back);
+    const history = { versions: [entry(1, a, true), ...Array.from({ length: 10 }, (_, i) => entry(i + 2, diff(i + 2)))] } as never;
+    const budget = { left: 100_000 };
+    expect(await sealedHead("d", history, (v) => (v === 1 ? a : null), (v) => (v > 1 ? diff(v) : null), budget)).toBeNull();
+    expect(budget).toMatchObject({ spent: true });
+    // The same history, with room for it, rebuilds.
+    expect(await sealedHead("d", history, (v) => (v === 1 ? a : null), (v) => (v > 1 ? diff(v) : null), { left: 10_000_000 })).toBe(a);
+  });
+
+  it("a reader that returns something other than text is no head, and the replay queue keeps working", async () => {
+    const a = "---\ntitle: x\n---\nA\n";
+    const history = { versions: [entry(1, a, true), entry(2, "x")] } as never;
+    expect(await sealedHead("d", history, () => a, (() => 5) as never)).toBeNull();
+    expect(await sealedHead("d", history, () => a, () => Promise.reject(new Error("EACCES")))).toBeNull();
+    expect(await sealedHead("d", { versions: [entry(1, a, true)] } as never, () => a, () => null)).toBe(a);
+  });
+
+  it("a bulk publish of grandfathered documents shares the import's replay budget", async () => {
+    for (const n of ["a", "b", "c"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Notes\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Notes\n${"y".repeat(5000)}\n` }, ctx);
+    }
+    await writeConfig(SUMMARY);
+    const ids = ["nodes/notes/a", "nodes/notes/b", "nodes/notes/c"];
+    const tight = { ...ctx, limits: { importReplayChars: 12_000 } };
+    const cut = await api.run<{ failed: { id?: string; error: string }[] }>("context_import", { ids }, tight);
+    expect(cut.failed.length).toBeGreaterThan(0);
+    for (const f of cut.failed) expect(f.error).toMatch(/split/i);
+    const roomy = await api.run<{ failed: unknown[] }>("context_import", { ids }, ctx);
+    expect(roomy.failed).toEqual([]);
+  });
+
+  it("an import cannot write the vault's own lock, or any dot-named entry of the root .versions/", async () => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: ".versions/.lock/owner", content: "not-your-token" }, { path: "nodes/.versions/.hidden/v1.md", content: "x" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual([".versions/.lock/owner", "nodes/.versions/.hidden/v1.md"]);
+    expect(await exists(".versions/.lock")).toBe(false);
+    const start = performance.now();
+    await api.run("context_create", { id: "nodes/after", title: "after", content: "y\n" }, ctx);
+    expect(performance.now() - start).toBeLessThan(5_000);
+  });
+});

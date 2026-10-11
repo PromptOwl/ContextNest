@@ -13,7 +13,6 @@ import { isDeepStrictEqual } from "node:util";
 import { isAbsolute, join, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { parseConfig } from "./config.js";
-import { mapInBatches } from "./concurrency.js";
 import { ConfigError } from "./errors.js";
 import { assertNotForgotten } from "./forget.js";
 import { generateIndexMd } from "./index-md-generator.js";
@@ -110,32 +109,35 @@ export async function sealedHead(
   const segment = versions.slice(start, end + 1);
   if (segment.some((e) => e.tombstone)) return null;
   try {
-    // Read, verify, then replay exactly what was verified — the segment alone.
-    // A few reads at a time: callers already batch documents, and nested full
-    // batches multiply into hundreds of open files.
-    const contents = await mapInBatches(
-      segment,
-      async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null)),
-      4,
-    );
-    return await oneAtATime(() => verifyAndReplay(segment, contents, budget));
+    // Read, verify, then replay exactly what was verified — the segment alone,
+    // one history at a time so only its artifacts are ever held.
+    return await oneAtATime(() => readVerifyReplay(segment, readKeyframe, readDiff, budget));
   } catch {
     return null;
   }
 }
 
 /**
- * Hashed and replayed, the work counted as it goes and the event loop let in
- * every so often: each diff walks the whole text, so one planted history must
- * neither stall the process nor every write judged against it.
+ * Read, hashed and replayed, every character charged as it goes — to the
+ * history's own caps and to the caller's budget — and the event loop let in
+ * every so often: a planted history must neither stall the process nor every
+ * write judged against it, however its cost is split between reading and
+ * replaying.
  */
-async function verifyAndReplay(
+async function readVerifyReplay(
   segment: DocumentHistory["versions"],
-  contents: (string | null)[],
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
   budget: ReplayBudget | undefined,
 ): Promise<string | null> {
   // Another history of this call spent the budget: the call is refused whole.
   if (budget?.spent) return null;
+  const charge = (chars: number) => {
+    if (!budget) return true;
+    budget.left -= chars;
+    if (budget.left < 0) budget.spent = true;
+    return !budget.spent;
+  };
   let sinceYield = 0;
   const step = async (chars: number) => {
     sinceYield += chars;
@@ -144,25 +146,31 @@ async function verifyAndReplay(
       await new Promise((resolve) => setImmediate(resolve));
     }
   };
-  for (const [i, c] of contents.entries()) {
-    if (c === null || computeContentHash(c) !== segment[i].content_hash) return null;
-    await step(c.length);
+  const contents: string[] = [];
+  let read = 0;
+  for (let i = 0; i < segment.length; i += READ_BATCH) {
+    const batch = await Promise.all(
+      segment
+        .slice(i, i + READ_BATCH)
+        .map(async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null))),
+    );
+    for (const [j, c] of batch.entries()) {
+      if (typeof c !== "string") return null;
+      read += c.length;
+      if (read > MAX_REPLAY_READ || !charge(c.length)) return null;
+      if (computeContentHash(c) !== segment[i + j].content_hash) return null;
+      contents.push(c);
+      await step(c.length);
+    }
   }
-  let content = contents[0] as string;
+  let content = contents[0];
   let work = 0;
-  for (const patch of contents.slice(1) as string[]) {
+  for (const patch of contents.slice(1)) {
     if (!patch) continue;
     work += content.length;
-    if (work > MAX_REPLAY_WORK) return null;
-    if (budget) {
-      budget.left -= content.length;
-      if (budget.left < 0) {
-        budget.spent = true;
-        return null;
-      }
-    }
+    if (work > MAX_REPLAY_WORK || !charge(content.length)) return null;
     const { result: next, compared } = applyPatchBounded(content, patch);
-    if (typeof next !== "string") return null;
+    if (typeof next !== "string" || !charge(compared)) return null;
     content = next;
     await step(content.length + compared);
   }
@@ -217,6 +225,15 @@ const MAX_SEALED_SEGMENT = 1000;
  * is not trusted (judged in full).
  */
 const MAX_REPLAY_WORK = 128 * 2 ** 20;
+
+/**
+ * Most characters sealedHead reads for one history (its keyframe and diffs).
+ * Past it the history is not trusted (judged in full) — and never held whole.
+ */
+const MAX_REPLAY_READ = 64 * 2 ** 20;
+
+/** Artifacts read at once: a few round trips in flight on a network mount. */
+const READ_BATCH = 4;
 
 /** Characters hashed or replayed between yields to the event loop. */
 const YIELD_EVERY = 2 ** 20;
@@ -278,9 +295,10 @@ export async function assertStructurePublish(
   rules: CompiledStructure,
   live: ContextNode,
   history?: DocumentHistory | null,
+  budget?: ReplayBudget,
 ): Promise<boolean> {
   const doc = { id: live.id, type: live.frontmatter.type, body: live.body };
-  const { violations, first } = await structurePublishViolations(storage, rules, doc, history);
+  const { violations, first } = await structurePublishViolations(storage, rules, doc, history, budget);
   enforceStructure(rules, violations);
   return first;
 }
