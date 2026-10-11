@@ -19,6 +19,7 @@ import {
   evaluate,
   Resolver,
   PackLoader,
+  invalidPackSelectors,
   VersionManager,
   CheckpointManager,
   ContextInjector,
@@ -1773,6 +1774,18 @@ program
         allErrors.push(err);
         if (!opts.json) {
           console.log(chalk.red(`✗ Circular dependency detected: ${cycle.join(" → ")}`));
+        }
+      }
+    }
+
+    // Pack selectors only fail when someone queries the pack; catch them here.
+    if (!path) {
+      for (const bad of invalidPackSelectors(await storage.readPacks())) {
+        hasErrors = true;
+        allErrors.push({ path: `pack:${bad.id}`, errors: [{ rule: "pack-query", message: bad.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ pack:${bad.id}`));
+          console.log(`  query "${bad.query}": ${bad.message}`);
         }
       }
     }

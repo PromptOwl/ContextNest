@@ -922,6 +922,20 @@ describe("[regression] ctx validate", () => {
     expect(parsed.valid).toBe(false);
     expect(parsed.errors[0].errors[0].field).toBe("title");
   });
+
+  it("flags a pack whose query won't parse, with the operator hint", () => {
+    runCtx(tmp, ["add", "nodes/clean", "--title", "Clean Doc"]);
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(
+      join(tmp, "packs", "bad.yml"),
+      "id: bad\nlabel: Bad\nquery: \"#a OR #b\"\n",
+      "utf-8",
+    );
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toContain("✗ pack:bad");
+    expect(res.stdout).toContain('spell OR as "|"');
+  });
 });
 
 // ─── index ────────────────────────────────────────────────────────────────────
