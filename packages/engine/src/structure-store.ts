@@ -33,7 +33,7 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { applyPatchBounded, type ArtifactReader } from "./reconstruct.js";
+import { applyPatchBounded, yielder, type ArtifactReader } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -207,14 +207,7 @@ async function verifyAndReplay(
 ): Promise<string | null> {
   // Another history of this call spent the budget: the call is refused whole.
   if (budget?.spent) return null;
-  let sinceYield = 0;
-  const step = async (chars: number) => {
-    sinceYield += chars;
-    if (sinceYield >= YIELD_EVERY) {
-      sinceYield = 0;
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-  };
+  const step = yielder();
   for (const [i, c] of contents.entries()) {
     if (computeContentHash(c) !== segment[i].content_hash) return null;
     await step(c.length);
@@ -310,9 +303,6 @@ export function sealedReaders(storage: NestStorage, id: string): { keyframe: Art
   const limit = { maxBytes: MAX_SEALED_ARTIFACT_BYTES };
   return { keyframe: (n) => storage.readKeyframe(id, n, limit), diff: (n) => storage.readDiff(id, n, limit) };
 }
-
-/** Characters hashed or replayed between yields to the event loop. */
-const YIELD_EVERY = 2 ** 20;
 
 /**
  * Replay work one caller allows across many sealed heads (an import judging a
