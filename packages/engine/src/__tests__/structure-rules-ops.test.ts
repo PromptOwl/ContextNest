@@ -2891,3 +2891,48 @@ describe("QA round 17: reads in the budget, bulk publish budgeted, the vault's o
     expect(performance.now() - start).toBeLessThan(5_000);
   });
 });
+
+describe("architecture round 19: patch search priced per comparison, reads outside the replay queue", () => {
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("hunks that only fit far from where they say are not trusted: each comparison costs its own weight", async () => {
+    // Every diff says line 1 but fits only at the last line, 200k lines away.
+    const kf = `${"a\n".repeat(200_000)}b\n`;
+    const there = "--- x\n+++ x\n@@ -1,1 +1,1 @@\n-b\n+c\n";
+    const back = "--- x\n+++ x\n@@ -1,1 +1,1 @@\n-c\n+b\n";
+    const diff = (v: number) => (v % 2 === 0 ? there : back);
+    const history = { versions: [entry(1, kf, true), ...Array.from({ length: 40 }, (_, i) => entry(i + 2, diff(i + 2)))] } as never;
+    const start = performance.now();
+    expect(await sealedHead("d", history, (v) => (v === 1 ? kf : null), (v) => (v > 1 ? diff(v) : null))).toBeNull();
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it("junk ahead of a patch's hunks does not buy it a longer search", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    const kf = `${"a\n".repeat(200_000)}b\n`;
+    const padded = `${"J".repeat(4_000_000)}\n--- x\n+++ x\n@@ -1,1 +1,1 @@\n-b\n+c\n`;
+    expect(applyPatchBounded(kf, padded).result).toBe(false);
+  });
+
+  it("a read that never settles for one document does not hold up another's", async () => {
+    const a = "---\ntitle: x\n---\nA\n";
+    const one = { versions: [entry(1, a, true)] } as never;
+    void sealedHead("stuck", one, () => new Promise<string | null>(() => {}), () => null);
+    const start = performance.now();
+    expect(await sealedHead("free", one, () => a, () => null)).toBe(a);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it("a version artifact over the size a reader allows is refused before it is read", async () => {
+    await api.run("context_create", { id: "nodes/big", title: "Big", content: `${"x".repeat(5000)}\n` }, ctx);
+    await expect(storage.readKeyframe("nodes/big", 1, { maxBytes: 100 })).rejects.toMatchObject({ code: "CORRUPT_HISTORY" });
+    expect(await storage.readKeyframe("nodes/big", 1, { maxBytes: 1_000_000 })).toContain("xxxx");
+  });
+});

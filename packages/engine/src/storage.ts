@@ -530,8 +530,27 @@ export interface NestStorageOptions {
  * would rebuild a version the disk does not hold.
  */
 function missingArtifact(err: unknown, docId: string): null {
+  if (err instanceof CorruptHistoryError) throw err;
   if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
   throw new CorruptHistoryError(docId, err instanceof Error ? err.message : String(err), err);
+}
+
+/** A ceiling on how many bytes a version-history read may take in. */
+export interface ReadLimit {
+  maxBytes?: number;
+}
+
+/**
+ * Refuse a history file over the caller's limit before reading it: a judge
+ * that must not hold more than so much never reads it whole. Over the limit
+ * is "cannot be read" (an I/O-class refusal), never "missing".
+ */
+async function assertWithinLimit(path: string, opts: ReadLimit, docId: string): Promise<void> {
+  if (opts.maxBytes === undefined) return;
+  const { size } = await stat(path);
+  if (size > opts.maxBytes) {
+    throw new CorruptHistoryError(docId, `${basename(path)} is ${size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
+  }
 }
 
 /** Artifact kind a vault-relative path holds, for sealing on import. */
@@ -2049,9 +2068,10 @@ export class NestStorage {
    * silently replaced by a two-entry history on the next publish — orphaning the
    * recorded versions' keyframe/diff files and taking `reconstruct` with them.
    */
-  async readHistory(docId: string): Promise<DocumentHistory | null> {
+  async readHistory(docId: string, opts: ReadLimit = {}): Promise<DocumentHistory | null> {
     let content: string;
     try {
+      await assertWithinLimit(this.historyPath(docId), opts, docId);
       content = await readFile(this.historyPath(docId), "utf-8");
     } catch (err) {
       // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
@@ -2279,7 +2299,7 @@ export class NestStorage {
   /**
    * Read a keyframe version file.
    */
-  async readKeyframe(docId: string, version: number): Promise<string | null> {
+  async readKeyframe(docId: string, version: number, opts: ReadLimit = {}): Promise<string | null> {
     const docName = basename(docId);
     const docDir = dirname(docId);
     const keyframePath = join(
@@ -2291,6 +2311,7 @@ export class NestStorage {
     );
     let raw: string;
     try {
+      await assertWithinLimit(keyframePath, opts, docId);
       raw = await readFile(keyframePath, "utf-8");
     } catch (err) {
       return missingArtifact(err, docId);
@@ -2377,7 +2398,7 @@ export class NestStorage {
    * callers fall back to `entry.diff` (see VersionManager.reconstructVersion) —
    * that fallback is what keeps pre-existing nests readable without migration.
    */
-  async readDiff(docId: string, version: number): Promise<string | null> {
+  async readDiff(docId: string, version: number, opts: ReadLimit = {}): Promise<string | null> {
     const docName = basename(docId);
     const docDir = dirname(docId);
     const diffPath = join(
@@ -2389,6 +2410,7 @@ export class NestStorage {
     );
     let raw: string;
     try {
+      await assertWithinLimit(diffPath, opts, docId);
       raw = await readFile(diffPath, "utf-8");
     } catch (err) {
       return missingArtifact(err, docId);

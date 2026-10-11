@@ -109,35 +109,104 @@ export async function sealedHead(
   const segment = versions.slice(start, end + 1);
   if (segment.some((e) => e.tombstone)) return null;
   try {
-    // Read, verify, then replay exactly what was verified — the segment alone,
-    // one history at a time so only its artifacts are ever held.
-    return await oneAtATime(() => readVerifyReplay(segment, readKeyframe, readDiff, budget));
+    if (budget?.spent) return null;
+    // Read (a few histories at a time, never stuck behind a stalled mount),
+    // then verify and replay exactly what was read — one history at a time.
+    const contents = await withReadSlot(() => readSegment(segment, readKeyframe, readDiff, budget));
+    if (contents === null) return null;
+    return await oneAtATime(() => verifyAndReplay(segment, contents, budget));
   } catch {
     return null;
   }
 }
 
+/** Charge `chars` to the budget; false once it is spent. */
+function charge(budget: ReplayBudget | undefined, chars: number): boolean {
+  if (!budget) return true;
+  budget.left -= chars;
+  if (budget.left < 0) budget.spent = true;
+  return !budget.spent;
+}
+
 /**
- * Read, hashed and replayed, every character charged as it goes — to the
- * history's own caps and to the caller's budget — and the event loop let in
- * every so often: a planted history must neither stall the process nor every
- * write judged against it, however its cost is split between reading and
- * replaying.
+ * A segment's artifacts, read a batch at a time: every character charged to
+ * the history's read cap and the caller's budget as it arrives, and a batch
+ * that does not settle in time read as "cannot be trusted" (judged in full).
  */
-async function readVerifyReplay(
+async function readSegment(
   segment: DocumentHistory["versions"],
   readKeyframe: ArtifactReader,
   readDiff: ArtifactReader,
   budget: ReplayBudget | undefined,
+): Promise<string[] | null> {
+  const contents: string[] = [];
+  let read = 0;
+  for (let i = 0; i < segment.length; i += READ_BATCH) {
+    const batch = await withinTime(
+      Promise.all(
+        segment
+          .slice(i, i + READ_BATCH)
+          .map(async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null))),
+      ),
+    );
+    if (batch === null) return null;
+    for (const c of batch) {
+      if (typeof c !== "string") return null;
+      read += c.length;
+      if (read > MAX_REPLAY_READ || !charge(budget, c.length)) return null;
+      contents.push(c);
+    }
+  }
+  return contents;
+}
+
+/** `task`'s result, or null once READ_TIMEOUT_MS pass without it. */
+async function withinTime<T>(task: Promise<T>): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), READ_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([task, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let readsInFlight = 0;
+const waitingForSlot: (() => void)[] = [];
+
+/**
+ * At most READ_SLOTS histories being read at once, process-wide: memory stays
+ * bounded (each history's read is capped), and a stalled mount holds one slot,
+ * never every vault's writes.
+ */
+async function withReadSlot<T>(task: () => Promise<T>): Promise<T> {
+  if (readsInFlight < READ_SLOTS) readsInFlight++;
+  else await new Promise<void>((resolve) => waitingForSlot.push(resolve));
+  try {
+    return await task();
+  } finally {
+    const next = waitingForSlot.shift();
+    if (next) next();
+    else readsInFlight--;
+  }
+}
+
+/**
+ * Hashed and replayed, every character — and every comparison a patch spends
+ * finding where it fits — charged to the history's own cap and to the
+ * caller's budget, the event loop let in every so often: a planted history
+ * must neither stall the process nor every write judged against it.
+ */
+async function verifyAndReplay(
+  segment: DocumentHistory["versions"],
+  contents: string[],
+  budget: ReplayBudget | undefined,
 ): Promise<string | null> {
   // Another history of this call spent the budget: the call is refused whole.
   if (budget?.spent) return null;
-  const charge = (chars: number) => {
-    if (!budget) return true;
-    budget.left -= chars;
-    if (budget.left < 0) budget.spent = true;
-    return !budget.spent;
-  };
   let sinceYield = 0;
   const step = async (chars: number) => {
     sinceYield += chars;
@@ -146,31 +215,19 @@ async function readVerifyReplay(
       await new Promise((resolve) => setImmediate(resolve));
     }
   };
-  const contents: string[] = [];
-  let read = 0;
-  for (let i = 0; i < segment.length; i += READ_BATCH) {
-    const batch = await Promise.all(
-      segment
-        .slice(i, i + READ_BATCH)
-        .map(async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null))),
-    );
-    for (const [j, c] of batch.entries()) {
-      if (typeof c !== "string") return null;
-      read += c.length;
-      if (read > MAX_REPLAY_READ || !charge(c.length)) return null;
-      if (computeContentHash(c) !== segment[i + j].content_hash) return null;
-      contents.push(c);
-      await step(c.length);
-    }
+  for (const [i, c] of contents.entries()) {
+    if (computeContentHash(c) !== segment[i].content_hash) return null;
+    await step(c.length);
   }
   let content = contents[0];
   let work = 0;
   for (const patch of contents.slice(1)) {
     if (!patch) continue;
     work += content.length;
-    if (work > MAX_REPLAY_WORK || !charge(content.length)) return null;
+    if (work > MAX_REPLAY_WORK || !charge(budget, content.length)) return null;
     const { result: next, compared } = applyPatchBounded(content, patch);
-    if (typeof next !== "string" || !charge(compared)) return null;
+    work += compared;
+    if (typeof next !== "string" || work > MAX_REPLAY_WORK || !charge(budget, compared)) return null;
     content = next;
     await step(content.length + compared);
   }
@@ -235,6 +292,25 @@ const MAX_REPLAY_READ = 64 * 2 ** 20;
 /** Artifacts read at once: a few round trips in flight on a network mount. */
 const READ_BATCH = 4;
 
+/** Histories being read at once, process-wide. */
+const READ_SLOTS = 4;
+
+/** How long one batch of artifact reads may take before the head is not trusted. */
+const READ_TIMEOUT_MS = 10_000;
+
+/**
+ * The most bytes one version file may hold to be read for a sealed head —
+ * twice the read cap in characters, room for an encrypted artifact's armour.
+ * Larger is not trusted (judged in full) and never read.
+ */
+export const MAX_SEALED_ARTIFACT_BYTES = 2 * MAX_REPLAY_READ;
+
+/** The vault's own readers for a sealed head: no artifact over the size a head may read. */
+export function sealedReaders(storage: NestStorage, id: string): { keyframe: ArtifactReader; diff: ArtifactReader } {
+  const limit = { maxBytes: MAX_SEALED_ARTIFACT_BYTES };
+  return { keyframe: (n) => storage.readKeyframe(id, n, limit), diff: (n) => storage.readDiff(id, n, limit) };
+}
+
 /** Characters hashed or replayed between yields to the event loop. */
 const YIELD_EVERY = 2 ** 20;
 
@@ -276,7 +352,7 @@ export async function structurePublishViolations(
   const first = !known || known.versions.length === 0;
   // The view that was hashed: any bytes with this head's hashes get the same verdict.
   const head = known
-    ? await sealedHeadView(id, known, (v) => storage.readKeyframe(id, v), (v) => storage.readDiff(id, v), budget)
+    ? await sealedHeadView(id, known, sealedReaders(storage, id).keyframe, sealedReaders(storage, id).diff, budget)
     : null;
   if (!head?.node) return { violations: checkDocument(rules, live), first };
   return { violations: checkUpdate(rules, head.doc, live), first };

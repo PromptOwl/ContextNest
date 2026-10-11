@@ -218,13 +218,8 @@ export function importVerdict(
   if (versioned) {
     const docId = versioned[1] ? `${versioned[1]}/${versioned[2]}` : versioned[2];
     const file = versioned[3];
-    if (/^v\d+\.(md|diff)$/.test(file)) {
-      const hash = computeContentHash(content);
-      if (index.contentHashes.has(hash)) {
-        return `${path} restores content a forget erased (${hash})`;
-      }
-      return null;
-    }
+    // A version file's bytes were checked against every erased hash above.
+    if (/^v\d+\.(md|diff)$/.test(file)) return null;
     if (/^[a-f0-9]{64}\.pdf$/.test(file)) {
       return index.pdfHashes.has(`sha256:${file.slice(0, 64)}`)
         ? `${path} restores a PDF binary a forget erased`

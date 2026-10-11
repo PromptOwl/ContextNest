@@ -10,7 +10,7 @@
  * (storage reads).
  */
 
-import { applyPatch } from "diff";
+import { applyPatch, parsePatch, type StructuredPatch } from "diff";
 import type { DocumentHistory } from "./types.js";
 import { ContextNestError, ForgottenVersionError } from "./errors.js";
 
@@ -107,17 +107,30 @@ export async function reconstructFromHistory(
  * `applyPatch`, its position search bounded. A hunk that does not fit where its
  * header says is looked for line by line across the whole text — lines × hunk
  * length, in one synchronous call — so a crafted patch could hold the process
- * for as long as it likes. The comparisons are capped near the patch's own
- * size: a patch that fits where it says, or close by, never comes near the
- * cap. Past it the patch does not apply (`false`). `compared` is the work done.
+ * for as long as it likes. The patch is parsed once; its cap is the work its
+ * own hunks do where they fit (one weighted comparison per line kept or
+ * removed — junk ahead of the hunks buys nothing), twice over plus a little
+ * slack for a nearby offset. Past it the patch does not apply (`false`).
+ * `compared` is the work done, in the same units as characters replayed.
  */
 export function applyPatchBounded(content: string, patch: string): { result: string | false; compared: number } {
-  let compared = 0;
-  const cap = 2 * patch.length + PATCH_SEARCH_SLACK;
+  let parsed: StructuredPatch[];
   try {
-    const result = applyPatch(content, patch, {
+    parsed = parsePatch(patch);
+  } catch {
+    return { result: false, compared: 0 };
+  }
+  if (parsed.length !== 1) return { result: false, compared: 0 };
+  let own = 0;
+  for (const hunk of parsed[0].hunks) {
+    for (const line of hunk.lines) if (line[0] === " " || line[0] === "-") own += COMPARE_WEIGHT + line.length;
+  }
+  const cap = 2 * own + PATCH_SEARCH_SLACK;
+  let compared = 0;
+  try {
+    const result = applyPatch(content, parsed[0], {
       compareLine: (_line, line, _op, want) => {
-        compared += 1 + Math.min(line?.length ?? 0, want.length);
+        compared += COMPARE_WEIGHT + Math.min(line?.length ?? 0, want.length);
         if (compared > cap) throw PATCH_TOO_FAR;
         return line === want;
       },
@@ -131,7 +144,13 @@ export function applyPatchBounded(content: string, patch: string): { result: str
 
 const PATCH_TOO_FAR = new Error("the patch does not fit where it says");
 
-/** Characters of line comparison a patch may spend beyond twice its own size. */
+/**
+ * What one line comparison costs, in characters replayed: trying a candidate
+ * position is far dearer than walking one character of text.
+ */
+const COMPARE_WEIGHT = 32;
+
+/** Comparison work a patch may spend beyond twice its own, for a nearby offset. */
 const PATCH_SEARCH_SLACK = 2 ** 20;
 
 /** A settled read's value, or its error rethrown. */

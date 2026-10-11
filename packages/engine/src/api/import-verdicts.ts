@@ -25,7 +25,7 @@ import {
   type StructureDoc,
   type Violation,
 } from "../structure.js";
-import { sealedHeadView, structurePublishViolations, type ReplayBudget } from "../structure-store.js";
+import { sealedHeadView, sealedReaders, structurePublishViolations, type ReplayBudget } from "../structure-store.js";
 import { importVerdict, type TombstoneIndex } from "../tombstones.js";
 import type { ContextNode, DocumentHistory } from "../types.js";
 import { readIfExists, type OperationContext } from "./context.js";
@@ -92,7 +92,7 @@ export async function importRefusals(
   // Over budget, some verdict was cut short: none of this call is trusted.
   if (budget.spent) {
     for (const f of plan) {
-      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls`);
+      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls, or run it again to continue`);
     }
   }
   return refused;
@@ -164,6 +164,12 @@ export function importedDoc(relPath: string, content: string): StructureDoc | nu
 
 /** Where a document's history and staged edits live: `<dir>/<store>/<doc>/…`. */
 const PER_DOCUMENT_STORES = [".versions", "_suggestions"];
+
+/**
+ * The largest history.yaml an import judges (about 50k versions). Larger is
+ * unreadable to it: never parsed, and its set is refused.
+ */
+const HISTORY_LIMIT = { maxBytes: 16 * 2 ** 20 };
 
 /** What the vault root's .versions/ holds besides documents' folders. */
 const ROOT_LEDGERS = new Set(["context_history.yaml", "context_latest.yaml", "chain_events.yaml"]);
@@ -355,10 +361,11 @@ async function assertSidecarKept(
  * `pdf.sha256` that head seals.
  */
 async function historyPdf(ctx: OperationContext, owner: string, budget: ReplayBudget): Promise<{ pdf: boolean; sha256?: string }> {
-  const history = await ctx.storage.readHistory(owner).catch(() => undefined);
+  const history = await ctx.storage.readHistory(owner, HISTORY_LIMIT).catch(() => undefined);
   if (history === null) return { pdf: false };
   if (history === undefined) return { pdf: true };
-  const head = await sealedHeadView(owner, history, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n), budget);
+  const disk = sealedReaders(ctx.storage, owner);
+  const head = await sealedHeadView(owner, history, disk.keyframe, disk.diff, budget);
   if (!head?.node) return { pdf: true };
   return head.node.frontmatter.type === "pdf" ? { pdf: true, sha256: head.node.frontmatter.pdf?.sha256 } : { pdf: false };
 }
@@ -382,7 +389,7 @@ export async function archiveReplacedPdf(ctx: OperationContext, f: { path: strin
   const onDisk = await vaultBytesIfExists(ctx, f.path);
   if (!onDisk || sha256Bytes(onDisk) === sha256Bytes(Buffer.from(f.content, "utf-8"))) return;
   const owner = f.path.slice(0, -".pdf".length);
-  const history = await ctx.storage.readHistory(owner).catch(() => undefined);
+  const history = await ctx.storage.readHistory(owner, HISTORY_LIMIT).catch(() => undefined);
   if (history !== null || (await readIfExists(ctx, owner).catch(() => null))) await ctx.storage.archivePdfBinary(owner, onDisk);
 }
 
@@ -433,7 +440,7 @@ async function historySetVerdict(
   const text = set.get("history.yaml");
   let onDisk: DocumentHistory | null;
   try {
-    onDisk = await ctx.storage.readHistory(owner);
+    onDisk = await ctx.storage.readHistory(owner, HISTORY_LIMIT);
   } catch (err) {
     // Unparseable: never trusted, so nothing to keep — an import may replace
     // it. Unreadable (EMFILE, EACCES): what it holds is unknown, so nothing is
@@ -454,13 +461,14 @@ async function historySetVerdict(
     history = null;
   }
   if (text !== undefined && !history) return refuse(`${owner}'s history.yaml is not a valid history`);
-  const keyframe = (n: number) => set.get(`v${n}.md`) ?? ctx.storage.readKeyframe(owner, n);
-  const diff = (n: number) => set.get(`v${n}.diff`) ?? ctx.storage.readDiff(owner, n);
+  const disk = sealedReaders(ctx.storage, owner);
+  const keyframe = (n: number) => set.get(`v${n}.md`) ?? disk.keyframe(n);
+  const diff = (n: number) => set.get(`v${n}.diff`) ?? disk.diff(n);
   // The head the disk holds now, if it verifies: grandfathering already trusts
   // it, so a head this call brings is judged as an update over it — only for
   // what it newly breaks, as any other write to this document is.
   const here = onDisk
-    ? await sealedHeadView(owner, onDisk, (n) => ctx.storage.readKeyframe(owner, n), (n) => ctx.storage.readDiff(owner, n), budget)
+    ? await sealedHeadView(owner, onDisk, disk.keyframe, disk.diff, budget)
     : null;
   // A head that does not parse is no baseline (as at publish): judged in full.
   const judge = (head: StructureDoc) => (here?.node ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
@@ -476,15 +484,15 @@ async function historySetVerdict(
       const m = set.get(name);
       return m !== undefined && computeContentHash(m) === pinnedHash.get(n);
     };
-    const pinned = (name: string, n: number, read: () => Promise<string | null>) => (counts(name, n) ? set.get(name)! : read());
+    const pinned = (name: string, n: number, read: () => string | null | Promise<string | null>) => (counts(name, n) ? set.get(name)! : read());
     // With no file of this call pinned there, the kept head is the head here.
     const anyPinned = onDisk.versions.some((e) => counts(`v${e.version}.md`, e.version) || counts(`v${e.version}.diff`, e.version));
     const kept = anyPinned
       ? await sealedHeadView(
           owner,
           onDisk,
-          (n) => pinned(`v${n}.md`, n, () => ctx.storage.readKeyframe(owner, n)),
-          (n) => pinned(`v${n}.diff`, n, () => ctx.storage.readDiff(owner, n)),
+          (n) => pinned(`v${n}.md`, n, () => disk.keyframe(n)),
+          (n) => pinned(`v${n}.diff`, n, () => disk.diff(n)),
           budget,
         )
       : here;

@@ -297,7 +297,7 @@ export async function publishDocuments(
       // Judged before historyOrRepair: a refused publish quarantines nothing.
       const budget = options.replayBudget;
       const cutShort = () =>
-        new ContextNestError(`${docId}: this call replays more version history than one call allows — split it into smaller calls`, "VALIDATION_FAILED");
+        new ContextNestError(`${docId}: this call replays more version history than one call allows — split it into smaller calls, or run it again to continue`, "VALIDATION_FAILED");
       if (budget?.spent) throw cutShort();
       let firstPublish = false;
       try {
