@@ -503,7 +503,7 @@ on it keep working. Opt in with `ctx config set review on`. Re-running
 ### Structure rules
 
 A nest owner can lay down hard rules for the vault's layout in
-`.context/config.yaml`: which folders may exist, which node types each takes,
+`.context/config.yaml` (full guide: [docs/structure-rules.md](docs/structure-rules.md)): which folders may exist, which node types each takes,
 the shape of folder and file names, the template a folder's files start from
 (and the headings they must keep), and the subfolders and files every matching
 folder must have.
