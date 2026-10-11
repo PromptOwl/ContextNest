@@ -90,7 +90,14 @@ import {
   expandServerVaults,
   folderFromId,
   remoteFetchRecipe,
+  remoteTaskLog,
 } from "./remote.js";
+import {
+  hasTaskFieldArgs,
+  localTaskFieldsError,
+  parseTaskLogStatus,
+  taskFieldArgs,
+} from "./task-fields.js";
 import { planPull, applyPull, type PullStep } from "./pull.js";
 import {
   listJsonEntry,
@@ -220,6 +227,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["read", "Show a document (add --html to open it in the browser)"],
       ["update", "Edit a document, then publish a new version (held instead when review is on)"],
       ["review", "List, approve or reject writes held for review"],
+      ["task", "Log what you did on a task in a remote nest (working / done / blocked)"],
       ["delete", "Remove a document and its version history"],
     ],
   },
@@ -2533,12 +2541,18 @@ program
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected|forgotten; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
+  .option("--assignee <email>", 'Remote nest: only items assigned to this email ("none" = unassigned)')
+  .option("--priority <p>", "Remote nest: only this priority (urgent|high|medium|low|none)")
+  .option("--due-before <date>", "Remote nest: only items due on or before YYYY-MM-DD")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteList(remote, opts);
       return;
+    }
+    if (opts.assignee || opts.priority || opts.dueBefore) {
+      throw localTaskFieldsError("--assignee / --priority / --due-before");
     }
     const storage = getStorage();
     // Aliases collapse here; the operation owns the rest of the filtering,
@@ -2596,11 +2610,18 @@ program
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
+  .option("--assignee <email>", 'Remote nest: assign to someone on its roster ("" or none unassigns)')
+  .option("--due <date>", 'Remote nest: due date YYYY-MM-DD ("" or none clears)')
+  .option("--priority <p>", 'Remote nest: urgent|high|medium|low ("" or none clears)')
+  .option("--parent <id>", 'Remote nest: parent node id, making this a sub-item ("" or none clears)')
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteUpdate(remote, path, opts);
       return;
+    }
+    if (hasTaskFieldArgs(taskFieldArgs(opts))) {
+      throw localTaskFieldsError("--assignee / --due / --priority / --parent");
     }
     const storage = getStorage();
     // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
@@ -2664,6 +2685,29 @@ program
     console.log(chalk.green(`Updated and published ${result.id}`));
     console.log(`  Version: ${result.version}`);
     console.log(`  Checkpoint: ${result.checkpoint}`);
+  });
+
+// ─── ctx task ─────────────────────────────────────────────────────────────────
+// Tasks live on a Community nest; this is how an agent says what it did.
+
+const taskCmd = program
+  .command("task")
+  .description("Work with tasks on a remote nest");
+
+taskCmd
+  .command("log <path>")
+  .description(
+    "Log an interaction on a task — attributed to you, the API key and the agent (shows in the task's activity)",
+  )
+  .requiredOption("--note <text>", "What you did or found")
+  .option("--status <status>", "working | done | blocked", parseTaskLogStatus)
+  .option("--claim", "Assign the task to yourself if it is unassigned")
+  .option("--agent <name>", "Agent name to record (default: $CONTEXTNEST_AGENT)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (!remote) throw localTaskFieldsError("`ctx task log`");
+    await remoteTaskLog(remote, path, opts);
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────

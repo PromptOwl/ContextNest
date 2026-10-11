@@ -31,6 +31,15 @@ import { confirmOrExit, isDryRun } from "./safety.js";
 import { parseRecipeManifest, manifestSources } from "./pull.js";
 import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
+  TASK_FIELD_FLAGS,
+  hasTaskFieldArgs,
+  taskFieldArgs,
+  taskFieldsSuffix,
+  taskFiltersIgnored,
+  taskListFilters,
+  unappliedTaskFields,
+} from "./task-fields.js";
+import {
   listJsonEntry,
   queryJsonPayload,
   searchLimit,
@@ -278,13 +287,27 @@ interface NodeSummary {
   nest?: { id: string; name: string };
   /** Set by labelFanout: the `--vault <server>/<nest>` that addresses this hit. */
   vault?: string;
+  /** Task (board) fields — reported by a Community nest when set. */
+  assignee?: string;
+  due?: string;
+  priority?: string;
+  parent?: string;
 }
 
 // ─── Read surface ───────────────────────────────────────────────────────────
 
 export async function remoteList(
   target: RemoteTarget,
-  opts: { type?: string; status?: string; tag?: string; limit?: number; json?: boolean },
+  opts: {
+    type?: string;
+    status?: string;
+    tag?: string;
+    limit?: number;
+    json?: boolean;
+    assignee?: string;
+    priority?: string;
+    dueBefore?: string;
+  },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     // Filters go to the NEST, exactly as they do locally. Re-deciding them here
@@ -292,12 +315,21 @@ export async function remoteList(
     // once already), and it cannot recover documents the nest already withheld
     // — an unfiltered context_list hides retired docs, so a client-side
     // `--status rejected` could only ever return nothing.
+    const taskFilters = taskListFilters(opts);
     const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {
       ...(opts.type ? { type: opts.type } : {}),
       ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
       ...(opts.tag ? { tag: opts.tag } : {}),
       ...(opts.limit ? { limit: opts.limit } : {}),
+      // Task filters, like the rest, are decided by the nest.
+      ...taskFilters,
     });
+    if (taskFiltersIgnored(taskFilters, out.documents)) {
+      throw new ContextNestError(
+        `"${target.alias}" ignored --assignee / --priority / --due-before — its server predates task filters. Upgrade the Community server.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
     const docs = await labelFanout(target, conn, out.documents);
 
     if (opts.json) {
@@ -310,7 +342,7 @@ export async function remoteList(
     }
     console.log(chalk.bold(`${docs.length} document(s):\n`));
     for (const d of docs) {
-      console.log(`  ${chalk.cyan(d.vault ? `${d.vault}:${d.id}` : d.id)} [${d.type || "document"}] ${d.status || "draft"}`);
+      console.log(`  ${chalk.cyan(d.vault ? `${d.vault}:${d.id}` : d.id)} [${d.type || "document"}] ${d.status || "draft"}${chalk.dim(taskFieldsSuffix(d))}`);
       console.log(`    ${d.title}`);
     }
   });
@@ -676,8 +708,18 @@ export async function remoteAdd(
 export async function remoteUpdate(
   target: RemoteTarget,
   path: string,
-  opts: { title?: string; tags?: string; status?: string; body?: string },
+  opts: {
+    title?: string;
+    tags?: string;
+    status?: string;
+    body?: string;
+    assignee?: string;
+    due?: string;
+    priority?: string;
+    parent?: string;
+  },
 ): Promise<void> {
+  const fields = taskFieldArgs(opts);
   // A rename stays refused: Community's context_update reads `title` as the
   // node SELECTOR, so sending it next to `id` would be silently ignored.
   if (opts.title !== undefined) {
@@ -686,8 +728,16 @@ export async function remoteUpdate(
       "NOT_IMPLEMENTED",
     );
   }
-  if (opts.body === undefined && opts.tags === undefined && opts.status === undefined) {
-    throw new ContextNestError("Nothing to update — pass --body, --tags or --status.", "VALIDATION_FAILED");
+  if (
+    opts.body === undefined &&
+    opts.tags === undefined &&
+    opts.status === undefined &&
+    !hasTaskFieldArgs(fields)
+  ) {
+    throw new ContextNestError(
+      "Nothing to update — pass --body, --tags, --status, --assignee, --due, --priority or --parent.",
+      "VALIDATION_FAILED",
+    );
   }
   await confirmRemoteWrite(
     target,
@@ -695,17 +745,33 @@ export async function remoteUpdate(
   );
   await withRemote(target, async (conn) => {
     // Same fields the local branch sends; tags REPLACE, as locally.
-    const updated = await conn.run<{ id: string; version: number; status?: string }>("context_update", {
-      id: normalizeDocumentId(path),
-      ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
-      ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
-      ...(opts.status !== undefined ? { status: normalizeStatus(opts.status) } : {}),
-    });
+    const updated = await conn.run<{ id: string; version: number; status?: string; [k: string]: unknown }>(
+      "context_update",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
+        ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
+        ...(opts.status !== undefined ? { status: normalizeStatus(opts.status) } : {}),
+        // Task fields: the nest validates them (roster, date, priority, parent).
+        ...fields,
+      },
+    );
     // The nest's stewardship decides whether the edit published, so report
     // the status it came back with rather than assuming "published".
     console.log(chalk.green(`Updated ${updated.id} (remote: ${target.alias})`));
     console.log(`  Version: ${updated.version}`);
     if (updated.status) console.log(`  Status: ${updated.status}`);
+    for (const k of TASK_FIELD_FLAGS) {
+      if (k in fields) console.log(`  ${k[0].toUpperCase()}${k.slice(1)}: ${String(updated[k] ?? "(cleared)")}`);
+    }
+    // An older server drops the arguments and still reports success.
+    const dropped = unappliedTaskFields(fields, updated);
+    if (dropped.length) {
+      throw new ContextNestError(
+        `"${target.alias}" did not apply ${dropped.map((k) => `--${k}`).join(", ")} — its server predates task fields over MCP. Upgrade the Community server.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
   });
 }
 
@@ -801,6 +867,63 @@ export async function remotePublish(
     console.log(chalk.green(`Published ${out.id} (remote: ${target.alias})`));
     console.log(`  Version: ${out.version}`);
     console.log(`  Checkpoint: ${out.checkpoint}`);
+  });
+}
+
+/** One logged interaction, as context_task_log returns it. */
+interface TaskLogEntry {
+  id: string;
+  actor: string;
+  status?: string;
+  note: string;
+  key?: { label?: string; prefix?: string; scoped: boolean };
+  client?: { agent?: string };
+  at: string;
+}
+
+/**
+ * `ctx task log <path> --note "…" [--status working|done|blocked] [--claim]` —
+ * register what was done on a task (Community `context_task_log`). The server
+ * attributes it to the key's owner, plus the key itself and `agent`.
+ */
+export async function remoteTaskLog(
+  target: RemoteTarget,
+  path: string,
+  opts: { note: string; status?: string; claim?: boolean; agent?: string; json?: boolean },
+): Promise<void> {
+  await withRemote(target, async (conn) => {
+    if (!(await conn.toolNames()).has("context_task_log")) {
+      throw new ContextNestError(
+        `"${target.alias}" has no task log (context_task_log) — it needs a newer Community server.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
+    const agent = opts.agent || process.env.CONTEXTNEST_AGENT;
+    const out = await conn.run<{
+      id: string;
+      entry: TaskLogEntry;
+      claim?: "assigned" | "already_yours" | "assigned_to_other";
+      assignee?: string;
+    }>("context_task_log", {
+      id: normalizeDocumentId(path),
+      note: opts.note,
+      ...(opts.status ? { status: opts.status } : {}),
+      ...(opts.claim ? { claim: true } : {}),
+      ...(agent ? { client: { agent } } : {}),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    const e = out.entry;
+    const key = e.key ? ` (key ${e.key.label || e.key.prefix})` : "";
+    console.log(chalk.green(`Logged on ${out.id} (remote: ${target.alias})`));
+    console.log(`  ${e.client?.agent ?? "ctx"}${key} on behalf of ${e.actor}${e.status ? ` · ${e.status}` : ""}`);
+    console.log(`  ${e.note}`);
+    if (out.claim === "assigned") console.log(chalk.cyan(`  Assigned to you (${out.assignee}).`));
+    if (out.claim === "assigned_to_other") {
+      console.log(chalk.yellow(`  Not claimed — already assigned to ${out.assignee}.`));
+    }
   });
 }
 
