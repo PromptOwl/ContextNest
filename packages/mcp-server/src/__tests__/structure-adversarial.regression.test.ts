@@ -72,7 +72,7 @@ describe("[regression] MCP server — structure adversarial probes", () => {
     for (const id of planted) expect(await readFile(join(vault, `${id}.md`), "utf-8"), id).toBe(raw);
   });
 
-  // FINDING (r8 rx / calls-r8, still open at 4336ffe): list_documents trims
+  // r8 rx / calls-r8 (fixed in round 25): list_documents trimmed
   // its path with `/\/+$/` before normalizeDocumentId refuses the length, and
   // that regex retries from every slash of a run that does not end the string:
   // quadratic, synchronous, on the server's only thread (40k slashes ≈ 1.3 s,

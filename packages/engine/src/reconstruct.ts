@@ -114,9 +114,9 @@ export async function reconstructFromHistory(
  * the end that is: a crafted patch could hold the process, or its memory, for
  * as long as it likes. The engine's own patches always fit where they say: a
  * replayed diff was made against exactly the text it follows (createVersion
- * falls back to a keyframe otherwise). A suggestion or held edit is checked
- * for staleness by its body only, so one whose frontmatter moved on since it
- * was staged does not apply here — its callers report it stale. Anything
+ * falls back to a keyframe otherwise). A suggestion or held edit goes through
+ * `applyStagedEdit` (suggestions.ts), which also checks the body it yields —
+ * one that no longer lands where it was made is reported stale. Anything
  * else does not apply (`false`). `compared` is the work done, in the same
  * units as characters replayed.
  */

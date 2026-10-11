@@ -2921,7 +2921,7 @@ describe("architecture round 19: patch search priced per comparison, reads outsi
     expect(applyPatchBounded(kf, padded).result).toBe(false);
   });
 
-  it("a read still pending for one document does not hold up another's while read slots remain", async () => {
+  it("a read still pending for one document does not hold up another's", async () => {
     const a = "---\ntitle: x\n---\nA\n";
     const one = { versions: [entry(1, a, true)] } as never;
     let release!: (v: string | null) => void;

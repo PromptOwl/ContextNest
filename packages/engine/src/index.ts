@@ -96,6 +96,7 @@ export {
   quarantineSuggestion,
   listSuggestions,
   readSuggestion,
+  applyStagedEdit,
 } from "./suggestions.js";
 export type {
   StageSuggestionInput,

@@ -1856,7 +1856,7 @@ The optional `review` key (`on` | `off`; YAML 1.1 booleans `true`/`false` are ac
 - A node that is not yet published is written in place with `status: pending_review` and no version; approving it publishes v1.
 - An edit to a published node is staged as a suggestion under `_suggestions/` with `source: manual-suggestion` and a note beginning `review-hold`. The canonical file and hash chain are untouched, so the published version keeps serving. A later held edit to the same node builds on the earlier one and supersedes it.
 
-No version or checkpoint is created until the hold is approved; approval performs exactly the write and publish the hold deferred. A hold whose base is no longer the node's latest version is stale and MUST NOT be approved. A vault without the key predates the gate and publishes immediately.
+No version or checkpoint is created until the hold is approved; approval performs exactly the write and publish the hold deferred. A hold is stale, and MUST NOT be approved, when the node's latest version has a different body than the one it was staged against, or when its edit no longer applies to that version exactly where it was made and yields the body it proposed (a frontmatter-only change that moves no line it touches leaves it approvable). A vault without the key predates the gate and publishes immediately.
 
 #### 11.1.1 Structure rules
 

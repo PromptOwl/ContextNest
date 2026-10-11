@@ -908,3 +908,20 @@ describe("enforceStructure", () => {
     expect(() => enforceStructure(rules(), [])).not.toThrow();
   });
 });
+
+describe("UX review: messages and warnings an owner can act on", () => {
+  it("warns when a template requires a section its own body does not have as a heading", () => {
+    const r = compileStructure({
+      folders: { m: { template: "meeting-note" } },
+      templates: { "meeting-note": { body: "## Attendees\n\n## Decisions\n", required_sections: ["Decisions", "Risks"] } },
+    });
+    const warnings = describeStructure(r).warnings ?? [];
+    expect(warnings.join("\n")).toMatch(/templates\.meeting-note\.required_sections: "Risks" is not a heading in the template's body/);
+    expect(warnings.join("\n")).not.toMatch(/"Decisions"/);
+  });
+
+  it("names an unclosed brace in a name format as such", () => {
+    expect(() => compileStructure({ folders: { m: { file_name: "{date" } } })).toThrow(/"\{date" opens a \{ that never closes/);
+    expect(() => compileStructure({ folders: { m: { file_name: "date}-{slug}" } } })).toThrow(/closes a \} that never opened/);
+  });
+});

@@ -2,8 +2,8 @@
  * The QA rounds' adversarial probes against the structure rules (spec
  * §11.1.1) and the import, replay, sidecar and tombstone defences around
  * them, kept as tests so every attack re-runs on every PR. Each test names
- * the round and the probe that found it (`r19 bigread4` is /tmp/qa-r19's
- * bigread4.mjs). Attacks with a test in structure-rules-ops.test.ts are not
+ * the QA round and the probe that found it (`r19 bigread4`: round 19's
+ * bigread4 probe). Attacks with a test in structure-rules-ops.test.ts are not
  * repeated here.
  *
  * Sizes are scaled down for CI. The assertions are on what the engine decides
@@ -184,41 +184,7 @@ describe("patch application and replay", () => {
     expect(performance.now() - started).toBeLessThan(15_000);
   });
 
-  it("r21 fuzz: a patch the engine makes applies back to exactly its target, and never to a wrong text", () => {
-    let seed = 1;
-    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
-    const pick = <T>(a: T[]) => a[Math.floor(rnd() * a.length)];
-    const words = ["a", "b", "", "---", "## Summary", " ", "x y", "é", "\t", "\\", "+", "-", "@@ -1 +1 @@"];
-    let lone = 0;
-    for (let i = 0; i < 3_000; i++) {
-      const mode = pick(["lf", "crlf", "mixed", "cr"]);
-      const eol = () => (mode === "lf" ? "\n" : mode === "crlf" ? "\r\n" : mode === "cr" ? pick(["\r", "\n"]) : pick(["\n", "\r\n", "\r"]));
-      let a = "";
-      for (let j = Math.floor(rnd() * 40); j > 0; j--) a += pick(words) + eol();
-      if (rnd() < 0.3) a = a.replace(/(\r\n|\r|\n)$/, "");
-      const lines = a.split(/(?<=\n)/);
-      for (let k = 1 + Math.floor(rnd() * 5); k > 0; k--) {
-        const p = Math.floor(rnd() * (lines.length + 1));
-        const o = rnd();
-        if (o < 0.4) lines.splice(p, 0, pick(words) + eol());
-        else if (o < 0.7) lines.splice(p, 1);
-        else lines[p] = pick(words) + eol();
-      }
-      if (rnd() < 0.2) lines.push(pick(words));
-      const b = lines.filter((x) => x !== undefined).join("");
-      const { result } = applyPatchBounded(a, createPatch("v", a, b, "v1", "v2"));
-      // A lone CR is no line break to the patch library, so a patch across one
-      // may not apply (createVersion then writes a keyframe) — but whatever
-      // applies is exactly the target.
-      if (/\r(?!\n)/.test(a + b)) {
-        lone++;
-        if (result !== false) expect(result, JSON.stringify([a, b])).toBe(b);
-      } else {
-        expect(result, JSON.stringify([a, b])).toBe(b);
-      }
-    }
-    expect(lone).toBeGreaterThan(0);
-  });
+  // r21 fuzz: the patch round-trip property test lives in structure-rules-ops.test.ts.
 
   it("r21 holdplant: a review hold planted through an import never lands among the document's held edits", async () => {
     const id = "nodes/notes/d";
@@ -705,11 +671,10 @@ describe("forget and tombstones", () => {
 
   it.each(SPELLINGS)("r10 chainev: an import of %j without overwrite never erases a forget's tombstone", (path) => eraseTombstones(path, false));
 
-  // FINDING (r10 chainev, still open at 4336ffe): with overwrite, each of these
-  // spellings is planned as .versions/chain_events.yaml ("path slugified") and
-  // written verbatim over the vault's chain-event log, so the forget's
-  // tombstones are gone and the pre-forget copy imports at another path. The
-  // plain spelling is replayed as imported forgets instead, and holds.
+  // r10 chainev (fixed in round 25): with overwrite, each of these spellings
+  // was planned as .versions/chain_events.yaml and written over the vault's
+  // chain-event log, erasing the forget's tombstones. The importer now folds
+  // the path as the planner does (isChainEventLog) and merges it as the log.
   it.each(SPELLINGS)("r10 chainev: an import of %j with overwrite never erases a forget's tombstone", (path) => eraseTombstones(path, true));
 });
 
@@ -761,7 +726,7 @@ describe("encryption", () => {
     expect((await storage.readDocument("nodes/notes/d")).frontmatter).toMatchObject({ title: "d", type: "document" });
   });
 
-  // FINDING (r15 s3enc, still open at 4336ffe): an import lands a sealed .md
+  // FINDING (r15 s3enc, open — PRD §10.1 known items): an import lands a sealed .md
   // whose authenticated text was altered (here its title, in an encrypted
   // vault's own export) verbatim — sealed bytes are written as they come —
   // and from then on context_list and context_verify fail for the whole vault
@@ -895,7 +860,7 @@ describe("document parsing", () => {
     expect((await refusal("context_publish", { id })).code).toBe("VALIDATION_FAILED");
   });
 
-  // FINDING (r12 badfm / r8 badsib, still open at 4336ffe): an import lands a
+  // FINDING (r12 badfm / r8 badsib, open — PRD §10.1 known items): an import lands a
   // .md whose frontmatter does not parse (rules on or off), and from then on
   // context_list and context_search throw YAMLException, and every write
   // writes its document and then throws from the checkpoint crawl
@@ -914,7 +879,7 @@ describe("document parsing", () => {
     await api.run("context_list", {}, ctx);
   });
 
-  // FINDING (r8 jats / rx, still open at 4336ffe): jatsToDocument trims inline
+  // r8 jats (fixed in round 25): jatsToDocument trimmed inline
   // markup with `/\s*$/` (wrapIfText, importers/jats.ts), which retries from
   // every whitespace character of a run that does not end the text: quadratic
   // and synchronous (80k spaces ≈ 5 s here). A backtracking regex has nothing
@@ -1310,7 +1275,7 @@ describe("legitimate flows that must keep working", () => {
     },
   );
 
-  // FINDING (r15 corrupt, still open at 4336ffe): verify crawls
+  // FINDING (r15 corrupt, open — PRD §10.1 known items): verify crawls
   // **/.versions/*/history.yaml as files, so a folder in history.yaml's place
   // drops the document from the crawl and verify passes green — the silent
   // green findAllHistories' onUnreadable exists to prevent. Repro: create a
@@ -1329,7 +1294,7 @@ describe("legitimate flows that must keep working", () => {
     expect(verify.errors.some((e) => e.document === id)).toBe(true);
   });
 
-  // FINDING (r19 obsid / r21 obsforget, still open at 4336ffe): in a flat
+  // FINDING (r19 obsid / r21 obsforget, open — PRD §10.1 known items): in a flat
   // (obsidian) vault, context_create { id: "doc" } re-roots the bare id under
   // nodes/ (normalizeDocumentId) and returns "nodes/doc", but context_update
   // { id: "doc" } then answers DOCUMENT_NOT_FOUND. The QA worked around it by

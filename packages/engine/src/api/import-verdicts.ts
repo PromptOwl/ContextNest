@@ -177,6 +177,24 @@ const HISTORY_LIMIT = { maxBytes: 16 * 2 ** 20 };
 /** What the vault root's .versions/ holds besides documents' folders. */
 const ROOT_LEDGERS = new Set(["context_history.yaml", "context_latest.yaml", "chain_events.yaml"]);
 
+/** Histories one import call judges at once (see importRefusals). */
+const SEALED_READS_AT_ONCE = 4;
+
+/**
+ * Whether an imported path is the vault's chain-event log, however it is
+ * spelled — the import planner folds `.Versions/`, `./`, `//` and a trailing
+ * dot onto it, so it is judged (merged, never written) as the log.
+ */
+export function isChainEventLog(path: string): boolean {
+  return (
+    String(path)
+      .split(/[\\/]+/)
+      .filter((seg) => seg !== "" && seg !== ".")
+      .map(comparableSegment)
+      .join("/") === ".versions/chain_events.yaml"
+  );
+}
+
 /** The index of the per-document store segment in a path, or -1. */
 function storeIndex(segs: string[]): number {
   // As Windows resolves the name: `.versions.` and `.versions::$X` are `.versions`.
@@ -224,9 +242,11 @@ async function importVerdicts(
     sets.set(v.owner, set);
   }
   const setVerdicts = new Map<string, { refusal: string | null; head: StructureDoc | null }>();
+  // A few histories at a time per call: each read may be sized to all the
+  // budget has left, so a wide batch must not hold many of them at once.
   await mapInBatches([...sets], async ([owner, set]) => {
     setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set, budget));
-  });
+  }, SEALED_READS_AT_ONCE);
 
   // Each document is judged as the publish that follows will judge it: against
   // the head its history will have after this call — the one this call brings,
@@ -245,7 +265,7 @@ async function importVerdicts(
       violations = (await structurePublishViolations(ctx.storage, rules, doc, undefined, budget)).violations;
     } else violations = full;
     docVerdicts.set(doc.id, violations);
-  });
+  }, SEALED_READS_AT_ONCE);
   plan.forEach((f, i) => {
     const doc = docs[i];
     let violations: Violation[];
@@ -536,8 +556,7 @@ async function historySetVerdict(
   // rebuilds to the same head; a file this call brings is always replayed.
   const brings = [...set.keys()].some((n) => /^v\d+\.(md|diff)$/i.test(n));
   const same = !brings && isDeepStrictEqual(history.versions, onDisk?.versions);
-  const view =
-    (same ? await here() : null) ?? (await sealedHeadView(owner, history, keyframe, diff, budget));
+  const view = same ? await here() : await sealedHeadView(owner, history, keyframe, diff, budget);
   // Refused, not waved through: the bytes judged here are pinned to their
   // content hashes, so if a file then fails to land the head on disk no
   // longer verifies and is judged in full — but only if the head judged here

@@ -491,6 +491,12 @@ function compileFormat(spelling: string, key: string): Matcher {
       items.push(tokenItem(token));
     } else {
       previous = null;
+      if (part.includes("{")) {
+        throw new ConfigError(`${key}: "${part}" opens a { that never closes — write tokens whole: ${TOKEN_LIST}`);
+      }
+      if (part.includes("}")) {
+        throw new ConfigError(`${key}: "${part}" closes a } that never opened — write tokens whole: ${TOKEN_LIST}`);
+      }
       if (!/^[a-z0-9-]+$/.test(part)) {
         throw new ConfigError(
           `${key}: "${part}" can never match — names are lowercase a-z, 0-9 and "-" (titles are slugified)`,
@@ -582,6 +588,20 @@ export function compileStructure(config: StructureConfig | null | undefined): Co
     throw new ConfigError(`folders: at most ${MAX_RULES} folder rules (found ${entries.length})`);
   }
   const warnings: string[] = [];
+  // A required section the template's own body lacks as a heading: under
+  // enforcement every file started from it would be refused until someone
+  // added the heading by hand.
+  for (const [name, t] of Object.entries(templates)) {
+    if (t.required_sections.length === 0) continue;
+    const have = headingAnchors(t.body);
+    for (const section of t.required_sections) {
+      if (!have.has(headingAnchor(section))) {
+        warnings.push(
+          `templates.${name}.required_sections: "${section}" is not a heading in the template's body — files started from it would be refused until someone adds it`,
+        );
+      }
+    }
+  }
 
   const rules: CompiledRule[] = [];
   const seen = new Map<string, string>();

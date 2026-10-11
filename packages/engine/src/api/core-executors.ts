@@ -116,6 +116,7 @@ import {
   importReplayBudget,
   storeOwner,
   versionsArtifact,
+  isChainEventLog,
 } from "./import-verdicts.js";
 import { isDeepStrictEqual } from "node:util";
 
@@ -1209,14 +1210,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incomingEvents: unknown[] = [];
   if (tombstones) {
     incoming = incoming.filter((f) => {
-      // However it is spelled (`.Versions/`, `./`, `//`, a trailing dot): the
-      // planner folds it to the vault's own log, so it is judged as the log.
-      const p = String(f.path ?? "")
-        .split(/[\\/]+/)
-        .filter((seg) => seg !== "" && seg !== ".")
-        .map(comparableSegment)
-        .join("/");
-      if (p !== ".versions/chain_events.yaml") return true;
+      if (!isChainEventLog(String(f.path ?? ""))) return true;
       try {
         const parsed = yaml.load(f.content ?? "");
         const list = Array.isArray(parsed)
