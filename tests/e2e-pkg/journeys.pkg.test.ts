@@ -796,9 +796,12 @@ const J5: Journey = {
         // Delete the untouched control node outright.
         { args: ["delete", "nodes/keepsake", "-y"], status: 0 },
         // The audit trail distinguishes the two modes — one forgotten, one deleted.
+        // Bridge each id to its mode with a regex rather than embedding the em-dash
+        // separator literally (same non-ASCII-glyph caution as J2-05's ✓) — the
+        // pairing is still pinned: jane-data → forgotten, keepsake → deleted.
         {
           args: ["forget-log"],
-          stdout: ["nodes/jane-data — forgotten", "nodes/keepsake — deleted"],
+          stdout: [/nodes\/jane-data[\s\S]*?forgotten/, /nodes\/keepsake[\s\S]*?deleted/],
         },
         // The forgotten node is still addressable — its stub tombstone remains...
         {
