@@ -1,5 +1,5 @@
 ---
-"@promptowl/contextnest-engine": minor
+"@promptowl/contextnest-engine": major
 "@promptowl/contextnest-cli": patch
 ---
 
