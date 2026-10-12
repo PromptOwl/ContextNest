@@ -1638,15 +1638,16 @@ describe("[regression] MCP server e2e — structure rules", () => {
       structure: { enforce: true, closed: true },
       folders: {
         "/": {},
-        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr", files: { index: {} } },
+        // Not `index`: where names fold case (macOS, Windows) that file is the folder's generated INDEX.md.
+        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr", files: { charter: {} } },
       },
       templates: { adr: { body: "## Context\n## Decision\n", required_sections: ["Decision"] } },
     });
-    await callJson(client, "context_create", { id: "nodes/decisions/index", title: "Index", content: "## Decision\nx\n" });
-    const { text, isError } = await callText(client, "delete_document", { path: "nodes/decisions/index" });
+    await callJson(client, "context_create", { id: "nodes/decisions/charter", title: "Charter", content: "## Decision\nx\n" });
+    const { text, isError } = await callText(client, "delete_document", { path: "nodes/decisions/charter" });
     expect(isError).toBe(true);
     expect(text).toMatch(/delete the folder/);
-    await access(join(vault, "nodes", "decisions", "index.md"));
+    await access(join(vault, "nodes", "decisions", "charter.md"));
   });
 
   it("the deprecated create_document scaffolds a new folder like context_create", async () => {
