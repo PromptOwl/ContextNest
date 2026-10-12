@@ -66,6 +66,13 @@ export interface JatsPaperMeta {
   voice?: string;
   keywords: string[];
   license?: string;
+  /**
+   * Normalised licence slug — `cc-by`, `cc-by-nc`, `cc0`, `cc-mark` (public
+   * domain mark), or the slugged `license-type` when no Creative Commons URL is
+   * given. The same value the `#license-*` tag carries; undefined when the
+   * article has no `<license>`.
+   */
+  license_slug?: string;
   erratum?: string[];
   retracted_by?: string[];
   related?: Array<{ type: string; ref: string }>;
@@ -1006,6 +1013,7 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   if (document_type) meta.document_type = document_type;
   if (voice) meta.voice = voice;
   if (license) meta.license = license;
+  if (licenseTag) meta.license_slug = licenseTag;
   if (erratum.length) meta.erratum = erratum;
   if (retracted) meta.retracted_by = retracted_by;
   if (related.length) meta.related = related;

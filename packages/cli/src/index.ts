@@ -137,6 +137,7 @@ import { loadCloudToken } from "./credentials.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
+import { parseLicenseList } from "./pubmed.js";
 import {
   configureSafety,
   openWriteScope,
@@ -3283,9 +3284,13 @@ importCmd
 
 importCmd
   .command("pubmed")
-  .description("Search PubMed Central (open-access) and import the hits as markdown twins")
-  .requiredOption("--term <query>", 'PubMed query, e.g. "fecal microbiota transplantation[mh] AND open access[filter]"')
-  .option("--max <n>", "Maximum articles to fetch", "25")
+  .description("Search PubMed (MeSH / publication-type filters honoured) and import the PMC full texts as markdown twins")
+  .requiredOption("--term <query>", 'PubMed query, e.g. "chronic pain[majr] AND systematic review[pt]" (restricted to PMC full text automatically)')
+  .option("--max <n>", "Maximum articles to import (counted after the licence filter)", "25")
+  .option(
+    "--license <list>",
+    "Keep only these licences, comma-separated: cc-by, cc0, cc-by-nc, cc-by-sa, …, or `commercial` (CC BY + CC0 + public domain)",
+  )
   .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
   .option("--keep-xml", "Also store each original under assets/jats/")
   .option("--no-relink", "Do not update existing papers whose references now resolve")
@@ -3296,21 +3301,38 @@ importCmd
     const storage = getStorage();
     const max = Math.max(1, parseInt(opts.max, 10) || 25);
     const apiKey = opts.apiKey ?? process.env.NCBI_API_KEY;
+    let licenses: string[] | undefined;
+    if (opts.license !== undefined) {
+      try {
+        licenses = parseLicenseList(String(opts.license));
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exitCode = 1;
+        return;
+      }
+    }
     await confirmOrExit(
-      `Fetch up to ${max} open-access PMC article(s) for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+      `Fetch up to ${max} PMC full-text article(s)${licenses ? ` licensed ${licenses.join("/")}` : ""} for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
     );
     const fetched = await fetchPmcSources({
       term: opts.term,
       max,
+      licenses,
       apiKey,
       onProgress: (done, total, pmcid) => {
         if (process.stdout.isTTY) process.stdout.write(`\rFetching ${done}/${total} ${pmcid}…`);
       },
     });
     if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
-    console.log(chalk.dim(`${fetched.total} match(es) in PMC; fetched ${fetched.sources.length}`));
+    console.log(
+      chalk.dim(
+        `${fetched.total} match(es) in PubMed with PMC full text; fetched ${fetched.sources.length}` +
+          (licenses ? `; skipped ${fetched.skippedLicense.length} for licence` : ""),
+      ),
+    );
     for (const f of fetched.failed) console.log(chalk.yellow(`  ! ${f}`));
     if (fetched.sources.length === 0) {
+      for (const sk of fetched.skippedLicense) console.log(chalk.dim(`  – ${sk}`));
       console.log(chalk.yellow("Nothing to import."));
       if (fetched.failed.length) process.exitCode = 1;
       return;
@@ -3325,7 +3347,8 @@ importCmd
       relink: opts.relink,
       force: isForce(),
     });
-    printImportSummary(r, opts.json);
+    // Licence drops are reported with the import's own skips (and in --json).
+    printImportSummary({ ...r, skipped: [...fetched.skippedLicense, ...r.skipped] }, opts.json);
   });
 
 const enrichCmd = program

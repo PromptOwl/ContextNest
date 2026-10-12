@@ -696,7 +696,9 @@ curated, as query tags:
 
 | Tag | From |
 |---|---|
-| `#pubtype-review-article`, `#pubtype-srma` | `article-type`, `custom-meta document_type` |
+| `#pubtype-systematic-review`, `#pubtype-meta-analysis`, `#pubtype-srma` (SR + MA), `#pubtype-guideline`, `#pubtype-rct`, `#pubtype-review` | MEDLINE publication types from PubMed (`ctx import pubmed`, `ctx enrich pubtator`); raw list in `metadata.publication_types` |
+| `#pubtype-review-article`, `#pubtype-srma` | JATS `article-type`, `custom-meta document_type` — when the PubMed types are unknown (plain `ctx import jats`) |
+| `#article-type-review-article` | JATS `article-type`, once PubMed's types are known (also `metadata.article_type`) |
 | `#year-2019`, `#journal-clin-gastroenterol-hepatol` | `pub-date`, `journal-id` |
 | `#fecal-microbiota-transplantation` | `<kwd>` keywords |
 | `#license-cc-by-nc-nd` | `<license>` / `<ali:license_ref>` |
@@ -713,7 +715,7 @@ papers are re-linked when the paper they cite arrives.
 ```bash
 ctx import jats ./corpus/                 # every .xml / .nxml under the folder
 ctx import jats paper.nxml --keep-xml     # also store the original under assets/jats/
-ctx import pubmed --term "fecal microbiota transplantation[mh] AND open access[filter]" --max 50
+ctx import pubmed --term "chronic pain[majr] AND systematic review[pt]" --license commercial --max 50
 ctx enrich pubtator                       # NCBI entities + relations, MeSH-normalised
 ctx query "#fmt #pubtype-srma -#status-retracted"
 ```
@@ -723,17 +725,30 @@ changed file cuts a new version, and a batch shares one checkpoint. A file
 holding several `<article>`s (a `pmc-articleset` dump) is imported article by
 article. The twin is *derived*: a re-import (`--force`, or changed XML)
 regenerates its body, tags and NLM metadata from the XML and carries over
-only enrichment (`metadata.entities` / `relations` / `pubtator`, `#mesh-`
-tags, a resolved `pmid`/`pmcid`) — hand edits to a twin do not survive. `import
-pubmed` and `enrich pubtator` call NCBI's public services (3 requests/s; set
-`NCBI_API_KEY` or `--api-key` for 10/s). Only the PMC open-access subset is
-fetchable; each twin records its licence.
+only enrichment (`metadata.entities` / `relations` / `pubtator` /
+`publication_types` and the tags derived from them, a resolved `pmid`/`pmcid`)
+— hand edits to a twin do not survive. `import pubmed` and `enrich pubtator`
+call NCBI's public services (3 requests/s; set `NCBI_API_KEY` or `--api-key`
+for 10/s). Each twin records its licence.
+
+`ctx import pubmed` searches **PubMed** — where MeSH (`[mh]`, `[majr]`) and
+publication-type (`[pt]`) qualifiers work; PMC's own search silently ignores
+them — restricted to records with PMC full text (`"pubmed pmc"[sb]` is added
+unless the term already has it), then fetches each hit's JATS from PMC.
+`#pubtype-*` tags come from the record's MEDLINE publication types, not the
+JATS `article-type` (which says "review-article" for most systematic reviews).
+`--license <list>` keeps only articles under those licences — `cc-by`, `cc0`,
+`cc-by-nc`, `cc-by-sa`, … or `commercial` (CC BY + CC0 + public domain). PMC's
+licence filters skip downloads; the licence the JATS itself declares decides,
+so an article with no declared licence is dropped. `--max` counts articles
+*imported*: up to 6× as many candidates are considered so licence drops do not
+shrink the batch, and the drops are listed as skipped.
 
 | Command | Description |
 |---|---|
 | `ctx import jats <paths...> [--folder nodes/papers] [--keep-xml] [--no-relink]` | Import JATS files or folders as markdown twins (the global `--force` republishes unchanged twins) |
-| `ctx import pubmed --term <query> [--max 25] [--api-key]` | Search PMC (open access) and import the hits |
-| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations and `#mesh-` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
+| `ctx import pubmed --term <query> [--max 25] [--license <list>] [--api-key]` | Search PubMed (PMC full text only), keep the licences asked for, and import the hits with MEDLINE `#pubtype-*` tags |
+| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations, `#mesh-` tags and MEDLINE `#pubtype-*` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
 
 ---
 
