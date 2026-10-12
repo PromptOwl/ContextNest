@@ -22,6 +22,11 @@ export interface DocListView {
   tags?: string[];
   /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
   vault?: string;
+  /** Task (board) fields — a Community nest reports them when set. */
+  assignee?: string;
+  due?: string;
+  priority?: string;
+  parent?: string;
 }
 
 /**
@@ -40,6 +45,10 @@ export function listJsonEntry(d: DocListView) {
     type: d.type || "document",
     status: d.status || "draft",
     tags: d.tags,
+    ...(d.assignee ? { assignee: d.assignee } : {}),
+    ...(d.due ? { due: d.due } : {}),
+    ...(d.priority ? { priority: d.priority } : {}),
+    ...(d.parent ? { parent: d.parent } : {}),
     ...(d.vault ? { vault: d.vault } : {}),
   };
 }

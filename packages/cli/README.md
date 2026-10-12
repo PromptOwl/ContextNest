@@ -96,6 +96,9 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
 - `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
 - `ctx update <path>` — Update a document
+- `ctx update <path> --assignee <email> --due <YYYY-MM-DD> --priority <urgent|high|medium|low> --parent <id>` — Remote (Community) nest only: set task fields; the nest checks the assignee is on its roster. `""` or `none` clears a field
+- `ctx list --assignee <email|none> --priority <p|none> --due-before <YYYY-MM-DD>` — Remote nest only: filter tasks
+- `ctx task log <path> --note "…" [--status working|done|blocked] [--claim] [--agent <name>]` — Remote nest only: record what you did on a task. Attributed to you, your API key and the agent (`--agent` or `$CONTEXTNEST_AGENT`), and shown in the task's activity. `--claim` assigns it to you if it is unassigned
 - `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
 - `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
 - `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
