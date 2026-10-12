@@ -1545,6 +1545,53 @@ describe("[regression] MCP server e2e — writes outside nodes/ are re-rooted", 
   });
 });
 
+// ─── Structure rules, not enforced ───────────────────────────────────────────
+//
+// Report-only rules, and a vault with no rules at all, must never block a
+// write — through any surface, the deprecated legacy tools included. Every
+// write below breaks the rules (undeclared folder, missing required section).
+
+describe.each([
+  ["report-only rules", { structure: { enforce: false, closed: true } }],
+  ["no structure block", null],
+])("[regression] MCP server e2e — %s never block a write", (_label, extra) => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    if (extra) {
+      await setStructure(new NestStorage(vault), {
+        ...extra,
+        folders: { "/": {}, decisions: { types: ["document"], template: "adr" } },
+        templates: { adr: { body: "## Decision\n", required_sections: ["Decision"] } },
+      });
+    }
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("context_create, create_document, update_document, publish_document and delete_document all land", async () => {
+    expect((await callText(client, "context_create", { title: "Idea", content: "x", folder: "notes" })).isError).toBe(false);
+    await access(join(vault, "nodes", "notes", "idea.md"));
+
+    expect((await callText(client, "create_document", { path: "nodes/notes/legacy", title: "Legacy" })).isError).toBe(false);
+    await access(join(vault, "nodes", "notes", "legacy.md"));
+
+    expect((await callText(client, "context_create", { id: "nodes/decisions/d1", title: "D1", content: "## Decision\nx\n" })).isError).toBe(false);
+    expect((await callText(client, "update_document", { path: "nodes/decisions/d1", body: "no decision now\n" })).isError).toBe(false);
+    expect(await readFile(join(vault, "nodes", "decisions", "d1.md"), "utf-8")).toContain("no decision now");
+
+    expect((await callText(client, "publish_document", { path: "nodes/notes/legacy" })).isError).toBe(false);
+    expect((await callText(client, "delete_document", { path: "nodes/notes/legacy" })).isError).toBe(false);
+    await expect(access(join(vault, "nodes", "notes", "legacy.md"))).rejects.toThrow();
+  });
+});
+
 // ─── Structure rules ─────────────────────────────────────────────────────────
 //
 // docs/prds/structure-rules.md (Community repo): rules in .context/config.yaml
