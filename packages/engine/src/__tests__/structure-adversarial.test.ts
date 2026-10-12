@@ -1604,7 +1604,19 @@ describe("legitimate flows that must keep working", () => {
       const { c, root } = await freshVault("obsidian");
       const id = `${Array.from({ length: 180 }, (_, i) => `seg${String(i).padStart(7, "0")}`).join("/")}/doc`;
       expect(id.length).toBeGreaterThan(1024);
-      await mkdir(join(root, id.slice(0, id.lastIndexOf("/"))), { recursive: true });
+      for (const [op, input] of [["context_publish", { id }], ["context_update", { id, content: "x" }]] as const) {
+        expect((await refusal(op, input, c)).code, op).toBe("INVALID_DOCUMENT_ID");
+      }
+      // A legacy file this long cannot exist where a whole path is capped
+      // shorter (macOS: 1024 bytes); there only the refusal above applies.
+      const made = await mkdir(join(root, id.slice(0, id.lastIndexOf("/"))), { recursive: true }).then(
+        () => true,
+        (err: NodeJS.ErrnoException) => {
+          if (err.code === "ENAMETOOLONG") return false;
+          throw err;
+        },
+      );
+      if (!made) return;
       await writeFile(join(root, `${id}.md`), "---\ntitle: deep\ntype: document\nstatus: draft\n---\nbody\n", "utf-8");
       expect((await api.run<{ documents: { id: string }[] }>("context_list", {}, c)).documents.map((d) => d.id)).toContain(id);
       expect((await api.run<{ id: string }>("context_get", { id }, c)).id).toBe(id);

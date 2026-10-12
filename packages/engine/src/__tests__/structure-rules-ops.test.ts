@@ -1144,7 +1144,10 @@ describe("QA round 6: root spellings, deep ids, the enforce switch, re-init, his
 
   it.skipIf(process.platform === "win32")("a 500-deep id publishes under enforced rules without holding the lock for seconds", async () => {
     await writeConfig({ structure: { enforce: true }, folders: { "{a}": { files: { overview: {} } } } });
-    const id = `nodes/${"a/".repeat(500)}x`;
+    // As deep as the platform's path limit holds (macOS: 1024 bytes for a
+    // whole path), with room for history and index files under it.
+    const room = (process.platform === "darwin" ? 1023 : 4095) - dir.length - 120;
+    const id = `nodes/${"a/".repeat(Math.min(500, Math.floor(room / 2)))}x`;
     const started = Date.now();
     await api.run("context_create", { id, title: "Deep", content: "x" }, ctx);
     expect(Date.now() - started).toBeLessThan(3000);
