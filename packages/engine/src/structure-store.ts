@@ -34,7 +34,7 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { applyPatchBounded, type ArtifactReader, BYTES_PER_CHAR, YIELD_EVERY } from "./reconstruct.js";
+import { applyPatchBounded, type ArtifactReader, BYTES_PER_CHAR, MAX_REPLAY_READ, YIELD_EVERY } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -273,11 +273,6 @@ const MAX_SEALED_SEGMENT = 1000;
  */
 const MAX_REPLAY_WORK = 128 * 2 ** 20;
 
-/**
- * Most characters sealedHead reads for one history (its keyframe and diffs).
- * Past it the history is not trusted (judged in full) — and never held whole.
- */
-const MAX_REPLAY_READ = 64 * 2 ** 20;
 
 /**
  * The most bytes one version file may hold to be read for a sealed head: the

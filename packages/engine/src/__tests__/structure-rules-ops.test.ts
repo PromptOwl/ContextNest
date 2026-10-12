@@ -674,6 +674,23 @@ describe("approvals are judged against the rules in force", () => {
     expect(await readFile(join(dir, `${id}.md`), "utf-8")).toContain("Ship.");
   });
 
+  // Review of 7016294: the held edit was judged against the rebuilt head and
+  // written, and only then did its publish judge it against the sealed head.
+  // A head that does not verify grants nothing, so the publish refused — with
+  // the unpublished edit already in the live file.
+  it("approveReview refused by its publish leaves the live file untouched", async () => {
+    const id = "nodes/meetings/kickoff";
+    await api.run("context_create", { title: "Kickoff", content: "## Notes\nold\n", folder: "meetings" }, ctx);
+    await api.run("context_update", { id, content: "## Notes\nnew\n", review: true }, ctx);
+    const historyPath = join(dir, "nodes/meetings/.versions/kickoff/history.yaml");
+    const history = await readFile(historyPath, "utf-8");
+    await writeFile(historyPath, history.replace(/content_hash: "?sha256:[a-f0-9]{64}"?/, `content_hash: "sha256:${"0".repeat(64)}"`), "utf-8");
+    await writeConfig(MEETING_RULES);
+    const live = await readFile(join(dir, `${id}.md`), "utf-8");
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/Decisions/);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).toBe(live);
+  });
+
   it("approving a held create scaffolds the folders that document alone occupies", async () => {
     await writeConfig(RULES);
     const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";

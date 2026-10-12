@@ -55,6 +55,7 @@ import {
   scaffoldFolders,
   assertStructureDelete,
   assertWritableDocumentId,
+  assertWritableDocumentPath,
   assertStructurePublish,
   currentReviewProposal,
   stageReviewHold,
@@ -1272,7 +1273,7 @@ tool(
       // Before any write — the file is written before the publish that would
       // otherwise be the first to refuse a reserved path.
       try {
-        assertWritableDocumentId(id);
+        await assertWritableDocumentPath(storage.root, id);
       } catch (err) {
         return toolError(err);
       }

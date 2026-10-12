@@ -160,9 +160,14 @@ const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
  * Case-folded, with trailing dots and spaces and any `:stream`
  * suffix dropped, because Windows drops them: `.context.` IS `.context` there. Reads keep going through
  * {@link assertSafeDocumentId} alone.
+ *
+ * `existing`: the id names a document already on disk. Its name is held to
+ * what the file system holds (as for an erase), not to the stricter limits
+ * for new names, so no document that exists is frozen against edits.
  */
-export function assertWritableDocumentId(raw: string): void {
-  assertFitsFileSystem(raw);
+export function assertWritableDocumentId(raw: string, existing = false): void {
+  if (existing) assertFitsFileSystem(raw, 255, 4096, true);
+  else assertFitsFileSystem(raw);
   const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
   assertSafeDocumentId(raw);
   // A backslash is a separator on Windows but a literal file-name character
@@ -198,7 +203,15 @@ export function assertWritableDocumentId(raw: string): void {
  * (history, sidecars, staged edits) calls before its first write.
  */
 export async function assertWritableDocumentPath(root: string, id: string): Promise<void> {
-  assertWritableDocumentId(id);
+  try {
+    assertWritableDocumentId(id);
+  } catch (err) {
+    // Only a name the new-name limits refuse is looked up on disk.
+    if (!(err instanceof ContextNestError && err.code === "INVALID_DOCUMENT_ID")) throw err;
+    assertWritableDocumentId(id, true);
+    const exists = await stat(join(root, `${id}.md`)).then((s) => s.isFile(), () => false);
+    if (!exists) throw err;
+  }
   await assertResolvesOutsideMachinery(root, id);
 }
 

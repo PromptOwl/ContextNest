@@ -17,7 +17,7 @@
  */
 
 import yaml from "js-yaml";
-import { documentHistorySchema, FORGET_REASON_CODES } from "./schemas.js";
+import { CHECKSUM_PATTERN, documentHistorySchema, FORGET_REASON_CODES } from "./schemas.js";
 import { computeContentHash, sha256Bytes } from "./integrity.js";
 import { getChecksumContent, parseDocument } from "./parser.js";
 import type { DocumentHistory, ForgetReasonCode } from "./types.js";
@@ -77,8 +77,45 @@ export interface TombstoneIndex {
 
 const REASONS = new Set<string>(FORGET_REASON_CODES);
 
-function stringArray(v: unknown): string[] {
-  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+/** A timestamp as a string. An unquoted YAML timestamp loads as a Date. */
+export function isoDate(v: unknown): string | null {
+  if (typeof v === "string") return v;
+  return v instanceof Date && !isNaN(v.getTime()) ? v.toISOString() : null;
+}
+
+/** Distinct `sha256:<hex>` entries only: anything else names no erased content. */
+function checksumArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.filter((x): x is string => typeof x === "string" && CHECKSUM_PATTERN.test(x)))];
+}
+
+/**
+ * True when `value`, with every YAML alias expanded, stays within `limit`
+ * characters. js-yaml has no alias cap and `dump` writes each alias out in
+ * full, so a chain-event log from outside is measured before it is kept:
+ * without aliases a parsed tree is never larger than its text. Stops once
+ * the limit is passed, so the walk costs at most `limit`.
+ */
+export function expandsWithin(value: unknown, limit: number): boolean {
+  // Charged as each node is pushed, so the stack never outgrows the limit.
+  let size = 0;
+  const stack: unknown[] = [];
+  const push = (v: unknown, key = ""): boolean => {
+    size += key.length + (typeof v === "string" ? v.length + 1 : 1);
+    if (size > limit) return false;
+    stack.push(v);
+    return true;
+  };
+  if (!push(value)) return false;
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (Array.isArray(v)) {
+      for (const child of v) if (!push(child)) return false;
+    } else if (v && typeof v === "object" && !(v instanceof Date)) {
+      for (const k of Object.keys(v)) if (!push((v as Record<string, unknown>)[k], k)) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -109,18 +146,13 @@ export function tombstoneFromEvent(raw: unknown): TombstoneRecord | null {
     versions,
     reason_code: reason,
     forgotten_by: typeof e.actor === "string" ? e.actor : "unknown",
-    forgotten_at:
-      typeof m.forgotten_at === "string"
-        ? m.forgotten_at
-        : typeof e.timestamp === "string"
-          ? e.timestamp
-          : "",
+    forgotten_at: isoDate(m.forgotten_at) ?? isoDate(e.timestamp) ?? "",
     ...(typeof m.requested_by === "string" ? { requested_by: m.requested_by } : {}),
     ...(Number.isInteger(m.stub_version) ? { stub_version: m.stub_version as number } : {}),
     ...(Number.isInteger(m.checkpoint) ? { checkpoint: m.checkpoint as number } : {}),
-    content_hashes: stringArray(m.content_hashes),
-    body_hashes: stringArray(m.body_hashes),
-    pdf_hashes: stringArray(m.pdf_hashes),
+    content_hashes: checksumArray(m.content_hashes),
+    body_hashes: checksumArray(m.body_hashes),
+    pdf_hashes: checksumArray(m.pdf_hashes),
   };
 }
 

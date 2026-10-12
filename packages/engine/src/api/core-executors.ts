@@ -39,7 +39,7 @@ import {
   applyImportedTombstones,
   assertNotForgotten,
 } from "../forget.js";
-import { addTombstone, buildTombstoneIndex, isPathForgotten } from "../tombstones.js";
+import { addTombstone, buildTombstoneIndex, expandsWithin, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
@@ -1234,7 +1234,13 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     incoming = incoming.filter((f) => {
       if (!isChainEventLog(String(f.path ?? ""))) return true;
       try {
-        const parsed = yaml.load(f.content ?? "");
+        const text = f.content ?? "";
+        const parsed = yaml.load(text);
+        // Aliases expanding it past its own text would be written out in
+        // full by every later append to this vault's log.
+        if (!expandsWithin(parsed, 2 * text.length + 1024)) {
+          throw new ContextNestError("its YAML aliases expand it far beyond its own size", "VALIDATION_FAILED");
+        }
         const list = Array.isArray(parsed)
           ? parsed
           : Array.isArray((parsed as { events?: unknown[] } | null)?.events)

@@ -20,7 +20,7 @@ import { join } from "node:path";
 import yaml from "js-yaml";
 import { computeContentHash } from "../integrity.js";
 import { sealedHead } from "../structure-store.js";
-import { applyPatchBounded } from "../reconstruct.js";
+import { applyPatchBounded, BYTES_PER_CHAR, MAX_REPLAY_READ, replayEveryVersion } from "../reconstruct.js";
 import { MemoryKeyStore, setDefaultVaultKeyStore } from "../encryption/key-store.js";
 import { decryptVault, encryptVault } from "../encryption/migrate.js";
 import { NestStorage } from "../storage.js";
@@ -344,6 +344,18 @@ describe("staged edits", () => {
 });
 
 describe("read budget", () => {
+  // Review of 7016294: replayEveryVersion read up to the whole import budget
+  // for one history (512 Mi chars), and without a budget, without bound.
+  it("one history's replay never reads past MAX_REPLAY_READ, budget or not", async () => {
+    const half = "a".repeat(MAX_REPLAY_READ / 2 + 1);
+    const versions = [1, 2].map((version) => ({ version, keyframe: true })) as Parameters<typeof replayEveryVersion>[0];
+    const asked: Array<number | undefined> = [];
+    const read = async (_n: number, maxBytes?: number) => (asked.push(maxBytes), half);
+    expect(await replayEveryVersion(versions, read, read, undefined, () => {})).toBe(false);
+    expect(await replayEveryVersion(versions, read, read, { left: 2 ** 30 }, () => {})).toBe(false);
+    expect(asked.every((m) => m !== undefined && m <= BYTES_PER_CHAR * MAX_REPLAY_READ)).toBe(true);
+  });
+
   it("r19 bigread4 / r21 readtrace: version files larger than the room left are refused unread, the first one spending the budget", async () => {
     await writeConfig(SUMMARY);
     const kf = "---\ntitle: v\ntype: document\nstatus: published\n---\n## Summary\nx\n";
@@ -805,16 +817,35 @@ describe("forget and tombstones", () => {
 
   // r23 evbomb: the imported event was appended verbatim, and yaml.dump
   // (noRefs) expands aliases: a 686-character alias chain became a 105 MB
-  // log that every later write read. Only the fields a forget record carries
-  // are logged.
+  // log that every later write read. A log whose aliases expand it past its
+  // own size is refused before any of it is kept.
   it("r23 evbomb: an imported event's alias chain is never expanded into the log", async () => {
     let extra = "    x0: &a0 [y, y]\n";
     for (let i = 1; i <= 20; i++) extra += `    x${i}: &a${i} [*a${i - 1}, *a${i - 1}]\n`;
     const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/elsewhere", "bomb", extra) }]);
-    expect(r.failed).toEqual([]);
-    const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8");
-    expect(log).toContain("bomb");
+    expect(r.failed.map((f) => f.error).join("\n")).toMatch(/aliases expand it/);
+    expect(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8").catch(() => "")).not.toContain("bomb");
+  });
+
+  // Review of 7016294: the hash arrays were kept as given, so aliases of one
+  // large string in body_hashes were written out in full per entry.
+  it("an imported forget's hash arrays never carry an aliased string into the log", async () => {
+    const big = "a".repeat(100_000);
+    const extra = `    pad: &s ${big}\n    body_hashes: [${Array(200).fill("*s").join(", ")}]\n`;
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/elsewhere", "strbomb", extra) }]);
+    expect(r.failed.map((f) => f.error).join("\n")).toMatch(/aliases expand it/);
+    const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8").catch(() => "");
     expect(log.length).toBeLessThan(4096);
+  });
+
+  it("an imported forget logs only sha256 hashes, once each", async () => {
+    const h = `sha256:${"1".repeat(64)}`;
+    const extra = `    body_hashes: ["${h}", "${h}", "not-a-hash"]\n`;
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/elsewhere", "hashes", extra) }]);
+    expect(r.failed).toEqual([]);
+    const logged = (yaml.load(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8")) as { event_id: string; action_metadata: { body_hashes: string[] } }[])
+      .find((e) => e.event_id === "hashes")!;
+    expect(logged.action_metadata.body_hashes).toEqual([h]);
   });
 
   // r23 evmerge: each imported event re-read, re-parsed and rewrote the whole
@@ -872,14 +903,16 @@ describe("forget and tombstones", () => {
     await api.run("context_update", { id, content: "## Summary\nkeep me around\nstill\n" }, ctx);
   });
 
-  // FINDING (r27 M2, open — PRD §10.1 known items): an imported event whose
-  // timestamp is an unquoted date (valid YAML; js-yaml loads a Date) fails the
-  // event schema and is applied without being logged: no anti-resurrection
-  // hashes are kept, and verify reports unrecorded_tombstone.
-  it.fails("r27 M2: an imported forget with an unquoted timestamp is logged, or refused — never applied unlogged", async () => {
+  // r27 M2: an imported event whose timestamp is an unquoted date (valid
+  // YAML; js-yaml loads a Date) failed the event schema and was applied
+  // without being logged. The Date is logged as ISO; a record that still
+  // cannot be logged is refused, never applied.
+  it("r27 M2: an imported forget with an unquoted timestamp is logged, or refused — never applied unlogged", async () => {
     const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/gone/y", "dated").replace('timestamp: "2026-01-01T00:00:00Z"', "timestamp: 2026-01-01T00:00:00Z") }]);
     const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8").catch(() => "");
-    expect(r.failed.length > 0 || log.includes("dated")).toBe(true);
+    expect(r.failed).toEqual([]);
+    expect(log).toContain("event_id: dated");
+    expect(log).toContain("2026-01-01T00:00:00.000Z");
   });
 
   // r24 B5 scope: the engine forgets whole documents (§6.3); a record scoped
@@ -1300,6 +1333,17 @@ describe("locking and queueing", () => {
 // ─── Legitimate flows that must keep working ────────────────────────────────
 
 describe("legitimate flows that must keep working", () => {
+  // Review of 7016294: the new-name limit (251 bytes, room for `.pdf`) froze
+  // a document already on disk with a 252-byte name (a legal 255-byte `.md`).
+  it("a document already on disk under a name past the new-name limit can still be updated", async () => {
+    const id = `nodes/notes/${"a".repeat(252)}`;
+    await mkdir(join(dir, "nodes/notes"), { recursive: true });
+    await writeFile(join(dir, `${id}.md`), "---\ntitle: long\ntype: document\nstatus: draft\n---\n\nold\n", "utf-8");
+    await api.run("context_update", { id, content: "new\n", publish: false }, ctx);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).toContain("new");
+    await expect(api.run("context_create", { id: `nodes/notes/${"b".repeat(252)}`, title: "x", content: "x\n" }, ctx)).rejects.toThrow(/longer than 251 bytes/);
+  });
+
   it.each([["CRLF", "\r\n"], ["LF", "\n"]])(
     "r19 legitpatch (%s): a long history with edits at both ends and the middle reconstructs, rolls back, and takes held edits and suggestions",
     async (_l, eol) => {

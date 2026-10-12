@@ -26,6 +26,12 @@ export const BYTES_PER_CHAR = 5;
 /** Characters hashed or replayed between yields to the event loop. */
 export const YIELD_EVERY = 2 ** 20;
 
+/**
+ * Most characters a replay reads for one history (its keyframes and diffs).
+ * Past it the history is not trusted — and never held whole.
+ */
+export const MAX_REPLAY_READ = 64 * 2 ** 20;
+
 export type ArtifactReader = (
   version: number,
   /** Most bytes the file may hold to be read at all — larger is refused unread. */
@@ -250,24 +256,27 @@ export async function replayEveryVersion(
   };
   let text: string | null = null;
   let sinceYield = 0;
+  let read = 0;
   for (const e of versions) {
     if (budget?.spent) return false;
     if (e.tombstone) {
       text = null;
       continue;
     }
-    const room = budget ? Math.max(0, budget.left) : Infinity;
+    // One history never reads past MAX_REPLAY_READ, whatever the budget.
+    const left = MAX_REPLAY_READ - read;
+    const room = Math.min(left, budget ? Math.max(0, budget.left) : Infinity);
     let artifact: string | null;
     try {
-      const maxBytes = budget ? BYTES_PER_CHAR * room : undefined;
+      const maxBytes = BYTES_PER_CHAR * room;
       artifact = e.keyframe
         ? await readKeyframe(e.version, maxBytes)
         : ((await readDiff(e.version, maxBytes)) ?? e.diff ?? null);
     } catch (err) {
       // Larger than the room left spends it, so the call is asked to split;
       // otherwise unreadable — a version not known here.
-      if (budget && err instanceof CorruptHistoryError && err.ioError === "too-large") {
-        spend(room + 1);
+      if (err instanceof CorruptHistoryError && err.ioError === "too-large") {
+        if (budget && room < left) spend(room + 1);
         return false;
       }
       artifact = null;
@@ -276,6 +285,8 @@ export async function replayEveryVersion(
       text = null;
       continue;
     }
+    read += artifact.length;
+    if (read > MAX_REPLAY_READ) return false;
     if (!spend(artifact.length)) return false;
     let cost = artifact.length;
     if (e.keyframe) {

@@ -34,12 +34,12 @@ import { join } from "node:path";
 import { parseConfig } from "./config.js";
 import { ConfigError, ContextNestError, IntegrityError } from "./errors.js";
 import { computeContentHash } from "./integrity.js";
-import { getChecksumContent, isPublished, isRejected, serializeDocument } from "./parser.js";
+import { getChecksumContent, isPublished, isRejected, parseDocument, serializeDocument } from "./parser.js";
 import { publishDocument } from "./publish.js";
 import { applyStagedEdit, listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { assertStructureUpdate } from "./structure-store.js";
+import { assertStructurePublish, assertStructureUpdate, enforcedStructure } from "./structure-store.js";
 import { assertSafeDocumentId } from "./storage.js";
 import type { NestStorage } from "./storage.js";
 import type { GovernanceTier, ReviewMode, SuggestionMeta } from "./types.js";
@@ -325,6 +325,10 @@ export async function approveReview(
       // Judged against the structure rules in force now (§11.1.1) — they may
       // have changed since the edit was held.
       await assertStructureUpdate(storage, id, approvedRaw!, proposedRaw);
+      // And as its publish will judge it (against the sealed head), BEFORE the
+      // write: a refusal there must not leave the held edit in the live file.
+      const rules = await enforcedStructure(storage);
+      if (rules) await assertStructurePublish(storage, rules, parseDocument(`${id}.md`, proposedRaw, id));
       // The write the hold deferred, then the publish it would have done.
       await storage.writeDocument(id, proposedRaw);
       const result = await publishDocument(storage, id, {

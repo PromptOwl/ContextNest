@@ -62,6 +62,7 @@ import {
   forgettableBodyHash,
   isPathForgotten,
   holdsErasedContent,
+  isoDate,
   tombstoneFromEvent,
   type TombstoneIndex,
   type TombstoneRecord,
@@ -502,6 +503,16 @@ export async function applyImportedTombstones(
     // The engine forgets whole documents (§6.3): a record scoped to versions
     // is recorded (what it erased stays refused) but never applied to a live
     // document here, and the import says so.
+    // A forget that cannot be logged is never honored: it would erase with no
+    // audit record and no anti-resurrection hashes (§6.3).
+    const event = known.has(rec.event_id) ? null : loggedForgetEvent(rec, raw);
+    if (!known.has(rec.event_id) && !event) {
+      refused.push({
+        id: rec.document_id,
+        reason: `the forget record ${rec.event_id} is not a valid chain event — not applied`,
+      });
+      continue;
+    }
     const partial = rec.scope === "versions" && node !== null && !isForgotten(node);
     if (partial) {
       refused.push({
@@ -509,12 +520,9 @@ export async function applyImportedTombstones(
         reason: `the forget record ${rec.event_id} is scoped to versions — this vault forgets whole documents, so it is recorded, not applied`,
       });
     }
-    if (!known.has(rec.event_id)) {
-      // Not a schema-valid event: honored for this import, but no malformed
-      // record goes into this vault's audit log.
-      const event = loggedForgetEvent(rec, raw);
-      if (event) toLog.push(event);
-      known.set(rec.event_id, event ?? raw);
+    if (event) {
+      toLog.push(event);
+      known.set(rec.event_id, event);
     }
     addTombstone(index, rec);
     if (node && !partial) toApply.push({ rec, node, history });
@@ -594,7 +602,7 @@ function loggedForgetEvent(rec: TombstoneRecord, raw: unknown): HashChainEvent |
   const event = {
     event_id: rec.event_id,
     event_type: FORGET_EVENT_TYPE,
-    timestamp: e.timestamp,
+    timestamp: isoDate(e.timestamp) ?? e.timestamp,
     actor: e.actor,
     document_id: rec.document_id,
     ...(typeof e.resulting_hash === "string" ? { resulting_hash: e.resulting_hash } : {}),

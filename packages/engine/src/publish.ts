@@ -287,7 +287,9 @@ export async function publishDocuments(
     if (seen.has(docId)) continue;
     seen.add(docId);
     try {
-      assertWritableDocumentId(docId);
+      // Name limits for an existing document; publishOne holds new names to
+      // the stricter ones (assertWritableDocumentPath).
+      assertWritableDocumentId(docId, true);
       ids.push(docId);
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
