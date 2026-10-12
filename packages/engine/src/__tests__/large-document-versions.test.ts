@@ -108,15 +108,15 @@ describe("large documents do not stall the event loop", () => {
       published.set(out.version, serializeDocument(await storage.readDocument(id)));
     };
     await publish(`${big}still big\n`); // v2: over the line
-    await publish("small now\n"); // v3: under it, a diff against v2's keyframe
-    await publish("small now\nand edited\n"); // v4: a diff
+    await publish("small now\n"); // v3: under it, but v2 is over: a keyframe, never a diff from 1 MB
+    await publish("small now\nand edited\n"); // v4: both sides small: a diff
     await publish(`${big}big again\n`); // v5: over the line again
 
     const versions = (await storage.readHistory(id))!.versions;
     expect(versions.map((e) => [e.version, e.keyframe === true])).toEqual([
       [1, true],
       [2, true],
-      [3, false],
+      [3, true],
       [4, false],
       [5, true],
     ]);

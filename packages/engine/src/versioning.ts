@@ -19,8 +19,9 @@ import { ContextNestError, CorruptHistoryError } from "./errors.js";
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
 /**
- * Largest document (serialized characters) a new version is stored as a diff
- * for. Above it the version is a keyframe: a diff would first replay the chain
+ * Largest document (serialized characters, UTF-16 units — not bytes) a new
+ * version is stored as a diff for, on either side of the diff. Above it the
+ * version is a keyframe: a diff would first replay the chain
  * to rebuild the previous version, then run `createPatch` over the whole text
  * in one synchronous call — seconds of blocked event loop on a 10 MB document.
  * ponytail: costs a full copy per version of such a document; a cheaper diff
@@ -204,6 +205,13 @@ export class VersionManager {
           history,
         );
       } catch {
+        isKeyframe = true;
+      }
+      // Shrinking back under the bound still diffs against the large previous
+      // text — the same synchronous createPatch. A keyframe instead (cheap to
+      // reach: that previous version was itself a size keyframe).
+      if (previousContent !== null && previousContent.length > MAX_DIFF_CHARS) {
+        previousContent = null;
         isKeyframe = true;
       }
     }
