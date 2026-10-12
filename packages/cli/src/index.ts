@@ -1849,9 +1849,22 @@ program
       }
     }
 
-    // Pack selectors only fail when someone queries the pack; catch them here.
+    // Pack problems only surface when someone queries the pack; catch them
+    // here. `validate <path>` checks one document, so it skips packs.
+    let packCount = 0;
     if (!path) {
-      for (const bad of invalidPackSelectors(await storage.readPacks())) {
+      const packProblems: Array<{ file: string; message: string }> = [];
+      const packs = await storage.readPacks(packProblems);
+      packCount = packs.length;
+      for (const p of packProblems) {
+        hasErrors = true;
+        allErrors.push({ path: p.file, errors: [{ rule: "pack-file", message: p.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ ${p.file}`));
+          console.log(`  ${p.message}`);
+        }
+      }
+      for (const bad of invalidPackSelectors(packs)) {
         hasErrors = true;
         allErrors.push({ path: `pack:${bad.id}`, errors: [{ rule: "pack-query", message: bad.message }] });
         if (!opts.json) {
@@ -1867,7 +1880,7 @@ program
       console.log(
         hasErrors
           ? chalk.red(`\nValidation failed with errors`)
-          : chalk.green(`\nAll ${docs.length} documents valid`),
+          : chalk.green(`\nAll ${docs.length} documents${path ? "" : ` and ${packCount} packs`} valid`),
       );
     }
 

@@ -947,6 +947,28 @@ describe("[regression] ctx validate", () => {
     expect(res.stdout).toContain("✗ pack:bad");
     expect(res.stdout).toContain('spell OR as "|"');
   });
+
+  it("reports a pack file that is not valid YAML or not a valid pack, and reads .yaml packs", () => {
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(join(tmp, "packs", "broken.yml"), "id: [broken\n", "utf-8");
+    writeFileSync(join(tmp, "packs", "nolabel.yml"), "id: nolabel\nquery: \"#a\"\n", "utf-8");
+    writeFileSync(join(tmp, "packs", "ext.yaml"), "id: ext\nlabel: Ext\nquery: \"#a OR #b\"\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toContain("✗ packs/broken.yml");
+    expect(res.stdout).toContain("invalid YAML");
+    expect(res.stdout).toContain("✗ packs/nolabel.yml");
+    expect(res.stdout).toContain("label");
+    expect(res.stdout).toContain("✗ pack:ext");
+  });
+
+  it("passes a vault whose packs are all valid", () => {
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(join(tmp, "packs", "ok.yml"), "id: ok\nlabel: Ok\nquery: \"#a | #b\"\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/and [1-9]\d* packs valid/);
+  });
 });
 
 // ─── index ────────────────────────────────────────────────────────────────────

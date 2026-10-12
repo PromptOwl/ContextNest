@@ -3130,17 +3130,31 @@ export class NestStorage {
   }
 
   /**
-   * Read all packs from packs/ directory (§3).
+   * Read all packs from packs/ directory (§3). Pass `problems` to collect
+   * files that are not valid YAML or not a valid pack instead of throwing on
+   * the first / silently skipping the rest (`ctx validate` does).
    */
-  async readPacks(): Promise<Pack[]> {
-    const packFiles = await globFiles(this.root, "packs/**/*.yml");
+  async readPacks(problems?: Array<{ file: string; message: string }>): Promise<Pack[]> {
+    const packFiles = await globFiles(this.root, ["packs/**/*.yml", "packs/**/*.yaml"]);
     const packs: Pack[] = [];
     for (const file of packFiles.sort()) {
       const content = await readFile(join(this.root, file), "utf-8");
-      const raw = yaml.load(content);
+      let raw: unknown;
+      try {
+        raw = yaml.load(content);
+      } catch (err) {
+        if (!problems) throw err;
+        problems.push({ file, message: `invalid YAML: ${(err as Error).message.split("\n")[0]}` });
+        continue;
+      }
       const result = packSchema.safeParse(raw);
       if (result.success) {
         packs.push(result.data as Pack);
+      } else {
+        problems?.push({
+          file,
+          message: result.error.issues.map((i) => `${i.path.join(".") || "pack"}: ${i.message}`).join("; "),
+        });
       }
     }
     return packs;
