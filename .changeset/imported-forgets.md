@@ -3,10 +3,11 @@
 "@promptowl/contextnest-cli": patch
 ---
 
-**An imported forget erases only a copy of what it forgot.**
+**An imported forget is applied only to a copy of what it forgot, and logged once.**
 
-- `context_import` re-applies an imported forget only to a pre-forget copy: a local document whose history, live text or live body carries content the forget erased. A forget record naming a document here that holds none of it is refused (reported under `.versions/chain_events.yaml`) and not logged — before, any document named by id was erased, so a caller who could import could erase what it could not forget.
+- `context_import` re-applies an imported forget only to a pre-forget copy: a local document whose live text, live body, or any sealed version carries content the forget erased. A record naming a document here that holds none of it is refused (reported under `.versions/chain_events.yaml`) and not logged. A record reusing the id of a logged event with a different record is refused too — the log is deduplicated by id, so it would have been applied with no audit record of its own. A record scoped to versions is recorded but not applied to a live document: the engine forgets whole documents.
+- This is a correctness filter, not authorization: a record carrying hashes a reader can obtain (a document's own checksum) still passes. Which callers may import forget records is the host's to decide; the engine applies no forget tier here.
 - Imported forget records are logged as their own fields, never verbatim (a YAML alias chain in one used to expand into a log of hundreds of megabytes), and in one read and one write of the log, however many (5000 used to take minutes under the vault lock). `NestStorage.appendChainEvents` appends a batch; `ChainEventLog.appendBatch` uses it.
-- `applyImportedTombstones` now returns `{ applied, refused }`.
+- **Breaking (API):** `applyImportedTombstones` now returns `{ applied, refused }` instead of `string[]`, and `TombstoneIndex` carries `eventIds`.
 - Version files (history, keyframes, diffs) are read only when they are regular files, opened without blocking and checked on the open handle: a FIFO in their place no longer hangs verify, reconstruct or update.
-- A JATS reference DOI, and the CLI's vault alias and nest labels, are trimmed in linear time.
+- A JATS reference DOI, and the CLI's vault alias and nest labels, are trimmed in linear time. A structure-rule format (regex or token pattern) is at most 200 characters; compiling a token pattern walked it from every `{`.

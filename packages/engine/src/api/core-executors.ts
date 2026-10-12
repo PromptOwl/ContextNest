@@ -240,6 +240,9 @@ async function resolveId(
  * it — normalizeDocumentId roots it under nodes/ — when that one exists.
  */
 async function givenId(ctx: OperationContext, id: string): Promise<string> {
+  // Validated before anything is read for it: an id that is refused never
+  // reaches the file system (nor answers with its path).
+  assertSafeDocumentId(id);
   if (id.includes("/") || (await readIfExists(ctx, id))) return id;
   const rooted = `nodes/${id}`;
   return (await readIfExists(ctx, rooted)) ? rooted : id;
@@ -630,11 +633,13 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // carry no prefix) to a document that doesn't exist. The storage layer
   // already resolves an id for its own layout — all this has to do is refuse
   // one that would escape the vault root, and find a bare id where create put it.
-  const id: string = await givenId(ctx, input.id);
   // An update writes the file before any publish, so a reserved path
   // (§11.1.1: `.versions/`, `_suggestions/`, the root `packs/`) is refused
-  // here, not left to the publish guard after the edit has landed.
-  await assertWritableDocumentPath(ctx.storage.root, id);
+  // here, not left to the publish guard after the edit has landed — and
+  // before the id is resolved, so nothing is read for an id that is refused.
+  await assertWritableDocumentPath(ctx.storage.root, String(input.id));
+  const id: string = await givenId(ctx, String(input.id));
+  if (id !== input.id) await assertWritableDocumentPath(ctx.storage.root, id);
   const live = await ctx.storage.readDocument(id);
   // Held for review (review.ts). An edit to a PUBLISHED node must not touch
   // the canonical file — it is staged as a suggestion instead — and it builds
@@ -1000,7 +1005,8 @@ const init: OperationExecutor = async (ctx, input: any) => {
  * renders `mcp____context_skill`.
  */
 async function loadSkillNode(ctx: OperationContext, input: any) {
-  const id = await givenId(ctx, sanitizeId(String(input.id ?? "")));
+  const id = normalizeDocumentId(String(input.id ?? ""));
+  assertSafeDocumentId(id);
   const [live, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
 
   // A rejected node does not dead-end: it falls back to the last APPROVED version,

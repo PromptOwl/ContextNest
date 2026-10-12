@@ -353,3 +353,18 @@ export class ForgottenVersionError extends ContextNestError {
     this.name = "ForgottenVersionError";
   }
 }
+
+/**
+ * A document's frontmatter parsed as YAML but has the wrong shape — not a
+ * mapping, or a field of the wrong kind (`tags: 5`). One typed error, so the
+ * vault crawl can skip the one document and verify can name it.
+ */
+export class FrontmatterShapeError extends ContextNestError {
+  constructor(
+    public readonly documentId: string,
+    detail: string,
+  ) {
+    super(`${documentId}: ${detail}`, "INVALID_FRONTMATTER", "§1");
+    this.name = "FrontmatterShapeError";
+  }
+}

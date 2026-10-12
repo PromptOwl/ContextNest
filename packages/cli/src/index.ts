@@ -2257,7 +2257,21 @@ program
     // Forget protocol (§6.3): erased content stays erased, and every
     // tombstone is accounted for by a recorded forget. Tombstoned versions
     // themselves verify hash-only — they are not errors.
-    const tombstoneErrors = await storage.verifyTombstones(allHistories);
+    // The crawl, once: a document that cannot be read (frontmatter that does
+    // not parse, sealed bytes that do not open) is reported, never skipped
+    // into a pass — and the tombstone and sidecar checks judge the same set.
+    let liveDocs: Awaited<ReturnType<typeof storage.discoverDocuments>> | undefined;
+    if (!lock) {
+      liveDocs = await storage.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (docId, reason) => {
+          totalErrors++;
+          allReportErrors.push({ type: "unreadable_document", document: docId, expected: null, actual: reason });
+          if (!opts.json) console.log(chalk.red(`✗ ${docId}: unreadable — ${reason}`));
+        },
+      });
+    }
+    const tombstoneErrors = await storage.verifyTombstones(allHistories, liveDocs);
     if (tombstoneErrors.length > 0) {
       totalErrors += tombstoneErrors.length;
       allReportErrors.push(...tombstoneErrors);
@@ -2285,7 +2299,7 @@ program
     // also must not hold content in plaintext. Both need the key.
     const sidecarErrors = lock
       ? []
-      : [...(await storage.verifyPdfSidecars()), ...(await storage.findUnencryptedFiles())];
+      : [...(await storage.verifyPdfSidecars(liveDocs)), ...(await storage.findUnencryptedFiles())];
     if (sidecarErrors.length > 0) {
       totalErrors += sidecarErrors.length;
       allReportErrors.push(...sidecarErrors);

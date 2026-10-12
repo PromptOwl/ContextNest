@@ -28,6 +28,7 @@
  * §6.3.5 retention keys): see CONTEXT_NEST_SPEC.md §6.3 "Not yet implemented".
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type {
   ClientMetadata,
   ContextNode,
@@ -444,7 +445,7 @@ export async function applyImportedTombstones(
   incomingEvents: readonly unknown[],
   index: TombstoneIndex,
 ): Promise<{ applied: string[]; refused: Array<{ id: string; reason: string }> }> {
-  const known = new Set((await new ChainEventLog(storage).readAll()).map((e) => e.event_id));
+  const known = new Map<string, unknown>((await new ChainEventLog(storage).readAll()).map((e) => [e.event_id, e]));
   const applied: string[] = [];
   const refused: Array<{ id: string; reason: string }> = [];
   const toLog: HashChainEvent[] = [];
@@ -460,26 +461,52 @@ export async function applyImportedTombstones(
     } catch {
       continue;
     }
+    // A record reusing the id of a logged event must be that event: the log
+    // is deduplicated by id, so a different record under a known id would be
+    // applied with no audit record of its own.
+    const logged = known.get(rec.event_id);
+    if (logged !== undefined && !isDeepStrictEqual(tombstoneFromEvent(logged), rec)) {
+      refused.push({
+        id: rec.document_id,
+        reason: `the forget record ${rec.event_id} reuses the id of a logged event with a different record — not applied`,
+      });
+      continue;
+    }
     // A delete record is audit-only: an import never deletes a local doc.
     let node: ContextNode | null = null;
     if (rec.mode !== "delete") node = await storage.readDocument(rec.document_id).catch(() => null);
     const history = node ? await storage.readHistory(rec.document_id).catch(() => null) : null;
-    if (node && !isForgotten(node) && !holdsErasedContent(rec, node.rawContent, history)) {
+    if (
+      node &&
+      !isForgotten(node) &&
+      !holdsErasedContent(rec, node.rawContent, history) &&
+      !(await historyHoldsErasedBody(storage, node, history, rec))
+    ) {
       refused.push({
         id: rec.document_id,
         reason: `the forget of ${rec.document_id} names a document here that holds none of the content it erased — not applied`,
       });
       continue;
     }
+    // The engine forgets whole documents (§6.3): a record scoped to versions
+    // is recorded (what it erased stays refused) but never applied to a live
+    // document here, and the import says so.
+    const partial = rec.scope === "versions" && node !== null && !isForgotten(node);
+    if (partial) {
+      refused.push({
+        id: rec.document_id,
+        reason: `the forget record ${rec.event_id} is scoped to versions — this vault forgets whole documents, so it is recorded, not applied`,
+      });
+    }
     if (!known.has(rec.event_id)) {
-      known.add(rec.event_id);
       // Not a schema-valid event: honored for this import, but no malformed
       // record goes into this vault's audit log.
       const event = loggedForgetEvent(rec, raw);
       if (event) toLog.push(event);
+      known.set(rec.event_id, event ?? raw);
     }
     addTombstone(index, rec);
-    if (node) toApply.push({ rec, node, history });
+    if (node && !partial) toApply.push({ rec, node, history });
   }
   await storage.appendChainEvents(toLog);
 
@@ -511,6 +538,22 @@ export async function applyImportedTombstones(
     await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","));
   }
   return { applied, refused };
+}
+
+/**
+ * The erased body may sit in a sealed version only — the live body was edited
+ * since (§6.3.4: the copy still holds it). Rebuilds the document's versions.
+ */
+async function historyHoldsErasedBody(
+  storage: NestStorage,
+  node: ContextNode,
+  history: DocumentHistory | null,
+  rec: TombstoneRecord,
+): Promise<boolean> {
+  if (!history || rec.body_hashes.length === 0) return false;
+  const erased = new Set(rec.body_hashes);
+  const { bodyHashes } = await collectErasedHashes(storage, node, history.versions.filter((e) => !e.tombstone));
+  return bodyHashes.some((h) => erased.has(h));
 }
 
 /**

@@ -130,6 +130,8 @@ export interface StructureView {
 export const MAX_MATCHED_NAME = 128;
 /** Longest owner-written regex accepted. */
 const MAX_REGEX_LENGTH = 200;
+/** Longest format, regex or token pattern: compiling one walks it from every `{`. */
+const MAX_FORMAT_LENGTH = 200;
 /**
  * `{slug}`/`{n}` tokens per token pattern — a readability limit (§11.1.1).
  * Cost is not the reason: token patterns run on the same linear matcher as
@@ -447,6 +449,9 @@ function linearTest(alternatives: RegexItem[][], name: string): boolean {
 
 /** Compile a format: `/regex/` or a token pattern like `{date}-{slug}`. */
 function compileFormat(spelling: string, key: string): Matcher {
+  if (spelling.length > MAX_FORMAT_LENGTH) {
+    throw new ConfigError(`${key}: the format is longer than ${MAX_FORMAT_LENGTH} characters`);
+  }
   if (spelling.length >= 2 && spelling.startsWith("/") && spelling.endsWith("/")) {
     const body = spelling.slice(1, -1);
     if (!body) throw new ConfigError(`${key}: the regex is empty`);

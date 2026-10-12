@@ -77,6 +77,7 @@ export {
   VersionArtifactExistsError,
   ForgottenDocumentError,
   ForgottenVersionError,
+  FrontmatterShapeError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";

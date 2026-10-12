@@ -4,6 +4,7 @@
  */
 
 import yaml from "js-yaml";
+import { FrontmatterShapeError } from "./errors.js";
 import { frontmatterSchema, STATUSES, STATUS_ALIASES } from "./schemas.js";
 import type { ContextNode, Frontmatter, Status, ValidationError, ValidationResult } from "./types.js";
 
@@ -33,9 +34,14 @@ export function normalizeStatus(raw: unknown): Status {
 }
 
 /** Normalize tags to always include the # prefix. Filters out null/undefined entries caused by YAML comment parsing. */
-export function normalizeTags(tags?: unknown[]): string[] | undefined {
-  if (!tags) return undefined;
-  const valid = tags.filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
+export function normalizeTags(tags?: unknown, documentId = "document"): string[] | undefined {
+  if (tags === undefined || tags === null) return undefined;
+  // Obsidian writes a single tag as a scalar (`tags: project`).
+  const list = typeof tags === "string" ? [tags] : tags;
+  if (!Array.isArray(list)) {
+    throw new FrontmatterShapeError(documentId, `tags must be a list of names (got ${typeof tags})`);
+  }
+  const valid = list.filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
   if (valid.length === 0) return undefined;
   return valid.map((tag) => (tag.startsWith("#") ? tag : `#${tag}`));
 }
@@ -199,11 +205,14 @@ export function parseDocument(
   id: string,
 ): ContextNode {
   const { data, body } = splitFrontmatter(content);
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new FrontmatterShapeError(id, "frontmatter is not a mapping of fields");
+  }
   const parsed = { data: data as Record<string, any>, content: body };
 
   // Normalize tags to include # prefix
-  if (parsed.data.tags) {
-    parsed.data.tags = normalizeTags(parsed.data.tags);
+  if (parsed.data.tags !== undefined) {
+    parsed.data.tags = normalizeTags(parsed.data.tags, id);
   }
 
   // Coerce auto-parsed Date values back to ISO strings so the runtime shape

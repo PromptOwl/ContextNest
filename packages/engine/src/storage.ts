@@ -62,6 +62,7 @@ import {
   CorruptHistoryError,
   DocumentNotFoundError,
   VersionArtifactExistsError,
+  FrontmatterShapeError,
 } from "./errors.js";
 import {
   packSchema,
@@ -70,6 +71,7 @@ import {
   checkpointHistorySchema,
 } from "./schemas.js";
 import {
+  ForeignVaultKeyError,
   VaultCrypto,
   VaultLockedError,
   WrongVaultKeyError,
@@ -956,8 +958,15 @@ export class NestStorage {
         node = parseDocument(filePath, await this.readText(filePath, "doc", id), id);
       } catch (err) {
         // A missing or wrong key fails at unlock (VAULT_LOCKED,
-        // VAULT_KEY_MISMATCH) and still throws: a locked vault never lists empty.
-        if (!(err instanceof yaml.YAMLException) && (err as { code?: string }).code !== "DECRYPTION_FAILED") throw err;
+        // VAULT_KEY_MISMATCH), and a file sealed under a key this vault does
+        // not hold is the vault's condition, not the file's: all still throw —
+        // a vault never lists empty for want of its key.
+        if (err instanceof ForeignVaultKeyError) throw err;
+        const oneFile =
+          err instanceof yaml.YAMLException ||
+          err instanceof FrontmatterShapeError ||
+          (err as { code?: string }).code === "DECRYPTION_FAILED";
+        if (!oneFile) throw err;
         options.onUnreadable?.(id, err instanceof Error ? err.message : String(err));
         return null;
       }
@@ -1390,7 +1399,15 @@ export class NestStorage {
       }
     }
 
-    for (const doc of docs ?? (await this.discoverDocuments({ includeRetired: true }))) {
+    // Crawling here (no docs given): a document that cannot be read is
+    // reported, never skipped into a pass.
+    const liveDocs =
+      docs ??
+      (await this.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+      }));
+    for (const doc of liveDocs) {
       if (doc.frontmatter.status !== "forgotten") {
         if (index.records.length === 0) continue;
         // A live document back at a path a forget retired,
@@ -1876,7 +1893,12 @@ export class NestStorage {
    */
   async verifyPdfSidecars(docs?: ContextNode[]): Promise<VerificationReport["errors"]> {
     const errors: VerificationReport["errors"] = [];
-    const nodes = docs ?? (await this.discoverDocuments({ includeRetired: true }));
+    const nodes =
+      docs ??
+      (await this.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+      }));
     for (const doc of nodes) {
       const pdf = doc.frontmatter.pdf;
       if (doc.frontmatter.type !== "pdf" || !pdf || typeof pdf.file !== "string") continue;

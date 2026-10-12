@@ -766,9 +766,9 @@ describe("forget and tombstones", () => {
   it.each(SPELLINGS)("r10 chainev: an import of %j with overwrite never erases a forget's tombstone", (path) => eraseTombstones(path, true));
 
   /** A forget record as another vault's chain-event log would carry it. */
-  const forgetEvent = (docId: string, eventId = "forged-1", extra = "") =>
+  const forgetEvent = (docId: string, eventId = "forged-1", extra = "", hash = ZERO) =>
     `- event_id: ${eventId}\n  event_type: document.forgotten\n  document_id: ${docId}\n  actor: mallory\n  timestamp: "2026-01-01T00:00:00Z"\n` +
-    `  action_metadata:\n    scope: node\n    reason_code: legal\n    content_hashes: ["${ZERO}"]\n${extra}`;
+    `  action_metadata:\n    scope: node\n    reason_code: legal\n    content_hashes: ["${hash}"]\n${extra}`;
 
   // r23 forgeforget: an imported forget was re-applied to the local document
   // by document_id alone — any document, whatever it held — so a caller who
@@ -829,6 +829,72 @@ describe("forget and tombstones", () => {
     const logged = yaml.load(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8")) as { event_id: string }[];
     expect(logged.filter((e) => /^e\d+$/.test(e.event_id))).toHaveLength(5000);
   }, 30_000);
+
+  // r27 B4 (architecture review): the log was deduplicated by event_id alone,
+  // so a forged record reusing a logged id (readable from context_forget_log)
+  // naming another document erased it with no audit record. A known id whose
+  // record differs from the logged one is refused.
+  it("r27 B4: an imported forget reusing the id of a logged event with a different record is refused and erases nothing", async () => {
+    await api.run("context_create", { id: "nodes/notes/s", title: "s", content: "## Summary\nTOP SECRET erased by legal\n" }, ctx);
+    await api.run("context_forget", { id: "nodes/notes/s", reason_code: "legal" }, ctx);
+    await api.run("context_create", { id: "nodes/notes/b", title: "b", content: "## Summary\nkeep me\n" }, ctx);
+    const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8");
+    const forgot = (yaml.load(log) as { event_id: string; event_type: string }[]).find((e) => e.event_type === "document.forgotten")!;
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/b", forgot.event_id) }]);
+    expect(r.failed.map((f) => f.error).join("\n")).toMatch(/reuses the id of a logged event/);
+    expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id: "nodes/notes/b" }, ctx)).frontmatter.status).not.toBe("forgotten");
+    expect(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8")).toBe(log);
+    expect((await api.run<{ valid: boolean }>("context_verify", {}, ctx)).valid).toBe(true);
+  });
+
+  // FINDING (r27 B4 informed, open — PRD §10.1 known items): a forget record
+  // carrying a document's own checksum — which any reader gets from
+  // context_get, and which an encrypted vault keeps in plaintext — passes the
+  // pre-forget-copy gate and erases the document. A record is a claim; who
+  // may import one is the host's to decide (authorization), not a hash check.
+  it.fails("r27 B4 informed: a forged forget carrying a live document's own checksum erases nothing", async () => {
+    await api.run("context_create", { id: "nodes/notes/victim", title: "victim", content: "## Summary\nkeep me\n" }, ctx);
+    const { frontmatter } = await api.run<{ frontmatter: { checksum: string } }>("context_get", { id: "nodes/notes/victim" }, ctx);
+    await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/victim", "informed", "", frontmatter.checksum) }]);
+    expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id: "nodes/notes/victim" }, ctx)).frontmatter.status).not.toBe("forgotten");
+  });
+
+  // FINDING (r27 B4 poison, open — PRD §10.1 known items): a record naming an
+  // absent path is logged with whatever hashes it carries; carrying a live
+  // document's checksum, it makes verify flag that document and refuses its
+  // next publish. Same root: recording hashes needs authorization.
+  it.fails("r27 B4 poison: a forged forget at an absent path carrying a live document's checksum never marks that document forgotten", async () => {
+    const id = "nodes/notes/victim";
+    await api.run("context_create", { id, title: "victim", content: "## Summary\nkeep me around\n" }, ctx);
+    const { frontmatter } = await api.run<{ frontmatter: { checksum: string } }>("context_get", { id }, ctx);
+    await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/gone/x", "poison", `    body_hashes: ["${frontmatter.checksum}"]\n`) }]);
+    expect((await api.run<{ valid: boolean }>("context_verify", {}, ctx)).valid).toBe(true);
+    await api.run("context_update", { id, content: "## Summary\nkeep me around\nstill\n" }, ctx);
+  });
+
+  // FINDING (r27 M2, open — PRD §10.1 known items): an imported event whose
+  // timestamp is an unquoted date (valid YAML; js-yaml loads a Date) fails the
+  // event schema and is applied without being logged: no anti-resurrection
+  // hashes are kept, and verify reports unrecorded_tombstone.
+  it.fails("r27 M2: an imported forget with an unquoted timestamp is logged, or refused — never applied unlogged", async () => {
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/gone/y", "dated").replace('timestamp: "2026-01-01T00:00:00Z"', "timestamp: 2026-01-01T00:00:00Z") }]);
+    const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8").catch(() => "");
+    expect(r.failed.length > 0 || log.includes("dated")).toBe(true);
+  });
+
+  // r24 B5 scope: the engine forgets whole documents (§6.3); a record scoped
+  // to versions named a live document and erased all of it. Such a record is
+  // recorded (what it erased stays refused) but never applied to a live
+  // document here, and the import says so.
+  it("r24 B5 scope: an imported forget scoped to versions never erases a whole live document", async () => {
+    const id = "nodes/notes/victim";
+    await api.run("context_create", { id, title: "victim", content: "## Summary\nkeep me around\n" }, ctx);
+    const { frontmatter } = await api.run<{ frontmatter: { checksum: string } }>("context_get", { id }, ctx);
+    const record = forgetEvent(id, "scoped", "    versions: [1]\n", frontmatter.checksum).replace("scope: node", "scope: versions");
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: record }]);
+    expect(r.failed.map((f) => f.error).join("\n")).toMatch(/scoped to versions/);
+    expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id }, ctx)).frontmatter.status).not.toBe("forgotten");
+  });
 });
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
@@ -1494,5 +1560,123 @@ describe("legitimate flows that must keep working", () => {
     await api.run("context_create", { id: "nodes/twin", title: "twin", content: "rooted\n" }, c);
     await writeFile(join(d, "twin.md"), "---\ntitle: twin\ntype: document\nstatus: draft\n---\nflat\n", "utf-8");
     expect((await api.run<{ body: string }>("context_get", { id: "twin" }, c)).body).toContain("flat");
+  });
+});
+
+// ─── Architecture review of rounds 27–28 ────────────────────────────────────
+
+describe("architecture review of rounds 27–28", () => {
+  // r27 B1: a file sealed with a key this vault does not hold threw the same
+  // code (DECRYPTION_FAILED) as a file that fails authentication, and
+  // discovery skipped both — so a vault whose key material was replaced
+  // listed empty, and the next write sealed a checkpoint holding only itself.
+  it("r27 B1: a vault whose key material was replaced refuses to read, never lists empty nor seals a checkpoint without its documents", async () => {
+    setDefaultVaultKeyStore(new MemoryKeyStore());
+    await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+    await api.run("context_create", { id: "nodes/notes/a", title: "a", content: "## Summary\nx\n" }, ctx);
+    await api.run("context_create", { id: "nodes/notes/b", title: "b", content: "## Summary\ny\n" }, ctx);
+    const before = (await storage.readCheckpointHistory())!.checkpoints.length;
+    // The obvious remedy for a lost config — encrypting again — must not mint
+    // a new key over files sealed under the old one.
+    const config = join(dir, ".context/encryption.yaml");
+    const saved = await readFile(config, "utf-8");
+    await rm(config);
+    await expect(encryptVault(new NestStorage(dir), { scrypt: { N: 2 ** 10, r: 8, p: 1 } })).rejects.toMatchObject({ code: "VAULT_LOCKED" });
+    expect(await exists(".context/encryption.yaml")).toBe(false);
+    await writeFile(config, saved, "utf-8");
+    // Another vault's key material in this vault's place: every file carries a
+    // key id the config does not hold.
+    const { root: other } = await freshVault();
+    await encryptVault(new NestStorage(other), { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+    await writeFile(config, await readFile(join(other, ".context/encryption.yaml"), "utf-8"), "utf-8");
+    const fresh = context(new NestStorage(dir));
+    await expect(api.run("context_list", {}, fresh)).rejects.toMatchObject({ code: "DECRYPTION_FAILED" });
+    await api.run("context_create", { id: "nodes/notes/new", title: "n", content: "## Summary\nz\n" }, fresh).catch(() => undefined);
+    const cps = (await new NestStorage(dir).readCheckpointHistory())!.checkpoints;
+    for (const cp of cps.slice(before)) expect(Object.keys(cp.document_versions)).toContain("nodes/notes/a");
+  });
+
+  // r27 B2: a checkpoint sealed while a document was unreadable left it out,
+  // and once the document was repaired the record stayed — verify-green and
+  // wrong. An unreadable document's last sealed entry is carried forward.
+  it("r27 B2: a checkpoint sealed while a document is unreadable carries that document's last sealed entry forward", async () => {
+    const a = "nodes/notes/a";
+    await api.run("context_create", { id: a, title: "a", content: "## Summary\nx\n" }, ctx);
+    await api.run("context_create", { id: "nodes/notes/b", title: "b", content: "## Summary\ny\n" }, ctx);
+    const before = (await storage.readCheckpointHistory())!.checkpoints.at(-1)!;
+    const file = join(dir, `${a}.md`);
+    const good = await readFile(file, "utf-8");
+    await writeFile(file, good.replace("title: a", "title: ["), "utf-8");
+    await api.run("context_create", { id: "nodes/notes/k", title: "k", content: "## Summary\nz\n" }, ctx);
+    const sealed = (await storage.readCheckpointHistory())!.checkpoints.at(-1)!;
+    expect(sealed.document_versions["nodes/notes/k"]).toBe(1);
+    expect(sealed.document_versions[a]).toBe(before.document_versions[a]);
+    expect(sealed.document_chain_hashes[a]).toBe(before.document_chain_hashes[a]);
+    await writeFile(file, good, "utf-8");
+    expect((await api.run<{ valid: boolean }>("context_verify", {}, ctx)).valid).toBe(true);
+  });
+
+  // r27 B3: context_update resolved a bare id (reading the disk) before
+  // validating it, so an over-long id answered ENAMETOOLONG with the vault's
+  // absolute path. The id is validated first, as every other op does.
+  it.each([["over-long", "a".repeat(300)], ["a NUL", "nodes/x\u0000y"], ["traversal", "nodes/../../x"]])(
+    "r27 B3: context_update refuses %s id before touching the disk, and never answers with the vault's path",
+    async (_l, id) => {
+      const err = await refusal("context_update", { id, content: "x" });
+      expect(err.message).not.toContain(dir);
+      expect(["INVALID_DOCUMENT_ID", "VALIDATION_FAILED"]).toContain(err.code);
+    },
+  );
+
+  // r27 M1 / r24 B3: discovery skipped a document only when its frontmatter
+  // failed to parse as YAML; frontmatter of the wrong shape (`tags: foo`,
+  // which Obsidian writes; `tags: 5`; a scalar) threw a TypeError from the
+  // parser and still took list, search, create and verify down. A scalar tag
+  // reads as a one-tag list; any other wrong shape is one typed parse error,
+  // which discovery skips and verify names.
+  it.each([
+    ["tags: foo", "---\ntitle: t\ntags: foo\n---\nx\n", true],
+    ["tags: 5", "---\ntitle: t\ntags: 5\n---\nx\n", false],
+    ["tags: {x: 1}", "---\ntitle: t\ntags: {x: 1}\n---\nx\n", false],
+    ["scalar frontmatter", "---\njust a string\n---\nx\n", false],
+  ])("r24 B3: a document with %s never takes list down — listed when it reads, named by verify when it does not", async (_l, raw, listed) => {
+    await mkdir(join(dir, "nodes/notes"), { recursive: true });
+    await writeFile(join(dir, "nodes/notes/t.md"), raw, "utf-8");
+    const ids = (await api.run<{ documents: { id: string }[] }>("context_list", {}, ctx)).documents.map((d) => d.id);
+    expect(ids.includes("nodes/notes/t")).toBe(listed);
+    await api.run("context_search", { query: "x" }, ctx);
+    await api.run("context_create", { id: "nodes/notes/k", title: "k", content: "x" }, ctx);
+    const verify = await api.run<{ errors: { type: string; document?: string }[] }>("context_verify", {}, ctx);
+    expect(verify.errors.some((e) => e.type === "unreadable_document" && e.document === "nodes/notes/t")).toBe(!listed);
+  });
+
+  // r24 B4: the pre-forget-copy gate compared a record's body hashes with the
+  // live body only, so a copy that was edited locally — the erased body still
+  // in its history — refused a legitimate forget made elsewhere (§6.3.4).
+  it("r24 B4: a forget made elsewhere reaches a copy whose history holds the erased body, even after a local edit", async () => {
+    const body = "## Summary\nTOP SECRET erased by legal\n";
+    await api.run("context_create", { id: "nodes/notes/x", title: "x", content: body }, ctx);
+    await api.run("context_update", { id: "nodes/notes/x", content: "## Summary\nedited locally\n" }, ctx);
+    const { root, c } = await freshVault();
+    await api.run("context_create", { id: "nodes/notes/x", title: "x", content: body }, c);
+    await api.run("context_forget", { id: "nodes/notes/x", reason_code: "legal" }, c);
+    const theirs = await readFile(join(root, ".versions/chain_events.yaml"), "utf-8");
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: theirs }]);
+    expect(r.failed).toEqual([]);
+    expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id: "nodes/notes/x" }, ctx)).frontmatter.status).toBe("forgotten");
+    expect(await exists("nodes/notes/.versions/x/v1.md")).toBe(false);
+  });
+
+  // r24 B6: a token format was split with `/(\{[^}]*\})/`, which rescans to
+  // the end from every `{` of a run: 120k braces cost 13 s on every enforced
+  // write and on `ctx structure`. Owner input, so the same class as the trims
+  // fixed in rounds 22–23. A format is capped like a regex is.
+  it("r24 B6: a token format of 120k braces is refused at once, and never slows a write", async () => {
+    const { setStructure } = await import("../structure-store.js");
+    const started = performance.now();
+    await setStructure(storage, { structure: { enforce: true }, folders: { notes: { file_name: "{".repeat(120_000) } } }).catch(() => undefined);
+    await api.run("context_create", { id: "nodes/notes/a", title: "a", content: "x" }, ctx).catch(() => undefined);
+    await api.run("context_structure", {}, ctx).catch(() => undefined);
+    expect(performance.now() - started).toBeLessThan(2_000);
   });
 });
