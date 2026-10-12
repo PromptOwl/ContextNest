@@ -42,6 +42,8 @@ import type { NestStorage } from "./storage.js";
 import { assertErasableDocumentId, assertNotMachineryPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
+// Type only: structure-store imports this module.
+import type { ReplayBudget } from "./structure-store.js";
 import { ChainEventLog } from "./chain-log.js";
 import { FORGET_REASON_CODES, hashChainEventSchema } from "./schemas.js";
 import {
@@ -444,7 +446,10 @@ export async function applyImportedTombstones(
   storage: NestStorage,
   incomingEvents: readonly unknown[],
   index: TombstoneIndex,
+  /** The import's replay budget: rebuilding a copy's versions is charged to it. */
+  budget?: ReplayBudget,
 ): Promise<{ applied: string[]; refused: Array<{ id: string; reason: string }> }> {
+  const sealed = new Map<string, Set<string> | null>();
   const known = new Map<string, unknown>((await new ChainEventLog(storage).readAll()).map((e) => [e.event_id, e]));
   const applied: string[] = [];
   const refused: Array<{ id: string; reason: string }> = [];
@@ -476,17 +481,22 @@ export async function applyImportedTombstones(
     let node: ContextNode | null = null;
     if (rec.mode !== "delete") node = await storage.readDocument(rec.document_id).catch(() => null);
     const history = node ? await storage.readHistory(rec.document_id).catch(() => null) : null;
-    if (
-      node &&
-      !isForgotten(node) &&
-      !holdsErasedContent(rec, node.rawContent, history) &&
-      !(await historyHoldsErasedBody(storage, node, history, rec))
-    ) {
-      refused.push({
-        id: rec.document_id,
-        reason: `the forget of ${rec.document_id} names a document here that holds none of the content it erased — not applied`,
-      });
-      continue;
+    if (node && !isForgotten(node) && !holdsErasedContent(rec, node.rawContent, history)) {
+      const bodies = rec.body_hashes.length > 0 ? await sealedBodies(storage, node, history, sealed, budget) : new Set<string>();
+      if (bodies === null) {
+        refused.push({
+          id: rec.document_id,
+          reason: `the forget of ${rec.document_id}: this import replays more version history than one call allows — split it into smaller calls`,
+        });
+        continue;
+      }
+      if (!rec.body_hashes.some((h) => bodies.has(h))) {
+        refused.push({
+          id: rec.document_id,
+          reason: `the forget of ${rec.document_id} names a document here that holds none of the content it erased — not applied`,
+        });
+        continue;
+      }
     }
     // The engine forgets whole documents (§6.3): a record scoped to versions
     // is recorded (what it erased stays refused) but never applied to a live
@@ -541,19 +551,47 @@ export async function applyImportedTombstones(
 }
 
 /**
- * The erased body may sit in a sealed version only — the live body was edited
- * since (§6.3.4: the copy still holds it). Rebuilds the document's versions.
+ * Body hashes of a document's sealed versions — an erased body may sit in
+ * one only, the live body edited since (§6.3.4: the copy still holds it).
+ * Rebuilt once per document per import and charged to the import's replay
+ * budget; null once that is spent.
+ *
+ * ponytail: charges each rebuilt version's length once, though rebuilding a
+ * version replays up to a keyframe interval of diffs; charge the replay itself
+ * if imports of long-history vaults need a tighter bound.
  */
-async function historyHoldsErasedBody(
+async function sealedBodies(
   storage: NestStorage,
   node: ContextNode,
   history: DocumentHistory | null,
-  rec: TombstoneRecord,
-): Promise<boolean> {
-  if (!history || rec.body_hashes.length === 0) return false;
-  const erased = new Set(rec.body_hashes);
-  const { bodyHashes } = await collectErasedHashes(storage, node, history.versions.filter((e) => !e.tombstone));
-  return bodyHashes.some((h) => erased.has(h));
+  cache: Map<string, Set<string> | null>,
+  budget: ReplayBudget | undefined,
+): Promise<Set<string> | null> {
+  const cached = cache.get(node.id);
+  if (cached !== undefined) return cached;
+  let bodies: Set<string> | null = new Set();
+  const vm = new VersionManager(storage);
+  for (const entry of history?.versions ?? []) {
+    if (entry.tombstone) continue;
+    let raw: string;
+    try {
+      raw = await vm.reconstructVersion(node.id, entry.version, history!);
+    } catch {
+      continue; // Unreconstructable: its content_hash still names it.
+    }
+    if (budget) {
+      budget.left -= raw.length;
+      if (budget.left < 0) budget.spent = true;
+      if (budget.spent) {
+        bodies = null;
+        break;
+      }
+    }
+    const h = forgettableBodyHash(raw);
+    if (h) bodies.add(h);
+  }
+  cache.set(node.id, bodies);
+  return bodies;
 }
 
 /**

@@ -1302,7 +1302,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   }
   if (tombstones && incomingEvents.length > 0) {
     try {
-      const { refused } = await applyImportedTombstones(ctx.storage, incomingEvents, tombstones);
+      const { refused } = await applyImportedTombstones(ctx.storage, incomingEvents, tombstones, replayBudget);
       for (const r of refused) failed.push({ id: ".versions/chain_events.yaml", error: r.reason });
     } catch (err) {
       failed.push({ id: ".versions/chain_events.yaml", error: vaultError(ctx, err) });

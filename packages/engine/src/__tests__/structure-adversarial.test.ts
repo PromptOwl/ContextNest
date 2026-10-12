@@ -895,6 +895,36 @@ describe("forget and tombstones", () => {
     expect(r.failed.map((f) => f.error).join("\n")).toMatch(/scoped to versions/);
     expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id }, ctx)).frontmatter.status).not.toBe("forgotten");
   });
+
+  // r28 N1 (architecture re-check): finding an erased body in a copy's sealed
+  // versions rebuilt every version of the document once per imported record,
+  // uncharged, under the vault lock — 200 records against a 60-version
+  // document took 30 s. Each document is rebuilt once per import, charged to
+  // the import's replay budget; once that is spent the rest are refused.
+  it("r28 N1: many imported forgets naming one long-history document rebuild it once", async () => {
+    const id = "nodes/notes/long";
+    await api.run("context_create", { id, title: "long", content: "## Summary\nversion 1 of a long history\n" }, ctx);
+    for (let v = 2; v <= 40; v++) await api.run("context_update", { id, content: `## Summary\nversion ${v} of a long history\n` }, ctx);
+    const fake = (i: number) => `sha256:${i.toString(16).padStart(64, "0")}`;
+    const records = Array.from({ length: 200 }, (_, i) => forgetEvent(id, `n1-${i}`, `    body_hashes: ["${fake(i + 1)}"]\n`, fake(10_000 + i))).join("");
+    const started = performance.now();
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: records }]);
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(r.failed).toHaveLength(200);
+    expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id }, ctx)).frontmatter.status).not.toBe("forgotten");
+  }, 60_000);
+
+  it("r28 N1: rebuilding a copy's versions is charged to the import's replay budget", async () => {
+    const id = "nodes/notes/budgeted";
+    await api.run("context_create", { id, title: "budgeted", content: "## Summary\nfirst body of this note\n" }, ctx);
+    await api.run("context_update", { id, content: "## Summary\nsecond body of this note\n" }, ctx);
+    const r = await importFiles(
+      [{ path: ".versions/chain_events.yaml", content: forgetEvent(id, "tight", `    body_hashes: ["${ZERO}"]\n`, `sha256:${"1".repeat(64)}`) }],
+      {},
+      { ...ctx, limits: { importReplayChars: 10 } },
+    );
+    expect(r.failed.map((f) => f.error).join("\n")).toMatch(SPLIT);
+  });
 });
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
