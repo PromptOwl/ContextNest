@@ -49,6 +49,7 @@ async function walkFiles(
   root: string,
   base: string,
   maxDepth = Infinity,
+  others?: string[],
 ): Promise<string[]> {
   const files: string[] = [];
 
@@ -61,6 +62,7 @@ async function walkFiles(
     }
     for (const entry of entries) {
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (!entry.isFile()) others?.push(rel);
       if (entry.isDirectory()) {
         // Never a knowledge node, and descending is pure cost.
         if (entry.name === "node_modules") continue;
@@ -142,6 +144,8 @@ export async function globFiles(
   patterns: string | string[],
   ignore: string[] = [],
   dot = false,
+  /** Filled with the matching paths that are there but are not regular files (a folder, a link). */
+  notFiles?: string[],
 ): Promise<string[]> {
   const list = Array.isArray(patterns) ? patterns : [patterns];
   const include = list.map((p) => globToRegExp(p, dot));
@@ -151,9 +155,10 @@ export async function globFiles(
   // Descend only into the subtree the patterns can match, and no deeper than
   // they can reach. Paths still come back relative to `cwd`, so patterns and
   // ignores are unaffected by the narrowing.
-  const files = await walkFiles(cwd, sharedBase(list), maxMatchDepth(list));
-  return files.filter(
-    (file) =>
-      include.some((re) => re.test(file)) && !exclude.some((re) => re.test(file)),
-  );
+  const others: string[] = [];
+  const files = await walkFiles(cwd, sharedBase(list), maxMatchDepth(list), notFiles && others);
+  const matches = (file: string) =>
+    include.some((re) => re.test(file)) && !exclude.some((re) => re.test(file));
+  notFiles?.push(...others.filter(matches));
+  return files.filter(matches);
 }

@@ -17,11 +17,11 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtemp, rm, cp, readFile, writeFile, access, readdir } from "node:fs/promises";
+import { mkdtemp, rm, cp, readFile, writeFile, access, readdir, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { NestStorage } from "@promptowl/contextnest-engine";
+import { NestStorage, setStructure } from "@promptowl/contextnest-engine";
 
 const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.url));
 const FIXTURES = fileURLToPath(new URL("../../../../fixtures/minimal-vault", import.meta.url));
@@ -53,6 +53,7 @@ const EXPECTED_TOOLS = [
   "context_nests",
   "context_skill",
   "context_skill_install",
+  "context_structure",
   // Hand-written, still current.
   "document_format",
   "read_index",
@@ -1541,5 +1542,186 @@ describe("[regression] MCP server e2e — writes outside nodes/ are re-rooted", 
     const { json } = await callJson(client, "context_create", { title: "Beta", id: "nodes/beta", content: "b" });
     expect(json.id).toBe("nodes/beta");
     expect(json.placement).toBeUndefined();
+  });
+});
+
+// ─── Structure rules, not enforced ───────────────────────────────────────────
+//
+// Report-only rules, and a vault with no rules at all, must never block a
+// write — through any surface, the deprecated legacy tools included. Every
+// write below breaks the rules (undeclared folder, missing required section).
+
+describe.each([
+  ["report-only rules", { structure: { enforce: false, closed: true } }],
+  ["no structure block", null],
+])("[regression] MCP server e2e — %s never block a write", (_label, extra) => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    if (extra) {
+      await setStructure(new NestStorage(vault), {
+        ...extra,
+        folders: { "/": {}, decisions: { types: ["document"], template: "adr" } },
+        templates: { adr: { body: "## Decision\n", required_sections: ["Decision"] } },
+      });
+    }
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("context_create, create_document, update_document, publish_document and delete_document all land", async () => {
+    expect((await callText(client, "context_create", { title: "Idea", content: "x", folder: "notes" })).isError).toBe(false);
+    await access(join(vault, "nodes", "notes", "idea.md"));
+
+    expect((await callText(client, "create_document", { path: "nodes/notes/legacy", title: "Legacy" })).isError).toBe(false);
+    await access(join(vault, "nodes", "notes", "legacy.md"));
+
+    expect((await callText(client, "context_create", { id: "nodes/decisions/d1", title: "D1", content: "## Decision\nx\n" })).isError).toBe(false);
+    expect((await callText(client, "update_document", { path: "nodes/decisions/d1", body: "no decision now\n" })).isError).toBe(false);
+    expect(await readFile(join(vault, "nodes", "decisions", "d1.md"), "utf-8")).toContain("no decision now");
+
+    expect((await callText(client, "publish_document", { path: "nodes/notes/legacy" })).isError).toBe(false);
+    expect((await callText(client, "delete_document", { path: "nodes/notes/legacy" })).isError).toBe(false);
+    await expect(access(join(vault, "nodes", "notes", "legacy.md"))).rejects.toThrow();
+  });
+});
+
+// ─── Structure rules ─────────────────────────────────────────────────────────
+//
+// docs/prds/structure-rules.md (Community repo): rules in .context/config.yaml
+// are enforced by the engine, so every write tool — catalog-driven AND the
+// deprecated legacy twins that write storage directly — refuses the same way.
+
+describe("[regression] MCP server e2e — structure rules", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    await setStructure(new NestStorage(vault), {
+      structure: { enforce: true, closed: true },
+      folders: {
+        "/": {},
+        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr" },
+      },
+      templates: { adr: { body: "## Context\n## Decision\n", required_sections: ["Decision"] } },
+    });
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("context_structure returns the rules and the resolved folder rule", async () => {
+    const { json, isError } = await callJson(client, "context_structure", { folder: "decisions" });
+    expect(isError).toBe(false);
+    expect(json.enforce).toBe(true);
+    expect(json.folders.map((f: { pattern: string }) => f.pattern)).toContain("decisions");
+    expect(json.resolved).toMatchObject({ file_name: "adr-{n}-{slug}", template_body: "## Context\n## Decision\n" });
+  });
+
+  it("context_create into an undeclared folder is refused with the rule", async () => {
+    const { text, isError } = await callText(client, "context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(isError).toBe(true);
+    expect(text).toContain("VALIDATION_FAILED");
+    expect(text).toMatch(/not an allowed folder/);
+    await expect(access(join(vault, "nodes", "notes", "idea.md"))).rejects.toThrow();
+  });
+
+  it("context_create that fits the rules lands", async () => {
+    const { json, isError } = await callJson(client, "context_create", {
+      title: "ADR 1 Use Postgres",
+      content: "## Context\nx\n## Decision\nPostgres.\n",
+      folder: "decisions",
+    });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/decisions/adr-1-use-postgres");
+  });
+
+  it("the deprecated create_document is no way around the rules", async () => {
+    const { text, isError } = await callText(client, "create_document", {
+      path: "nodes/notes/legacy",
+      title: "Legacy",
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/not an allowed folder/);
+    await expect(access(join(vault, "nodes", "notes", "legacy.md"))).rejects.toThrow();
+  });
+
+  it("the deprecated update_document cannot drop a required section", async () => {
+    const { text, isError } = await callText(client, "update_document", {
+      path: "nodes/decisions/adr-1-use-postgres",
+      body: "## Context\nonly\n",
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/Decision/);
+    const raw = await readFile(join(vault, "nodes", "decisions", "adr-1-use-postgres.md"), "utf-8");
+    expect(raw).toContain("Postgres.");
+  });
+
+  it("the deprecated update_document judges a publishing edit before it writes anything", async () => {
+    // A never-published draft that predates the rules: the edit itself is
+    // grandfathered, but publishing it is its first publish, judged in full.
+    const file = join(vault, "nodes", "drafts", "old.md");
+    const raw = "---\ntitle: Old\ntype: document\nstatus: draft\n---\nold\n";
+    await mkdir(join(vault, "nodes", "drafts"), { recursive: true });
+    await writeFile(file, raw, "utf-8");
+    const { text, isError } = await callText(client, "update_document", { path: "nodes/drafts/old", body: "new" });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/not an allowed folder/);
+    expect(await readFile(file, "utf-8")).toBe(raw);
+  });
+
+  it("the deprecated delete_document cannot delete a required file on its own", async () => {
+    await setStructure(new NestStorage(vault), {
+      structure: { enforce: true, closed: true },
+      folders: {
+        "/": {},
+        // Not `index`: where names fold case (macOS, Windows) that file is the folder's generated INDEX.md.
+        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr", files: { charter: {} } },
+      },
+      templates: { adr: { body: "## Context\n## Decision\n", required_sections: ["Decision"] } },
+    });
+    await callJson(client, "context_create", { id: "nodes/decisions/charter", title: "Charter", content: "## Decision\nx\n" });
+    const { text, isError } = await callText(client, "delete_document", { path: "nodes/decisions/charter" });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/delete the folder/);
+    await access(join(vault, "nodes", "decisions", "charter.md"));
+  });
+
+  it("the deprecated create_document scaffolds a new folder like context_create", async () => {
+    await setStructure(new NestStorage(vault), {
+      structure: { enforce: true, closed: true },
+      folders: { "/": {}, "teams/{team}": { files: { charter: { template: "c" } } } },
+      templates: { c: { body: "## Mission\n" } },
+    });
+    const { isError } = await callText(client, "create_document", { path: "nodes/teams/platform/roadmap", title: "Roadmap" });
+    expect(isError).toBe(false);
+    expect(await readFile(join(vault, "nodes", "teams", "platform", "charter.md"), "utf-8")).toContain("## Mission");
+  });
+
+  it("the deprecated create_document cannot write a document under a reserved path", async () => {
+    for (const path of ["nodes/.context/evil", "nodes/x/.versions/y/v9", "_suggestions/evil"]) {
+      const { isError } = await callText(client, "create_document", { path, title: "Evil" });
+      expect(isError).toBe(true);
+    }
+  });
+
+  it("context_import cannot rewrite .context/config.yaml", async () => {
+    const before = await readFile(join(vault, ".context", "config.yaml"), "utf-8");
+    const { json } = await callJson(client, "context_import", {
+      files: [{ path: ".context/config.yaml", content: "version: 1\nname: pwned\n" }],
+      overwrite: true,
+    });
+    expect(json.failed.map((f: { id?: string }) => f.id)).toEqual([".context/config.yaml"]);
+    expect(await readFile(join(vault, ".context", "config.yaml"), "utf-8")).toBe(before);
   });
 });

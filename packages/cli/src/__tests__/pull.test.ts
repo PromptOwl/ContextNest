@@ -174,8 +174,12 @@ describe("parseRecipeManifest", () => {
     const bad = (yaml: string) => () => parseRecipeManifest("```yaml recipe\n" + yaml + "\n```\n");
     expect(bad("id: x\nincludes:\n  - from: nodes/a\n    to: ../../etc/passwd")).toThrow(/inside the vault/);
     expect(bad("id: x\nincludes:\n  - from: nodes/a\n    to: packs/sneaky")).toThrow(/under nodes\//);
+    // Reserved segments: settings, history and staged suggestions are never documents.
+    for (const to of ["nodes/.context/evil", "nodes/x/.versions/y/v1", "nodes/x/_suggestions/evil"]) {
+      expect(bad(`id: x\nincludes:\n  - from: nodes/a\n    to: ${to}`)).toThrow(/reserved/);
+    }
     // Template files: YAML only, never a dot-folder (code-running config) or a governed folder.
-    for (const to of [".context/config.yaml", ".git/hooks/pre-commit", ".claude/settings.yaml", "nodes/x.yaml", "packs/x.yml", "run.sh"]) {
+    for (const to of [".context/config.yaml", ".git/hooks/pre-commit", ".claude/settings.yaml", "nodes/x.yaml", "packs/x.yml", "PACKS/x.yml", "Nodes/misc/x.yaml", "run.sh", "_suggestions/n/S1.meta.yaml", "x/_Suggestions/n/S1.meta.yaml"]) {
       expect(bad(`id: x\nfiles:\n  - from: nodes/a\n    to: ${to}`)).toThrow(/must be a \.yaml\/\.yml path/);
     }
     expect(parseRecipeManifest("```yaml recipe\nid: x\nfiles:\n  - from: nodes/a\n    to: config/stewards.yml\n```\n").files[0].to).toBe(
@@ -399,5 +403,32 @@ describe("pull — re-pull", () => {
     const again = await pullOnce();
     expect(again.find((s) => s.kind === "file")!.action).toBe("create");
     expect(existsSync(join(root, "stewards.example.yaml"))).toBe(true);
+  });
+});
+
+describe("pull — structure rules: scaffolding", () => {
+  it("a pulled document that creates a folder gets that folder's required files", async () => {
+    writeFileSync(
+      join(root, ".context", "config.yaml"),
+      "version: 1\nname: pull-test\nstructure: {enforce: true}\nfolders:\n  methodologies:\n    files: {readme: {}}\n",
+    );
+    await applyPull(storage, await planPull(storage, await remoteFetchRecipe(target, "test")));
+    expect(existsSync(join(root, "nodes", "methodologies", "readme.md"))).toBe(true);
+  });
+});
+
+describe("pull — structure rules", () => {
+  it("a destination the vault's enforced rules refuse is reported, not written; the rest lands", async () => {
+    writeFileSync(
+      join(root, ".context", "config.yaml"),
+      "version: 1\nname: pull-test\nstructure: {enforce: true, closed: true}\nfolders:\n  standards: {}\n  skills: {}\n",
+    );
+    const steps = await planPull(storage, await remoteFetchRecipe(target, "test"));
+    await applyPull(storage, steps);
+    const step = steps.find((s) => s.to === "nodes/methodologies/method")!;
+    expect(step.action).toBe("conflict");
+    expect(step.note).toMatch(/not an allowed folder/);
+    expect(existsSync(join(root, "nodes", "methodologies", "method.md"))).toBe(false);
+    expect(existsSync(join(root, "nodes", "standards", "facts.md"))).toBe(true);
   });
 });

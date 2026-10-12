@@ -3,6 +3,7 @@ export {
   VaultCrypto,
   VaultLockedError,
   WrongVaultKeyError,
+  ForeignVaultKeyError,
   ENCRYPTION_CONFIG_FILE,
   VAULT_PASSPHRASE_ENV,
   generateRecoveryPassphrase,

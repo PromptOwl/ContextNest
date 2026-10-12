@@ -17,10 +17,10 @@
  */
 
 import yaml from "js-yaml";
-import { documentHistorySchema, FORGET_REASON_CODES } from "./schemas.js";
-import { computeContentHash } from "./integrity.js";
+import { CHECKSUM_PATTERN, documentHistorySchema, FORGET_REASON_CODES } from "./schemas.js";
+import { computeContentHash, sha256Bytes } from "./integrity.js";
 import { getChecksumContent, parseDocument } from "./parser.js";
-import type { ForgetReasonCode } from "./types.js";
+import type { DocumentHistory, ForgetReasonCode } from "./types.js";
 
 /** The chain-event type every forget records. */
 export const FORGET_EVENT_TYPE = "document.forgotten" as const;
@@ -67,6 +67,8 @@ export interface TombstoneRecord {
 /** Every forget in a vault, indexed for the anti-resurrection checks. */
 export interface TombstoneIndex {
   records: TombstoneRecord[];
+  /** event_id of every record, so folding one in is O(1). */
+  eventIds: Set<string>;
   byDocument: Map<string, TombstoneRecord[]>;
   contentHashes: Set<string>;
   bodyHashes: Set<string>;
@@ -75,8 +77,45 @@ export interface TombstoneIndex {
 
 const REASONS = new Set<string>(FORGET_REASON_CODES);
 
-function stringArray(v: unknown): string[] {
-  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+/** A timestamp as a string. An unquoted YAML timestamp loads as a Date. */
+export function isoDate(v: unknown): string | null {
+  if (typeof v === "string") return v;
+  return v instanceof Date && !isNaN(v.getTime()) ? v.toISOString() : null;
+}
+
+/** Distinct `sha256:<hex>` entries only: anything else names no erased content. */
+function checksumArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.filter((x): x is string => typeof x === "string" && CHECKSUM_PATTERN.test(x)))];
+}
+
+/**
+ * True when `value`, with every YAML alias expanded, stays within `limit`
+ * characters. js-yaml has no alias cap and `dump` writes each alias out in
+ * full, so a chain-event log from outside is measured before it is kept:
+ * without aliases a parsed tree is never larger than its text. Stops once
+ * the limit is passed, so the walk costs at most `limit`.
+ */
+export function expandsWithin(value: unknown, limit: number): boolean {
+  // Charged as each node is pushed, so the stack never outgrows the limit.
+  let size = 0;
+  const stack: unknown[] = [];
+  const push = (v: unknown, key = ""): boolean => {
+    size += key.length + (typeof v === "string" ? v.length + 1 : 1);
+    if (size > limit) return false;
+    stack.push(v);
+    return true;
+  };
+  if (!push(value)) return false;
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (Array.isArray(v)) {
+      for (const child of v) if (!push(child)) return false;
+    } else if (v && typeof v === "object" && !(v instanceof Date)) {
+      for (const k of Object.keys(v)) if (!push((v as Record<string, unknown>)[k], k)) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -107,18 +146,13 @@ export function tombstoneFromEvent(raw: unknown): TombstoneRecord | null {
     versions,
     reason_code: reason,
     forgotten_by: typeof e.actor === "string" ? e.actor : "unknown",
-    forgotten_at:
-      typeof m.forgotten_at === "string"
-        ? m.forgotten_at
-        : typeof e.timestamp === "string"
-          ? e.timestamp
-          : "",
+    forgotten_at: isoDate(m.forgotten_at) ?? isoDate(e.timestamp) ?? "",
     ...(typeof m.requested_by === "string" ? { requested_by: m.requested_by } : {}),
     ...(Number.isInteger(m.stub_version) ? { stub_version: m.stub_version as number } : {}),
     ...(Number.isInteger(m.checkpoint) ? { checkpoint: m.checkpoint as number } : {}),
-    content_hashes: stringArray(m.content_hashes),
-    body_hashes: stringArray(m.body_hashes),
-    pdf_hashes: stringArray(m.pdf_hashes),
+    content_hashes: checksumArray(m.content_hashes),
+    body_hashes: checksumArray(m.body_hashes),
+    pdf_hashes: checksumArray(m.pdf_hashes),
   };
 }
 
@@ -126,6 +160,7 @@ export function tombstoneFromEvent(raw: unknown): TombstoneRecord | null {
 export function buildTombstoneIndex(events: readonly unknown[]): TombstoneIndex {
   const index: TombstoneIndex = {
     records: [],
+    eventIds: new Set(),
     byDocument: new Map(),
     contentHashes: new Set(),
     bodyHashes: new Set(),
@@ -140,7 +175,8 @@ export function buildTombstoneIndex(events: readonly unknown[]): TombstoneIndex 
 
 /** Fold one record into an index (used when an import brings new tombstones). */
 export function addTombstone(index: TombstoneIndex, rec: TombstoneRecord): void {
-  if (index.records.some((r) => r.event_id === rec.event_id)) return;
+  if (index.eventIds.has(rec.event_id)) return;
+  index.eventIds.add(rec.event_id);
   index.records.push(rec);
   const list = index.byDocument.get(rec.document_id) ?? [];
   list.push(rec);
@@ -182,6 +218,19 @@ export function carriesForgottenBody(index: TombstoneIndex, raw: string): boolea
 }
 
 /**
+ * True when a document here is a pre-forget copy for `rec` (§6.3.4): its
+ * history, its live text or its live body holds content the record erased.
+ */
+export function holdsErasedContent(rec: TombstoneRecord, raw: string, history: DocumentHistory | null): boolean {
+  const erased = new Set(rec.content_hashes);
+  if (erased.has(computeContentHash(getChecksumContent(raw)))) return true;
+  if (history?.versions.some((e) => !e.tombstone && erased.has(e.content_hash))) return true;
+  const bodies = new Set(rec.body_hashes);
+  const body = forgettableBodyHash(raw);
+  return body !== null && (bodies.has(body) || bodies.has(computeContentHash(getChecksumContent(raw))));
+}
+
+/**
  * Anti-resurrection check for ONE file an import is about to write at
  * `relPath` (vault-relative). Returns the reason to refuse, or null to let it
  * land. Matching is by content hash wherever there is content to hash, so a
@@ -194,8 +243,9 @@ export function carriesForgottenBody(index: TombstoneIndex, raw: string): boolea
  *   - a live `.md` at a path a node-level forget retired (unless it is itself
  *     a forgotten stub), or whose body matches an erased revision.
  *
- * Unparseable files are let through: they carry nothing this check can match,
- * and `ctx validate` / `ctx verify` report them.
+ * A `.md` whose frontmatter does not parse is still checked by its path and
+ * its body; other unparseable files carry nothing this check can match, and
+ * `ctx validate` / `ctx verify` report them.
  */
 export function importVerdict(
   index: TombstoneIndex,
@@ -204,18 +254,21 @@ export function importVerdict(
 ): string | null {
   if (index.records.length === 0) return null;
   const path = relPath.replace(/\\/g, "/");
+  // A forgotten binary or version text, under any name or path (§6.3.4) —
+  // `copy.bin`, `copy.txt` too.
+  if (index.pdfHashes.size > 0 && index.pdfHashes.has(sha256Bytes(Buffer.from(content, "utf-8")))) {
+    return `${path} restores a PDF binary a forget erased`;
+  }
+  if (index.contentHashes.has(computeContentHash(content))) {
+    return `${path} restores content a forget erased`;
+  }
 
   const versioned = /^(?:(.*)\/)?\.versions\/([^/]+)\/([^/]+)$/.exec(path);
   if (versioned) {
     const docId = versioned[1] ? `${versioned[1]}/${versioned[2]}` : versioned[2];
     const file = versioned[3];
-    if (/^v\d+\.(md|diff)$/.test(file)) {
-      const hash = computeContentHash(content);
-      if (index.contentHashes.has(hash)) {
-        return `${path} restores content a forget erased (${hash})`;
-      }
-      return null;
-    }
+    // A version file's bytes were checked against every erased hash above.
+    if (/^v\d+\.(md|diff)$/.test(file)) return null;
     if (/^[a-f0-9]{64}\.pdf$/.test(file)) {
       return index.pdfHashes.has(`sha256:${file.slice(0, 64)}`)
         ? `${path} restores a PDF binary a forget erased`
@@ -243,19 +296,17 @@ export function importVerdict(
 
   if (/\.md$/i.test(path)) {
     const id = path.replace(/\.md$/i, "");
-    let status: string | undefined;
-    let body = "";
+    let node: ReturnType<typeof parseDocument> | null = null;
     try {
-      const node = parseDocument(`${id}.md`, content, id);
-      status = node.frontmatter.status;
-      body = node.body;
+      node = parseDocument(`${id}.md`, content, id);
     } catch {
-      return null;
+      // Unparseable frontmatter is still checked by path and by body below:
+      // one broken line must not carry an erased body back in.
     }
     // A forgotten stub carries no content — importing one propagates the
     // forget. One that does carry a body is not a stub, whatever it says.
-    if (status === "forgotten") {
-      return body.trim() === "" ? null : `${id} claims status forgotten but carries a body`;
+    if (node?.frontmatter.status === "forgotten") {
+      return node.body.trim() === "" ? null : `${id} claims status forgotten but carries a body`;
     }
     if (isPathForgotten(index, id)) {
       return `${id} was forgotten; its path cannot take content again (publish under a new path)`;
