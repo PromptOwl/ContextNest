@@ -290,6 +290,16 @@ describe("<server>/<nest> targets", () => {
     delete process.env.CONTEXTNEST_CONFIG_DIR;
   });
 
+  // r23 slugre: the label was trimmed with `/^-+|-+$/g`, which retries from
+  // every dash of a run that does not end the name: "a" + 100k dashes + "b"
+  // took 11.8 s. Trimmed with a loop now.
+  it("r23 slugre: a nest name with a long run of dashes is labelled in linear time", () => {
+    const started = performance.now();
+    const labels = nestLabels([{ id: "x", name: `a${"-".repeat(100_000)}b` }]);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect([...labels.values()][0]).toBe(`a${"-".repeat(100_000)}b`);
+  });
+
   it("labels nests by slugged name, disambiguating collisions with the id", () => {
     const labels = nestLabels([...nests, { id: "abcdef12-zz", name: "strategy" }]);
     expect([...labels.values()]).toEqual(["strategy-id-strat", "chameleon-collective", "strategy-abcdef12"]);

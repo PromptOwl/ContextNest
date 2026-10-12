@@ -674,7 +674,10 @@ function refIds(ref: XNode): { doi?: string; pmid?: string } {
       const m = (link.attrs.href ?? "").match(/doi\.org\/(10\.[^\s"'<>]+)/);
       if (m) {
         // A DOI pasted into prose often drags trailing punctuation along.
-        out.doi = m[1].replace(/[.,;:)\]]+$/, "");
+        // Trimmed with a loop: `/[…]+$/` retries from every character of a run.
+        let end = m[1].length;
+        while (end > 0 && ".,;:)]".includes(m[1][end - 1])) end--;
+        out.doi = m[1].slice(0, end);
         break;
       }
     }

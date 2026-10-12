@@ -16,6 +16,7 @@ import {
   readdir,
   realpath,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
@@ -541,21 +542,27 @@ export interface ReadLimit {
 }
 
 /**
- * Refuse a history file over the caller's limit before reading it: a judge
- * that must not hold more than so much never reads it whole. Over the limit
- * is "cannot be read" (an I/O-class refusal), never "missing".
+ * Read a version-history file (history.yaml, a keyframe, a diff) — only a
+ * regular file, and under a limit not one over it: a judge that must not hold
+ * more than so much never reads it whole. A FIFO or a device could block or
+ * never end, so the file is opened without blocking and judged on the open
+ * handle — nothing can swap in between the check and the read. Not a regular
+ * file, or over the limit, is "cannot be read" (an I/O-class refusal), never
+ * "missing".
  */
-async function assertWithinLimit(path: string, opts: ReadLimit, docId: string): Promise<void> {
-  if (opts.maxBytes === undefined) return;
-  const st = await stat(path);
-  // A FIFO or a device reports no size worth trusting — and reading one could
-  // block or never end. Only a regular file is read under a limit.
-  if (!st.isFile()) {
-    throw new CorruptHistoryError(docId, `${basename(path)} is not a regular file`, "not-a-file");
-  }
-  const size = st.size;
-  if (size > opts.maxBytes) {
-    throw new CorruptHistoryError(docId, `${basename(path)} is ${size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
+async function readHistoryFile(path: string, opts: ReadLimit, docId: string): Promise<string> {
+  const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) {
+      throw new CorruptHistoryError(docId, `${basename(path)} is not a regular file`, "not-a-file");
+    }
+    if (opts.maxBytes !== undefined && st.size > opts.maxBytes) {
+      throw new CorruptHistoryError(docId, `${basename(path)} is ${st.size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
+    }
+    return await handle.readFile("utf-8");
+  } finally {
+    await handle.close();
   }
 }
 
@@ -2106,8 +2113,7 @@ export class NestStorage {
   async readHistory(docId: string, opts: ReadLimit = {}): Promise<DocumentHistory | null> {
     let content: string;
     try {
-      await assertWithinLimit(this.historyPath(docId), opts, docId);
-      content = await readFile(this.historyPath(docId), "utf-8");
+      content = await readHistoryFile(this.historyPath(docId), opts, docId);
     } catch (err) {
       // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
       // an I/O error) must not read as a fresh document either.
@@ -2348,8 +2354,7 @@ export class NestStorage {
     );
     let raw: string;
     try {
-      await assertWithinLimit(keyframePath, opts, docId);
-      raw = await readFile(keyframePath, "utf-8");
+      raw = await readHistoryFile(keyframePath, opts, docId);
     } catch (err) {
       return missingArtifact(err, docId);
     }
@@ -2447,8 +2452,7 @@ export class NestStorage {
     );
     let raw: string;
     try {
-      await assertWithinLimit(diffPath, opts, docId);
-      raw = await readFile(diffPath, "utf-8");
+      raw = await readHistoryFile(diffPath, opts, docId);
     } catch (err) {
       return missingArtifact(err, docId);
     }
@@ -3033,8 +3037,14 @@ export class NestStorage {
    * ensuring the event is schema-valid.
    */
   async appendChainEvent(event: unknown): Promise<void> {
+    await this.appendChainEvents([event]);
+  }
+
+  /** Append events in order: one read and one write of the log, however many. */
+  async appendChainEvents(events: readonly unknown[]): Promise<void> {
+    if (events.length === 0) return;
     const existing = await this.readChainEventLog();
-    existing.push(event);
+    existing.push(...events);
     const dir = join(this.root, ".versions");
     await mkdir(dir, { recursive: true });
     const content =

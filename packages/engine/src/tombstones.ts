@@ -20,7 +20,7 @@ import yaml from "js-yaml";
 import { documentHistorySchema, FORGET_REASON_CODES } from "./schemas.js";
 import { computeContentHash, sha256Bytes } from "./integrity.js";
 import { getChecksumContent, parseDocument } from "./parser.js";
-import type { ForgetReasonCode } from "./types.js";
+import type { DocumentHistory, ForgetReasonCode } from "./types.js";
 
 /** The chain-event type every forget records. */
 export const FORGET_EVENT_TYPE = "document.forgotten" as const;
@@ -67,6 +67,8 @@ export interface TombstoneRecord {
 /** Every forget in a vault, indexed for the anti-resurrection checks. */
 export interface TombstoneIndex {
   records: TombstoneRecord[];
+  /** event_id of every record, so folding one in is O(1). */
+  eventIds: Set<string>;
   byDocument: Map<string, TombstoneRecord[]>;
   contentHashes: Set<string>;
   bodyHashes: Set<string>;
@@ -126,6 +128,7 @@ export function tombstoneFromEvent(raw: unknown): TombstoneRecord | null {
 export function buildTombstoneIndex(events: readonly unknown[]): TombstoneIndex {
   const index: TombstoneIndex = {
     records: [],
+    eventIds: new Set(),
     byDocument: new Map(),
     contentHashes: new Set(),
     bodyHashes: new Set(),
@@ -140,7 +143,8 @@ export function buildTombstoneIndex(events: readonly unknown[]): TombstoneIndex 
 
 /** Fold one record into an index (used when an import brings new tombstones). */
 export function addTombstone(index: TombstoneIndex, rec: TombstoneRecord): void {
-  if (index.records.some((r) => r.event_id === rec.event_id)) return;
+  if (index.eventIds.has(rec.event_id)) return;
+  index.eventIds.add(rec.event_id);
   index.records.push(rec);
   const list = index.byDocument.get(rec.document_id) ?? [];
   list.push(rec);
@@ -179,6 +183,19 @@ export function carriesForgottenBody(index: TombstoneIndex, raw: string): boolea
   const body = forgettableBodyHash(raw);
   if (!body) return false;
   return index.bodyHashes.has(body) || index.bodyHashes.has(computeContentHash(getChecksumContent(raw)));
+}
+
+/**
+ * True when a document here is a pre-forget copy for `rec` (§6.3.4): its
+ * history, its live text or its live body holds content the record erased.
+ */
+export function holdsErasedContent(rec: TombstoneRecord, raw: string, history: DocumentHistory | null): boolean {
+  const erased = new Set(rec.content_hashes);
+  if (erased.has(computeContentHash(getChecksumContent(raw)))) return true;
+  if (history?.versions.some((e) => !e.tombstone && erased.has(e.content_hash))) return true;
+  const bodies = new Set(rec.body_hashes);
+  const body = forgettableBodyHash(raw);
+  return body !== null && (bodies.has(body) || bodies.has(computeContentHash(getChecksumContent(raw))));
 }
 
 /**

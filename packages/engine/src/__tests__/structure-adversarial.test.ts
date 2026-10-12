@@ -255,6 +255,94 @@ describe("patch application and replay", () => {
 
 // ─── Read budget ────────────────────────────────────────────────────────────
 
+describe("version files that are not regular files", () => {
+  // r23 fifo: only the reads that judge rules refused a non-regular version
+  // file. With a FIFO at v1.md, context_verify, context_reconstruct and
+  // context_update hung forever, the writes holding the vault lock. Every
+  // version-file read now opens without blocking and judges the open handle.
+  it.skipIf(process.platform === "win32")("r23 fifo: a FIFO in a version file's place never hangs verify, reconstruct or update", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const id = "nodes/notes/f";
+    await api.run("context_create", { id, title: "f", content: "## Summary\nv1\n" }, ctx);
+    await api.run("context_update", { id, content: "## Summary\nv2\n" }, ctx);
+    const v1 = join(dir, "nodes/notes/.versions/f/v1.md");
+    await rm(v1);
+    execFileSync("mkfifo", [v1]);
+    const settled = (p: Promise<unknown>) =>
+      Promise.race([p.then(() => "settled", () => "settled"), new Promise((r) => setTimeout(() => r("hung"), 3_000))]);
+    expect(await settled(api.run("context_verify", {}, ctx))).toBe("settled");
+    expect(await settled(api.run("context_reconstruct", { id, version: 1 }, ctx))).toBe("settled");
+    expect(await settled(api.run("context_update", { id, content: "## Summary\nv3\n" }, ctx))).toBe("settled");
+    const verify = await api.run<{ valid: boolean }>("context_verify", {}, ctx);
+    expect(verify.valid).toBe(false);
+  });
+});
+
+describe("sealed version files outside the replayed range", () => {
+  // FINDING (r23 outrange, open — PRD §10.1 known items): an import whose
+  // history.yaml equals the one on disk judges its version files by the one
+  // rebuild of the head, which replays from the last keyframe. A file before
+  // that (v1.md of a 12-version history) is not judged: with overwrite it
+  // replaces the sealed file with other bytes, and only verify then reports
+  // it (content_hash_mismatch). Same on 39b3863. Repro: 12 versions, import
+  // { overwrite: true } the same history.yaml plus a v1.md with other text.
+  it.fails("r23 outrange: an import never replaces a sealed version file with other bytes", async () => {
+    const id = "nodes/notes/long";
+    await api.run("context_create", { id, title: "long", content: "## Summary\nv1\n" }, ctx);
+    for (let v = 2; v <= 12; v++) await api.run("context_update", { id, content: `## Summary\nv${v}\n` }, ctx);
+    const store = "nodes/notes/.versions/long";
+    const sealed = await readFile(join(dir, store, "v1.md"), "utf-8");
+    const history = await readFile(join(dir, store, "history.yaml"), "utf-8");
+    await importFiles(
+      [
+        { path: `${store}/history.yaml`, content: history },
+        { path: `${store}/v1.md`, content: sealed.replace("v1", "tampered") },
+      ],
+      { overwrite: true },
+    );
+    expect(await readFile(join(dir, store, "v1.md"), "utf-8")).toBe(sealed);
+  });
+});
+
+describe("staged edits", () => {
+  // r23 weak test: the round-trip property test checked applyPatchBounded,
+  // not the path a staged edit takes — staged through storage, read back,
+  // applied by applyStagedEdit.
+  const CASES: Array<[string, string, string]> = [
+    ["LF", "---\ntitle: a\n---\none\ntwo\n", "---\ntitle: a\n---\none\n2\n"],
+    ["CRLF", "---\r\ntitle: a\r\n---\r\none\r\ntwo\r\n", "---\r\ntitle: a\r\n---\r\none\r\n2\r\n"],
+    ["CR only", "---\rtitle: a\r---\rone\rtwo\r", "---\rtitle: a\r---\rone\r2\r"],
+    ["BOM", "\uFEFF---\ntitle: a\n---\none\n", "\uFEFF---\ntitle: a\n---\none\nmore\n"],
+    ["--- lines in the body", "---\ntitle: a\n---\n--- x\n+++ y\n@@ z\n", "---\ntitle: a\n---\n--- x\n+++ w\n@@ z\n"],
+    ["frontmatter only", "---\ntitle: a\n---\nbody\n", "---\ntitle: a\ndescription: d\n---\nbody\n"],
+    ["no final newline", "---\ntitle: a\n---\nbody", "---\ntitle: a\n---\nbody\nmore"],
+  ];
+  it.each(CASES)("r23 staged: an edit staged over %s applies back to exactly what it proposed", async (_l, a, b) => {
+    const { stageSuggestion, readSuggestion, applyStagedEdit } = await import("../suggestions.js");
+    const { meta } = await stageSuggestion({
+      storage,
+      documentId: "nodes/notes/s",
+      approvedRawContent: a,
+      proposedRawContent: b,
+      source: "out-of-band-edit",
+      actor: "x",
+      docTier: "standard",
+    });
+    const sug = await readSuggestion(storage, "nodes/notes/s", meta.suggestion_id);
+    expect(applyStagedEdit(a, sug!)).toBe(b);
+  });
+
+  it("r23 staged: a held edit to a CRLF body is approved with the body it proposed", async () => {
+    const { approveReview } = await import("../review.js");
+    const id = "nodes/notes/crlf";
+    await api.run("context_create", { id, title: "crlf", content: "## Summary\r\none\r\ntwo\r\n" }, ctx);
+    await api.run("context_update", { id, content: "## Summary\r\none\r\n2\r\n", review: true }, ctx);
+    await approveReview(storage, id, { actor: "owner" });
+    const got = await api.run<{ body: string }>("context_get", { id }, ctx);
+    expect(got.body.replace(/\r\n/g, "\n")).toContain("one\n2");
+  });
+});
+
 describe("read budget", () => {
   it("r19 bigread4 / r21 readtrace: version files larger than the room left are refused unread, the first one spending the budget", async () => {
     await writeConfig(SUMMARY);
@@ -676,6 +764,71 @@ describe("forget and tombstones", () => {
   // chain-event log, erasing the forget's tombstones. The importer now folds
   // the path as the planner does (isChainEventLog) and merges it as the log.
   it.each(SPELLINGS)("r10 chainev: an import of %j with overwrite never erases a forget's tombstone", (path) => eraseTombstones(path, true));
+
+  /** A forget record as another vault's chain-event log would carry it. */
+  const forgetEvent = (docId: string, eventId = "forged-1", extra = "") =>
+    `- event_id: ${eventId}\n  event_type: document.forgotten\n  document_id: ${docId}\n  actor: mallory\n  timestamp: "2026-01-01T00:00:00Z"\n` +
+    `  action_metadata:\n    scope: node\n    reason_code: legal\n    content_hashes: ["${ZERO}"]\n${extra}`;
+
+  // r23 forgeforget: an imported forget was re-applied to the local document
+  // by document_id alone — any document, whatever it held — so a caller who
+  // may import could erase what it may not forget. §6.3.4 re-applies a forget
+  // to a pre-forget copy: one holding content the forget erased. A record that
+  // names a document here holding none of it is refused, and not logged (its
+  // path would read as forgotten, and verify would flag the live document).
+  it.each([".versions/chain_events.yaml", ".Versions/chain_events.yaml."])(
+    "r23 forgeforget: an imported forget naming a document here that holds none of what it erased (%j) erases nothing and is not logged",
+    async (path) => {
+      await api.run("context_create", { id: "nodes/notes/victim", title: "victim", content: "## Summary\nkeep me\n" }, ctx);
+      const live = await readFile(join(dir, "nodes/notes/victim.md"), "utf-8");
+      const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8").catch(() => "");
+      const r = await importFiles([{ path, content: forgetEvent("nodes/notes/victim") }]);
+      expect(r.failed.map((f) => f.error).join("\n")).toMatch(/holds none of the content it erased/);
+      expect(await readFile(join(dir, "nodes/notes/victim.md"), "utf-8")).toBe(live);
+      expect(await exists("nodes/notes/.versions/victim/v1.md")).toBe(true);
+      expect(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8").catch(() => "")).toBe(log);
+      expect((await api.run<{ valid: boolean }>("context_verify", {}, ctx)).valid).toBe(true);
+    },
+  );
+
+  it("r23 forgeforget: a forget made elsewhere still erases the pre-forget copy here", async () => {
+    const body = "## Summary\nTOP SECRET erased by legal\n";
+    await api.run("context_create", { id: "nodes/notes/s", title: "s", content: body }, ctx);
+    const { root, c } = await freshVault();
+    await api.run("context_create", { id: "nodes/notes/s", title: "s", content: body }, c);
+    await api.run("context_forget", { id: "nodes/notes/s", reason_code: "legal" }, c);
+    const theirs = await readFile(join(root, ".versions/chain_events.yaml"), "utf-8");
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: theirs }]);
+    expect(r.failed).toEqual([]);
+    expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id: "nodes/notes/s" }, ctx)).frontmatter.status).toBe("forgotten");
+  });
+
+  // r23 evbomb: the imported event was appended verbatim, and yaml.dump
+  // (noRefs) expands aliases: a 686-character alias chain became a 105 MB
+  // log that every later write read. Only the fields a forget record carries
+  // are logged.
+  it("r23 evbomb: an imported event's alias chain is never expanded into the log", async () => {
+    let extra = "    x0: &a0 [y, y]\n";
+    for (let i = 1; i <= 20; i++) extra += `    x${i}: &a${i} [*a${i - 1}, *a${i - 1}]\n`;
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/elsewhere", "bomb", extra) }]);
+    expect(r.failed).toEqual([]);
+    const log = await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8");
+    expect(log).toContain("bomb");
+    expect(log.length).toBeLessThan(4096);
+  });
+
+  // r23 evmerge: each imported event re-read, re-parsed and rewrote the whole
+  // log, and each record was checked against every one before it: 5000
+  // events took 338 s under the vault lock. One read and one write now.
+  it("r23 evmerge: 5000 imported forgets merge in one pass", async () => {
+    const events = Array.from({ length: 5000 }, (_, i) => forgetEvent(`nodes/gone/d${i}`, `e${i}`)).join("");
+    const started = performance.now();
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: events }]);
+    expect(r.failed).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(10_000);
+    const logged = yaml.load(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8")) as { event_id: string }[];
+    expect(logged.filter((e) => /^e\d+$/.test(e.event_id))).toHaveLength(5000);
+  }, 30_000);
 });
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
@@ -905,6 +1058,18 @@ describe("document parsing", () => {
   it("r8 jats: inline markup with a long run of whitespace is converted in linear time", async () => {
     const { jatsToDocument } = await import("../index.js");
     const xml = `<article><front><article-meta><title-group><article-title>T</article-title></title-group></article-meta></front><body><sec><title>S</title><p><italic>${" ".repeat(80_000)}x</italic></p></sec></body></article>`;
+    const started = performance.now();
+    jatsToDocument(xml);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  // r23 jatsdoi: a reference's DOI was trimmed with `/[.,;:)\]]+$/`, which
+  // retries from every character of a run that does not end the text — 100k
+  // dots and an "x" took 11 s, through `ctx import pubmed` on remote XML.
+  it("r23 jatsdoi: a DOI with a long run of trailing punctuation is trimmed in linear time", async () => {
+    const { jatsToDocument } = await import("../index.js");
+    const href = `https://doi.org/10.1/${".".repeat(100_000)}x`;
+    const xml = `<article><front><article-meta><title-group><article-title>T</article-title></title-group></article-meta></front><body><p>x</p></body><back><ref-list><ref id="r1"><mixed-citation>A <ext-link href="${href}">l</ext-link></mixed-citation></ref></ref-list></back></article>`;
     const started = performance.now();
     jatsToDocument(xml);
     expect(performance.now() - started).toBeLessThan(500);

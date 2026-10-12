@@ -94,6 +94,7 @@ import {
   expandServerVaults,
   folderFromId,
   remoteFetchRecipe,
+  slugLabel,
 } from "./remote.js";
 import { planPull, applyPull, type PullStep } from "./pull.js";
 import {
@@ -874,11 +875,7 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
 // Derive a sensible default alias from a directory name, sanitized to the
 // allowed alias characters.
 function slugifyAlias(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug || "vault";
+  return slugLabel(name) || "vault";
 }
 
 /**

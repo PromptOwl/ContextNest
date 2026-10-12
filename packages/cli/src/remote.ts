@@ -87,13 +87,26 @@ export interface IndexedNest {
 }
 
 /**
+ * A name as a label: lower case, every run of other characters one "-", no
+ * "-" at either end — trimmed with a loop, since `/^-+|-+$/` retries from
+ * every dash of a run that does not end the name.
+ */
+export function slugLabel(name: string): string {
+  const s = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  let start = 0;
+  let end = s.length;
+  while (start < end && s[start] === "-") start++;
+  while (end > start && s[end - 1] === "-") end--;
+  return s.slice(start, end);
+}
+
+/**
  * Pure: the `<nest>` label for each nest id — its slugged name, or
  * `<slug>-<id8>` when two nests the key can see slug the same (names are
  * unique per owner only, so a shared nest can collide with your own).
  */
 export function nestLabels(nests: IndexedNest[]): Map<string, string> {
-  const slug = (n: IndexedNest) =>
-    n.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "nest";
+  const slug = (n: IndexedNest) => slugLabel(n.name) || "nest";
   const counts = new Map<string, number>();
   for (const n of nests) counts.set(slug(n), (counts.get(slug(n)) ?? 0) + 1);
   return new Map(
