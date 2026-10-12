@@ -276,6 +276,17 @@ describe("jatsToDocument — publisher variations (2)", () => {
     expect(r.content).toContain("'#license-cc-by-nc'");
   });
 
+  it("exposes the normalised licence slug on meta (cc-by, cc0, public-domain mark, none)", () => {
+    expect(jatsToDocument(xml).meta.license_slug).toBe("cc-by");
+    const lic = '<license license-type="open-access" xlink:href="http://creativecommons.org/licenses/by/4.0/">';
+    const zero = xml.replace(lic, '<license xlink:href="https://creativecommons.org/publicdomain/zero/1.0/">');
+    expect(jatsToDocument(zero).meta.license_slug).toBe("cc0");
+    const mark = xml.replace(lic, '<license xlink:href="https://creativecommons.org/publicdomain/mark/1.0/">');
+    expect(jatsToDocument(mark).meta.license_slug).toBe("cc-mark");
+    const none = xml.replace(/<license[\s\S]*?<\/license>/, "");
+    expect(jatsToDocument(none).meta.license_slug).toBeUndefined();
+  });
+
   it("reads a structured abstract whose paragraphs sit under nested <sec>", () => {
     const structured = xml.replace(
       /<abstract>[\s\S]*?<\/abstract>/,

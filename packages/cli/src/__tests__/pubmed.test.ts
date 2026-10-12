@@ -2,7 +2,17 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { esearch, meshTag, pubtatorFetch, resolvePmid, summarizePubTator } from "../pubmed.js";
+import {
+  esearch,
+  esummaryPubmed,
+  meshTag,
+  parseLicenseList,
+  pmcLicensePrefilter,
+  publicationTypeTags,
+  pubtatorFetch,
+  resolvePmid,
+  summarizePubTator,
+} from "../pubmed.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const biocText = readFileSync(join(here, "fixtures", "pubtator-30056182.json"), "utf8");
@@ -134,5 +144,89 @@ describe("NCBI clients (fetch injected)", () => {
       new Response('{"detail":"Could not retrieve publications"}', { status: 400 })) as unknown as typeof fetch;
     const map = await pubtatorFetch(["42769844"], { fetchImpl, minIntervalMs: 0 });
     expect(map.size).toBe(0);
+  });
+});
+
+describe("esummaryPubmed", () => {
+  it("maps PMIDs to PMC ids and MEDLINE publication types, skipping unknown records", async () => {
+    const fetchImpl = fakeFetch([
+      [
+        /esummary\.fcgi\?.*db=pubmed/,
+        JSON.stringify({
+          result: {
+            uids: ["11", "12", "13"],
+            "11": {
+              pubtype: ["Journal Article", "Systematic Review", "Meta-Analysis"],
+              articleids: [{ idtype: "pubmed", value: "11" }, { idtype: "pmc", value: "PMC111" }],
+            },
+            "12": { pubtype: ["Review"], articleids: [{ idtype: "doi", value: "10.1/x" }] },
+            "13": { error: "cannot get document summary" },
+          },
+        }),
+      ],
+    ]);
+    const map = await esummaryPubmed(["11", "12", "13", "nope"], { fetchImpl, minIntervalMs: 0 });
+    expect(map.get("11")).toEqual({ pmid: "11", pmcid: "PMC111", pubtypes: ["Journal Article", "Systematic Review", "Meta-Analysis"] });
+    expect(map.get("12")).toEqual({ pmid: "12", pubtypes: ["Review"] });
+    expect(map.has("13")).toBe(false);
+    const calls = (fetchImpl as unknown as { calls: string[] }).calls;
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("id=11%2C12%2C13");
+  });
+});
+
+describe("publicationTypeTags", () => {
+  it("tags SR + MA as srma, and maps guidelines, RCTs and reviews", () => {
+    expect(publicationTypeTags(["Journal Article", "Systematic Review", "Meta-Analysis"])).toEqual([
+      "#pubtype-systematic-review",
+      "#pubtype-meta-analysis",
+      "#pubtype-srma",
+    ]);
+    expect(publicationTypeTags(["Network Meta-Analysis", "Systematic Review"])).toContain("#pubtype-srma");
+    expect(publicationTypeTags(["Systematic Review"])).toEqual(["#pubtype-systematic-review"]);
+    expect(publicationTypeTags(["Practice Guideline", "Guideline"])).toEqual(["#pubtype-guideline", "#pubtype-practice-guideline"]);
+    expect(publicationTypeTags(["Randomized Controlled Trial"])).toEqual(["#pubtype-rct"]);
+    expect(publicationTypeTags(["Review"])).toEqual(["#pubtype-review"]);
+    // Bibliographic / funding types are metadata, not tags.
+    expect(publicationTypeTags(["Journal Article", "Research Support, Non-U.S. Gov't"])).toEqual([]);
+    // Selector lexer rejects ':' — every tag must be colon-free.
+    for (const t of publicationTypeTags(["Consensus Development Conference, NIH", "Clinical Trial, Phase III"])) {
+      expect(t).toMatch(/^#[a-z][a-z0-9-]*$/);
+    }
+  });
+});
+
+describe("parseLicenseList", () => {
+  it("normalises spellings and expands commercial", () => {
+    expect(parseLicenseList("CC BY 4.0, cc0")).toEqual(["cc-by", "cc0"]);
+    expect(parseLicenseList("license-cc-by-nc")).toEqual(["cc-by-nc"]);
+    expect(parseLicenseList("commercial")).toEqual(["cc-by", "cc0", "cc-mark", "public-domain"]);
+    expect(parseLicenseList("pd")).toEqual(["cc-mark", "public-domain"]);
+    expect(() => parseLicenseList(" , ")).toThrow(/no licence/);
+  });
+});
+
+describe("pmcLicensePrefilter", () => {
+  it("runs a positive [uid] + [filter] query when every licence has a PMC filter", async () => {
+    const fetchImpl = fakeFetch([[/esearch\.fcgi/, JSON.stringify({ esearchresult: { idlist: ["2"], count: "1" } })]]);
+    const keep = await pmcLicensePrefilter(["PMC1", "PMC2"], ["cc-by", "cc0"], { fetchImpl, minIntervalMs: 0 });
+    expect([...keep]).toEqual(["2"]);
+    const url = decodeURIComponent((fetchImpl as unknown as { calls: string[] }).calls[0]).replace(/\+/g, " ");
+    expect(url).toContain("db=pmc");
+    // PMC123[pmcid] matches nothing in db=pmc; the numeric uid is what works.
+    expect(url).toContain('(1[uid] OR 2[uid]) AND ("cc by license"[filter] OR "cc0 license"[filter])');
+    expect(url).not.toContain("[pmcid]");
+  });
+
+  it("falls back to dropping known other licences when one has no filter (public domain)", async () => {
+    const fetchImpl = fakeFetch([[/esearch\.fcgi/, JSON.stringify({ esearchresult: { idlist: ["1"], count: "1" } })]]);
+    const keep = await pmcLicensePrefilter(["PMC1", "PMC2"], ["cc-by", "cc0", "cc-mark", "public-domain"], {
+      fetchImpl,
+      minIntervalMs: 0,
+    });
+    expect([...keep]).toEqual(["2"]);
+    const url = decodeURIComponent((fetchImpl as unknown as { calls: string[] }).calls[0]).replace(/\+/g, " ");
+    expect(url).toContain('"cc by-nc license"[filter]');
+    expect(url).not.toContain('"cc by license"[filter]');
   });
 });
