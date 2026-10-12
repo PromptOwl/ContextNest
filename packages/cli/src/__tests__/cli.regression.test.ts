@@ -896,6 +896,17 @@ describe("[regression] ctx verify", () => {
     expect(res.stdout).toMatch(/content_hash_mismatch/);
     expect(res.stdout).toMatch(/integrity error/);
   });
+
+  // r24 B1: the crawl now skips a document it cannot read, and ctx verify's
+  // own crawl did not report the skip — so a vault whose documents could not
+  // be read verified green. It names each one, and fails.
+  it("names a document whose frontmatter does not parse, and exits non-zero", () => {
+    const file = join(tmp, "nodes", "sealed.md");
+    writeFileSync(file, readFileSync(file, "utf-8").replace(/^title: .*$/m, "title: [Sealed"));
+    const res = runCtxResult(tmp, ["verify", "--json"]);
+    expect(res.status).toBe(1);
+    expect(JSON.parse(res.stdout).errors).toContainEqual(expect.objectContaining({ type: "unreadable_document", document: "nodes/sealed" }));
+  });
 });
 
 // ─── validate ─────────────────────────────────────────────────────────────────

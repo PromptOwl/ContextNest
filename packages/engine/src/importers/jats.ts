@@ -27,7 +27,7 @@ import { createHash } from "node:crypto";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { parseDocument, serializeDocument } from "../parser.js";
 import { TAG_PATTERN } from "../schemas.js";
-import { normalizeFolder } from "../storage.js";
+import { assertWritableDocumentId, normalizeFolder } from "../storage.js";
 import { slugify } from "../import-hygiene.js";
 import type { Frontmatter } from "../types.js";
 
@@ -283,12 +283,14 @@ function texOf(tex: XNode): string {
 const SAFE_LINK = /^(?:https?:|ftp:|mailto:)/i;
 
 function wrapIfText(s: string, mark: string): string {
-  const t = s.trim();
-  if (!t) return s;
-  // Preserve outer whitespace so word boundaries survive the wrap.
-  const lead = s.match(/^\s*/)?.[0] ?? "";
-  const tail = s.match(/\s*$/)?.[0] ?? "";
-  return `${lead}${mark}${t}${mark}${tail}`;
+  // Preserve outer whitespace so word boundaries survive the wrap. Scanned
+  // with loops: an unanchored `\s*$` retries from every space of a run.
+  let start = 0;
+  while (start < s.length && /\s/.test(s[start])) start++;
+  let end = s.length;
+  while (end > start && /\s/.test(s[end - 1])) end--;
+  if (start === end) return s;
+  return `${s.slice(0, start)}${mark}${s.slice(start, end)}${mark}${s.slice(end)}`;
 }
 
 /** `<alternatives>` holds the same content several ways; prefer TeX, then text. */
@@ -672,7 +674,10 @@ function refIds(ref: XNode): { doi?: string; pmid?: string } {
       const m = (link.attrs.href ?? "").match(/doi\.org\/(10\.[^\s"'<>]+)/);
       if (m) {
         // A DOI pasted into prose often drags trailing punctuation along.
-        out.doi = m[1].replace(/[.,;:)\]]+$/, "");
+        // Trimmed with a loop: `/[…]+$/` retries from every character of a run.
+        let end = m[1].length;
+        while (end > 0 && ".,;:)]".includes(m[1][end - 1])) end--;
+        out.doi = m[1].slice(0, end);
         break;
       }
     }
@@ -1047,6 +1052,9 @@ export function jatsToDocument(xml: string, opts: JatsImportOptions = {}): JatsI
   // empty segments dropped, `..` refused.
   const folder = normalizeFolder(opts.folder ?? "nodes/papers") || "nodes/papers";
   const path = `${folder}/${slugId}.md`;
+  // Refused here, before any caller stages the file: a reserved folder
+  // (`.versions/`, `_suggestions/`, the root `packs/`) never holds a twin.
+  assertWritableDocumentId(`${folder}/${slugId}`);
 
   const frontmatter: Frontmatter = {
     title: titlePlain.slice(0, 200),

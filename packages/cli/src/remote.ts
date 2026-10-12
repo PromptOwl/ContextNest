@@ -45,6 +45,8 @@ import {
   printSearchResults,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
 
 export interface RemoteTarget {
@@ -93,13 +95,26 @@ export interface IndexedNest {
 }
 
 /**
+ * A name as a label: lower case, every run of other characters one "-", no
+ * "-" at either end — trimmed with a loop, since `/^-+|-+$/` retries from
+ * every dash of a run that does not end the name.
+ */
+export function slugLabel(name: string): string {
+  const s = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  let start = 0;
+  let end = s.length;
+  while (start < end && s[start] === "-") start++;
+  while (end > start && s[end - 1] === "-") end--;
+  return s.slice(start, end);
+}
+
+/**
  * Pure: the `<nest>` label for each nest id — its slugged name, or
  * `<slug>-<id8>` when two nests the key can see slug the same (names are
  * unique per owner only, so a shared nest can collide with your own).
  */
 export function nestLabels(nests: IndexedNest[]): Map<string, string> {
-  const slug = (n: IndexedNest) =>
-    n.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "nest";
+  const slug = (n: IndexedNest) => slugLabel(n.name) || "nest";
   const counts = new Map<string, number>();
   for (const n of nests) counts.set(slug(n), (counts.get(slug(n)) ?? 0) + 1);
   return new Map(
@@ -671,7 +686,7 @@ export async function remoteAdd(
     const input: Record<string, unknown> = {
       id,
       title,
-      content: opts.body ? `\n${opts.body}\n` : `\n# ${title}\n\n`,
+      content: opts.body ? `\n${opts.body}\n` : await remoteTemplateBody(conn, id, title),
     };
     // Send the folder alongside the id. A nest whose `context_create` predates
     // the catalog's `id` parameter drops that key and derives the id from the
@@ -696,6 +711,32 @@ export async function remoteAdd(
     }
     console.log(chalk.green(`Created and published ${created.id}.md (remote: ${target.alias})`));
     console.log(`  Version: ${created.version}`);
+  });
+}
+
+/**
+ * The body a bodiless `ctx add` starts from on a remote nest: the folder's
+ * template (§11.1), same as the local branch. A nest that does not advertise
+ * `context_structure` (it predates structure rules) gets the plain heading.
+ */
+async function remoteTemplateBody(conn: RemoteNestConnection, id: string, title: string): Promise<string> {
+  const heading = `\n# ${title}\n\n`;
+  if (!(await conn.toolNames()).has("context_structure")) return heading;
+  const out = await conn.run<StructureOutput>("context_structure", { folder: folderFromId(id) });
+  return out.resolved?.template_body ? `\n${out.resolved.template_body}` : heading;
+}
+
+/** `ctx structure` against a remote nest — the same op, the same output. */
+export async function remoteStructure(
+  target: RemoteTarget,
+  opts: { folder?: string; report?: boolean; json?: boolean },
+): Promise<void> {
+  await withRemote(target, async (conn) => {
+    const out = await conn.run<StructureOutput>("context_structure", {
+      ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+      ...(opts.report ? { report: true } : {}),
+    });
+    printStructure(out, opts);
   });
 }
 

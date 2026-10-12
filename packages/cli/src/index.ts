@@ -23,7 +23,7 @@ import {
   CheckpointManager,
   ContextInjector,
   GraphQueryEngine,
-  publishDocument,
+  publishDocuments,
   ContextNestError,
   assertVaultRoot,
   isRefusedCwd,
@@ -72,6 +72,9 @@ import {
   approveReview,
   rejectReview,
   REVIEW_OFF_COMMAND,
+  enforcedStructure,
+  checkDocument,
+  parseDocument,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -87,9 +90,11 @@ import {
   remotePublish,
   remoteDelete,
   remoteMove,
+  remoteStructure,
   expandServerVaults,
   folderFromId,
   remoteFetchRecipe,
+  slugLabel,
   remoteTaskLog,
 } from "./remote.js";
 import {
@@ -108,6 +113,8 @@ import {
   type SearchHitView,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
 import { createEngineApi } from "@promptowl/contextnest-engine/api";
 import type { OperationContext } from "@promptowl/contextnest-engine/api";
@@ -878,11 +885,7 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
 // Derive a sensible default alias from a directory name, sanitized to the
 // allowed alias characters.
 function slugifyAlias(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug || "vault";
+  return slugLabel(name) || "vault";
 }
 
 /**
@@ -994,8 +997,24 @@ async function applyStarter(
     await storage.writeConfig(initialConfig);
   }
 
+  // A starter on a re-initialized vault meets its structure rules like any
+  // other write: what they refuse is left out, not forced in.
+  const rules = await enforcedStructure(storage);
+  const nodes = starter.nodes.filter((node) => {
+    if (!rules) return true;
+    const doc = parseDocument(`${node.path}.md`, node.content, node.path);
+    return checkDocument(rules, { id: node.path, type: doc.frontmatter.type, body: doc.body }).length === 0;
+  });
+  if (nodes.length < starter.nodes.length) {
+    console.log(
+      chalk.yellow(
+        `  Skipped ${starter.nodes.length - nodes.length} starter document(s) this vault's structure rules refuse (ctx structure).`,
+      ),
+    );
+  }
+
   // Write starter nodes
-  for (const node of starter.nodes) {
+  for (const node of nodes) {
     await storage.writeDocument(node.path, node.content);
   }
 
@@ -1006,20 +1025,23 @@ async function applyStarter(
     await fs.promises.writeFile(packPath, pack.content, "utf-8");
   }
 
-  // Publish all starter nodes
-  for (const node of starter.nodes) {
-    await publishDocument(storage, node.path, {
-      editedBy: "cli@contextnest.local",
-      note: `Created by ${starter.id} starter`,
-    });
+  // Publish all starter nodes as one batch: one checkpoint, and folders the
+  // starter shares between nodes are scaffolded under enforced rules.
+  const published = await publishDocuments(
+    storage,
+    nodes.map((node) => node.path),
+    { editedBy: "cli@contextnest.local", note: `Created by ${starter.id} starter` },
+  );
+  if (published.failed.length > 0) {
+    throw new Error(`Could not publish starter documents: ${published.failed.map((f) => `${f.id}: ${f.error}`).join("; ")}`);
   }
 
   await regenerateIndex(storage);
 
   // Print results
   console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
-  console.log(`  Created ${starter.nodes.length} documents:`);
-  for (const node of starter.nodes) {
+  console.log(`  Created ${nodes.length} documents:`);
+  for (const node of nodes) {
     console.log(`    ${chalk.cyan(node.path + ".md")}`);
   }
   console.log(`  Created ${starter.packs.length} pack(s):`);
@@ -1043,7 +1065,7 @@ async function applyStarter(
     vaultName: opts.name,
     starterName: starter.id,
     starterDisplayName: starter.name,
-    nodes: starter.nodes.map((n) => ({
+    nodes: nodes.map((n) => ({
       path: n.path,
       title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
       type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
@@ -1233,6 +1255,7 @@ program
     const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
     const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
     const review = reinit ? priorReview : "on";
+    // storage.init carries the vault's structure rules over a re-init.
     await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
     if (review === "on") {
@@ -1670,8 +1693,21 @@ program
     }
 
     let body: string;
+    // A folder with a template (§11.1 structure rules) starts its files from it.
+    const template =
+      !opts.body && opts.type !== "skill"
+        ? (
+            await cliApi().run<StructureOutput>(
+              "context_structure",
+              { folder: id.split("/").slice(0, -1).join("/") },
+              opContext(storage, "cli@contextnest.local"),
+            )
+          ).resolved?.template_body
+        : undefined;
     if (opts.body) {
       body = `\n${opts.body}\n`;
+    } else if (template) {
+      body = `\n${template}`;
     } else if (opts.type === "skill") {
       body = `\n# ${title}\n\n## Steps\n\n1. \n2. \n3. \n\n## Expected Output\n\nDescribe what the agent should produce.\n`;
     } else {
@@ -1732,6 +1768,32 @@ async function afterHold(storage: NestStorage, id: string): Promise<void> {
     print: (line) => console.log(chalk.yellow(line)),
   });
 }
+
+// ─── ctx structure ─────────────────────────────────────────────────────────────
+
+program
+  .command("structure")
+  .description("Show the nest's structure rules: allowed folders, node types, name formats and templates")
+  .option("--folder <path>", "Show the rule governing one folder, with its template")
+  .option("--report", "Also list existing content that breaks the rules")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteStructure(remote, opts);
+      return;
+    }
+    const storage = getStorage();
+    const out = await cliApi().run<StructureOutput>(
+      "context_structure",
+      {
+        ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+        ...(opts.report ? { report: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    printStructure(out, opts);
+  });
 
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 
@@ -2215,7 +2277,21 @@ program
     // Forget protocol (§6.3): erased content stays erased, and every
     // tombstone is accounted for by a recorded forget. Tombstoned versions
     // themselves verify hash-only — they are not errors.
-    const tombstoneErrors = await storage.verifyTombstones(allHistories);
+    // The crawl, once: a document that cannot be read (frontmatter that does
+    // not parse, sealed bytes that do not open) is reported, never skipped
+    // into a pass — and the tombstone and sidecar checks judge the same set.
+    let liveDocs: Awaited<ReturnType<typeof storage.discoverDocuments>> | undefined;
+    if (!lock) {
+      liveDocs = await storage.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (docId, reason) => {
+          totalErrors++;
+          allReportErrors.push({ type: "unreadable_document", document: docId, expected: null, actual: reason });
+          if (!opts.json) console.log(chalk.red(`✗ ${docId}: unreadable — ${reason}`));
+        },
+      });
+    }
+    const tombstoneErrors = await storage.verifyTombstones(allHistories, liveDocs);
     if (tombstoneErrors.length > 0) {
       totalErrors += tombstoneErrors.length;
       allReportErrors.push(...tombstoneErrors);
@@ -2243,7 +2319,7 @@ program
     // also must not hold content in plaintext. Both need the key.
     const sidecarErrors = lock
       ? []
-      : [...(await storage.verifyPdfSidecars()), ...(await storage.findUnencryptedFiles())];
+      : [...(await storage.verifyPdfSidecars(liveDocs)), ...(await storage.findUnencryptedFiles())];
     if (sidecarErrors.length > 0) {
       totalErrors += sidecarErrors.length;
       allReportErrors.push(...sidecarErrors);

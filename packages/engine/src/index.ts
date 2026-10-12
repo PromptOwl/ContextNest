@@ -81,6 +81,7 @@ export {
   VersionArtifactExistsError,
   ForgottenDocumentError,
   ForgottenVersionError,
+  FrontmatterShapeError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
@@ -100,6 +101,7 @@ export {
   quarantineSuggestion,
   listSuggestions,
   readSuggestion,
+  applyStagedEdit,
 } from "./suggestions.js";
 export type {
   StageSuggestionInput,
@@ -259,7 +261,19 @@ export {
 export type { RemoteNestConnection } from "./remote-nest.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId, normalizeFolder } from "./storage.js";
+export {
+  NestStorage,
+  UNSTAGED_DRIFT_SENTINEL,
+  normalizeDocumentId,
+  normalizeFolder,
+  assertWritableDocumentId,
+  assertNotMachineryPath,
+  assertErasableDocumentId,
+  assertResolvesOutsideMachinery,
+  assertWritableDocumentPath,
+  machineryAliasSegment,
+  assertFitsFileSystem,
+} from "./storage.js";
 export type {
   LayoutMode,
   ReadDocumentOptions,
@@ -495,6 +509,50 @@ export type {
   ApproveReviewResult,
   RejectReviewResult,
 } from "./review.js";
+
+// Structure rules (§11.1) — see structure.ts / structure-store.ts
+export {
+  compileStructure,
+  checkDocument,
+  checkUpdate,
+  structureView,
+  checkFolder,
+  checkDeleteDocument,
+  checkDeleteFolder,
+  scaffoldPlan,
+  auditStructure,
+  resolveFolder,
+  describeStructure,
+  enforceStructure,
+  documentFolders,
+  MAX_MATCHED_NAME,
+  comparableSegment,
+} from "./structure.js";
+export type {
+  StructureConfig,
+  StructureDoc,
+  Violation,
+  ViolationCode,
+  CompiledStructure,
+  CompiledRule,
+  FolderRuleView,
+  ResolvedFolderRule,
+  StructureView,
+} from "./structure.js";
+export {
+  setStructure,
+  enforcedStructure,
+  missingFolders,
+  scaffoldFolders,
+  assertStructureUpdate,
+  assertStructureDelete,
+  scaffoldFirstPublish,
+  assertStructurePublish,
+  structurePublishViolations,
+  sealedHead,
+  structureReport,
+  isEnforced,
+} from "./structure-store.js";
 
 // PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
 export {

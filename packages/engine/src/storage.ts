@@ -14,10 +14,13 @@ import {
   rm,
   rename,
   readdir,
+  realpath,
 } from "node:fs/promises";
-import { join, dirname, basename, isAbsolute } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
+import { comparableSegment } from "./structure.js";
 import { parseDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
@@ -55,10 +58,12 @@ import type {
   IntegrityFailure,
 } from "./types.js";
 import {
+  ConfigError,
   ContextNestError,
   CorruptHistoryError,
   DocumentNotFoundError,
   VersionArtifactExistsError,
+  FrontmatterShapeError,
 } from "./errors.js";
 import {
   packSchema,
@@ -67,6 +72,7 @@ import {
   checkpointHistorySchema,
 } from "./schemas.js";
 import {
+  ForeignVaultKeyError,
   VaultCrypto,
   VaultLockedError,
   WrongVaultKeyError,
@@ -135,7 +141,209 @@ export function normalizeDocumentId(raw: string): string {
  * under `nodes/` — wrong for an id a flat-layout vault already resolved, which
  * needs the traversal check WITHOUT the rewrite.
  */
+/** Longest document id a write accepts (paths stay well inside PATH_MAX). */
+const MAX_DOCUMENT_ID_LENGTH = 1024;
+/**
+ * Longest id segment: NAME_MAX (255 bytes) less the longest extension a node
+ * writes beside it (`.pdf`). A longer name cannot exist on disk, so no document
+ * is frozen by this.
+ */
+const MAX_SEGMENT_BYTES = 251;
+
+/** Segments that hold vault machinery at any depth — never a document. */
+const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
+
+/**
+ * Refuse a document id a WRITE must never create: anything under `.context/`
+ * (the vault's settings — structure rules, review gate), `.versions/` (sealed
+ * history), `_suggestions/` (staged edits), or the vault-root `packs/`.
+ * Case-folded, with trailing dots and spaces and any `:stream`
+ * suffix dropped, because Windows drops them: `.context.` IS `.context` there. Reads keep going through
+ * {@link assertSafeDocumentId} alone.
+ *
+ * `existing`: the id names a document already on disk. Each name is held to
+ * what the file system holds (as for an erase), not to the stricter limit
+ * for new names, so a document with a long name is not frozen against edits.
+ * The whole id stays capped at MAX_DOCUMENT_ID_LENGTH either way.
+ */
+export function assertWritableDocumentId(raw: string, existing = false): void {
+  if (existing) assertFitsFileSystem(raw, 255, MAX_DOCUMENT_ID_LENGTH, true);
+  else assertFitsFileSystem(raw);
+  const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
+  assertSafeDocumentId(raw);
+  // A backslash is a separator on Windows but a literal file-name character
+  // on POSIX, so the path a check judges and the file storage writes would
+  // differ. Ids use "/".
+  if (raw.includes("\\")) {
+    throw new ContextNestError(`Invalid document id "${raw}": use "/" between folders, not "\\"`, "INVALID_DOCUMENT_ID");
+  }
+  // A control character is never a name, and NUL makes fs throw an error
+  // that carries the absolute vault path.
+  if (/[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new ContextNestError(
+      `Invalid document id ${shown}: control characters are not allowed`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  assertNotMachineryPath(raw);
+  const segments = raw
+    .split("/")
+    .map(comparableSegment)
+    .filter((seg) => seg !== "");
+  if (segments[0] === "packs") {
+    throw new ContextNestError(
+      `${shown}: "packs" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
+/**
+ * {@link assertWritableDocumentId} and {@link assertResolvesOutsideMachinery}
+ * together: what every writer that touches files keyed by a document id
+ * (history, sidecars, staged edits) calls before its first write.
+ */
+export async function assertWritableDocumentPath(root: string, id: string): Promise<void> {
+  try {
+    assertWritableDocumentId(id);
+  } catch (err) {
+    // Only a name the new-name limits refuse is looked up on disk.
+    if (!(err instanceof ContextNestError && err.code === "INVALID_DOCUMENT_ID")) throw err;
+    assertWritableDocumentId(id, true);
+    const exists = await stat(join(root, `${id}.md`)).then((s) => s.isFile(), () => false);
+    if (!exists) throw err;
+  }
+  await assertResolvesOutsideMachinery(root, id);
+}
+
+/**
+ * Refuse a path a file system cannot hold, before anything touches one: an
+ * over-long path otherwise costs a stat per ancestor folder before failing
+ * with an error that names the absolute vault path. Never echoes the path
+ * back whole. Document ids pass through this with room for the extension a
+ * node writes beside them; imported file paths, which carry their own, are
+ * held to NAME_MAX itself.
+ */
+export function assertFitsFileSystem(
+  raw: string,
+  maxSegmentBytes = MAX_SEGMENT_BYTES,
+  maxLength = MAX_DOCUMENT_ID_LENGTH,
+  /**
+   * Measure a name as this platform's file system does — NTFS counts UTF-16
+   * units, so 86 CJK characters (258 UTF-8 bytes) is a legal name there. For
+   * reads and erases of what may already exist; new names stay in bytes, so
+   * a vault written anywhere fits everywhere.
+   */
+  native = false,
+): void {
+  const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
+  if (raw.length > maxLength) {
+    throw new ContextNestError(
+      `Invalid path ${shown}: longer than ${maxLength} characters`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+  const size = native && process.platform === "win32" ? (seg: string) => seg.length : (seg: string) => Buffer.byteLength(seg);
+  if (raw.split(/[/\\]/).some((seg) => size(seg) > maxSegmentBytes)) {
+    throw new ContextNestError(
+      `Invalid path ${shown}: a folder or file name is longer than ${maxSegmentBytes} bytes`,
+      "INVALID_DOCUMENT_ID",
+    );
+  }
+}
+
+/**
+ * The first segment of a path that is another spelling of a machinery folder
+ * — it resolves to `.context`, `.versions` or `_suggestions` on some file
+ * system (case, trailing dots, `:stream`, ignorable code points) but is not
+ * spelled so. Undefined when there is none.
+ */
+export function machineryAliasSegment(path: string): string | undefined {
+  return path.split(/[/\\]+/).find((seg) => {
+    const folded = comparableSegment(seg);
+    return RESERVED_SEGMENTS.has(folded) && folded !== seg;
+  });
+}
+
+/**
+ * Refuse an id that names vault machinery: a `.context`, `.versions` or
+ * `_suggestions` segment at any depth, compared as a file system resolves it.
+ * NestStorage.writeDocument/deleteDocument call this as a backstop; deletes
+ * and forgets go through {@link assertErasableDocumentId}, so a legacy id the
+ * full write guard would refuse (`Nodes/…`, an over-long name) can still be
+ * erased.
+ */
+export function assertNotMachineryPath(raw: string): void {
+  assertSafeDocumentId(raw);
+  const reserved = raw.split(/[/\\]+/).map(comparableSegment).find((seg) => RESERVED_SEGMENTS.has(seg));
+  if (reserved) {
+    const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
+    throw new ContextNestError(
+      `${shown}: "${reserved}" is a reserved path (.context, .versions, _suggestions, and the vault-root packs) and cannot hold documents`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
+/**
+ * Refuse erasing (delete, forget — imported forgets too) anything but a
+ * document: {@link assertNotMachineryPath} and {@link assertResolvesOutsideMachinery}.
+ * Nothing else here — a legacy id the write guard would refuse (`Nodes/…`,
+ * an over-long name) stays erasable — except a name no file system could
+ * hold, refused before its error could name the vault path.
+ */
+export async function assertErasableDocumentId(root: string, id: string): Promise<void> {
+  assertFitsFileSystem(id, 255, 4096, true);
+  assertNotMachineryPath(id);
+  await assertResolvesOutsideMachinery(root, id);
+}
+
+/**
+ * Refuse an id whose path resolves into vault machinery although its
+ * spelling does not: an NTFS short name (`VERSIO~1`, which Windows expands —
+ * fs/promises `realpath` has `realpath.native` semantics), or a symlink or
+ * junction inside the vault pointing at `.versions/`, `.context/` or
+ * `_suggestions/` (a git checkout can create one). Resolves the deepest part
+ * of the path that exists, so a new file under an aliased folder is caught
+ * too. Where nothing resolves differently, `Plan~2` is an ordinary name.
+ * Every document write and erase reaches this: two realpaths and
+ * log(depth) stats.
+ */
+export async function assertResolvesOutsideMachinery(root: string, id: string): Promise<void> {
+  const segs = id.split("/");
+  let base: string;
+  try {
+    base = await realpath(root);
+  } catch {
+    return;
+  }
+  // The deepest part of the path that exists, by binary search: existence is
+  // monotone along prefixes, and resolving each prefix in turn costs depth².
+  const at = (n: number) => join(root, ...segs.slice(0, n - 1), n === segs.length ? `${segs[n - 1]}.md` : segs[n - 1]);
+  let lo = 0; // longest prefix known to exist (0 = the root)
+  let hi = segs.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const exists = await stat(at(mid)).then(
+      () => true,
+      () => false,
+    );
+    if (exists) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo === 0) return;
+  const finalResolved = await realpath(at(lo)).catch(() => null);
+  if (finalResolved === null) return;
+  const inVault = relative(base, finalResolved);
+  // Outside the vault is no machinery of this one — but a folder named `..x` is inside.
+  if (inVault === ".." || inVault.startsWith(`..${sep}`) || isAbsolute(inVault)) return;
+  assertNotMachineryPath([...inVault.split(/[/\\]+/), ...segs.slice(lo)].join("/").replace(/\.md$/i, ""));
+}
+
 export function assertSafeDocumentId(raw: string): void {
+  // No file system holds more; refused here so an error never names the vault
+  // path. Measured on the file the id names: its leaf carries `.md`.
+  assertFitsFileSystem(`${raw}.md`, 255, 4096, true);
   const segments = raw.split(/[/\\]/);
   if (segments.some((seg) => seg === "..")) {
     throw new ContextNestError(
@@ -331,6 +539,48 @@ export interface NestStorageOptions {
    * key store. Ignored for a plain vault.
    */
   encryption?: VaultCryptoOptions;
+}
+
+/**
+ * A version artifact that is absent reads as null; one that is present but
+ * unreadable (a directory, EACCES, EMFILE) is corrupt history, never "missing"
+ * — a reader that fell back past it (an inline diff, a neighbouring keyframe)
+ * would rebuild a version the disk does not hold.
+ */
+function missingArtifact(err: unknown, docId: string): null {
+  if (err instanceof CorruptHistoryError) throw err;
+  if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+  throw new CorruptHistoryError(docId, err instanceof Error ? err.message : String(err), err);
+}
+
+/** A ceiling on how many bytes a version-history read may take in. */
+export interface ReadLimit {
+  maxBytes?: number;
+}
+
+/**
+ * Read a version-history file (history.yaml, a keyframe, a diff) — only a
+ * regular file, and under a limit not one over it: a judge that must not hold
+ * more than so much never reads it whole. A FIFO or a device could block or
+ * never end, so the file is opened without blocking and judged on the open
+ * handle — nothing can swap in between the check and the read. Not a regular
+ * file, or over the limit, is "cannot be read" (an I/O-class refusal), never
+ * "missing".
+ */
+async function readHistoryFile(path: string, opts: ReadLimit, docId: string): Promise<string> {
+  const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) {
+      throw new CorruptHistoryError(docId, `${basename(path)} is not a regular file`, "not-a-file");
+    }
+    if (opts.maxBytes !== undefined && st.size > opts.maxBytes) {
+      throw new CorruptHistoryError(docId, `${basename(path)} is ${st.size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
+    }
+    return await handle.readFile("utf-8");
+  } finally {
+    await handle.close();
+  }
 }
 
 /** Artifact kind a vault-relative path holds, for sealing on import. */
@@ -685,6 +935,12 @@ export class NestStorage {
       includeSuperseded?: boolean;
       folder?: string;
       recursive?: boolean;
+      /**
+       * A document whose frontmatter does not parse, or (vault unlocked) whose
+       * sealed bytes do not open, is skipped — one bad file used to take every
+       * list, search and checkpoint down — and named here. Verify reports it.
+       */
+      onUnreadable?: (id: string, reason: string) => void;
     } = {},
   ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
@@ -712,8 +968,23 @@ export class NestStorage {
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
       const id = file.replace(/\.md$/, "");
-      const content = await this.readText(filePath, "doc", id);
-      const node = parseDocument(filePath, content, id);
+      let node: ContextNode;
+      try {
+        node = parseDocument(filePath, await this.readText(filePath, "doc", id), id);
+      } catch (err) {
+        // A missing or wrong key fails at unlock (VAULT_LOCKED,
+        // VAULT_KEY_MISMATCH), and a file sealed under a key this vault does
+        // not hold is the vault's condition, not the file's: all still throw —
+        // a vault never lists empty for want of its key.
+        if (err instanceof ForeignVaultKeyError) throw err;
+        const oneFile =
+          err instanceof yaml.YAMLException ||
+          err instanceof FrontmatterShapeError ||
+          (err as { code?: string }).code === "DECRYPTION_FAILED";
+        if (!oneFile) throw err;
+        options.onUnreadable?.(id, err instanceof Error ? err.message : String(err));
+        return null;
+      }
       // Root-level discovery (structured layout) globs *.md at the vault root so
       // a node can live anywhere. But a vault root commonly holds scaffold files
       // (CHANGELOG, CONTRIBUTING, LICENSE, SECURITY, …) that are NOT knowledge
@@ -795,6 +1066,15 @@ export class NestStorage {
   }
 
   /**
+   * Read a document from text as this vault would read it from disk — opened
+   * when sealed, then parsed. Throws when it would not read (frontmatter that
+   * does not parse, sealed bytes that do not open with this vault's key).
+   */
+  async readDocumentText(id: string, raw: string): Promise<ContextNode> {
+    return parseDocument(join(this.root, `${id}.md`), await this.openText(raw, "doc", id), id);
+  }
+
+  /**
    * The id of an existing document as it is spelled on disk (issue #117).
    *
    * `readDocument` returns the id it was given. On a case-insensitive
@@ -807,6 +1087,19 @@ export class NestStorage {
     return resolveIdCasing(id, (relDir) =>
       readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root),
     );
+  }
+
+  /**
+   * One key per document file, whatever spelling reaches it: its device and
+   * inode, from one stat — exact on every file system, case-folding or not.
+   * Where a file system reports no inode (0: FAT, some network shares), the
+   * id as spelled on disk ({@link resolveDocumentIdCasing}, which lists the
+   * folders on its path).
+   */
+  async documentFileKey(id: string): Promise<string> {
+    const st = await stat(join(this.root, `${id}.md`), { bigint: true }).catch(() => null);
+    if (st && st.ino !== 0n) return `inode:${st.dev}:${st.ino}`;
+    return `id:${await this.resolveDocumentIdCasing(id)}`;
   }
 
   /**
@@ -993,6 +1286,8 @@ export class NestStorage {
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
    *   - unreadable_history when a history.yaml exists but cannot be parsed
+   *   - unreadable_document when a document's frontmatter does not parse, or
+   *     its sealed bytes do not open with the vault's key
    *   - version_unreconstructable when a recorded version no longer rebuilds
    *     from its keyframe+diff chain (see verifyHistoryChain)
    *   - sidecar_drift / sidecar_missing for pdf nodes (see verifyPdfSidecars)
@@ -1048,8 +1343,12 @@ export class NestStorage {
 
     errors.push(...(await this.findUnencryptedFiles()));
 
-    // Integrity check must verify every doc on disk, including retired ones.
-    const liveDocs = await this.discoverDocuments({ includeRetired: true });
+    // Integrity check must verify every doc on disk, including retired ones,
+    // and name any it cannot read.
+    const liveDocs = await this.discoverDocuments({
+      includeRetired: true,
+      onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+    });
     errors.push(...(await this.verifyPdfSidecars(liveDocs)));
     // Forget protocol (§6.3): erased content must stay erased, and every
     // tombstone must be accounted for by a recorded forget.
@@ -1100,8 +1399,10 @@ export class NestStorage {
         if (entry.tombstone) {
           const leftovers: string[] = [];
           if (entry.diff) leftovers.push("inline diff");
-          if ((await this.readKeyframe(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.md`);
-          if ((await this.readDiff(docId, entry.version)) !== null) leftovers.push(`v${entry.version}.diff`);
+          // Present but unreadable (a directory, EACCES) is still present.
+          const present = (read: Promise<string | null>) => read.then((c) => c !== null, () => true);
+          if (await present(this.readKeyframe(docId, entry.version))) leftovers.push(`v${entry.version}.md`);
+          if (await present(this.readDiff(docId, entry.version))) leftovers.push(`v${entry.version}.diff`);
           if (leftovers.length > 0) {
             errors.push({
               type: "forgotten_content_present",
@@ -1141,7 +1442,15 @@ export class NestStorage {
       }
     }
 
-    for (const doc of docs ?? (await this.discoverDocuments({ includeRetired: true }))) {
+    // Crawling here (no docs given): a document that cannot be read is
+    // reported, never skipped into a pass.
+    const liveDocs =
+      docs ??
+      (await this.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+      }));
+    for (const doc of liveDocs) {
       if (doc.frontmatter.status !== "forgotten") {
         if (index.records.length === 0) continue;
         // A live document back at a path a forget retired,
@@ -1265,7 +1574,8 @@ export class NestStorage {
         if (!(err instanceof ContextNestError)) throw err;
         if (err instanceof VaultLockedError || err instanceof WrongVaultKeyError) throw err;
         cryptoErrors.push({
-          type: "decryption_failed",
+          // Unreadable on disk (a directory, EACCES): its bytes match no hash.
+          type: err instanceof CorruptHistoryError ? "content_hash_mismatch" : "decryption_failed",
           document: docId,
           version: entry.version,
           expected: entry.content_hash,
@@ -1434,6 +1744,8 @@ export class NestStorage {
     content: string,
     options: { exclusive?: boolean } = {},
   ): Promise<void> {
+    assertNotMachineryPath(id);
+    await assertResolvesOutsideMachinery(this.root, id);
     const filePath = join(this.root, `${id}.md`);
     const onDisk = await this.sealText(id, "doc", content);
     try {
@@ -1471,10 +1783,14 @@ export class NestStorage {
     // Encrypted vault: an import lands sealed like any other write. Verbatim
     // still holds for the PLAINTEXT — it is what gets sealed, byte for byte, so
     // every hash the source recorded keeps verifying.
-    let onDisk = content;
+    let onDisk: string | Uint8Array = content;
     if ((await this.isEncrypted()) && !isArmoredText(content)) {
       const target = kindForVaultPath(relPath);
-      if (target) {
+      if (/\.pdf$/i.test(relPath)) {
+        // A sidecar or its archive: sealed as bytes, as writeVaultBinary does.
+        const bytes = Buffer.from(content, "utf-8");
+        if (!isSealedBinary(bytes)) onDisk = await this.sealBytes(relPath.replace(/\.[^./\\]+$/, ""), bytes);
+      } else if (target) {
         onDisk = await this.sealText(target.docId, target.kind, content);
       } else if (/(^|\/)\.versions\/[^/]+\/history\.yaml$/.test(relPath.replace(/\\/g, "/"))) {
         const norm = relPath.replace(/\\/g, "/");
@@ -1489,7 +1805,7 @@ export class NestStorage {
         }
       }
     }
-    await writeFile(filePath, onDisk, "utf-8");
+    await writeFile(filePath, onDisk, typeof onDisk === "string" ? "utf-8" : undefined);
   }
 
   /**
@@ -1502,6 +1818,19 @@ export class NestStorage {
    * is the guard that actually refuses it, so the caller sees that path fail
    * on its own. Do not read a `false` here as "safe to write".
    */
+  /**
+   * The entry names of a vault folder (`""` is the root), as the file system
+   * spells them; empty when there is none. Same path guard.
+   */
+  async vaultEntryNames(relDir: string): Promise<string[]> {
+    try {
+      return await readdir(relDir === "" ? this.root : this.vaultFilePath(relDir));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return [];
+      throw err;
+    }
+  }
+
   async hasVaultFile(relPath: string): Promise<boolean> {
     try {
       await access(this.vaultFilePath(relPath));
@@ -1607,7 +1936,12 @@ export class NestStorage {
    */
   async verifyPdfSidecars(docs?: ContextNode[]): Promise<VerificationReport["errors"]> {
     const errors: VerificationReport["errors"] = [];
-    const nodes = docs ?? (await this.discoverDocuments({ includeRetired: true }));
+    const nodes =
+      docs ??
+      (await this.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+      }));
     for (const doc of nodes) {
       const pdf = doc.frontmatter.pdf;
       if (doc.frontmatter.type !== "pdf" || !pdf || typeof pdf.file !== "string") continue;
@@ -1697,6 +2031,8 @@ export class NestStorage {
    * node, its binary sidecar (archived prior binaries go with `.versions/`).
    */
   async deleteDocument(id: string): Promise<void> {
+    assertNotMachineryPath(id);
+    await assertResolvesOutsideMachinery(this.root, id);
     // Drop the cached serve-path verdict with the document it describes.
     this.historyVerdicts.delete(id);
     this.markHistoryTouched(id);
@@ -1850,17 +2186,20 @@ export class NestStorage {
    * silently replaced by a two-entry history on the next publish — orphaning the
    * recorded versions' keyframe/diff files and taking `reconstruct` with them.
    */
-  async readHistory(docId: string): Promise<DocumentHistory | null> {
+  async readHistory(docId: string, opts: ReadLimit = {}): Promise<DocumentHistory | null> {
     let content: string;
     try {
-      content = await readFile(this.historyPath(docId), "utf-8");
+      content = await readHistoryFile(this.historyPath(docId), opts, docId);
     } catch (err) {
       // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
       // an I/O error) must not read as a fresh document either.
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      // Already ours (over the read limit): one message, not wrapped twice.
+      if (err instanceof CorruptHistoryError) throw err;
       throw new CorruptHistoryError(
         docId,
         err instanceof Error ? err.message : String(err),
+        err,
       );
     }
 
@@ -2079,7 +2418,7 @@ export class NestStorage {
   /**
    * Read a keyframe version file.
    */
-  async readKeyframe(docId: string, version: number): Promise<string | null> {
+  async readKeyframe(docId: string, version: number, opts: ReadLimit = {}): Promise<string | null> {
     const docName = basename(docId);
     const docDir = dirname(docId);
     const keyframePath = join(
@@ -2091,9 +2430,9 @@ export class NestStorage {
     );
     let raw: string;
     try {
-      raw = await readFile(keyframePath, "utf-8");
-    } catch {
-      return null;
+      raw = await readHistoryFile(keyframePath, opts, docId);
+    } catch (err) {
+      return missingArtifact(err, docId);
     }
     // Decryption errors propagate on purpose: a keyframe that cannot be opened
     // must never read as "no keyframe" — that is how a verify passes silently.
@@ -2177,7 +2516,7 @@ export class NestStorage {
    * callers fall back to `entry.diff` (see VersionManager.reconstructVersion) —
    * that fallback is what keeps pre-existing nests readable without migration.
    */
-  async readDiff(docId: string, version: number): Promise<string | null> {
+  async readDiff(docId: string, version: number, opts: ReadLimit = {}): Promise<string | null> {
     const docName = basename(docId);
     const docDir = dirname(docId);
     const diffPath = join(
@@ -2189,9 +2528,9 @@ export class NestStorage {
     );
     let raw: string;
     try {
-      raw = await readFile(diffPath, "utf-8");
-    } catch {
-      return null;
+      raw = await readHistoryFile(diffPath, opts, docId);
+    } catch (err) {
+      return missingArtifact(err, docId);
     }
     return this.openText(raw, "diff", `${docId} v${version} diff`);
   }
@@ -2774,8 +3113,14 @@ export class NestStorage {
    * ensuring the event is schema-valid.
    */
   async appendChainEvent(event: unknown): Promise<void> {
+    await this.appendChainEvents([event]);
+  }
+
+  /** Append events in order: one read and one write of the log, however many. */
+  async appendChainEvents(events: readonly unknown[]): Promise<void> {
+    if (events.length === 0) return;
     const existing = await this.readChainEventLog();
-    existing.push(event);
+    existing.push(...events);
     const dir = join(this.root, ".versions");
     await mkdir(dir, { recursive: true });
     const content =
@@ -2842,21 +3187,34 @@ export class NestStorage {
   async findAllHistories(
     onUnreadable?: (docId: string, reason: string) => void,
   ): Promise<Map<string, DocumentHistory>> {
+    // A folder or link in history.yaml's place is unreadable too, not absent.
+    const notFiles: string[] = [];
     const historyFiles = await globFiles(
       this.root,
       "**/.versions/*/history.yaml",
+      [],
+      false,
+      notFiles,
     );
-
-    // Read in batches, then fold in input order so the map's iteration order
-    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
-    const read = await mapInBatches(historyFiles, async (file) => {
-      // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
+    // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
+    const docIdOf = (file: string): string | null => {
       const parts = file.split("/");
       const versionsIdx = parts.indexOf(".versions");
       if (versionsIdx === -1) return null;
       const docDir = parts.slice(0, versionsIdx).join("/");
       const docName = parts[versionsIdx + 1];
-      const docId = docDir ? `${docDir}/${docName}` : docName;
+      return docDir ? `${docDir}/${docName}` : docName;
+    };
+    for (const file of notFiles) {
+      const docId = docIdOf(file);
+      if (docId) onUnreadable?.(docId, "history.yaml is not a regular file");
+    }
+
+    // Read in batches, then fold in input order so the map's iteration order
+    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
+    const read = await mapInBatches(historyFiles, async (file) => {
+      const docId = docIdOf(file);
+      if (docId === null) return null;
       try {
         const raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
         return { docId, raw, error: null as string | null };
@@ -2894,6 +3252,30 @@ export class NestStorage {
     description?: string,
     options: { review?: ReviewMode } = {},
   ): Promise<void> {
+    // A re-init keeps the vault's structure rules (§11.1.1): re-initializing
+    // must never be a way to drop them. They are read as plain YAML, so a
+    // config that fails validation elsewhere still hands them over; one that
+    // is not YAML at all may hold them however spelled, so it is refused
+    // rather than overwritten.
+    const configPath = join(this.root, ".context", "config.yaml");
+    const prior = await readFile(configPath, "utf-8").catch(() => null);
+    const rules: Record<string, unknown> = {};
+    if (prior !== null) {
+      let parsed: unknown;
+      try {
+        parsed = yaml.load(prior);
+      } catch {
+        throw new ConfigError(
+          `${configPath} is not valid YAML — fix or remove it before re-initializing (it may hold structure rules that would be lost).`,
+        );
+      }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const key of ["structure", "folders", "templates"]) {
+          const value = (parsed as Record<string, unknown>)[key];
+          if (value !== undefined) rules[key] = value;
+        }
+      }
+    }
     await mkdir(this.root, { recursive: true });
 
     if (layout === "structured") {
@@ -2916,6 +3298,7 @@ export class NestStorage {
       // writes for review. Embedders calling init() directly keep the
       // pre-gate config (no key → publish by default).
       ...(options.review ? { review: options.review } : {}),
+      ...rules,
     };
     await this.writeConfig(config);
 

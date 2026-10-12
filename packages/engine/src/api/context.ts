@@ -14,10 +14,11 @@
  * inspects actor strings or role tables. Commercial governance enforcement is
  * layered on via the extension framework (`extension.ts`), not here.
  */
+import { DocumentNotFoundError } from "../errors.js";
 import type { NestStorage } from "../storage.js";
 import type { GraphQueryEngine } from "../graph-query-engine.js";
 import type { VersionManager } from "../versioning.js";
-import type { RbacHook } from "../types.js";
+import type { ContextNode, RbacHook } from "../types.js";
 
 /**
  * Everything an executor needs to run one operation against a single vault.
@@ -55,6 +56,15 @@ export interface OperationContext {
    * limit — the host (CLI, MCP server, Community) decides it.
    */
   readonly limits?: OperationLimits;
+  /**
+   * `"skip"`: a trusted host operation that brings a whole vault back as it
+   * was (Community's import staging, bundle restore, folder sync) or derives
+   * content rather than authoring it (annotation projections). Structure
+   * rules (§11.1) are not enforced and `context_import` may land
+   * `.context/` files. On the context, never in an input: a caller that could
+   * ask for it would have no rules at all.
+   */
+  readonly structure?: "skip";
 }
 
 /** See {@link OperationContext.limits}. */
@@ -64,6 +74,19 @@ export interface OperationLimits {
    * `DEFAULT_PDF_MAX_BYTES` (50 MB).
    */
   readonly pdfMaxBytes?: number;
+  /**
+   * Most version-history text one `context_import` may replay while judging
+   * its batch (characters, across every history it checks). Over it while
+   * judging, `files[]` are refused whole and asked to split; while publishing,
+   * documents publish in the order given until it is spent, and the rest are
+   * reported not published, to be published in a separate call (a document
+   * that passes the full check, or has no history, replays nothing and always
+   * publishes). Default
+   * `DEFAULT_IMPORT_REPLAY_CHARS` (512 Mi — a few seconds of work). One history may replay up to
+   * 128 Mi and a set is judged up to four times, so a value below 512 Mi can
+   * refuse a single large document however the batch is split.
+   */
+  readonly importReplayChars?: number;
 }
 
 /**
@@ -75,3 +98,13 @@ export type OperationExecutor<Input = unknown, Output = unknown> = (
   ctx: OperationContext,
   input: Input,
 ) => Promise<Output> | Output;
+
+/** Read a node, or null when there is none at that id. */
+export async function readIfExists(ctx: OperationContext, id: string): Promise<ContextNode | null> {
+  try {
+    return await ctx.storage.readDocument(id);
+  } catch (err) {
+    if (err instanceof DocumentNotFoundError) return null;
+    throw err;
+  }
+}
