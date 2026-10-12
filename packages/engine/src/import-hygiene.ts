@@ -52,12 +52,25 @@ const EXTENSION = /\.[a-z0-9]{1,8}$/i;
  * looks legitimate.
  */
 export function slugifyImportPath(relPath: string): string {
-  const segments = String(relPath ?? "").split(/[/\\]/).filter(Boolean);
+  // `.` segments dropped: `a/./b` is `a/b` to every file system, so two
+  // spellings of one target must not reach the checks as two paths.
+  const segments = String(relPath ?? "")
+    .split(/[/\\]/)
+    .filter((s) => s !== "" && s !== ".");
   return segments
-    .map((segment, i) => {
+    .map((raw, i) => {
+      // Trailing dots and spaces dropped, as Windows drops them, so every
+      // check downstream sees the name the file system will hold
+      // (`history.yaml.` is `history.yaml`). Dot-only segments (`..`) are left
+      // for the traversal guard. A loop, not `/[. ]+$/`, which is quadratic.
+      let end = raw.length;
+      if (!/^\.+$/.test(raw)) while (end > 0 && (raw[end - 1] === "." || raw[end - 1] === " ")) end--;
+      const segment = raw.slice(0, end) || raw;
       if (segment.startsWith(".")) return segment.toLowerCase();
       if (CLEAN_SEGMENT.test(segment)) return segment;
       const isLast = i === segments.length - 1;
+      // `INDEX.md`, `README.md`: kept as named, or the copy is read as a node.
+      if (isLast && KEPT_IMPORT_NAMES.has(segment)) return segment;
       const ext = isLast ? (segment.match(EXTENSION)?.[0] ?? "") : "";
       const stem = ext ? segment.slice(0, -ext.length) : segment;
       const slug = slugify(stem) || "untitled";
@@ -65,6 +78,13 @@ export function slugifyImportPath(relPath: string): string {
     })
     .join("/");
 }
+
+/**
+ * File names an import keeps with their capitals: a generated `INDEX.md` and a
+ * folder's `README.md` are not nodes, and lowercased they would be. Only these
+ * two — import-verdicts refuses one whose folder holds another spelling of it.
+ */
+export const KEPT_IMPORT_NAMES: ReadonlySet<string> = new Set(["INDEX.md", "README.md"]);
 
 /** Where the last path segment's extension starts, or its length if none. */
 function extensionStart(segment: string): number {
@@ -115,9 +135,10 @@ function versionPathParts(path: string): { prefix: string; suffix: string } | un
  * to prevent.
  */
 function rawDocKey(rawPath: string): string {
+  // `.` segments resolve away, as slugifyImportPath drops them.
   const segments = String(rawPath ?? "")
     .split(/[/\\]/)
-    .filter(Boolean);
+    .filter((s) => s !== "" && s !== ".");
   const i = segments.findIndex((segment) => segment.toLowerCase() === ".versions");
   if (i >= 0 && i + 1 < segments.length) {
     return [...segments.slice(0, i), segments[i + 1]].join("/");
@@ -154,6 +175,9 @@ export async function planImportPaths(
 ): Promise<Array<{ raw: string; path: string; warnings: string[] }>> {
   const claimed = new Map<string, string>(); // target → raw path that owns it
   const renamedStems = new Map<string, string>(); // `<dir>/<stem>` → new stem
+  // Next `-n` to try per `<dir><stem>\0<ext>`: a suffix taken once stays
+  // taken, so a run of collisions on one slug costs linear lookups, not n².
+  const nextSuffix = new Map<string, number>();
   const bases = rawPaths.map((raw) => slugifyImportPath(raw));
   const plan: Array<{ raw: string; path: string; warnings: string[] }> = new Array(rawPaths.length);
   // Stable sort, so documents — and version files among themselves — keep
@@ -190,7 +214,9 @@ export async function planImportPaths(
 
     let target = base;
     let takenBy: string | undefined;
-    for (let n = 2; ; n++) {
+    const key = `${dir}${stem}\0${ext}`;
+    let n = nextSuffix.get(key) ?? 2;
+    for (;;) {
       const owner = claimed.get(target);
       if (owner !== undefined) {
         takenBy ??= owner;
@@ -199,8 +225,9 @@ export async function planImportPaths(
       } else {
         break;
       }
-      target = `${dir}${stem}-${n}${ext}`;
+      target = `${dir}${stem}-${n++}${ext}`;
     }
+    if (target !== base) nextSuffix.set(key, n);
     claimed.set(target, raw);
     if (!parts && target !== base) {
       renamedStems.set(rawDocKey(raw), target.slice(cut, -ext.length || undefined));

@@ -187,6 +187,32 @@ describe("remoteAdd — folder", () => {
   });
 });
 
+describe("remoteAdd — structure template", () => {
+  it("a bodiless add starts from the folder's template when the nest advertises context_structure", async () => {
+    advertised = new Set(["context_create", "context_structure"]);
+    replies.context_structure = { resolved: { template_body: "## Decisions\n" } };
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+
+    await remoteAdd(target, "nodes/m/x", {});
+
+    expect(calls[0]).toMatchObject({ op: "context_structure", input: { folder: "m" } });
+    expect(calls[1].input).toMatchObject({ content: "\n## Decisions\n" });
+  });
+
+  it("asks nothing of a nest that predates structure rules, and an explicit body wins", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+    await remoteAdd(target, "nodes/m/x", {});
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+
+    calls = [];
+    advertised = new Set(["context_create", "context_structure"]);
+    await remoteAdd(target, "nodes/m/y", { body: "mine" });
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+    expect(calls[0].input).toMatchObject({ content: "\nmine\n" });
+  });
+});
+
 describe("remoteAdd — push-confirmation gate", () => {
   it("reports a held create instead of failing, and does not claim it was created", async () => {
     advertised = new Set(["context_create"]);
@@ -262,6 +288,16 @@ describe("<server>/<nest> targets", () => {
   });
   afterEach(() => {
     delete process.env.CONTEXTNEST_CONFIG_DIR;
+  });
+
+  // r23 slugre: the label was trimmed with `/^-+|-+$/g`, which retries from
+  // every dash of a run that does not end the name: "a" + 100k dashes + "b"
+  // took 11.8 s. Trimmed with a loop now.
+  it("r23 slugre: a nest name with a long run of dashes is labelled in linear time", () => {
+    const started = performance.now();
+    const labels = nestLabels([{ id: "x", name: `a${"-".repeat(100_000)}b` }]);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect([...labels.values()][0]).toBe(`a${"-".repeat(100_000)}b`);
   });
 
   it("labels nests by slugged name, disambiguating collisions with the id", () => {

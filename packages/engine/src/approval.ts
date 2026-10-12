@@ -26,13 +26,12 @@
  */
 
 import { join } from "node:path";
-import { applyPatch } from "diff";
 import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { readSuggestion } from "./suggestions.js";
+import { readSuggestion, applyStagedEdit } from "./suggestions.js";
 import {
   requireCzar,
   requireDocOwner,
@@ -50,8 +49,9 @@ import type {
   RbacHook,
   VersionEntry,
 } from "./types.js";
-import type { NestStorage } from "./storage.js";
+import { assertWritableDocumentPath, type NestStorage } from "./storage.js";
 import { settlePdfForCommit } from "./pdf-nodes.js";
+import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish } from "./structure-store.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -108,14 +108,15 @@ async function approveSuggestionImpl(
   const approved = await loadApprovedBase(input.storage, input.documentId);
   await assertNotStale(approved.content, sug.meta.target_hash, input.suggestionId);
 
-  const patched = applyPatch(approved.content, sug.patch);
-  if (typeof patched !== "string" || patched === "") {
+  const patched = applyStagedEdit(approved.content, sug);
+  if (patched === null) {
     throw new IntegrityError(
-      `Failed to apply suggestion "${input.suggestionId}" to current approved content`,
+      `Suggestion "${input.suggestionId}" no longer applies to the current version — the document changed since it was staged, or the patch is damaged; stage it again`,
       "content_hash_mismatch",
     );
   }
-
+  // commitNewVersion judges it against the structure rules in force now
+  // (§11.1.1), for what the edit newly breaks against the approved base.
   const { versionEntry } = await commitNewVersion({
     storage: input.storage,
     documentId: input.documentId,
@@ -418,8 +419,16 @@ interface CommitInput {
 async function commitNewVersion(
   input: CommitInput,
 ): Promise<{ versionEntry: VersionEntry; serialized: string }> {
+  // Every caller (suggestion approval, rollback, czar direct edit) seals and
+  // writes a version, so the id guard and the structure rules (§11.1.1) are
+  // applied here, before anything is written.
+  await assertWritableDocumentPath(input.storage.root, input.documentId);
   const filePath = join(input.storage.root, `${input.documentId}.md`);
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
+
+  // Judged before historyOrRepair: a refused write quarantines nothing.
+  const rules = await enforcedStructure(input.storage);
+  const first = rules ? await assertStructurePublish(input.storage, rules, parsed, input.knownHistory) : false;
 
   const versionManager = new VersionManager(input.storage);
   // Read once, shared by the numbering and the append below.
@@ -468,6 +477,9 @@ async function commitNewVersion(
   // chain consistent (history wrote first, live file matches the chain
   // head only after this succeeds).
   await input.storage.writeDocument(input.documentId, serialized);
+  // A czar direct edit may create the document: its new folders get their
+  // required contents, as any first publish's do.
+  if (rules && first) await scaffoldFirstPublish(input.storage, rules, [input.documentId]);
 
   return { versionEntry, serialized };
 }
