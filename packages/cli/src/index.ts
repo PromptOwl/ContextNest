@@ -19,6 +19,7 @@ import {
   evaluate,
   Resolver,
   PackLoader,
+  invalidPackSelectors,
   VersionManager,
   CheckpointManager,
   ContextInjector,
@@ -1848,13 +1849,38 @@ program
       }
     }
 
+    // Pack problems only surface when someone queries the pack; catch them
+    // here. `validate <path>` checks one document, so it skips packs.
+    let packCount = 0;
+    if (!path) {
+      const packProblems: Array<{ file: string; message: string }> = [];
+      const packs = await storage.readPacks(packProblems);
+      packCount = packs.length;
+      for (const p of packProblems) {
+        hasErrors = true;
+        allErrors.push({ path: p.file, errors: [{ rule: "pack-file", message: p.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ ${p.file}`));
+          console.log(`  ${p.message}`);
+        }
+      }
+      for (const bad of invalidPackSelectors(packs)) {
+        hasErrors = true;
+        allErrors.push({ path: `pack:${bad.id}`, errors: [{ rule: "pack-query", message: bad.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ pack:${bad.id}`));
+          console.log(`  query "${bad.query}": ${bad.message}`);
+        }
+      }
+    }
+
     if (opts.json) {
       console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors }, null, 2));
     } else {
       console.log(
         hasErrors
           ? chalk.red(`\nValidation failed with errors`)
-          : chalk.green(`\nAll ${docs.length} documents valid`),
+          : chalk.green(`\nAll ${docs.length} documents${path ? "" : ` and ${packCount} packs`} valid`),
       );
     }
 

@@ -342,7 +342,7 @@ export {
 export type { StewardRole, StewardEntry, StewardsConfig } from "./stewards.js";
 
 // Packs
-export { PackLoader } from "./packs.js";
+export { PackLoader, invalidPackSelectors } from "./packs.js";
 
 // Versioning
 export { VersionManager } from "./versioning.js";
