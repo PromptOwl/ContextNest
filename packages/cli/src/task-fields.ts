@@ -49,7 +49,10 @@ export function taskListFilters(opts: {
   priority?: string;
   dueBefore?: string;
 }): TaskListFilters {
-  const orNone = (v: string) => v.trim() || "none";
+  const orNone = (v: string) => {
+    const s = v.trim();
+    return s === "" || s.toLowerCase() === "none" ? "none" : s;
+  };
   return {
     ...(opts.assignee !== undefined ? { assignee: orNone(opts.assignee) } : {}),
     ...(opts.priority !== undefined ? { priority: orNone(opts.priority) } : {}),

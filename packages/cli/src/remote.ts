@@ -757,7 +757,10 @@ export async function remoteUpdate(
     console.log(`  Version: ${updated.version}`);
     if (updated.status) console.log(`  Status: ${updated.status}`);
     for (const k of TASK_FIELD_FLAGS) {
-      if (k in fields) console.log(`  ${k[0].toUpperCase()}${k.slice(1)}: ${String(updated[k] ?? "(cleared)")}`);
+      // The nest omits unset fields from its reply, so a cleared field reads
+      // back as absent; only a field sent as null may be reported cleared.
+      const shown = fields[k] === null ? "(cleared)" : String(updated[k] ?? "(not returned by the nest)");
+      if (k in fields) console.log(`  ${k[0].toUpperCase()}${k.slice(1)}: ${shown}`);
     }
   });
 }

@@ -72,6 +72,7 @@ describe("task field flags", () => {
 
   it('list filters: "" means none, as it does for update', () => {
     expect(taskListFilters({ assignee: "", priority: " high " })).toEqual({ assignee: "none", priority: "high" });
+    expect(taskListFilters({ assignee: "None", priority: "NONE" })).toEqual({ assignee: "none", priority: "none" });
     expect(taskListFilters({})).toEqual({});
   });
 
@@ -102,6 +103,13 @@ describe("ctx update on a remote nest", () => {
   it("a task field alone is enough to update", async () => {
     replies.context_update = { id: "nodes/t", version: 4, due: "2026-10-31" };
     await expect(remoteUpdate(target, "nodes/t", { due: "2026-10-31" })).resolves.toBeUndefined();
+  });
+
+  it("a set field the nest did not return is not reported as cleared", async () => {
+    replies.context_update = { id: "nodes/t", version: 4 };
+    await remoteUpdate(target, "nodes/t", { priority: "high" });
+    expect(plain()).toContain("Priority: (not returned by the nest)");
+    expect(plain()).not.toContain("(cleared)");
   });
 
   it("an older server is refused before anything is written — set or clear", async () => {
@@ -194,6 +202,13 @@ describe("ctx task log", () => {
     await remoteTaskLog(target, "nodes/t", { note: "on it", claim: true });
     expect(calls[0].input).not.toHaveProperty("client");
     expect(plain()).toContain("Not claimed — already assigned to ann@x.com");
+  });
+
+  it("--agent overrides $CONTEXTNEST_AGENT", async () => {
+    process.env.CONTEXTNEST_AGENT = "Claude Code";
+    replies.context_task_log = { id: "nodes/t", entry };
+    await remoteTaskLog(target, "nodes/t", { note: "on it", agent: " Codex " });
+    expect(calls[0].input.client).toEqual({ agent: "Codex" });
   });
 
   it("already_yours prints no claim line", async () => {
