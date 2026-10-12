@@ -639,6 +639,179 @@ const J4: Journey = {
   ],
 };
 
+/** The events a `ctx forget-log --json` payload records. */
+type ForgetEvent = { mode: string; reason_code: string; requested_by: string };
+const forgetEvents = (data: unknown) => (data as { events: ForgetEvent[] }).events;
+
+/**
+ * J5 — "I erase a node on request and prove nothing leaks."
+ * The compliance promise (spec §6.3): when someone exercises their right to be
+ * forgotten, `ctx forget` wipes the node's content — from the live file and from
+ * every version in history — while keeping the hash chain intact so the vault
+ * still verifies. The audit trail records who asked, when, and why, but never
+ * the content; and the erased node cannot be brought back.
+ *
+ * A distinct secret token lives in the body and a different address is the
+ * requester, so "the log keeps who/why but not the content" is unambiguous: the
+ * requester email is audit metadata that SHOULD appear; the body token must not.
+ *
+ * The review gate is turned OFF (like J2/J3): the node is published knowledge
+ * being erased on request, not a draft behind a gate.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const SECRET = "SSN-078-05-1120"; // the erased content — must never surface in the audit trail
+const J5: Journey = {
+  id: "J5",
+  title: "Right to be forgotten (compliance officer)",
+  cases: [
+    {
+      id: "J5-01",
+      title: "Forgetting a published node erases its content and marks it forgotten",
+      actions: [
+        { args: ["init", "--name", "right-to-erasure"], stdout: ["Initialized"] },
+        // Published knowledge being erased — not a draft held behind the gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/jane-data",
+            "--type", "document",
+            "--title", "Jane Data",
+            "--tags", "#pii",
+            "--body", `classified token ${SECRET} here`,
+            "-y",
+          ],
+          files: [{ path: "nodes/jane-data.md", exists: true }],
+        },
+        // A second node that is NEVER forgotten — the control for the
+        // forget-vs-delete contrast in J5-05.
+        {
+          args: [
+            "add", "nodes/keepsake",
+            "--type", "document",
+            "--title", "Keepsake",
+            "--tags", "#keep",
+            "--body", "ordinary content",
+            "-y",
+          ],
+          files: [{ path: "nodes/keepsake.md", exists: true }],
+        },
+        // The erasure itself: content wiped, a forgotten stub left in its place.
+        {
+          args: [
+            "forget", "nodes/jane-data",
+            "--reason", "user_request",
+            "--requested-by", "jane@example.com",
+            "-y",
+          ],
+          stdout: ["Forgot nodes/jane-data", "status: forgotten", "Hashes kept"],
+          files: [{ path: "nodes/jane-data.md", contains: "status: forgotten" }],
+        },
+        // Opening the node now shows only a tombstone — the secret body is gone.
+        {
+          args: ["read", "nodes/jane-data"],
+          stdout: ["forgotten", "content was erased"],
+          stdoutNot: [SECRET],
+        },
+      ],
+    },
+    {
+      id: "J5-02",
+      title: "The forget log records who asked, when, and why — but never the erased content",
+      actions: [
+        {
+          args: ["forget-log"],
+          // Who/why is kept; the requester address is audit metadata and appears.
+          stdout: ["nodes/jane-data", "forgotten", "Reason: user_request", "jane@example.com"],
+          // The erased body token must not leak into the audit trail.
+          stdoutNot: [SECRET],
+        },
+        {
+          args: ["forget-log", "--json"],
+          json: (data) => {
+            const events = forgetEvents(data);
+            expect(events).toHaveLength(1);
+            expect(events[0].mode).toBe("forget");
+            expect(events[0].reason_code).toBe("user_request");
+            expect(events[0].requested_by).toBe("jane@example.com");
+            // Structural proof the content is absent from the record too.
+            expect(JSON.stringify(data)).not.toContain(SECRET);
+          },
+        },
+      ],
+    },
+    {
+      id: "J5-03",
+      title: "Re-adding or re-publishing the forgotten node is refused (anti-resurrection)",
+      actions: [
+        // The stub still occupies the path, so re-adding the id is rejected.
+        {
+          args: [
+            "add", "nodes/jane-data",
+            "--type", "document",
+            "--title", "Jane Data",
+            "--body", "trying to bring it back",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["DOCUMENT_EXISTS"],
+        },
+        // And editing the stub to republish content is refused outright — the
+        // real anti-resurrection guard.
+        {
+          args: ["update", "nodes/jane-data", "--body", "bring it back", "-y"],
+          status: 1,
+          stderr: ["FORGOTTEN_DOCUMENT", "cannot be republished"],
+        },
+      ],
+    },
+    {
+      id: "J5-04",
+      title: "The vault still passes an integrity check after the forget (hashes kept)",
+      actions: [
+        {
+          // The forgotten version is verified hash-only (content erased), and the
+          // whole vault still passes — avoid the ✓ glyph so Windows stdout
+          // decoding can't trip the match; `--json` below is the structural proof.
+          args: ["verify"],
+          stdout: [
+            "nodes/jane-data",
+            "forgotten version(s) verified hash-only",
+            "All integrity checks passed",
+          ],
+        },
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J5-05",
+      title: "Forget is not delete — a forgotten node leaves an auditable stub, a deleted node is gone",
+      actions: [
+        // Delete the untouched control node outright.
+        { args: ["delete", "nodes/keepsake", "-y"], status: 0 },
+        // The audit trail distinguishes the two modes — one forgotten, one deleted.
+        {
+          args: ["forget-log"],
+          stdout: ["nodes/jane-data — forgotten", "nodes/keepsake — deleted"],
+        },
+        // The forgotten node is still addressable — its stub tombstone remains...
+        {
+          args: ["read", "nodes/jane-data"],
+          stdout: ["forgotten", "content was erased"],
+        },
+        // ...whereas the deleted node is gone entirely.
+        { args: ["read", "nodes/keepsake"], status: 1, stderr: ["DOCUMENT_NOT_FOUND"] },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -654,5 +827,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J4 — work with an Obsidian-layout vault", () => {
     runJourney({ installDir: INSTALL, scratch }, J4);
+  });
+
+  it("J5 — erase a node on request (right to be forgotten)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J5);
   });
 });
