@@ -22,6 +22,11 @@ export interface DocListView {
   tags?: string[];
   /** Server-level remote only: the `--vault <server>/<nest>` holding this doc. */
   vault?: string;
+  /** Task (board) fields — a Community nest reports them when set. */
+  assignee?: string;
+  due?: string;
+  priority?: string;
+  parent?: string;
 }
 
 /**
@@ -40,6 +45,10 @@ export function listJsonEntry(d: DocListView) {
     type: d.type || "document",
     status: d.status || "draft",
     tags: d.tags,
+    ...(d.assignee ? { assignee: d.assignee } : {}),
+    ...(d.due ? { due: d.due } : {}),
+    ...(d.priority ? { priority: d.priority } : {}),
+    ...(d.parent ? { parent: d.parent } : {}),
     ...(d.vault ? { vault: d.vault } : {}),
   };
 }
@@ -131,15 +140,16 @@ export function searchLimit(raw: number | undefined): number | undefined {
 
 /**
  * Render `context_search` output, local or remote. Hits arrive best-first;
- * when `total` says the list was cut, a footer names the remainder (on
- * stderr in `--json` mode so stdout stays a parseable array).
+ * when `count` says the list was cut, a footer names the remainder (on
+ * stderr in `--json` mode so stdout stays a parseable array). `total` is the
+ * deprecated alias an engine <= 2.9.x sends instead of `count`.
  */
 export function printSearchResults(
-  out: { results: SearchHitView[]; total?: number },
+  out: { results: SearchHitView[]; count?: number; total?: number },
   opts: { json?: boolean },
 ): void {
   const { results } = out;
-  const total = out.total ?? results.length;
+  const total = out.count ?? out.total ?? results.length;
   const more = Math.max(0, total - results.length);
   const footer = `… ${more} more — raise --limit (0 = all)`;
   if (opts.json) {

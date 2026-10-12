@@ -19,6 +19,7 @@ import type {
   PdfMeta,
   SkillMeta,
   SourceMeta,
+  ViewMeta,
 } from "../types.js";
 import {
   serializeDocument,
@@ -38,7 +39,7 @@ import {
   applyImportedTombstones,
   assertNotForgotten,
 } from "../forget.js";
-import { addTombstone, buildTombstoneIndex, isPathForgotten } from "../tombstones.js";
+import { addTombstone, buildTombstoneIndex, expandsWithin, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
@@ -86,7 +87,6 @@ import {
   sanitizeImportedFrontmatter,
 } from "../import-hygiene.js";
 import {
-  auditStructure,
   checkDeleteDocument,
   checkDocument,
   checkUpdate,
@@ -97,6 +97,7 @@ import {
   resolveFolder,
   type CompiledStructure,
   type StructureDoc,
+  comparableSegment,
 } from "../structure.js";
 import {
   assertStructureDelete,
@@ -105,6 +106,7 @@ import {
   assertStructurePublish,
   isEnforced,
   scaffoldFolders,
+  structureReport,
 } from "../structure-store.js";
 import { readIfExists, type OperationContext, type OperationExecutor } from "./context.js";
 import {
@@ -115,6 +117,7 @@ import {
   importReplayBudget,
   storeOwner,
   versionsArtifact,
+  isChainEventLog,
 } from "./import-verdicts.js";
 import { isDeepStrictEqual } from "node:util";
 
@@ -218,8 +221,8 @@ async function resolveId(
       "VALIDATION_FAILED",
     );
   }
-  if (sel.id) return sanitizeId(sel.id);
-  if (sel.uri) return sanitizeId(parseUri(sel.uri).path);
+  if (sel.id) return givenId(ctx, sanitizeId(sel.id));
+  if (sel.uri) return givenId(ctx, sanitizeId(parseUri(sel.uri).path));
   // includeRetired, or a title lookup cannot see a rejected document at all and
   // falls through to the slug guess below — which quietly resolves to whatever
   // sits at that slug, or to nothing for a doc created with a custom id. The
@@ -230,6 +233,20 @@ async function resolveId(
   );
   if (match) return match.id;
   return normalizeDocumentId(requireSlug(String(sel.title)));
+}
+
+/**
+ * A caller's id is used as given when a document is there (flat-layout ids
+ * carry no nodes/ prefix). A bare one that names none is the id create gave
+ * it — normalizeDocumentId roots it under nodes/ — when that one exists.
+ */
+async function givenId(ctx: OperationContext, id: string): Promise<string> {
+  // Validated before anything is read for it: an id that is refused never
+  // reaches the file system (nor answers with its path).
+  assertSafeDocumentId(id);
+  if (id.includes("/") || (await readIfExists(ctx, id))) return id;
+  const rooted = `nodes/${id}`;
+  return (await readIfExists(ctx, rooted)) ? rooted : id;
 }
 
 /**
@@ -374,7 +391,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // intersection/union walk the left side first, so
   // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
-  if (!query) return { results: [], total: 0 };
+  if (!query) return { results: [], count: 0, total: 0 };
   const docs = await ctx.storage.discoverDocuments();
   const hits = new Resolver({ documents: docs })
     .search(query)
@@ -382,6 +399,8 @@ const search: OperationExecutor = async (ctx, input: any) => {
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
     results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    // Counted before the `limit` slice. `total` is the deprecated alias.
+    count: hits.length,
     total: hits.length,
   };
 };
@@ -490,6 +509,7 @@ function buildDraftNode(input: {
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
   source?: SourceMeta;
+  view?: ViewMeta;
 }): ContextNode {
   const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
@@ -514,12 +534,13 @@ function buildDraftNode(input: {
     // updated_at until its first edit, and every surface renders it blank.
     updated_at: now,
   };
-  // `source` and `skill` are required by one type and forbidden on the others,
+  // `source`, `skill` and `view` are required by one type and forbidden on the others,
   // so they cannot ride along inside `metadata` and cannot be added afterwards
   // — a source node written without its block fails every later update.
   applyTypedBlocks(frontmatter, {
     type,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -616,12 +637,14 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // `nodes/`, which silently redirects every id from a flat-layout vault (they
   // carry no prefix) to a document that doesn't exist. The storage layer
   // already resolves an id for its own layout — all this has to do is refuse
-  // one that would escape the vault root.
-  const id: string = input.id;
+  // one that would escape the vault root, and find a bare id where create put it.
   // An update writes the file before any publish, so a reserved path
   // (§11.1.1: `.versions/`, `_suggestions/`, the root `packs/`) is refused
-  // here, not left to the publish guard after the edit has landed.
-  await assertWritableDocumentPath(ctx.storage.root, id);
+  // here, not left to the publish guard after the edit has landed — and
+  // before the id is resolved, so nothing is read for an id that is refused.
+  await assertWritableDocumentPath(ctx.storage.root, String(input.id));
+  const id: string = await givenId(ctx, String(input.id));
+  if (id !== input.id) await assertWritableDocumentPath(ctx.storage.root, id);
   const live = await ctx.storage.readDocument(id);
   // Held for review (review.ts). An edit to a PUBLISHED node must not touch
   // the canonical file — it is staged as a suggestion instead — and it builds
@@ -706,6 +729,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   applyTypedBlocks(frontmatter, {
     type: nextType,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -841,7 +865,7 @@ const forget: OperationExecutor = async (ctx, input: any) => {
 };
 
 const forgetLogExec: OperationExecutor = async (ctx, input: any) => {
-  const id = input?.id ? sanitizeId(String(input.id)) : undefined;
+  const id = input?.id ? await givenId(ctx, sanitizeId(String(input.id))) : undefined;
   const records = await forgetLog(ctx.storage, id);
   return {
     events: records.map((r) => ({
@@ -1208,10 +1232,15 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   const incomingEvents: unknown[] = [];
   if (tombstones) {
     incoming = incoming.filter((f) => {
-      const p = String(f.path ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
-      if (p !== ".versions/chain_events.yaml") return true;
+      if (!isChainEventLog(String(f.path ?? ""))) return true;
       try {
-        const parsed = yaml.load(f.content ?? "");
+        const text = f.content ?? "";
+        const parsed = yaml.load(text);
+        // Aliases expanding it past its own text would be written out in
+        // full by every later append to this vault's log.
+        if (!expandsWithin(parsed, 2 * text.length + 1024)) {
+          throw new ContextNestError("its YAML aliases expand it far beyond its own size", "VALIDATION_FAILED");
+        }
         const list = Array.isArray(parsed)
           ? parsed
           : Array.isArray((parsed as { events?: unknown[] } | null)?.events)
@@ -1279,7 +1308,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   }
   if (tombstones && incomingEvents.length > 0) {
     try {
-      await applyImportedTombstones(ctx.storage, incomingEvents, tombstones);
+      const { refused } = await applyImportedTombstones(ctx.storage, incomingEvents, tombstones, replayBudget);
+      for (const r of refused) failed.push({ id: ".versions/chain_events.yaml", error: r.reason });
     } catch (err) {
       failed.push({ id: ".versions/chain_events.yaml", error: vaultError(ctx, err) });
     }
@@ -1416,6 +1446,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
                 }
               : null
         : undefined,
+      // The scan just read these under the same lock; reading each again cost
+      // one round trip per document on a network-backed mount.
+      preloaded: new Map(scanned.map((d) => [d.id, d])),
     });
     published = result.published.map((p) => ({ id: p.id, version: p.version }));
     checkpoint = result.checkpointNumber;
@@ -1587,6 +1620,14 @@ async function importPdfLocked(
     existing = await readIfExists(ctx, raw);
     id = existing ? raw : normalizeDocumentId(raw);
     if (!existing && id !== raw) existing = await readIfExists(ctx, id);
+    // On a case-insensitive filesystem `nodes/report` reads `nodes/Report.md`,
+    // and the read hands back the caller's spelling. Every path below — the
+    // sidecar, `pdf.file`, the version history — must use the spelling
+    // discovery reports, or rule 26 fails and delete misses the sidecar (#117).
+    if (existing) {
+      id = await ctx.storage.resolveDocumentIdCasing(id);
+      existing = { ...existing, id };
+    }
   } else {
     const title =
       input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF";
@@ -1684,7 +1725,10 @@ async function importPdfLocked(
       );
     const wantsDescription =
       typeof input.description === "string" && input.description !== (fm.description ?? "");
-    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription) {
+    // A node written before #117 may record `pdf.file` in the caller's
+    // casing; rewriting it to the on-disk spelling repairs rule 26.
+    const wantsRepair = existingPdf.file !== sidecar;
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription && !wantsRepair) {
       return {
         id,
         version: fm.version ?? 1,
@@ -1702,7 +1746,7 @@ async function importPdfLocked(
   // restamp extracted_at); new bytes get both fresh.
   const pdf: PdfMeta =
     sameBytes && existingPdf
-      ? existingPdf
+      ? { ...existingPdf, file: sidecar }
       : {
           file: sidecar,
           sha256: extraction.sha256,
@@ -1866,20 +1910,7 @@ const structureExec: OperationExecutor = async (ctx, input: any) => {
   }
   const out: Record<string, unknown> = { ...describeStructure(rules) };
   if (input?.folder !== undefined) out.resolved = resolveFolder(rules, String(input.folder));
-  if (input?.report === true) {
-    const docs = await ctx.storage.discoverDocuments();
-    // In a structured vault only nodes/ holds content; root-level folders
-    // (sources/, packs/, assets/) are not judged against the folder rules.
-    const structured = (await ctx.storage.detectLayout()) === "structured";
-    const folders = (await ctx.storage.listFolders())
-      .map((f) => f.path)
-      .filter((p) => !structured || p === "nodes" || p.startsWith("nodes/"));
-    out.violations = auditStructure(
-      rules,
-      docs.map((d) => structureView(d.id, d)),
-      folders,
-    );
-  }
+  if (input?.report === true) out.violations = await structureReport(ctx.storage, rules);
   return out;
 };
 

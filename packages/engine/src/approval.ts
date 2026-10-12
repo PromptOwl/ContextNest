@@ -26,13 +26,12 @@
  */
 
 import { join } from "node:path";
-import { applyPatchBounded } from "./reconstruct.js";
 import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { readSuggestion } from "./suggestions.js";
+import { readSuggestion, applyStagedEdit } from "./suggestions.js";
 import {
   requireCzar,
   requireDocOwner,
@@ -109,10 +108,10 @@ async function approveSuggestionImpl(
   const approved = await loadApprovedBase(input.storage, input.documentId);
   await assertNotStale(approved.content, sug.meta.target_hash, input.suggestionId);
 
-  const patched = applyPatchBounded(approved.content, sug.patch).result;
-  if (typeof patched !== "string" || patched === "") {
+  const patched = applyStagedEdit(approved.content, sug);
+  if (patched === null) {
     throw new IntegrityError(
-      `Failed to apply suggestion "${input.suggestionId}" to current approved content`,
+      `Suggestion "${input.suggestionId}" no longer applies to the current version — the document changed since it was staged, or the patch is damaged; stage it again`,
       "content_hash_mismatch",
     );
   }

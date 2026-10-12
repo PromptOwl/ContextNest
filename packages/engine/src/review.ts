@@ -31,16 +31,15 @@
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applyPatchBounded } from "./reconstruct.js";
 import { parseConfig } from "./config.js";
 import { ConfigError, ContextNestError, IntegrityError } from "./errors.js";
 import { computeContentHash } from "./integrity.js";
-import { getChecksumContent, isPublished, isRejected, serializeDocument } from "./parser.js";
+import { getChecksumContent, isPublished, isRejected, parseDocument, serializeDocument } from "./parser.js";
 import { publishDocument } from "./publish.js";
-import { listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
+import { applyStagedEdit, listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { assertStructureUpdate } from "./structure-store.js";
+import { assertStructurePublish, assertStructureUpdate, enforcedStructure } from "./structure-store.js";
 import { assertSafeDocumentId } from "./storage.js";
 import type { NestStorage } from "./storage.js";
 import type { GovernanceTier, ReviewMode, SuggestionMeta } from "./types.js";
@@ -120,7 +119,11 @@ async function writeReviewMode(storage: NestStorage, mode: ReviewMode): Promise<
 
 /** A staged review hold, with whether the node has moved on since. */
 export interface ReviewHold extends SuggestionMeta {
-  /** True when the published node changed after staging — approval is refused. */
+  /**
+   * True when the published node changed after staging — its body, or its
+   * frontmatter so that the held edit no longer applies where it was made.
+   * Approval is refused, and a later hold does not build on it.
+   */
   stale: boolean;
 }
 
@@ -152,7 +155,17 @@ async function holdsWithHead(
   if (metas.length === 0) return { holds: [], head: null };
   const head = await approvedHead(storage, id);
   const headHash = head === null ? null : computeContentHash(getChecksumContent(head));
-  return { holds: metas.map((m) => ({ ...m, stale: m.target_hash !== headHash })), head };
+  // The body hash is not the whole story: an edit that only changes the
+  // frontmatter can move every line a held patch names. One that no longer
+  // applies to the head is stale too — listed, proposed and approved alike.
+  const applies = async (m: SuggestionMeta) => {
+    if (head === null) return false;
+    const sug = await readSuggestion(storage, id, m.suggestion_id);
+    return sug !== null && applyStagedEdit(head, sug) !== null;
+  };
+  const holds: ReviewHold[] = [];
+  for (const m of metas) holds.push({ ...m, stale: m.target_hash !== headHash || !(await applies(m)) });
+  return { holds, head };
 }
 
 /** Review holds staged for one node, oldest first. */
@@ -175,8 +188,8 @@ export async function currentReviewProposal(
   const newest = holds[holds.length - 1];
   const sug = await readSuggestion(storage, id, newest.suggestion_id);
   if (!sug) return null;
-  const proposedRaw = applyPatchBounded(approvedRaw, sug.patch).result;
-  if (typeof proposedRaw !== "string" || proposedRaw === "") return null;
+  const proposedRaw = applyStagedEdit(approvedRaw, sug);
+  if (proposedRaw === null) return null;
   return { suggestionId: newest.suggestion_id, approvedRaw, proposedRaw };
 }
 
@@ -295,24 +308,27 @@ export async function approveReview(
     const chosen = holds.filter((h) => !h.stale).at(-1) ?? holds.at(-1);
 
     if (chosen) {
-      if (chosen.stale) {
+      const sug = await readSuggestion(storage, id, chosen.suggestion_id);
+      if (!sug) {
         throw new IntegrityError(
-          `The held edit ${chosen.suggestion_id} for ${id} is stale: the published node changed after it was staged. Reject it and make the edit again.`,
+          `The held edit ${chosen.suggestion_id} for ${id} could not be read. Reject it and make the edit again.`,
           "content_hash_mismatch",
         );
       }
-      const sug = await readSuggestion(storage, id, chosen.suggestion_id);
-      const proposedRaw =
-        approvedRaw !== null && sug ? applyPatchBounded(approvedRaw, sug.patch).result : false;
-      if (typeof proposedRaw !== "string" || proposedRaw === "") {
+      const proposedRaw = !chosen.stale && approvedRaw !== null ? applyStagedEdit(approvedRaw, sug) : null;
+      if (proposedRaw === null) {
         throw new IntegrityError(
-          `Could not apply the held edit ${chosen.suggestion_id} to ${id}.`,
+          `The held edit ${chosen.suggestion_id} for ${id} is stale: the published node changed after it was staged, so the edit no longer applies. Reject it and make the edit again.`,
           "content_hash_mismatch",
         );
       }
       // Judged against the structure rules in force now (§11.1.1) — they may
       // have changed since the edit was held.
       await assertStructureUpdate(storage, id, approvedRaw!, proposedRaw);
+      // And as its publish will judge it (against the sealed head), BEFORE the
+      // write: a refusal there must not leave the held edit in the live file.
+      const rules = await enforcedStructure(storage);
+      if (rules) await assertStructurePublish(storage, rules, parseDocument(`${id}.md`, proposedRaw, id));
       // The write the hold deferred, then the publish it would have done.
       await storage.writeDocument(id, proposedRaw);
       const result = await publishDocument(storage, id, {

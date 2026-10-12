@@ -130,6 +130,8 @@ export interface StructureView {
 export const MAX_MATCHED_NAME = 128;
 /** Longest owner-written regex accepted. */
 const MAX_REGEX_LENGTH = 200;
+/** Longest format, regex or token pattern: compiling one walks it from every `{`. */
+const MAX_FORMAT_LENGTH = 200;
 /**
  * `{slug}`/`{n}` tokens per token pattern — a readability limit (§11.1.1).
  * Cost is not the reason: token patterns run on the same linear matcher as
@@ -447,6 +449,9 @@ function linearTest(alternatives: RegexItem[][], name: string): boolean {
 
 /** Compile a format: `/regex/` or a token pattern like `{date}-{slug}`. */
 function compileFormat(spelling: string, key: string): Matcher {
+  if (spelling.length > MAX_FORMAT_LENGTH) {
+    throw new ConfigError(`${key}: the format is longer than ${MAX_FORMAT_LENGTH} characters`);
+  }
   if (spelling.length >= 2 && spelling.startsWith("/") && spelling.endsWith("/")) {
     const body = spelling.slice(1, -1);
     if (!body) throw new ConfigError(`${key}: the regex is empty`);
@@ -491,6 +496,12 @@ function compileFormat(spelling: string, key: string): Matcher {
       items.push(tokenItem(token));
     } else {
       previous = null;
+      if (part.includes("{")) {
+        throw new ConfigError(`${key}: "${part}" opens a { that never closes — write tokens whole: ${TOKEN_LIST}`);
+      }
+      if (part.includes("}")) {
+        throw new ConfigError(`${key}: "${part}" closes a } that never opened — write tokens whole: ${TOKEN_LIST}`);
+      }
       if (!/^[a-z0-9-]+$/.test(part)) {
         throw new ConfigError(
           `${key}: "${part}" can never match — names are lowercase a-z, 0-9 and "-" (titles are slugified)`,
@@ -582,6 +593,20 @@ export function compileStructure(config: StructureConfig | null | undefined): Co
     throw new ConfigError(`folders: at most ${MAX_RULES} folder rules (found ${entries.length})`);
   }
   const warnings: string[] = [];
+  // A required section the template's own body lacks as a heading: under
+  // enforcement every file started from it would be refused until someone
+  // added the heading by hand.
+  for (const [name, t] of Object.entries(templates)) {
+    if (t.required_sections.length === 0) continue;
+    const have = headingAnchors(t.body);
+    for (const section of t.required_sections) {
+      if (!have.has(headingAnchor(section))) {
+        warnings.push(
+          `templates.${name}.required_sections: "${section}" is not a heading in the template's body — files started from it would be refused until someone adds it`,
+        );
+      }
+    }
+  }
 
   const rules: CompiledRule[] = [];
   const seen = new Map<string, string>();

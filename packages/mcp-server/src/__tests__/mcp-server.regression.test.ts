@@ -436,6 +436,30 @@ describe("[regression] MCP server e2e — mutation tools", () => {
     expect(json.frontmatter.skill.trigger).toBe("when asked to do the thing");
   });
 
+  it("create_document round-trips a view node's block, refuses one without it, and update_document re-types it away", async () => {
+    const view = { blocks: [{ md: { ref: "nodes/created" } }, { list: { select: "#alpha" } }] };
+    const { json } = await callJson(client, "create_document", {
+      path: "nodes/my-view",
+      title: "My View",
+      type: "view",
+      view,
+    });
+    expect(json.frontmatter.type).toBe("view");
+    expect(json.frontmatter.view).toEqual(view);
+    expect(await isToolError(client, "create_document", { path: "nodes/no-view", title: "No View", type: "view" })).toBe(true);
+    expect(
+      await isToolError(client, "create_document", {
+        path: "nodes/bad-view",
+        title: "Bad View",
+        type: "view",
+        view: { blocks: [{ md: { ref: "https://evil.example" } }] },
+      }),
+    ).toBe(true);
+    const updated = await callJson(client, "update_document", { path: "nodes/my-view", type: "document" });
+    expect(updated.json.frontmatter.type).toBe("document");
+    expect(updated.json.frontmatter.view).toBeUndefined();
+  });
+
   it("create_document round-trips a source node's block, and refuses one without it", async () => {
     const source = { transport: "mcp", server: "harvest", tools: ["list_projects"] };
     const { json } = await callJson(client, "create_document", {
@@ -1138,6 +1162,8 @@ describe("[regression] MCP server e2e — review gate", () => {
     expect(json.checkpoint).toBeNull();
     expect(json.review).toMatch(/pending review/);
     expect(json.review).toMatch(/turn off review/);
+    // First-run trap: a held node is invisible to search, so say so.
+    expect(json.review).toMatch(/not searchable/);
   });
 
   it("context_review approve publishes the held node", async () => {
@@ -1221,7 +1247,7 @@ describe("[regression] MCP server e2e — context_search", () => {
   const search = async (args: Record<string, unknown>) => {
     const { json, isError } = await callJson(client, "context_search", args);
     expect(isError, JSON.stringify(args)).toBe(false);
-    return json as { results: Array<{ id: string; title: string; score?: number }>; total: number };
+    return json as { results: Array<{ id: string; title: string; score?: number }>; count: number; total: number };
   };
   const ids = async (query: string) => (await search({ query })).results.map((r) => r.id);
 
@@ -1253,18 +1279,21 @@ describe("[regression] MCP server e2e — context_search", () => {
     }
   });
 
-  it("limit caps results while total still counts every match", async () => {
+  it("limit caps results while count still counts every match", async () => {
     const all = await search({ query: "API" });
-    expect(all.total).toBeGreaterThan(1);
+    expect(all.count).toBeGreaterThan(1);
+    expect(all.count).toBe(all.results.length);
     const one = await search({ query: "API", limit: 1 });
     expect(one.results).toHaveLength(1);
     expect(one.results[0].id).toBe(all.results[0].id);
-    expect(one.total).toBe(all.total);
+    expect(one.count).toBe(all.count);
+    // Deprecated alias, same value.
+    expect(one.total).toBe(one.count);
   });
 
   it("no match and a whitespace-only query return empty results, not an error", async () => {
-    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], total: 0 });
-    expect(await search({ query: "   " })).toEqual({ results: [], total: 0 });
+    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], count: 0, total: 0 });
+    expect(await search({ query: "   " })).toEqual({ results: [], count: 0, total: 0 });
   });
 
   it("special characters in the query never break the search", async () => {
@@ -1475,6 +1504,47 @@ describe("[regression] MCP server e2e — context_query", () => {
   });
 });
 
+// ─── Onboarding: placement outside discovered folders ─────────────────────────
+
+describe("[regression] MCP server e2e — writes outside nodes/ are re-rooted", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("create_document with a path outside nodes/ lands under nodes/ and says so", async () => {
+    const { json, isError } = await callJson(client, "create_document", { path: "projects/plan", title: "Plan" });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/projects/plan");
+    expect(json.placement).toMatch(/outside nodes\//);
+    expect(await exists(join(vault, "nodes", "projects", "plan.md"))).toBe(true);
+    expect(await exists(join(vault, "projects", "plan.md"))).toBe(false);
+  });
+
+  it("context_create with an explicit id outside nodes/ is re-rooted and listable", async () => {
+    const { json, isError } = await callJson(client, "context_create", { title: "Alpha", id: "projects/alpha", content: "a" });
+    expect(isError).toBe(false);
+    expect(json.id).toBe("nodes/projects/alpha");
+    expect(json.placement).toMatch(/outside nodes\//);
+    const list = await callText(client, "context_list", {});
+    expect(list.text).toContain("nodes/projects/alpha");
+  });
+
+  it("an id already under nodes/ is untouched and carries no placement note", async () => {
+    const { json } = await callJson(client, "context_create", { title: "Beta", id: "nodes/beta", content: "b" });
+    expect(json.id).toBe("nodes/beta");
+    expect(json.placement).toBeUndefined();
+  });
+});
+
 // ─── Structure rules ─────────────────────────────────────────────────────────
 //
 // docs/prds/structure-rules.md (Community repo): rules in .context/config.yaml
@@ -1568,15 +1638,16 @@ describe("[regression] MCP server e2e — structure rules", () => {
       structure: { enforce: true, closed: true },
       folders: {
         "/": {},
-        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr", files: { index: {} } },
+        // Not `index`: where names fold case (macOS, Windows) that file is the folder's generated INDEX.md.
+        decisions: { types: ["document"], file_name: "adr-{n}-{slug}", template: "adr", files: { charter: {} } },
       },
       templates: { adr: { body: "## Context\n## Decision\n", required_sections: ["Decision"] } },
     });
-    await callJson(client, "context_create", { id: "nodes/decisions/index", title: "Index", content: "## Decision\nx\n" });
-    const { text, isError } = await callText(client, "delete_document", { path: "nodes/decisions/index" });
+    await callJson(client, "context_create", { id: "nodes/decisions/charter", title: "Charter", content: "## Decision\nx\n" });
+    const { text, isError } = await callText(client, "delete_document", { path: "nodes/decisions/charter" });
     expect(isError).toBe(true);
     expect(text).toMatch(/delete the folder/);
-    await access(join(vault, "nodes", "decisions", "index.md"));
+    await access(join(vault, "nodes", "decisions", "charter.md"));
   });
 
   it("the deprecated create_document scaffolds a new folder like context_create", async () => {

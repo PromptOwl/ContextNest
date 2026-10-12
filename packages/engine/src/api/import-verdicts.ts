@@ -26,6 +26,7 @@ import {
   type Violation,
 } from "../structure.js";
 import { sealedHeadView, sealedReaders, structurePublishViolations, type ReplayBudget } from "../structure-store.js";
+import type { ArtifactReader } from "../reconstruct.js";
 import { importVerdict, type TombstoneIndex } from "../tombstones.js";
 import type { ContextNode, DocumentHistory } from "../types.js";
 import { readIfExists, type OperationContext } from "./context.js";
@@ -92,7 +93,7 @@ export async function importRefusals(
   // Over budget, some verdict was cut short: none of this call is trusted.
   if (budget.spent) {
     for (const f of plan) {
-      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls, or run it again to continue`);
+      refused.set(f.raw, `${f.raw}: this import replays more version history than one call allows — split it into smaller calls`);
     }
   }
   return refused;
@@ -110,7 +111,9 @@ export const DEFAULT_IMPORT_REPLAY_CHARS = 512 * 2 ** 20;
  * request cannot buy unbounded work from histories planted earlier.
  */
 export function importReplayBudget(ctx: OperationContext): ReplayBudget {
-  return { left: ctx.limits?.importReplayChars ?? DEFAULT_IMPORT_REPLAY_CHARS };
+  const limit = ctx.limits?.importReplayChars;
+  // `NaN` (an unparsed host setting) compares false to everything: never unlimited.
+  return { left: typeof limit === "number" && !Number.isNaN(limit) ? limit : DEFAULT_IMPORT_REPLAY_CHARS };
 }
 
 /**
@@ -145,6 +148,17 @@ export function historyMember(relPath: string): string | null {
  * is still a document — checked as type document with its raw text.
  */
 export function importedDoc(relPath: string, content: string): StructureDoc | null {
+  const id = importedDocId(relPath);
+  if (id === null) return null;
+  try {
+    return structureView(id, parseDocument(`${id}.md`, content, id));
+  } catch {
+    return { id, body: content };
+  }
+}
+
+/** The id discovery will read an imported file as, or null when it is no document. */
+function importedDocId(relPath: string): string | null {
   const norm = relPath.replace(/\\/g, "/");
   const last = norm.split("/").pop() ?? norm;
   // What discovery will read as a node: a lowercase `.md`, not history, not a
@@ -154,12 +168,7 @@ export function importedDoc(relPath: string, content: string): StructureDoc | nu
   if (isVersionArtifactPath(norm) || !/\.md$/i.test(last) || last.startsWith(".")) return null;
   if (NON_DOCUMENT_BASENAMES.has(last)) return null;
   if (norm.split("/").includes("_suggestions")) return null;
-  const id = norm.slice(0, -".md".length);
-  try {
-    return structureView(id, parseDocument(`${id}.md`, content, id));
-  } catch {
-    return { id, body: content };
-  }
+  return norm.slice(0, -".md".length);
 }
 
 /** Where a document's history and staged edits live: `<dir>/<store>/<doc>/…`. */
@@ -173,6 +182,24 @@ const HISTORY_LIMIT = { maxBytes: 16 * 2 ** 20 };
 
 /** What the vault root's .versions/ holds besides documents' folders. */
 const ROOT_LEDGERS = new Set(["context_history.yaml", "context_latest.yaml", "chain_events.yaml"]);
+
+/** Histories one import call judges at once (see importRefusals). */
+const SEALED_READS_AT_ONCE = 4;
+
+/**
+ * Whether an imported path is the vault's chain-event log, however it is
+ * spelled — the import planner folds `.Versions/`, `./`, `//` and a trailing
+ * dot onto it, so it is judged (merged, never written) as the log.
+ */
+export function isChainEventLog(path: string): boolean {
+  return (
+    String(path)
+      .split(/[\\/]+/)
+      .filter((seg) => seg !== "" && seg !== ".")
+      .map(comparableSegment)
+      .join("/") === ".versions/chain_events.yaml"
+  );
+}
 
 /** The index of the per-document store segment in a path, or -1. */
 function storeIndex(segs: string[]): number {
@@ -221,9 +248,11 @@ async function importVerdicts(
     sets.set(v.owner, set);
   }
   const setVerdicts = new Map<string, { refusal: string | null; head: StructureDoc | null }>();
+  // A few histories at a time per call: each read may be sized to all the
+  // budget has left, so a wide batch must not hold many of them at once.
   await mapInBatches([...sets], async ([owner, set]) => {
     setVerdicts.set(owner, await historySetVerdict(ctx, rules, owner, set, budget));
-  });
+  }, SEALED_READS_AT_ONCE);
 
   // Each document is judged as the publish that follows will judge it: against
   // the head its history will have after this call — the one this call brings,
@@ -234,12 +263,15 @@ async function importVerdicts(
     if (!doc) return;
     const brought = setVerdicts.get(doc.id);
     let violations: Violation[];
-    if (brought) violations = brought.head ? checkUpdate(rules, brought.head, doc) : checkDocument(rules, doc);
+    const full = checkDocument(rules, doc);
+    // A document that passes the full check needs no head to excuse it.
+    if (full.length === 0) violations = full;
+    else if (brought) violations = brought.head ? checkUpdate(rules, brought.head, doc) : full;
     else if (overwrite && (await readIfExists(ctx, doc.id))) {
       violations = (await structurePublishViolations(ctx.storage, rules, doc, undefined, budget)).violations;
-    } else violations = checkDocument(rules, doc);
+    } else violations = full;
     docVerdicts.set(doc.id, violations);
-  });
+  }, SEALED_READS_AT_ONCE);
   plan.forEach((f, i) => {
     const doc = docs[i];
     let violations: Violation[];
@@ -270,6 +302,24 @@ async function importVerdicts(
 }
 
 /** Every per-file refusal of an import that needs no structure rules. */
+/**
+ * A document lands only if it reads: frontmatter that parses, sealed bytes
+ * that open with this vault's key. A trusted restore (`structure: "skip"`)
+ * keeps what it brings; every crawl skips such a file and verify names it.
+ */
+async function assertReadable(ctx: OperationContext, f: { raw: string; path: string; content: string }): Promise<void> {
+  const id = importedDocId(f.path);
+  if (id === null || ctx.structure === "skip") return;
+  try {
+    await ctx.storage.readDocumentText(id, f.content);
+  } catch (err) {
+    throw new ContextNestError(
+      `${f.raw}: does not read as a document — ${err instanceof Error ? err.message : String(err)}`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
 async function assertImportable(
   ctx: OperationContext,
   f: { raw: string; path: string; content: string },
@@ -297,12 +347,18 @@ async function assertImportable(
   if (k !== -1 && k >= segs.length - 2 && !(k === 0 && ROOT_LEDGERS.has(segs[k + 1]))) {
     throw new ContextNestError(`${f.raw}: .versions/ holds a folder per document, not files`, "VALIDATION_FAILED");
   }
+  // A folder in a root ledger's place would keep that ledger from ever being
+  // written — every checkpoint, or every forget, failing after it.
+  if (k === 0 && segs.length > 2 && ROOT_LEDGERS.has(comparableSegment(segs[1]))) {
+    throw new ContextNestError(`${f.raw}: .versions/${segs[1]} is the nest's own ledger, not a folder`, "VALIDATION_FAILED");
+  }
   // No document is named with a leading dot: such an entry is machinery — the
   // vault's own write lock (`.versions/.lock`) among it.
   if (k !== -1 && comparableSegment(segs[k + 1] ?? "").startsWith(".")) {
     throw new ContextNestError(`${f.raw}: .versions/${segs[k + 1]} is the vault's own, not a document's history`, "VALIDATION_FAILED");
   }
   await assertNoCaseTwin(ctx, f);
+  await assertReadable(ctx, f);
   await assertSidecarKept(ctx, f, budget);
   if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
     throw new ContextNestError(
@@ -462,42 +518,56 @@ async function historySetVerdict(
   }
   if (text !== undefined && !history) return refuse(`${owner}'s history.yaml is not a valid history`);
   const disk = sealedReaders(ctx.storage, owner);
-  const keyframe = (n: number) => set.get(`v${n}.md`) ?? disk.keyframe(n);
-  const diff = (n: number) => set.get(`v${n}.diff`) ?? disk.diff(n);
+  // The room a read is given passes through to the disk: the call's own
+  // files are already in memory, and charged as they are replayed.
+  const keyframe: ArtifactReader = (n, max) => set.get(`v${n}.md`) ?? disk.keyframe(n, max);
+  const diff: ArtifactReader = (n, max) => set.get(`v${n}.diff`) ?? disk.diff(n, max);
   // The head the disk holds now, if it verifies: grandfathering already trusts
   // it, so a head this call brings is judged as an update over it — only for
-  // what it newly breaks, as any other write to this document is.
-  const here = onDisk
-    ? await sealedHeadView(owner, onDisk, disk.keyframe, disk.diff, budget)
-    : null;
+  // what it newly breaks, as any other write to this document is. Rebuilt
+  // only when a verdict needs it: a head that passes the full check needs no
+  // baseline, so a conforming restore never replays the disk's history.
+  let hereView: ReturnType<typeof sealedHeadView> | undefined;
+  const here = () => (hereView ??= onDisk ? sealedHeadView(owner, onDisk, disk.keyframe, disk.diff, budget) : Promise.resolve(null));
   // A head that does not parse is no baseline (as at publish): judged in full.
-  const judge = (head: StructureDoc) => (here?.node ? checkUpdate(rules, here.doc, head) : checkDocument(rules, head));
+  const judge = async (head: StructureDoc) => {
+    const full = checkDocument(rules, head);
+    if (full.length === 0) return full;
+    const base = await here();
+    return base?.node ? checkUpdate(rules, base.doc, head) : full;
+  };
   // The history.yaml this call brings is written last and may not land (a file
   // of its set fails): the history already here, over these files, is a head
   // the vault may then hold too. A file counts there only if its bytes are the
   // ones that history pinned — any other fails its hash — so this is the one
   // head it can ever rebuild. Refused only for what it changes: a head the
   // disk already holds grants nothing new.
-  if (text !== undefined && onDisk) {
+  // The same history as the one on disk: the head kept and the head brought
+  // are one head, rebuilt once below. A file of this call in the range that
+  // rebuild replays (from the head's last keyframe) that does not match its
+  // pinned hash fails it, and the set with it; one outside that range is not
+  // judged here — verify reports it (content_hash_mismatch).
+  if (text !== undefined && onDisk && !isDeepStrictEqual(history!.versions, onDisk.versions)) {
     const pinnedHash = new Map(onDisk.versions.map((e) => [e.version, e.content_hash]));
     const counts = (name: string, n: number) => {
       const m = set.get(name);
       return m !== undefined && computeContentHash(m) === pinnedHash.get(n);
     };
     const pinned = (name: string, n: number, read: () => string | null | Promise<string | null>) => (counts(name, n) ? set.get(name)! : read());
-    // With no file of this call pinned there, the kept head is the head here.
+    // With no file of this call pinned there, the kept head is the head here:
+    // nothing new to judge.
     const anyPinned = onDisk.versions.some((e) => counts(`v${e.version}.md`, e.version) || counts(`v${e.version}.diff`, e.version));
     const kept = anyPinned
       ? await sealedHeadView(
           owner,
           onDisk,
-          (n) => pinned(`v${n}.md`, n, () => disk.keyframe(n)),
-          (n) => pinned(`v${n}.diff`, n, () => disk.diff(n)),
+          (n, max) => pinned(`v${n}.md`, n, () => disk.keyframe(n, max)),
+          (n, max) => pinned(`v${n}.diff`, n, () => disk.diff(n, max)),
           budget,
         )
-      : here;
-    if (kept && kept.raw !== here?.raw) {
-      const violations = judge(kept.doc);
+      : null;
+    if (kept && checkDocument(rules, kept.doc).length > 0 && kept.raw !== (await here())?.raw) {
+      const violations = await judge(kept.doc);
       if (violations.length > 0) {
         return refuse(
           `${owner}'s history, kept with these files, ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`,
@@ -512,10 +582,8 @@ async function historySetVerdict(
   // The same history as the one here, with no version file of this call in it,
   // rebuilds to the same head; a file this call brings is always replayed.
   const brings = [...set.keys()].some((n) => /^v\d+\.(md|diff)$/i.test(n));
-  const view =
-    here && !brings && isDeepStrictEqual(history.versions, onDisk?.versions)
-      ? here
-      : await sealedHeadView(owner, history, keyframe, diff, budget);
+  const same = !brings && isDeepStrictEqual(history.versions, onDisk?.versions);
+  const view = same ? await here() : await sealedHeadView(owner, history, keyframe, diff, budget);
   // Refused, not waved through: the bytes judged here are pinned to their
   // content hashes, so if a file then fails to land the head on disk no
   // longer verifies and is judged in full — but only if the head judged here
@@ -526,7 +594,7 @@ async function historySetVerdict(
     );
   }
   const head = view.doc;
-  const violations = judge(head);
+  const violations = await judge(head);
   return violations.length === 0
     ? { refusal: null, head: view.node ? head : null }
     : refuse(`${owner}'s history ends in a version the structure rules refuse (${violations.map((x) => x.message).join(" ")})`);

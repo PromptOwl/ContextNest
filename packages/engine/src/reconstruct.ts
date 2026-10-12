@@ -12,11 +12,30 @@
 
 import { applyPatch, parsePatch, type StructuredPatch } from "diff";
 import type { DocumentHistory } from "./types.js";
-import { ContextNestError, ForgottenVersionError } from "./errors.js";
+import { ContextNestError, CorruptHistoryError, ForgottenVersionError } from "./errors.js";
 
 /** Artifact content for a version, or null when there is none to read. */
+/**
+ * Bytes a version file may hold per character of room: UTF-8 spends up to 3
+ * bytes on a character (CJK text), and an encrypted artifact's armour about
+ * a third more (measured: 4.06 for CJK) — so text of any script is read up
+ * to its character allowance.
+ */
+export const BYTES_PER_CHAR = 5;
+
+/** Characters hashed or replayed between yields to the event loop. */
+export const YIELD_EVERY = 2 ** 20;
+
+/**
+ * Most characters a replay reads for one history (its keyframes and diffs).
+ * Past it the history is not trusted — and never held whole.
+ */
+export const MAX_REPLAY_READ = 64 * 2 ** 20;
+
 export type ArtifactReader = (
   version: number,
+  /** Most bytes the file may hold to be read at all — larger is refused unread. */
+  maxBytes?: number,
 ) => string | null | Promise<string | null>;
 
 /**
@@ -104,9 +123,6 @@ export async function reconstructFromHistory(
   return content!;
 }
 
-/** Characters hashed or replayed between yields to the event loop. */
-const YIELD_EVERY = 2 ** 20;
-
 /**
  * A work counter that lets the event loop in every {@link YIELD_EVERY}
  * characters: each diff walks the whole text, so a long chain over a large
@@ -124,14 +140,19 @@ export function yielder(): (chars: number) => Promise<void> {
 }
 
 /**
- * `applyPatch`, its position search bounded. A hunk that does not fit where its
- * header says is looked for line by line across the whole text — lines × hunk
- * length, in one synchronous call — so a crafted patch could hold the process
- * for as long as it likes. The patch is parsed once; its cap is the work its
- * own hunks do where they fit (one weighted comparison per line kept or
- * removed — junk ahead of the hunks buys nothing), twice over plus a little
- * slack for a nearby offset. Past it the patch does not apply (`false`).
- * `compared` is the work done, in the same units as characters replayed.
+ * `applyPatch`, each hunk applied only at the line its header names, in
+ * order, inside the text. Off there, the library looks line by line across
+ * the whole text — lines × hunk length in one synchronous call, added lines
+ * walked at every position without a comparison — and before applying a hunk
+ * it copies every line up to the start its header states, however far past
+ * the end that is: a crafted patch could hold the process, or its memory, for
+ * as long as it likes. The engine's own patches always fit where they say: a
+ * replayed diff was made against exactly the text it follows (createVersion
+ * falls back to a keyframe otherwise). A suggestion or held edit goes through
+ * `applyStagedEdit` (suggestions.ts), which also checks the body it yields —
+ * one that no longer lands where it was made is reported stale. Anything
+ * else does not apply (`false`). `compared` is the work done, in the same
+ * units as characters replayed.
  */
 export function applyPatchBounded(content: string, patch: string): { result: string | false; compared: number } {
   let parsed: StructuredPatch[];
@@ -141,37 +162,40 @@ export function applyPatchBounded(content: string, patch: string): { result: str
     return { result: false, compared: 0 };
   }
   if (parsed.length !== 1) return { result: false, compared: 0 };
-  let own = 0;
+  // Each hunk's stated lines inside the text (as the library splits it: on
+  // "\n"), and after the hunk before it.
+  let lines = 1;
+  for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) lines++;
+  let from = 0;
   for (const hunk of parsed[0].hunks) {
-    for (const line of hunk.lines) if (line[0] === " " || line[0] === "-") own += COMPARE_WEIGHT + line.length;
+    const start = hunk.oldStart - 1;
+    if (!(start >= from && start + hunk.oldLines <= lines)) return { result: false, compared: 0 };
+    from = start + hunk.oldLines;
   }
-  const cap = 2 * own + PATCH_SEARCH_SLACK;
   let compared = 0;
   try {
     const result = applyPatch(content, parsed[0], {
       compareLine: (_line, line, _op, want) => {
         compared += COMPARE_WEIGHT + Math.min(line?.length ?? 0, want.length);
-        if (compared > cap) throw PATCH_TOO_FAR;
-        return line === want;
+        // The first position tried is the stated one: a miss there is a miss.
+        if (line !== want) throw DOES_NOT_FIT;
+        return true;
       },
     });
     return { result, compared };
   } catch (err) {
-    if (err === PATCH_TOO_FAR) return { result: false, compared };
+    if (err === DOES_NOT_FIT) return { result: false, compared };
     throw err;
   }
 }
 
-const PATCH_TOO_FAR = new Error("the patch does not fit where it says");
+const DOES_NOT_FIT = new Error("the patch does not fit where it says");
 
 /**
- * What one line comparison costs, in characters replayed: trying a candidate
- * position is far dearer than walking one character of text.
+ * What one line comparison costs, in characters replayed: a comparison is
+ * dearer than walking one character of text.
  */
 const COMPARE_WEIGHT = 32;
-
-/** Comparison work a patch may spend beyond twice its own, for a nearby offset. */
-const PATCH_SEARCH_SLACK = 2 ** 20;
 
 /** A settled read's value, or its error rethrown. */
 function value<T>(r: PromiseSettledResult<T>): T {
@@ -226,4 +250,75 @@ async function applyWindow(
   }
 
   return content;
+}
+
+/**
+ * Every version a history rebuilds to, in one forward pass: each artifact read
+ * once — sized to what `budget` has left — and each diff applied once to the
+ * running text, every character read and every comparison charged, the event
+ * loop let in every so often. A version whose base does not rebuild (a missing
+ * artifact, a tombstone, a patch that does not fit) is skipped until the next
+ * keyframe. False once the budget is spent: what was visited is then partial.
+ */
+export async function replayEveryVersion(
+  versions: DocumentHistory["versions"],
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
+  budget: { left: number; spent?: boolean } | undefined,
+  visit: (text: string) => void,
+): Promise<boolean> {
+  const spend = (chars: number): boolean => {
+    if (!budget) return true;
+    budget.left -= chars;
+    if (budget.left < 0) budget.spent = true;
+    return !budget.spent;
+  };
+  let text: string | null = null;
+  const step = yielder();
+  let read = 0;
+  for (const e of versions) {
+    if (budget?.spent) return false;
+    if (e.tombstone) {
+      text = null;
+      continue;
+    }
+    // One history never reads past MAX_REPLAY_READ, whatever the budget.
+    const left = MAX_REPLAY_READ - read;
+    const room = Math.min(left, budget ? Math.max(0, budget.left) : Infinity);
+    let artifact: string | null;
+    try {
+      const maxBytes = BYTES_PER_CHAR * room;
+      artifact = e.keyframe
+        ? await readKeyframe(e.version, maxBytes)
+        : ((await readDiff(e.version, maxBytes)) ?? e.diff ?? null);
+    } catch (err) {
+      // Larger than the room left spends it, so the call is asked to split;
+      // otherwise unreadable — a version not known here.
+      if (err instanceof CorruptHistoryError && err.ioError === "too-large") {
+        if (budget && room < left) spend(room + 1);
+        return false;
+      }
+      artifact = null;
+    }
+    if (artifact === null) {
+      text = null;
+      continue;
+    }
+    read += artifact.length;
+    if (read > MAX_REPLAY_READ) return false;
+    if (!spend(artifact.length)) return false;
+    let cost = artifact.length;
+    if (e.keyframe) {
+      text = artifact;
+    } else if (text !== null) {
+      if (!spend(text.length)) return false;
+      const { result, compared } = applyPatchBounded(text, artifact);
+      if (!spend(compared)) return false;
+      cost += text.length + compared;
+      text = typeof result === "string" ? result : null;
+    }
+    if (text !== null) visit(text);
+    await step(cost);
+  }
+  return true;
 }

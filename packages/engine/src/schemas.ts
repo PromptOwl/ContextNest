@@ -4,6 +4,7 @@
  */
 
 import { z } from "zod";
+import { viewMetaSchema } from "./view-schema.js";
 
 export const NODE_TYPES = [
   "document",
@@ -24,6 +25,15 @@ export const NODE_TYPES = [
   // A PDF document: the body is the text extracted from it, and the required
   // `pdf:` block binds the binary sidecar beside the .md by SHA-256 (§1.11).
   "pdf",
+  // A unit of work on a project board. Body is markdown; board fields
+  // (assignee, due, priority, parent) live in `metadata`. No type-specific
+  // validation rules — it behaves exactly like `document` here, and servers
+  // decide what governance (if any) applies to it.
+  "task",
+  // A governed composition of other nodes. The required `view:` block is a
+  // declarative layout — md/list/summary/html/... blocks naming what to show
+  // and from where (§1.12); the content itself is resolved at read time.
+  "view",
 ] as const;
 
 export const STATUSES = [
@@ -314,6 +324,7 @@ export const frontmatterSchema = z
     source: sourceMetaSchema.optional(),
     skill: skillMetaSchema.optional(),
     pdf: pdfMetaSchema.optional(),
+    view: viewMetaSchema.optional(),
     zone: z
       .string()
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
@@ -368,6 +379,23 @@ export const frontmatterSchema = z
         code: z.ZodIssueCode.custom,
         message: "PDF block must not be present when type is not 'pdf' (§13 rule 29)",
         path: ["pdf"],
+      });
+    }
+    // Rule 30: view block MUST be present when type is "view"
+    if (data.type === "view" && !data.view) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "View block is required when type is 'view' (§13 rule 30)",
+        path: ["view"],
+      });
+    }
+    // Rule 31: view block MUST NOT be present on non-view types. An untyped
+    // node defaults to `document`, so it may not carry one either.
+    if (data.type !== "view" && data.view) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "View block must not be present when type is not 'view' (§13 rule 31)",
+        path: ["view"],
       });
     }
   });

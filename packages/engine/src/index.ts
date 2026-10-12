@@ -16,6 +16,10 @@ export type {
   HashChainEventType,
   SourceMeta,
   PdfMeta,
+  ViewMeta,
+  ViewBlock,
+  ViewRenderMode,
+  ViewAudience,
   SkillInput,
   SkillMeta,
   Frontmatter,
@@ -77,6 +81,7 @@ export {
   VersionArtifactExistsError,
   ForgottenDocumentError,
   ForgottenVersionError,
+  FrontmatterShapeError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
@@ -96,6 +101,7 @@ export {
   quarantineSuggestion,
   listSuggestions,
   readSuggestion,
+  applyStagedEdit,
 } from "./suggestions.js";
 export type {
   StageSuggestionInput,
@@ -543,6 +549,7 @@ export {
   assertStructurePublish,
   structurePublishViolations,
   sealedHead,
+  structureReport,
   isEnforced,
 } from "./structure-store.js";
 
@@ -558,6 +565,29 @@ export {
 } from "./importers/pdf.js";
 export type { PdfExtraction } from "./importers/pdf.js";
 export { readPdfBinary, readPdfMeta, pdfSidecarPath } from "./pdf-nodes.js";
+
+// View nodes (§1.12)
+export {
+  viewMetaSchema,
+  isVaultRef,
+  VIEW_BLOCK_KINDS,
+  VIEW_RENDER_MODES,
+  VIEW_AUDIENCES,
+  VIEW_LAYOUTS,
+  VIEW_LIST_FIELDS,
+} from "./view-schema.js";
+export { resolveView, viewFingerprint, DEFAULT_VIEW_LIST_LIMIT } from "./view-nodes.js";
+export type {
+  ResolveViewOptions,
+  ResolvedView,
+  ResolvedViewBlock,
+  ResolvedMdBlock,
+  ResolvedListBlock,
+  ResolvedListItem,
+  ResolvedCalloutBlock,
+  ServerResolvedBlock,
+  ViewBlockUnavailableReason,
+} from "./view-nodes.js";
 export type { ReadPdfBinaryOptions } from "./pdf-nodes.js";
 
 // ─── Importers ───────────────────────────────────────────────────────────────

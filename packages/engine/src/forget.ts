@@ -28,6 +28,7 @@
  * §6.3.5 retention keys): see CONTEXT_NEST_SPEC.md §6.3 "Not yet implemented".
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type {
   ClientMetadata,
   ContextNode,
@@ -40,9 +41,12 @@ import type {
 import type { NestStorage } from "./storage.js";
 import { assertErasableDocumentId, assertNotMachineryPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
+import { replayEveryVersion } from "./reconstruct.js";
 import { CheckpointManager } from "./checkpoint.js";
+// Type only: structure-store imports this module.
+import type { ReplayBudget } from "./structure-store.js";
 import { ChainEventLog } from "./chain-log.js";
-import { FORGET_REASON_CODES } from "./schemas.js";
+import { FORGET_REASON_CODES, hashChainEventSchema } from "./schemas.js";
 import {
   getChecksumContent,
   isForgotten,
@@ -57,6 +61,8 @@ import {
   carriesForgottenBody,
   forgettableBodyHash,
   isPathForgotten,
+  holdsErasedContent,
+  isoDate,
   tombstoneFromEvent,
   type TombstoneIndex,
   type TombstoneRecord,
@@ -428,18 +434,29 @@ export async function assertNotForgotten(
 
 /**
  * Honor forgets that arrived with an import (§6.3.4 "exports carry
- * tombstones"): record each incoming event this vault has not seen, and
- * re-apply a forget (never a delete) to any local copy the vault already holds — a pre-forget copy
- * here MUST NOT outlive a forget made elsewhere. Returns the ids brought in line.
+ * tombstones"): a pre-forget copy here MUST NOT outlive a forget made
+ * elsewhere, so a forget (never a delete) is re-applied to a local document
+ * holding content it erased. A record naming a document here that holds none
+ * of it is refused — it is no forget of this document, and logged it would
+ * retire a live document's path — so a caller who may import cannot erase
+ * what it may not forget. Every record kept is logged once, as the fields a
+ * forget record carries (never the incoming event verbatim: an alias chain
+ * would expand), in one write, before any forget is applied. Returns the ids
+ * brought in line, and the refusals.
  */
 export async function applyImportedTombstones(
   storage: NestStorage,
   incomingEvents: readonly unknown[],
   index: TombstoneIndex,
-): Promise<string[]> {
-  const log = new ChainEventLog(storage);
-  const known = new Set((await log.readAll()).map((e) => e.event_id));
+  /** The import's replay budget: rebuilding a copy's versions is charged to it. */
+  budget?: ReplayBudget,
+): Promise<{ applied: string[]; refused: Array<{ id: string; reason: string }> }> {
+  const sealed = new Map<string, Set<string> | null>();
+  const known = new Map<string, unknown>((await new ChainEventLog(storage).readAll()).map((e) => [e.event_id, e]));
   const applied: string[] = [];
+  const refused: Array<{ id: string; reason: string }> = [];
+  const toLog: HashChainEvent[] = [];
+  const toApply: Array<{ rec: TombstoneRecord; node: ContextNode; history: DocumentHistory | null }> = [];
   for (const raw of incomingEvents) {
     const rec = tombstoneFromEvent(raw);
     if (!rec) continue;
@@ -451,26 +468,68 @@ export async function applyImportedTombstones(
     } catch {
       continue;
     }
-    if (!known.has(rec.event_id)) {
-      try {
-        await log.append(raw as HashChainEvent);
-      } catch {
-        // Not a schema-valid event: honor it for this import, but do not
-        // write a malformed record into this vault's audit log.
+    // A record reusing the id of a logged event must be that event: the log
+    // is deduplicated by id, so a different record under a known id would be
+    // applied with no audit record of its own.
+    const logged = known.get(rec.event_id);
+    if (logged !== undefined && !isDeepStrictEqual(tombstoneFromEvent(logged), rec)) {
+      refused.push({
+        id: rec.document_id,
+        reason: `the forget record ${rec.event_id} reuses the id of a logged event with a different record — not applied`,
+      });
+      continue;
+    }
+    // A delete record is audit-only: an import never deletes a local doc.
+    let node: ContextNode | null = null;
+    if (rec.mode !== "delete") node = await storage.readDocument(rec.document_id).catch(() => null);
+    const history = node ? await storage.readHistory(rec.document_id).catch(() => null) : null;
+    if (node && !isForgotten(node) && !holdsErasedContent(rec, node.rawContent, history)) {
+      const bodies = rec.body_hashes.length > 0 ? await sealedBodies(storage, node, history, sealed, budget) : new Set<string>();
+      if (bodies === null) {
+        refused.push({
+          id: rec.document_id,
+          reason: `the forget of ${rec.document_id}: this import replays more version history than one call allows — split it into smaller calls`,
+        });
+        continue;
       }
-      known.add(rec.event_id);
+      if (!rec.body_hashes.some((h) => bodies.has(h))) {
+        refused.push({
+          id: rec.document_id,
+          reason: `the forget of ${rec.document_id} names a document here that holds none of the content it erased — not applied`,
+        });
+        continue;
+      }
+    }
+    // The engine forgets whole documents (§6.3): a record scoped to versions
+    // is recorded (what it erased stays refused) but never applied to a live
+    // document here, and the import says so.
+    // A forget that cannot be logged is never honored: it would erase with no
+    // audit record and no anti-resurrection hashes (§6.3).
+    const event = known.has(rec.event_id) ? null : loggedForgetEvent(rec, raw);
+    if (!known.has(rec.event_id) && !event) {
+      refused.push({
+        id: rec.document_id,
+        reason: `the forget record ${rec.event_id} is not a valid chain event — not applied`,
+      });
+      continue;
+    }
+    const partial = rec.scope === "versions" && node !== null && !isForgotten(node);
+    if (partial) {
+      refused.push({
+        id: rec.document_id,
+        reason: `the forget record ${rec.event_id} is scoped to versions — this vault forgets whole documents, so it is recorded, not applied`,
+      });
+    }
+    if (event) {
+      toLog.push(event);
+      known.set(rec.event_id, event);
     }
     addTombstone(index, rec);
-    // A delete record is audit-only: an import never deletes a local doc.
-    if (rec.mode === "delete") continue;
+    if (node && !partial) toApply.push({ rec, node, history });
+  }
+  await storage.appendChainEvents(toLog);
 
-    let node: ContextNode;
-    try {
-      node = await storage.readDocument(rec.document_id);
-    } catch {
-      continue; // Nothing held locally under that path.
-    }
-    const history = await storage.readHistory(rec.document_id).catch(() => null);
+  for (const { rec, node, history } of toApply) {
     try {
       if (isForgotten(node)) {
         // The stub is here already; make sure nothing erased lingers.
@@ -478,13 +537,12 @@ export async function applyImportedTombstones(
           if (e.tombstone) await storage.removeVersionArtifacts(rec.document_id, e.version);
         }
         continue;
-      } else {
-        await forgetNode(storage, node, history, {
-          reasonCode: rec.reason_code,
-          forgottenBy: rec.forgotten_by,
-          replay: rec,
-        });
       }
+      await forgetNode(storage, node, history, {
+        reasonCode: rec.reason_code,
+        forgottenBy: rec.forgotten_by,
+        replay: rec,
+      });
       applied.push(rec.document_id);
     } catch (err) {
       throw new ContextNestError(
@@ -498,5 +556,70 @@ export async function applyImportedTombstones(
   if (applied.length > 0) {
     await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","));
   }
-  return applied;
+  return { applied, refused };
+}
+
+/**
+ * Body hashes of a document's sealed versions — an erased body may sit in
+ * one only, the live body edited since (§6.3.4: the copy still holds it).
+ * Rebuilt once per document per import, in one forward pass charged to the
+ * import's replay budget; null once that is spent.
+ */
+async function sealedBodies(
+  storage: NestStorage,
+  node: ContextNode,
+  history: DocumentHistory | null,
+  cache: Map<string, Set<string> | null>,
+  budget: ReplayBudget | undefined,
+): Promise<Set<string> | null> {
+  // Keyed by the file, not the spelling: where names fold case, every
+  // spelling of the id reads this one document and history (#117).
+  const key = await storage.documentFileKey(node.id);
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  const bodies = new Set<string>();
+  const complete = await replayEveryVersion(
+    history?.versions ?? [],
+    (n, maxBytes) => storage.readKeyframe(node.id, n, { maxBytes }),
+    (n, maxBytes) => storage.readDiff(node.id, n, { maxBytes }),
+    budget,
+    (text) => {
+      const h = forgettableBodyHash(text);
+      if (h) bodies.add(h);
+    },
+  );
+  const result = complete ? bodies : null;
+  cache.set(key, result);
+  return result;
+}
+
+/**
+ * The event logged for an imported forget: only what a forget record carries,
+ * rebuilt from it. Null when that is not a valid event.
+ */
+function loggedForgetEvent(rec: TombstoneRecord, raw: unknown): HashChainEvent | null {
+  const e = raw as Record<string, unknown>;
+  const event = {
+    event_id: rec.event_id,
+    event_type: FORGET_EVENT_TYPE,
+    timestamp: isoDate(e.timestamp) ?? e.timestamp,
+    actor: e.actor,
+    document_id: rec.document_id,
+    ...(typeof e.resulting_hash === "string" ? { resulting_hash: e.resulting_hash } : {}),
+    action_metadata: {
+      scope: rec.scope,
+      mode: rec.mode,
+      versions: rec.versions,
+      reason_code: rec.reason_code,
+      ...(rec.requested_by !== undefined ? { requested_by: rec.requested_by } : {}),
+      ...(rec.forgotten_at ? { forgotten_at: rec.forgotten_at } : {}),
+      ...(rec.stub_version !== undefined ? { stub_version: rec.stub_version } : {}),
+      ...(rec.checkpoint !== undefined ? { checkpoint: rec.checkpoint } : {}),
+      content_hashes: rec.content_hashes,
+      body_hashes: rec.body_hashes,
+      pdf_hashes: rec.pdf_hashes,
+    },
+  };
+  const parsed = hashChainEventSchema.safeParse(event);
+  return parsed.success ? (parsed.data as HashChainEvent) : null;
 }

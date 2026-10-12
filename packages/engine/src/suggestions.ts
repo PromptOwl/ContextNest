@@ -19,6 +19,7 @@
  */
 
 import { createPatch } from "diff";
+import { applyPatchBounded } from "./reconstruct.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { suggestionMetaSchema } from "./schemas.js";
@@ -171,6 +172,19 @@ export async function readSuggestion(
   const patch = await storage.readSuggestionPatch(documentId, suggestionId);
   if (patch === null) return null;
   return { meta: metaResult.data as SuggestionMeta, patch };
+}
+
+/**
+ * A staged edit applied to `head` — only where it was made: its patch applies
+ * where its hunks say and yields exactly the body it proposed (`proposed_hash`).
+ * Null otherwise: the head moved so the edit no longer lands where it was made
+ * (on repetitive text a shifted patch can apply to the wrong line), or the
+ * patch is damaged. Listing, proposal and approval all judge with this.
+ */
+export function applyStagedEdit(head: string, sug: { meta: SuggestionMeta; patch: string }): string | null {
+  const out = applyPatchBounded(head, sug.patch).result;
+  if (typeof out !== "string" || out === "") return null;
+  return computeContentHash(getChecksumContent(out)) === sug.meta.proposed_hash ? out : null;
 }
 
 function generateSuggestionId(detectedAt: string, proposedHash: string): string {

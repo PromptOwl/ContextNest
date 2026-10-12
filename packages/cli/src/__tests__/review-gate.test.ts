@@ -56,7 +56,8 @@ describe("resolveHeldWrite — the held-write prompt", () => {
     expect(await h.run(false)).toBe("kept");
     expect(h.calls).toEqual([]);
     expect(h.lines).toEqual([
-      "Held for review: ctx review approve nodes/x   (turn off: ctx config set review off)",
+      "Held for review: ctx review approve nodes/x   (turn off: ctx config set review off)" +
+        " — not visible to search or agents until approved",
     ]);
   });
 });

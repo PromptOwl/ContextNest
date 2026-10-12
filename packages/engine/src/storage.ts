@@ -16,6 +16,7 @@ import {
   readdir,
   realpath,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
@@ -35,6 +36,7 @@ import { generateContextYaml } from "./index-generator.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
+import { resolveIdCasing } from "./id-casing.js";
 import {
   buildTombstoneIndex,
   carriesForgottenBody,
@@ -61,6 +63,7 @@ import {
   CorruptHistoryError,
   DocumentNotFoundError,
   VersionArtifactExistsError,
+  FrontmatterShapeError,
 } from "./errors.js";
 import {
   packSchema,
@@ -69,6 +72,7 @@ import {
   checkpointHistorySchema,
 } from "./schemas.js";
 import {
+  ForeignVaultKeyError,
   VaultCrypto,
   VaultLockedError,
   WrongVaultKeyError,
@@ -156,9 +160,15 @@ const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
  * Case-folded, with trailing dots and spaces and any `:stream`
  * suffix dropped, because Windows drops them: `.context.` IS `.context` there. Reads keep going through
  * {@link assertSafeDocumentId} alone.
+ *
+ * `existing`: the id names a document already on disk. Each name is held to
+ * what the file system holds (as for an erase), not to the stricter limit
+ * for new names, so a document with a long name is not frozen against edits.
+ * The whole id stays capped at MAX_DOCUMENT_ID_LENGTH either way.
  */
-export function assertWritableDocumentId(raw: string): void {
-  assertFitsFileSystem(raw);
+export function assertWritableDocumentId(raw: string, existing = false): void {
+  if (existing) assertFitsFileSystem(raw, 255, MAX_DOCUMENT_ID_LENGTH, true);
+  else assertFitsFileSystem(raw);
   const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
   assertSafeDocumentId(raw);
   // A backslash is a separator on Windows but a literal file-name character
@@ -194,7 +204,15 @@ export function assertWritableDocumentId(raw: string): void {
  * (history, sidecars, staged edits) calls before its first write.
  */
 export async function assertWritableDocumentPath(root: string, id: string): Promise<void> {
-  assertWritableDocumentId(id);
+  try {
+    assertWritableDocumentId(id);
+  } catch (err) {
+    // Only a name the new-name limits refuse is looked up on disk.
+    if (!(err instanceof ContextNestError && err.code === "INVALID_DOCUMENT_ID")) throw err;
+    assertWritableDocumentId(id, true);
+    const exists = await stat(join(root, `${id}.md`)).then((s) => s.isFile(), () => false);
+    if (!exists) throw err;
+  }
   await assertResolvesOutsideMachinery(root, id);
 }
 
@@ -541,15 +559,27 @@ export interface ReadLimit {
 }
 
 /**
- * Refuse a history file over the caller's limit before reading it: a judge
- * that must not hold more than so much never reads it whole. Over the limit
- * is "cannot be read" (an I/O-class refusal), never "missing".
+ * Read a version-history file (history.yaml, a keyframe, a diff) — only a
+ * regular file, and under a limit not one over it: a judge that must not hold
+ * more than so much never reads it whole. A FIFO or a device could block or
+ * never end, so the file is opened without blocking and judged on the open
+ * handle — nothing can swap in between the check and the read. Not a regular
+ * file, or over the limit, is "cannot be read" (an I/O-class refusal), never
+ * "missing".
  */
-async function assertWithinLimit(path: string, opts: ReadLimit, docId: string): Promise<void> {
-  if (opts.maxBytes === undefined) return;
-  const { size } = await stat(path);
-  if (size > opts.maxBytes) {
-    throw new CorruptHistoryError(docId, `${basename(path)} is ${size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
+async function readHistoryFile(path: string, opts: ReadLimit, docId: string): Promise<string> {
+  const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) {
+      throw new CorruptHistoryError(docId, `${basename(path)} is not a regular file`, "not-a-file");
+    }
+    if (opts.maxBytes !== undefined && st.size > opts.maxBytes) {
+      throw new CorruptHistoryError(docId, `${basename(path)} is ${st.size} bytes, over the ${opts.maxBytes} this read allows`, "too-large");
+    }
+    return await handle.readFile("utf-8");
+  } finally {
+    await handle.close();
   }
 }
 
@@ -905,6 +935,12 @@ export class NestStorage {
       includeSuperseded?: boolean;
       folder?: string;
       recursive?: boolean;
+      /**
+       * A document whose frontmatter does not parse, or (vault unlocked) whose
+       * sealed bytes do not open, is skipped — one bad file used to take every
+       * list, search and checkpoint down — and named here. Verify reports it.
+       */
+      onUnreadable?: (id: string, reason: string) => void;
     } = {},
   ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
@@ -932,8 +968,23 @@ export class NestStorage {
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
       const id = file.replace(/\.md$/, "");
-      const content = await this.readText(filePath, "doc", id);
-      const node = parseDocument(filePath, content, id);
+      let node: ContextNode;
+      try {
+        node = parseDocument(filePath, await this.readText(filePath, "doc", id), id);
+      } catch (err) {
+        // A missing or wrong key fails at unlock (VAULT_LOCKED,
+        // VAULT_KEY_MISMATCH), and a file sealed under a key this vault does
+        // not hold is the vault's condition, not the file's: all still throw —
+        // a vault never lists empty for want of its key.
+        if (err instanceof ForeignVaultKeyError) throw err;
+        const oneFile =
+          err instanceof yaml.YAMLException ||
+          err instanceof FrontmatterShapeError ||
+          (err as { code?: string }).code === "DECRYPTION_FAILED";
+        if (!oneFile) throw err;
+        options.onUnreadable?.(id, err instanceof Error ? err.message : String(err));
+        return null;
+      }
       // Root-level discovery (structured layout) globs *.md at the vault root so
       // a node can live anywhere. But a vault root commonly holds scaffold files
       // (CHANGELOG, CONTRIBUTING, LICENSE, SECURITY, …) that are NOT knowledge
@@ -1012,6 +1063,43 @@ export class NestStorage {
 
     await scan(base, options.recursive === false ? 1 : Infinity);
     return found.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * Read a document from text as this vault would read it from disk — opened
+   * when sealed, then parsed. Throws when it would not read (frontmatter that
+   * does not parse, sealed bytes that do not open with this vault's key).
+   */
+  async readDocumentText(id: string, raw: string): Promise<ContextNode> {
+    return parseDocument(join(this.root, `${id}.md`), await this.openText(raw, "doc", id), id);
+  }
+
+  /**
+   * The id of an existing document as it is spelled on disk (issue #117).
+   *
+   * `readDocument` returns the id it was given. On a case-insensitive
+   * filesystem that may not be the spelling discovery reports (`nodes/report`
+   * reads `nodes/Report.md`), so a caller about to derive paths from the id —
+   * a pdf sidecar, `pdf.file`, version history — resolves it here first.
+   * Unchanged on a case-sensitive filesystem, and for an id with no file.
+   */
+  async resolveDocumentIdCasing(id: string): Promise<string> {
+    return resolveIdCasing(id, (relDir) =>
+      readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root),
+    );
+  }
+
+  /**
+   * One key per document file, whatever spelling reaches it: its device and
+   * inode, from one stat — exact on every file system, case-folding or not.
+   * Where a file system reports no inode (0: FAT, some network shares), the
+   * id as spelled on disk ({@link resolveDocumentIdCasing}, which lists the
+   * folders on its path).
+   */
+  async documentFileKey(id: string): Promise<string> {
+    const st = await stat(join(this.root, `${id}.md`), { bigint: true }).catch(() => null);
+    if (st && st.ino !== 0n) return `inode:${st.dev}:${st.ino}`;
+    return `id:${await this.resolveDocumentIdCasing(id)}`;
   }
 
   /**
@@ -1198,6 +1286,8 @@ export class NestStorage {
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
    *   - unreadable_history when a history.yaml exists but cannot be parsed
+   *   - unreadable_document when a document's frontmatter does not parse, or
+   *     its sealed bytes do not open with the vault's key
    *   - version_unreconstructable when a recorded version no longer rebuilds
    *     from its keyframe+diff chain (see verifyHistoryChain)
    *   - sidecar_drift / sidecar_missing for pdf nodes (see verifyPdfSidecars)
@@ -1253,8 +1343,12 @@ export class NestStorage {
 
     errors.push(...(await this.findUnencryptedFiles()));
 
-    // Integrity check must verify every doc on disk, including retired ones.
-    const liveDocs = await this.discoverDocuments({ includeRetired: true });
+    // Integrity check must verify every doc on disk, including retired ones,
+    // and name any it cannot read.
+    const liveDocs = await this.discoverDocuments({
+      includeRetired: true,
+      onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+    });
     errors.push(...(await this.verifyPdfSidecars(liveDocs)));
     // Forget protocol (§6.3): erased content must stay erased, and every
     // tombstone must be accounted for by a recorded forget.
@@ -1348,7 +1442,15 @@ export class NestStorage {
       }
     }
 
-    for (const doc of docs ?? (await this.discoverDocuments({ includeRetired: true }))) {
+    // Crawling here (no docs given): a document that cannot be read is
+    // reported, never skipped into a pass.
+    const liveDocs =
+      docs ??
+      (await this.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+      }));
+    for (const doc of liveDocs) {
       if (doc.frontmatter.status !== "forgotten") {
         if (index.records.length === 0) continue;
         // A live document back at a path a forget retired,
@@ -1834,7 +1936,12 @@ export class NestStorage {
    */
   async verifyPdfSidecars(docs?: ContextNode[]): Promise<VerificationReport["errors"]> {
     const errors: VerificationReport["errors"] = [];
-    const nodes = docs ?? (await this.discoverDocuments({ includeRetired: true }));
+    const nodes =
+      docs ??
+      (await this.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+      }));
     for (const doc of nodes) {
       const pdf = doc.frontmatter.pdf;
       if (doc.frontmatter.type !== "pdf" || !pdf || typeof pdf.file !== "string") continue;
@@ -1939,7 +2046,18 @@ export class NestStorage {
     try {
       const raw = await this.readText(filePath, "doc", id);
       const fm = parseDocument(filePath, raw, id).frontmatter;
-      if (fm.type === "pdf" && fm.pdf?.file === `${id}.pdf`) sidecar = fm.pdf.file;
+      if (fm.type === "pdf" && fm.pdf?.file) {
+        // Compared against the on-disk spelling: on a case-insensitive
+        // filesystem the caller may have reached `nodes/Report.md` as
+        // `nodes/report` (#117). The caller's spelling still counts, for a
+        // node written before #117 that recorded it — both name this node's
+        // own file. Never a case-folded compare: on a case-sensitive
+        // filesystem that could name another node's binary.
+        const onDisk = await this.resolveDocumentIdCasing(id);
+        if (fm.pdf.file === `${onDisk}.pdf` || fm.pdf.file === `${id}.pdf`) {
+          sidecar = fm.pdf.file;
+        }
+      }
     } catch {
       // Missing or unparseable: the unlink below reports the former, and an
       // unparseable file declares no sidecar.
@@ -2071,12 +2189,13 @@ export class NestStorage {
   async readHistory(docId: string, opts: ReadLimit = {}): Promise<DocumentHistory | null> {
     let content: string;
     try {
-      await assertWithinLimit(this.historyPath(docId), opts, docId);
-      content = await readFile(this.historyPath(docId), "utf-8");
+      content = await readHistoryFile(this.historyPath(docId), opts, docId);
     } catch (err) {
       // Absent is the only benign case. Present-but-unreadable (EACCES, EISDIR,
       // an I/O error) must not read as a fresh document either.
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      // Already ours (over the read limit): one message, not wrapped twice.
+      if (err instanceof CorruptHistoryError) throw err;
       throw new CorruptHistoryError(
         docId,
         err instanceof Error ? err.message : String(err),
@@ -2311,8 +2430,7 @@ export class NestStorage {
     );
     let raw: string;
     try {
-      await assertWithinLimit(keyframePath, opts, docId);
-      raw = await readFile(keyframePath, "utf-8");
+      raw = await readHistoryFile(keyframePath, opts, docId);
     } catch (err) {
       return missingArtifact(err, docId);
     }
@@ -2410,8 +2528,7 @@ export class NestStorage {
     );
     let raw: string;
     try {
-      await assertWithinLimit(diffPath, opts, docId);
-      raw = await readFile(diffPath, "utf-8");
+      raw = await readHistoryFile(diffPath, opts, docId);
     } catch (err) {
       return missingArtifact(err, docId);
     }
@@ -2996,8 +3113,14 @@ export class NestStorage {
    * ensuring the event is schema-valid.
    */
   async appendChainEvent(event: unknown): Promise<void> {
+    await this.appendChainEvents([event]);
+  }
+
+  /** Append events in order: one read and one write of the log, however many. */
+  async appendChainEvents(events: readonly unknown[]): Promise<void> {
+    if (events.length === 0) return;
     const existing = await this.readChainEventLog();
-    existing.push(event);
+    existing.push(...events);
     const dir = join(this.root, ".versions");
     await mkdir(dir, { recursive: true });
     const content =
@@ -3064,21 +3187,34 @@ export class NestStorage {
   async findAllHistories(
     onUnreadable?: (docId: string, reason: string) => void,
   ): Promise<Map<string, DocumentHistory>> {
+    // A folder or link in history.yaml's place is unreadable too, not absent.
+    const notFiles: string[] = [];
     const historyFiles = await globFiles(
       this.root,
       "**/.versions/*/history.yaml",
+      [],
+      false,
+      notFiles,
     );
-
-    // Read in batches, then fold in input order so the map's iteration order
-    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
-    const read = await mapInBatches(historyFiles, async (file) => {
-      // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
+    // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
+    const docIdOf = (file: string): string | null => {
       const parts = file.split("/");
       const versionsIdx = parts.indexOf(".versions");
       if (versionsIdx === -1) return null;
       const docDir = parts.slice(0, versionsIdx).join("/");
       const docName = parts[versionsIdx + 1];
-      const docId = docDir ? `${docDir}/${docName}` : docName;
+      return docDir ? `${docDir}/${docName}` : docName;
+    };
+    for (const file of notFiles) {
+      const docId = docIdOf(file);
+      if (docId) onUnreadable?.(docId, "history.yaml is not a regular file");
+    }
+
+    // Read in batches, then fold in input order so the map's iteration order
+    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
+    const read = await mapInBatches(historyFiles, async (file) => {
+      const docId = docIdOf(file);
+      if (docId === null) return null;
       try {
         const raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
         return { docId, raw, error: null as string | null };

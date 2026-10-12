@@ -8,6 +8,7 @@ import type {
   Checkpoint,
   ClientMetadata,
   ContextNode,
+  DocumentHistory,
   Frontmatter,
   VersionEntry,
 } from "./types.js";
@@ -112,6 +113,7 @@ export async function publishDocument(
   // The history read above, reused below instead of re-read; a seed just
   // appended to it, so then it is read fresh.
   const knownHistory = seeded ? undefined : existingHistory;
+  const knownSealed = await listOnceWithoutHistory(storage, docId, knownHistory);
 
   // Bump version — past the recorded history too, not just frontmatter, so a
   // doc whose frontmatter lags its history.yaml (imported/copied vault) cannot
@@ -120,6 +122,7 @@ export async function publishDocument(
     docId,
     node.frontmatter.version || 0,
     knownHistory,
+    knownSealed,
   );
   node.frontmatter.version = newVersion;
   node.frontmatter.status = "published";
@@ -150,6 +153,7 @@ export async function publishDocument(
     publishedAt,
     client: options.client,
     knownHistory,
+    knownSealed,
   });
   // Before the checkpoint, so the vault crawl it hands back includes them.
   if (rules && firstPublish) await scaffoldFirstPublish(storage, rules, [docId]);
@@ -173,6 +177,18 @@ export async function publishDocument(
     checkpoint,
     vaultDocs,
   };
+}
+
+/**
+ * With no history, numbering and the restart check both list the doc's
+ * `.versions/` dir; list it once for both. Otherwise only numbering lists it.
+ */
+async function listOnceWithoutHistory(
+  storage: NestStorage,
+  docId: string,
+  knownHistory: DocumentHistory | null | undefined,
+): Promise<number | undefined> {
+  return knownHistory === null ? storage.maxRecordedVersion(docId) : undefined;
 }
 
 /** Parse a document from the plaintext just written, as readDocument would. */
@@ -217,6 +233,12 @@ export interface BulkPublishOptions extends PublishOptions {
    * after this and always win.
    */
   frontmatter?: (node: ContextNode) => Partial<Frontmatter> | null | undefined;
+  /**
+   * Documents the caller read from this vault under the same lock (an
+   * importer's discovery scan). Used instead of re-reading each one; ids not
+   * in the map are read as usual.
+   */
+  preloaded?: ReadonlyMap<string, ContextNode>;
 }
 
 export interface BulkPublishResult {
@@ -265,7 +287,9 @@ export async function publishDocuments(
     if (seen.has(docId)) continue;
     seen.add(docId);
     try {
-      assertWritableDocumentId(docId);
+      // Name limits for an existing document; publishOne holds new names to
+      // the stricter ones (assertWritableDocumentPath).
+      assertWritableDocumentId(docId, true);
       ids.push(docId);
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
@@ -277,10 +301,19 @@ export async function publishDocuments(
   const rules = options.structure === "skip" ? null : await enforcedStructure(storage);
   const firstPublished: string[] = [];
 
+  // Judged in the batch's order, whatever order the reads finish in, when a
+  // replay budget is shared: which documents an over-budget call publishes is
+  // the same on every run. Only the judging waits its turn; the writes overlap.
+  const turns = rules && options.replayBudget ? judgingTurns(ids) : null;
+
   const publishOne = async (docId: string): Promise<void> => {
     try {
       await assertWritableDocumentPath(storage.root, docId);
-      let node = await storage.readDocument(docId);
+      const pre = options.preloaded?.get(docId);
+      // Copied: the publish below mutates frontmatter, and the map is the caller's.
+      let node = pre
+        ? { ...pre, frontmatter: { ...pre.frontmatter } }
+        : await storage.readDocument(docId);
       if (isRejected(node)) throw new RejectedDocumentError(docId);
       await assertNotForgotten(storage, node, tombstones);
       await assertPdfSidecarIntact(storage, docId, node);
@@ -297,15 +330,29 @@ export async function publishDocuments(
       // Judged before historyOrRepair: a refused publish quarantines nothing.
       const budget = options.replayBudget;
       const cutShort = () =>
-        new ContextNestError(`${docId}: this call replays more version history than one call allows — split it into smaller calls, or run it again to continue`, "VALIDATION_FAILED");
-      if (budget?.spent) throw cutShort();
+        new ContextNestError(`${docId}: not published — this call replays more version history than one call allows; publish it in a separate call`, "VALIDATION_FAILED");
       let firstPublish = false;
-      try {
-        firstPublish = rules ? await assertStructurePublish(storage, rules, node, undefined, budget) : false;
-      } catch (err) {
-        throw budget?.spent ? cutShort() : err;
+      if (rules) {
+        let known: DocumentHistory | null = null;
+        try {
+          known = await storage.readHistory(docId);
+        } catch {
+          known = null; // corrupt: judged in full, as a first publish is
+        }
+        // Only a document that fails the full check is replayed (its head may
+        // excuse it), so only such a document — with a history — can be cut
+        // short: refused because the budget left no room to rebuild its head.
+        const replays = !!known?.versions.length;
+        const turn = turns?.get(docId);
+        await turn?.after;
+        try {
+          firstPublish = await assertStructurePublish(storage, rules, node, known, budget);
+        } catch (err) {
+          throw replays && budget?.spent ? cutShort() : err;
+        } finally {
+          turn?.done();
+        }
       }
-      if (budget?.spent) throw cutShort();
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
@@ -316,11 +363,13 @@ export async function publishDocuments(
         });
       }
       const knownHistory = seeded ? undefined : existingHistory;
+      const knownSealed = await listOnceWithoutHistory(storage, docId, knownHistory);
 
       const newVersion = await versionManager.nextVersion(
         docId,
         node.frontmatter.version || 0,
         knownHistory,
+        knownSealed,
       );
       node.frontmatter.version = newVersion;
       node.frontmatter.status = "published";
@@ -337,6 +386,7 @@ export async function publishDocuments(
         publishedAt: new Date().toISOString(),
         client: options.client,
         knownHistory,
+        knownSealed,
       });
       published.push({
         id: docId,
@@ -347,6 +397,9 @@ export async function publishDocuments(
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
     } finally {
+      // A document that failed before its turn still hands the turn on.
+      const turn = turns?.get(docId);
+      if (turn) void turn.after.then(turn.done);
       // Counter increments are safe unsynchronized — JS runs them on one thread;
       // only the awaited I/O above overlaps.
       options.onProgress?.(++settled, ids.length);
@@ -383,4 +436,17 @@ export async function publishDocuments(
   const checkpointNumber = checkpoint?.checkpoint ?? null;
 
   return { published, failed, checkpointNumber };
+}
+
+/** Each id's turn to be judged: after the one before it in `ids` is done. */
+function judgingTurns(ids: string[]): Map<string, { after: Promise<void>; done: () => void }> {
+  const turns = new Map<string, { after: Promise<void>; done: () => void }>();
+  let after: Promise<void> = Promise.resolve();
+  for (const id of ids) {
+    let done!: () => void;
+    const next = new Promise<void>((resolve) => (done = resolve));
+    turns.set(id, { after, done });
+    after = next;
+  }
+  return turns;
 }

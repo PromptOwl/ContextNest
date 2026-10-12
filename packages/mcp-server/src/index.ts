@@ -40,6 +40,7 @@ import {
   ContextNestError,
   applyTypedBlocks,
   sourceMetaSchema,
+  viewMetaSchema,
   readReviewMode,
   setReviewMode,
   listPendingReview,
@@ -54,6 +55,7 @@ import {
   scaffoldFolders,
   assertStructureDelete,
   assertWritableDocumentId,
+  assertWritableDocumentPath,
   assertStructurePublish,
   currentReviewProposal,
   stageReviewHold,
@@ -72,6 +74,7 @@ import {
 } from "@promptowl/contextnest-engine/api";
 import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
+import { rerootForDiscovery, placementNote, heldReviewNotice } from "./onboarding-hints.js";
 
 /** Engine operation catalog — schemas and implementations for `context_*` tools. */
 const engineApi = createEngineApi();
@@ -346,6 +349,17 @@ function wouldPublish(opName: string, args: Record<string, unknown>): boolean {
 }
 
 async function runGatedWrite(opName: string, args: Record<string, unknown>) {
+  // An explicit create id outside nodes/ would land where discovery never looks
+  // (list, search and agents would not see it). Re-root it and say so.
+  let placement: string | undefined;
+  if (opName === "context_create" && typeof args.id === "string") {
+    const requested = normalizeDocumentId(args.id);
+    const placed = rerootForDiscovery(requested, await storage.detectLayout());
+    if (placed.rerooted) {
+      args = { ...args, id: placed.id };
+      placement = placementNote(requested, placed.id);
+    }
+  }
   let input = args;
   if ((await vaultReviewMode()) === "on" && wouldPublish(opName, args)) {
     // A held write settles its own status; an explicit `published` would
@@ -355,10 +369,11 @@ async function runGatedWrite(opName: string, args: Record<string, unknown>) {
   }
   try {
     const result = (await api.run(opName, withClientDefaults(input), opCtx())) as Record<string, unknown>;
+    const withPlacement = placement ? { ...result, placement } : result;
     if (result && result.held_for_review === true) {
-      return toolResult({ ...result, review: reviewHeldMessage(String(result.id)) });
+      return toolResult({ ...withPlacement, review: heldReviewNotice(String(result.id)) });
     }
-    return toolResult(result);
+    return toolResult(withPlacement);
   } catch (err) {
     return toolError(err);
   }
@@ -525,7 +540,12 @@ tool(
       // Segment boundary, not a bare startsWith: "nodes/his" must not match
       // "nodes/history". A trailing slash or .md from a caller pasting a file
       // path is tolerated rather than silently matching nothing.
-      const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
+      // Trailing slashes trimmed with a loop: an unanchored `\/+$` retries from
+      // every slash of a run, quadratic before any length check.
+      const bare = path.replace(/\.md$/, "");
+      let end = bare.length;
+      while (end > 0 && bare[end - 1] === "/") end--;
+      const prefix = normalizeDocumentId(bare.slice(0, end));
       docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
     }
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);
@@ -593,7 +613,7 @@ tool(
           required: false,
           type: "string",
           default: "document",
-          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf", "task", "view"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -608,6 +628,8 @@ tool(
             artifact: "Generated output, as stored by other tools (no type-specific rules)",
             table: "Tabular data, as stored by other tools (no type-specific rules)",
             pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
+            task: "A unit of work on a project board; board fields (assignee, due, priority, parent) live in metadata (no type-specific rules)",
+            view: "A governed composition of other nodes: the view block lays out md/list/summary/html/table/kpi/chart/callout/metric/data blocks; refs and bindings are vault references, never URLs",
           },
         },
         tags: {
@@ -982,6 +1004,11 @@ tool(
       .describe(
         "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
       ),
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required when type is 'view'): the layout of blocks this view composes. Refs and bindings must be vault references, never URLs.",
+      ),
   },
   async ({
     path,
@@ -995,6 +1022,7 @@ tool(
     tools_required,
     output_format,
     source,
+    view,
   }) =>
     lockedHandler(async () => {
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
@@ -1002,8 +1030,13 @@ tool(
 
       // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
       // lands in the same place as one created via `ctx add` (single source of
-      // truth — normalizeDocumentId in the engine).
-      const id = normalizeDocumentId(path);
+      // truth — normalizeDocumentId in the engine). A folder discovery never
+      // scans would hide the document from list, search and agents, so re-root
+      // it under nodes/ and say so, as `ctx add` does.
+      const requested = normalizeDocumentId(path);
+      const placed = rerootForDiscovery(requested, await storage.detectLayout());
+      const id = placed.id;
+      const placement = placed.rerooted ? placementNote(requested, id) : undefined;
       // Never under .context/, .versions/, _suggestions/ or the root packs/ —
       // the same guard every catalog write runs.
       try {
@@ -1045,6 +1078,7 @@ tool(
         applyTypedBlocks(frontmatter, {
           type,
           ...(source !== undefined ? { source } : {}),
+          ...(view !== undefined ? { view } : {}),
           ...(trigger !== undefined ? { trigger } : {}),
           ...(tools_required !== undefined ? { tools_required } : {}),
           ...(output_format !== undefined ? { output_format } : {}),
@@ -1104,7 +1138,8 @@ tool(
           frontmatter: node.frontmatter,
           held_for_review: true,
           message: "Document created and held for review (status: pending_review). Not published.",
-          review: reviewHeldMessage(id),
+          review: heldReviewNotice(id),
+          ...(placement ? { placement } : {}),
         });
       }
 
@@ -1151,6 +1186,7 @@ tool(
                 checkpoint: result.checkpointNumber,
                 chain_hash: result.versionEntry.chain_hash,
                 message: "Document created and published successfully",
+                ...(placement ? { placement } : {}),
               },
               null,
               2,
@@ -1194,7 +1230,7 @@ tool(
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill/view needs that type's block in the same call — `source` for a source node, `trigger` for a skill node, `view` for a view node.",
       ),
     source: sourceMetaSchema
       .strict()
@@ -1202,6 +1238,9 @@ tool(
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
       ),
+    view: viewMetaSchema
+      .optional()
+      .describe("Replacement view block, for a node that is (or is becoming) type:view. Replaces the block wholesale."),
     trigger: z
       .string()
       .optional()
@@ -1222,6 +1261,7 @@ tool(
     content: bodyAlias,
     type,
     source,
+    view,
     trigger,
     tools_required,
     output_format,
@@ -1233,7 +1273,7 @@ tool(
       // Before any write — the file is written before the publish that would
       // otherwise be the first to refuse a reserved path.
       try {
-        assertWritableDocumentId(id);
+        await assertWritableDocumentPath(storage.root, id);
       } catch (err) {
         return toolError(err);
       }
@@ -1304,6 +1344,7 @@ tool(
         applyTypedBlocks(doc.frontmatter, {
           type: nextType,
           ...(source !== undefined ? { source } : {}),
+          ...(view !== undefined ? { view } : {}),
           ...(trigger !== undefined ? { trigger } : {}),
           ...(tools_required !== undefined ? { tools_required } : {}),
           ...(output_format !== undefined ? { output_format } : {}),

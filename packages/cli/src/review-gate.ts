@@ -12,7 +12,10 @@ export const HELD_PROMPT = "Held for review. Publish? [y]es / [n]o / [a]lways (t
 
 /** The one line printed when a held write is left for review. */
 export function heldNotice(id: string): string {
-  return `Held for review: ctx review approve ${id}   (turn off: ctx config set review off)`;
+  return (
+    `Held for review: ctx review approve ${id}   (turn off: ctx config set review off)` +
+    " — not visible to search or agents until approved"
+  );
 }
 
 /** Map an answer to {@link HELD_PROMPT}. Anything unrecognised keeps the hold. */

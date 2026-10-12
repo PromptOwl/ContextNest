@@ -76,9 +76,13 @@ export interface OperationLimits {
   readonly pdfMaxBytes?: number;
   /**
    * Most version-history text one `context_import` may replay while judging
-   * its batch (characters, across every history it checks). Over it, the call
-   * is refused whole and asked to split. Default `DEFAULT_IMPORT_REPLAY_CHARS`
-   * (512 Mi — about two seconds of work). One history may replay up to
+   * its batch (characters, across every history it checks). Over it while
+   * judging, `files[]` are refused whole and asked to split; while publishing,
+   * documents publish in the order given until it is spent, and the rest are
+   * reported not published, to be published in a separate call (a document
+   * that passes the full check, or has no history, replays nothing and always
+   * publishes). Default
+   * `DEFAULT_IMPORT_REPLAY_CHARS` (512 Mi — a few seconds of work). One history may replay up to
    * 128 Mi and a set is judged up to four times, so a value below 512 Mi can
    * refuse a single large document however the batch is split.
    */

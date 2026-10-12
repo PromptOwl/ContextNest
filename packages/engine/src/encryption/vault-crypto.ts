@@ -97,6 +97,22 @@ export class VaultLockedError extends ContextNestError {
   }
 }
 
+/**
+ * A file is sealed under a key id this vault's config does not hold: the
+ * file came from another encrypted vault, or this vault's key material was
+ * replaced. The vault's condition, not the file's — a crawl must not skip it.
+ */
+export class ForeignVaultKeyError extends ContextNestError {
+  constructor(what: string, kid: string, current: string) {
+    super(
+      `${what} was sealed with key ${kid}, which this vault does not hold (current key ${current}). ` +
+        `It was copied from another encrypted vault, or the vault's key material was replaced.`,
+      "DECRYPTION_FAILED",
+    );
+    this.name = "ForeignVaultKeyError";
+  }
+}
+
 /** A key was found, but it does not unwrap this vault's data key. */
 export class WrongVaultKeyError extends ContextNestError {
   constructor(source: string) {
@@ -343,13 +359,7 @@ export class VaultCrypto {
 
   private async key(kid: string, what: string): Promise<Buffer> {
     await this.unlock();
-    if (kid !== this.config.dek.id) {
-      throw new ContextNestError(
-        `${what} was sealed with key ${kid}, which this vault does not hold (current key ${this.config.dek.id}). ` +
-          `It was copied from another encrypted vault, or the vault's key material was replaced.`,
-        "DECRYPTION_FAILED",
-      );
-    }
+    if (kid !== this.config.dek.id) throw new ForeignVaultKeyError(what, kid, this.config.dek.id);
     return this.dek!;
   }
 

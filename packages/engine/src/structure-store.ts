@@ -13,7 +13,7 @@ import { isDeepStrictEqual } from "node:util";
 import { isAbsolute, join, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { parseConfig } from "./config.js";
-import { ConfigError } from "./errors.js";
+import { ConfigError, CorruptHistoryError } from "./errors.js";
 import { assertNotForgotten } from "./forget.js";
 import { generateIndexMd } from "./index-md-generator.js";
 import { parseDocument, serializeDocument, validateDocument } from "./parser.js";
@@ -26,6 +26,7 @@ import {
   enforceStructure,
   documentFolders,
   scaffoldPlan,
+  auditStructure,
   type CompiledStructure,
   type StructureConfig,
   type StructureDoc,
@@ -33,7 +34,7 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { applyPatchBounded, yielder, type ArtifactReader } from "./reconstruct.js";
+import { applyPatchBounded, type ArtifactReader, BYTES_PER_CHAR, MAX_REPLAY_READ, yielder } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -63,6 +64,22 @@ export function isEnforced(config: { structure?: unknown } | null | undefined): 
   if (typeof structure !== "object" || Array.isArray(structure)) return true;
   const enforce = (structure as { enforce?: unknown }).enforce;
   return enforce !== undefined && enforce !== false;
+}
+
+/**
+ * The compliance report: every existing document and folder of the vault that
+ * breaks `rules` — the saved ones (`context_structure` with `report`) or a
+ * draft a host wants judged before it saves it. In a structured vault only
+ * nodes/ holds content; root-level folders (sources/, packs/, assets/) are not
+ * judged against the folder rules.
+ */
+export async function structureReport(storage: NestStorage, rules: CompiledStructure): Promise<Violation[]> {
+  const docs = await storage.discoverDocuments();
+  const structured = (await storage.detectLayout()) === "structured";
+  const folders = (await storage.listFolders())
+    .map((f) => f.path)
+    .filter((p) => !structured || p === "nodes" || p.startsWith("nodes/"));
+  return auditStructure(rules, docs.map((d) => structureView(d.id, d)), folders);
 }
 
 /**
@@ -110,9 +127,10 @@ export async function sealedHead(
   if (segment.some((e) => e.tombstone)) return null;
   try {
     if (budget?.spent) return null;
-    // Read (a few histories at a time, never stuck behind a stalled mount),
-    // then verify and replay exactly what was read — one history at a time.
-    const contents = await withReadSlot(() => readSegment(segment, readKeyframe, readDiff, budget));
+    // Read (outside the replay queue — no shared slot a hung read could keep:
+    // the runtime's I/O threads are the only limit), then verify and replay
+    // exactly what was read, one history at a time.
+    const contents = await readSegment(segment, readKeyframe, readDiff, budget);
     if (contents === null) return null;
     return await oneAtATime(() => verifyAndReplay(segment, contents, budget));
   } catch {
@@ -129,9 +147,10 @@ function charge(budget: ReplayBudget | undefined, chars: number): boolean {
 }
 
 /**
- * A segment's artifacts, read a batch at a time: every character charged to
- * the history's read cap and the caller's budget as it arrives, and a batch
- * that does not settle in time read as "cannot be trusted" (judged in full).
+ * A segment's artifacts, read one at a time, each sized to the room left — the
+ * history's read cap and the caller's budget — and refused unread past it,
+ * every character charged as it arrives. A read too large for what the
+ * budget has left spends it, so the call is asked to split.
  */
 async function readSegment(
   segment: DocumentHistory["versions"],
@@ -141,57 +160,28 @@ async function readSegment(
 ): Promise<string[] | null> {
   const contents: string[] = [];
   let read = 0;
-  for (let i = 0; i < segment.length; i += READ_BATCH) {
-    const batch = await withinTime(
-      Promise.all(
-        segment
-          .slice(i, i + READ_BATCH)
-          .map(async (e) => (e.keyframe ? await readKeyframe(e.version) : ((await readDiff(e.version)) ?? e.diff ?? null))),
-      ),
-    );
-    if (batch === null) return null;
-    for (const c of batch) {
-      if (typeof c !== "string") return null;
-      read += c.length;
-      if (read > MAX_REPLAY_READ || !charge(budget, c.length)) return null;
-      contents.push(c);
+  for (const e of segment) {
+    const room = Math.min(MAX_REPLAY_READ - read, budget ? budget.left : Infinity);
+    const maxBytes = BYTES_PER_CHAR * Math.max(0, room);
+    let c: string | null;
+    try {
+      c = await Promise.resolve(
+        e.keyframe ? readKeyframe(e.version, maxBytes) : readDiff(e.version, maxBytes),
+      ).then((d) => d ?? (e.keyframe ? null : (e.diff ?? null)));
+    } catch (err) {
+      if (budget && room === budget.left && isTooLarge(err)) charge(budget, room + 1);
+      return null;
     }
+    if (typeof c !== "string") return null;
+    read += c.length;
+    if (!charge(budget, c.length) || read > MAX_REPLAY_READ) return null;
+    contents.push(c);
   }
   return contents;
 }
 
-/** `task`'s result, or null once READ_TIMEOUT_MS pass without it. */
-async function withinTime<T>(task: Promise<T>): Promise<T | null> {
-  let timer: NodeJS.Timeout | undefined;
-  const late = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), READ_TIMEOUT_MS);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([task, late]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-let readsInFlight = 0;
-const waitingForSlot: (() => void)[] = [];
-
-/**
- * At most READ_SLOTS histories being read at once, process-wide: memory stays
- * bounded (each history's read is capped), and a stalled mount holds one slot,
- * never every vault's writes.
- */
-async function withReadSlot<T>(task: () => Promise<T>): Promise<T> {
-  if (readsInFlight < READ_SLOTS) readsInFlight++;
-  else await new Promise<void>((resolve) => waitingForSlot.push(resolve));
-  try {
-    return await task();
-  } finally {
-    const next = waitingForSlot.shift();
-    if (next) next();
-    else readsInFlight--;
-  }
+function isTooLarge(err: unknown): boolean {
+  return err instanceof CorruptHistoryError && err.ioError === "too-large";
 }
 
 /**
@@ -205,7 +195,7 @@ async function verifyAndReplay(
   contents: string[],
   budget: ReplayBudget | undefined,
 ): Promise<string | null> {
-  // Another history of this call spent the budget: the call is refused whole.
+  // Another history of this call spent the budget: this one is not rebuilt.
   if (budget?.spent) return null;
   const step = yielder();
   for (const [i, c] of contents.entries()) {
@@ -276,32 +266,21 @@ const MAX_SEALED_SEGMENT = 1000;
  */
 const MAX_REPLAY_WORK = 128 * 2 ** 20;
 
-/**
- * Most characters sealedHead reads for one history (its keyframe and diffs).
- * Past it the history is not trusted (judged in full) — and never held whole.
- */
-const MAX_REPLAY_READ = 64 * 2 ** 20;
-
-/** Artifacts read at once: a few round trips in flight on a network mount. */
-const READ_BATCH = 4;
-
-/** Histories being read at once, process-wide. */
-const READ_SLOTS = 4;
-
-/** How long one batch of artifact reads may take before the head is not trusted. */
-const READ_TIMEOUT_MS = 10_000;
 
 /**
- * The most bytes one version file may hold to be read for a sealed head —
- * twice the read cap in characters, room for an encrypted artifact's armour.
+ * The most bytes one version file may hold to be read for a sealed head: the
+ * read cap in characters, at the bytes any script and armour may take.
  * Larger is not trusted (judged in full) and never read.
  */
-export const MAX_SEALED_ARTIFACT_BYTES = 2 * MAX_REPLAY_READ;
+export const MAX_SEALED_ARTIFACT_BYTES = BYTES_PER_CHAR * MAX_REPLAY_READ;
 
 /** The vault's own readers for a sealed head: no artifact over the size a head may read. */
 export function sealedReaders(storage: NestStorage, id: string): { keyframe: ArtifactReader; diff: ArtifactReader } {
-  const limit = { maxBytes: MAX_SEALED_ARTIFACT_BYTES };
-  return { keyframe: (n) => storage.readKeyframe(id, n, limit), diff: (n) => storage.readDiff(id, n, limit) };
+  const limit = (maxBytes = Infinity) => ({ maxBytes: Math.min(maxBytes, MAX_SEALED_ARTIFACT_BYTES) });
+  return {
+    keyframe: (n, maxBytes) => storage.readKeyframe(id, n, limit(maxBytes)),
+    diff: (n, maxBytes) => storage.readDiff(id, n, limit(maxBytes)),
+  };
 }
 
 /**
@@ -340,11 +319,14 @@ export async function structurePublishViolations(
     known = null; // corrupt: judged in full below
   }
   const first = !known || known.versions.length === 0;
+  // A document that passes the full check needs no head to excuse it: it is
+  // never replayed, so the replay budget only ever touches what breaks a rule.
+  const full = checkDocument(rules, live);
+  if (full.length === 0 || !known) return { violations: full, first };
   // The view that was hashed: any bytes with this head's hashes get the same verdict.
-  const head = known
-    ? await sealedHeadView(id, known, sealedReaders(storage, id).keyframe, sealedReaders(storage, id).diff, budget)
-    : null;
-  if (!head?.node) return { violations: checkDocument(rules, live), first };
+  const readers = sealedReaders(storage, id);
+  const head = await sealedHeadView(id, known, readers.keyframe, readers.diff, budget);
+  if (!head?.node) return { violations: full, first };
   return { violations: checkUpdate(rules, head.doc, live), first };
 }
 
@@ -363,8 +345,7 @@ export async function assertStructurePublish(
   history?: DocumentHistory | null,
   budget?: ReplayBudget,
 ): Promise<boolean> {
-  const doc = { id: live.id, type: live.frontmatter.type, body: live.body };
-  const { violations, first } = await structurePublishViolations(storage, rules, doc, history, budget);
+  const { violations, first } = await structurePublishViolations(storage, rules, structureView(live.id, live), history, budget);
   enforceStructure(rules, violations);
   return first;
 }

@@ -1,5 +1,70 @@
 # @promptowl/contextnest-engine
 
+## 2.12.0
+
+### Minor Changes
+
+- ce831be: Add the `view` node type (spec §1.12): a governed composition of other nodes. A view's required `view` frontmatter block is a layout of blocks (`md`, `list`, `summary`, `html`, `table`, `kpi`, `chart`, `callout`, `metric`, `data`) that name what to show and where it comes from. Being frontmatter, the layout is versioned and hashed like any node, so approving a view approves its layout.
+
+  - **Validation (rules 30–36, §13.5):** the block is required on `type: view` and forbidden elsewhere, needs at least one block with exactly one kind each, and is strict at every level. Every `ref`/`binding` must be a node path or `contextnest://` URI, never a URL, so no URL, credential or unknown key can ride inside a view. Refs carry no `@`/`#` suffix: an `md` block pins with `version`. Selectors must parse, `from`/`data_from` must name an earlier block's id, and a `render: pinned` view must pin every `md` block.
+  - **Writes:** `context_create`, `context_update`, `context_import` and the MCP `create_document`/`update_document` tools take a `view` parameter. A node can be created as a view or re-typed to and from one in a single call, as with `source` and `skill`.
+  - **Resolution:** new `resolveView(node, { documents, reconstructVersion?, includeDrafts? })` resolves `md`, `list` and `callout` blocks from the vault under retrieval visibility (published only by default; forgotten nodes never resolve). A pinned version is served only while its node is still published. `documents` is the reader's scope: the engine applies status visibility, and access control and `audience` are the caller's. It returns a structured result, a markdown rendering and what a render receipt needs: each `md` block's `ref@version` and content hash, each `list` block's members and set hash, and `viewFingerprint(view)` over the layout. Other kinds come back as `status: "server"` for the serving implementation.
+
+  This only widens the vocabulary, so no existing document changes bytes or hashes. §13 rule 6 now counts 15 node types (it said 13).
+
+### Patch Changes
+
+- 0d7f082: **Folder import does less storage I/O.** On a network-backed vault (Cloud Storage via gcsfuse) every file operation is a round trip, and a few hundred documents paid several of them each in places where none were needed.
+
+  - `context_import` checks whether its incoming files already exist in the vault in parallel, not one file at a time. Path planning is unchanged: same targets, same `-2`/`-3` collision numbering, same warnings.
+  - A checkpoint sealed with no readable head (the first one in a new or freshly imported nest, or after an unreadable `context_history.yaml`) no longer walks the vault and reads every `history.yaml`. It takes the hashes the publish just sealed and reads history only for published documents those don't cover, as a seal on top of an existing head already did.
+  - `publishDocuments` takes an optional `preloaded` map of documents the caller already read under the same lock; discover-mode `context_import` passes its scan, so each document is no longer read a second time before it is published.
+  - Publishing a document with no history lists its `.versions/` directory once instead of twice (`nextVersion` and `createVersion` accept an optional `knownSealed`).
+
+  Sealed versions, chain hashes and checkpoints are the same as before.
+
+## 2.11.0
+
+### Minor Changes
+
+- 2c90a57: Add `task` to `NODE_TYPES`: a unit of work on a project board. The body is markdown, and board fields (`assignee`, `due`, `priority`, `parent`) are ordinary `metadata` keys. There are no type-specific validation rules (it validates like `document`), and whether a task goes through review is up to the server's governance. This only widens the vocabulary, so no existing document changes bytes or hashes. Spec §1.6 and the MCP `frontmatter_fields.type` enum list it.
+
+### Patch Changes
+
+- 7b09d12: **A PDF import resolves an explicit id to its on-disk casing (#117).**
+
+  On a case-insensitive filesystem (macOS, Windows), `context_import_pdf` / `ctx import pdf --id nodes/report` finds an existing `nodes/Report.md`, but used to carry on under the caller's spelling: it versioned the node as `nodes/report`, wrote the sidecar to `nodes/report.pdf` and recorded `pdf.file: nodes/report.pdf`, which then failed validation rule 26 against the id discovery reports. The import now resolves the id to the spelling each directory lists before it derives the sidecar path, `pdf.file` or the version history from it, and returns that id. `deleteDocument` likewise removes a pdf node's sidecar when the node is addressed in another casing. A node written before this fix, whose `pdf.file` carries the caller's casing, is repaired by a same-bytes re-import, and is still deleted with its sidecar when addressed in that casing. On a case-sensitive filesystem nothing changes.
+
+  New: `NestStorage.resolveDocumentIdCasing(id)`.
+
+## 2.10.0
+
+### Minor Changes
+
+- fbfd50a: **Publishing reads far less from disk, and bulk approval keeps the reviewer's note.**
+
+  - A publish now reads each document's version history once instead of five times, and no longer reads the document back after writing it: the history is reused across picking the next version number, rebuilding the previous version for the diff, and appending the new entry, all under the same lock. The checkpoint takes the chain hash of the entry just appended instead of re-reading the history, and the index rebuild reuses the checkpoint just sealed. Chains, version numbers, diffs and checkpoints are computed exactly as before; only repeated reads are gone. On network-backed storage each of those reads was a round trip.
+  - `context_import` takes an optional `note`, recorded in the version history of every document the call publishes. With `ids` alone (for example a bulk approval) the batch's single index rebuild rewrites only the folders of those documents.
+  - New optional inputs for callers that already hold the data: `knownHistory` on `VersionManager.nextVersion`, `createVersion` and `reconstructVersion`; the just-sealed entries on `CheckpointManager.createCheckpointFromVault`; `latestCheckpoint` on `regenerateIndex`; `indexOnlyBatchFolders` on `publishDocuments`. `publishDocument` now also returns the `checkpoint` it sealed. Calls without them behave as before.
+
+- 1b97da6: **Publishing or approving one document no longer rewrites every folder's index.** The index rebuild that follows a publish now rewrites only the INDEX.md of the folder the document lives in, since a folder's index lists only its own documents; context.yaml is still rebuilt in full. Agent configuration files (CLAUDE.md, GEMINI.md, .cursorrules and the rest) are only written when their content actually changed. On a nest with many folders this makes each publish, and each approval in a bulk review, far cheaper. The rebuild takes a new optional changedIds option to scope it; calls without it behave as before.
+- 6c9738a: **`context_search` returns `count`, the total number of matches, next to `results`.**
+
+  With `limit` set, a capped page could read as the whole answer. `searchOp.output` now has a required `count: z.number().int().nonnegative()`, filled with every published match _before_ the `limit` slice. The name matches the hosted REST and MCP search responses, which already return `count`. `total`, which carried the same number, stays as a deprecated alias so existing clients keep working. `ctx search` (local and remote) reads `count` first and falls back to `total`, so its "… N more — raise --limit" footer now also appears against a hosted nest that sends only `count`.
+
+### Patch Changes
+
+- fbfd50a: **Approving an external edit or suggestion, rolling back, and publishing from the MCP server now read less from disk.** Approving a staged suggestion reads the document's version history once instead of four times, and a rollback or direct edit once instead of three times; version numbering, diffs and chain hashes are computed exactly as before. The MCP server's create, update and publish tools rebuild only the published document's folder index and reuse the checkpoint the publish just sealed, matching `context_publish`.
+- fbfd50a: **A publish no longer re-creates directories that already exist.** Every write on the publish path — the document, its diff or keyframe, its history entry, the checkpoint, each folder index and each agent configuration file — first ran a `mkdir -p` on its directory, about ten per publish, and on network-backed storage each one is a round trip even when the directory is already there. Writes now go straight to the file and create the directory only if it turns out to be missing, then write once more; the checkpoint append, which only ever extends an existing file, no longer touches directories at all. A publish into an existing folder drops from twelve directory calls to the two the vault lock needs. New folders are still created on demand, and nothing is kept in memory.
+- fbfd50a: **Rebuilding a past version reads its files together.** Reconstructing a version read its keyframe and then each diff after it one at a time — up to ten back-to-back reads, each a round trip on network-backed storage. The files it needs are known from the history up front, so they are now read together, up to ten at a time, and applied in the same order — a window is applied and released before the next is read, so memory stays bounded however long the replay. Every publish rebuilds the previous version to compute its diff, so this shortens every publish, as well as version reads and integrity checks. Results and errors are unchanged: a missing or unreadable file fails at the same point it did before.
+- fbfd50a: **Approving a held edit rebuilds the approved content once.** `approveReview` (used by `ctx review approve`, the review gate and the MCP review tools) rebuilt the document's approved content once to check its holds and again to apply the chosen hold, each time reading the version history twice. It now rebuilds it once and reuses it, and the rebuild uses the history it already read: five history reads become two, and the keyframe-and-diff replay runs once instead of twice. Stacking a new held edit (`currentReviewProposal`) and staging one (`stageReviewHold`) benefit the same way.
+- 6c9738a: **Full-text search ignores stopwords, weights titles, and drops weak partial matches, so a natural-language question retrieves the nodes about its topic.**
+
+  Hosts pass the user's question straight through as the search text. Words like "what", "is", "the" and "for" were indexed and OR-matched, so every node containing "the" came back as a hit, and chat hosts cited them. `Resolver.search` (behind `context_search`, `ctx search`, and `contextnest://search/…` in `context_query`) now drops English stopwords from both the index and the query, boosts title (×3), tags (×2) and description (×1.5) over body, and drops partial hits scoring below 5% of the best hit. Documents matching every query term are always kept. A query made only of stopwords returns nothing.
+
+- fbfd50a: **A publish lists the vault once instead of twice.** Sealing the checkpoint and rebuilding the index after a publish each read and parsed every document in the vault. The checkpoint's listing is now handed to the index rebuild, which uses it instead of listing again (`regenerateIndex` takes it as `docs`; `publishDocument` returns it as `vaultDocs`). Applies to `context_publish`, create/update with publish, review approval, bulk `context_import`, and the MCP server's publish tools. Without a document cache (the CLI and the MCP server) this halves the reads a publish makes on a large or network-mounted vault.
+- fbfd50a: **Publishing no longer re-reads the whole forget log each time.** Every publish checks the vault's forget log so forgotten content cannot come back, and that meant reading and parsing the entire log — which grows with every delete and forget — on every publish. The parsed log is now reused until the file's size or modification time changes or it is replaced, so a publish costs one file stat instead of a full read. Only a log of up to 256 KB is kept in memory; a larger one is read on each check as before, so memory use stays bounded. A forget recorded by any process on the same storage changes the file and is picked up on the next check, so the protection is unchanged.
+
 ## 2.9.1
 
 ### Patch Changes
