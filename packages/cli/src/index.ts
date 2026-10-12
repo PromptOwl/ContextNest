@@ -95,6 +95,7 @@ import {
 import {
   hasTaskFieldArgs,
   localTaskFieldsError,
+  parseIsoDate,
   parseTaskLogStatus,
   taskFieldArgs,
 } from "./task-fields.js";
@@ -2543,7 +2544,7 @@ program
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
   .option("--assignee <email>", 'Remote nest: only items assigned to this email ("none" = unassigned)')
   .option("--priority <p>", "Remote nest: only this priority (urgent|high|medium|low|none)")
-  .option("--due-before <date>", "Remote nest: only items due on or before YYYY-MM-DD")
+  .option("--due-before <date>", "Remote nest: only items due on or before YYYY-MM-DD", parseIsoDate)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
@@ -2551,7 +2552,7 @@ program
       await remoteList(remote, opts);
       return;
     }
-    if (opts.assignee || opts.priority || opts.dueBefore) {
+    if (opts.assignee !== undefined || opts.priority !== undefined || opts.dueBefore !== undefined) {
       throw localTaskFieldsError("--assignee / --priority / --due-before");
     }
     const storage = getStorage();

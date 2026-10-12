@@ -39,35 +39,55 @@ export interface TaskListFilters {
   due_before?: string;
 }
 
-/** `ctx list` filter flags → context_list arguments (`none` passes through). */
+/**
+ * `ctx list` filter flags → context_list arguments. `""` means `none`, as it
+ * does for `ctx update`, so an empty value filters for unset rather than
+ * falling through to an unfiltered listing.
+ */
 export function taskListFilters(opts: {
   assignee?: string;
   priority?: string;
   dueBefore?: string;
 }): TaskListFilters {
+  const orNone = (v: string) => v.trim() || "none";
   return {
-    ...(opts.assignee ? { assignee: opts.assignee } : {}),
-    ...(opts.priority ? { priority: opts.priority } : {}),
-    ...(opts.dueBefore ? { due_before: opts.dueBefore } : {}),
+    ...(opts.assignee !== undefined ? { assignee: orNone(opts.assignee) } : {}),
+    ...(opts.priority !== undefined ? { priority: orNone(opts.priority) } : {}),
+    ...(opts.dueBefore !== undefined ? { due_before: opts.dueBefore } : {}),
   };
 }
 
 /**
- * A server that predates task fields silently drops the arguments (the MCP SDK
- * strips undeclared keys) and reports success. It also echoes nothing back, so
- * a field that was SET but is missing from the reply was not applied.
+ * A server that predates task fields strips the arguments (the MCP SDK drops
+ * undeclared keys) and still reports success. Task fields, the list filters and
+ * `context_task_log` shipped in the same server release, so the advertised tool
+ * is the capability signal. Checked BEFORE the call: nothing half-applies, and
+ * a clear (which the server never echoes back) cannot be reported as done.
  */
-export function unappliedTaskFields(
-  sent: TaskFieldArgs,
-  echoed: Partial<Record<string, unknown>>,
-): TaskFieldFlag[] {
-  return TASK_FIELD_FLAGS.filter((k) => typeof sent[k] === "string" && echoed[k] === undefined);
+export async function requireTaskSupport(
+  conn: { toolNames(): Promise<ReadonlySet<string>> },
+  alias: string,
+): Promise<void> {
+  if (!(await conn.toolNames()).has("context_task_log")) {
+    throw new ContextNestError(
+      `"${alias}" does not support task fields or the task log — its server predates them. Upgrade the Community server. Nothing was written.`,
+      "NOT_IMPLEMENTED",
+    );
+  }
+}
+
+/** Commander option parser for `ctx list --due-before`: the nest compares dates as YYYY-MM-DD. */
+export function parseIsoDate(v: string): string {
+  const s = v.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new InvalidArgumentError("expected a date as YYYY-MM-DD.");
+  return s;
 }
 
 export const TASK_LOG_STATUSES = ["working", "done", "blocked"] as const;
 
 /** Commander option parser for `ctx task log --status`. */
 export function parseTaskLogStatus(v: string): string {
+  v = v.trim().toLowerCase();
   if (!(TASK_LOG_STATUSES as readonly string[]).includes(v)) {
     throw new InvalidArgumentError(`--status must be one of ${TASK_LOG_STATUSES.join(", ")}.`);
   }
@@ -95,28 +115,4 @@ export function taskFieldsSuffix(d: {
     d.parent ? `parent ${d.parent}` : null,
   ].filter(Boolean);
   return parts.length ? ` · ${parts.join(" · ")}` : "";
-}
-
-/**
- * True when a listing could NOT have come from a server that applied the task
- * filters — an older server strips them and lists everything. Checked on the
- * rows themselves, since the reply carries no other signal.
- */
-export function taskFiltersIgnored(
-  filters: TaskListFilters,
-  docs: Array<{ assignee?: string; priority?: string; due?: string }>,
-): boolean {
-  return docs.some((d) => {
-    if (filters.assignee !== undefined) {
-      const want = filters.assignee.toLowerCase();
-      if (want === "none" ? !!d.assignee : d.assignee?.toLowerCase() !== want) return true;
-    }
-    if (filters.priority !== undefined) {
-      if (filters.priority === "none" ? !!d.priority : d.priority !== filters.priority) return true;
-    }
-    if (filters.due_before !== undefined) {
-      if (!d.due || d.due > filters.due_before) return true;
-    }
-    return false;
-  });
 }

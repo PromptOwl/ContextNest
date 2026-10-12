@@ -7,7 +7,12 @@
  * sends, that "" / none clears, and that an older server that silently drops
  * the arguments is reported instead of read as success.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ContextNestError } from "@promptowl/contextnest-engine";
 import type { RemoteNestSpec } from "@promptowl/contextnest-engine";
 
@@ -32,12 +37,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
 
 const { remoteUpdate, remoteList, remoteTaskLog } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
-const {
-  taskFieldArgs,
-  unappliedTaskFields,
-  parseTaskLogStatus,
-  taskFiltersIgnored,
-} = await import("../task-fields.js");
+const { taskFieldArgs, taskListFilters, parseIsoDate, parseTaskLogStatus } = await import("../task-fields.js");
 
 const target = { alias: "team", spec: { transport: "stdio", command: "node" } as RemoteNestSpec };
 
@@ -70,25 +70,32 @@ describe("task field flags", () => {
     expect(taskFieldArgs({})).toEqual({});
   });
 
-  it("flags a field that was set but not echoed back", () => {
-    expect(unappliedTaskFields({ assignee: "a@b.co", due: null }, {})).toEqual(["assignee"]);
-    expect(unappliedTaskFields({ assignee: "a@b.co" }, { assignee: "a@b.co" })).toEqual([]);
+  it('list filters: "" means none, as it does for update', () => {
+    expect(taskListFilters({ assignee: "", priority: " high " })).toEqual({ assignee: "none", priority: "high" });
+    expect(taskListFilters({})).toEqual({});
   });
 
-  it("--status accepts working | done | blocked only", () => {
+  it("--due-before takes YYYY-MM-DD only", () => {
+    expect(parseIsoDate(" 2026-10-31 ")).toBe("2026-10-31");
+    expect(() => parseIsoDate("10/31/2026")).toThrow(/YYYY-MM-DD/);
+  });
+
+  it("--status accepts working | done | blocked only, any case", () => {
     expect(parseTaskLogStatus("done")).toBe("done");
+    expect(parseTaskLogStatus("Done")).toBe("done");
     expect(() => parseTaskLogStatus("finished")).toThrow(/working, done, blocked/);
   });
 });
 
 describe("ctx update on a remote nest", () => {
   it("sends task fields to context_update and prints what the nest set", async () => {
-    replies.context_update = { id: "nodes/t", version: 3, status: "published", assignee: "a@b.co", priority: "high" };
-    await remoteUpdate(target, "nodes/t", { assignee: "a@b.co", priority: "high", due: "none" });
+    replies.context_update = { id: "nodes/t", version: 3, status: "published", assignee: "a@b.co", priority: "high", parent: "nodes/epic" };
+    await remoteUpdate(target, "nodes/t", { assignee: "a@b.co", priority: "high", due: "none", parent: "nodes/epic" });
     expect(calls).toEqual([
-      { op: "context_update", input: { id: "nodes/t", assignee: "a@b.co", priority: "high", due: null } },
+      { op: "context_update", input: { id: "nodes/t", assignee: "a@b.co", priority: "high", due: null, parent: "nodes/epic" } },
     ]);
     expect(plain()).toContain("Assignee: a@b.co");
+    expect(plain()).toContain("Parent: nodes/epic");
     expect(plain()).toContain("Due: (cleared)");
   });
 
@@ -97,12 +104,24 @@ describe("ctx update on a remote nest", () => {
     await expect(remoteUpdate(target, "nodes/t", { due: "2026-10-31" })).resolves.toBeUndefined();
   });
 
-  it("refuses to report success when an older server dropped the fields", async () => {
+  it("an older server is refused before anything is written — set or clear", async () => {
+    advertised = new Set(["context_update", "context_list"]);
     replies.context_update = { id: "nodes/t", version: 5, status: "published" };
-    const err = await remoteUpdate(target, "nodes/t", { assignee: "a@b.co" }).catch((e) => e);
-    expect(err).toBeInstanceOf(ContextNestError);
-    expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
-    expect((err as Error).message).toContain("--assignee");
+    for (const opts of [{ assignee: "a@b.co", body: "x" }, { due: "none" }]) {
+      const err = await remoteUpdate(target, "nodes/t", opts).catch((e) => e);
+      expect(err).toBeInstanceOf(ContextNestError);
+      expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
+    }
+    expect(calls).toEqual([]);
+    expect(plain()).not.toContain("Updated");
+    expect(plain()).not.toContain("(cleared)");
+  });
+
+  it("an older server still takes updates without task fields", async () => {
+    advertised = new Set(["context_update"]);
+    replies.context_update = { id: "nodes/t", version: 6 };
+    await remoteUpdate(target, "nodes/t", { body: "x" });
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -125,11 +144,15 @@ describe("ctx list filters on a remote nest", () => {
     expect(JSON.parse(plain())[0]).toMatchObject({ id: "nodes/t", assignee: "a@b.co" });
   });
 
-  it("an older server that ignored the filters is reported, not listed", async () => {
-    expect(taskFiltersIgnored({ assignee: "none" }, [{ assignee: "x@y.z" }])).toBe(true);
-    replies.context_list = { documents: [{ id: "nodes/other", title: "O", type: "task", status: "published" }] };
+  it("an older server is refused before listing, even if the result would be empty", async () => {
+    advertised = new Set(["context_list"]);
+    replies.context_list = { documents: [] };
     const err = await remoteList(target, { assignee: "a@b.co" }).catch((e) => e);
     expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
+    expect(calls).toEqual([]);
+    // No task filter → no capability needed.
+    await remoteList(target, {});
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -159,10 +182,64 @@ describe("ctx task log", () => {
     expect(text).toContain("Assigned to you");
   });
 
+  it("--json prints the server reply as-is", async () => {
+    replies.context_task_log = { id: "nodes/t", entry };
+    await remoteTaskLog(target, "nodes/t", { note: "on it", json: true });
+    expect(JSON.parse(plain())).toEqual({ id: "nodes/t", entry });
+  });
+
+  it("reports a claim on a task someone else holds, and ignores a blank agent", async () => {
+    process.env.CONTEXTNEST_AGENT = "   ";
+    replies.context_task_log = { id: "nodes/t", entry, claim: "assigned_to_other", assignee: "ann@x.com" };
+    await remoteTaskLog(target, "nodes/t", { note: "on it", claim: true });
+    expect(calls[0].input).not.toHaveProperty("client");
+    expect(plain()).toContain("Not claimed — already assigned to ann@x.com");
+  });
+
+  it("already_yours prints no claim line", async () => {
+    replies.context_task_log = { id: "nodes/t", entry, claim: "already_yours", assignee: "misha@x.com" };
+    await remoteTaskLog(target, "nodes/t", { note: "on it", claim: true });
+    expect(plain()).not.toMatch(/Assigned to you|Not claimed/);
+  });
+
+  it("goes through the remote write guard (--dry-run refuses)", async () => {
+    configureSafety({ dryRun: true });
+    const err = await remoteTaskLog(target, "nodes/t", { note: "x" }).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
+    expect(calls).toEqual([]);
+  });
+
   it("says when the server has no task log", async () => {
     advertised = new Set(["context_update"]);
     const err = await remoteTaskLog(target, "nodes/t", { note: "x" }).catch((e) => e);
     expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
     expect(calls).toEqual([]);
+  });
+});
+
+// The local-vault refusals live in index.ts, so drive the built CLI.
+describe("local vaults refuse task flags", () => {
+  const distPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "dist", "index.js");
+  const tmp = mkdtempSync(join(tmpdir(), "cn-task-local-"));
+  mkdirSync(join(tmp, ".context"));
+  writeFileSync(join(tmp, ".context", "config.yaml"), "version: 1\nname: local\n");
+  afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+  const ctx = (...args: string[]) =>
+    spawnSync("node", [distPath, ...args], {
+      cwd: tmp,
+      encoding: "utf8",
+      env: { ...process.env, CONTEXTNEST_CONFIG_DIR: tmp, CONTEXTNEST_VAULT: "", CONTEXTNEST_VAULT_PATH: tmp },
+    });
+
+  it.each([
+    ["update", "nodes/t", "--assignee", "a@b.co"],
+    ["update", "nodes/t", "--due", ""],
+    ["list", "--assignee", ""],
+    ["list", "--priority", "high"],
+    ["task", "log", "nodes/t", "--note", "x"],
+  ])("ctx %s %s …", (...args) => {
+    const r = ctx(...args);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr + r.stdout).toMatch(/Community nest/);
   });
 });

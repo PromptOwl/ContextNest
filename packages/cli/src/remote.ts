@@ -33,11 +33,10 @@ import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
   TASK_FIELD_FLAGS,
   hasTaskFieldArgs,
+  requireTaskSupport,
   taskFieldArgs,
   taskFieldsSuffix,
-  taskFiltersIgnored,
   taskListFilters,
-  unappliedTaskFields,
 } from "./task-fields.js";
 import {
   listJsonEntry,
@@ -316,6 +315,7 @@ export async function remoteList(
     // — an unfiltered context_list hides retired docs, so a client-side
     // `--status rejected` could only ever return nothing.
     const taskFilters = taskListFilters(opts);
+    if (Object.keys(taskFilters).length) await requireTaskSupport(conn, target.alias);
     const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {
       ...(opts.type ? { type: opts.type } : {}),
       ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
@@ -324,12 +324,6 @@ export async function remoteList(
       // Task filters, like the rest, are decided by the nest.
       ...taskFilters,
     });
-    if (taskFiltersIgnored(taskFilters, out.documents)) {
-      throw new ContextNestError(
-        `"${target.alias}" ignored --assignee / --priority / --due-before — its server predates task filters. Upgrade the Community server.`,
-        "NOT_IMPLEMENTED",
-      );
-    }
     const docs = await labelFanout(target, conn, out.documents);
 
     if (opts.json) {
@@ -744,6 +738,7 @@ export async function remoteUpdate(
     `Update ${normalizeDocumentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
   );
   await withRemote(target, async (conn) => {
+    if (hasTaskFieldArgs(fields)) await requireTaskSupport(conn, target.alias);
     // Same fields the local branch sends; tags REPLACE, as locally.
     const updated = await conn.run<{ id: string; version: number; status?: string; [k: string]: unknown }>(
       "context_update",
@@ -763,14 +758,6 @@ export async function remoteUpdate(
     if (updated.status) console.log(`  Status: ${updated.status}`);
     for (const k of TASK_FIELD_FLAGS) {
       if (k in fields) console.log(`  ${k[0].toUpperCase()}${k.slice(1)}: ${String(updated[k] ?? "(cleared)")}`);
-    }
-    // An older server drops the arguments and still reports success.
-    const dropped = unappliedTaskFields(fields, updated);
-    if (dropped.length) {
-      throw new ContextNestError(
-        `"${target.alias}" did not apply ${dropped.map((k) => `--${k}`).join(", ")} — its server predates task fields over MCP. Upgrade the Community server.`,
-        "NOT_IMPLEMENTED",
-      );
     }
   });
 }
@@ -891,21 +878,18 @@ export async function remoteTaskLog(
   path: string,
   opts: { note: string; status?: string; claim?: boolean; agent?: string; json?: boolean },
 ): Promise<void> {
+  const id = normalizeDocumentId(path);
+  await confirmRemoteWrite(target, `Log on ${id} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
-    if (!(await conn.toolNames()).has("context_task_log")) {
-      throw new ContextNestError(
-        `"${target.alias}" has no task log (context_task_log) — it needs a newer Community server.`,
-        "NOT_IMPLEMENTED",
-      );
-    }
-    const agent = opts.agent || process.env.CONTEXTNEST_AGENT;
+    await requireTaskSupport(conn, target.alias);
+    const agent = (opts.agent ?? process.env.CONTEXTNEST_AGENT)?.trim();
     const out = await conn.run<{
       id: string;
       entry: TaskLogEntry;
       claim?: "assigned" | "already_yours" | "assigned_to_other";
       assignee?: string;
     }>("context_task_log", {
-      id: normalizeDocumentId(path),
+      id,
       note: opts.note,
       ...(opts.status ? { status: opts.status } : {}),
       ...(opts.claim ? { claim: true } : {}),
