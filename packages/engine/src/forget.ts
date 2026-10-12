@@ -564,16 +564,16 @@ async function sealedBodies(
   cache: Map<string, Set<string> | null>,
   budget: ReplayBudget | undefined,
 ): Promise<Set<string> | null> {
-  // Keyed by the spelling on disk: where names fold case, every spelling of
-  // the id reads this one document and history (#117).
-  const key = await storage.resolveDocumentIdCasing(node.id);
+  // Keyed by the file, not the spelling: where names fold case, every
+  // spelling of the id reads this one document and history (#117).
+  const key = await storage.documentFileKey(node.id);
   const cached = cache.get(key);
   if (cached !== undefined) return cached;
   const bodies = new Set<string>();
   const complete = await replayEveryVersion(
     history?.versions ?? [],
-    (n, maxBytes) => storage.readKeyframe(key, n, { maxBytes }),
-    (n, maxBytes) => storage.readDiff(key, n, { maxBytes }),
+    (n, maxBytes) => storage.readKeyframe(node.id, n, { maxBytes }),
+    (n, maxBytes) => storage.readDiff(node.id, n, { maxBytes }),
     budget,
     (text) => {
       const h = forgettableBodyHash(text);

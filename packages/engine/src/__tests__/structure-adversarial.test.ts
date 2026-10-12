@@ -974,6 +974,28 @@ describe("forget and tombstones", () => {
     expect(artifactReads).toBeLessThanOrEqual(12);
   });
 
+  // r28 N1b (architecture re-check of 34d5ee1): the cache key came from
+  // resolveDocumentIdCasing, which lists every folder on the path, once per
+  // record, under the vault lock: 5,000 records against a 20,000-file folder
+  // took 79 s. The key is the file's identity, one stat per record; the
+  // spelling lookup is left for file systems that report no inode.
+  it("r28 N1b: many imported forgets naming one document never list its folders per record", async () => {
+    const id = "nodes/notes/hot";
+    await api.run("context_create", { id, title: "hot", content: "## Summary\nthe hot note body text\n" }, ctx);
+    await api.run("context_update", { id, content: "## Summary\nthe hot note body text, edited\n" }, ctx);
+    let listings = 0;
+    const s = storage as unknown as { resolveDocumentIdCasing: (x: string) => Promise<string> };
+    const resolve = s.resolveDocumentIdCasing.bind(storage);
+    s.resolveDocumentIdCasing = (x) => {
+      listings++;
+      return resolve(x);
+    };
+    const records = Array.from({ length: 200 }, (_, i) => forgetEvent(id, `b-${i}`, `    body_hashes: ["${ZERO}"]\n`, `sha256:${(i + 7).toString(16).padStart(64, "0")}`)).join("");
+    const r = await importFiles([{ path: ".versions/chain_events.yaml", content: records }]);
+    expect(r.failed).toHaveLength(200);
+    expect(listings).toBeLessThanOrEqual(1);
+  });
+
   it("r28 N1: rebuilding a copy's versions is charged to the import's replay budget", async () => {
     const id = "nodes/notes/budgeted";
     await api.run("context_create", { id, title: "budgeted", content: "## Summary\nfirst body of this note\n" }, ctx);

@@ -1076,6 +1076,19 @@ export class NestStorage {
   }
 
   /**
+   * One key per document file, whatever spelling reaches it: its device and
+   * inode, from one stat — exact on every file system, case-folding or not.
+   * Where a file system reports no inode (0: FAT, some network shares), the
+   * id as spelled on disk ({@link resolveDocumentIdCasing}, which lists the
+   * folders on its path).
+   */
+  async documentFileKey(id: string): Promise<string> {
+    const st = await stat(join(this.root, `${id}.md`), { bigint: true }).catch(() => null);
+    if (st && st.ino !== 0n) return `inode:${st.dev}:${st.ino}`;
+    return `id:${await this.resolveDocumentIdCasing(id)}`;
+  }
+
+  /**
    * Read a single document by its id (relative path without .md).
    *
    * Default behavior (no options): reads the live `.md` file and returns
