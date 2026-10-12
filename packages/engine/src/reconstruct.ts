@@ -12,9 +12,20 @@
 
 import { applyPatch, parsePatch, type StructuredPatch } from "diff";
 import type { DocumentHistory } from "./types.js";
-import { ContextNestError, ForgottenVersionError } from "./errors.js";
+import { ContextNestError, CorruptHistoryError, ForgottenVersionError } from "./errors.js";
 
 /** Artifact content for a version, or null when there is none to read. */
+/**
+ * Bytes a version file may hold per character of room: UTF-8 spends up to 3
+ * bytes on a character (CJK text), and an encrypted artifact's armour about
+ * a third more (measured: 4.06 for CJK) — so text of any script is read up
+ * to its character allowance.
+ */
+export const BYTES_PER_CHAR = 5;
+
+/** Characters hashed or replayed between yields to the event loop. */
+export const YIELD_EVERY = 2 ** 20;
+
 export type ArtifactReader = (
   version: number,
   /** Most bytes the file may hold to be read at all — larger is refused unread. */
@@ -214,4 +225,74 @@ async function applyWindow(
   }
 
   return content;
+}
+
+/**
+ * Every version a history rebuilds to, in one forward pass: each artifact read
+ * once — sized to what `budget` has left — and each diff applied once to the
+ * running text, every character read and every comparison charged, the event
+ * loop let in every so often. A version whose base does not rebuild (a missing
+ * artifact, a tombstone, a patch that does not fit) is skipped until the next
+ * keyframe. False once the budget is spent: what was visited is then partial.
+ */
+export async function replayEveryVersion(
+  versions: DocumentHistory["versions"],
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
+  budget: { left: number; spent?: boolean } | undefined,
+  visit: (text: string) => void,
+): Promise<boolean> {
+  const spend = (chars: number): boolean => {
+    if (!budget) return true;
+    budget.left -= chars;
+    if (budget.left < 0) budget.spent = true;
+    return !budget.spent;
+  };
+  let text: string | null = null;
+  let sinceYield = 0;
+  for (const e of versions) {
+    if (budget?.spent) return false;
+    if (e.tombstone) {
+      text = null;
+      continue;
+    }
+    const room = budget ? Math.max(0, budget.left) : Infinity;
+    let artifact: string | null;
+    try {
+      const maxBytes = budget ? BYTES_PER_CHAR * room : undefined;
+      artifact = e.keyframe
+        ? await readKeyframe(e.version, maxBytes)
+        : ((await readDiff(e.version, maxBytes)) ?? e.diff ?? null);
+    } catch (err) {
+      // Larger than the room left spends it, so the call is asked to split;
+      // otherwise unreadable — a version not known here.
+      if (budget && err instanceof CorruptHistoryError && err.ioError === "too-large") {
+        spend(room + 1);
+        return false;
+      }
+      artifact = null;
+    }
+    if (artifact === null) {
+      text = null;
+      continue;
+    }
+    if (!spend(artifact.length)) return false;
+    let cost = artifact.length;
+    if (e.keyframe) {
+      text = artifact;
+    } else if (text !== null) {
+      if (!spend(text.length)) return false;
+      const { result, compared } = applyPatchBounded(text, artifact);
+      if (!spend(compared)) return false;
+      cost += text.length + compared;
+      text = typeof result === "string" ? result : null;
+    }
+    if (text !== null) visit(text);
+    sinceYield += cost;
+    if (sinceYield >= YIELD_EVERY) {
+      sinceYield = 0;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return true;
 }

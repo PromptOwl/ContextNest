@@ -914,6 +914,66 @@ describe("forget and tombstones", () => {
     expect((await api.run<{ frontmatter: { status: string } }>("context_get", { id }, ctx)).frontmatter.status).not.toBe("forgotten");
   }, 60_000);
 
+  // r28 N1 (re-check of e78f66c): the rebuild ran reconstructVersion once
+  // per version — each replaying every diff since the keyframe — and charged
+  // only the rebuilt text: an imported history with one keyframe and 600
+  // versions made one forget record cost 31.7 s. One forward pass now, each
+  // artifact read once and each patch applied once, charged as it is spent.
+  it("r28 N1: one forget record naming a planted 600-version history is checked in one pass", async () => {
+    const kf = `---\ntitle: planted\n---\n${"line of planted text\n".repeat(200)}`;
+    const b = `${kf}one more line\n`;
+    const diffs = Array.from({ length: 599 }, (_, i) => (i % 2 ? createPatch("v", b, kf) : createPatch("v", kf, b)));
+    const planted = await importFiles([
+      ...plantedSet("nodes/notes", "planted", kf, diffs),
+      { path: "nodes/notes/planted.md", content: "---\ntitle: planted\ntype: document\n---\nlive body of the planted note\n" },
+    ]);
+    expect(planted.failed).toEqual([]);
+    const started = performance.now();
+    const r = await importFiles([
+      { path: ".versions/chain_events.yaml", content: forgetEvent("nodes/notes/planted", "one", `    body_hashes: ["${ZERO}"]\n`, `sha256:${"2".repeat(64)}`) },
+    ]);
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(r.failed).toHaveLength(1);
+  }, 120_000);
+
+  // r28 N1 (QA re-check of e78f66c): the per-import cache was keyed by the
+  // record's spelling of the id. On a file system that ignores case,
+  // `nodes/notes/HOT` and `Nodes/Notes/hot` read the same document and history,
+  // so each spelling rebuilt every version again. The cache is keyed by the
+  // spelling on disk (resolveDocumentIdCasing). Simulated here: every read
+  // folds the id's case, as such a file system resolves it.
+  it("r28 N1: case variants of one document's id rebuild its versions once", async () => {
+    const { applyImportedTombstones } = await import("../forget.js");
+    const { buildTombstoneIndex } = await import("../tombstones.js");
+    const id = "nodes/notes/hot";
+    await api.run("context_create", { id, title: "hot", content: "## Summary\nversion 1 of the hot note\n" }, ctx);
+    for (let v = 2; v <= 12; v++) await api.run("context_update", { id, content: `## Summary\nversion ${v} of the hot note\n` }, ctx);
+    const folding = new NestStorage(dir);
+    const fold = (x: string) => x.toLowerCase();
+    let artifactReads = 0;
+    const s = folding as unknown as Record<string, (...a: unknown[]) => unknown>;
+    // readDocument answers with the id it was asked for, as on such a file system.
+    const readDocument = s.readDocument.bind(folding);
+    s.readDocument = async (x: unknown, ...rest: unknown[]) => ({ ...(await readDocument(fold(String(x)), ...rest) as object), id: String(x) });
+    const readHistory = s.readHistory.bind(folding);
+    s.readHistory = (x: unknown, ...rest: unknown[]) => readHistory(fold(String(x)), ...rest);
+    for (const m of ["readKeyframe", "readDiff"]) {
+      const orig = s[m].bind(folding);
+      s[m] = (x: unknown, ...rest: unknown[]) => {
+        artifactReads++;
+        return orig(fold(String(x)), ...rest);
+      };
+    }
+    s.resolveDocumentIdCasing = async (x: unknown) => fold(String(x));
+    const spellings = ["nodes/notes/HOT", "Nodes/notes/hot", "nodes/Notes/hot", "NODES/NOTES/HOT", "nodes/notes/Hot", "nodes/notes/hOt"];
+    const events = spellings.map((docId, i) =>
+      yaml.load(forgetEvent(docId, `case-${i}`, `    body_hashes: ["${ZERO}"]\n`, `sha256:${String(i + 3).repeat(64)}`)),
+    ).flat();
+    const { refused } = await applyImportedTombstones(folding, events, buildTombstoneIndex([]));
+    expect(refused).toHaveLength(spellings.length);
+    expect(artifactReads).toBeLessThanOrEqual(12);
+  });
+
   it("r28 N1: rebuilding a copy's versions is charged to the import's replay budget", async () => {
     const id = "nodes/notes/budgeted";
     await api.run("context_create", { id, title: "budgeted", content: "## Summary\nfirst body of this note\n" }, ctx);

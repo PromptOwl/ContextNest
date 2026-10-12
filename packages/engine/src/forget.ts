@@ -41,6 +41,7 @@ import type {
 import type { NestStorage } from "./storage.js";
 import { assertErasableDocumentId, assertNotMachineryPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
+import { replayEveryVersion } from "./reconstruct.js";
 import { CheckpointManager } from "./checkpoint.js";
 // Type only: structure-store imports this module.
 import type { ReplayBudget } from "./structure-store.js";
@@ -553,12 +554,8 @@ export async function applyImportedTombstones(
 /**
  * Body hashes of a document's sealed versions — an erased body may sit in
  * one only, the live body edited since (§6.3.4: the copy still holds it).
- * Rebuilt once per document per import and charged to the import's replay
- * budget; null once that is spent.
- *
- * ponytail: charges each rebuilt version's length once, though rebuilding a
- * version replays up to a keyframe interval of diffs; charge the replay itself
- * if imports of long-history vaults need a tighter bound.
+ * Rebuilt once per document per import, in one forward pass charged to the
+ * import's replay budget; null once that is spent.
  */
 async function sealedBodies(
   storage: NestStorage,
@@ -567,31 +564,25 @@ async function sealedBodies(
   cache: Map<string, Set<string> | null>,
   budget: ReplayBudget | undefined,
 ): Promise<Set<string> | null> {
-  const cached = cache.get(node.id);
+  // Keyed by the spelling on disk: where names fold case, every spelling of
+  // the id reads this one document and history (#117).
+  const key = await storage.resolveDocumentIdCasing(node.id);
+  const cached = cache.get(key);
   if (cached !== undefined) return cached;
-  let bodies: Set<string> | null = new Set();
-  const vm = new VersionManager(storage);
-  for (const entry of history?.versions ?? []) {
-    if (entry.tombstone) continue;
-    let raw: string;
-    try {
-      raw = await vm.reconstructVersion(node.id, entry.version, history!);
-    } catch {
-      continue; // Unreconstructable: its content_hash still names it.
-    }
-    if (budget) {
-      budget.left -= raw.length;
-      if (budget.left < 0) budget.spent = true;
-      if (budget.spent) {
-        bodies = null;
-        break;
-      }
-    }
-    const h = forgettableBodyHash(raw);
-    if (h) bodies.add(h);
-  }
-  cache.set(node.id, bodies);
-  return bodies;
+  const bodies = new Set<string>();
+  const complete = await replayEveryVersion(
+    history?.versions ?? [],
+    (n, maxBytes) => storage.readKeyframe(key, n, { maxBytes }),
+    (n, maxBytes) => storage.readDiff(key, n, { maxBytes }),
+    budget,
+    (text) => {
+      const h = forgettableBodyHash(text);
+      if (h) bodies.add(h);
+    },
+  );
+  const result = complete ? bodies : null;
+  cache.set(key, result);
+  return result;
 }
 
 /**

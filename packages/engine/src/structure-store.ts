@@ -34,7 +34,7 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { applyPatchBounded, type ArtifactReader } from "./reconstruct.js";
+import { applyPatchBounded, type ArtifactReader, BYTES_PER_CHAR, YIELD_EVERY } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -280,14 +280,6 @@ const MAX_REPLAY_WORK = 128 * 2 ** 20;
 const MAX_REPLAY_READ = 64 * 2 ** 20;
 
 /**
- * Bytes a version file may hold per character of room: UTF-8 spends up to 3
- * bytes on a character (CJK text), and an encrypted artifact's armour about
- * a third more (measured: 4.06 for CJK) — so text of any script is read up
- * to its character allowance.
- */
-const BYTES_PER_CHAR = 5;
-
-/**
  * The most bytes one version file may hold to be read for a sealed head: the
  * read cap in characters, at the bytes any script and armour may take.
  * Larger is not trusted (judged in full) and never read.
@@ -302,9 +294,6 @@ export function sealedReaders(storage: NestStorage, id: string): { keyframe: Art
     diff: (n, maxBytes) => storage.readDiff(id, n, limit(maxBytes)),
   };
 }
-
-/** Characters hashed or replayed between yields to the event loop. */
-const YIELD_EVERY = 2 ** 20;
 
 /**
  * Replay work one caller allows across many sealed heads (an import judging a
