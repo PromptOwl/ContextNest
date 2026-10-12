@@ -15,7 +15,7 @@
  */
 
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
-import { rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { rmSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { packCli, freshInstall, runJourney, type Journey } from "./journey-harness.js";
 
@@ -640,8 +640,22 @@ const J4: Journey = {
 };
 
 /** The events a `ctx forget-log --json` payload records. */
-type ForgetEvent = { mode: string; reason_code: string; requested_by: string };
+type ForgetEvent = {
+  document_id: string;
+  mode: string; // "forget" (erase content, keep stub) vs "delete" (remove node)
+  reason_code: string;
+  requested_by?: string; // present for forget; delete events omit it
+};
 const forgetEvents = (data: unknown) => (data as { events: ForgetEvent[] }).events;
+const forgetEventFor = (data: unknown, id: string) =>
+  forgetEvents(data).find((e) => e.document_id === id);
+
+/** True if the secret token appears in any file under the given dir subtree. */
+const treeContains = (dir: string, token: string): boolean =>
+  readdirSync(dir, { recursive: true }).some((entry) => {
+    const p = join(dir, entry.toString());
+    return statSync(p).isFile() && readFileSync(p, "utf-8").includes(token);
+  });
 
 /**
  * J5 — "I erase a node on request and prove nothing leaks."
@@ -682,6 +696,13 @@ const J5: Journey = {
             "-y",
           ],
           files: [{ path: "nodes/jane-data.md", exists: true }],
+        },
+        // Revise it once so the node has TWO versions on the chain, both holding
+        // the secret — so "erased from every version in history" (J5-06) has
+        // something real to prove, not just the single live file.
+        {
+          args: ["update", "nodes/jane-data", "--body", `revised, ${SECRET} still here`, "-y"],
+          stdout: ["Version: 2"],
         },
         // A second node that is NEVER forgotten — the control for the
         // forget-vs-delete contrast in J5-05.
@@ -757,11 +778,19 @@ const J5: Journey = {
           stderr: ["DOCUMENT_EXISTS"],
         },
         // And editing the stub to republish content is refused outright — the
-        // real anti-resurrection guard.
+        // real anti-resurrection guard (DOCUMENT_EXISTS above only proves the
+        // path is occupied; this proves the content specifically can't return).
         {
           args: ["update", "nodes/jane-data", "--body", "bring it back", "-y"],
           status: 1,
           stderr: ["FORGOTTEN_DOCUMENT", "cannot be republished"],
+        },
+        // The refused write left the stub untouched — the rejected text is not
+        // in it, so nothing partially leaked through.
+        {
+          args: ["read", "nodes/jane-data"],
+          stdout: ["content was erased"],
+          stdoutNot: ["bring it back"],
         },
       ],
     },
@@ -795,13 +824,16 @@ const J5: Journey = {
       actions: [
         // Delete the untouched control node outright.
         { args: ["delete", "nodes/keepsake", "-y"], status: 0 },
-        // The audit trail distinguishes the two modes — one forgotten, one deleted.
-        // Bridge each id to its mode with a regex rather than embedding the em-dash
-        // separator literally (same non-ASCII-glyph caution as J2-05's ✓) — the
-        // pairing is still pinned: jane-data → forgotten, keepsake → deleted.
+        // The audit trail distinguishes the two modes. Assert it structurally
+        // from --json, keyed by node id — this pins the exact pairing (jane-data
+        // forgotten, keepsake deleted) instead of a loose cross-line text match,
+        // and sidesteps the em-dash separator entirely.
         {
-          args: ["forget-log"],
-          stdout: [/nodes\/jane-data[\s\S]*?forgotten/, /nodes\/keepsake[\s\S]*?deleted/],
+          args: ["forget-log", "--json"],
+          json: (data) => {
+            expect(forgetEventFor(data, "nodes/jane-data")?.mode).toBe("forget");
+            expect(forgetEventFor(data, "nodes/keepsake")?.mode).toBe("delete");
+          },
         },
         // The forgotten node is still addressable — its stub tombstone remains...
         {
@@ -810,6 +842,39 @@ const J5: Journey = {
         },
         // ...whereas the deleted node is gone entirely.
         { args: ["read", "nodes/keepsake"], status: 1, stderr: ["DOCUMENT_NOT_FOUND"] },
+      ],
+    },
+    {
+      id: "J5-06",
+      title: "The content is erased from history too — no past version survives and nothing is searchable",
+      actions: [
+        // The node had two versions (J5-01), both holding the secret. Neither
+        // can be reconstructed now — the keyframe and diff were erased, hashes
+        // kept, so reconstruction is refused rather than returning stale content.
+        {
+          args: ["reconstruct", "nodes/jane-data", "1"],
+          status: 1,
+          stderr: ["VERSION_FORGOTTEN"],
+        },
+        {
+          args: ["reconstruct", "nodes/jane-data", "2"],
+          status: 1,
+          stderr: ["VERSION_FORGOTTEN"],
+          // Belt-and-braces on-disk proof of "every version in history": the
+          // secret token is absent from the whole version-history subtree, not
+          // just unreadable through the CLI.
+          check: (vault) => {
+            const versions = join(vault, "nodes", ".versions", "jane-data");
+            expect(treeContains(versions, SECRET)).toBe(false);
+          },
+        },
+        // The natural leak check for a "prove nothing leaks" journey: a full-text
+        // search for the erased token finds nothing anywhere in the vault.
+        {
+          args: ["search", SECRET],
+          stdout: ["No results found"],
+          stdoutNot: [SECRET],
+        },
       ],
     },
   ],
