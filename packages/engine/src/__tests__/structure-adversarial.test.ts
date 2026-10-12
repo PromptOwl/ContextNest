@@ -606,6 +606,25 @@ describe("import path rules", () => {
       expect(await snapshot()).toEqual(before);
     },
   );
+
+  // Review of 7016294: only a `~digit` name was resolved, so a plainly named
+  // symlink or junction inside the vault (a git checkout makes one) let a
+  // write land in sealed history.
+  it("no write or erase reaches sealed history through a symlink or junction with an ordinary name", async () => {
+    const { symlink } = await import("node:fs/promises");
+    await api.run("context_create", { id: "nodes/notes/victim", title: "victim", content: "## Summary\nok\n" }, ctx);
+    await symlink(join(dir, "nodes/notes/.versions"), join(dir, "nodes/notes/evil"), process.platform === "win32" ? "junction" : "dir");
+    const store = "nodes/notes/.versions/victim";
+    const snapshot = async () => (await exportOf(dir, store)).map((f) => `${f.path}:${hex(f.content)}`).sort();
+    const before = await snapshot();
+    const A = "nodes/notes/evil/victim/v1";
+    await expect(api.run("context_update", { id: A, content: "evil", publish: false }, ctx)).rejects.toThrow(/reserved/);
+    await expect(api.run("context_publish", { id: A }, ctx)).rejects.toThrow(/reserved/);
+    await expect(api.run("context_delete", { id: A }, ctx)).rejects.toThrow(/reserved/);
+    const raw = "---\ntitle: evil\ntype: document\nstatus: published\n---\nevil\n";
+    await importFiles([{ path: "nodes/notes/evil/victim/v9.md", content: raw }], { overwrite: true });
+    expect(await snapshot()).toEqual(before);
+  });
 });
 
 // ─── PDF and sidecars ───────────────────────────────────────────────────────
@@ -1728,6 +1747,22 @@ describe("legitimate flows that must keep working", () => {
     await api.run("context_create", { id: "nodes/twin", title: "twin", content: "rooted\n" }, c);
     await writeFile(join(d, "twin.md"), "---\ntitle: twin\ntype: document\nstatus: draft\n---\nflat\n", "utf-8");
     expect((await api.run<{ body: string }>("context_get", { id: "twin" }, c)).body).toContain("flat");
+  });
+
+  // Review of 7016294: `readme` resolved to the vault root's README.md, and
+  // an update then wrote frontmatter into it; an unreadable root file hid
+  // the nodes/ document of the same bare id.
+  it("a bare id never resolves to a root scaffold file, and an unreadable root file does not hide nodes/", async () => {
+    const { c, root: d } = await freshVault("obsidian");
+    await writeFile(join(d, "README.md"), "# Repo readme\n", "utf-8");
+    await api.run("context_create", { id: "nodes/readme", title: "readme", content: "node\n" }, c);
+    await api.run("context_update", { id: "readme", content: "edited\n" }, c);
+    expect(await readFile(join(d, "README.md"), "utf-8")).toBe("# Repo readme\n");
+    expect((await api.run<{ body: string }>("context_get", { id: "nodes/readme" }, c)).body).toContain("edited");
+
+    await writeFile(join(d, "notes.md"), "---\ntitle: [unclosed\n---\nbroken\n", "utf-8");
+    await api.run("context_create", { id: "nodes/notes", title: "notes", content: "good\n" }, c);
+    expect((await api.run<{ body: string }>("context_get", { id: "notes" }, c)).body).toContain("good");
   });
 });
 

@@ -31,9 +31,11 @@ import {
   enforcedStructure,
   checkDocument,
   checkUpdate,
+  structureView,
   missingFolders,
   scaffoldFolders,
   assertWritableDocumentId,
+  assertNotMachineryPath,
   comparableSegment,
 } from "@promptowl/contextnest-engine";
 import type { ContextNode, Frontmatter, NestStorage, Violation } from "@promptowl/contextnest-engine";
@@ -161,8 +163,17 @@ export function parseRecipeManifest(body: string): RecipeManifest {
     // state); no nodes/ or packs/ keeps it from writing past governance —
     // compared as a case-insensitive volume or Windows would read the name.
     const root = comparableSegment(to.split("/")[0]);
-    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || root === "nodes" || root === "packs") {
-      throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/ and dot-folders`);
+    // _suggestions/ at any depth holds staged edits: a template there would be one.
+    const machinery = (() => {
+      try {
+        assertNotMachineryPath(to);
+        return false;
+      } catch {
+        return true;
+      }
+    })();
+    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || root === "nodes" || root === "packs" || machinery) {
+      throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/, _suggestions/ and dot-folders`);
     }
     return { from: normalizeDocumentId(str(entry.from, `files[${i}].from`)), to, extract: "yaml" as const };
   });
@@ -496,9 +507,9 @@ async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise
       }
       if (rules) {
         const incoming = parseDocument(`${step.to}.md`, step.content, step.to);
-        const after = { id: step.to, type: incoming.frontmatter.type, body: incoming.body };
+        const after = structureView(step.to, incoming);
         const violations = local
-          ? checkUpdate(rules, { id: step.to, type: local.frontmatter.type, body: local.body }, after)
+          ? checkUpdate(rules, structureView(step.to, local), after)
           : checkDocument(rules, after);
         if (violations.length > 0) {
           refuse(step, violations);

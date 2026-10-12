@@ -515,6 +515,7 @@ export {
   compileStructure,
   checkDocument,
   checkUpdate,
+  structureView,
   checkFolder,
   checkDeleteDocument,
   checkDeleteFolder,

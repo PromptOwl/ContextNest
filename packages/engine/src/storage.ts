@@ -299,18 +299,18 @@ export async function assertErasableDocumentId(root: string, id: string): Promis
 }
 
 /**
- * Refuse an id with a segment that may be an NTFS short name (`VERSIO~1`)
- * when the path it names resolves into vault machinery — which is where
- * Windows expands it (fs/promises `realpath` has `realpath.native`
- * semantics). Resolves the deepest part of the path that exists, so a new
- * file under an aliased folder is caught too. On a volume with no short
- * names (`~2` is an ordinary character there) nothing resolves differently,
- * so `Plan~2` is an ordinary name. Every document write and erase reaches
- * this; ids without `~` and a digit cost nothing.
+ * Refuse an id whose path resolves into vault machinery although its
+ * spelling does not: an NTFS short name (`VERSIO~1`, which Windows expands —
+ * fs/promises `realpath` has `realpath.native` semantics), or a symlink or
+ * junction inside the vault pointing at `.versions/`, `.context/` or
+ * `_suggestions/` (a git checkout can create one). Resolves the deepest part
+ * of the path that exists, so a new file under an aliased folder is caught
+ * too. Where nothing resolves differently, `Plan~2` is an ordinary name.
+ * Every document write and erase reaches this: two realpaths and
+ * log(depth) stats.
  */
 export async function assertResolvesOutsideMachinery(root: string, id: string): Promise<void> {
   const segs = id.split("/");
-  if (!segs.some((seg) => /~\d/.test(seg))) return;
   let base: string;
   try {
     base = await realpath(root);

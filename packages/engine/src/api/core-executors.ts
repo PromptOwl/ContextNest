@@ -48,6 +48,9 @@ import {
   assertSafeDocumentId,
   assertWritableDocumentId,
   assertWritableDocumentPath,
+  assertNotMachineryPath,
+  assertResolvesOutsideMachinery,
+  NON_DOCUMENT_BASENAMES,
 } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -244,7 +247,14 @@ async function givenId(ctx: OperationContext, id: string): Promise<string> {
   // Validated before anything is read for it: an id that is refused never
   // reaches the file system (nor answers with its path).
   assertSafeDocumentId(id);
-  if (id.includes("/") || (await readIfExists(ctx, id))) return id;
+  if (id.includes("/")) return id;
+  // A bare id names the vault root, where README.md, CLAUDE.md, CONTEXT.md …
+  // are scaffold, never documents — `readme` must not resolve to (and an
+  // update must not rewrite) one of them, whatever its case. A root file that
+  // will not read is no reason to miss the nodes/ one either.
+  const file = `${id}.md`.toLowerCase();
+  const scaffold = file === "context.md" || [...NON_DOCUMENT_BASENAMES].some((b) => b.toLowerCase() === file);
+  if (!scaffold && (await readIfExists(ctx, id).catch(() => null))) return id;
   const rooted = `nodes/${id}`;
   return (await readIfExists(ctx, rooted)) ? rooted : id;
 }
@@ -1188,6 +1198,15 @@ async function writeImportedFile(
       }
     }
   }
+  // A path spelled outside vault machinery must not land in it through a
+  // symlink or junction (history spelled as `.versions/…` is a restore).
+  let spelledMachinery = false;
+  try {
+    assertNotMachineryPath(relPath);
+  } catch {
+    spelledMachinery = true;
+  }
+  if (!spelledMachinery) await assertResolvesOutsideMachinery(ctx.storage.root, relPath.replace(/\.md$/i, ""));
   await ctx.storage.writeVaultFile(relPath, content);
 }
 

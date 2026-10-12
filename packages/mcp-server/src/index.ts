@@ -51,6 +51,7 @@ import {
   enforceStructure,
   checkDocument,
   checkUpdate,
+  structureView,
   missingFolders,
   scaffoldFolders,
   assertStructureDelete,
@@ -1123,7 +1124,7 @@ tool(
       }
 
       const refused = await structureRefusal((rules) =>
-        checkDocument(rules, { id, type: node.frontmatter.type, body: node.body }),
+        checkDocument(rules, structureView(id, node)),
       );
       if (refused) return refused;
 
@@ -1296,7 +1297,7 @@ tool(
       if (proposal) doc = parseDocument(doc.filePath, proposal.proposedRaw, id);
       // What the edit starts from, before `doc` is mutated in place below —
       // structure rules refuse only what the edit newly breaks.
-      const before = { id, type: doc.frontmatter.type, body: doc.body };
+      const before = structureView(id, doc);
 
       // Refuse content edits on rejected docs unless the caller explicitly
       // names a new status (revive to draft/pending_review/approved/published,
@@ -1379,7 +1380,7 @@ tool(
         };
       }
       const refused = await structureRefusal((rules) =>
-        checkUpdate(rules, before, { id, type: doc.frontmatter.type, body: doc.body }),
+        checkUpdate(rules, before, structureView(id, doc)),
       );
       if (refused) return refused;
       // A publishing edit is judged as its publish will be (a never-published
