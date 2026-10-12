@@ -591,8 +591,9 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
   const warnings: string[] = [];
   if (byPmid.size) {
     // MEDLINE publication types (esummary, 200 per request). A failure here
-    // costs the `#pubtype-*` tags, not the PubTator enrichment.
-    let pubtypes = new Map<string, string[]>();
+    // costs the `#pubtype-*` tags, not the PubTator enrichment, and leaves
+    // them unset so the next run retries.
+    let pubtypes: Map<string, string[]> | undefined;
     try {
       const sums = await esummaryPubmed([...byPmid.keys()], opts);
       pubtypes = new Map([...sums].map(([pmid, s]) => [pmid, s.pubtypes]));
@@ -613,7 +614,9 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
     }
     for (const [pmid, node] of byPmid) {
       const s = summaries.get(pmid);
-      const types = pubtypes.get(pmid);
+      // A PMID esummary answered for without a record has no known types: store
+      // [] so the "already enriched" check settles instead of re-enriching forever.
+      const types = pubtypes ? (pubtypes.get(pmid) ?? []) : undefined;
       if (!s) {
         unresolved.push(`${node.id} (PubTator has no record for PMID ${pmid})`);
         // Publication types alone are still worth writing (once).

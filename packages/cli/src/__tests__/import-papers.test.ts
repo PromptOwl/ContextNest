@@ -246,6 +246,32 @@ describe("enrichPubTator", () => {
     expect(doc.frontmatter.version).toBe(3);
   });
 
+  it("does not re-enrich forever when PubMed has no summary for the PMID, but retries after an esummary failure", async () => {
+    const withSummary = (esummary: () => Response) =>
+      (async (input: string | URL) =>
+        /esummary\.fcgi/.test(String(input)) ? esummary() : fetchImpl(input)) as unknown as typeof fetch;
+    const id = "nodes/papers/doi-10-1016-j-cgh-2018-07-026";
+    await importJats({ storage, api, ctx, sources: [{ name: "cited.xml", xml: citedXml }] });
+
+    // esummary down: PubTator still applies, and the next run tries again.
+    const down = withSummary(() => new Response("boom", { status: 500 }));
+    const r1 = await enrichPubTator({ storage, api, ctx, fetchImpl: down, minIntervalMs: 0 });
+    expect(r1.enriched.map((e) => e.id)).toEqual([id]);
+    expect(r1.warnings).toEqual([expect.stringMatching(/^publication types not fetched/)]);
+    const r2 = await enrichPubTator({ storage, api, ctx, fetchImpl: down, minIntervalMs: 0 });
+    expect(r2.enriched.map((e) => e.id)).toEqual([id]);
+
+    // esummary answers but has no record: settle on "no types", then skip.
+    const missing = withSummary(() => new Response(JSON.stringify({ result: { uids: [] } }), { status: 200 }));
+    const r3 = await enrichPubTator({ storage, api, ctx, fetchImpl: missing, minIntervalMs: 0 });
+    expect(r3.enriched.map((e) => e.id)).toEqual([id]);
+    const doc = (await storage.discoverDocuments()).find((d) => d.id === id)!;
+    expect((doc.frontmatter.metadata as Record<string, unknown>).publication_types).toEqual([]);
+    const r4 = await enrichPubTator({ storage, api, ctx, fetchImpl: missing, minIntervalMs: 0 });
+    expect(r4.enriched).toEqual([]);
+    expect(r4.skipped).toEqual([`${id} (already enriched)`]);
+  });
+
   it("accepts a short id and reports an unknown one", async () => {
     await importJats({ storage, api, ctx, sources: [{ name: "cited.xml", xml: citedXml }] });
     const r = await enrichPubTator({
