@@ -911,6 +911,12 @@ export class NestStorage {
       includeSuperseded?: boolean;
       folder?: string;
       recursive?: boolean;
+      /**
+       * A document whose frontmatter does not parse, or (vault unlocked) whose
+       * sealed bytes do not open, is skipped — one bad file used to take every
+       * list, search and checkpoint down — and named here. Verify reports it.
+       */
+      onUnreadable?: (id: string, reason: string) => void;
     } = {},
   ): Promise<ContextNode[]> {
     const layout = await this.detectLayout();
@@ -938,8 +944,16 @@ export class NestStorage {
     const parsed = await mapInBatches(files.sort(), async (file) => {
       const filePath = join(this.root, file);
       const id = file.replace(/\.md$/, "");
-      const content = await this.readText(filePath, "doc", id);
-      const node = parseDocument(filePath, content, id);
+      let node: ContextNode;
+      try {
+        node = parseDocument(filePath, await this.readText(filePath, "doc", id), id);
+      } catch (err) {
+        // A missing or wrong key fails at unlock (VAULT_LOCKED,
+        // VAULT_KEY_MISMATCH) and still throws: a locked vault never lists empty.
+        if (!(err instanceof yaml.YAMLException) && (err as { code?: string }).code !== "DECRYPTION_FAILED") throw err;
+        options.onUnreadable?.(id, err instanceof Error ? err.message : String(err));
+        return null;
+      }
       // Root-level discovery (structured layout) globs *.md at the vault root so
       // a node can live anywhere. But a vault root commonly holds scaffold files
       // (CHANGELOG, CONTRIBUTING, LICENSE, SECURITY, …) that are NOT knowledge
@@ -1018,6 +1032,15 @@ export class NestStorage {
 
     await scan(base, options.recursive === false ? 1 : Infinity);
     return found.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * Read a document from text as this vault would read it from disk — opened
+   * when sealed, then parsed. Throws when it would not read (frontmatter that
+   * does not parse, sealed bytes that do not open with this vault's key).
+   */
+  async readDocumentText(id: string, raw: string): Promise<ContextNode> {
+    return parseDocument(join(this.root, `${id}.md`), await this.openText(raw, "doc", id), id);
   }
 
   /**
@@ -1204,6 +1227,8 @@ export class NestStorage {
    *   - cross_chain_mismatch / checkpoint_hash_mismatch in checkpoints
    *   - body_drift when live `.md` body sha256 != frontmatter.checksum
    *   - unreadable_history when a history.yaml exists but cannot be parsed
+   *   - unreadable_document when a document's frontmatter does not parse, or
+   *     its sealed bytes do not open with the vault's key
    *   - version_unreconstructable when a recorded version no longer rebuilds
    *     from its keyframe+diff chain (see verifyHistoryChain)
    *   - sidecar_drift / sidecar_missing for pdf nodes (see verifyPdfSidecars)
@@ -1259,8 +1284,12 @@ export class NestStorage {
 
     errors.push(...(await this.findUnencryptedFiles()));
 
-    // Integrity check must verify every doc on disk, including retired ones.
-    const liveDocs = await this.discoverDocuments({ includeRetired: true });
+    // Integrity check must verify every doc on disk, including retired ones,
+    // and name any it cannot read.
+    const liveDocs = await this.discoverDocuments({
+      includeRetired: true,
+      onUnreadable: (id, reason) => errors.push({ type: "unreadable_document", document: id, expected: null, actual: reason }),
+    });
     errors.push(...(await this.verifyPdfSidecars(liveDocs)));
     // Forget protocol (§6.3): erased content must stay erased, and every
     // tombstone must be accounted for by a recorded forget.
@@ -3072,21 +3101,34 @@ export class NestStorage {
   async findAllHistories(
     onUnreadable?: (docId: string, reason: string) => void,
   ): Promise<Map<string, DocumentHistory>> {
+    // A folder or link in history.yaml's place is unreadable too, not absent.
+    const notFiles: string[] = [];
     const historyFiles = await globFiles(
       this.root,
       "**/.versions/*/history.yaml",
+      [],
+      false,
+      notFiles,
     );
-
-    // Read in batches, then fold in input order so the map's iteration order
-    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
-    const read = await mapInBatches(historyFiles, async (file) => {
-      // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
+    // Extract doc ID from path: e.g. "nodes/.versions/api-design/history.yaml" -> "nodes/api-design"
+    const docIdOf = (file: string): string | null => {
       const parts = file.split("/");
       const versionsIdx = parts.indexOf(".versions");
       if (versionsIdx === -1) return null;
       const docDir = parts.slice(0, versionsIdx).join("/");
       const docName = parts[versionsIdx + 1];
-      const docId = docDir ? `${docDir}/${docName}` : docName;
+      return docDir ? `${docDir}/${docName}` : docName;
+    };
+    for (const file of notFiles) {
+      const docId = docIdOf(file);
+      if (docId) onUnreadable?.(docId, "history.yaml is not a regular file");
+    }
+
+    // Read in batches, then fold in input order so the map's iteration order
+    // (and the order `onUnreadable` fires) stays what a serial crawl produced.
+    const read = await mapInBatches(historyFiles, async (file) => {
+      const docId = docIdOf(file);
+      if (docId === null) return null;
       try {
         const raw = yaml.load(await readFile(join(this.root, file), "utf-8"));
         return { docId, raw, error: null as string | null };

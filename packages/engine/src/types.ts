@@ -721,6 +721,9 @@ export interface VerificationReport {
       | "checkpoint_hash_mismatch"
       | "body_drift"
       | "unreadable_history"
+      // A document whose frontmatter does not parse, or whose sealed bytes do
+      // not open with the vault's key — skipped by every crawl, named here.
+      | "unreadable_document"
       // A recorded version can no longer be rebuilt from its keyframe+diff
       // chain (§6.1), even when every stored hash still agrees — e.g. an
       // import overwrote version artifacts and rewrote their fingerprints

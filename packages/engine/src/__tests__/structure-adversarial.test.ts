@@ -726,25 +726,37 @@ describe("encryption", () => {
     expect((await storage.readDocument("nodes/notes/d")).frontmatter).toMatchObject({ title: "d", type: "document" });
   });
 
-  // FINDING (r15 s3enc, open — PRD §10.1 known items): an import lands a sealed .md
-  // whose authenticated text was altered (here its title, in an encrypted
-  // vault's own export) verbatim — sealed bytes are written as they come —
-  // and from then on context_list and context_verify fail for the whole vault
-  // with DECRYPTION_FAILED instead of reporting the one document. Repro:
-  // encrypt a vault, create nodes/notes/a, re-import nodes/notes/a.md with
-  // "title: a" changed to "title: z" (overwrite), run context_list.
-  it.fails("r15 s3enc: a sealed document altered in transit is refused, or reported by verify — it never takes list and verify down", async () => {
+  // r15 s3enc (fixed): an import landed a sealed .md whose authenticated text
+  // was altered (here its title, in an encrypted vault's own export) verbatim,
+  // and from then on context_list and context_verify failed for the whole
+  // vault with DECRYPTION_FAILED. Now the import refuses a document that would
+  // not read, and one damaged on disk is skipped by every crawl and named by
+  // verify — while a vault with no key, or the wrong one, still refuses to
+  // list rather than listing empty.
+  it("r15 s3enc: a sealed document altered in transit is refused, and one damaged on disk never takes list and verify down", async () => {
     setDefaultVaultKeyStore(new MemoryKeyStore());
     await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
     await api.run("context_create", { id: "nodes/notes/a", title: "a", content: "body\n" }, ctx);
     await api.run("context_create", { id: "nodes/notes/b", title: "b", content: "body b\n" }, ctx);
     const raw = await readFile(join(dir, "nodes/notes/a.md"), "utf-8");
     expect(raw).toContain("title: a");
-    const r = await importFiles([{ path: "nodes/notes/a.md", content: raw.replace("title: a", "title: z") }], { overwrite: true });
-    if (r.failed.length === 0) {
-      expect((await api.run<{ documents: unknown[] }>("context_list", {}, ctx)).documents.length).toBeGreaterThan(0);
-      const verify = await api.run<{ valid: boolean; errors: { document?: string }[] }>("context_verify", {}, ctx);
-      expect(verify.errors.some((e) => e.document === "nodes/notes/a")).toBe(true);
+    const altered = raw.replace("title: a", "title: z");
+    const r = await importFiles([{ path: "nodes/notes/a.md", content: altered }], { overwrite: true });
+    expect(r.failed.map((f) => f.error).join("\n")).toMatch(/does not read as a document/);
+    expect(await readFile(join(dir, "nodes/notes/a.md"), "utf-8")).toBe(raw);
+
+    await writeFile(join(dir, "nodes/notes/a.md"), altered, "utf-8");
+    const listed = (await api.run<{ documents: { id: string }[] }>("context_list", {}, ctx)).documents.map((d) => d.id);
+    expect(listed).toContain("nodes/notes/b");
+    expect(listed).not.toContain("nodes/notes/a");
+    const verify = await api.run<{ valid: boolean; errors: { type: string; document?: string }[] }>("context_verify", {}, ctx);
+    expect(verify.valid).toBe(false);
+    expect(verify.errors).toContainEqual(expect.objectContaining({ type: "unreadable_document", document: "nodes/notes/a" }));
+    for (const s of [
+      new NestStorage(dir, { encryption: { keyStore: new MemoryKeyStore() } }),
+      new NestStorage(dir, { encryption: { kek: Buffer.alloc(32, 7) } }),
+    ]) {
+      await expect(api.run("context_list", {}, context(s))).rejects.toMatchObject({ code: expect.stringMatching(/^VAULT_(LOCKED|KEY_MISMATCH)$/) });
     }
   });
 });
@@ -860,23 +872,28 @@ describe("document parsing", () => {
     expect((await refusal("context_publish", { id })).code).toBe("VALIDATION_FAILED");
   });
 
-  // FINDING (r12 badfm / r8 badsib, open — PRD §10.1 known items): an import lands a
-  // .md whose frontmatter does not parse (rules on or off), and from then on
-  // context_list and context_search throw YAMLException, and every write
-  // writes its document and then throws from the checkpoint crawl
-  // (createCheckpointFromVault → discoverDocuments) — reported failed, landed
-  // on disk. Repro: context_import files [{ path: "nodes/notes/bad.md",
-  // content: "---\ntitle: [\n---\nx\n" }], then context_list; or
-  // context_create nodes/other/k: throws, and k.md exists.
-  it.fails("r12 badfm / r8 badsib: a document whose frontmatter does not parse never takes list down, nor turns a write into a false failure", async () => {
-    const r = await importFiles([{ path: "nodes/notes/bad.md", content: "---\ntitle: [\n---\nx\n" }]);
-    expect(r.failed).toEqual([]);
-    const outcome = await api.run("context_create", { id: "nodes/other/k", title: "k", content: "x" }, ctx).then(
-      () => "landed",
-      () => "refused",
-    );
-    expect(outcome).toBe((await exists("nodes/other/k.md")) ? "landed" : "refused");
-    await api.run("context_list", {}, ctx);
+  // r12 badfm / r8 badsib (fixed): an import landed a .md whose frontmatter
+  // does not parse, and from then on context_list and context_search threw
+  // YAMLException, and every write wrote its document and then threw from the
+  // checkpoint crawl (createCheckpointFromVault → discoverDocuments) —
+  // reported failed, landed on disk. Now the import refuses it, and one
+  // already on disk is skipped by every crawl and named by verify.
+  it("r12 badfm / r8 badsib: a document whose frontmatter does not parse is refused, and one on disk never takes list down nor turns a write into a false failure", async () => {
+    const bad = "---\ntitle: [\n---\nx\n";
+    const r = await importFiles([{ path: "nodes/notes/bad.md", content: bad }]);
+    expect(r.failed).toHaveLength(1);
+    expect(r.failed[0].error).toMatch(/does not read as a document/);
+    expect(await exists("nodes/notes/bad.md")).toBe(false);
+
+    await mkdir(join(dir, "nodes/notes"), { recursive: true });
+    await writeFile(join(dir, "nodes/notes/bad.md"), bad, "utf-8");
+    await api.run("context_create", { id: "nodes/other/k", title: "k", content: "x" }, ctx);
+    expect(await exists("nodes/other/k.md")).toBe(true);
+    const listed = (await api.run<{ documents: { id: string }[] }>("context_list", {}, ctx)).documents.map((d) => d.id);
+    expect(listed).toContain("nodes/other/k");
+    await api.run("context_search", { query: "x" }, ctx);
+    const verify = await api.run<{ errors: { type: string; document?: string }[] }>("context_verify", {}, ctx);
+    expect(verify.errors).toContainEqual(expect.objectContaining({ type: "unreadable_document", document: "nodes/notes/bad" }));
   });
 
   // r8 jats (fixed in round 25): jatsToDocument trimmed inline
@@ -1275,13 +1292,12 @@ describe("legitimate flows that must keep working", () => {
     },
   );
 
-  // FINDING (r15 corrupt, open — PRD §10.1 known items): verify crawls
-  // **/.versions/*/history.yaml as files, so a folder in history.yaml's place
-  // drops the document from the crawl and verify passes green — the silent
-  // green findAllHistories' onUnreadable exists to prevent. Repro: create a
-  // document, replace nodes/notes/.versions/x/history.yaml with a folder, run
-  // context_verify: { valid: true, errors: [] }.
-  it.fails("r15 corrupt: a history.yaml with a folder in its place is reported by verify, never passed green", async () => {
+  // r15 corrupt (fixed): verify crawled **/.versions/*/history.yaml as files
+  // only, so a folder in history.yaml's place dropped the document from the
+  // crawl and verify passed green — the silent green findAllHistories'
+  // onUnreadable exists to prevent. The crawl now reports a matching path that
+  // is not a regular file as unreadable.
+  it("r15 corrupt: a history.yaml with a folder in its place is reported by verify, never passed green", async () => {
     const id = "nodes/notes/x";
     await api.run("context_create", { id, title: "x", content: "## Summary\nv1\n" }, ctx);
     await api.run("context_update", { id, content: "## Summary\nv2\n" }, ctx);
@@ -1294,14 +1310,24 @@ describe("legitimate flows that must keep working", () => {
     expect(verify.errors.some((e) => e.document === id)).toBe(true);
   });
 
-  // FINDING (r19 obsid / r21 obsforget, open — PRD §10.1 known items): in a flat
-  // (obsidian) vault, context_create { id: "doc" } re-roots the bare id under
-  // nodes/ (normalizeDocumentId) and returns "nodes/doc", but context_update
-  // { id: "doc" } then answers DOCUMENT_NOT_FOUND. The QA worked around it by
-  // using the returned id.
-  it.fails("r19 obsid: in a flat vault a document created under a bare id is found again by that id", async () => {
+  // r19 obsid / r21 obsforget (fixed): context_create { id: "doc" } re-roots
+  // the bare id under nodes/ (normalizeDocumentId) and returns "nodes/doc",
+  // but every lookup took the id as given, so context_update { id: "doc" }
+  // answered DOCUMENT_NOT_FOUND. A bare id that names no document now resolves
+  // to the one create gave it; a document at the bare id still wins.
+  it("r19 obsid: in a flat vault a document created under a bare id is found again by that id", async () => {
     const { c } = await freshVault("obsidian");
     await api.run("context_create", { id: "doc", title: "doc", content: "one\n" }, c);
     await api.run("context_update", { id: "doc", content: "two\n" }, c);
+    expect((await api.run<{ body: string }>("context_get", { id: "doc" }, c)).body).toContain("two");
+    await api.run("context_forget", { id: "doc", reason_code: "user_request" }, c);
+    await expect(api.run("context_get", { id: "nodes/doc" }, c)).resolves.toMatchObject({ frontmatter: { status: "forgotten" } });
+  });
+
+  it("r19 obsid: a document at the bare id itself wins over the nodes/ one", async () => {
+    const { c, root: d } = await freshVault("obsidian");
+    await api.run("context_create", { id: "nodes/twin", title: "twin", content: "rooted\n" }, c);
+    await writeFile(join(d, "twin.md"), "---\ntitle: twin\ntype: document\nstatus: draft\n---\nflat\n", "utf-8");
+    expect((await api.run<{ body: string }>("context_get", { id: "twin" }, c)).body).toContain("flat");
   });
 });

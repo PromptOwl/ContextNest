@@ -148,6 +148,17 @@ export function historyMember(relPath: string): string | null {
  * is still a document — checked as type document with its raw text.
  */
 export function importedDoc(relPath: string, content: string): StructureDoc | null {
+  const id = importedDocId(relPath);
+  if (id === null) return null;
+  try {
+    return structureView(id, parseDocument(`${id}.md`, content, id));
+  } catch {
+    return { id, body: content };
+  }
+}
+
+/** The id discovery will read an imported file as, or null when it is no document. */
+function importedDocId(relPath: string): string | null {
   const norm = relPath.replace(/\\/g, "/");
   const last = norm.split("/").pop() ?? norm;
   // What discovery will read as a node: a lowercase `.md`, not history, not a
@@ -157,12 +168,7 @@ export function importedDoc(relPath: string, content: string): StructureDoc | nu
   if (isVersionArtifactPath(norm) || !/\.md$/i.test(last) || last.startsWith(".")) return null;
   if (NON_DOCUMENT_BASENAMES.has(last)) return null;
   if (norm.split("/").includes("_suggestions")) return null;
-  const id = norm.slice(0, -".md".length);
-  try {
-    return structureView(id, parseDocument(`${id}.md`, content, id));
-  } catch {
-    return { id, body: content };
-  }
+  return norm.slice(0, -".md".length);
 }
 
 /** Where a document's history and staged edits live: `<dir>/<store>/<doc>/…`. */
@@ -296,6 +302,24 @@ async function importVerdicts(
 }
 
 /** Every per-file refusal of an import that needs no structure rules. */
+/**
+ * A document lands only if it reads: frontmatter that parses, sealed bytes
+ * that open with this vault's key. A trusted restore (`structure: "skip"`)
+ * keeps what it brings; every crawl skips such a file and verify names it.
+ */
+async function assertReadable(ctx: OperationContext, f: { raw: string; path: string; content: string }): Promise<void> {
+  const id = importedDocId(f.path);
+  if (id === null || ctx.structure === "skip") return;
+  try {
+    await ctx.storage.readDocumentText(id, f.content);
+  } catch (err) {
+    throw new ContextNestError(
+      `${f.raw}: does not read as a document — ${err instanceof Error ? err.message : String(err)}`,
+      "VALIDATION_FAILED",
+    );
+  }
+}
+
 async function assertImportable(
   ctx: OperationContext,
   f: { raw: string; path: string; content: string },
@@ -334,6 +358,7 @@ async function assertImportable(
     throw new ContextNestError(`${f.raw}: .versions/${segs[k + 1]} is the vault's own, not a document's history`, "VALIDATION_FAILED");
   }
   await assertNoCaseTwin(ctx, f);
+  await assertReadable(ctx, f);
   await assertSidecarKept(ctx, f, budget);
   if (ctx.structure !== "skip" && (isSettingsPath(f.raw) || isSettingsPath(f.path))) {
     throw new ContextNestError(

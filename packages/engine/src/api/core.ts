@@ -781,6 +781,7 @@ const verifyError = z.object({
     "checkpoint_hash_mismatch",
     "body_drift",
     "unreadable_history",
+    "unreadable_document",
     "version_unreconstructable",
     "sidecar_drift",
     "sidecar_missing",

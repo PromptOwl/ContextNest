@@ -220,8 +220,8 @@ async function resolveId(
       "VALIDATION_FAILED",
     );
   }
-  if (sel.id) return sanitizeId(sel.id);
-  if (sel.uri) return sanitizeId(parseUri(sel.uri).path);
+  if (sel.id) return givenId(ctx, sanitizeId(sel.id));
+  if (sel.uri) return givenId(ctx, sanitizeId(parseUri(sel.uri).path));
   // includeRetired, or a title lookup cannot see a rejected document at all and
   // falls through to the slug guess below — which quietly resolves to whatever
   // sits at that slug, or to nothing for a doc created with a custom id. The
@@ -232,6 +232,17 @@ async function resolveId(
   );
   if (match) return match.id;
   return normalizeDocumentId(requireSlug(String(sel.title)));
+}
+
+/**
+ * A caller's id is used as given when a document is there (flat-layout ids
+ * carry no nodes/ prefix). A bare one that names none is the id create gave
+ * it — normalizeDocumentId roots it under nodes/ — when that one exists.
+ */
+async function givenId(ctx: OperationContext, id: string): Promise<string> {
+  if (id.includes("/") || (await readIfExists(ctx, id))) return id;
+  const rooted = `nodes/${id}`;
+  return (await readIfExists(ctx, rooted)) ? rooted : id;
 }
 
 /**
@@ -618,8 +629,8 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // `nodes/`, which silently redirects every id from a flat-layout vault (they
   // carry no prefix) to a document that doesn't exist. The storage layer
   // already resolves an id for its own layout — all this has to do is refuse
-  // one that would escape the vault root.
-  const id: string = input.id;
+  // one that would escape the vault root, and find a bare id where create put it.
+  const id: string = await givenId(ctx, input.id);
   // An update writes the file before any publish, so a reserved path
   // (§11.1.1: `.versions/`, `_suggestions/`, the root `packs/`) is refused
   // here, not left to the publish guard after the edit has landed.
@@ -843,7 +854,7 @@ const forget: OperationExecutor = async (ctx, input: any) => {
 };
 
 const forgetLogExec: OperationExecutor = async (ctx, input: any) => {
-  const id = input?.id ? sanitizeId(String(input.id)) : undefined;
+  const id = input?.id ? await givenId(ctx, sanitizeId(String(input.id))) : undefined;
   const records = await forgetLog(ctx.storage, id);
   return {
     events: records.map((r) => ({
@@ -989,8 +1000,7 @@ const init: OperationExecutor = async (ctx, input: any) => {
  * renders `mcp____context_skill`.
  */
 async function loadSkillNode(ctx: OperationContext, input: any) {
-  const id = normalizeDocumentId(String(input.id ?? ""));
-  assertSafeDocumentId(id);
+  const id = await givenId(ctx, sanitizeId(String(input.id ?? "")));
   const [live, config] = await Promise.all([ctx.storage.readDocument(id), ctx.storage.readConfig()]);
 
   // A rejected node does not dead-end: it falls back to the last APPROVED version,
