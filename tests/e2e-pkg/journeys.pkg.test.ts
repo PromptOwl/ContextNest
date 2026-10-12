@@ -15,7 +15,15 @@
  */
 
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
-import { rmSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import {
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  existsSync,
+} from "node:fs";
 import { join } from "node:path";
 import { packCli, freshInstall, runJourney, type Journey } from "./journey-harness.js";
 
@@ -650,12 +658,28 @@ const forgetEvents = (data: unknown) => (data as { events: ForgetEvent[] }).even
 const forgetEventFor = (data: unknown, id: string) =>
   forgetEvents(data).find((e) => e.document_id === id);
 
-/** True if the secret token appears in any file under the given dir subtree. */
-const treeContains = (dir: string, token: string): boolean =>
-  readdirSync(dir, { recursive: true }).some((entry) => {
-    const p = join(dir, entry.toString());
-    return statSync(p).isFile() && readFileSync(p, "utf-8").includes(token);
-  });
+/**
+ * Scan every file under `dir` (recursively) for `token`, reading raw bytes via
+ * `Buffer.includes` (no text decode, so a binary file is safe to scan).
+ * Returns how many files were inspected and which ones contained the token — so
+ * a leak check can assert BOTH that the scan was meaningful (files > 0, not a
+ * vacuous pass over an empty or removed tree) and that nothing leaked (hits
+ * empty, naming any offender).
+ */
+const scanTreeForToken = (
+  dir: string,
+  token: string,
+): { files: number; hits: string[] } => {
+  const hits: string[] = [];
+  let files = 0;
+  for (const entry of readdirSync(dir, { recursive: true })) {
+    const rel = entry.toString();
+    if (!statSync(join(dir, rel)).isFile()) continue;
+    files++;
+    if (readFileSync(join(dir, rel)).includes(token)) hits.push(rel);
+  }
+  return { files, hits };
+};
 
 /**
  * J5 — "I erase a node on request and prove nothing leaks."
@@ -861,11 +885,23 @@ const J5: Journey = {
           status: 1,
           stderr: ["VERSION_FORGOTTEN"],
           // Belt-and-braces on-disk proof of "every version in history": the
-          // secret token is absent from the whole version-history subtree, not
-          // just unreadable through the CLI.
+          // secret token survives nowhere in the WHOLE vault — version keyframes
+          // and diffs, context.yaml, INDEX.md, checkpoint history and chain logs
+          // included (the CLI-level checks above only cover indexed/reachable
+          // paths). Reading bytes, so binary files are safe.
           check: (vault) => {
+            // Hashes are kept, so the version-history subtree still exists with
+            // files — assert that first, so the whole-vault scan below can't
+            // pass vacuously over a tree that forget removed rather than erased.
             const versions = join(vault, "nodes", ".versions", "jane-data");
-            expect(treeContains(versions, SECRET)).toBe(false);
+            expect(
+              existsSync(versions),
+              "version-history subtree should survive forget (hashes kept)",
+            ).toBe(true);
+            expect(scanTreeForToken(versions, SECRET).files).toBeGreaterThan(0);
+            // Nothing anywhere in the vault still carries the erased token.
+            const leaks = scanTreeForToken(vault, SECRET).hits;
+            expect(leaks, `secret leaked into: ${leaks.join(", ")}`).toEqual([]);
           },
         },
         // The natural leak check for a "prove nothing leaks" journey: a full-text
