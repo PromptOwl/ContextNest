@@ -161,12 +161,13 @@ const RESERVED_SEGMENTS = new Set([".context", ".versions", "_suggestions"]);
  * suffix dropped, because Windows drops them: `.context.` IS `.context` there. Reads keep going through
  * {@link assertSafeDocumentId} alone.
  *
- * `existing`: the id names a document already on disk. Its name is held to
- * what the file system holds (as for an erase), not to the stricter limits
- * for new names, so no document that exists is frozen against edits.
+ * `existing`: the id names a document already on disk. Each name is held to
+ * what the file system holds (as for an erase), not to the stricter limit
+ * for new names, so a document with a long name is not frozen against edits.
+ * The whole id stays capped at MAX_DOCUMENT_ID_LENGTH either way.
  */
 export function assertWritableDocumentId(raw: string, existing = false): void {
-  if (existing) assertFitsFileSystem(raw, 255, 4096, true);
+  if (existing) assertFitsFileSystem(raw, 255, MAX_DOCUMENT_ID_LENGTH, true);
   else assertFitsFileSystem(raw);
   const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}…` : raw);
   assertSafeDocumentId(raw);
