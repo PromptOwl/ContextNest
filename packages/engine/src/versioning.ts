@@ -18,6 +18,17 @@ import { ContextNestError, CorruptHistoryError } from "./errors.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
+/**
+ * Largest document (serialized characters, UTF-16 units — not bytes) a new
+ * version is stored as a diff for, on either side of the diff. Above it the
+ * version is a keyframe: a diff would first replay the chain
+ * to rebuild the previous version, then run `createPatch` over the whole text
+ * in one synchronous call — seconds of blocked event loop on a 10 MB document.
+ * ponytail: costs a full copy per version of such a document; a cheaper diff
+ * (common prefix/suffix trimmed before createPatch) if that storage matters.
+ */
+const MAX_DIFF_CHARS = 2 ** 20;
+
 /** What {@link VersionManager.historyOrRepair} found, and what it had to do. */
 export interface ResilientHistory {
   /** The parsed history, or null when there is none to read. */
@@ -166,13 +177,14 @@ export class VersionManager {
     };
 
     const currentVersion = node.frontmatter.version || 1;
+    const fullContent = serializeDocument(node);
     let isKeyframe =
       options.keyframe === true ||
       history.versions.length === 0 ||
       currentVersion % history.keyframe_interval === 1 ||
-      currentVersion === 1;
+      currentVersion === 1 ||
+      fullContent.length > MAX_DIFF_CHARS;
 
-    const fullContent = serializeDocument(node);
     const editedAt = new Date().toISOString();
 
     let contentForHash: string;
@@ -193,6 +205,13 @@ export class VersionManager {
           history,
         );
       } catch {
+        isKeyframe = true;
+      }
+      // Shrinking back under the bound still diffs against the large previous
+      // text — the same synchronous createPatch. A keyframe instead (cheap to
+      // reach: that previous version was itself a size keyframe).
+      if (previousContent !== null && previousContent.length > MAX_DIFF_CHARS) {
+        previousContent = null;
         isKeyframe = true;
       }
     }

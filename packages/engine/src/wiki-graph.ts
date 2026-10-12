@@ -49,6 +49,9 @@ const CONTEXT_LINK =
 
 /** Extract all contextnest:// link targets from a markdown body */
 export function extractContextLinks(body: string): string[] {
+  // Exact shortcut: masking only blanks text, so no literal, no link. Spares
+  // the line split of every large link-free body on every index rebuild.
+  if (!body.includes("contextnest://")) return [];
   // CRLF, LF and lone CR: `.` does not match `\r` in a JS regex, so a stray
   // carriage return would defeat every end-anchored pattern below.
   const lines = splitLines(body);
@@ -105,6 +108,7 @@ export interface WikiDocLike {
  * not a link.
  */
 export function extractWikiLinks(body: string): string[] {
+  if (!body.includes("[[")) return []; // exact shortcut, as in extractContextLinks
   const out = new Set<string>();
   // Inner class excludes '[' as well as ']' so it can't backtrack across
   // overlapping '[[' — keeps this linear and avoids the polynomial-ReDoS

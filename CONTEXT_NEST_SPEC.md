@@ -1290,7 +1290,7 @@ For tools that support versioning, version history is stored in `.versions/{docu
 
 Version history uses a **keyframe + diff model** for efficiency:
 
-- **Keyframe versions** (version 1, and every version *n* where (*n* − 1) is a multiple of `keyframe_interval`, default 10, i.e. versions 1, 11, 21, ...): stored as a full Markdown snapshot file (`v1.md`, `v11.md`, ...). An implementation also writes a keyframe whenever the previous version cannot be reconstructed, so a diff is never recorded against unknown content.
+- **Keyframe versions** (version 1, and every version *n* where (*n* − 1) is a multiple of `keyframe_interval`, default 10, i.e. versions 1, 11, 21, ...): stored as a full Markdown snapshot file (`v1.md`, `v11.md`, ...). An implementation also writes a keyframe whenever the previous version cannot be reconstructed, so a diff is never recorded against unknown content. An implementation MAY write a keyframe at any other version too (for example, above a document-size bound, where a diff would be costly to compute). Readers MUST locate keyframes by the entry's `keyframe` flag, never by version arithmetic.
 - **All other versions**: stored as a unified diff from the previous version, recorded inline in `history.yaml`.
 - **Reconstruction**: apply diffs forward from the nearest keyframe to reach any target version.
 

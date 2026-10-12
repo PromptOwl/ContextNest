@@ -100,6 +100,7 @@ export async function reconstructFromHistory(
   const readFor = (entry: (typeof replay)[number]) =>
     entry.tombstone ? null : entry.keyframe ? readKeyframe(entry.version) : readDiff(entry.version);
   let content: string | null = null;
+  const step = yielder();
   for (let start = 0; start === 0 || start < replay.length; start += REPLAY_READ_WINDOW) {
     const window = replay.slice(start, start + REPLAY_READ_WINDOW);
     // The first window also reads the anchor keyframe.
@@ -117,9 +118,25 @@ export async function reconstructFromHistory(
         );
       }
     }
-    content = await applyWindow(docId, content!, window, reads, readDiff);
+    content = await applyWindow(docId, content!, window, reads, readDiff, step);
   }
   return content!;
+}
+
+/**
+ * A work counter that lets the event loop in every {@link YIELD_EVERY}
+ * characters: each diff walks the whole text, so a long chain over a large
+ * document must not hold the process for the whole replay.
+ */
+export function yielder(): (chars: number) => Promise<void> {
+  let sinceYield = 0;
+  return async (chars) => {
+    sinceYield += chars;
+    if (sinceYield >= YIELD_EVERY) {
+      sinceYield = 0;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
 }
 
 /**
@@ -196,6 +213,7 @@ async function applyWindow(
   window: DocumentHistory["versions"],
   reads: PromiseSettledResult<string | null>[],
   readDiff: ArtifactReader,
+  step: (chars: number) => Promise<void>,
 ): Promise<string> {
   for (const [i, entry] of window.entries()) {
     // A forgotten version between the anchor and the target means the diff
@@ -217,9 +235,10 @@ async function applyWindow(
     const diff = entry.keyframe ? await readDiff(entry.version) : read;
     const patch = diff ?? entry.diff;
     if (patch) {
-      const { result } = applyPatchBounded(content, patch);
+      const { result, compared } = applyPatchBounded(content, patch);
       if (typeof result === "string") {
         content = result;
+        await step(content.length + compared);
       } else if (result === false) {
         throw new ContextNestError(
           `Failed to apply diff for version ${entry.version} of ${docId}`,
@@ -255,7 +274,7 @@ export async function replayEveryVersion(
     return !budget.spent;
   };
   let text: string | null = null;
-  let sinceYield = 0;
+  const step = yielder();
   let read = 0;
   for (const e of versions) {
     if (budget?.spent) return false;
@@ -299,11 +318,7 @@ export async function replayEveryVersion(
       text = typeof result === "string" ? result : null;
     }
     if (text !== null) visit(text);
-    sinceYield += cost;
-    if (sinceYield >= YIELD_EVERY) {
-      sinceYield = 0;
-      await new Promise((resolve) => setImmediate(resolve));
-    }
+    await step(cost);
   }
   return true;
 }

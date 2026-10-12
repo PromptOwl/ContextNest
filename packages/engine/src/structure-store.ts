@@ -34,7 +34,7 @@ import {
 } from "./structure.js";
 import { withVaultLock } from "./vault-lock.js";
 import { computeContentHash, normalizeForHash } from "./integrity.js";
-import { applyPatchBounded, type ArtifactReader, BYTES_PER_CHAR, MAX_REPLAY_READ, YIELD_EVERY } from "./reconstruct.js";
+import { applyPatchBounded, type ArtifactReader, BYTES_PER_CHAR, MAX_REPLAY_READ, yielder } from "./reconstruct.js";
 import type { NestStorage } from "./storage.js";
 import type { ContextNode, DocumentHistory, Frontmatter } from "./types.js";
 
@@ -197,14 +197,7 @@ async function verifyAndReplay(
 ): Promise<string | null> {
   // Another history of this call spent the budget: this one is not rebuilt.
   if (budget?.spent) return null;
-  let sinceYield = 0;
-  const step = async (chars: number) => {
-    sinceYield += chars;
-    if (sinceYield >= YIELD_EVERY) {
-      sinceYield = 0;
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-  };
+  const step = yielder();
   for (const [i, c] of contents.entries()) {
     if (computeContentHash(c) !== segment[i].content_hash) return null;
     await step(c.length);
