@@ -11,6 +11,7 @@ import type { SelectorNode } from "./parser.js";
 import type { ContextYamlDocument, Pack } from "../types.js";
 import { parseUri } from "../uri.js";
 import { normalizeStatus } from "../parser.js";
+import { processSearchTerm } from "../resolver.js";
 
 export interface IndexEvaluatorOptions {
   packLoader?: (packId: string) => Pack | undefined;
@@ -140,6 +141,7 @@ function buildLightweightSearch(docs: ContextYamlDocument[]): MiniSearch {
     fields: ["title", "description", "tags"],
     storeFields: ["id"],
     idField: "id",
+    processTerm: processSearchTerm,
   });
 
   const searchDocs = docs

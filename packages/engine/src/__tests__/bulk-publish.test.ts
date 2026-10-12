@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -75,6 +75,27 @@ describe("publishDocuments — bulk import", () => {
 
     const report = await storage.verifyVaultIntegrity();
     expect(report.valid).toBe(true);
+  });
+
+  it("on a fresh vault, reuses preloaded docs, lists each versions dir once, never crawls histories", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) ids.push(await writeDraft(storage, `fresh-${i}`));
+    const preloaded = new Map(
+      await Promise.all(ids.map(async (id) => [id, await storage.readDocument(id)] as const)),
+    );
+    const crawl = vi.spyOn(storage, "findAllHistories");
+    const read = vi.spyOn(storage, "readDocument");
+    const list = vi.spyOn(storage, "maxRecordedVersion");
+
+    const result = await publishDocuments(storage, ids, { editedBy: "importer", preloaded });
+
+    expect(result.published).toHaveLength(5);
+    expect(crawl).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledTimes(5);
+    expect((await storage.verifyVaultIntegrity()).valid).toBe(true);
+    // The caller's map is left as it was read.
+    expect(preloaded.get(ids[0])!.frontmatter.status).toBe("draft");
   });
 
   it("isolates failures — a rejected doc lands in failed[], the rest publish", async () => {

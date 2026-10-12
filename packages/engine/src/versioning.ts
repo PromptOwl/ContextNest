@@ -90,6 +90,8 @@ export class VersionManager {
     hint = 0,
     /** History the caller already read under the same lock; omit to read it. */
     knownHistory?: DocumentHistory | null,
+    /** `maxRecordedVersion` the caller already listed, nothing sealed since. */
+    knownSealed?: number,
   ): Promise<number> {
     const history =
       knownHistory !== undefined ? knownHistory : (await this.historyOrRepair(docId)).history;
@@ -97,7 +99,7 @@ export class VersionManager {
       (max, entry) => Math.max(max, entry.version),
       0,
     );
-    const sealed = await this.storage.maxRecordedVersion(docId);
+    const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
     return Math.max(hint, recorded, sealed) + 1;
   }
 
@@ -109,9 +111,10 @@ export class VersionManager {
   private async restartNoteFor(
     docId: string,
     history: DocumentHistory | null,
+    knownSealed?: number,
   ): Promise<string | null> {
     if (history) return null;
-    const sealed = await this.storage.maxRecordedVersion(docId);
+    const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
     if (sealed === 0) return null; // genuinely new document, not a restart
     return `Chain restarted — no readable history.yaml, and versions up to v${sealed} were already sealed`;
   }
@@ -142,6 +145,8 @@ export class VersionManager {
        * lock, with nothing appended since; `null` = none. Omit to read it here.
        */
       knownHistory?: DocumentHistory | null;
+      /** `maxRecordedVersion` the caller already listed, nothing sealed since. */
+      knownSealed?: number;
     } = {},
   ): Promise<VersionEntry> {
     // Resilient read: an unreadable history is moved aside and treated as
@@ -154,7 +159,7 @@ export class VersionManager {
     // Decided BEFORE this version's own artifact is written below: counting
     // the v{N}.md we are about to seal made every brand-new document's first
     // entry claim "Chain restarted" (it saw its own keyframe as prior history).
-    const restartNote = await this.restartNoteFor(node.id, readHistory);
+    const restartNote = await this.restartNoteFor(node.id, readHistory, options.knownSealed);
     const history = readHistory || {
       keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
       versions: [],
