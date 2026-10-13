@@ -916,6 +916,347 @@ const J5: Journey = {
   ],
 };
 
+/** The violations a `ctx structure --report --json` payload reports. */
+type StructureViolation = { code: string; path: string; message: string };
+const violationsOf = (data: unknown) =>
+  (data as { violations: StructureViolation[] }).violations;
+
+/**
+ * The house-style rules this journey enforces, appended to `.context/config.yaml`
+ * under the `structure`/`folders`/`templates` keys (spec §11.1.1). There is no
+ * `ctx structure set` command — `setStructure` is the engine-internal writer — so
+ * an owner establishes rules by editing the config, done here via the `mutate`
+ * hook the way J3 authored its pack yml.
+ *
+ * The rules are deliberately small and legible: enforced + closed (only the three
+ * named folders may exist). `decisions/` takes only documents named like an ADR,
+ * `reference/` takes documents or glossary terms, and `meetings/` takes documents
+ * that must follow a template requiring a "Decisions" section. That exercises
+ * every structure dimension the story needs — allowed folders, name formats,
+ * node types, and templates — across the three refusal kinds (bad name, bad type,
+ * bad folder), a template's required-section rule, and compliant writes.
+ */
+const STRUCTURE_RULES = [
+  "structure:",
+  "  enforce: true",
+  "  closed: true",
+  "folders:",
+  "  decisions:",
+  "    types: [document]",
+  // file_name uses the structure-rules WHITELIST grammar (engine structure.ts: a
+  // linear-time position-set matcher), NOT JS RegExp — it accepts bounded repeats
+  // on a char class, e.g. [0-9]{4}. Do not "simplify" this into a quantified
+  // group: that grammar rejects quantified groups, so the rewrite fails to
+  // compile the rules.
+  '    file_name: "/adr-[0-9]{4}-[a-z0-9-]+/"',
+  "  reference:",
+  "    types: [document, glossary]",
+  "  meetings:",
+  "    types: [document]",
+  "    template: meeting-note",
+  "templates:",
+  "  meeting-note:",
+  '    body: "## Attendees\\n## Decisions\\n## Action items\\n"',
+  "    required_sections: [Decisions]",
+  "",
+].join("\n");
+
+const seedStructureRules = (vault: string) => {
+  const cfg = join(vault, ".context", "config.yaml");
+  const existing = readFileSync(cfg, "utf-8");
+  // Append the rule blocks rather than parse-and-merge — valid only because
+  // `ctx init` does not emit structure:/folders:/templates: itself. Fail loudly
+  // if that ever changes, so a silent duplicate YAML key can't turn into a
+  // confusing downstream parse failure that looks like a product bug.
+  if (/^(structure|folders|templates):/m.test(existing)) {
+    throw new Error(
+      "init already wrote structure rule keys — seedStructureRules would duplicate them; switch to a parse-and-merge.",
+    );
+  }
+  writeFileSync(cfg, `${existing}\n${STRUCTURE_RULES}`);
+};
+
+/**
+ * J6 — "I keep my vault on house-style and the CLI enforces it for me."
+ * The nest owner's promise (structure rules, spec §11.1.1): lay down which
+ * folders are allowed, how nodes must be named, and which types belong where —
+ * then every write is judged against those rules. Off-style writes are refused
+ * before they touch disk, compliant ones sail through, and a drift report shows
+ * anything already in the vault that breaks the rules.
+ *
+ * The rules are enforced + closed, so an undeclared folder, a disallowed type,
+ * a badly-named file, and a node that skips a template's required section are
+ * each refused. The review gate is turned OFF (like J2/J3/J5): this journey is
+ * about structure enforcement on the write path, not the approval gate, so a
+ * compliant write should land as published directly without a gate in between.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J6: Journey = {
+  id: "J6",
+  title: "Keep a vault on house-style (nest owner)",
+  cases: [
+    {
+      id: "J6-01",
+      title: "I set the vault's structure rules and see the blueprint of what's allowed",
+      actions: [
+        { args: ["init", "--name", "house-style"], stdout: ["Initialized"] },
+        // Seed the house-style rules, then turn the review gate off so a
+        // compliant write later lands as published, not held. `config set`
+        // rewrites the config but preserves the rule keys appended above.
+        {
+          mutate: seedStructureRules,
+          args: ["config", "set", "review", "off"],
+          stdout: ["review: off"],
+        },
+        // The blueprint names the allowed folders, their types, and the ADR
+        // name format — exactly what an owner would check after setting rules.
+        {
+          args: ["structure"],
+          stdout: [
+            "enforced, closed",
+            "decisions",
+            "/adr-[0-9]{4}-[a-z0-9-]+/",
+            "reference",
+            "document, glossary",
+          ],
+        },
+        {
+          args: ["structure", "--json"],
+          json: (data) => {
+            const d = data as {
+              enforce: boolean;
+              closed: boolean;
+              folders: Array<{ pattern: string }>;
+            };
+            expect(d.enforce).toBe(true);
+            expect(d.closed).toBe(true);
+            expect(d.folders.map((f) => f.pattern).sort()).toEqual([
+              "decisions",
+              "meetings",
+              "reference",
+            ]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J6-02",
+      title: "A node whose name breaks the house naming format is refused",
+      actions: [
+        {
+          // "random-thought" doesn't match the ADR name format decisions/ requires.
+          //
+          // Refusal assertions here pin the stable VALIDATION_FAILED code and the
+          // on-disk absence (the durable contract), plus ONE short fragment of the
+          // engine's message — just enough to prove the RIGHT rule fired (a name
+          // refusal, not a type or folder one), which the code alone can't show.
+          // The fragment is English prose, so a wording change in the engine would
+          // need these updated; that's the deliberate cost of proving the reason.
+          args: [
+            "add", "nodes/decisions/random-thought",
+            "--type", "document",
+            "--title", "Random Thought",
+            "--body", "nope",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", "File names in"],
+          files: [{ path: "nodes/decisions/random-thought.md", exists: false }],
+        },
+      ],
+    },
+    {
+      id: "J6-03",
+      title: "A node of a disallowed type, or in an undeclared folder, is refused",
+      actions: [
+        {
+          // The NAME is compliant (adr-0002-use-redis), so the type is the sole
+          // violation — a prompt isn't allowed in decisions/ (documents only).
+          args: [
+            "add", "nodes/decisions/adr-0002-use-redis",
+            "--type", "prompt",
+            "--title", "Use Redis",
+            "--body", "nope",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", "can't go in"],
+          files: [{ path: "nodes/decisions/adr-0002-use-redis.md", exists: false }],
+        },
+        {
+          // A closed vault only allows the declared folders — scratchpad/ isn't one.
+          args: [
+            "add", "nodes/scratchpad/idea",
+            "--type", "document",
+            "--title", "Idea",
+            "--body", "nope",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", "not an allowed folder"],
+          files: [{ path: "nodes/scratchpad/idea.md", exists: false }],
+        },
+      ],
+    },
+    {
+      id: "J6-04",
+      title: "A node that matches the folder, name, and type rules is accepted and published",
+      actions: [
+        // A properly-named ADR document in decisions/ — every rule satisfied.
+        {
+          args: [
+            "add", "nodes/decisions/adr-0001-use-postgres",
+            "--type", "document",
+            "--title", "Use Postgres",
+            "--body", "We will use Postgres.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/decisions/adr-0001-use-postgres"],
+          files: [{ path: "nodes/decisions/adr-0001-use-postgres.md", exists: true }],
+        },
+        // A glossary term in reference/ — the other allowed folder, and its
+        // second allowed type — so "compliant passes" isn't a one-folder fluke.
+        {
+          args: [
+            "add", "nodes/reference/http-status",
+            "--type", "glossary",
+            "--title", "HTTP Status",
+            "--body", "200 means OK.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/reference/http-status"],
+          files: [{ path: "nodes/reference/http-status.md", exists: true }],
+        },
+        // Both compliant nodes are published knowledge now.
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/decisions/adr-0001-use-postgres")).toBe("published");
+            expect(statusOf(data, "nodes/reference/http-status")).toBe("published");
+          },
+        },
+      ],
+    },
+    {
+      id: "J6-05",
+      title: "I audit the vault for drift and the report flags content that breaks the rules",
+      actions: [
+        // With only compliant nodes, the report is clean.
+        {
+          args: ["structure", "--report"],
+          stdout: ["Compliance", "Everything fits the rules"],
+          stdoutNot: ["FOLDER_NOT_ALLOWED"],
+        },
+        {
+          args: ["structure", "--report", "--json"],
+          json: (data) => {
+            expect(violationsOf(data)).toEqual([]);
+          },
+        },
+        // Drift appears the way it does in real life: a node lands on disk
+        // outside the write path (a sync, a hand edit, a merge) in a folder the
+        // rules forbid. Plant it directly, then re-audit.
+        {
+          mutate: (vault) => {
+            mkdirSync(join(vault, "nodes", "scratchpad"), { recursive: true });
+            // Reuse J4's flat-node writer — it emits exactly the published
+            // document frontmatter a stray node has; no need to re-hand-roll it.
+            writeFileSync(
+              join(vault, "nodes", "scratchpad", "stray.md"),
+              flatNode("nodes/scratchpad/stray", "Stray", "x", "A node that drifted into a forbidden folder."),
+            );
+          },
+          // The report names the offending folder — and the command still exits
+          // 0 (a report, not a gate). Assert the code + path in text, avoiding
+          // the ✗ glyph so Windows stdout decoding can't trip the match.
+          args: ["structure", "--report"],
+          stdout: ["Compliance", "FOLDER_NOT_ALLOWED", "scratchpad"],
+          stdoutNot: ["Everything fits the rules"],
+        },
+        {
+          args: ["structure", "--report", "--json"],
+          json: (data) => {
+            const v = violationsOf(data);
+            expect(v).toHaveLength(1);
+            expect(v[0].code).toBe("FOLDER_NOT_ALLOWED");
+            expect(v[0].path).toBe("scratchpad");
+          },
+        },
+      ],
+    },
+    {
+      id: "J6-06",
+      title: "A node that skips a required section of its folder's template is refused, one that follows it passes",
+      actions: [
+        // meetings/ documents must follow the meeting-note template, which
+        // requires a "Decisions" section. This body omits it → refused, nothing
+        // written (the name and folder and type are all fine; only the template
+        // section is missing, so this isolates the template rule).
+        {
+          args: [
+            "add", "nodes/meetings/2026-01-kickoff",
+            "--type", "document",
+            "--title", "Kickoff",
+            "--body", "## Attendees\nAlice, Bob\n## Action items\nShip it.",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", 'needs a "Decisions" heading'],
+          files: [{ path: "nodes/meetings/2026-01-kickoff.md", exists: false }],
+        },
+        // The same note WITH the required "Decisions" section is accepted.
+        {
+          args: [
+            "add", "nodes/meetings/2026-02-planning",
+            "--type", "document",
+            "--title", "Planning",
+            "--body", "## Attendees\nAlice, Bob\n## Decisions\nUse Postgres.\n## Action items\nShip it.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/meetings/2026-02-planning"],
+          files: [{ path: "nodes/meetings/2026-02-planning.md", exists: true }],
+        },
+        // The per-folder blueprint shows the template an owner must follow,
+        // including the sections it requires.
+        {
+          args: ["structure", "--folder", "meetings"],
+          stdout: ["meeting-note", "required sections: Decisions"],
+        },
+      ],
+    },
+    {
+      id: "J6-07",
+      title: "Editing an existing compliant node to break a rule is refused too, not just new nodes",
+      actions: [
+        // Enforcement covers the update path, not only add: edit the compliant
+        // meetings note from J6-06 to drop its required "Decisions" section. The
+        // edit is refused and the node is left untouched (the section survives) —
+        // so the vault can't drift out of house-style through a later edit.
+        {
+          args: [
+            "update", "nodes/meetings/2026-02-planning",
+            "--body", "## Attendees\nAlice, Bob\n## Action items\nShip it.",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", 'remove the required "Decisions" heading'],
+          files: [{ path: "nodes/meetings/2026-02-planning.md", contains: "## Decisions" }],
+        },
+        // An edit that keeps the section compliant is accepted — a second version.
+        {
+          args: [
+            "update", "nodes/meetings/2026-02-planning",
+            "--body", "## Attendees\nAlice, Bob, Carol\n## Decisions\nUse Postgres and Redis.\n## Action items\nShip it.",
+            "-y",
+          ],
+          stdout: ["Updated and published", "Version: 2"],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -935,5 +1276,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J5 — erase a node on request (right to be forgotten)", () => {
     runJourney({ installDir: INSTALL, scratch }, J5);
+  });
+
+  it("J6 — keep a vault on house-style (structure rules)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J6);
   });
 });
