@@ -18,7 +18,9 @@
  * `ctx login` runs finishing at the same instant can drop one entry (re-run
  * it). Logins are interactive and rare, so a lock isn't worth its failure modes.
  */
-import { ACCOUNT_NAME_PATTERN } from "@promptowl/contextnest-engine";
+import fs from "node:fs";
+import pathMod from "node:path";
+import { ACCOUNT_NAME_PATTERN, getRegistryDir } from "@promptowl/contextnest-engine";
 import {
   CredentialStore,
   CredentialStoreError,
@@ -251,8 +253,44 @@ export async function assertServerMapWritable(opts: CredentialStoreOptions = {})
 
 /** Persist the map securely. Returns where it went (e.g. "macOS Keychain"). */
 export async function saveServerMap(map: ServerMap, opts: CredentialStoreOptions = {}): Promise<string> {
-  return new CredentialStore(opts).set(SERVERS_ACCOUNT, JSON.stringify(map));
+  const where = await new CredentialStore(opts).set(SERVERS_ACCOUNT, JSON.stringify(map));
+  writeLoginState(map, opts);
+  return where;
 }
+
+// ─── Login-state marker ─────────────────────────────────────────────────────
+// Reading the store spawns a process (on Windows PowerShell + a C# compile,
+// ~1 s), and every command against a key-less HTTP remote looks up a saved key.
+// `<registry>/login-state` remembers, without the secret, whether any key is
+// saved: "none" skips the read. No marker (fresh install, or keys saved by a
+// ctx that predates it) means read once and write it. A ctx that predates it
+// can still save keys behind a "none"; connectTarget re-reads `fresh` when the
+// server then asks for a key, so that costs one read, never a lost login.
+
+function loginStatePath(opts: CredentialStoreOptions): string {
+  return pathMod.join(opts.home ? pathMod.join(opts.home, ".contextnest") : getRegistryDir(), "login-state");
+}
+
+function writeLoginState(map: ServerMap, opts: CredentialStoreOptions): void {
+  try {
+    const file = loginStatePath(opts);
+    fs.mkdirSync(pathMod.dirname(file), { recursive: true });
+    fs.writeFileSync(file, Object.keys(map.servers).length > 0 ? "saved" : "none");
+  } catch {
+    // Only a cache: without it the next lookup reads the store.
+  }
+}
+
+function nothingSaved(opts: CredentialStoreOptions): boolean {
+  try {
+    return fs.readFileSync(loginStatePath(opts), "utf-8").trim() === "none";
+  } catch {
+    return false;
+  }
+}
+
+/** A lookup's options. `fresh` reads the store even when the marker says nothing is saved. */
+export type SavedLookupOptions = CredentialStoreOptions & { fresh?: boolean };
 
 /**
  * The saved token for `endpoint`, or null when nothing is saved for it. A store
@@ -262,7 +300,7 @@ export async function saveServerMap(map: ServerMap, opts: CredentialStoreOptions
  */
 export async function savedTokenFor(
   endpoint: string,
-  opts: CredentialStoreOptions = {},
+  opts: SavedLookupOptions = {},
   account?: string,
 ): Promise<string | null> {
   return tokenForEndpoint(await readSavedMap(opts), endpoint, account);
@@ -272,17 +310,20 @@ export async function savedTokenFor(
 export async function savedTokensForServer(
   endpoint: string,
   account?: string,
-  opts: CredentialStoreOptions = {},
+  opts: SavedLookupOptions = {},
 ): Promise<string[]> {
   return tokensForServerEndpoint(await readSavedMap(opts), endpoint, account);
 }
 
-async function readSavedMap(opts: CredentialStoreOptions): Promise<ServerMap> {
+async function readSavedMap(opts: SavedLookupOptions): Promise<ServerMap> {
+  if (!opts.fresh && nothingSaved(opts)) return emptyServerMap();
   let json: string | null;
   try {
     json = await new CredentialStore(opts).get(SERVERS_ACCOUNT);
   } catch (err) {
     throw new CredentialStoreError(`Saved \`ctx login\` keys exist but couldn't be read: ${(err as Error).message}`);
   }
-  return parseServerMap(json);
+  const map = parseServerMap(json);
+  writeLoginState(map, opts);
+  return map;
 }

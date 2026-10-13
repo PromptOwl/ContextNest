@@ -274,6 +274,18 @@ describe("connectTarget", () => {
     );
   });
 
+  it("when the server asks for a key the cached lookup missed, reads the store fresh once and signs in", async () => {
+    const lookup = vi.fn(async (_url: string, _account?: string, fresh?: boolean) => (fresh ? "cnst_saved" : null));
+    const connect = vi.fn(async (_alias: string, spec: RemoteNestSpec) => {
+      if (spec.transport === "http" && !spec.auth) throw new ContextNestError("no auth configured", "REMOTE_AUTH_FAILED");
+      return conn;
+    });
+    await expect(connectTarget({ alias: "h", spec: http }, lookup, connect as never)).resolves.toBe(conn);
+    expect(lookup).toHaveBeenLastCalledWith(`${SERVER}/mcp`, undefined, true);
+    const [, , env] = connect.mock.calls[1] as unknown as [string, RemoteNestSpec, Record<string, string>];
+    expect(env[LOGIN_TOKEN_ENV]).toBe("cnst_saved");
+  });
+
   it("an unreadable store never blocks a remote that needs no key; it surfaces only when the server asks for one", async () => {
     const unreadable = async () => {
       throw new Error("Saved `ctx login` keys exist but couldn't be read: wrong key");

@@ -206,6 +206,38 @@ describe("server map (secure store)", () => {
     await expect(assertServerMapWritable({ home, env: {}, keyring: memoryKeyring() })).resolves.toBeUndefined();
   });
 
+  it("skips the store read once a non-secret marker says nothing is saved", async () => {
+    const keyring = memoryKeyring();
+    let reads = 0;
+    const counted = { ...keyring, get: async (a: string) => (reads++, keyring.get(a)) };
+    const opts = { home, env: {}, keyring: counted };
+    const marker = join(home, ".contextnest", "login-state");
+    // No marker yet (fresh install, or keys saved by an older ctx): read once, then remember.
+    expect(await savedTokenFor(A, opts)).toBeNull();
+    expect(readFileSync(marker, "utf-8")).toBe("none");
+    expect(reads).toBe(1);
+    expect(await savedTokenFor(A, opts)).toBeNull();
+    expect(reads).toBe(1);
+    // A login flips it; the marker never holds the key.
+    await saveServerMap(upsertServer(emptyServerMap(), A, { token: "cnst_secret" }), opts);
+    expect(readFileSync(marker, "utf-8")).toBe("saved");
+    expect(await savedTokenFor(A, opts)).toBe("cnst_secret");
+    // Logging out of everything flips it back.
+    await saveServerMap(emptyServerMap(), opts);
+    expect(readFileSync(marker, "utf-8")).toBe("none");
+  });
+
+  it("a fresh lookup reads the store even when the marker says nothing is saved", async () => {
+    const keyring = memoryKeyring();
+    const opts = { home, env: {}, keyring };
+    expect(await savedTokenFor(A, opts)).toBeNull();
+    // Keys written behind the marker's back (an older ctx, a hand edit).
+    keyring.items.set(SERVERS_ACCOUNT, JSON.stringify(upsertServer(emptyServerMap(), A, { token: "old" })));
+    expect(await savedTokenFor(A, opts)).toBeNull();
+    expect(await savedTokenFor(A, { ...opts, fresh: true })).toBe("old");
+    expect(readFileSync(join(home, ".contextnest", "login-state"), "utf-8")).toBe("saved");
+  });
+
   it("a corrupt stored map fails loudly and is never overwritten by a lookup", async () => {
     const keyring = memoryKeyring();
     keyring.items.set(SERVERS_ACCOUNT, "{corrupt");

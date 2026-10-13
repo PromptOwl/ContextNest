@@ -297,8 +297,8 @@ export function wantsLoginKey(spec: RemoteNestSpec): spec is Extract<RemoteNestS
   return spec.transport === "http" && !spec.auth;
 }
 
-/** Saved-key lookup for an endpoint, under the alias's `account`. */
-export type LoginLookup = (url: string, account?: string) => Promise<string | null>;
+/** Saved-key lookup for an endpoint, under the alias's `account`. `fresh` bypasses the login-state marker. */
+export type LoginLookup = (url: string, account?: string, fresh?: boolean) => Promise<string | null>;
 
 /**
  * Connect to a remote. An HTTP remote registered without auth borrows the key
@@ -309,7 +309,7 @@ export type LoginLookup = (url: string, account?: string) => Promise<string | nu
  */
 export async function connectTarget(
   target: RemoteTarget,
-  lookup: LoginLookup = (url, account) => savedTokenFor(url, {}, account),
+  lookup: LoginLookup = (url, account, fresh) => savedTokenFor(url, { fresh }, account),
   connect: typeof connectRemoteNest = connectRemoteNest,
   nestId?: string,
 ): Promise<RemoteNestConnection> {
@@ -344,8 +344,8 @@ async function connectWithLogin(
   if (!wantsLoginKey(spec)) return connect(target.alias, spec);
   let token: string | null = null;
   let storeError: Error | undefined;
+  const url = nestId ? `${spec.url.replace(/\/mcp\/?$/, "")}/nests/${encodeURIComponent(nestId)}` : spec.url;
   try {
-    const url = nestId ? `${spec.url.replace(/\/mcp\/?$/, "")}/nests/${encodeURIComponent(nestId)}` : spec.url;
     token = await lookup(url, spec.account);
   } catch (err) {
     storeError = err as Error;
@@ -357,6 +357,15 @@ async function connectWithLogin(
       return await connect(target.alias, spec);
     } catch (err) {
       if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
+        if (!storeError) {
+          // The lookup may have trusted a stale "nothing saved" marker: read the store itself once.
+          try {
+            token = await lookup(url, spec.account, true);
+          } catch (e) {
+            storeError = e as Error;
+          }
+          if (token) return connectWithToken(target.alias, spec, token, connect);
+        }
         if (storeError) throw new ContextNestError(storeError.message, "CONFIG_ERROR");
         // A key saved for one nest signs in only as `<alias>/<nest>`, never for the whole server.
         const serverAlias = !nestId && !/\/nests\/[^/]+\/mcp\/?$/.test(spec.url);
