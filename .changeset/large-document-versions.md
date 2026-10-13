@@ -1,5 +1,0 @@
----
-"@promptowl/contextnest-engine": patch
----
-
-**Publishing a large document no longer freezes the process.** A new version of a document was stored as a diff against the previous one, which meant rebuilding that version from its keyframe and diffs, then diffing the whole text, all without letting other work run. On a 10 MB document with a dozen versions that held the process for seconds, and every other request waited, including requests for other vaults. Three changes: rebuilding a past version now lets other work run as it goes; a version is stored as a full snapshot instead of a diff when the document is over 1 MiB on either side (the new text or the previous one), so publishing it never replays its history or diffs a large text; and the index rebuild after a write skips the link scan for bodies that contain no links. Every version still rebuilds to exactly the same bytes, and existing histories are untouched. The trade-off for documents over 1 MiB: each new version takes a full copy on disk, and `ctx history --diff` / `context_versions` show no diff for those versions.
