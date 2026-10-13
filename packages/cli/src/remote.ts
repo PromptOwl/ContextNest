@@ -31,13 +31,24 @@ import { confirmOrExit, isDryRun } from "./safety.js";
 import { parseRecipeManifest, manifestSources } from "./pull.js";
 import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
+  TASK_FIELD_FLAGS,
+  hasTaskFieldArgs,
+  requireTaskSupport,
+  taskFieldArgs,
+  taskFieldsSuffix,
+  taskListFilters,
+} from "./task-fields.js";
+import {
   listJsonEntry,
   queryJsonPayload,
   searchLimit,
   printSearchResults,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
+import { savedTokenFor } from "./server-credentials.js";
 
 export interface RemoteTarget {
   alias: string;
@@ -85,13 +96,26 @@ export interface IndexedNest {
 }
 
 /**
+ * A name as a label: lower case, every run of other characters one "-", no
+ * "-" at either end — trimmed with a loop, since `/^-+|-+$/` retries from
+ * every dash of a run that does not end the name.
+ */
+export function slugLabel(name: string): string {
+  const s = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  let start = 0;
+  let end = s.length;
+  while (start < end && s[start] === "-") start++;
+  while (end > start && s[end - 1] === "-") end--;
+  return s.slice(start, end);
+}
+
+/**
  * Pure: the `<nest>` label for each nest id — its slugged name, or
  * `<slug>-<id8>` when two nests the key can see slug the same (names are
  * unique per owner only, so a shared nest can collide with your own).
  */
 export function nestLabels(nests: IndexedNest[]): Map<string, string> {
-  const slug = (n: IndexedNest) =>
-    n.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "nest";
+  const slug = (n: IndexedNest) => slugLabel(n.name) || "nest";
   const counts = new Map<string, number>();
   for (const n of nests) counts.set(slug(n), (counts.get(slug(n)) ?? 0) + 1);
   return new Map(
@@ -136,14 +160,9 @@ export async function serverNests(
       // best-effort
     }
   };
+  const cached = readNestCache(baseAlias, spec.url);
   if (!opts.fresh) {
-    let cached: { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean } | undefined;
-    try {
-      cached = JSON.parse(fs.readFileSync(file, "utf-8"));
-    } catch {
-      // no cache yet, or unreadable — ask the server
-    }
-    if (cached?.url === spec.url) {
+    if (cached) {
       const age = Date.now() - cached.at;
       // A failed probe only short-circuits the next probes, not a caller that
       // already holds a live connection (that is proof the server is back).
@@ -164,11 +183,24 @@ export async function serverNests(
   try {
     nests = conn ? await fetchNests(conn) : await withRemote({ alias: baseAlias, spec }, fetchNests);
   } catch (err) {
-    if (!conn) write({ failed: true });
+    // Keep the last good list: a listing can still show it while the server is down.
+    if (!conn) write({ failed: true, ...(cached?.nests ? { nests: cached.nests } : {}) });
     throw err;
   }
   write({ nests });
   return nests;
+}
+
+type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean };
+
+/** The cached probe for this alias and URL; undefined when there is none or it is unreadable. */
+function readNestCache(baseAlias: string, url: string): NestCache | undefined {
+  try {
+    const cached = JSON.parse(fs.readFileSync(nestCachePath(baseAlias), "utf-8")) as NestCache;
+    return cached.url === url ? cached : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** `--vault <server>/<nest>` → the nest id to send. Throws with the choices on a miss. */
@@ -207,6 +239,96 @@ async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnectio
   return hit.id;
 }
 
+/** Env var name the saved `ctx login` key is handed to the engine under. */
+export const LOGIN_TOKEN_ENV = "CONTEXTNEST_LOGIN_TOKEN";
+
+/**
+ * Whether a remote should borrow the `ctx login` key: only an HTTP remote
+ * registered with NO auth. Explicit registry auth (bearer_env / header_env)
+ * always wins, and stdio remotes never carry a bearer.
+ */
+export function wantsLoginKey(spec: RemoteNestSpec): spec is Extract<RemoteNestSpec, { transport: "http" }> {
+  return spec.transport === "http" && !spec.auth;
+}
+
+/**
+ * Connect to a remote. An HTTP remote registered without auth borrows the key
+ * `ctx login` saved for its server, so `ctx vault add <alias> --url <server>/mcp`
+ * needs no --bearer-env once you're logged in.
+ */
+export async function connectTarget(
+  target: RemoteTarget,
+  lookup: (url: string) => Promise<string | null> = savedTokenFor,
+  connect: typeof connectRemoteNest = connectRemoteNest,
+): Promise<RemoteNestConnection> {
+  try {
+    return await connectWithLogin(target, lookup, connect);
+  } catch (err) {
+    throw nestPathHint(target.spec, err);
+  }
+}
+
+/**
+ * A Community nest lives at `/nests/<id>/mcp`; the singular `/nest/<id>/mcp`
+ * 404s and would otherwise read as a bare "unreachable". Name the fix.
+ */
+export function nestPathHint(spec: RemoteNestSpec, err: unknown): unknown {
+  if (!(err instanceof ContextNestError) || err.code !== "REMOTE_UNREACHABLE" || spec.transport !== "http") return err;
+  const fixed = spec.url.replace(/\/nest\/([^/]+)\/mcp\/?$/, "/nests/$1/mcp");
+  if (fixed === spec.url) return err;
+  return new ContextNestError(
+    `${err.message}\n  Nest endpoints are /nests/<id>/mcp (plural) — did you mean ${fixed} ?`,
+    err.code,
+  );
+}
+
+async function connectWithLogin(
+  target: RemoteTarget,
+  lookup: (url: string) => Promise<string | null>,
+  connect: typeof connectRemoteNest,
+): Promise<RemoteNestConnection> {
+  const { spec } = target;
+  if (!wantsLoginKey(spec)) return connect(target.alias, spec);
+  let token: string | null = null;
+  let storeError: Error | undefined;
+  try {
+    token = await lookup(spec.url);
+  } catch (err) {
+    storeError = err as Error;
+  }
+  if (!token) {
+    // An unreadable store must not break a remote that needs no key; it only
+    // matters once the server asks for one, and then it is the real cause.
+    try {
+      return await connect(target.alias, spec);
+    } catch (err) {
+      if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
+        if (storeError) throw new ContextNestError(storeError.message, "CONFIG_ERROR");
+        throw new ContextNestError(`${err.message} Or sign in once: \`ctx login <server>\`.`, err.code);
+      }
+      throw err;
+    }
+  }
+  try {
+    // The engine reads bearers from env-var references only, so hand it the key
+    // under a private name rather than widening the registry format.
+    return await connect(
+      target.alias,
+      { ...spec, auth: { bearer_env: LOGIN_TOKEN_ENV } },
+      { ...process.env, [LOGIN_TOKEN_ENV]: token },
+    );
+  } catch (err) {
+    // The engine's message would point at our internal env var; point at the fix instead.
+    if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
+        "REMOTE_AUTH_FAILED",
+      );
+    }
+    throw err;
+  }
+}
+
 /**
  * Connect, run, and always close — the standard remote command wrapper.
  * With a `<server>/<nest>` target, every call carries that nest's id.
@@ -215,7 +337,7 @@ async function withRemote<T>(
   target: RemoteTarget,
   fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
 ): Promise<T> {
-  const conn = await connectRemoteNest(target.alias, target.spec);
+  const conn = await connectTarget(target);
   try {
     if (!target.nest) return await fn(conn);
     const nestId = await resolveTargetNest(target, conn);
@@ -278,13 +400,27 @@ interface NodeSummary {
   nest?: { id: string; name: string };
   /** Set by labelFanout: the `--vault <server>/<nest>` that addresses this hit. */
   vault?: string;
+  /** Task (board) fields — reported by a Community nest when set. */
+  assignee?: string;
+  due?: string;
+  priority?: string;
+  parent?: string;
 }
 
 // ─── Read surface ───────────────────────────────────────────────────────────
 
 export async function remoteList(
   target: RemoteTarget,
-  opts: { type?: string; status?: string; tag?: string; limit?: number; json?: boolean },
+  opts: {
+    type?: string;
+    status?: string;
+    tag?: string;
+    limit?: number;
+    json?: boolean;
+    assignee?: string;
+    priority?: string;
+    dueBefore?: string;
+  },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     // Filters go to the NEST, exactly as they do locally. Re-deciding them here
@@ -292,11 +428,15 @@ export async function remoteList(
     // once already), and it cannot recover documents the nest already withheld
     // — an unfiltered context_list hides retired docs, so a client-side
     // `--status rejected` could only ever return nothing.
+    const taskFilters = taskListFilters(opts);
+    if (Object.keys(taskFilters).length) await requireTaskSupport(conn, target.alias);
     const out = await conn.run<{ documents: NodeSummary[] }>("context_list", {
       ...(opts.type ? { type: opts.type } : {}),
       ...(opts.status ? { status: normalizeStatus(opts.status) } : {}),
       ...(opts.tag ? { tag: opts.tag } : {}),
       ...(opts.limit ? { limit: opts.limit } : {}),
+      // Task filters, like the rest, are decided by the nest.
+      ...taskFilters,
     });
     const docs = await labelFanout(target, conn, out.documents);
 
@@ -310,7 +450,7 @@ export async function remoteList(
     }
     console.log(chalk.bold(`${docs.length} document(s):\n`));
     for (const d of docs) {
-      console.log(`  ${chalk.cyan(d.vault ? `${d.vault}:${d.id}` : d.id)} [${d.type || "document"}] ${d.status || "draft"}`);
+      console.log(`  ${chalk.cyan(d.vault ? `${d.vault}:${d.id}` : d.id)} [${d.type || "document"}] ${d.status || "draft"}${chalk.dim(taskFieldsSuffix(d))}`);
       console.log(`    ${d.title}`);
     }
   });
@@ -645,7 +785,7 @@ export async function remoteAdd(
     const input: Record<string, unknown> = {
       id,
       title,
-      content: opts.body ? `\n${opts.body}\n` : `\n# ${title}\n\n`,
+      content: opts.body ? `\n${opts.body}\n` : await remoteTemplateBody(conn, id, title),
     };
     // Send the folder alongside the id. A nest whose `context_create` predates
     // the catalog's `id` parameter drops that key and derives the id from the
@@ -673,11 +813,47 @@ export async function remoteAdd(
   });
 }
 
+/**
+ * The body a bodiless `ctx add` starts from on a remote nest: the folder's
+ * template (§11.1), same as the local branch. A nest that does not advertise
+ * `context_structure` (it predates structure rules) gets the plain heading.
+ */
+async function remoteTemplateBody(conn: RemoteNestConnection, id: string, title: string): Promise<string> {
+  const heading = `\n# ${title}\n\n`;
+  if (!(await conn.toolNames()).has("context_structure")) return heading;
+  const out = await conn.run<StructureOutput>("context_structure", { folder: folderFromId(id) });
+  return out.resolved?.template_body ? `\n${out.resolved.template_body}` : heading;
+}
+
+/** `ctx structure` against a remote nest — the same op, the same output. */
+export async function remoteStructure(
+  target: RemoteTarget,
+  opts: { folder?: string; report?: boolean; json?: boolean },
+): Promise<void> {
+  await withRemote(target, async (conn) => {
+    const out = await conn.run<StructureOutput>("context_structure", {
+      ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+      ...(opts.report ? { report: true } : {}),
+    });
+    printStructure(out, opts);
+  });
+}
+
 export async function remoteUpdate(
   target: RemoteTarget,
   path: string,
-  opts: { title?: string; tags?: string; status?: string; body?: string },
+  opts: {
+    title?: string;
+    tags?: string;
+    status?: string;
+    body?: string;
+    assignee?: string;
+    due?: string;
+    priority?: string;
+    parent?: string;
+  },
 ): Promise<void> {
+  const fields = taskFieldArgs(opts);
   // A rename stays refused: Community's context_update reads `title` as the
   // node SELECTOR, so sending it next to `id` would be silently ignored.
   if (opts.title !== undefined) {
@@ -686,26 +862,46 @@ export async function remoteUpdate(
       "NOT_IMPLEMENTED",
     );
   }
-  if (opts.body === undefined && opts.tags === undefined && opts.status === undefined) {
-    throw new ContextNestError("Nothing to update — pass --body, --tags or --status.", "VALIDATION_FAILED");
+  if (
+    opts.body === undefined &&
+    opts.tags === undefined &&
+    opts.status === undefined &&
+    !hasTaskFieldArgs(fields)
+  ) {
+    throw new ContextNestError(
+      "Nothing to update — pass --body, --tags, --status, --assignee, --due, --priority or --parent.",
+      "VALIDATION_FAILED",
+    );
   }
   await confirmRemoteWrite(
     target,
     `Update ${normalizeDocumentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
   );
   await withRemote(target, async (conn) => {
+    if (hasTaskFieldArgs(fields)) await requireTaskSupport(conn, target.alias);
     // Same fields the local branch sends; tags REPLACE, as locally.
-    const updated = await conn.run<{ id: string; version: number; status?: string }>("context_update", {
-      id: normalizeDocumentId(path),
-      ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
-      ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
-      ...(opts.status !== undefined ? { status: normalizeStatus(opts.status) } : {}),
-    });
+    const updated = await conn.run<{ id: string; version: number; status?: string; [k: string]: unknown }>(
+      "context_update",
+      {
+        id: normalizeDocumentId(path),
+        ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
+        ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
+        ...(opts.status !== undefined ? { status: normalizeStatus(opts.status) } : {}),
+        // Task fields: the nest validates them (roster, date, priority, parent).
+        ...fields,
+      },
+    );
     // The nest's stewardship decides whether the edit published, so report
     // the status it came back with rather than assuming "published".
     console.log(chalk.green(`Updated ${updated.id} (remote: ${target.alias})`));
     console.log(`  Version: ${updated.version}`);
     if (updated.status) console.log(`  Status: ${updated.status}`);
+    for (const k of TASK_FIELD_FLAGS) {
+      // The nest omits unset fields from its reply, so a cleared field reads
+      // back as absent; only a field sent as null may be reported cleared.
+      const shown = fields[k] === null ? "(cleared)" : String(updated[k] ?? "(not returned by the nest)");
+      if (k in fields) console.log(`  ${k[0].toUpperCase()}${k.slice(1)}: ${shown}`);
+    }
   });
 }
 
@@ -804,6 +1000,60 @@ export async function remotePublish(
   });
 }
 
+/** One logged interaction, as context_task_log returns it. */
+interface TaskLogEntry {
+  id: string;
+  actor: string;
+  status?: string;
+  note: string;
+  key?: { label?: string; prefix?: string; scoped: boolean };
+  client?: { agent?: string };
+  at: string;
+}
+
+/**
+ * `ctx task log <path> --note "…" [--status working|done|blocked] [--claim]` —
+ * register what was done on a task (Community `context_task_log`). The server
+ * attributes it to the key's owner, plus the key itself and `agent`.
+ */
+export async function remoteTaskLog(
+  target: RemoteTarget,
+  path: string,
+  opts: { note: string; status?: string; claim?: boolean; agent?: string; json?: boolean },
+): Promise<void> {
+  const id = normalizeDocumentId(path);
+  await confirmRemoteWrite(target, `Log on ${id} on remote nest "${target.alias}"?`);
+  await withRemote(target, async (conn) => {
+    await requireTaskSupport(conn, target.alias);
+    const agent = (opts.agent ?? process.env.CONTEXTNEST_AGENT)?.trim();
+    const out = await conn.run<{
+      id: string;
+      entry: TaskLogEntry;
+      claim?: "assigned" | "already_yours" | "assigned_to_other";
+      assignee?: string;
+    }>("context_task_log", {
+      id,
+      note: opts.note,
+      ...(opts.status ? { status: opts.status } : {}),
+      ...(opts.claim ? { claim: true } : {}),
+      ...(agent ? { client: { agent } } : {}),
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    const e = out.entry;
+    const key = e.key ? ` (key ${e.key.label || e.key.prefix})` : "";
+    console.log(chalk.green(`Logged on ${out.id} (remote: ${target.alias})`));
+    console.log(`  ${e.client?.agent ?? "ctx"}${key} on behalf of ${e.actor}${e.status ? ` · ${e.status}` : ""}`);
+    console.log(`  ${e.note}`);
+    if (out.claim === "assigned") console.log(chalk.cyan(`  Assigned to you (${out.assignee}).`));
+    if (out.claim === "assigned_to_other") {
+      console.log(chalk.yellow(`  Not claimed — already assigned to ${out.assignee}.`));
+    }
+  });
+}
+
 export async function remoteDelete(target: RemoteTarget, path: string): Promise<void> {
   await confirmRemoteWrite(
     target,
@@ -861,29 +1111,41 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
   // Probe every server at once: a dead one then costs one timeout per listing,
   // not one per dead server.
   const probes = await Promise.all(
-    vaults.map(async (v): Promise<IndexedNest[] | null> => {
+    vaults.map(async (v): Promise<{ nests: IndexedNest[] | null; note?: string }> => {
       const spec = registry.remotes?.[v.alias];
-      if (v.kind !== "remote" || spec?.transport !== "http") return null;
+      if (v.kind !== "remote" || spec?.transport !== "http") return { nests: null };
       try {
         // An unreachable server costs one probe timeout, then is skipped for
         // NEST_PROBE_BACKOFF_MS (serverNests remembers the failure).
-        return await serverNests(v.alias, {
-          ...spec,
-          timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS),
-        });
-      } catch {
-        return null;
+        return {
+          nests: await serverNests(v.alias, {
+            ...spec,
+            timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS),
+          }),
+        };
+      } catch (err) {
+        // Never drop nests silently: show the last known list, or say why there is none.
+        const stale = readNestCache(v.alias, spec.url)?.nests ?? null;
+        const why =
+          err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED"
+            ? "server refused the key — `ctx login <server>`"
+            : "server didn't answer";
+        return { nests: stale, note: `${why}; ${stale ? "nest list may be out of date" : "nests not listed — try again shortly"}` };
       }
     }),
   );
   const rows: VaultRow[] = [];
   vaults.forEach((v, i) => {
-    const nests = probes[i];
+    const { nests, note } = probes[i];
+    const withNote = (text: string | undefined) => (note ? [text, `(${note})`].filter(Boolean).join(" ") : text);
     if (!nests) {
-      rows.push(v);
+      rows.push(note ? { ...v, description: withNote(v.description) } : v);
       return;
     }
-    rows.push({ ...v, description: v.description || `All ${nests.length} nest(s) on this server — reads span every nest` });
+    rows.push({
+      ...v,
+      description: withNote(v.description || `All ${nests.length} nest(s) on this server — reads span every nest`),
+    });
     const labels = nestLabels(nests);
     for (const n of nests) {
       rows.push({

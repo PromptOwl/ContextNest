@@ -87,6 +87,15 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx vault describe <alias> [description]` — Set or clear a registry description; omit the text to remove it
 - `ctx vault default <alias>` / `ctx vault remove <alias>` / `ctx vault which`
 
+### Hosted nests
+- `ctx login <server>` — Sign in once in the browser; the CLI mints its own API key and keeps it in your OS keyring (or the encrypted file store — never plaintext). `--key-stdin` saves an existing `cnst_…` key instead (hidden prompt on a terminal; a server without browser login falls back to it)
+- `ctx login <server> --as <alias> [--set-default]` — Sign in and register the server as a vault in one step: `ctx vault list` then shows every nest as `<alias>/<nest>`. With `--nest <id>` the alias points at that nest
+- `ctx vault add <alias> --url <server>/mcp` — Register the server; with a saved login no `--bearer-env` is needed. Then `ctx --vault <alias> query …`
+- `ctx push --server <server> --nest <id>` — Uses the saved key when `--key` / `CONTEXTNEST_API_KEY` are absent
+- `ctx login --list [server]` — Show the servers and nests you're logged into (never prints keys)
+- `ctx login <server> --nest <id> --key-stdin` — Save a key for one nest only; it wins over the server-wide key for that nest. Hosted (`https://nest.promptowl.ai`), self-hosted and nest-scoped keys all live side by side, so you never log out to switch
+- `ctx logout <server|alias> [--nest <id>] | --all` — Forget a server's keys (with its nest-scoped keys), one nest's key, or everything; `--all` also resets an unreadable store. Revoke keys on the server in the web UI
+
 ### Document Management
 - `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)
 - `ctx add <path> --type skill` — Create a skill node with trigger, inputs, and guard rails
@@ -96,6 +105,9 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
 - `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
 - `ctx update <path>` — Update a document
+- `ctx update <path> --assignee <email> --due <YYYY-MM-DD> --priority <urgent|high|medium|low> --parent <id>` — Remote (Community) nest only: set task fields; the nest checks the assignee is on its roster. `""` or `none` clears a field
+- `ctx list --assignee <email|none> --priority <p|none> --due-before <YYYY-MM-DD>` — Remote nest only: filter tasks
+- `ctx task log <path> --note "…" [--status working|done|blocked] [--claim] [--agent <name>]` — Remote nest only: record what you did on a task. Attributed to you, your API key and the agent (`--agent` or `$CONTEXTNEST_AGENT`), and shown in the task's activity. `--claim` assigns it to you if it is unassigned
 - `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
 - `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
 - `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)

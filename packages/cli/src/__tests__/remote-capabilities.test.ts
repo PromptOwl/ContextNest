@@ -187,6 +187,32 @@ describe("remoteAdd — folder", () => {
   });
 });
 
+describe("remoteAdd — structure template", () => {
+  it("a bodiless add starts from the folder's template when the nest advertises context_structure", async () => {
+    advertised = new Set(["context_create", "context_structure"]);
+    replies.context_structure = { resolved: { template_body: "## Decisions\n" } };
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+
+    await remoteAdd(target, "nodes/m/x", {});
+
+    expect(calls[0]).toMatchObject({ op: "context_structure", input: { folder: "m" } });
+    expect(calls[1].input).toMatchObject({ content: "\n## Decisions\n" });
+  });
+
+  it("asks nothing of a nest that predates structure rules, and an explicit body wins", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+    await remoteAdd(target, "nodes/m/x", {});
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+
+    calls = [];
+    advertised = new Set(["context_create", "context_structure"]);
+    await remoteAdd(target, "nodes/m/y", { body: "mine" });
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+    expect(calls[0].input).toMatchObject({ content: "\nmine\n" });
+  });
+});
+
 describe("remoteAdd — push-confirmation gate", () => {
   it("reports a held create instead of failing, and does not claim it was created", async () => {
     advertised = new Set(["context_create"]);
@@ -262,6 +288,16 @@ describe("<server>/<nest> targets", () => {
   });
   afterEach(() => {
     delete process.env.CONTEXTNEST_CONFIG_DIR;
+  });
+
+  // r23 slugre: the label was trimmed with `/^-+|-+$/g`, which retries from
+  // every dash of a run that does not end the name: "a" + 100k dashes + "b"
+  // took 11.8 s. Trimmed with a loop now.
+  it("r23 slugre: a nest name with a long run of dashes is labelled in linear time", () => {
+    const started = performance.now();
+    const labels = nestLabels([{ id: "x", name: `a${"-".repeat(100_000)}b` }]);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect([...labels.values()][0]).toBe(`a${"-".repeat(100_000)}b`);
   });
 
   it("labels nests by slugged name, disambiguating collisions with the id", () => {
@@ -384,6 +420,36 @@ describe("<server>/<nest> targets", () => {
     advertised = new Set(); // every server now "unreachable"/single-nest
     const plainRows = await expandServerVaults([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
     expect(plainRows).toEqual([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
+  });
+
+  it("vault list never drops nests silently: last known list (marked stale) on a failed probe, a note when there is none", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(
+      join(dir, "config.yaml"),
+      "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n  cold:\n    transport: http\n    url: https://cold.example/mcp\n",
+    );
+    const cn = { alias: "cn", kind: "remote", transport: "http", url: "https://cn.example/mcp", isDefault: true } as const;
+    const cold = { alias: "cold", kind: "remote", transport: "http", url: "https://cold.example/mcp", isDefault: false } as const;
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    await expandServerVaults([cn]); // caches cn's nests
+
+    replies = { nest_index: new ContextNestError("timed out", "REMOTE_UNREACHABLE") };
+    const now = Date.now;
+    Date.now = () => now() + NEST_INDEX_TTL_MS + 1; // cache expired, server now silent
+    let rows;
+    try {
+      rows = await expandServerVaults([cn, cold]);
+    } finally {
+      Date.now = now;
+    }
+    expect(rows).toMatchObject([
+      { alias: "cn", description: expect.stringMatching(/All 2 nest.*didn't answer; nest list may be out of date/) },
+      { alias: "cn/strategy" },
+      { alias: "cn/chameleon-collective" },
+      { alias: "cold", description: expect.stringMatching(/didn't answer; nests not listed/) },
+    ]);
   });
 
   it("the nest-less-write rewrite also matches the server's own prose refusal", async () => {

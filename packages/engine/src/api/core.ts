@@ -462,6 +462,7 @@ const createOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "DOCUMENT_ALREADY_EXISTS",
     "FORGOTTEN_DOCUMENT",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
     "PENDING_CONFIRMATION",
   ],
@@ -592,6 +593,7 @@ const updateOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
     "FORGOTTEN_DOCUMENT",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
@@ -669,6 +671,7 @@ const deleteOp: OperationDescriptor = {
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["delete_document"],
@@ -797,6 +800,7 @@ const verifyError = z.object({
     "checkpoint_hash_mismatch",
     "body_drift",
     "unreadable_history",
+    "unreadable_document",
     "version_unreconstructable",
     "sidecar_drift",
     "sidecar_missing",
@@ -1085,7 +1089,7 @@ const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest. A `.versions/chain_events.yaml` in `files` re-applies its forget records here: grant import of it only to callers who may also forget.",
   // Every input is optional and validated in the executor rather than through
   // a refined union: `.refine()` produces a ZodEffects, which degrades to a
   // useless JSON Schema through zod-to-json-schema — and MCP publishes
@@ -1183,7 +1187,7 @@ const importOp: OperationDescriptor = {
       )
       .optional(),
   }),
-  errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
+  errors: ["VALIDATION_FAILED", "CONFIG_ERROR", "VAULT_LOCK_TIMEOUT"],
 };
 
 
@@ -1264,6 +1268,7 @@ const importPdfOp: OperationDescriptor = {
     "FORGOTTEN_DOCUMENT",
     // The publish refuses a sidecar that does not hash to pdf.sha256.
     "INTEGRITY_ERROR",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
   ],
 };
@@ -1375,6 +1380,75 @@ const skillInstallOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
 };
 
+// ─── context_structure ───────────────────────────────────────────────────────
+
+/** One folder rule as `context_structure` reports it. */
+const folderRuleView = z.object({
+  pattern: z.string().describe('Folder path pattern, e.g. "clients/{client}/meetings"; "/" is the vault root'),
+  description: z.string().optional(),
+  types: z.array(z.string()).optional().describe("Node types allowed directly in the folder; absent = any, [] = none"),
+  folder_name: z.string().optional().describe("Format of the trailing {placeholder} folder name: token pattern or /regex/"),
+  file_name: z.string().optional().describe('Format of file names in the folder: token pattern ("{date}-{slug}") or /regex/'),
+  template: z.string().optional().describe("Template new files in the folder start from"),
+  required: z.boolean().describe("This fixed-name folder is created with its parent and cannot be deleted alone"),
+  files: z
+    .record(z.object({ template: z.string().optional(), type: z.string().optional() }))
+    .describe("Files every matching folder must contain (leaf name → template/type)"),
+});
+
+const structureOp: OperationDescriptor = {
+  name: "context_structure",
+  namespace: "core",
+  description:
+    "Read this nest's structure rules: which folders may exist, which node types and file-name formats each " +
+    "folder allows, the template its files start from, and the sections and files that are required. Call it " +
+    "before creating or moving a document in a nest with rules; writes that break an enforced rule are refused. " +
+    "Pass `folder` to get the one rule governing that folder (with its template body); `report: true` lists " +
+    "existing content that breaks the rules. File names come from titles (lowercased, words joined by \"-\").",
+  input: z.object({
+    folder: z
+      .string()
+      .optional()
+      .describe('Folder to resolve the governing rule for, e.g. "clients/acme-042/meetings" (a leading "nodes/" is optional)'),
+    report: z.boolean().optional().describe("Also list every existing document and folder that breaks a rule"),
+    ...clientField,
+  }),
+  output: z.object({
+    enforce: z.boolean().describe("true: writes that break a rule are refused; false: rules are report-only"),
+    closed: z.boolean().describe("true: only declared folders (and their ancestors) may exist and hold documents"),
+    folders: z.array(folderRuleView),
+    templates: z.record(z.object({ body: z.string(), required_sections: z.array(z.string()) })),
+    resolved: folderRuleView
+      .extend({
+        template_body: z.string().optional(),
+        required_sections: z.array(z.string()).optional(),
+      })
+      .nullable()
+      .optional()
+      .describe("With `folder`: the governing rule, or null when no rule governs it"),
+    violations: z
+      .array(
+        z.object({
+          code: z.string(),
+          path: z.string(),
+          rule: z.string().optional(),
+          message: z.string(),
+        }),
+      )
+      .optional()
+      .describe("With `report`: what breaks the rules today (grandfathered content stays editable)"),
+    warnings: z
+      .array(z.string())
+      .optional()
+      .describe("Rules that compile but are probably mistakes, e.g. a template name not defined under templates"),
+    error: z
+      .string()
+      .optional()
+      .describe("Present when the rules in config.yaml do not compile: why. Writes are refused only if the rules are enforced"),
+  }),
+  errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
+};
+
 /** All `core` namespace operations, in catalog order. */
 export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   getOp,
@@ -1399,4 +1473,5 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   importPdfOp,
   skillOp,
   skillInstallOp,
+  structureOp,
 ];

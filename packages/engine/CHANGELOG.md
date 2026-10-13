@@ -1,5 +1,28 @@
 # @promptowl/contextnest-engine
 
+## 2.12.0
+
+### Minor Changes
+
+- ce831be: Add the `view` node type (spec §1.12): a governed composition of other nodes. A view's required `view` frontmatter block is a layout of blocks (`md`, `list`, `summary`, `html`, `table`, `kpi`, `chart`, `callout`, `metric`, `data`) that name what to show and where it comes from. Being frontmatter, the layout is versioned and hashed like any node, so approving a view approves its layout.
+
+  - **Validation (rules 30–36, §13.5):** the block is required on `type: view` and forbidden elsewhere, needs at least one block with exactly one kind each, and is strict at every level. Every `ref`/`binding` must be a node path or `contextnest://` URI, never a URL, so no URL, credential or unknown key can ride inside a view. Refs carry no `@`/`#` suffix: an `md` block pins with `version`. Selectors must parse, `from`/`data_from` must name an earlier block's id, and a `render: pinned` view must pin every `md` block.
+  - **Writes:** `context_create`, `context_update`, `context_import` and the MCP `create_document`/`update_document` tools take a `view` parameter. A node can be created as a view or re-typed to and from one in a single call, as with `source` and `skill`.
+  - **Resolution:** new `resolveView(node, { documents, reconstructVersion?, includeDrafts? })` resolves `md`, `list` and `callout` blocks from the vault under retrieval visibility (published only by default; forgotten nodes never resolve). A pinned version is served only while its node is still published. `documents` is the reader's scope: the engine applies status visibility, and access control and `audience` are the caller's. It returns a structured result, a markdown rendering and what a render receipt needs: each `md` block's `ref@version` and content hash, each `list` block's members and set hash, and `viewFingerprint(view)` over the layout. Other kinds come back as `status: "server"` for the serving implementation.
+
+  This only widens the vocabulary, so no existing document changes bytes or hashes. §13 rule 6 now counts 15 node types (it said 13).
+
+### Patch Changes
+
+- 0d7f082: **Folder import does less storage I/O.** On a network-backed vault (Cloud Storage via gcsfuse) every file operation is a round trip, and a few hundred documents paid several of them each in places where none were needed.
+
+  - `context_import` checks whether its incoming files already exist in the vault in parallel, not one file at a time. Path planning is unchanged: same targets, same `-2`/`-3` collision numbering, same warnings.
+  - A checkpoint sealed with no readable head (the first one in a new or freshly imported nest, or after an unreadable `context_history.yaml`) no longer walks the vault and reads every `history.yaml`. It takes the hashes the publish just sealed and reads history only for published documents those don't cover, as a seal on top of an existing head already did.
+  - `publishDocuments` takes an optional `preloaded` map of documents the caller already read under the same lock; discover-mode `context_import` passes its scan, so each document is no longer read a second time before it is published.
+  - Publishing a document with no history lists its `.versions/` directory once instead of twice (`nextVersion` and `createVersion` accept an optional `knownSealed`).
+
+  Sealed versions, chain hashes and checkpoints are the same as before.
+
 ## 2.11.0
 
 ### Minor Changes

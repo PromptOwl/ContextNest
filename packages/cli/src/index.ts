@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
@@ -19,11 +19,12 @@ import {
   evaluate,
   Resolver,
   PackLoader,
+  invalidPackSelectors,
   VersionManager,
   CheckpointManager,
   ContextInjector,
   GraphQueryEngine,
-  publishDocument,
+  publishDocuments,
   ContextNestError,
   DocumentNotFoundError,
   assertVaultRoot,
@@ -73,6 +74,9 @@ import {
   approveReview,
   rejectReview,
   REVIEW_OFF_COMMAND,
+  enforcedStructure,
+  checkDocument,
+  parseDocument,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -88,10 +92,20 @@ import {
   remotePublish,
   remoteDelete,
   remoteMove,
+  remoteStructure,
   expandServerVaults,
   folderFromId,
   remoteFetchRecipe,
+  slugLabel,
+  remoteTaskLog,
 } from "./remote.js";
+import {
+  hasTaskFieldArgs,
+  localTaskFieldsError,
+  parseIsoDate,
+  parseTaskLogStatus,
+  taskFieldArgs,
+} from "./task-fields.js";
 import { planPull, applyPull, type PullStep, kindDocId, parseKindDocument } from "./pull.js";
 import { planKindApply, executeKindPlan, renderKindPlan, parseStewardMappings } from "./kind.js";
 import {
@@ -102,6 +116,8 @@ import {
   type SearchHitView,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
 import { createEngineApi } from "@promptowl/contextnest-engine/api";
 import type { OperationContext } from "@promptowl/contextnest-engine/api";
@@ -117,12 +133,30 @@ import type {
 import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
-import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
+import {
+  emptyServerMap,
+  isNestScope,
+  assertServerMapWritable,
+  keyForEndpoint,
+  keysUnderServer,
+  loadServerMap,
+  nestScopeUrl,
+  normalizeServerUrl,
+  removeServer,
+  saveServerMap,
+  savedTokenFor,
+  upsertServer,
+  type ServerCredential,
+  type ServerMap,
+} from "./server-credentials.js";
+import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
+import { parseLicenseList } from "./pubmed.js";
 import {
   configureSafety,
   openWriteScope,
@@ -222,6 +256,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["read", "Show a document (add --html to open it in the browser)"],
       ["update", "Edit a document, then publish a new version (held instead when review is on)"],
       ["review", "List, approve or reject writes held for review"],
+      ["task", "Log what you did on a task in a remote nest (working / done / blocked)"],
       ["delete", "Remove a document and its version history"],
     ],
   },
@@ -872,11 +907,7 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
 // Derive a sensible default alias from a directory name, sanitized to the
 // allowed alias characters.
 function slugifyAlias(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug || "vault";
+  return slugLabel(name) || "vault";
 }
 
 /**
@@ -988,8 +1019,24 @@ async function applyStarter(
     await storage.writeConfig(initialConfig);
   }
 
+  // A starter on a re-initialized vault meets its structure rules like any
+  // other write: what they refuse is left out, not forced in.
+  const rules = await enforcedStructure(storage);
+  const nodes = starter.nodes.filter((node) => {
+    if (!rules) return true;
+    const doc = parseDocument(`${node.path}.md`, node.content, node.path);
+    return checkDocument(rules, { id: node.path, type: doc.frontmatter.type, body: doc.body }).length === 0;
+  });
+  if (nodes.length < starter.nodes.length) {
+    console.log(
+      chalk.yellow(
+        `  Skipped ${starter.nodes.length - nodes.length} starter document(s) this vault's structure rules refuse (ctx structure).`,
+      ),
+    );
+  }
+
   // Write starter nodes
-  for (const node of starter.nodes) {
+  for (const node of nodes) {
     await storage.writeDocument(node.path, node.content);
   }
 
@@ -1000,20 +1047,23 @@ async function applyStarter(
     await fs.promises.writeFile(packPath, pack.content, "utf-8");
   }
 
-  // Publish all starter nodes
-  for (const node of starter.nodes) {
-    await publishDocument(storage, node.path, {
-      editedBy: "cli@contextnest.local",
-      note: `Created by ${starter.id} starter`,
-    });
+  // Publish all starter nodes as one batch: one checkpoint, and folders the
+  // starter shares between nodes are scaffolded under enforced rules.
+  const published = await publishDocuments(
+    storage,
+    nodes.map((node) => node.path),
+    { editedBy: "cli@contextnest.local", note: `Created by ${starter.id} starter` },
+  );
+  if (published.failed.length > 0) {
+    throw new Error(`Could not publish starter documents: ${published.failed.map((f) => `${f.id}: ${f.error}`).join("; ")}`);
   }
 
   await regenerateIndex(storage);
 
   // Print results
   console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
-  console.log(`  Created ${starter.nodes.length} documents:`);
-  for (const node of starter.nodes) {
+  console.log(`  Created ${nodes.length} documents:`);
+  for (const node of nodes) {
     console.log(`    ${chalk.cyan(node.path + ".md")}`);
   }
   console.log(`  Created ${starter.packs.length} pack(s):`);
@@ -1037,7 +1087,7 @@ async function applyStarter(
     vaultName: opts.name,
     starterName: starter.id,
     starterDisplayName: starter.name,
-    nodes: starter.nodes.map((n) => ({
+    nodes: nodes.map((n) => ({
       path: n.path,
       title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
       type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
@@ -1227,6 +1277,7 @@ program
     const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
     const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
     const review = reinit ? priorReview : "on";
+    // storage.init carries the vault's structure rules over a re-init.
     await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
     if (review === "on") {
@@ -1664,8 +1715,21 @@ program
     }
 
     let body: string;
+    // A folder with a template (§11.1 structure rules) starts its files from it.
+    const template =
+      !opts.body && opts.type !== "skill"
+        ? (
+            await cliApi().run<StructureOutput>(
+              "context_structure",
+              { folder: id.split("/").slice(0, -1).join("/") },
+              opContext(storage, "cli@contextnest.local"),
+            )
+          ).resolved?.template_body
+        : undefined;
     if (opts.body) {
       body = `\n${opts.body}\n`;
+    } else if (template) {
+      body = `\n${template}`;
     } else if (opts.type === "skill") {
       body = `\n# ${title}\n\n## Steps\n\n1. \n2. \n3. \n\n## Expected Output\n\nDescribe what the agent should produce.\n`;
     } else {
@@ -1727,6 +1791,32 @@ async function afterHold(storage: NestStorage, id: string): Promise<void> {
   });
 }
 
+// ─── ctx structure ─────────────────────────────────────────────────────────────
+
+program
+  .command("structure")
+  .description("Show the nest's structure rules: allowed folders, node types, name formats and templates")
+  .option("--folder <path>", "Show the rule governing one folder, with its template")
+  .option("--report", "Also list existing content that breaks the rules")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteStructure(remote, opts);
+      return;
+    }
+    const storage = getStorage();
+    const out = await cliApi().run<StructureOutput>(
+      "context_structure",
+      {
+        ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+        ...(opts.report ? { report: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    printStructure(out, opts);
+  });
+
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 
 program
@@ -1780,13 +1870,38 @@ program
       }
     }
 
+    // Pack problems only surface when someone queries the pack; catch them
+    // here. `validate <path>` checks one document, so it skips packs.
+    let packCount = 0;
+    if (!path) {
+      const packProblems: Array<{ file: string; message: string }> = [];
+      const packs = await storage.readPacks(packProblems);
+      packCount = packs.length;
+      for (const p of packProblems) {
+        hasErrors = true;
+        allErrors.push({ path: p.file, errors: [{ rule: "pack-file", message: p.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ ${p.file}`));
+          console.log(`  ${p.message}`);
+        }
+      }
+      for (const bad of invalidPackSelectors(packs)) {
+        hasErrors = true;
+        allErrors.push({ path: `pack:${bad.id}`, errors: [{ rule: "pack-query", message: bad.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ pack:${bad.id}`));
+          console.log(`  query "${bad.query}": ${bad.message}`);
+        }
+      }
+    }
+
     if (opts.json) {
       console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors }, null, 2));
     } else {
       console.log(
         hasErrors
           ? chalk.red(`\nValidation failed with errors`)
-          : chalk.green(`\nAll ${docs.length} documents valid`),
+          : chalk.green(`\nAll ${docs.length} documents${path ? "" : ` and ${packCount} packs`} valid`),
       );
     }
 
@@ -2209,7 +2324,21 @@ program
     // Forget protocol (§6.3): erased content stays erased, and every
     // tombstone is accounted for by a recorded forget. Tombstoned versions
     // themselves verify hash-only — they are not errors.
-    const tombstoneErrors = await storage.verifyTombstones(allHistories);
+    // The crawl, once: a document that cannot be read (frontmatter that does
+    // not parse, sealed bytes that do not open) is reported, never skipped
+    // into a pass — and the tombstone and sidecar checks judge the same set.
+    let liveDocs: Awaited<ReturnType<typeof storage.discoverDocuments>> | undefined;
+    if (!lock) {
+      liveDocs = await storage.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (docId, reason) => {
+          totalErrors++;
+          allReportErrors.push({ type: "unreadable_document", document: docId, expected: null, actual: reason });
+          if (!opts.json) console.log(chalk.red(`✗ ${docId}: unreadable — ${reason}`));
+        },
+      });
+    }
+    const tombstoneErrors = await storage.verifyTombstones(allHistories, liveDocs);
     if (tombstoneErrors.length > 0) {
       totalErrors += tombstoneErrors.length;
       allReportErrors.push(...tombstoneErrors);
@@ -2237,7 +2366,7 @@ program
     // also must not hold content in plaintext. Both need the key.
     const sidecarErrors = lock
       ? []
-      : [...(await storage.verifyPdfSidecars()), ...(await storage.findUnencryptedFiles())];
+      : [...(await storage.verifyPdfSidecars(liveDocs)), ...(await storage.findUnencryptedFiles())];
     if (sidecarErrors.length > 0) {
       totalErrors += sidecarErrors.length;
       allReportErrors.push(...sidecarErrors);
@@ -2536,12 +2665,18 @@ program
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected|forgotten; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
+  .option("--assignee <email>", 'Remote nest: only items assigned to this email ("none" = unassigned)')
+  .option("--priority <p>", "Remote nest: only this priority (urgent|high|medium|low|none)")
+  .option("--due-before <date>", "Remote nest: only items due on or before YYYY-MM-DD", parseIsoDate)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteList(remote, opts);
       return;
+    }
+    if (opts.assignee !== undefined || opts.priority !== undefined || opts.dueBefore !== undefined) {
+      throw localTaskFieldsError("--assignee / --priority / --due-before");
     }
     const storage = getStorage();
     // Aliases collapse here; the operation owns the rest of the filtering,
@@ -2599,11 +2734,18 @@ program
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
+  .option("--assignee <email>", 'Remote nest: assign to someone on its roster ("" or none unassigns)')
+  .option("--due <date>", 'Remote nest: due date YYYY-MM-DD ("" or none clears)')
+  .option("--priority <p>", 'Remote nest: urgent|high|medium|low ("" or none clears)')
+  .option("--parent <id>", 'Remote nest: parent node id, making this a sub-item ("" or none clears)')
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteUpdate(remote, path, opts);
       return;
+    }
+    if (hasTaskFieldArgs(taskFieldArgs(opts))) {
+      throw localTaskFieldsError("--assignee / --due / --priority / --parent");
     }
     const storage = getStorage();
     // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
@@ -2667,6 +2809,29 @@ program
     console.log(chalk.green(`Updated and published ${result.id}`));
     console.log(`  Version: ${result.version}`);
     console.log(`  Checkpoint: ${result.checkpoint}`);
+  });
+
+// ─── ctx task ─────────────────────────────────────────────────────────────────
+// Tasks live on a Community nest; this is how an agent says what it did.
+
+const taskCmd = program
+  .command("task")
+  .description("Work with tasks on a remote nest");
+
+taskCmd
+  .command("log <path>")
+  .description(
+    "Log an interaction on a task — attributed to you, the API key and the agent (shows in the task's activity)",
+  )
+  .requiredOption("--note <text>", "What you did or found")
+  .option("--status <status>", "working | done | blocked", parseTaskLogStatus)
+  .option("--claim", "Assign the task to yourself if it is unassigned")
+  .option("--agent <name>", "Agent name to record (default: $CONTEXTNEST_AGENT)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (!remote) throw localTaskFieldsError("`ctx task log`");
+    await remoteTaskLog(remote, path, opts);
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────
@@ -3139,9 +3304,13 @@ importCmd
 
 importCmd
   .command("pubmed")
-  .description("Search PubMed Central (open-access) and import the hits as markdown twins")
-  .requiredOption("--term <query>", 'PubMed query, e.g. "fecal microbiota transplantation[mh] AND open access[filter]"')
-  .option("--max <n>", "Maximum articles to fetch", "25")
+  .description("Search PubMed (MeSH / publication-type filters honoured) and import the PMC full texts as markdown twins")
+  .requiredOption("--term <query>", 'PubMed query, e.g. "chronic pain[majr] AND systematic review[pt]" (restricted to PMC full text automatically)')
+  .option("--max <n>", "Maximum articles to import (counted after the licence filter)", "25")
+  .option(
+    "--license <list>",
+    "Keep only these licences, comma-separated: cc-by, cc0, cc-by-nc, cc-by-sa, …, or `commercial` (CC BY + CC0 + public domain)",
+  )
   .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
   .option("--keep-xml", "Also store each original under assets/jats/")
   .option("--no-relink", "Do not update existing papers whose references now resolve")
@@ -3152,21 +3321,38 @@ importCmd
     const storage = getStorage();
     const max = Math.max(1, parseInt(opts.max, 10) || 25);
     const apiKey = opts.apiKey ?? process.env.NCBI_API_KEY;
+    let licenses: string[] | undefined;
+    if (opts.license !== undefined) {
+      try {
+        licenses = parseLicenseList(String(opts.license));
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exitCode = 1;
+        return;
+      }
+    }
     await confirmOrExit(
-      `Fetch up to ${max} open-access PMC article(s) for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+      `Fetch up to ${max} PMC full-text article(s)${licenses ? ` licensed ${licenses.join("/")}` : ""} for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
     );
     const fetched = await fetchPmcSources({
       term: opts.term,
       max,
+      licenses,
       apiKey,
       onProgress: (done, total, pmcid) => {
         if (process.stdout.isTTY) process.stdout.write(`\rFetching ${done}/${total} ${pmcid}…`);
       },
     });
     if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
-    console.log(chalk.dim(`${fetched.total} match(es) in PMC; fetched ${fetched.sources.length}`));
+    console.log(
+      chalk.dim(
+        `${fetched.total} match(es) in PubMed with PMC full text; fetched ${fetched.sources.length}` +
+          (licenses ? `; skipped ${fetched.skippedLicense.length} for licence` : ""),
+      ),
+    );
     for (const f of fetched.failed) console.log(chalk.yellow(`  ! ${f}`));
     if (fetched.sources.length === 0) {
+      for (const sk of fetched.skippedLicense) console.log(chalk.dim(`  – ${sk}`));
       console.log(chalk.yellow("Nothing to import."));
       if (fetched.failed.length) process.exitCode = 1;
       return;
@@ -3181,7 +3367,8 @@ importCmd
       relink: opts.relink,
       force: isForce(),
     });
-    printImportSummary(r, opts.json);
+    // Licence drops are reported with the import's own skips (and in --json).
+    printImportSummary({ ...r, skipped: [...fetched.skippedLicense, ...r.skipped] }, opts.json);
   });
 
 const enrichCmd = program
@@ -3274,6 +3461,275 @@ program
     }
   });
 
+// ─── ctx login / logout ──────────────────────────────────────────────────────
+
+/** A pasted key: piped stdin is read to EOF; on a terminal it is one hidden line, done at Enter. */
+async function readStdin(): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    // A key is ~70 bytes; refuse a runaway pipe instead of buffering all of it.
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of stdin) {
+      size += (chunk as Buffer).length;
+      if (size > 4096) throw new Error("Too much input on stdin — pipe in just the key (cnst_…).");
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+  }
+  process.stderr.write(chalk.dim("Paste the key and press Enter — it stays hidden. Ctrl-C to cancel.\n> "));
+  return new Promise((resolve, reject) => {
+    let key = "";
+    const finish = () => {
+      stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.off("error", onError);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stderr.write("\n");
+    };
+    const onData = (s: string) => {
+      for (const ch of s) {
+        if (ch === "\u0003") {
+          finish();
+          console.error(chalk.yellow("Cancelled — nothing was saved."));
+          process.exit(130);
+        } else if (ch === "\r" || ch === "\n") {
+          if (key.trim()) {
+            finish();
+            resolve(key);
+            return;
+          }
+          process.stderr.write(chalk.dim("\nNothing pasted yet — paste the key and press Enter, or Ctrl-C to cancel.\n> "));
+        } else if (ch === "\u007f" || ch === "\b") {
+          key = key.slice(0, -1);
+        } else {
+          key += ch;
+        }
+      }
+    };
+    // A terminal that closes or errors mid-prompt must not leave login hanging.
+    const onError = (err: Error) => {
+      finish();
+      reject(err);
+    };
+    const onEnd = () => onError(new Error("Input closed before a key was pasted."));
+    stdin.setEncoding("utf-8");
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+    stdin.once("end", onEnd);
+    stdin.once("error", onError);
+  });
+}
+
+program
+  .command("login [server]")
+  .description("Sign in to a ContextNest server once; push and remote --vault aliases reuse the saved key")
+  .option("--key-stdin", "Read an existing API key (cnst_…) from stdin instead of the browser flow")
+  .option("--nest <id>", "Save the key for this one nest only (with --key-stdin); it wins over the server-wide key")
+  .option("--label <text>", "Label for this credential (default: your account email)")
+  .option("--list", "Show the servers and nests you're logged into (never prints keys)")
+  .option("--as <alias>", "Also register the server (all its nests), or the --nest, as a remote vault alias")
+  .option("--set-default", "With --as: make that alias the default vault")
+  .action(async (
+    server: string | undefined,
+    opts: { keyStdin?: boolean; nest?: string; label?: string; list?: boolean; as?: string; setDefault?: boolean },
+  ) => {
+    try {
+      if (opts.list) {
+        const map = await loadServerMap();
+        const keys = (server ? keysUnderServer(map, server) : Object.keys(map.servers)).sort();
+        if (keys.length === 0) {
+          console.log(chalk.yellow(server ? `No saved key for ${normalizeServerUrl(server)}.` : "Not logged in to any server."));
+          return;
+        }
+        for (const key of keys) {
+          const cred = map.servers[key];
+          const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
+          console.log(`${key}${scope}`);
+          const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
+          if (meta) console.log(chalk.dim(`  ${meta}`));
+        }
+        return;
+      }
+      if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
+      assertSafeEndpoint(server, "<server>");
+      if (opts.nest && !opts.keyStdin) {
+        throw new Error(
+          "Browser login signs in to the whole server. To save a key for one nest, paste it:\n" +
+            `  ctx login ${server} --nest ${opts.nest} --key-stdin`,
+        );
+      }
+      const serverUrl = normalizeServerUrl(server);
+      const url = opts.nest ? nestScopeUrl(serverUrl, opts.nest) : serverUrl;
+      if (opts.setDefault && !opts.as) throw new Error("--set-default goes with --as <alias>.");
+      // Check the alias before signing in, not after a key has been minted.
+      if (opts.as) {
+        const reg = readRegistry();
+        if (reg.vaults[opts.as] || (reg.remotes?.[opts.as] && !isForce())) {
+          throw new Error(`"${opts.as}" is already a registered vault — pick another alias, or pass --force to replace a remote.`);
+        }
+      }
+      // Registered with no auth, so the alias borrows the key — the key never enters the registry.
+      // Confirmed before signing in, so declining never leaves a saved key without its alias.
+      const aliasSpec: RemoteNestSpec = { transport: "http", url: `${url}/mcp` };
+      if (opts.as) {
+        await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
+      }
+      // Fail on an unusable store now, before the server mints a key.
+      await assertServerMapWritable();
+      let token: string | undefined;
+      let label = opts.label;
+      let mintedLabel: string | undefined;
+      if (!opts.keyStdin) {
+        // The name the server shows for this key (what you'd revoke). Asked on a
+        // terminal only; Enter keeps the default, and scripts always get it.
+        const defaultName = `ctx CLI (${hostname()})`;
+        let keyName = defaultName;
+        while (process.stdin.isTTY) {
+          keyName = await promptText("Name for the API key this login creates", defaultName);
+          if (keyName.length <= 60) break;
+          console.log(chalk.yellow("  Key names can be at most 60 characters."));
+        }
+        try {
+          const res = await deviceLogin(url, {
+            deviceName: keyName,
+            prompt: (verificationUrl, userCode) => {
+              console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(verificationUrl)}`);
+              if (userCode) console.log(`  Code: ${chalk.bold(userCode)}`);
+              openUrlInBrowser(verificationUrl);
+              console.log(chalk.dim("\n  Waiting for approval… (Ctrl-C to cancel)"));
+            },
+          });
+          token = res.token;
+          mintedLabel = res.keyLabel;
+          label ??= res.email ? `${res.email} · key "${res.keyLabel}"` : `key "${res.keyLabel}"`;
+        } catch (err) {
+          // No browser login on this server: on a terminal, take a pasted key instead.
+          if (!(err instanceof NoBrowserLoginError && process.stdin.isTTY)) throw err;
+          console.log(chalk.yellow(`${err.message.split("\n")[0]} Create a key in its web UI (Connect) and paste it.`));
+        }
+      }
+      token ??= parsePastedKey(await readStdin());
+      // The OS keyring can take a second or two (Windows starts PowerShell).
+      console.log(chalk.dim("  Saving the key to the secure store…"));
+      let map: ServerMap;
+      let where: string;
+      try {
+        map = upsertServer(await loadServerMap(), url, {
+          token,
+          ...(label ? { label } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+        where = await saveServerMap(map);
+      } catch (err) {
+        if (!mintedLabel) throw err;
+        throw new Error(
+          `${(err as Error).message}\n  The server already created key "${mintedLabel}" — revoke it in its web UI.`,
+        );
+      }
+      console.log(
+        chalk.green(`\nLogged in to ${url}${label ? ` (${label})` : ""}.`) +
+          (opts.nest ? chalk.dim("  (this nest only)") : map.default === url ? chalk.dim("  (default)") : ""),
+      );
+      console.log(chalk.dim(`  Key saved to ${where}.`));
+      if (opts.as) {
+        let reg: ReturnType<typeof addRemote>;
+        try {
+          reg = addRemote(opts.as, aliasSpec, { setDefault: opts.setDefault, force: isForce() });
+        } catch (err) {
+          throw new Error(
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${opts.as} --url ${aliasSpec.url}`,
+          );
+        }
+        console.log(
+          chalk.green(`Registered remote "${chalk.bold(opts.as)}"${reg.default === opts.as ? " (default)" : ""} → ${aliasSpec.url}`),
+        );
+        console.log(
+          chalk.dim(
+            opts.nest
+              ? `  Next: ctx --vault ${opts.as} list`
+              : `  Next: ctx vault list   (each nest shows as ${opts.as}/<nest>; use --vault ${opts.as}/<nest> for one)`,
+          ),
+        );
+        return;
+      }
+      // A nest-scoped key only matches its own nest's URL, so it gets just that line.
+      const next = opts.nest
+        ? [`This nest:  ctx vault add <alias> --url ${url}/mcp`]
+        : [
+            `All nests:  ctx vault add <alias> --url ${url}/mcp`,
+            `            then \`ctx vault list\` shows each one as <alias>/<nest>; use --vault <alias>/<nest> for one`,
+            `One nest:   ctx vault add <alias> --url ${url}/nests/<id>/mcp`,
+          ];
+      console.log(chalk.dim(`\n  Next — connect with this key (no --bearer-env needed):`));
+      for (const line of next) console.log(chalk.dim(`    ${line}`));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout [server]")
+  .description(
+    "Forget keys saved by `ctx login` for a server URL or a remote alias, including that server's nest-scoped keys (they stay valid on the server — revoke them in the web UI)",
+  )
+  .option("--nest <id>", "Forget only the key saved for this nest")
+  .option("--all", "Forget every saved server key")
+  .action(async (server: string | undefined, opts: { nest?: string; all?: boolean }) => {
+    try {
+      if (opts.all) {
+        if (server || opts.nest) throw new Error("--all forgets every server; drop the <server> / --nest.");
+        // Don't parse first: --all is the way out of a corrupt or newer-format map.
+        let forgotten: [string, ServerCredential][] = [];
+        try {
+          forgotten = Object.entries((await loadServerMap()).servers);
+        } catch {
+          /* unreadable — wipe it anyway */
+        }
+        await saveServerMap(emptyServerMap());
+        if (forgotten.length === 0) {
+          console.log(chalk.yellow("No saved server keys."));
+          return;
+        }
+        for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+        return;
+      }
+      if (!server) throw new Error("Name the <server> or remote alias to log out of, or pass --all.");
+      let map = await loadServerMap();
+      if (!/^https?:\/\//i.test(server)) {
+        // A remote alias: forget the saved key it signs in with (and, if server-wide, that server's nest keys).
+        const spec = readRegistry().remotes?.[server];
+        if (spec?.transport !== "http") throw new Error(`"${server}" is neither a server URL nor a registered HTTP remote alias.`);
+        const key = keyForEndpoint(map, spec.url);
+        if (!key) {
+          console.log(chalk.yellow(`No saved key is used by "${server}" (${spec.url}).`));
+          return;
+        }
+        server = key;
+      }
+      const targets = opts.nest ? [nestScopeUrl(server, opts.nest)].filter((k) => map.servers[k]) : keysUnderServer(map, server);
+      if (targets.length === 0) {
+        console.log(chalk.yellow(`No saved key for ${opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server)}.`));
+        return;
+      }
+      const forgotten = targets.map((k) => [k, map.servers[k]] as const);
+      for (const k of targets) map = removeServer(map, k);
+      await saveServerMap(map);
+      for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+function printLoggedOut(url: string, cred: ServerCredential): void {
+  console.log(chalk.green(`Logged out of ${url}.`));
+  console.log(chalk.dim(`  The key still works until you revoke it in the server's web UI${cred.label ? ` — ${cred.label}` : ""}.`));
+}
+
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
 /** Print the terminal result of a gated push. Success stays on stdout. */
@@ -3310,7 +3766,7 @@ program
   .description("Push the local vault to a hosted ContextNest server")
   .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
   .requiredOption("--nest <id>", "Target nest ID")
-  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer `ctx login` or the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .option(
     "--no-wait",
@@ -3331,13 +3787,22 @@ program
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
-    const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
-    if (!apiKey) {
-      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+    // Refuse to put documents and a bearer token on the wire in the clear —
+    // checked first, so a refused URL never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
       process.exit(1);
     }
-    // Refuse to put documents and a bearer token on the wire in the clear.
-    assertSafeEndpoint(opts.server, "--server");
+    if (!apiKey) {
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
+      process.exit(1);
+    }
 
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
@@ -3413,6 +3878,9 @@ program
       if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
+        if (res.status === 401 && !opts.key && !process.env.CONTEXTNEST_API_KEY) {
+          console.error(chalk.dim("  The key saved by `ctx login` was rejected — check `ctx login --list`, then log in again."));
+        }
         process.exit(1);
       }
 

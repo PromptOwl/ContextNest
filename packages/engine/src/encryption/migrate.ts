@@ -112,9 +112,22 @@ export async function encryptVault(
     let crypto = await VaultCrypto.load(storage.root, { keyStore: options.keyStore });
     let passphrase: string | null = null;
     const resumed = crypto !== null;
+    const files = await sensitiveFiles(storage.root);
     if (crypto) {
       await crypto.unlock();
     } else {
+      // No config, yet sealed files: the config was lost, not never made. A
+      // new key would leave every sealed file unreadable under it.
+      for (const { rel, kind } of files) {
+        const abs = join(storage.root, rel);
+        const sealed = kind === "binary" ? isSealedBinary(await readFile(abs)) : isArmoredText(await readFile(abs, "utf-8"));
+        if (sealed) {
+          throw new ContextNestError(
+            `${rel} is sealed, but this vault has no .context/encryption.yaml — restore the config (and its key) instead of encrypting again, or a new key would lock every sealed file out.`,
+            "VAULT_LOCKED",
+          );
+        }
+      }
       const created = VaultCrypto.create(storage.root, { keyStore: options.keyStore, scrypt: options.scrypt });
       crypto = created.crypto;
       passphrase = created.passphrase;
@@ -126,7 +139,7 @@ export async function encryptVault(
     storage.setVaultCrypto(crypto);
 
     let sealed = 0;
-    for (const { rel, kind } of await sensitiveFiles(storage.root)) {
+    for (const { rel, kind } of files) {
       const abs = join(storage.root, rel);
       if (kind === "binary") {
         const bytes = await readFile(abs);
