@@ -26,6 +26,7 @@ import {
   GraphQueryEngine,
   publishDocuments,
   ContextNestError,
+  DocumentNotFoundError,
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
@@ -105,7 +106,8 @@ import {
   parseTaskLogStatus,
   taskFieldArgs,
 } from "./task-fields.js";
-import { planPull, applyPull, type PullStep } from "./pull.js";
+import { planPull, applyPull, type PullStep, kindDocId, parseKindDocument } from "./pull.js";
+import { planKindApply, executeKindPlan, renderKindPlan, parseStewardMappings, type KindStep } from "./kind.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -298,6 +300,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
     commands: [
       ["push", "Push the vault to a hosted ContextNest server"],
       ["pull", "Pull a recipe from a remote nest into this vault, as drafts with lineage"],
+      ["kind", "Apply a pulled kind (edge types, edges, schedules, plugins, stewards) to a hosted nest"],
     ],
   },
 ];
@@ -4350,12 +4353,17 @@ Example:
     if (conflicts.length > 0) {
       console.log(chalk.red(`${conflicts.length} conflict(s) left untouched — those paths hold documents this recipe did not pull.`));
     }
-    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill");
+    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill" || s.kind === "kind");
     if (docs.length > 0) {
       console.log(chalk.dim("Pulled documents are drafts. Review them, then publish: ctx publish <path>"));
     }
     for (const skill of written.filter((s) => s.kind === "skill")) {
       console.log(chalk.dim(`Install the skill so it can't drift: ctx skill install ${skill.to} --mode loader --write`));
+    }
+    for (const k of written.filter((s) => s.kind === "kind")) {
+      console.log(
+        chalk.dim(`Kind written: ${k.to} — review and publish it, then: ctx kind apply ${fetched.manifest.id} --server <url> --nest <id>`),
+      );
     }
     const files = written.filter((s) => s.kind === "file");
     for (const file of files) {
@@ -4363,6 +4371,142 @@ Example:
         console.log(chalk.dim(`Template written: ${file.to} — fill it in and rename it before syncing.`));
       }
     }
+  });
+
+// ─── ctx kind ────────────────────────────────────────────────────────────────
+
+const kindCommand = program
+  .command("kind")
+  .description("Apply the server-side half of a recipe (a kind) to a hosted nest");
+
+kindCommand
+  .command("apply <kind-id>")
+  .description("Apply a pulled kind to a hosted nest — prints the plan; --yes sends it")
+  .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
+  .requiredOption("--nest <id>", "Target nest ID")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option(
+    "--steward <mapping>",
+    "Map a steward placeholder to a person: @placeholder=email (repeatable)",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[],
+  )
+  .option("--json", "Print the plan and result as JSON")
+  .option("--allow-draft", "With --yes, apply a kind that is not published yet (it has not been reviewed)")
+  .addHelpText(
+    "after",
+    `
+Reads nodes/kinds/<kind-id> from the local vault (written by \`ctx pull\` when a
+recipe carries a kind: section) and maps it onto the server's REST API: edge
+types, edges and schedules (workflow plane), plugin configuration (plugins
+plane) and steward roles. Planes the server has switched off are skipped with
+a warning. Plugins are configured but never enabled, and secrets are never
+sent: set them on the server. Stewards apply only once each placeholder is
+mapped with --steward.
+
+Dry run by default: nothing but GETs leaves the machine until --yes is passed.
+--yes applies only a PUBLISHED kind — review and \`ctx publish\` it first, or
+pass --allow-draft to apply an unreviewed one deliberately.
+
+Example:
+  ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com
+  ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com --yes`,
+  )
+  .action(async (kindId: string, opts: { server: string; nest: string; key?: string; steward: string[]; json?: boolean; allowDraft?: boolean }, cmd: Command) => {
+    // Same key resolution as `ctx push`; the URL is checked first so a
+    // refused server never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+    if (!apiKey) {
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
+      process.exit(1);
+    }
+    const stewards = parseStewardMappings(opts.steward);
+
+    const storage = getStorage();
+    const id = kindDocId(kindId);
+    const node = await storage.readDocument(id).catch((err) => {
+      if (err instanceof DocumentNotFoundError) {
+        throw new ContextNestError(
+          `No kind "${kindId}" in this vault (expected ${id}) — pull a recipe that carries a kind: section first.`,
+          "DOCUMENT_NOT_FOUND",
+        );
+      }
+      throw err;
+    });
+    const kind = parseKindDocument(node.body);
+
+    const execute = cmd.optsWithGlobals().yes === true && !isDryRun();
+    const draft = node.frontmatter.status !== "published";
+    // Applying creates edge types and schedules and can switch governance on
+    // (stewards): an unreviewed kind needs an explicit, separate yes.
+    if (execute && draft && !opts.allowDraft) {
+      console.error(
+        chalk.red(`${id} is ${node.frontmatter.status ?? "draft"}, not published — refusing to apply an unreviewed kind.`) +
+          `\n  Review and publish it (ctx publish ${id}), or pass --allow-draft to apply it anyway.`,
+      );
+      process.exit(1);
+    }
+
+    const target = { server: opts.server.replace(/\/$/, ""), nest: opts.nest, apiKey };
+    const plan = await planKindApply(kindId, kind, target, { stewards });
+
+    if (execute) await executeKindPlan(plan, target);
+    const failed = plan.steps.filter((s) => s.result === "failed");
+
+    if (opts.json) {
+      console.log(
+        JSON.stringify(
+          {
+            kind: kindId,
+            document: id,
+            status: node.frontmatter.status,
+            server: target.server,
+            nest: target.nest,
+            dry_run: !execute,
+            steps: plan.steps,
+            warnings: plan.warnings,
+            runner_handlers: plan.runnerHandlers,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(chalk.bold(`Kind ${kindId} → ${target.server} nest ${target.nest}\n`));
+      if (draft) {
+        console.log(chalk.yellow(`! ${id} is ${node.frontmatter.status}, not published — review it before applying.\n`));
+      }
+      for (const line of renderKindPlan(plan)) console.log(line);
+      console.log("");
+      const planned = plan.steps.filter((s) => s.action === "apply").length;
+      if (!execute) {
+        console.log(chalk.yellow(`Dry run — ${planned} request(s) planned, nothing sent. Rerun with --yes to apply.`));
+      } else {
+        const count = (r: KindStep["result"]) => plan.steps.filter((s) => s.result === r).length;
+        const applied = count("created") + count("updated");
+        const parts = [
+          `${applied} applied`,
+          count("exists") && `${count("exists")} already there`,
+          count("skipped") && `${count("skipped")} skipped`,
+          failed.length && `${failed.length} failed`,
+        ].filter(Boolean);
+        const summary = `${parts.join(", ")} (of ${planned} planned request(s)).`;
+        if (failed.length) console.log(chalk.red(summary));
+        else if (applied === 0) console.log(chalk.yellow(`Nothing applied — ${summary} See the skips and warnings above.`));
+        else console.log(chalk.green(summary));
+      }
+    }
+    // exitCode, not exit(): exit() can cut off a large --json write to a pipe.
+    if (failed.length) process.exitCode = 1;
   });
 
 // ─── ctx vault ───────────────────────────────────────────────────────────────
