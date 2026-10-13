@@ -47,6 +47,17 @@ import {
   approveReview,
   rejectReview,
   reviewHeldMessage,
+  enforcedStructure,
+  enforceStructure,
+  checkDocument,
+  checkUpdate,
+  structureView,
+  missingFolders,
+  scaffoldFolders,
+  assertStructureDelete,
+  assertWritableDocumentId,
+  assertWritableDocumentPath,
+  assertStructurePublish,
   currentReviewProposal,
   stageReviewHold,
   NODE_TYPES,
@@ -530,7 +541,12 @@ tool(
       // Segment boundary, not a bare startsWith: "nodes/his" must not match
       // "nodes/history". A trailing slash or .md from a caller pasting a file
       // path is tolerated rather than silently matching nothing.
-      const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
+      // Trailing slashes trimmed with a loop: an unanchored `\/+$` retries from
+      // every slash of a run, quadratic before any length check.
+      const bare = path.replace(/\.md$/, "");
+      let end = bare.length;
+      while (end > 0 && bare[end - 1] === "/") end--;
+      const prefix = normalizeDocumentId(bare.slice(0, end));
       docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
     }
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);
@@ -933,6 +949,25 @@ tool(
 const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
   withVaultLock(storage.root, fn);
 
+/**
+ * Structure rules (§11.1) for the legacy writers below. They write storage
+ * directly instead of through the catalog executors, so without this they
+ * would be a way around every rule. Returns the error result, or null to go on.
+ */
+async function structureRefusal(
+  check: (
+    rules: NonNullable<Awaited<ReturnType<typeof enforcedStructure>>>,
+  ) => ReturnType<typeof checkDocument> | Promise<ReturnType<typeof checkDocument>>,
+) {
+  try {
+    const rules = await enforcedStructure(storage);
+    if (rules) enforceStructure(rules, await check(rules));
+    return null;
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
 tool(
@@ -1003,6 +1038,13 @@ tool(
       const placed = rerootForDiscovery(requested, await storage.detectLayout());
       const id = placed.id;
       const placement = placed.rerooted ? placementNote(requested, id) : undefined;
+      // Never under .context/, .versions/, _suggestions/ or the root packs/ —
+      // the same guard every catalog write runs.
+      try {
+        assertWritableDocumentId(id);
+      } catch (err) {
+        return toolError(err);
+      }
 
       // Check if document already exists
       try {
@@ -1081,6 +1123,11 @@ tool(
         };
       }
 
+      const refused = await structureRefusal((rules) =>
+        checkDocument(rules, structureView(id, node)),
+      );
+      if (refused) return refused;
+
       // Review gate, same as context_create: held as pending_review, unversioned
       // (approval publishes v1). The legacy tool must not be a way around it.
       if ((await vaultReviewMode()) === "on") {
@@ -1098,6 +1145,10 @@ tool(
       }
 
       const content = serializeDocument(node);
+      // Folders this write creates get their required contents, as with
+      // context_create (a held create above is scaffolded when it is approved).
+      const rules = await enforcedStructure(storage);
+      const created = rules ? await missingFolders(storage, id) : null;
       await storage.writeDocument(id, content);
 
       // Auto-publish: bump version, create version entry & checkpoint.
@@ -1122,6 +1173,7 @@ tool(
       }
 
       await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
+      if (rules && created) await scaffoldFolders(storage, rules, created);
 
       return {
         content: [
@@ -1219,6 +1271,13 @@ tool(
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
       if (!resolvedBody.ok) return validationError(resolvedBody.error);
       const id = normalizeDocumentId(path);
+      // Before any write — the file is written before the publish that would
+      // otherwise be the first to refuse a reserved path.
+      try {
+        await assertWritableDocumentPath(storage.root, id);
+      } catch (err) {
+        return toolError(err);
+      }
       let doc = await storage.readDocument(id);
 
       // Normalize caller-supplied status to canonical before any guard or
@@ -1236,6 +1295,9 @@ tool(
       const holdAsSuggestion = hold && isPublished(doc);
       const proposal = holdAsSuggestion ? await currentReviewProposal(storage, id) : null;
       if (proposal) doc = parseDocument(doc.filePath, proposal.proposedRaw, id);
+      // What the edit starts from, before `doc` is mutated in place below —
+      // structure rules refuse only what the edit newly breaks.
+      const before = structureView(id, doc);
 
       // Refuse content edits on rejected docs unless the caller explicitly
       // names a new status (revive to draft/pending_review/approved/published,
@@ -1316,6 +1378,19 @@ tool(
           ],
           isError: true,
         };
+      }
+      const refused = await structureRefusal((rules) =>
+        checkUpdate(rules, before, structureView(id, doc)),
+      );
+      if (refused) return refused;
+      // A publishing edit is judged as its publish will be (a never-published
+      // document in full), before the file is written.
+      if (!hold && (normalizedStatus === undefined || normalizedStatus === "published")) {
+        const refusedPublish = await structureRefusal(async (rules) => {
+          await assertStructurePublish(storage, rules, doc);
+          return [];
+        });
+        if (refusedPublish) return refusedPublish;
       }
 
       if (hold) {
@@ -1434,6 +1509,13 @@ tool(
   async ({ path }) =>
     lockedHandler(async () => {
       const id = normalizeDocumentId(path);
+
+      // A required file goes last, as with context_delete (§11.1.1).
+      try {
+        await assertStructureDelete(storage, id);
+      } catch (err) {
+        return toolError(err);
+      }
 
       // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
       // id, and appends an audit-only record (§6.3.4). Additive: the path

@@ -12,15 +12,16 @@ import type {
   Frontmatter,
   VersionEntry,
 } from "./types.js";
-import { NestStorage, assertSafeDocumentId } from "./storage.js";
+import { NestStorage, assertWritableDocumentId, assertWritableDocumentPath } from "./storage.js";
 import { VersionManager } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected, parseDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
-import { RejectedDocumentError } from "./errors.js";
+import { ContextNestError, RejectedDocumentError } from "./errors.js";
 import { mapInBatches } from "./concurrency.js";
 import { assertPdfSidecarIntact } from "./pdf-nodes.js";
 import { assertNotForgotten } from "./forget.js";
+import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish, type ReplayBudget } from "./structure-store.js";
 
 export interface PublishOptions {
   editedBy: string;
@@ -30,6 +31,12 @@ export interface PublishOptions {
    * which agent, in which session. Not hashed; see `VersionEntry.client`.
    */
   client?: ClientMetadata;
+  /**
+   * `skip` leaves structure rules (§11.1.1) unchecked — for trusted hosts
+   * restoring a whole vault only, as `OperationContext.structure`. The
+   * reserved-path guard still applies.
+   */
+  structure?: "skip";
 }
 
 export interface PublishResult {
@@ -55,6 +62,9 @@ export async function publishDocument(
   docId: string,
   options: PublishOptions,
 ): Promise<PublishResult> {
+  // Every publish surface (context_publish, ids[] imports, approvals, legacy
+  // tools) ends here, so a reserved path is refused once, for all of them.
+  await assertWritableDocumentPath(storage.root, docId);
   // Read current document
   let node = await storage.readDocument(docId);
 
@@ -70,6 +80,7 @@ export async function publishDocument(
   await assertNotForgotten(storage, node);
   // A pdf node seals pdf.sha256 into the chain; the bytes must be there.
   await assertPdfSidecarIntact(storage, docId, node);
+  const rules = options.structure === "skip" ? null : await enforcedStructure(storage);
 
   const versionManager = new VersionManager(storage);
 
@@ -87,6 +98,9 @@ export async function publishDocument(
   // seeding would write `v{current}.md` at a number the old chain may already
   // have sealed as a keyframe — an exclusive create that throws, which would
   // put the author right back behind the corrupt file we just worked around.
+  // Every publish surface ends here, so the structure rules judge it here —
+  // before historyOrRepair, so a refused publish never quarantines a history.
+  const firstPublish = rules ? await assertStructurePublish(storage, rules, node) : false;
   const { history: existingHistory, quarantinedAs } =
     await versionManager.historyOrRepair(docId);
   const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
@@ -141,6 +155,8 @@ export async function publishDocument(
     knownHistory,
     knownSealed,
   });
+  // Before the checkpoint, so the vault crawl it hands back includes them.
+  if (rules && firstPublish) await scaffoldFirstPublish(storage, rules, [docId]);
 
   // Create checkpoint. The published-docs and histories snapshots are gathered
   // INSIDE the checkpoint lock (createCheckpointFromVault) so a concurrent
@@ -188,6 +204,12 @@ export interface BulkPublishOptions extends PublishOptions {
   concurrency?: number;
   /** Regenerate context.yaml / INDEX.md once after the batch (default true). */
   regenerateIndex?: boolean;
+  /**
+   * The replay work the batch's structure checks may share (an import's
+   * budget). Once spent, the documents still to be judged are refused —
+   * never published on a check cut short — and asked to come in smaller calls.
+   */
+  replayBudget?: ReplayBudget;
   /**
    * Rewrite INDEX.md only for the folders of the batch's documents. Only safe
    * when nothing else in the vault changed in the same operation.
@@ -265,18 +287,28 @@ export async function publishDocuments(
     if (seen.has(docId)) continue;
     seen.add(docId);
     try {
-      assertSafeDocumentId(docId);
+      // Name limits for an existing document; publishOne holds new names to
+      // the stricter ones (assertWritableDocumentPath).
+      assertWritableDocumentId(docId, true);
       ids.push(docId);
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
-  // One read of the forget registry for the whole batch.
+  // One read of the forget registry, and of the structure rules, for the whole batch.
   const tombstones = await storage.readTombstones();
+  const rules = options.structure === "skip" ? null : await enforcedStructure(storage);
+  const firstPublished: string[] = [];
+
+  // Judged in the batch's order, whatever order the reads finish in, when a
+  // replay budget is shared: which documents an over-budget call publishes is
+  // the same on every run. Only the judging waits its turn; the writes overlap.
+  const turns = rules && options.replayBudget ? judgingTurns(ids) : null;
 
   const publishOne = async (docId: string): Promise<void> => {
     try {
+      await assertWritableDocumentPath(storage.root, docId);
       const pre = options.preloaded?.get(docId);
       // Copied: the publish below mutates frontmatter, and the map is the caller's.
       let node = pre
@@ -295,6 +327,32 @@ export async function publishDocuments(
       const versionManager = new VersionManager(storage);
       // Same resilient read, the same seed skip on a restart, and the same
       // single history read — see the notes in publishDocument.
+      // Judged before historyOrRepair: a refused publish quarantines nothing.
+      const budget = options.replayBudget;
+      const cutShort = () =>
+        new ContextNestError(`${docId}: not published — this call replays more version history than one call allows; publish it in a separate call`, "VALIDATION_FAILED");
+      let firstPublish = false;
+      if (rules) {
+        let known: DocumentHistory | null = null;
+        try {
+          known = await storage.readHistory(docId);
+        } catch {
+          known = null; // corrupt: judged in full, as a first publish is
+        }
+        // Only a document that fails the full check is replayed (its head may
+        // excuse it), so only such a document — with a history — can be cut
+        // short: refused because the budget left no room to rebuild its head.
+        const replays = !!known?.versions.length;
+        const turn = turns?.get(docId);
+        await turn?.after;
+        try {
+          firstPublish = await assertStructurePublish(storage, rules, node, known, budget);
+        } catch (err) {
+          throw replays && budget?.spent ? cutShort() : err;
+        } finally {
+          turn?.done();
+        }
+      }
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
@@ -335,9 +393,13 @@ export async function publishDocuments(
         version: versionEntry.version,
         chainHash: versionEntry.chain_hash,
       });
+      if (firstPublish) firstPublished.push(docId);
     } catch (err) {
       failed.push({ id: docId, error: err instanceof Error ? err.message : String(err) });
     } finally {
+      // A document that failed before its turn still hands the turn on.
+      const turn = turns?.get(docId);
+      if (turn) void turn.after.then(turn.done);
       // Counter increments are safe unsynchronized — JS runs them on one thread;
       // only the awaited I/O above overlaps.
       options.onProgress?.(++settled, ids.length);
@@ -348,6 +410,8 @@ export async function publishDocuments(
   // (the shared helper avoids pulling in a p-limit dependency). publishOne
   // records its own outcome, so the returned array is unused.
   await mapInBatches(ids, publishOne, concurrency);
+  // Before the checkpoint, so the vault crawl it takes includes them.
+  if (rules && firstPublished.length > 0) await scaffoldFirstPublish(storage, rules, firstPublished);
 
   // ONE checkpoint sealing every doc published above (createCheckpointFromVault
   // snapshots all published docs in the vault under the checkpoint lock).
@@ -372,4 +436,17 @@ export async function publishDocuments(
   const checkpointNumber = checkpoint?.checkpoint ?? null;
 
   return { published, failed, checkpointNumber };
+}
+
+/** Each id's turn to be judged: after the one before it in `ids` is done. */
+function judgingTurns(ids: string[]): Map<string, { after: Promise<void>; done: () => void }> {
+  const turns = new Map<string, { after: Promise<void>; done: () => void }>();
+  let after: Promise<void> = Promise.resolve();
+  for (const id of ids) {
+    let done!: () => void;
+    const next = new Promise<void>((resolve) => (done = resolve));
+    turns.set(id, { after, done });
+    after = next;
+  }
+  return turns;
 }

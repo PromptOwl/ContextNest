@@ -19,6 +19,8 @@ import {
   normalizeFolder,
   parseDocument,
   serializeDocument,
+  slugify,
+  TAG_PATTERN,
   JATS_IMPORTER_VERSION,
   type ContextNode,
   type NestStorage,
@@ -27,7 +29,10 @@ import type { OperationContext } from "@promptowl/contextnest-engine/api";
 import {
   efetchPmc,
   esearch,
+  esummaryPubmed,
   meshTag,
+  pmcLicensePrefilter,
+  publicationTypeTags,
   pubtatorFetch,
   resolvePmid,
   type NcbiOptions,
@@ -58,6 +63,12 @@ export interface JatsSource {
   /** Display name recorded as `metadata.source_path` (a file name or a PMCID). */
   name: string;
   xml: string;
+  /**
+   * MEDLINE publication types from PubMed, when the caller looked them up
+   * (`ctx import pubmed` does). They drive the `#pubtype-*` tags and are
+   * stored raw as `metadata.publication_types`.
+   */
+  publicationTypes?: string[];
 }
 
 export interface ImportJatsOptions {
@@ -139,6 +150,7 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
   const bySha = new Set<string>();
   const xmlBySha = new Map<string, string>();
   const byPath = new Map<string, ReturnType<typeof jatsToDocument>>();
+  const pubtypesByPath = new Map<string, string[]>();
   // A file may hold several <article>s (a pmc-articleset dump); each is its
   // own source, named `file#n`, hashed on its own.
   const articles: JatsSource[] = [];
@@ -169,6 +181,8 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
       warnings.push(`${src.name}: same paper as ${byPath.get(r.path)!.meta.title} — later file wins`);
     }
     byPath.set(r.path, r);
+    if (src.publicationTypes) pubtypesByPath.set(r.path, src.publicationTypes);
+    else pubtypesByPath.delete(r.path);
   }
 
   // 2. Skip what the vault already holds at this hash.
@@ -185,11 +199,15 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
       continue;
     }
     const prevMeta = prev ? metadataOf(prev) : undefined;
+    const types = pubtypesByPath.get(r.path);
     if (
       !opts.force &&
       prevMeta &&
       prevMeta.source_sha256 === r.sha256 &&
-      prevMeta.importer === JATS_IMPORTER_VERSION
+      prevMeta.importer === JATS_IMPORTER_VERSION &&
+      // Same XML but publication types newly known (or changed upstream):
+      // republish so the tags follow. Unknown types never force a republish.
+      (!types || sameList(prevMeta.publication_types, types))
     ) {
       skipped.push(`${id} (unchanged)`);
       continue;
@@ -209,6 +227,8 @@ export async function importJats(opts: ImportJatsOptions): Promise<ImportSummary
     // Enrichment already on the node (PubTator entities, mesh tags) survives a
     // re-import: the twin's body and NLM metadata are replaced, the rest kept.
     if (prev) content = carryEnrichment(prev, content);
+    const types = pubtypesByPath.get(r.path);
+    if (types) content = applyPublicationTypes(content, types);
     const linked = linkCitations(content, index);
     files.push({ path: r.path, content: linked.content });
   }
@@ -275,44 +295,171 @@ function carryEnrichment(prev: ContextNode, nextContent: string): string {
   const prevMeta = metadataOf(prev);
   const next = parseDocument("x.md", nextContent, "x");
   const nextMeta = { ...(next.frontmatter.metadata ?? {}) } as Record<string, unknown>;
-  for (const key of ["entities", "relations", "pubtator", "pmid", "pmcid"]) {
+  for (const key of ["entities", "relations", "pubtator", "pmid", "pmcid", "publication_types"]) {
     if (nextMeta[key] === undefined && prevMeta[key] !== undefined) nextMeta[key] = prevMeta[key];
   }
   const tags = [...(next.frontmatter.tags ?? [])];
   for (const t of prev.frontmatter.tags ?? []) {
     if (t.startsWith("#mesh-") && !tags.includes(t)) tags.push(t);
   }
-  return serializeDocument({
+  const merged = serializeDocument({
     ...next,
     frontmatter: { ...next.frontmatter, tags, metadata: nextMeta },
   });
+  // Publication types carried over re-derive their tags on the fresh twin.
+  const types = nextMeta.publication_types;
+  return Array.isArray(types) ? applyPublicationTypes(merged, types as string[]) : merged;
+}
+
+function sameList(a: unknown, b: string[]): boolean {
+  return Array.isArray(a) && a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+function tagSlug(s: string): string {
+  return slugify(s.normalize("NFKD").replace(/[\u0300-\u036f]/g, ""));
+}
+
+/**
+ * Re-derive a twin's `#pubtype-*` tags from PubMed's MEDLINE publication
+ * types. Pure and idempotent.
+ *
+ * - Every `#pubtype-*` tag is dropped and rebuilt from `pubtypes`, except the
+ *   one the publisher's `custom-meta document_type` gave (`#pubtype-srma` on
+ *   AGA's corpus), which is curated upstream and kept.
+ * - The JATS `article-type` ("review-article", "research-article") is NOT a
+ *   publication type; once PubMed's types are known it moves to
+ *   `#article-type-*` (and stays in `metadata.article_type`).
+ * - The raw list is stored as `metadata.publication_types`.
+ */
+export function applyPublicationTypes(content: string, pubtypes: string[]): string {
+  const doc = parseDocument("x.md", content, "x");
+  const meta = { ...(doc.frontmatter.metadata ?? {}) } as Record<string, unknown>;
+  const docType = typeof meta.document_type === "string" ? `#pubtype-${tagSlug(meta.document_type)}` : undefined;
+  const tags = (doc.frontmatter.tags ?? []).filter((t) => !t.startsWith("#pubtype-") || t === docType);
+  const add = (t: string) => {
+    if (TAG_PATTERN.test(t) && !tags.includes(t)) tags.push(t);
+  };
+  if (typeof meta.article_type === "string" && tagSlug(meta.article_type)) {
+    add(`#article-type-${tagSlug(meta.article_type)}`);
+  }
+  for (const t of publicationTypeTags(pubtypes)) add(t);
+  meta.publication_types = [...pubtypes];
+  return serializeDocument({ ...doc, frontmatter: { ...doc.frontmatter, tags, metadata: meta } });
 }
 
 // ─── ctx import pubmed ───────────────────────────────────────────────────────
 
 export interface FetchPubmedOptions extends NcbiOptions {
   term: string;
+  /** Articles to return — counted after licence filtering. */
   max: number;
+  /**
+   * Licence slugs to keep (`cc-by`, `cc0`, `cc-mark`…; see `parseLicenseList`).
+   * Unset = no licence filter.
+   */
+  licenses?: string[];
   onProgress?: (done: number, total: number, pmcid: string) => void;
 }
 
-/** Search PMC and fetch each hit's JATS as an import source. */
-export async function fetchPmcSources(opts: FetchPubmedOptions): Promise<{ sources: JatsSource[]; total: number; failed: string[] }> {
-  const { ids, count } = await esearch("pmc", opts.term, opts.max, opts);
+export interface FetchPubmedResult {
+  sources: JatsSource[];
+  /** PubMed records matching the query (restricted to PMC full text). */
+  total: number;
+  /** Candidates considered (PMIDs pulled from PubMed). */
+  candidates: number;
+  failed: string[];
+  /** Articles dropped because their licence is not in `licenses`. */
+  skippedLicense: string[];
+  /** The query actually sent to PubMed. */
+  term: string;
+}
+
+/** Candidates pulled per article wanted when a licence filter will drop some. */
+const LICENSE_OVERFETCH = 6;
+/** Without a licence filter, a little slack for PMC records efetch cannot serve. */
+const PLAIN_OVERFETCH = 2;
+
+/**
+ * The PubMed query `ctx import pubmed` runs: the user's term, restricted to
+ * records with full text in PMC unless the term already says so.
+ */
+export function pubmedTerm(term: string): string {
+  return /pubmed\s+pmc"?\s*\[(sb|filter)\]/i.test(term) ? term : `(${term}) AND "pubmed pmc"[sb]`;
+}
+
+/**
+ * Search PubMed, map the hits to PMC, filter by licence, fetch the JATS.
+ *
+ * PubMed, not PMC, is searched because PMC's esearch silently ignores MeSH
+ * (`[mh]`, `[majr]`) and publication-type (`[pt]`) qualifiers. One esummary
+ * per 200 PMIDs gives both the PMC id and the MEDLINE publication types (which
+ * become `#pubtype-*` tags). With `licenses`, a PMC licence pre-filter saves
+ * downloads and the JATS `<license>` decides. Stops once `max` articles pass.
+ */
+export async function fetchPmcSources(opts: FetchPubmedOptions): Promise<FetchPubmedResult> {
+  const max = Math.max(1, Math.floor(opts.max));
+  const licenses = opts.licenses?.length ? new Set(opts.licenses) : undefined;
+  const term = pubmedTerm(opts.term);
+  const pool = Math.min(max * (licenses ? LICENSE_OVERFETCH : PLAIN_OVERFETCH), 10_000);
+  const { ids: pmids, count } = await esearch("pubmed", term, pool, opts);
+
   const sources: JatsSource[] = [];
   const failed: string[] = [];
-  let done = 0;
-  for (const id of ids) {
-    const pmcid = `PMC${id}`;
-    try {
-      sources.push({ name: pmcid, xml: await efetchPmc(pmcid, opts) });
-    } catch (err) {
-      failed.push(`${pmcid}: ${err instanceof Error ? err.message : String(err)}`);
+  const skippedLicense: string[] = [];
+  const target = Math.min(max, pmids.length);
+  let considered = 0;
+
+  // Batches of 100 keep the licence pre-filter's query short and stop early
+  // once enough articles have passed.
+  for (let i = 0; i < pmids.length && sources.length < max; i += 100) {
+    const batch = pmids.slice(i, i + 100);
+    const summaries = await esummaryPubmed(batch, opts);
+    const linked: Array<{ pmid: string; pmcid?: string; pubtypes: string[] }> = batch.map((pmid) => {
+      const s = summaries.get(pmid);
+      return { pmid, ...(s?.pmcid ? { pmcid: s.pmcid } : {}), pubtypes: s?.pubtypes ?? [] };
+    });
+    let allowed: Set<string> | undefined;
+    if (licenses) {
+      const pmcIds = linked.map((l) => l.pmcid).filter((x): x is string => !!x);
+      allowed = await pmcLicensePrefilter(pmcIds, [...licenses], opts);
     }
-    done++;
-    opts.onProgress?.(done, ids.length, pmcid);
+    for (const l of linked) {
+      if (sources.length >= max) break;
+      considered++;
+      if (!l.pmcid) {
+        failed.push(`PMID ${l.pmid}: no PMC full text linked`);
+        continue;
+      }
+      if (allowed && !allowed.has(l.pmcid.replace(/^PMC/i, ""))) {
+        skippedLicense.push(`${l.pmcid} (PMID ${l.pmid}): licence not in ${[...licenses!].join(",")} (PMC filter)`);
+        continue;
+      }
+      let xml: string;
+      try {
+        xml = await efetchPmc(l.pmcid, opts);
+      } catch (err) {
+        failed.push(`${l.pmcid}: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      if (licenses) {
+        // Authoritative: the licence the article itself declares.
+        let slug: string | undefined;
+        try {
+          slug = jatsToDocument(xml, { sourcePath: l.pmcid }).meta.license_slug;
+        } catch (err) {
+          failed.push(`${l.pmcid}: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
+        }
+        if (!slug || !licenses.has(slug)) {
+          skippedLicense.push(`${l.pmcid} (PMID ${l.pmid}): licence ${slug ?? "none declared"}`);
+          continue;
+        }
+      }
+      sources.push({ name: l.pmcid, xml, publicationTypes: l.pubtypes });
+      opts.onProgress?.(sources.length, target, l.pmcid);
+    }
   }
-  return { sources, total: count, failed };
+  return { sources, total: count, candidates: considered, failed, skippedLicense, term };
 }
 
 // ─── ctx enrich pubtator ─────────────────────────────────────────────────────
@@ -405,7 +552,9 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
       skipped.push(`${p.id} (rejected by a steward)`);
       continue;
     }
-    if (!opts.force && meta.pubtator) {
+    // Enriched before publication types were fetched → enrich again so the
+    // MEDLINE `#pubtype-*` tags arrive too.
+    if (!opts.force && meta.pubtator && Array.isArray(meta.publication_types)) {
       skipped.push(`${p.id} (already enriched)`);
       continue;
     }
@@ -439,7 +588,18 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
 
   // 2. Fetch in batches of 100, apply, republish as one batch.
   const files: Array<{ path: string; content: string }> = [];
+  const warnings: string[] = [];
   if (byPmid.size) {
+    // MEDLINE publication types (esummary, 200 per request). A failure here
+    // costs the `#pubtype-*` tags, not the PubTator enrichment, and leaves
+    // them unset so the next run retries.
+    let pubtypes: Map<string, string[]> | undefined;
+    try {
+      const sums = await esummaryPubmed([...byPmid.keys()], opts);
+      pubtypes = new Map([...sums].map(([pmid, s]) => [pmid, s.pubtypes]));
+    } catch (err) {
+      warnings.push(`publication types not fetched: ${err instanceof Error ? err.message : String(err)}`);
+    }
     let summaries: Map<string, PubTatorSummary>;
     try {
       summaries = await pubtatorFetch([...byPmid.keys()], opts);
@@ -454,14 +614,25 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
     }
     for (const [pmid, node] of byPmid) {
       const s = summaries.get(pmid);
+      // A PMID esummary answered for without a record has no known types: store
+      // [] so the "already enriched" check settles instead of re-enriching forever.
+      const types = pubtypes ? (pubtypes.get(pmid) ?? []) : undefined;
       if (!s) {
         unresolved.push(`${node.id} (PubTator has no record for PMID ${pmid})`);
+        // Publication types alone are still worth writing (once).
+        if (types && !sameList(metadataOf(node).publication_types, types)) {
+          files.push({ path: `${node.id}.md`, content: applyPublicationTypes(node.rawContent, types) });
+        }
         continue;
       }
-      files.push({ path: `${node.id}.md`, content: applyPubTator(node, s, opts.tagLimit) });
+      let content = applyPubTator(node, s, opts.tagLimit);
+      if (types) content = applyPublicationTypes(content, types);
+      files.push({ path: `${node.id}.md`, content });
     }
   }
-  if (files.length === 0) return { enriched: [], skipped, unresolved, failed, checkpoint: null };
+  if (files.length === 0) {
+    return { enriched: [], skipped, unresolved, failed, checkpoint: null, ...(warnings.length ? { warnings } : {}) };
+  }
 
   const result = await publishFiles(opts.api, opts.ctx, files);
   return {
@@ -470,6 +641,6 @@ export async function enrichPubTator(opts: EnrichOptions): Promise<EnrichSummary
     unresolved,
     failed: [...failed, ...result.failed],
     checkpoint: result.checkpoint,
-    ...(result.warnings?.length ? { warnings: result.warnings } : {}),
+    ...(warnings.length || result.warnings?.length ? { warnings: [...warnings, ...(result.warnings ?? [])] } : {}),
   };
 }

@@ -301,8 +301,10 @@ export class CheckpointManager {
   ): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
       // includeRetired only adds rejected docs, which the published filter drops
-      // anyway — and it is the set regenerateIndex needs.
-      const crawled = await this.storage.discoverDocuments({ includeRetired: true });
+      // anyway — and it is the set regenerateIndex needs. A document the crawl
+      // cannot read is not gone: its last sealed entry is carried forward.
+      const unreadable: string[] = [];
+      const crawled = await this.storage.discoverDocuments({ includeRetired: true, onUnreadable: (id) => unreadable.push(id) });
       onCrawl?.(crawled);
       const publishedDocuments = crawled.filter(isPublished);
       // Snapshot before the reads: a write that lands during the seal stays
@@ -343,11 +345,19 @@ export class CheckpointManager {
           // (called without `onUnreadable`) skipping it. `verify` reports it.
         }
       });
+      // A document the crawl could not read keeps the entry the head sealed.
+      const carried = new Map<string, Pick<VersionEntry, "version" | "chain_hash">>();
+      for (const id of unreadable) {
+        const version = head?.document_versions[id];
+        const hash = head?.document_chain_hashes[id];
+        if (version !== undefined && hash) carried.set(id, { version, chain_hash: hash });
+      }
       const checkpoint = await this.sealCheckpoint(
         triggeredBy,
         publishedDocuments,
         documentHistories,
         chainState,
+        carried,
       );
       this.storage.clearTouchedHistories(touched);
       return checkpoint;
@@ -363,6 +373,8 @@ export class CheckpointManager {
     publishedDocuments: ContextNode[],
     documentHistories: ReadonlyMap<string, SealHistory>,
     knownChainState?: CheckpointChainState,
+    /** Entries carried forward for documents the crawl could not read (§8.4). */
+    carried?: ReadonlyMap<string, Pick<VersionEntry, "version" | "chain_hash">>,
   ): Promise<Checkpoint> {
     {
       // Re-read inside the lock so the checkpoint number and previous-hash
@@ -415,6 +427,13 @@ export class CheckpointManager {
           docHistory.versions.find((v) => v.version === sealedVersion) ??
           docHistory.versions[docHistory.versions.length - 1];
         documentChainHashes[doc.id] = entry.chain_hash;
+      }
+      // An unreadable document keeps the entry the head sealed for it: the
+      // snapshot never records a deletion that never happened.
+      for (const [id, entry] of carried ?? []) {
+        if (id in documentVersions) continue;
+        documentVersions[id] = entry.version;
+        documentChainHashes[id] = entry.chain_hash;
       }
 
       const checkpointHash = computeCheckpointHash(

@@ -15,7 +15,15 @@
  */
 
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
-import { rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  existsSync,
+} from "node:fs";
 import { join } from "node:path";
 import { packCli, freshInstall, runJourney, type Journey } from "./journey-harness.js";
 
@@ -475,6 +483,439 @@ const J3: Journey = {
   ],
 };
 
+/** The id/tag rows `ctx list --json` returns. */
+type NodeRow = { id: string };
+const idsOf = (data: unknown) => (data as NodeRow[]).map((r) => r.id).sort();
+
+/**
+ * J4 — "I govern my existing Obsidian vault in place."
+ * Context Nest supports two on-disk layouts (spec §1.1); this journey proves the
+ * Obsidian one end-to-end. An Obsidian user keeps plain-markdown nodes as flat
+ * files and wants them indexed, found, and audited without reshaping their vault.
+ *
+ * Obsidian authoring is flat `.md` files at the vault root — and `ctx add`
+ * deliberately does NOT do that (it always writes under `nodes/`, which would
+ * flip the vault to structured, since layout is detected by `nodes/` existing).
+ * So the nodes are written directly, the way Obsidian / the user would, via the
+ * harness `mutate` hook, and the CLI is driven over them from there.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const flatNodeLines = (id: string, title: string, tags: string, body: string) => [
+  "---",
+  `id: ${id}`,
+  `title: ${title}`,
+  "type: document",
+  "status: published",
+  `tags: [${tags}]`,
+  "---",
+  "",
+  body,
+  "",
+];
+
+const flatNode = (id: string, title: string, tags: string, body: string) =>
+  flatNodeLines(id, title, tags, body).join("\n");
+
+// Obsidian on Windows writes CRLF; the parser normalizes it, so a CRLF-authored
+// node must index, link, and query exactly like an LF one. Cheap cross-platform
+// coverage — one flat node in the journey is authored this way.
+const flatNodeCRLF = (id: string, title: string, tags: string, body: string) =>
+  flatNodeLines(id, title, tags, body).join("\r\n");
+
+const J4: Journey = {
+  id: "J4",
+  title: "Obsidian-layout vault (Obsidian user)",
+  cases: [
+    {
+      id: "J4-01",
+      title:
+        "Initialize a new vault in Obsidian layout and confirm it's ready without the structured folders",
+      actions: [
+        {
+          args: ["init", "--layout", "obsidian", "--name", "obsidian-vault"],
+          stdout: ["Initialized obsidian vault"],
+          files: [
+            { path: "CONTEXT.md", exists: true },
+            { path: ".context", exists: true },
+            // Obsidian layout is flat: the structured folders are NOT carved out.
+            { path: "nodes", exists: false },
+            { path: "sources", exists: false },
+            { path: "packs", exists: false },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J4-02",
+      title:
+        "Add two nodes as flat markdown files with a wikilink between them, then index the vault so the link is recognized",
+      actions: [
+        {
+          // Write the nodes the Obsidian way — flat files at the vault root — then
+          // index so the [[project-plan]] wikilink becomes a graph edge.
+          mutate: (vault) => {
+            // meeting-node is authored CRLF (Obsidian-on-Windows) — it must index
+            // and link identically to the LF project-plan below.
+            writeFileSync(
+              join(vault, "meeting-node.md"),
+              flatNodeCRLF(
+                "meeting-node",
+                "Weekly Sync",
+                "meetings, onboarding",
+                "Summary of the weekly sync. See [[project-plan]] for the roadmap.",
+              ),
+            );
+            writeFileSync(
+              join(vault, "project-plan.md"),
+              flatNode("project-plan", "Project Plan", "planning", "The Q4 roadmap and milestones."),
+            );
+          },
+          args: ["index"],
+          stdout: ["Generated context.yaml", /1 relationship edge/],
+          files: [
+            { path: "meeting-node.md", exists: true },
+            { path: "project-plan.md", exists: true },
+            // Still flat — indexing a flat vault must not create nodes/.
+            { path: "nodes", exists: false },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J4-03",
+      title: "Find a node by its tag and follow its wikilink through to the connected node",
+      actions: [
+        {
+          // First pin the direct match: with traversal off (--hops 0), #onboarding
+          // resolves to meeting-node ALONE — project-plan is NOT tagged it. This is
+          // the control, so the next step proves project-plan arrives via the edge,
+          // not via an implicit tag/expansion default.
+          args: ["query", "#onboarding", "--hops", "0"],
+          stdout: ["meeting-node", /\b1 nodes\b/],
+          stdoutNot: ["project-plan"],
+        },
+        {
+          // Now let traversal run: following meeting-node's [[project-plan]] wikilink
+          // pulls project-plan in (1 hop → 2 nodes). The delta vs. the step above is
+          // the edge being followed, so a regression in link-following fails here.
+          args: ["query", "#onboarding"],
+          stdout: ["meeting-node", "project-plan", /\b1 hops\b/, /\b2 nodes\b/],
+        },
+      ],
+    },
+    {
+      id: "J4-04",
+      title: "Run a full-text search and match a word inside a node's body",
+      actions: [
+        // "milestones" lives only in project-plan's body — a single exact hit.
+        { args: ["search", "milestones"], stdout: ["1 result(s)", "project-plan"] },
+      ],
+    },
+    {
+      id: "J4-05",
+      title: "List all nodes and resolve one by name to confirm they're tracked",
+      actions: [
+        {
+          // Flat nodes are tracked by their bare ids — no nodes/ prefix.
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(idsOf(data)).toEqual(["meeting-node", "project-plan"]);
+          },
+        },
+        {
+          args: ["resolve", "#planning", "--json"],
+          json: (data) => {
+            expect((data as NodeRow[])[0].id).toBe("project-plan");
+          },
+        },
+      ],
+    },
+    {
+      id: "J4-06",
+      title: "Run an integrity check and confirm the whole vault verifies clean",
+      actions: [
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+  ],
+};
+
+/** The events a `ctx forget-log --json` payload records. */
+type ForgetEvent = {
+  document_id: string;
+  mode: string; // "forget" (erase content, keep stub) vs "delete" (remove node)
+  reason_code: string;
+  requested_by?: string; // present for forget; delete events omit it
+};
+const forgetEvents = (data: unknown) => (data as { events: ForgetEvent[] }).events;
+const forgetEventFor = (data: unknown, id: string) =>
+  forgetEvents(data).find((e) => e.document_id === id);
+
+/**
+ * Scan every file under `dir` (recursively) for `token`, reading raw bytes via
+ * `Buffer.includes` (no text decode, so a binary file is safe to scan).
+ * Returns how many files were inspected and which ones contained the token — so
+ * a leak check can assert BOTH that the scan was meaningful (files > 0, not a
+ * vacuous pass over an empty or removed tree) and that nothing leaked (hits
+ * empty, naming any offender).
+ */
+const scanTreeForToken = (
+  dir: string,
+  token: string,
+): { files: number; hits: string[] } => {
+  const hits: string[] = [];
+  let files = 0;
+  for (const entry of readdirSync(dir, { recursive: true })) {
+    const rel = entry.toString();
+    if (!statSync(join(dir, rel)).isFile()) continue;
+    files++;
+    if (readFileSync(join(dir, rel)).includes(token)) hits.push(rel);
+  }
+  return { files, hits };
+};
+
+/**
+ * J5 — "I erase a node on request and prove nothing leaks."
+ * The compliance promise (spec §6.3): when someone exercises their right to be
+ * forgotten, `ctx forget` wipes the node's content — from the live file and from
+ * every version in history — while keeping the hash chain intact so the vault
+ * still verifies. The audit trail records who asked, when, and why, but never
+ * the content; and the erased node cannot be brought back.
+ *
+ * A distinct secret token lives in the body and a different address is the
+ * requester, so "the log keeps who/why but not the content" is unambiguous: the
+ * requester email is audit metadata that SHOULD appear; the body token must not.
+ *
+ * The review gate is turned OFF (like J2/J3): the node is published knowledge
+ * being erased on request, not a draft behind a gate.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const SECRET = "SSN-078-05-1120"; // the erased content — must never surface in the audit trail
+const J5: Journey = {
+  id: "J5",
+  title: "Right to be forgotten (compliance officer)",
+  cases: [
+    {
+      id: "J5-01",
+      title: "Forgetting a published node erases its content and marks it forgotten",
+      actions: [
+        { args: ["init", "--name", "right-to-erasure"], stdout: ["Initialized"] },
+        // Published knowledge being erased — not a draft held behind the gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/jane-data",
+            "--type", "document",
+            "--title", "Jane Data",
+            "--tags", "#pii",
+            "--body", `classified token ${SECRET} here`,
+            "-y",
+          ],
+          files: [{ path: "nodes/jane-data.md", exists: true }],
+        },
+        // Revise it once so the node has TWO versions on the chain, both holding
+        // the secret — so "erased from every version in history" (J5-06) has
+        // something real to prove, not just the single live file.
+        {
+          args: ["update", "nodes/jane-data", "--body", `revised, ${SECRET} still here`, "-y"],
+          stdout: ["Version: 2"],
+        },
+        // A second node that is NEVER forgotten — the control for the
+        // forget-vs-delete contrast in J5-05.
+        {
+          args: [
+            "add", "nodes/keepsake",
+            "--type", "document",
+            "--title", "Keepsake",
+            "--tags", "#keep",
+            "--body", "ordinary content",
+            "-y",
+          ],
+          files: [{ path: "nodes/keepsake.md", exists: true }],
+        },
+        // The erasure itself: content wiped, a forgotten stub left in its place.
+        {
+          args: [
+            "forget", "nodes/jane-data",
+            "--reason", "user_request",
+            "--requested-by", "jane@example.com",
+            "-y",
+          ],
+          stdout: ["Forgot nodes/jane-data", "status: forgotten", "Hashes kept"],
+          files: [{ path: "nodes/jane-data.md", contains: "status: forgotten" }],
+        },
+        // Opening the node now shows only a tombstone — the secret body is gone.
+        {
+          args: ["read", "nodes/jane-data"],
+          stdout: ["forgotten", "content was erased"],
+          stdoutNot: [SECRET],
+        },
+      ],
+    },
+    {
+      id: "J5-02",
+      title: "The forget log records who asked, when, and why — but never the erased content",
+      actions: [
+        {
+          args: ["forget-log"],
+          // Who/why is kept; the requester address is audit metadata and appears.
+          stdout: ["nodes/jane-data", "forgotten", "Reason: user_request", "jane@example.com"],
+          // The erased body token must not leak into the audit trail.
+          stdoutNot: [SECRET],
+        },
+        {
+          args: ["forget-log", "--json"],
+          json: (data) => {
+            const events = forgetEvents(data);
+            expect(events).toHaveLength(1);
+            expect(events[0].mode).toBe("forget");
+            expect(events[0].reason_code).toBe("user_request");
+            expect(events[0].requested_by).toBe("jane@example.com");
+            // Structural proof the content is absent from the record too.
+            expect(JSON.stringify(data)).not.toContain(SECRET);
+          },
+        },
+      ],
+    },
+    {
+      id: "J5-03",
+      title: "Re-adding or re-publishing the forgotten node is refused (anti-resurrection)",
+      actions: [
+        // The stub still occupies the path, so re-adding the id is rejected.
+        {
+          args: [
+            "add", "nodes/jane-data",
+            "--type", "document",
+            "--title", "Jane Data",
+            "--body", "trying to bring it back",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["DOCUMENT_EXISTS"],
+        },
+        // And editing the stub to republish content is refused outright — the
+        // real anti-resurrection guard (DOCUMENT_EXISTS above only proves the
+        // path is occupied; this proves the content specifically can't return).
+        {
+          args: ["update", "nodes/jane-data", "--body", "bring it back", "-y"],
+          status: 1,
+          stderr: ["FORGOTTEN_DOCUMENT", "cannot be republished"],
+        },
+        // The refused write left the stub untouched — the rejected text is not
+        // in it, so nothing partially leaked through.
+        {
+          args: ["read", "nodes/jane-data"],
+          stdout: ["content was erased"],
+          stdoutNot: ["bring it back"],
+        },
+      ],
+    },
+    {
+      id: "J5-04",
+      title: "The vault still passes an integrity check after the forget (hashes kept)",
+      actions: [
+        {
+          // The forgotten version is verified hash-only (content erased), and the
+          // whole vault still passes — avoid the ✓ glyph so Windows stdout
+          // decoding can't trip the match; `--json` below is the structural proof.
+          args: ["verify"],
+          stdout: [
+            "nodes/jane-data",
+            "forgotten version(s) verified hash-only",
+            "All integrity checks passed",
+          ],
+        },
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J5-05",
+      title: "Forget is not delete — a forgotten node leaves an auditable stub, a deleted node is gone",
+      actions: [
+        // Delete the untouched control node outright.
+        { args: ["delete", "nodes/keepsake", "-y"], status: 0 },
+        // The audit trail distinguishes the two modes. Assert it structurally
+        // from --json, keyed by node id — this pins the exact pairing (jane-data
+        // forgotten, keepsake deleted) instead of a loose cross-line text match,
+        // and sidesteps the em-dash separator entirely.
+        {
+          args: ["forget-log", "--json"],
+          json: (data) => {
+            expect(forgetEventFor(data, "nodes/jane-data")?.mode).toBe("forget");
+            expect(forgetEventFor(data, "nodes/keepsake")?.mode).toBe("delete");
+          },
+        },
+        // The forgotten node is still addressable — its stub tombstone remains...
+        {
+          args: ["read", "nodes/jane-data"],
+          stdout: ["forgotten", "content was erased"],
+        },
+        // ...whereas the deleted node is gone entirely.
+        { args: ["read", "nodes/keepsake"], status: 1, stderr: ["DOCUMENT_NOT_FOUND"] },
+      ],
+    },
+    {
+      id: "J5-06",
+      title: "The content is erased from history too — no past version survives and nothing is searchable",
+      actions: [
+        // The node had two versions (J5-01), both holding the secret. Neither
+        // can be reconstructed now — the keyframe and diff were erased, hashes
+        // kept, so reconstruction is refused rather than returning stale content.
+        {
+          args: ["reconstruct", "nodes/jane-data", "1"],
+          status: 1,
+          stderr: ["VERSION_FORGOTTEN"],
+        },
+        {
+          args: ["reconstruct", "nodes/jane-data", "2"],
+          status: 1,
+          stderr: ["VERSION_FORGOTTEN"],
+          // Belt-and-braces on-disk proof of "every version in history": the
+          // secret token survives nowhere in the WHOLE vault — version keyframes
+          // and diffs, context.yaml, INDEX.md, checkpoint history and chain logs
+          // included (the CLI-level checks above only cover indexed/reachable
+          // paths). Reading bytes, so binary files are safe.
+          check: (vault) => {
+            // Hashes are kept, so the version-history subtree still exists with
+            // files — assert that first, so the whole-vault scan below can't
+            // pass vacuously over a tree that forget removed rather than erased.
+            const versions = join(vault, "nodes", ".versions", "jane-data");
+            expect(
+              existsSync(versions),
+              "version-history subtree should survive forget (hashes kept)",
+            ).toBe(true);
+            expect(scanTreeForToken(versions, SECRET).files).toBeGreaterThan(0);
+            // Nothing anywhere in the vault still carries the erased token.
+            const leaks = scanTreeForToken(vault, SECRET).hits;
+            expect(leaks, `secret leaked into: ${leaks.join(", ")}`).toEqual([]);
+          },
+        },
+        // The natural leak check for a "prove nothing leaks" journey: a full-text
+        // search for the erased token finds nothing anywhere in the vault.
+        {
+          args: ["search", SECRET],
+          stdout: ["No results found"],
+          stdoutNot: [SECRET],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -486,5 +927,13 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J3 — curate and reuse a pack of nodes", () => {
     runJourney({ installDir: INSTALL, scratch }, J3);
+  });
+
+  it("J4 — work with an Obsidian-layout vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J4);
+  });
+
+  it("J5 — erase a node on request (right to be forgotten)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J5);
   });
 });

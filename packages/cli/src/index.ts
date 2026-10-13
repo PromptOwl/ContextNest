@@ -19,11 +19,12 @@ import {
   evaluate,
   Resolver,
   PackLoader,
+  invalidPackSelectors,
   VersionManager,
   CheckpointManager,
   ContextInjector,
   GraphQueryEngine,
-  publishDocument,
+  publishDocuments,
   ContextNestError,
   assertVaultRoot,
   isRefusedCwd,
@@ -72,6 +73,9 @@ import {
   approveReview,
   rejectReview,
   REVIEW_OFF_COMMAND,
+  enforcedStructure,
+  checkDocument,
+  parseDocument,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -87,10 +91,20 @@ import {
   remotePublish,
   remoteDelete,
   remoteMove,
+  remoteStructure,
   expandServerVaults,
   folderFromId,
   remoteFetchRecipe,
+  slugLabel,
+  remoteTaskLog,
 } from "./remote.js";
+import {
+  hasTaskFieldArgs,
+  localTaskFieldsError,
+  parseIsoDate,
+  parseTaskLogStatus,
+  taskFieldArgs,
+} from "./task-fields.js";
 import { planPull, applyPull, type PullStep } from "./pull.js";
 import {
   listJsonEntry,
@@ -100,6 +114,8 @@ import {
   type SearchHitView,
   titleFromId,
   parseTagsOption,
+  printStructure,
+  type StructureOutput,
 } from "./doc-views.js";
 import { createEngineApi } from "@promptowl/contextnest-engine/api";
 import type { OperationContext } from "@promptowl/contextnest-engine/api";
@@ -121,6 +137,7 @@ import { loadCloudToken } from "./credentials.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
+import { parseLicenseList } from "./pubmed.js";
 import {
   configureSafety,
   openWriteScope,
@@ -220,6 +237,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
       ["read", "Show a document (add --html to open it in the browser)"],
       ["update", "Edit a document, then publish a new version (held instead when review is on)"],
       ["review", "List, approve or reject writes held for review"],
+      ["task", "Log what you did on a task in a remote nest (working / done / blocked)"],
       ["delete", "Remove a document and its version history"],
     ],
   },
@@ -869,11 +887,7 @@ function promptToolsByNumber(tools: AgentTool[]): Promise<string[]> {
 // Derive a sensible default alias from a directory name, sanitized to the
 // allowed alias characters.
 function slugifyAlias(name: string): string {
-  const slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug || "vault";
+  return slugLabel(name) || "vault";
 }
 
 /**
@@ -985,8 +999,24 @@ async function applyStarter(
     await storage.writeConfig(initialConfig);
   }
 
+  // A starter on a re-initialized vault meets its structure rules like any
+  // other write: what they refuse is left out, not forced in.
+  const rules = await enforcedStructure(storage);
+  const nodes = starter.nodes.filter((node) => {
+    if (!rules) return true;
+    const doc = parseDocument(`${node.path}.md`, node.content, node.path);
+    return checkDocument(rules, { id: node.path, type: doc.frontmatter.type, body: doc.body }).length === 0;
+  });
+  if (nodes.length < starter.nodes.length) {
+    console.log(
+      chalk.yellow(
+        `  Skipped ${starter.nodes.length - nodes.length} starter document(s) this vault's structure rules refuse (ctx structure).`,
+      ),
+    );
+  }
+
   // Write starter nodes
-  for (const node of starter.nodes) {
+  for (const node of nodes) {
     await storage.writeDocument(node.path, node.content);
   }
 
@@ -997,20 +1027,23 @@ async function applyStarter(
     await fs.promises.writeFile(packPath, pack.content, "utf-8");
   }
 
-  // Publish all starter nodes
-  for (const node of starter.nodes) {
-    await publishDocument(storage, node.path, {
-      editedBy: "cli@contextnest.local",
-      note: `Created by ${starter.id} starter`,
-    });
+  // Publish all starter nodes as one batch: one checkpoint, and folders the
+  // starter shares between nodes are scaffolded under enforced rules.
+  const published = await publishDocuments(
+    storage,
+    nodes.map((node) => node.path),
+    { editedBy: "cli@contextnest.local", note: `Created by ${starter.id} starter` },
+  );
+  if (published.failed.length > 0) {
+    throw new Error(`Could not publish starter documents: ${published.failed.map((f) => `${f.id}: ${f.error}`).join("; ")}`);
   }
 
   await regenerateIndex(storage);
 
   // Print results
   console.log(chalk.green(`  Applied starter: ${chalk.bold(starter.name)}\n`));
-  console.log(`  Created ${starter.nodes.length} documents:`);
-  for (const node of starter.nodes) {
+  console.log(`  Created ${nodes.length} documents:`);
+  for (const node of nodes) {
     console.log(`    ${chalk.cyan(node.path + ".md")}`);
   }
   console.log(`  Created ${starter.packs.length} pack(s):`);
@@ -1034,7 +1067,7 @@ async function applyStarter(
     vaultName: opts.name,
     starterName: starter.id,
     starterDisplayName: starter.name,
-    nodes: starter.nodes.map((n) => ({
+    nodes: nodes.map((n) => ({
       path: n.path,
       title: n.content.match(/^title:\s*(.+)$/m)?.[1] || n.path,
       type: n.content.match(/^type:\s*(.+)$/m)?.[1] || "document",
@@ -1224,6 +1257,7 @@ program
     const reinit = fs.existsSync(pathMod.join(root, ".context", "config.yaml"));
     const priorReview = reinit ? await readReviewMode(storage).catch(() => "on" as const) : undefined;
     const review = reinit ? priorReview : "on";
+    // storage.init carries the vault's structure rules over a re-init.
     await storage.init(opts.name, opts.layout as LayoutMode, registerDescription, review ? { review } : {});
     console.log(chalk.green(`\n  Initialized ${opts.layout} vault: ${displayRoot}`));
     if (review === "on") {
@@ -1661,8 +1695,21 @@ program
     }
 
     let body: string;
+    // A folder with a template (§11.1 structure rules) starts its files from it.
+    const template =
+      !opts.body && opts.type !== "skill"
+        ? (
+            await cliApi().run<StructureOutput>(
+              "context_structure",
+              { folder: id.split("/").slice(0, -1).join("/") },
+              opContext(storage, "cli@contextnest.local"),
+            )
+          ).resolved?.template_body
+        : undefined;
     if (opts.body) {
       body = `\n${opts.body}\n`;
+    } else if (template) {
+      body = `\n${template}`;
     } else if (opts.type === "skill") {
       body = `\n# ${title}\n\n## Steps\n\n1. \n2. \n3. \n\n## Expected Output\n\nDescribe what the agent should produce.\n`;
     } else {
@@ -1724,6 +1771,32 @@ async function afterHold(storage: NestStorage, id: string): Promise<void> {
   });
 }
 
+// ─── ctx structure ─────────────────────────────────────────────────────────────
+
+program
+  .command("structure")
+  .description("Show the nest's structure rules: allowed folders, node types, name formats and templates")
+  .option("--folder <path>", "Show the rule governing one folder, with its template")
+  .option("--report", "Also list existing content that breaks the rules")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (remote) {
+      await remoteStructure(remote, opts);
+      return;
+    }
+    const storage = getStorage();
+    const out = await cliApi().run<StructureOutput>(
+      "context_structure",
+      {
+        ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
+        ...(opts.report ? { report: true } : {}),
+      },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    printStructure(out, opts);
+  });
+
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 
 program
@@ -1777,13 +1850,38 @@ program
       }
     }
 
+    // Pack problems only surface when someone queries the pack; catch them
+    // here. `validate <path>` checks one document, so it skips packs.
+    let packCount = 0;
+    if (!path) {
+      const packProblems: Array<{ file: string; message: string }> = [];
+      const packs = await storage.readPacks(packProblems);
+      packCount = packs.length;
+      for (const p of packProblems) {
+        hasErrors = true;
+        allErrors.push({ path: p.file, errors: [{ rule: "pack-file", message: p.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ ${p.file}`));
+          console.log(`  ${p.message}`);
+        }
+      }
+      for (const bad of invalidPackSelectors(packs)) {
+        hasErrors = true;
+        allErrors.push({ path: `pack:${bad.id}`, errors: [{ rule: "pack-query", message: bad.message }] });
+        if (!opts.json) {
+          console.log(chalk.red(`✗ pack:${bad.id}`));
+          console.log(`  query "${bad.query}": ${bad.message}`);
+        }
+      }
+    }
+
     if (opts.json) {
       console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors }, null, 2));
     } else {
       console.log(
         hasErrors
           ? chalk.red(`\nValidation failed with errors`)
-          : chalk.green(`\nAll ${docs.length} documents valid`),
+          : chalk.green(`\nAll ${docs.length} documents${path ? "" : ` and ${packCount} packs`} valid`),
       );
     }
 
@@ -2206,7 +2304,21 @@ program
     // Forget protocol (§6.3): erased content stays erased, and every
     // tombstone is accounted for by a recorded forget. Tombstoned versions
     // themselves verify hash-only — they are not errors.
-    const tombstoneErrors = await storage.verifyTombstones(allHistories);
+    // The crawl, once: a document that cannot be read (frontmatter that does
+    // not parse, sealed bytes that do not open) is reported, never skipped
+    // into a pass — and the tombstone and sidecar checks judge the same set.
+    let liveDocs: Awaited<ReturnType<typeof storage.discoverDocuments>> | undefined;
+    if (!lock) {
+      liveDocs = await storage.discoverDocuments({
+        includeRetired: true,
+        onUnreadable: (docId, reason) => {
+          totalErrors++;
+          allReportErrors.push({ type: "unreadable_document", document: docId, expected: null, actual: reason });
+          if (!opts.json) console.log(chalk.red(`✗ ${docId}: unreadable — ${reason}`));
+        },
+      });
+    }
+    const tombstoneErrors = await storage.verifyTombstones(allHistories, liveDocs);
     if (tombstoneErrors.length > 0) {
       totalErrors += tombstoneErrors.length;
       allReportErrors.push(...tombstoneErrors);
@@ -2234,7 +2346,7 @@ program
     // also must not hold content in plaintext. Both need the key.
     const sidecarErrors = lock
       ? []
-      : [...(await storage.verifyPdfSidecars()), ...(await storage.findUnencryptedFiles())];
+      : [...(await storage.verifyPdfSidecars(liveDocs)), ...(await storage.findUnencryptedFiles())];
     if (sidecarErrors.length > 0) {
       totalErrors += sidecarErrors.length;
       allReportErrors.push(...sidecarErrors);
@@ -2533,12 +2645,18 @@ program
   .option("-s, --status <status>", "Filter by status (draft|pending_review|approved|published|rejected|forgotten; aliases accepted)")
   .option("--tag <tag>", "Filter by tag")
   .option("--limit <n>", "Max documents to return (0 = all)", parseLimit)
+  .option("--assignee <email>", 'Remote nest: only items assigned to this email ("none" = unassigned)')
+  .option("--priority <p>", "Remote nest: only this priority (urgent|high|medium|low|none)")
+  .option("--due-before <date>", "Remote nest: only items due on or before YYYY-MM-DD", parseIsoDate)
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteList(remote, opts);
       return;
+    }
+    if (opts.assignee !== undefined || opts.priority !== undefined || opts.dueBefore !== undefined) {
+      throw localTaskFieldsError("--assignee / --priority / --due-before");
     }
     const storage = getStorage();
     // Aliases collapse here; the operation owns the rest of the filtering,
@@ -2596,11 +2714,18 @@ program
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
+  .option("--assignee <email>", 'Remote nest: assign to someone on its roster ("" or none unassigns)')
+  .option("--due <date>", 'Remote nest: due date YYYY-MM-DD ("" or none clears)')
+  .option("--priority <p>", 'Remote nest: urgent|high|medium|low ("" or none clears)')
+  .option("--parent <id>", 'Remote nest: parent node id, making this a sub-item ("" or none clears)')
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteUpdate(remote, path, opts);
       return;
+    }
+    if (hasTaskFieldArgs(taskFieldArgs(opts))) {
+      throw localTaskFieldsError("--assignee / --due / --priority / --parent");
     }
     const storage = getStorage();
     // Aliases (`cancelled`, `submitted`, `active`, …) collapse here: the op
@@ -2664,6 +2789,29 @@ program
     console.log(chalk.green(`Updated and published ${result.id}`));
     console.log(`  Version: ${result.version}`);
     console.log(`  Checkpoint: ${result.checkpoint}`);
+  });
+
+// ─── ctx task ─────────────────────────────────────────────────────────────────
+// Tasks live on a Community nest; this is how an agent says what it did.
+
+const taskCmd = program
+  .command("task")
+  .description("Work with tasks on a remote nest");
+
+taskCmd
+  .command("log <path>")
+  .description(
+    "Log an interaction on a task — attributed to you, the API key and the agent (shows in the task's activity)",
+  )
+  .requiredOption("--note <text>", "What you did or found")
+  .option("--status <status>", "working | done | blocked", parseTaskLogStatus)
+  .option("--claim", "Assign the task to yourself if it is unassigned")
+  .option("--agent <name>", "Agent name to record (default: $CONTEXTNEST_AGENT)")
+  .option("--json", "Output as JSON")
+  .action(async (path, opts) => {
+    const remote = remoteTarget(selectedVaultAlias);
+    if (!remote) throw localTaskFieldsError("`ctx task log`");
+    await remoteTaskLog(remote, path, opts);
   });
 
 // ─── ctx delete ───────────────────────────────────────────────────────────────
@@ -3136,9 +3284,13 @@ importCmd
 
 importCmd
   .command("pubmed")
-  .description("Search PubMed Central (open-access) and import the hits as markdown twins")
-  .requiredOption("--term <query>", 'PubMed query, e.g. "fecal microbiota transplantation[mh] AND open access[filter]"')
-  .option("--max <n>", "Maximum articles to fetch", "25")
+  .description("Search PubMed (MeSH / publication-type filters honoured) and import the PMC full texts as markdown twins")
+  .requiredOption("--term <query>", 'PubMed query, e.g. "chronic pain[majr] AND systematic review[pt]" (restricted to PMC full text automatically)')
+  .option("--max <n>", "Maximum articles to import (counted after the licence filter)", "25")
+  .option(
+    "--license <list>",
+    "Keep only these licences, comma-separated: cc-by, cc0, cc-by-nc, cc-by-sa, …, or `commercial` (CC BY + CC0 + public domain)",
+  )
   .option("--folder <folder>", "Vault folder for the twins", "nodes/papers")
   .option("--keep-xml", "Also store each original under assets/jats/")
   .option("--no-relink", "Do not update existing papers whose references now resolve")
@@ -3149,21 +3301,38 @@ importCmd
     const storage = getStorage();
     const max = Math.max(1, parseInt(opts.max, 10) || 25);
     const apiKey = opts.apiKey ?? process.env.NCBI_API_KEY;
+    let licenses: string[] | undefined;
+    if (opts.license !== undefined) {
+      try {
+        licenses = parseLicenseList(String(opts.license));
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+        process.exitCode = 1;
+        return;
+      }
+    }
     await confirmOrExit(
-      `Fetch up to ${max} open-access PMC article(s) for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
+      `Fetch up to ${max} PMC full-text article(s)${licenses ? ` licensed ${licenses.join("/")}` : ""} for "${opts.term}" and import into ${opts.folder} of ${realRootPath() ?? storage.root}?`,
     );
     const fetched = await fetchPmcSources({
       term: opts.term,
       max,
+      licenses,
       apiKey,
       onProgress: (done, total, pmcid) => {
         if (process.stdout.isTTY) process.stdout.write(`\rFetching ${done}/${total} ${pmcid}…`);
       },
     });
     if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
-    console.log(chalk.dim(`${fetched.total} match(es) in PMC; fetched ${fetched.sources.length}`));
+    console.log(
+      chalk.dim(
+        `${fetched.total} match(es) in PubMed with PMC full text; fetched ${fetched.sources.length}` +
+          (licenses ? `; skipped ${fetched.skippedLicense.length} for licence` : ""),
+      ),
+    );
     for (const f of fetched.failed) console.log(chalk.yellow(`  ! ${f}`));
     if (fetched.sources.length === 0) {
+      for (const sk of fetched.skippedLicense) console.log(chalk.dim(`  – ${sk}`));
       console.log(chalk.yellow("Nothing to import."));
       if (fetched.failed.length) process.exitCode = 1;
       return;
@@ -3178,7 +3347,8 @@ importCmd
       relink: opts.relink,
       force: isForce(),
     });
-    printImportSummary(r, opts.json);
+    // Licence drops are reported with the import's own skips (and in --json).
+    printImportSummary({ ...r, skipped: [...fetched.skippedLicense, ...r.skipped] }, opts.json);
   });
 
 const enrichCmd = program
