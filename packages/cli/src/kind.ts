@@ -279,7 +279,7 @@ export async function planKindApply(
   // ── Plugins ──
   if (kind.plugins.length > 0) {
     const listed = await call(target, "GET", nestPath(target, "/plugins"));
-    let loaded: Map<string, { secretKeys: string[]; configured: boolean }> | null = null;
+    let loaded: Map<string, { name: string; secretKeys: string[]; configured: boolean }> | null = null;
     if (listed.status === 404) {
       warn(`Skipping ${kind.plugins.length} plugin(s): ${PLUGINS_OFF}`);
     } else if (!listed.ok) {
@@ -288,6 +288,7 @@ export async function planKindApply(
       loaded = new Map();
       for (const p of listed.body?.plugins ?? []) {
         loaded.set(String(p.name).toLowerCase(), {
+          name: String(p.name),
           secretKeys: Array.isArray(p.secretKeys) ? p.secretKeys.map(String) : [],
           configured: p.configured === true,
         });
@@ -324,7 +325,8 @@ export async function planKindApply(
         note: `${server.configured ? "merge into existing config" : "configure"}; enable it on the server once its secrets are set`,
         request: {
           method: "PUT",
-          path: nestPath(target, `/plugins/${encodeURIComponent(p.name)}`),
+          // The server's spelling: the lookup above ignores case, its route may not.
+          path: nestPath(target, `/plugins/${encodeURIComponent(server.name)}`),
           body: { mode: p.mode, ...(p.settings ? { settings: p.settings } : {}) },
         },
       });

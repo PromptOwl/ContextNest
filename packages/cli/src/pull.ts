@@ -340,23 +340,38 @@ const SECRET_KEY = /secret|token|passw(?:or)?d|passphrase|api[_-]?key|private[_-
 /** "token" as a quantity (an LLM budget), not a credential: max_tokens, tokenLimit, … */
 const TOKEN_QUANTITY = /(?:max|min|num)[_-]?tokens?|tokens?[_-]?(?:budget|limit|count)/gi;
 
+/** Key names that are credentials (a bare `key`, as in sort_key, is not). */
+const SECRET_KEY_NAME = /(?:access|client|signing|master|encryption|app|consumer|license|session)[_-]?key|connection[_-]?string/i;
+/** Whole words in a setting name that are credentials: auth (not author), pat, dsn, webhook. */
+const SECRET_WORDS = new Set(["auth", "pat", "dsn", "webhook", "webhooks"]);
+
 /** A setting NAME that says secret. Exported for tests. */
 export function secretSettingName(key: string): boolean {
-  return SECRET_KEY.test(key.replace(TOKEN_QUANTITY, ""));
+  const name = key.replace(TOKEN_QUANTITY, "");
+  if (SECRET_KEY.test(name) || SECRET_KEY_NAME.test(name)) return true;
+  const words = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/);
+  return words.some((w) => SECRET_WORDS.has(w));
 }
 
 const SECRET_HINT = " — set secrets on the server, never in a recipe (if it isn't a secret, rename the setting)";
 const SECRET_VALUE = [
-  /^(?:cnst_|sk-|sk_(?:live|test)_|rk_(?:live|test)_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abposr]-|AKIA|ASIA|AIza|ya29\.)/,
+  /^(?:cnst_|sk-|sk_(?:live|test)_|rk_(?:live|test)_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abposr]-|xapp-|lin_api_|AKIA|ASIA|AIza|ya29\.)/,
+  /^(?:bearer|basic)\s+\S/i, // an Authorization header value
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/, // JWT
   /^[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i, // credentials in a URL
+  // Webhook URLs carry their secret in the path.
+  /^https?:\/\/(?:hooks\.slack\.com\/(?:services|workflows|triggers)\/|(?:\w+\.)?discord(?:app)?\.com\/api\/webhooks\/|[\w.-]+\.webhook\.office\.com\/)/i,
 ];
 
 function looksSecret(value: string): boolean {
   if (SECRET_VALUE.some((re) => re.test(value))) return true;
   // A long unbroken token mixing cases and digits reads as a key, not a name.
-  return /^[A-Za-z0-9+/_=.-]{32,}$/.test(value) && /\d/.test(value) && /[a-z]/.test(value) && /[A-Z]/.test(value);
+  if (/^[A-Za-z0-9+/_=.-]{32,}$/.test(value) && /\d/.test(value) && /[a-z]/.test(value) && /[A-Z]/.test(value)) {
+    return true;
+  }
+  // So does a long run of letters and digits with no separators: a hex or base32 key.
+  return /^[A-Za-z0-9]{32,}$/.test(value) && /\d/.test(value) && /[a-z]/i.test(value);
 }
 
 function settingValue(value: unknown, where: string): KindSettingValue {
@@ -380,11 +395,17 @@ function parseCondition(raw: unknown, where: string): KindEdgeCondition {
   const entry = obj(raw, where);
   const mode = oneOf(entry.mode, CONDITION_MODES, `${where}.mode`);
   if (mode === "structured") {
-    const { mode: _mode, ...predicate } = entry;
-    if (Object.keys(predicate).length === 0) {
+    // The server's predicate shape: {term, op, value}.
+    onlyKeys(entry, ["mode", "term", "op", "value"], where);
+    if (entry.term === undefined && entry.op === undefined && entry.value === undefined) {
       throw invalid(`${where} needs a predicate beside its mode, e.g. term, op and value`);
     }
-    return { mode, ...predicate };
+    return {
+      mode,
+      ...(entry.term !== undefined ? { term: str(entry.term, `${where}.term`) } : {}),
+      ...(entry.op !== undefined ? { op: str(entry.op, `${where}.op`) } : {}),
+      ...(entry.value !== undefined ? { value: settingValue(entry.value, `${where}.value`) } : {}),
+    };
   }
   onlyKeys(entry, ["mode", "text"], where);
   return { mode, text: str(entry.text, `${where}.text`) };
@@ -430,6 +451,11 @@ export function parseKindSection(raw: unknown): KindSection {
     // The server's own rule for an edge-type name.
     if (name.length > 100 || !/^[a-z0-9][a-z0-9-]*$/i.test(name)) {
       throw invalid(`${where}.name "${name}" must be letters, digits and dashes (100 max), e.g. escalates-when`);
+    }
+    // Applying upserts by name: redefining a stock type would overwrite the
+    // server's own description and is_flow for every nest user.
+    if (STOCK_EDGE_TYPES.includes(name.toLowerCase())) {
+      throw invalid(`${where}.name "${name}" is a stock edge type — use it in kind.edges without declaring it`);
     }
     if (typeNames.has(name.toLowerCase())) throw invalid(`${where}.name "${name}" is listed twice`);
     typeNames.add(name.toLowerCase());

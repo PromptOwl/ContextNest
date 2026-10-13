@@ -211,10 +211,14 @@ describe("helpers", () => {
   });
 
   it("secretSettingName: token as an LLM budget is a setting, token as a credential is a secret", () => {
-    for (const ok of ["max_tokens", "maxTokens", "min-tokens", "token_budget", "tokenLimit", "num_tokens", "repos"]) {
+    for (const ok of ["max_tokens", "maxTokens", "min-tokens", "token_budget", "tokenLimit", "num_tokens", "repos", "sort_key", "author", "path", "patterns"]) {
       expect(secretSettingName(ok), ok).toBe(false);
     }
-    for (const bad of ["token", "access_token", "accessToken", "api_key", "client_secret", "password", "max_tokens_secret"]) {
+    for (const bad of [
+      "token", "access_token", "accessToken", "api_key", "client_secret", "password", "max_tokens_secret",
+      "accessKey", "access_key", "client_key", "signingKey", "auth", "pat", "github_pat", "dsn", "webhook_url",
+      "webhookUrl", "connection_string", "connectionString",
+    ]) {
       expect(secretSettingName(bad), bad).toBe(true);
     }
   });
@@ -549,17 +553,25 @@ describe("parseRecipeManifest — kind section", () => {
     ["a ContextNest key value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        label: cnst_0123456789abcdef", /settings\.label looks like a secret/],
     ["a high-entropy value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        hint: Zx8q2LmN4pR7tV1wY5bC9dF3gH6jK0sA", /settings\.hint looks like a secret/],
     ["a credentialed URL", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        url: https://bob:hunter2@example.com/x", /settings\.url looks like a secret/],
+    ["a lowercase hex key", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        hint: 0123456789abcdef0123456789abcdef01234567", /settings\.hint looks like a secret/],
+    ["a Linear key", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        hint: lin_api_abc123", /settings\.hint looks like a secret/],
+    ["a Slack webhook URL", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        notify: https://hooks.slack.com/services/T000/B000/XXXX", /settings\.notify looks like a secret/],
+    ["a bearer header value", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        header: Bearer abc.def", /settings\.header looks like a secret/],
     ["a nested settings object", "  plugins:\n    - name: gh\n      mode: raw\n      settings:\n        deep:\n          a: 1", /settings\.deep must be a string, number, boolean or a list of them/],
     ["an edge type with a bad name", "  edge_types:\n    - name: \"has space\"\n      description: d", /kind\.edge_types\[0\]\.name "has space" must be letters, digits and dashes/],
     ["an edge type with no description", "  edge_types:\n    - name: blocks", /kind\.edge_types\[0\]\.description must be a non-empty string/],
     ["a non-boolean is_flow", "  edge_types:\n    - name: blocks\n      description: d\n      is_flow: yes-please", /kind\.edge_types\[0\]\.is_flow must be true or false/],
     ["a bad condition schema", "  edge_types:\n    - name: blocks\n      description: d\n      condition_schema:\n        params: CAC", /kind\.edge_types\[0\]\.condition_schema\.params must be a list/],
+    ["a redeclared stock edge type", "  edge_types:\n    - name: Next\n      description: d", /kind\.edge_types\[0\]\.name "Next" is a stock edge type/],
     ["a duplicate edge type", "  edge_types:\n    - name: blocks\n      description: d\n    - name: Blocks\n      description: d", /kind\.edge_types\[1\]\.name "Blocks" is listed twice/],
     ["an edge of an undeclared type", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: blocks", /kind\.edges\[0\]\.type "blocks" is neither declared in kind\.edge_types nor a stock type/],
     ["an edge leaving nodes/", "  edges:\n    - from: nodes/a\n      to: ../b\n      type: next", /kind\.edges\[0\]\.to "\.\.\/b" must stay inside the vault/],
     ["a bad condition mode", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: vibes", /kind\.edges\[0\]\.condition\.mode must be structured \| nl \| open/],
     ["an nl condition without text", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: nl", /kind\.edges\[0\]\.condition\.text must be a non-empty string/],
     ["an empty structured condition", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: structured", /kind\.edges\[0\]\.condition needs a predicate/],
+    ["an unknown structured condition key", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: structured\n        term: CAC\n        extra: 1", /kind\.edges\[0\]\.condition\.extra is not a known field/],
+    ["a nested structured value", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: structured\n        term: CAC\n        op: \"=\"\n        value:\n          a: 1", /kind\.edges\[0\]\.condition\.value must be a string, number, boolean/],
+    ["a secret in a structured value", "  edges:\n    - from: nodes/a\n      to: nodes/b\n      type: next\n      condition:\n        mode: structured\n        term: CAC\n        op: \"=\"\n        value: ghp_abcdefghijklmnopqrstuvwxyz0123456789", /kind\.edges\[0\]\.condition\.value looks like a secret/],
     ["a too-frequent schedule", "  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 1", /kind\.schedules\[0\]\.every_minutes must be a whole number from 5 to 10080/],
     ["a fractional schedule", "  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 7.5", /every_minutes must be a whole number/],
     ["a duplicate schedule", "  schedules:\n    - agent: nodes/agents/a\n      every_minutes: 10\n    - agent: nodes/agents/a\n      every_minutes: 20", /kind\.schedules\[1\]\.agent "nodes\/agents\/a" is scheduled twice/],

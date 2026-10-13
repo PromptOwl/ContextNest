@@ -4,11 +4,15 @@
  * outside nodes/kinds/. Both refusals happen before any request is sent, so
  * the server here is a port nothing listens on.
  *
- * Plan/execute behaviour against a fake server lives in kind.test.ts.
+ * The last block runs the CLI against a local HTTP server: what --json and
+ * the exit code say when a request fails, and that the key stays off the
+ * output. Plan/execute behaviour in detail lives in kind.test.ts.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtempSync, writeFileSync, rmSync, cpSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -96,5 +100,60 @@ describe("[regression] ctx kind apply — gates", () => {
     const res = apply("../drafty");
     expect(res.status).not.toBe(0);
     expect(res.stderr).toMatch(/must be a plain name/);
+  });
+});
+
+describe("[regression] ctx kind apply — against a server", () => {
+  let server: Server;
+  let url: string;
+  const auth: string[] = [];
+
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      auth.push(String(req.headers.authorization));
+      const reply = (status: number, body: unknown) => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      if (req.method === "GET" && req.url === "/nests/n1") return reply(200, { id: "n1" });
+      if (req.method === "GET" && req.url === "/nests/n1/edge-types") return reply(200, { edge_types: [] });
+      if (req.method === "POST" && req.url === "/nests/n1/edge-types") return reply(500, { error: "boom" });
+      reply(404, { error: "Not found" });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
+
+  // Async: the server lives in this process, so a sync spawn would block it.
+  const applyAsync = (...args: string[]) =>
+    new Promise<{ status: number; stdout: string; stderr: string }>((resolve) => {
+      execFile(
+        "node",
+        [distPath, "kind", "apply", "ready", "--server", url, "--nest", "n1", ...args],
+        {
+          cwd: vault,
+          env: { ...process.env, CONTEXTNEST_NO_BROWSER: "1", CONTEXTNEST_CONFIG_DIR: configDir, CONTEXTNEST_VAULT: "", CONTEXTNEST_VAULT_PATH: "", CONTEXTNEST_API_KEY: "cnst_regression" },
+          encoding: "utf-8",
+        },
+        (err, stdout, stderr) => resolve({ status: err ? Number((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
+      );
+    });
+
+  it("--json --yes: a failed request is in the JSON, the exit code is 1, and the key never prints", async () => {
+    const res = await applyAsync("--yes", "--json");
+    expect(res.status).toBe(1);
+    const out = JSON.parse(res.stdout);
+    expect(out.dry_run).toBe(false);
+    expect(out.steps).toEqual([expect.objectContaining({ kind: "edge-type", result: "failed", error: "500 boom" })]);
+    expect(auth.every((a) => a === "Bearer cnst_regression")).toBe(true);
+    expect(res.stdout + res.stderr).not.toContain("cnst_regression");
+  });
+
+  it("a dry run exits 0 and says nothing was sent", async () => {
+    const res = await applyAsync();
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Dry run — 1 request\(s\) planned, nothing sent/);
   });
 });

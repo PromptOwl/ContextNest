@@ -107,7 +107,7 @@ import {
   taskFieldArgs,
 } from "./task-fields.js";
 import { planPull, applyPull, type PullStep, kindDocId, parseKindDocument } from "./pull.js";
-import { planKindApply, executeKindPlan, renderKindPlan, parseStewardMappings } from "./kind.js";
+import { planKindApply, executeKindPlan, renderKindPlan, parseStewardMappings, type KindStep } from "./kind.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -4413,12 +4413,22 @@ Example:
   ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com --yes`,
   )
   .action(async (kindId: string, opts: { server: string; nest: string; key?: string; steward: string[]; json?: boolean; allowDraft?: boolean }, cmd: Command) => {
-    const apiKey = opts.key ?? process.env.CONTEXTNEST_API_KEY;
-    if (!apiKey) {
-      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+    // Same key resolution as `ctx push`; the URL is checked first so a
+    // refused server never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
       process.exit(1);
     }
-    assertSafeEndpoint(opts.server, "--server");
+    if (!apiKey) {
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
+      process.exit(1);
+    }
     const stewards = parseStewardMappings(opts.steward);
 
     const storage = getStorage();
@@ -4481,14 +4491,22 @@ Example:
       if (!execute) {
         console.log(chalk.yellow(`Dry run — ${planned} request(s) planned, nothing sent. Rerun with --yes to apply.`));
       } else {
-        console.log(
-          failed.length
-            ? chalk.red(`${planned - failed.length} of ${planned} request(s) applied; ${failed.length} failed.`)
-            : chalk.green(`Applied ${planned} request(s).`),
-        );
+        const count = (r: KindStep["result"]) => plan.steps.filter((s) => s.result === r).length;
+        const applied = count("created") + count("updated");
+        const parts = [
+          `${applied} applied`,
+          count("exists") && `${count("exists")} already there`,
+          count("skipped") && `${count("skipped")} skipped`,
+          failed.length && `${failed.length} failed`,
+        ].filter(Boolean);
+        const summary = `${parts.join(", ")} (of ${planned} planned request(s)).`;
+        if (failed.length) console.log(chalk.red(summary));
+        else if (applied === 0) console.log(chalk.yellow(`Nothing applied — ${summary} See the skips and warnings above.`));
+        else console.log(chalk.green(summary));
       }
     }
-    if (failed.length) process.exit(1);
+    // exitCode, not exit(): exit() can cut off a large --json write to a pipe.
+    if (failed.length) process.exitCode = 1;
   });
 
 // ─── ctx vault ───────────────────────────────────────────────────────────────

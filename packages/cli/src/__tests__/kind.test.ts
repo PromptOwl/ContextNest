@@ -378,6 +378,15 @@ describe("review hardening", () => {
     };
     await expect(planKindApply("seam", kind(), { ...target, fetch: htmlFetch })).rejects.toThrow(/without a JSON body/);
   });
+
+  it("addresses a plugin by the server's spelling of its name", async () => {
+    routes[key("GET", "/nests/n1/plugins")] = {
+      status: 200,
+      body: { plugins: [{ name: "GitHub", secretKeys: [], configured: false }], load_errors: [] },
+    };
+    const plan = await planKindApply("seam", kind(), target);
+    expect(plan.steps.find((s) => s.kind === "plugin")!.request!.path).toBe("/nests/n1/plugins/GitHub");
+  });
 });
 
 // ─── Flags ──────────────────────────────────────────────────────────────────
