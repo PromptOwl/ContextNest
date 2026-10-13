@@ -3464,8 +3464,14 @@ program
 async function readStdin(): Promise<string> {
   const stdin = process.stdin;
   if (!stdin.isTTY) {
+    // A key is ~70 bytes; refuse a runaway pipe instead of buffering all of it.
     const chunks: Buffer[] = [];
-    for await (const chunk of stdin) chunks.push(chunk as Buffer);
+    let size = 0;
+    for await (const chunk of stdin) {
+      size += (chunk as Buffer).length;
+      if (size > 4096) throw new Error("Too much input on stdin — pipe in just the key (cnst_…).");
+      chunks.push(chunk as Buffer);
+    }
     return Buffer.concat(chunks).toString("utf-8");
   }
   process.stderr.write(chalk.dim("Paste the key and press Enter — it stays hidden. Ctrl-C to cancel.\n> "));
@@ -3562,15 +3568,30 @@ program
           throw new Error(`"${opts.as}" is already a registered vault — pick another alias, or pass --force to replace a remote.`);
         }
       }
+      // Registered with no auth, so the alias borrows the key — the key never enters the registry.
+      // Confirmed before signing in, so declining never leaves a saved key without its alias.
+      const aliasSpec: RemoteNestSpec = { transport: "http", url: `${url}/mcp` };
+      if (opts.as) {
+        await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
+      }
       // Fail on an unusable store now, before the server mints a key.
       await assertServerMapWritable();
       let token: string | undefined;
       let label = opts.label;
       let mintedLabel: string | undefined;
       if (!opts.keyStdin) {
+        // The name the server shows for this key (what you'd revoke). Asked on a
+        // terminal only; Enter keeps the default, and scripts always get it.
+        const defaultName = `ctx CLI (${hostname()})`;
+        let keyName = defaultName;
+        while (process.stdin.isTTY) {
+          keyName = await promptText("Name for the API key this login creates", defaultName);
+          if (keyName.length <= 60) break;
+          console.log(chalk.yellow("  Key names can be at most 60 characters."));
+        }
         try {
           const res = await deviceLogin(url, {
-            deviceName: `ctx CLI (${hostname()})`,
+            deviceName: keyName,
             prompt: (verificationUrl, userCode) => {
               console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(verificationUrl)}`);
               if (userCode) console.log(`  Code: ${chalk.bold(userCode)}`);
@@ -3611,12 +3632,16 @@ program
       );
       console.log(chalk.dim(`  Key saved to ${where}.`));
       if (opts.as) {
-        // Registered with no auth, so the alias borrows the key just saved — the key never enters the registry.
-        const spec: RemoteNestSpec = { transport: "http", url: `${url}/mcp` };
-        await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(spec)} in ${registryPathForLog()}?`);
-        const reg = addRemote(opts.as, spec, { setDefault: opts.setDefault, force: isForce() });
+        let reg: ReturnType<typeof addRemote>;
+        try {
+          reg = addRemote(opts.as, aliasSpec, { setDefault: opts.setDefault, force: isForce() });
+        } catch (err) {
+          throw new Error(
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${opts.as} --url ${aliasSpec.url}`,
+          );
+        }
         console.log(
-          chalk.green(`Registered remote "${chalk.bold(opts.as)}"${reg.default === opts.as ? " (default)" : ""} → ${spec.url}`),
+          chalk.green(`Registered remote "${chalk.bold(opts.as)}"${reg.default === opts.as ? " (default)" : ""} → ${aliasSpec.url}`),
         );
         console.log(
           chalk.dim(

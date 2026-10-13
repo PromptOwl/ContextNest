@@ -98,6 +98,13 @@ describe("ctx login / logout (regression)", () => {
     expect(onlyHosted.stdout).not.toContain(SELF);
   });
 
+  it("refuses a runaway pipe on --key-stdin instead of buffering it", () => {
+    const r = ctx(["login", SELF, "--key-stdin"], `cnst_${"a".repeat(5000)}`);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("Too much input on stdin");
+    expect(ctx(["login", "--list"]).stdout).toContain("Not logged in");
+  });
+
   it("refuses --nest with the browser flow (that key would be server-wide)", () => {
     const r = ctx(["login", HOSTED, "--nest", "n1"]);
     expect(r.status).toBe(1);

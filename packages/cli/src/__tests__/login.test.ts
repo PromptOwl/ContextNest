@@ -159,8 +159,8 @@ describe("deviceLogin", () => {
     for (const bad of [
       { verificationUrl: "file:///etc/passwd" },
       { verificationUrl: "javascript:alert(1)" },
-      { verificationUrl: "https://po.example/]8;;evil" },
-      { userCode: "AB[2J" },
+      { verificationUrl: "https://po.example/\u001b]8;;evil\u0007" },
+      { userCode: "AB\u001b[2J" },
     ]) {
       const prompt = vi.fn();
       const f = scriptedFetch({ "/auth/device": [{ body: { ...START.body, ...bad } }] });
