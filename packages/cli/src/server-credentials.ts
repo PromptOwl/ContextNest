@@ -272,10 +272,16 @@ function loginStatePath(opts: CredentialStoreOptions): string {
 }
 
 function writeLoginState(map: ServerMap, opts: CredentialStoreOptions): void {
+  const file = loginStatePath(opts);
+  const state = Object.keys(map.servers).length > 0 ? "saved" : "none";
   try {
-    const file = loginStatePath(opts);
+    if (fs.readFileSync(file, "utf-8") === state) return;
+  } catch {
+    // missing: write it
+  }
+  try {
     fs.mkdirSync(pathMod.dirname(file), { recursive: true });
-    fs.writeFileSync(file, Object.keys(map.servers).length > 0 ? "saved" : "none");
+    fs.writeFileSync(file, state);
   } catch {
     // Only a cache: without it the next lookup reads the store.
   }
@@ -289,7 +295,11 @@ function nothingSaved(opts: CredentialStoreOptions): boolean {
   }
 }
 
-/** A lookup's options. `fresh` reads the store even when the marker says nothing is saved. */
+/**
+ * A lookup's options. `fresh` reads the store even when the marker says nothing
+ * is saved — for rare commands (`ctx push`) where a stale marker must not read
+ * as "not logged in".
+ */
 export type SavedLookupOptions = CredentialStoreOptions & { fresh?: boolean };
 
 /**
