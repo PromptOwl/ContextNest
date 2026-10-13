@@ -3376,6 +3376,7 @@ program
   .action(async (server: string | undefined, opts: { nest?: string; all?: boolean }) => {
     try {
       if (opts.all) {
+        if (server || opts.nest) throw new Error("--all forgets every server; drop the <server> / --nest.");
         // Don't parse first: --all is the way out of a corrupt or newer-format map.
         let forgotten: [string, ServerCredential][] = [];
         try {
@@ -3560,6 +3561,9 @@ program
       if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
+        if (res.status === 401 && !opts.key && !process.env.CONTEXTNEST_API_KEY) {
+          console.error(chalk.dim("  The key saved by `ctx login` was rejected — check `ctx login --list`, then log in again."));
+        }
         process.exit(1);
       }
 

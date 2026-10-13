@@ -67,6 +67,13 @@ describe("deviceLogin", () => {
       "/auth/keys": [{ status: 302, headers: { location: "https://evil.example/keys" } }],
     });
     await expect(deviceLogin(SERVER, io(f))).rejects.toThrow(/redirected.*evil\.example/);
+
+    // A redirected poll is refused outright, not retried as a transient failure.
+    const poll = scriptedFetch({
+      "/auth/device": [START],
+      "/auth/device/poll": [{ status: 302, headers: { location: "https://evil.example/poll" } }, APPROVED],
+    });
+    await expect(deviceLogin(SERVER, io(poll))).rejects.toThrow(/redirected.*evil\.example/);
   });
 
   it("says browser login is unavailable and points at --key-stdin", async () => {
@@ -176,21 +183,34 @@ describe("connectTarget", () => {
     expect(connect).toHaveBeenCalledWith("h", spec);
   });
 
-  it("rewrites an auth failure to point at ctx login, and surfaces an unreadable store", async () => {
+  it("rewrites an auth failure to point at ctx login", async () => {
     const reject = vi.fn(async () => {
       throw new ContextNestError("rejected — Check that CONTEXTNEST_LOGIN_TOKEN is exported", "REMOTE_AUTH_FAILED");
     });
     await expect(connectTarget({ alias: "h", spec: http }, async () => "cnst_old", reject as never)).rejects.toThrow(
       /ctx login <server>` again/,
     );
-    await expect(
-      connectTarget(
-        { alias: "h", spec: http },
-        async () => {
-          throw new Error("Saved `ctx login` keys exist but couldn't be read: wrong key");
-        },
-        reject as never,
-      ),
-    ).rejects.toMatchObject({ code: "CONFIG_ERROR", message: expect.stringMatching(/couldn't be read/) });
+  });
+
+  it("an unreadable store never blocks a remote that needs no key; it surfaces only when the server asks for one", async () => {
+    const unreadable = async () => {
+      throw new Error("Saved `ctx login` keys exist but couldn't be read: wrong key");
+    };
+    const open = vi.fn(async () => conn);
+    await expect(connectTarget({ alias: "h", spec: http }, unreadable, open as never)).resolves.toBe(conn);
+    expect(open).toHaveBeenCalledWith("h", http);
+
+    const reject = vi.fn(async () => {
+      throw new ContextNestError("no auth configured", "REMOTE_AUTH_FAILED");
+    });
+    await expect(connectTarget({ alias: "h", spec: http }, unreadable, reject as never)).rejects.toMatchObject({
+      code: "CONFIG_ERROR",
+      message: expect.stringMatching(/couldn't be read/),
+    });
+    // Nothing saved and the server wants a key: point at ctx login.
+    await expect(connectTarget({ alias: "h", spec: http }, async () => null, reject as never)).rejects.toMatchObject({
+      code: "REMOTE_AUTH_FAILED",
+      message: expect.stringMatching(/ctx login <server>/),
+    });
   });
 });

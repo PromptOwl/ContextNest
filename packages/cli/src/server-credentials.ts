@@ -190,12 +190,11 @@ export async function saveServerMap(map: ServerMap, opts: CredentialStoreOptions
  * not masquerade as "not logged in".
  */
 export async function savedTokenFor(endpoint: string, opts: CredentialStoreOptions = {}): Promise<string | null> {
-  let map: ServerMap;
+  let json: string | null;
   try {
-    map = await loadServerMap(opts);
+    json = await new CredentialStore(opts).get(SERVERS_ACCOUNT);
   } catch (err) {
-    if ((err as Error).message.startsWith("Saved `ctx login` keys")) throw err;
     throw new CredentialStoreError(`Saved \`ctx login\` keys exist but couldn't be read: ${(err as Error).message}`);
   }
-  return tokenForEndpoint(map, endpoint);
+  return tokenForEndpoint(parseServerMap(json), endpoint);
 }

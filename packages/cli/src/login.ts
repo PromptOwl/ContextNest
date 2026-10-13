@@ -54,12 +54,10 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
 
   // Every hop carries a secret (device secret, PromptOwl token, session cookie),
   // so none may follow a redirect to an unvalidated host — same rule as push.
+  const send = (path: string, init: RequestInit = {}): Promise<Response> =>
+    doFetch(`${serverUrl}${path}`, { ...NO_REDIRECT, ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   const call = async (path: string, init: RequestInit = {}): Promise<Response> => {
-    const res = await doFetch(`${serverUrl}${path}`, {
-      ...NO_REDIRECT,
-      ...init,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    const res = await send(path, init);
     assertNotRedirected(res, "The server");
     return res;
   };
@@ -101,11 +99,11 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
     try {
       let res: Response;
       try {
-        res = await call(pollPath);
+        res = await send(pollPath);
       } catch (err) {
-        if ((err as Error).message.includes("redirected")) throw err;
         throw new TransientError((err as Error).message);
       }
+      assertNotRedirected(res, "The server");
       if (res.status >= 500) throw new TransientError(`server error ${res.status}`);
       const pd = (await res.json().catch(() => null)) as { status?: string; token?: string; error?: string } | null;
       if (!pd) throw new TransientError(`unreadable poll response (${res.status})`);

@@ -232,13 +232,26 @@ export async function connectTarget(
 ): Promise<RemoteNestConnection> {
   const { spec } = target;
   if (!wantsLoginKey(spec)) return connect(target.alias, spec);
-  let token: string | null;
+  let token: string | null = null;
+  let storeError: Error | undefined;
   try {
     token = await lookup(spec.url);
   } catch (err) {
-    throw new ContextNestError((err as Error).message, "CONFIG_ERROR");
+    storeError = err as Error;
   }
-  if (!token) return connect(target.alias, spec);
+  if (!token) {
+    // An unreadable store must not break a remote that needs no key; it only
+    // matters once the server asks for one, and then it is the real cause.
+    try {
+      return await connect(target.alias, spec);
+    } catch (err) {
+      if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
+        if (storeError) throw new ContextNestError(storeError.message, "CONFIG_ERROR");
+        throw new ContextNestError(`${err.message} Or sign in once: \`ctx login <server>\`.`, err.code);
+      }
+      throw err;
+    }
+  }
   try {
     // The engine reads bearers from env-var references only, so hand it the key
     // under a private name rather than widening the registry format.
