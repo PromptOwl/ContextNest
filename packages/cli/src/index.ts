@@ -3829,7 +3829,7 @@ program
     assertSafeEndpoint(opts.server, "--server");
     let apiKey: string | null;
     try {
-      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest), { fresh: true }));
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
@@ -4455,7 +4455,7 @@ Example:
     assertSafeEndpoint(opts.server, "--server");
     let apiKey: string | null;
     try {
-      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest), { fresh: true }));
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
