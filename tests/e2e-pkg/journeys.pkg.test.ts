@@ -943,6 +943,11 @@ const STRUCTURE_RULES = [
   "folders:",
   "  decisions:",
   "    types: [document]",
+  // file_name uses the structure-rules WHITELIST grammar (engine structure.ts: a
+  // linear-time position-set matcher), NOT JS RegExp — it accepts bounded repeats
+  // on a char class, e.g. [0-9]{4}. Do not "simplify" this into a quantified
+  // group: that grammar rejects quantified groups, so the rewrite fails to
+  // compile the rules.
   '    file_name: "/adr-[0-9]{4}-[a-z0-9-]+/"',
   "  reference:",
   "    types: [document, glossary]",
@@ -958,7 +963,17 @@ const STRUCTURE_RULES = [
 
 const seedStructureRules = (vault: string) => {
   const cfg = join(vault, ".context", "config.yaml");
-  writeFileSync(cfg, `${readFileSync(cfg, "utf-8")}\n${STRUCTURE_RULES}`);
+  const existing = readFileSync(cfg, "utf-8");
+  // Append the rule blocks rather than parse-and-merge — valid only because
+  // `ctx init` does not emit structure:/folders:/templates: itself. Fail loudly
+  // if that ever changes, so a silent duplicate YAML key can't turn into a
+  // confusing downstream parse failure that looks like a product bug.
+  if (/^(structure|folders|templates):/m.test(existing)) {
+    throw new Error(
+      "init already wrote structure rule keys — seedStructureRules would duplicate them; switch to a parse-and-merge.",
+    );
+  }
+  writeFileSync(cfg, `${existing}\n${STRUCTURE_RULES}`);
 };
 
 /**
@@ -1031,6 +1046,13 @@ const J6: Journey = {
       actions: [
         {
           // "random-thought" doesn't match the ADR name format decisions/ requires.
+          //
+          // Refusal assertions here pin the stable VALIDATION_FAILED code and the
+          // on-disk absence (the durable contract), plus ONE short fragment of the
+          // engine's message — just enough to prove the RIGHT rule fired (a name
+          // refusal, not a type or folder one), which the code alone can't show.
+          // The fragment is English prose, so a wording change in the engine would
+          // need these updated; that's the deliberate cost of proving the reason.
           args: [
             "add", "nodes/decisions/random-thought",
             "--type", "document",
@@ -1039,8 +1061,7 @@ const J6: Journey = {
             "-y",
           ],
           status: 1,
-          stderr: ["VALIDATION_FAILED", "File names in", "random-thought"],
-          // The refusal wrote nothing — the off-style file is not on disk.
+          stderr: ["VALIDATION_FAILED", "File names in"],
           files: [{ path: "nodes/decisions/random-thought.md", exists: false }],
         },
       ],
@@ -1060,7 +1081,7 @@ const J6: Journey = {
             "-y",
           ],
           status: 1,
-          stderr: ["VALIDATION_FAILED", 'A "prompt" can\'t go in "decisions/"'],
+          stderr: ["VALIDATION_FAILED", "can't go in"],
           files: [{ path: "nodes/decisions/adr-0002-use-redis.md", exists: false }],
         },
         {
@@ -1073,10 +1094,7 @@ const J6: Journey = {
             "-y",
           ],
           status: 1,
-          // Match the folder and the allow-list members individually, not a
-          // single fixed-order "Allowed: a, b, c" string that a reordering would
-          // break.
-          stderr: ["VALIDATION_FAILED", "not an allowed folder", "decisions", "reference"],
+          stderr: ["VALIDATION_FAILED", "not an allowed folder"],
           files: [{ path: "nodes/scratchpad/idea.md", exists: false }],
         },
       ],
@@ -1184,7 +1202,7 @@ const J6: Journey = {
             "-y",
           ],
           status: 1,
-          stderr: ["VALIDATION_FAILED", 'needs a "Decisions" heading', "meeting-note template"],
+          stderr: ["VALIDATION_FAILED", 'needs a "Decisions" heading'],
           files: [{ path: "nodes/meetings/2026-01-kickoff.md", exists: false }],
         },
         // The same note WITH the required "Decisions" section is accepted.
@@ -1204,6 +1222,35 @@ const J6: Journey = {
         {
           args: ["structure", "--folder", "meetings"],
           stdout: ["meeting-note", "required sections: Decisions"],
+        },
+      ],
+    },
+    {
+      id: "J6-07",
+      title: "Editing an existing compliant node to break a rule is refused too, not just new nodes",
+      actions: [
+        // Enforcement covers the update path, not only add: edit the compliant
+        // meetings note from J6-06 to drop its required "Decisions" section. The
+        // edit is refused and the node is left untouched (the section survives) —
+        // so the vault can't drift out of house-style through a later edit.
+        {
+          args: [
+            "update", "nodes/meetings/2026-02-planning",
+            "--body", "## Attendees\nAlice, Bob\n## Action items\nShip it.",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", 'remove the required "Decisions" heading'],
+          files: [{ path: "nodes/meetings/2026-02-planning.md", contains: "## Decisions" }],
+        },
+        // An edit that keeps the section compliant is accepted — a second version.
+        {
+          args: [
+            "update", "nodes/meetings/2026-02-planning",
+            "--body", "## Attendees\nAlice, Bob, Carol\n## Decisions\nUse Postgres and Redis.\n## Action items\nShip it.",
+            "-y",
+          ],
+          stdout: ["Updated and published", "Version: 2"],
         },
       ],
     },
