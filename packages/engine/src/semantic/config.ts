@@ -6,7 +6,7 @@
  *     full_match_first: true   # lexical: pin all-terms matches above partial ones
  *     field_boosts: { title: 1.25, tags: 1.25, description: 1, body: 1 }   # BM25 per-field boosts (these are the defaults)
  *     candidates: 100          # per-list depth fused by RRF
- *     fusion_weights: { lexical: 1, semantic: 1 }   # hybrid: w/(60+rank) per list (default 1:1)
+ *     fusion_weights: { lexical: 1, semantic: 2 }   # hybrid: w/(60+rank) per list (default 1:2)
  *     embeddings:
  *       provider: bedrock      # bedrock | openai (any OpenAI-compatible /embeddings: OpenAI, Ollama, vLLM)
  *       model: cohere.embed-v4:0

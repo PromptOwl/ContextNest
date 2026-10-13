@@ -326,6 +326,7 @@ export {
   rerankHits,
   buildEmbeddings,
   RRF_K,
+  DEFAULT_FUSION_WEIGHTS,
   type RankedHit,
   type HitScores,
 } from "./semantic/hybrid.js";

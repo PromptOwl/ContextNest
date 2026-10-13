@@ -21,7 +21,7 @@ import {
   type EmbeddingProvider,
   type Reranker,
 } from "../semantic/providers.js";
-import { rrfFuse, RRF_K } from "../semantic/hybrid.js";
+import { rrfFuse, RRF_K, DEFAULT_FUSION_WEIGHTS } from "../semantic/hybrid.js";
 import { EMBEDDINGS_DIR } from "../semantic/embedding-store.js";
 import { createBedrockEmbeddingProvider, createBedrockReranker } from "../semantic/bedrock.js";
 
@@ -219,6 +219,10 @@ describe("reciprocal rank fusion", () => {
     expect(RRF_K).toBe(60);
   });
 
+  it("hybrid defaults to lexical 1 : semantic 2 (dev-set sweep, SciFact + NFCorpus)", () => {
+    expect(DEFAULT_FUSION_WEIGHTS).toEqual({ lexical: 1, semantic: 2 });
+  });
+
   it("Given two lists, Then a doc ranked well in both beats a doc first in only one", () => {
     const fused = rrfFuse([
       ["a", "b", "c"],
@@ -363,6 +367,11 @@ describe("context_embed — governed embedding index", () => {
       expect(typeof r.scores?.rrf).toBe("number");
       expect(r.score).toBe(r.scores!.rrf);
     }
+    // Default weights 1:2: every rrf is Σ w/(61+i) with w ∈ {1, 2}.
+    const top = out.results[0].scores!;
+    const expected = (top.lexical !== undefined ? 1 : 0) + (top.semantic !== undefined ? 2 : 0);
+    expect(top.rrf! * 61).toBeLessThanOrEqual(expected + 1e-9);
+    expect(top.rrf! * 61).toBeGreaterThan(0);
   });
 
   it("hybrid keeps an exact title match as a deterministic top seed", async () => {

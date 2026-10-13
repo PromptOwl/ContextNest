@@ -20,6 +20,18 @@ export const RRF_K = 60;
 export const DEFAULT_CANDIDATES = 100;
 export const DEFAULT_RERANK_TOP_N = 50;
 
+/**
+ * Default hybrid RRF weights: semantic counts double. Chosen on a dev-set
+ * sweep (1:1, 1:1.5, 1:2, 1:3) over BEIR SciFact + NFCorpus with bge-base
+ * dense: SciFact NDCG@10 1:1 0.726 → 1:2 0.747 (dense alone 0.740); NFCorpus
+ * 1:1 = 1:2 = 0.370, with 1:2 best Recall@100. Held-out sets were not used.
+ * Override with `search.fusion_weights`.
+ */
+export const DEFAULT_FUSION_WEIGHTS: Readonly<{ lexical: number; semantic: number }> = Object.freeze({
+  lexical: 1,
+  semantic: 2,
+});
+
 export interface HitScores {
   lexical?: number;
   semantic?: number;
@@ -64,7 +76,7 @@ export interface SemanticSearchOptions {
   candidates?: number;
   fullMatchFirst?: boolean;
   fieldBoosts?: Partial<FieldBoosts>;
-  /** Hybrid RRF weights per list (default 1:1). */
+  /** Hybrid RRF weights per list (default DEFAULT_FUSION_WEIGHTS, 1:2). */
   fusionWeights?: { lexical?: number; semantic?: number };
   maxChars?: number;
   reranker?: Reranker;
@@ -128,8 +140,8 @@ export async function semanticSearch(query: string, opts: SemanticSearchOptions)
       .slice(0, candidates);
     const lexScore = new Map(lexical.map((h) => [h.document.id, h.score]));
     const fused = rrfFuse([lexical.map((h) => h.document.id), vecTop.map((h) => h.id)], RRF_K, [
-      opts.fusionWeights?.lexical ?? 1,
-      opts.fusionWeights?.semantic ?? 1,
+      opts.fusionWeights?.lexical ?? DEFAULT_FUSION_WEIGHTS.lexical,
+      opts.fusionWeights?.semantic ?? DEFAULT_FUSION_WEIGHTS.semantic,
     ]);
     const seeds = exactSeeds(q, published);
     const seedSet = new Set(seeds);

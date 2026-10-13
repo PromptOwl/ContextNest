@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `lexical` (default) | BM25 over title/description/body/tags, English-stemmed (Porter) at index and query time, stopwords dropped. Field boosts default to title 1.25, tags 1.25, description 1, body 1 (`search.field_boosts`). Documents matching every term are pinned first unless `search.full_match_first: false`. | nothing |
 | `semantic` | Cosine similarity between the query embedding and each published document's embedding. | `search.embeddings` + `ctx embed` |
-| `hybrid` | Weighted reciprocal rank fusion (k0 = 60, w/(k0+rank), weights from `search.fusion_weights`, default 1:1) of the lexical and semantic lists (top `candidates` of each, default 100). Exact matches stay deterministic: a document whose title equals the query, or that carries a `#tag` written in the query, is pinned above the fused list. | same as semantic |
+| `hybrid` | Weighted reciprocal rank fusion (k0 = 60, w/(k0+rank), weights from `search.fusion_weights`, default lexical 1 : semantic 2) of the lexical and semantic lists (top `candidates` of each, default 100). Exact matches stay deterministic: a document whose title equals the query, or that carries a `#tag` written in the query, is pinned above the fused list. | same as semantic |
 
 `--rerank` (`rerank: true`) re-scores the top `search.rerank.top_n` (default 50) non-seed hits with the configured reranker. Seeds stay pinned.
 
@@ -19,6 +19,17 @@ The field boosts used to be title 3, tags 2, description 1.5. MiniSearch already
 
 With no `--mode`, search is **lexical**. A vault can opt into a different default with `search.mode`, and that default takes effect only once an index exists. Until `ctx embed` has run, a vault configured for `hybrid` still answers lexically instead of failing. An explicit `--mode semantic|hybrid` with no config or no index is an error that names the fix.
 
+### Why hybrid weights semantic 2:1
+
+Each list adds `w / (60 + rank)`. The default `{ lexical: 1, semantic: 2 }` was chosen by a dev-set sweep of 1:1, 1:1.5, 1:2 and 1:3 on BEIR SciFact and NFCorpus, with bge-base-en-v1.5 as the dense model. The held-out benchmark sets were not touched.
+
+| NDCG@10 | 1:1 | 1:2 | dense only |
+| --- | --- | --- | --- |
+| SciFact | 0.726 | **0.747** | 0.740 |
+| NFCorpus | 0.370 | 0.370 | 0.374 |
+
+At 1:1, fusion fell below dense-only on SciFact, because the lexical list's weaker ranks diluted strong semantic hits. At 1:2, SciFact beats dense-only and NFCorpus is unchanged, with the best Recall@100 (0.342). Vaults with very keyword-heavy content can set `fusion_weights: { lexical: 1, semantic: 1 }`.
+
 ## Configuration (`.context/config.yaml`)
 
 ```yaml
@@ -27,7 +38,7 @@ search:
   full_match_first: true       # lexical all-terms tier (default true)
   field_boosts: { title: 1.25, tags: 1.25, description: 1, body: 1 }   # BM25 per-field boosts (defaults shown)
   candidates: 100              # per-list depth fused by RRF
-  fusion_weights: { lexical: 1, semantic: 1 }   # hybrid: each list adds w/(60+rank); default 1:1
+  fusion_weights: { lexical: 1, semantic: 2 }   # hybrid: each list adds w/(60+rank); default 1:2
   embeddings:
     provider: bedrock          # bedrock | openai (also: openai-compatible, ollama, vllm)
     model: cohere.embed-v4:0   # or amazon.titan-embed-text-v2:0, us.cohere.embed-v4:0, ...
