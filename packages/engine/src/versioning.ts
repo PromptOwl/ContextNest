@@ -111,7 +111,8 @@ export class VersionManager {
       0,
     );
     const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
-    return Math.max(hint, recorded, sealed) + 1;
+    // A hand-edited `version: 1.1` must not mint 2.1: versions are integers.
+    return Math.max(Math.floor(Number(hint)) || 0, recorded, sealed) + 1;
   }
 
   /**
