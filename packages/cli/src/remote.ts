@@ -160,14 +160,9 @@ export async function serverNests(
       // best-effort
     }
   };
+  const cached = readNestCache(baseAlias, spec.url);
   if (!opts.fresh) {
-    let cached: { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean } | undefined;
-    try {
-      cached = JSON.parse(fs.readFileSync(file, "utf-8"));
-    } catch {
-      // no cache yet, or unreadable — ask the server
-    }
-    if (cached?.url === spec.url) {
+    if (cached) {
       const age = Date.now() - cached.at;
       // A failed probe only short-circuits the next probes, not a caller that
       // already holds a live connection (that is proof the server is back).
@@ -188,11 +183,24 @@ export async function serverNests(
   try {
     nests = conn ? await fetchNests(conn) : await withRemote({ alias: baseAlias, spec }, fetchNests);
   } catch (err) {
-    if (!conn) write({ failed: true });
+    // Keep the last good list: a listing can still show it while the server is down.
+    if (!conn) write({ failed: true, ...(cached?.nests ? { nests: cached.nests } : {}) });
     throw err;
   }
   write({ nests });
   return nests;
+}
+
+type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean };
+
+/** The cached probe for this alias and URL; undefined when there is none or it is unreadable. */
+function readNestCache(baseAlias: string, url: string): NestCache | undefined {
+  try {
+    const cached = JSON.parse(fs.readFileSync(nestCachePath(baseAlias), "utf-8")) as NestCache;
+    return cached.url === url ? cached : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** `--vault <server>/<nest>` → the nest id to send. Throws with the choices on a miss. */
@@ -252,6 +260,32 @@ export async function connectTarget(
   target: RemoteTarget,
   lookup: (url: string) => Promise<string | null> = savedTokenFor,
   connect: typeof connectRemoteNest = connectRemoteNest,
+): Promise<RemoteNestConnection> {
+  try {
+    return await connectWithLogin(target, lookup, connect);
+  } catch (err) {
+    throw nestPathHint(target.spec, err);
+  }
+}
+
+/**
+ * A Community nest lives at `/nests/<id>/mcp`; the singular `/nest/<id>/mcp`
+ * 404s and would otherwise read as a bare "unreachable". Name the fix.
+ */
+export function nestPathHint(spec: RemoteNestSpec, err: unknown): unknown {
+  if (!(err instanceof ContextNestError) || err.code !== "REMOTE_UNREACHABLE" || spec.transport !== "http") return err;
+  const fixed = spec.url.replace(/\/nest\/([^/]+)\/mcp\/?$/, "/nests/$1/mcp");
+  if (fixed === spec.url) return err;
+  return new ContextNestError(
+    `${err.message}\n  Nest endpoints are /nests/<id>/mcp (plural) — did you mean ${fixed} ?`,
+    err.code,
+  );
+}
+
+async function connectWithLogin(
+  target: RemoteTarget,
+  lookup: (url: string) => Promise<string | null>,
+  connect: typeof connectRemoteNest,
 ): Promise<RemoteNestConnection> {
   const { spec } = target;
   if (!wantsLoginKey(spec)) return connect(target.alias, spec);
@@ -1077,29 +1111,41 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
   // Probe every server at once: a dead one then costs one timeout per listing,
   // not one per dead server.
   const probes = await Promise.all(
-    vaults.map(async (v): Promise<IndexedNest[] | null> => {
+    vaults.map(async (v): Promise<{ nests: IndexedNest[] | null; note?: string }> => {
       const spec = registry.remotes?.[v.alias];
-      if (v.kind !== "remote" || spec?.transport !== "http") return null;
+      if (v.kind !== "remote" || spec?.transport !== "http") return { nests: null };
       try {
         // An unreachable server costs one probe timeout, then is skipped for
         // NEST_PROBE_BACKOFF_MS (serverNests remembers the failure).
-        return await serverNests(v.alias, {
-          ...spec,
-          timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS),
-        });
-      } catch {
-        return null;
+        return {
+          nests: await serverNests(v.alias, {
+            ...spec,
+            timeout_ms: Math.min(spec.timeout_ms ?? LIST_PROBE_TIMEOUT_MS, LIST_PROBE_TIMEOUT_MS),
+          }),
+        };
+      } catch (err) {
+        // Never drop nests silently: show the last known list, or say why there is none.
+        const stale = readNestCache(v.alias, spec.url)?.nests ?? null;
+        const why =
+          err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED"
+            ? "server refused the key — `ctx login <server>`"
+            : "server didn't answer";
+        return { nests: stale, note: `${why}; ${stale ? "nest list may be out of date" : "nests not listed — try again shortly"}` };
       }
     }),
   );
   const rows: VaultRow[] = [];
   vaults.forEach((v, i) => {
-    const nests = probes[i];
+    const { nests, note } = probes[i];
+    const withNote = (text: string | undefined) => (note ? [text, `(${note})`].filter(Boolean).join(" ") : text);
     if (!nests) {
-      rows.push(v);
+      rows.push(note ? { ...v, description: withNote(v.description) } : v);
       return;
     }
-    rows.push({ ...v, description: v.description || `All ${nests.length} nest(s) on this server — reads span every nest` });
+    rows.push({
+      ...v,
+      description: withNote(v.description || `All ${nests.length} nest(s) on this server — reads span every nest`),
+    });
     const labels = nestLabels(nests);
     for (const n of nests) {
       rows.push({

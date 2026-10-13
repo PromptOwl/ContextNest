@@ -422,6 +422,36 @@ describe("<server>/<nest> targets", () => {
     expect(plainRows).toEqual([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
   });
 
+  it("vault list never drops nests silently: last known list (marked stale) on a failed probe, a note when there is none", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(
+      join(dir, "config.yaml"),
+      "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n  cold:\n    transport: http\n    url: https://cold.example/mcp\n",
+    );
+    const cn = { alias: "cn", kind: "remote", transport: "http", url: "https://cn.example/mcp", isDefault: true } as const;
+    const cold = { alias: "cold", kind: "remote", transport: "http", url: "https://cold.example/mcp", isDefault: false } as const;
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    await expandServerVaults([cn]); // caches cn's nests
+
+    replies = { nest_index: new ContextNestError("timed out", "REMOTE_UNREACHABLE") };
+    const now = Date.now;
+    Date.now = () => now() + NEST_INDEX_TTL_MS + 1; // cache expired, server now silent
+    let rows;
+    try {
+      rows = await expandServerVaults([cn, cold]);
+    } finally {
+      Date.now = now;
+    }
+    expect(rows).toMatchObject([
+      { alias: "cn", description: expect.stringMatching(/All 2 nest.*didn't answer; nest list may be out of date/) },
+      { alias: "cn/strategy" },
+      { alias: "cn/chameleon-collective" },
+      { alias: "cold", description: expect.stringMatching(/didn't answer; nests not listed/) },
+    ]);
+  });
+
   it("the nest-less-write rewrite also matches the server's own prose refusal", async () => {
     advertised = new Set(["context_delete"]);
     replies = { context_delete: new ContextNestError("This tool requires a `nest` argument. Use nest_index to see available nests.", "INTERNAL") };

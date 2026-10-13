@@ -240,6 +240,20 @@ describe("connectTarget", () => {
     expect(connect).toHaveBeenCalledWith("h", spec);
   });
 
+  it("names the plural /nests/ path when a singular /nest/<id>/mcp is unreachable, keeping the exit code", async () => {
+    const unreachable = vi.fn(async () => {
+      throw new ContextNestError('Remote nest "h" is unreachable — {"error":"Not found"}', "REMOTE_UNREACHABLE");
+    });
+    const typo: RemoteNestSpec = { transport: "http", url: `${SERVER}/nest/abc/mcp`, auth: { bearer_env: "K" } };
+    await expect(connectTarget({ alias: "h", spec: typo }, async () => null, unreachable as never)).rejects.toMatchObject({
+      code: "REMOTE_UNREACHABLE",
+      message: expect.stringContaining(`did you mean ${SERVER}/nests/abc/mcp`),
+    });
+    const right: RemoteNestSpec = { transport: "http", url: `${SERVER}/nests/abc/mcp` };
+    const err = await connectTarget({ alias: "h", spec: right }, async () => null, unreachable as never).catch((e) => e);
+    expect((err as Error).message).not.toContain("did you mean");
+  });
+
   it("rewrites an auth failure to point at ctx login", async () => {
     const reject = vi.fn(async () => {
       throw new ContextNestError("rejected — Check that CONTEXTNEST_LOGIN_TOKEN is exported", "REMOTE_AUTH_FAILED");
