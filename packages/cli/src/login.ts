@@ -19,8 +19,8 @@ const DEFAULT_EXPIRES_S = 600;
 const MAX_POLL_RETRIES = 5;
 /** The server's key-label length cap. */
 const MAX_KEY_LABEL = 60;
-/** Labels tried ("<label>", "<label> #2", …) before a duplicate-label 409 is reported. */
-const MAX_LABEL_TRIES = 20;
+/** C0/C1 control characters: a server-supplied value carrying one could drive terminal escapes. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 
 export interface DeviceLoginIO {
   fetch?: typeof fetch;
@@ -90,6 +90,16 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
   if (!start.deviceCode || !start.clientSecret || !start.verificationUrl) {
     throw new LoginError("Server returned an incomplete device-login response.");
   }
+  // Both are printed, and the URL opened in a browser: http(s) only, no control
+  // characters. Not same-origin — approval may live on the PromptOwl site.
+  if (
+    !/^https?:\/\//i.test(start.verificationUrl) ||
+    !URL.canParse(start.verificationUrl) ||
+    CONTROL_CHARS.test(start.verificationUrl) ||
+    CONTROL_CHARS.test(start.userCode ?? "")
+  ) {
+    throw new LoginError("Server returned an unsafe verification link; not opening it.");
+  }
   io.prompt?.(start.verificationUrl, start.userCode);
 
   const intervalMs = Math.max(1, start.interval ?? DEFAULT_POLL_INTERVAL_S) * 1000;
@@ -137,18 +147,27 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
   if (!cookie) throw new LoginError("Server did not return a session cookie.");
   const ex = (await exRes.json().catch(() => ({}))) as { user?: { email?: string } };
 
-  // Labels are unique per account (409 on a repeat) and capped in length, so a
-  // second login from this machine mints "<label> #2", then "#3", …
-  for (let n = 1; ; n++) {
-    const suffix = n === 1 ? "" : ` #${n}`;
-    const label = keyLabel.slice(0, MAX_KEY_LABEL - suffix.length) + suffix;
-    const mintRes = await postJson("/auth/keys", { label }, { Cookie: cookie });
-    if (mintRes.status === 409 && n < MAX_LABEL_TRIES) continue;
-    if (!mintRes.ok) throw new LoginError(`Could not create an API key (${await errorText(mintRes)}).`);
-    const minted = (await mintRes.json().catch(() => ({}))) as { api_key?: string };
-    if (!minted.api_key) throw new LoginError("Server did not return an API key.");
-    return { token: minted.api_key, keyLabel: label, ...(ex.user?.email ? { email: ex.user.email } : {}) };
+  const mint = (label: string) => postJson("/auth/keys", { label }, { Cookie: cookie });
+  let label = keyLabel.slice(0, MAX_KEY_LABEL);
+  let mintRes = await mint(label);
+  if (mintRes.status === 409) {
+    // Labels are unique per account, so a repeat login from this machine takes
+    // the first free "<label> #2", "#3", … A 409 for any other reason (the
+    // per-account key limit) is reported as the server worded it.
+    const listRes = await call("/auth/keys", { headers: { Cookie: cookie } });
+    const list = (listRes.ok ? await listRes.json().catch(() => ({})) : {}) as { keys?: { label?: string | null }[] };
+    const taken = new Set((list.keys ?? []).map((k) => (k.label ?? "").trim().toLowerCase()));
+    if (taken.has(label.toLowerCase())) {
+      for (let n = 2; taken.has(label.toLowerCase()); n++) {
+        label = `${keyLabel.slice(0, MAX_KEY_LABEL - ` #${n}`.length)} #${n}`;
+      }
+      mintRes = await mint(label);
+    }
   }
+  if (!mintRes.ok) throw new LoginError(`Could not create an API key (${await errorText(mintRes)}).`);
+  const minted = (await mintRes.json().catch(() => ({}))) as { api_key?: string };
+  if (!minted.api_key) throw new LoginError("Server did not return an API key.");
+  return { token: minted.api_key, keyLabel: label, ...(ex.user?.email ? { email: ex.user.email } : {}) };
 }
 
 /**

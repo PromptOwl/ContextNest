@@ -14,7 +14,12 @@
  * `ctx login` runs finishing at the same instant can drop one entry (re-run
  * it). Logins are interactive and rare, so a lock isn't worth its failure modes.
  */
-import { CredentialStore, CredentialStoreError, type CredentialStoreOptions } from "./credentials.js";
+import {
+  CredentialStore,
+  CredentialStoreError,
+  NO_SECURE_STORE_HELP,
+  type CredentialStoreOptions,
+} from "./credentials.js";
 
 /** Secure-store account the server map lives under. */
 export const SERVERS_ACCOUNT = "contextnest-servers";
@@ -182,6 +187,17 @@ const UNREADABLE_MAP =
 /** The saved server map; empty when nothing is stored. Store errors propagate. */
 export async function loadServerMap(opts: CredentialStoreOptions = {}): Promise<ServerMap> {
   return parseServerMap(await new CredentialStore(opts).get(SERVERS_ACCOUNT));
+}
+
+/**
+ * Throws when a login could not be saved — no secure store, or a saved map that
+ * can't be read — so `ctx login` fails before the server mints a key, not after.
+ */
+export async function assertServerMapWritable(opts: CredentialStoreOptions = {}): Promise<void> {
+  if ((await new CredentialStore(opts).describe()).kind === "none") {
+    throw new CredentialStoreError(NO_SECURE_STORE_HELP);
+  }
+  await loadServerMap(opts);
 }
 
 /** Persist the map securely. Returns where it went (e.g. "macOS Keychain"). */

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { KeyringBackend } from "../keyring.js";
 import {
   SERVERS_ACCOUNT,
+  assertServerMapWritable,
   emptyServerMap,
   isNestScope,
   keysUnderServer,
@@ -63,6 +64,9 @@ describe("server map (pure)", () => {
     expect(tokenForEndpoint(m, "https://nest.example.com.evil.io/mcp")).toBeNull();
     expect(tokenForEndpoint(m, "http://nest.example.com/mcp")).toBeNull();
     expect(tokenForEndpoint(m, "garbage")).toBeNull();
+    // Nor the other way: a key saved for plaintext http never reaches the https origin, or vice versa.
+    const plain = upsertServer(emptyServerMap(), "http://h.example", { token: "plain" });
+    expect(tokenForEndpoint(plain, "https://h.example/mcp")).toBeNull();
   });
 
   it("parses defensively, but refuses corrupt or newer-format data instead of emptying it", () => {
@@ -151,6 +155,14 @@ describe("server map (secure store)", () => {
     for (const bad of [{}, { CONTEXTNEST_CREDENTIALS_KEY: "wrong" }]) {
       await expect(savedTokenFor(A, { home, env: bad, keyring: null })).rejects.toThrow(/couldn't be read/);
     }
+  });
+
+  it("the pre-login check fails on no secure store or an unreadable map, and passes on an empty store", async () => {
+    await expect(assertServerMapWritable({ home, env: {}, keyring: null })).rejects.toThrow(/nowhere safe/);
+    const corrupt = memoryKeyring();
+    corrupt.items.set(SERVERS_ACCOUNT, "{corrupt");
+    await expect(assertServerMapWritable({ home, env: {}, keyring: corrupt })).rejects.toThrow(/unreadable/);
+    await expect(assertServerMapWritable({ home, env: {}, keyring: memoryKeyring() })).resolves.toBeUndefined();
   });
 
   it("a corrupt stored map fails loudly and is never overwritten by a lookup", async () => {

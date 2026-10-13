@@ -115,18 +115,31 @@ describe("deviceLogin", () => {
     expect(sleeps).toEqual([5000, 5000, 5000]);
   });
 
-  it("a repeat login from the same machine mints '<label> #2' instead of failing on the duplicate label", async () => {
-    const taken = { status: 409, body: { error: 'You already have a key named "ctx CLI (box)".' } };
+  it("a repeat login from the same machine mints the first free '<label> #N' instead of failing", async () => {
+    const dup = { status: 409, body: { error: 'You already have a key named "ctx CLI (box)".' } };
+    const list = { body: { keys: [{ label: "ctx CLI (box)" }, { label: "CTX CLI (box) #2 " }, { label: "other" }] } };
     const f = scriptedFetch({
       "/auth/device": [START],
       "/auth/device/poll": [APPROVED],
       "/auth/promptowl": [EXCHANGE],
-      "/auth/keys": [taken, MINT],
+      "/auth/keys": [dup, list, MINT],
     });
     const res = await deviceLogin(SERVER, io(f));
-    expect(res).toMatchObject({ token: "cnst_minted", keyLabel: "ctx CLI (box) #2" });
-    const labels = f.calls.filter((c) => c.path === "/auth/keys").map((c) => JSON.parse(String(c.init.body)).label);
-    expect(labels).toEqual(["ctx CLI (box)", "ctx CLI (box) #2"]);
+    expect(res).toMatchObject({ token: "cnst_minted", keyLabel: "ctx CLI (box) #3" });
+    const minted = f.calls.filter((c) => c.path === "/auth/keys" && c.init.method === "POST");
+    expect(minted.map((c) => JSON.parse(String(c.init.body)).label)).toEqual(["ctx CLI (box)", "ctx CLI (box) #3"]);
+  });
+
+  it("reports a 409 that isn't a taken label (the key limit) as the server worded it, without retrying", async () => {
+    const limit = { status: 409, body: { error: "You already have 25 API keys. Revoke one before creating another." } };
+    const f = scriptedFetch({
+      "/auth/device": [START],
+      "/auth/device/poll": [APPROVED],
+      "/auth/promptowl": [EXCHANGE],
+      "/auth/keys": [limit, { body: { keys: [{ label: "something else" }] } }],
+    });
+    await expect(deviceLogin(SERVER, io(f))).rejects.toThrow(/409: You already have 25 API keys/);
+    expect(f.calls.filter((c) => c.path === "/auth/keys" && c.init.method === "POST")).toHaveLength(1);
   });
 
   it("keeps the key label within the server's 60-character cap, suffix included", async () => {
@@ -135,11 +148,25 @@ describe("deviceLogin", () => {
       "/auth/device": [START],
       "/auth/device/poll": [APPROVED],
       "/auth/promptowl": [EXCHANGE],
-      "/auth/keys": [{ status: 409, body: {} }, MINT],
+      "/auth/keys": [{ status: 409, body: {} }, { body: { keys: [{ label: long.slice(0, 60) }] } }, MINT],
     });
     const { keyLabel } = await deviceLogin(SERVER, io(f, { deviceName: long }));
     expect(keyLabel.length).toBe(60);
     expect(keyLabel.endsWith(" #2")).toBe(true);
+  });
+
+  it("refuses to show or open a verification link that isn't plain http(s)", async () => {
+    for (const bad of [
+      { verificationUrl: "file:///etc/passwd" },
+      { verificationUrl: "javascript:alert(1)" },
+      { verificationUrl: "https://po.example/]8;;evil" },
+      { userCode: "AB[2J" },
+    ]) {
+      const prompt = vi.fn();
+      const f = scriptedFetch({ "/auth/device": [{ body: { ...START.body, ...bad } }] });
+      await expect(deviceLogin(SERVER, io(f, { prompt }))).rejects.toThrow(/unsafe verification link/);
+      expect(prompt).not.toHaveBeenCalled();
+    }
   });
 
   it("fails clearly when the exchange sets no session cookie or the mint returns no key", async () => {

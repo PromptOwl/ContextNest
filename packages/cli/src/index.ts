@@ -137,6 +137,7 @@ import { loadCloudToken } from "./credentials.js";
 import {
   emptyServerMap,
   isNestScope,
+  assertServerMapWritable,
   keyForEndpoint,
   keysUnderServer,
   loadServerMap,
@@ -147,6 +148,7 @@ import {
   savedTokenFor,
   upsertServer,
   type ServerCredential,
+  type ServerMap,
 } from "./server-credentials.js";
 import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
@@ -3467,10 +3469,12 @@ async function readStdin(): Promise<string> {
     return Buffer.concat(chunks).toString("utf-8");
   }
   process.stderr.write(chalk.dim("Paste the key and press Enter — it stays hidden. Ctrl-C to cancel.\n> "));
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let key = "";
     const finish = () => {
       stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.off("error", onError);
       stdin.setRawMode(false);
       stdin.pause();
       process.stderr.write("\n");
@@ -3482,7 +3486,11 @@ async function readStdin(): Promise<string> {
           console.error(chalk.yellow("Cancelled — nothing was saved."));
           process.exit(130);
         } else if (ch === "\r" || ch === "\n") {
-          if (key.trim()) return finish(), resolve(key);
+          if (key.trim()) {
+            finish();
+            resolve(key);
+            return;
+          }
           process.stderr.write(chalk.dim("\nNothing pasted yet — paste the key and press Enter, or Ctrl-C to cancel.\n> "));
         } else if (ch === "\u007f" || ch === "\b") {
           key = key.slice(0, -1);
@@ -3491,10 +3499,18 @@ async function readStdin(): Promise<string> {
         }
       }
     };
+    // A terminal that closes or errors mid-prompt must not leave login hanging.
+    const onError = (err: Error) => {
+      finish();
+      reject(err);
+    };
+    const onEnd = () => onError(new Error("Input closed before a key was pasted."));
     stdin.setEncoding("utf-8");
     stdin.setRawMode(true);
     stdin.resume();
     stdin.on("data", onData);
+    stdin.once("end", onEnd);
+    stdin.once("error", onError);
   });
 }
 
@@ -3546,8 +3562,11 @@ program
           throw new Error(`"${opts.as}" is already a registered vault — pick another alias, or pass --force to replace a remote.`);
         }
       }
+      // Fail on an unusable store now, before the server mints a key.
+      await assertServerMapWritable();
       let token: string | undefined;
       let label = opts.label;
+      let mintedLabel: string | undefined;
       if (!opts.keyStdin) {
         try {
           const res = await deviceLogin(url, {
@@ -3560,6 +3579,7 @@ program
             },
           });
           token = res.token;
+          mintedLabel = res.keyLabel;
           label ??= res.email ? `${res.email} · key "${res.keyLabel}"` : `key "${res.keyLabel}"`;
         } catch (err) {
           // No browser login on this server: on a terminal, take a pasted key instead.
@@ -3570,12 +3590,21 @@ program
       token ??= parsePastedKey(await readStdin());
       // The OS keyring can take a second or two (Windows starts PowerShell).
       console.log(chalk.dim("  Saving the key to the secure store…"));
-      const map = upsertServer(await loadServerMap(), url, {
-        token,
-        ...(label ? { label } : {}),
-        updatedAt: new Date().toISOString(),
-      });
-      const where = await saveServerMap(map);
+      let map: ServerMap;
+      let where: string;
+      try {
+        map = upsertServer(await loadServerMap(), url, {
+          token,
+          ...(label ? { label } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+        where = await saveServerMap(map);
+      } catch (err) {
+        if (!mintedLabel) throw err;
+        throw new Error(
+          `${(err as Error).message}\n  The server already created key "${mintedLabel}" — revoke it in its web UI.`,
+        );
+      }
       console.log(
         chalk.green(`\nLogged in to ${url}${label ? ` (${label})` : ""}.`) +
           (opts.nest ? chalk.dim("  (this nest only)") : map.default === url ? chalk.dim("  (default)") : ""),
@@ -3730,6 +3759,9 @@ program
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
+    // Refuse to put documents and a bearer token on the wire in the clear —
+    // checked first, so a refused URL never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
     let apiKey: string | null;
     try {
       apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
@@ -3743,8 +3775,6 @@ program
       );
       process.exit(1);
     }
-    // Refuse to put documents and a bearer token on the wire in the clear.
-    assertSafeEndpoint(opts.server, "--server");
 
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
