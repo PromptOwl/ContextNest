@@ -137,8 +137,10 @@ import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
 import {
+  accountKey,
   emptyServerMap,
   isNestScope,
+  splitAccountKey,
   assertServerMapWritable,
   keyForEndpoint,
   keysUnderServer,
@@ -3529,17 +3531,31 @@ program
   .option("--key-stdin", "Read an existing API key (cnst_…) from stdin instead of the browser flow")
   .option("--nest <id>", "Save the key for this one nest only (with --key-stdin); it wins over the server-wide key")
   .option("--label <text>", "Label for this credential (default: your account email)")
+  .option("--account <name>", "Save the key under a named account, to sign in to the same server as someone else too")
   .option("--list", "Show the servers and nests you're logged into (never prints keys)")
   .option("--as <alias>", "Also register the server (all its nests), or the --nest, as a remote vault alias")
   .option("--set-default", "With --as: make that alias the default vault")
   .action(async (
     server: string | undefined,
-    opts: { keyStdin?: boolean; nest?: string; label?: string; list?: boolean; as?: string; setDefault?: boolean },
+    opts: {
+      keyStdin?: boolean;
+      nest?: string;
+      label?: string;
+      account?: string;
+      list?: boolean;
+      as?: string;
+      setDefault?: boolean;
+    },
   ) => {
     try {
       if (opts.list) {
         const map = await loadServerMap();
-        const keys = (server ? keysUnderServer(map, server) : Object.keys(map.servers)).sort();
+        const all = Object.keys(map.servers);
+        // Every account's keys for the server.
+        const keys = (server
+          ? all.filter((k) => keysUnderServer(map, server, splitAccountKey(k).account).includes(k))
+          : all
+        ).sort();
         if (keys.length === 0) {
           console.log(chalk.yellow(server ? `No saved key for ${normalizeServerUrl(server)}.` : "Not logged in to any server."));
           return;
@@ -3563,6 +3579,9 @@ program
       }
       const serverUrl = normalizeServerUrl(server);
       const url = opts.nest ? nestScopeUrl(serverUrl, opts.nest) : serverUrl;
+      accountKey(url, opts.account); // a bad --account fails before signing in
+      const accountNote = opts.account ? ` (account "${opts.account}")` : "";
+      const accountFlag = opts.account ? ` --account ${opts.account}` : "";
       if (opts.setDefault && !opts.as) throw new Error("--set-default goes with --as <alias>.");
       // Check the alias before signing in, not after a key has been minted.
       if (opts.as) {
@@ -3573,7 +3592,11 @@ program
       }
       // Registered with no auth, so the alias borrows the key — the key never enters the registry.
       // Confirmed before signing in, so declining never leaves a saved key without its alias.
-      const aliasSpec: RemoteNestSpec = { transport: "http", url: `${url}/mcp` };
+      const aliasSpec: RemoteNestSpec = {
+        transport: "http",
+        url: `${url}/mcp`,
+        ...(opts.account ? { account: opts.account } : {}),
+      };
       if (opts.as) {
         await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
       }
@@ -3617,11 +3640,12 @@ program
       let map: ServerMap;
       let where: string;
       try {
-        map = upsertServer(await loadServerMap(), url, {
-          token,
-          ...(label ? { label } : {}),
-          updatedAt: new Date().toISOString(),
-        });
+        map = upsertServer(
+          await loadServerMap(),
+          url,
+          { token, ...(label ? { label } : {}), updatedAt: new Date().toISOString() },
+          opts.account,
+        );
         where = await saveServerMap(map);
       } catch (err) {
         if (!mintedLabel) throw err;
@@ -3630,7 +3654,7 @@ program
         );
       }
       console.log(
-        chalk.green(`\nLogged in to ${url}${label ? ` (${label})` : ""}.`) +
+        chalk.green(`\nLogged in to ${url}${accountNote}${label ? ` (${label})` : ""}.`) +
           (opts.nest ? chalk.dim("  (this nest only)") : map.default === url ? chalk.dim("  (default)") : ""),
       );
       console.log(chalk.dim(`  Key saved to ${where}.`));
@@ -3640,7 +3664,7 @@ program
           reg = addRemote(opts.as, aliasSpec, { setDefault: opts.setDefault, force: isForce() });
         } catch (err) {
           throw new Error(
-            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${opts.as} --url ${aliasSpec.url}`,
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${opts.as} --url ${aliasSpec.url}${accountFlag}`,
           );
         }
         console.log(
@@ -3655,13 +3679,16 @@ program
         );
         return;
       }
-      // A nest-scoped key only matches its own nest's URL, so it gets just that line.
+      // A nest-scoped key reaches only its own nest, directly or as <alias>/<nest> behind a server alias.
       const next = opts.nest
-        ? [`This nest:  ctx vault add <alias> --url ${url}/mcp`]
+        ? [
+            `This nest:  ctx vault add <alias> --url ${url}/mcp${accountFlag}`,
+            `            or, with a server alias, --vault <alias>/<nest>`,
+          ]
         : [
-            `All nests:  ctx vault add <alias> --url ${url}/mcp`,
+            `All nests:  ctx vault add <alias> --url ${serverUrl}/mcp${accountFlag}`,
             `            then \`ctx vault list\` shows each one as <alias>/<nest>; use --vault <alias>/<nest> for one`,
-            `One nest:   ctx vault add <alias> --url ${url}/nests/<id>/mcp`,
+            `One nest:   ctx vault add <alias> --url ${serverUrl}/nests/<id>/mcp${accountFlag}`,
           ];
       console.log(chalk.dim(`\n  Next — connect with this key (no --bearer-env needed):`));
       for (const line of next) console.log(chalk.dim(`    ${line}`));
@@ -3677,11 +3704,15 @@ program
     "Forget keys saved by `ctx login` for a server URL or a remote alias, including that server's nest-scoped keys (they stay valid on the server — revoke them in the web UI)",
   )
   .option("--nest <id>", "Forget only the key saved for this nest")
+  .option("--account <name>", "Forget the keys of this named account (default: the unnamed one)")
   .option("--all", "Forget every saved server key")
-  .action(async (server: string | undefined, opts: { nest?: string; all?: boolean }) => {
+  .action(async (server: string | undefined, opts: { nest?: string; account?: string; all?: boolean }) => {
     try {
+      let account = opts.account;
       if (opts.all) {
-        if (server || opts.nest) throw new Error("--all forgets every server; drop the <server> / --nest.");
+        if (server || opts.nest || account) {
+          throw new Error("--all forgets every server; drop the <server> / --nest / --account.");
+        }
         // Don't parse first: --all is the way out of a corrupt or newer-format map.
         let forgotten: [string, ServerCredential][] = [];
         try {
@@ -3703,16 +3734,17 @@ program
         // A remote alias: forget the saved key it signs in with (and, if server-wide, that server's nest keys).
         const spec = readRegistry().remotes?.[server];
         if (spec?.transport !== "http") throw new Error(`"${server}" is neither a server URL nor a registered HTTP remote alias.`);
-        const key = keyForEndpoint(map, spec.url);
+        const key = keyForEndpoint(map, spec.url, account ?? spec.account);
         if (!key) {
           console.log(chalk.yellow(`No saved key is used by "${server}" (${spec.url}).`));
           return;
         }
-        server = key;
+        ({ scope: server, account } = splitAccountKey(key));
       }
-      const targets = opts.nest ? [nestScopeUrl(server, opts.nest)].filter((k) => map.servers[k]) : keysUnderServer(map, server);
+      const wanted = accountKey(opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server), account);
+      const targets = opts.nest ? [wanted].filter((k) => map.servers[k]) : keysUnderServer(map, server, account);
       if (targets.length === 0) {
-        console.log(chalk.yellow(`No saved key for ${opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server)}.`));
+        console.log(chalk.yellow(`No saved key for ${wanted}.`));
         return;
       }
       const forgotten = targets.map((k) => [k, map.servers[k]] as const);
@@ -4627,6 +4659,7 @@ vaultCmd
   // No local --force: the global one (see the root command) covers it.
   .option("--url <url>", "Register a REMOTE nest at this MCP endpoint (streamable HTTP)")
   .option("--bearer-env <var>", "Env var holding the bearer token for --url (stored as a reference, never the value)")
+  .option("--account <name>", "With --url: sign in with the keys `ctx login --account <name>` saved")
   .option("--mcp-command <cmd>", "Register a REMOTE nest served by this stdio MCP command")
   .option(
     "--mcp-arg <arg>",
@@ -4646,11 +4679,16 @@ vaultCmd
           console.log(chalk.red("A remote nest takes no path argument."));
           process.exit(1);
         }
+        if (opts.account && (!opts.url || opts.bearerEnv)) {
+          console.log(chalk.red("--account goes with --url and no --bearer-env (it picks a `ctx login` account)."));
+          process.exit(1);
+        }
         const spec: RemoteNestSpec = opts.url
           ? {
               transport: "http",
               url: opts.url,
               ...(opts.bearerEnv ? { auth: { bearer_env: opts.bearerEnv } } : {}),
+              ...(opts.account ? { account: opts.account } : {}),
               ...(opts.description ? { description: opts.description } : {}),
             }
           : {

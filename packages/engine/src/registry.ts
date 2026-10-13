@@ -132,6 +132,7 @@ const remoteNestSpecSchema = z
       transport: z.literal("http"),
       url: z.string().min(1),
       auth: remoteAuthSchema.optional(),
+      account: z.string().min(1).optional(),
       description: z.string().optional(),
       timeout_ms: z.number().int().positive().optional(),
     }),

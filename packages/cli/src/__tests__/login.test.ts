@@ -231,6 +231,17 @@ describe("connectTarget", () => {
     expect(env[LOGIN_TOKEN_ENV]).toBe("cnst_saved");
   });
 
+  it("looks up the named nest's key, under the alias's account, for a server alias naming one nest", async () => {
+    const connect = vi.fn(async () => conn);
+    const lookup = vi.fn(async () => "cnst_nest");
+    await connectTarget({ alias: "h/n", spec: { ...http, account: "client" }, nest: "n" }, lookup, connect as never, "id/1");
+    expect(lookup).toHaveBeenCalledWith(`${SERVER}/nests/id%2F1`, "client");
+    const [, spec, env] = connect.mock.calls[0] as unknown as [string, RemoteNestSpec, Record<string, string>];
+    // The server endpoint, not the nest's own: the server limits the key to its nest.
+    expect(spec).toMatchObject({ url: `${SERVER}/mcp` });
+    expect(env[LOGIN_TOKEN_ENV]).toBe("cnst_nest");
+  });
+
   it("leaves explicit registry auth alone and never reads the store for it", async () => {
     const connect = vi.fn(async () => conn);
     const lookup = vi.fn(async () => "cnst_saved");
@@ -281,7 +292,11 @@ describe("connectTarget", () => {
     // Nothing saved and the server wants a key: point at ctx login.
     await expect(connectTarget({ alias: "h", spec: http }, async () => null, reject as never)).rejects.toMatchObject({
       code: "REMOTE_AUTH_FAILED",
-      message: expect.stringMatching(/ctx login <server>/),
+      message: expect.stringMatching(/ctx login <server>.*--vault h\/<nest>/),
     });
+    // A single-nest endpoint has no /<nest> to name.
+    const one: RemoteNestSpec = { transport: "http", url: `${SERVER}/nests/abc/mcp` };
+    const err = await connectTarget({ alias: "h", spec: one }, async () => null, reject as never).catch((e) => e);
+    expect((err as Error).message).not.toContain("--vault h/<nest>");
   });
 });

@@ -28,20 +28,28 @@ let calls: Array<{ op: string; input: Record<string, unknown> }> = [];
 let opened = 0;
 let closed = 0;
 
+/** `nest_index` answer per saved key, for a server that limits each key to its nests. */
+let nestsByToken: Record<string, unknown> = {};
+/** The saved key each run() went out with (undefined: none). */
+let callTokens: Array<string | undefined> = [];
+
 vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@promptowl/contextnest-engine")>();
   return {
     ...actual,
-    connectRemoteNest: async () => {
+    connectRemoteNest: async (_alias: string, _spec: unknown, env?: Record<string, string>) => {
       opened += 1;
+      const token = env?.CONTEXTNEST_LOGIN_TOKEN;
       return {
         toolNames: async () => advertised as ReadonlySet<string>,
         run: async (op: string, input: Record<string, unknown>) => {
           calls.push({ op, input });
+          callTokens.push(token);
           if (!advertised.has(op)) {
             throw new ContextNestError(`Tool ${op} not found`, "INTERNAL");
           }
           if (replies[op] instanceof Error) throw replies[op];
+          if (op === "nest_index" && token && nestsByToken[token]) return nestsByToken[token];
           return replies[op];
         },
         close: async () => {
@@ -51,6 +59,21 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
     },
   };
 });
+
+/** What `ctx login` "saved" — in memory, never the real secure store. */
+let savedMap: import("../server-credentials.js").ServerMap;
+
+vi.mock("../server-credentials.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../server-credentials.js")>();
+  return {
+    ...actual,
+    savedTokenFor: async (url: string, _opts: unknown, account?: string) =>
+      actual.tokenForEndpoint(savedMap, url, account),
+    savedTokensForServer: async (url: string, account?: string) =>
+      actual.tokensForServerEndpoint(savedMap, url, account),
+  };
+});
+const { emptyServerMap, upsertServer, nestScopeUrl } = await import("../server-credentials.js");
 
 const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, remoteQuery, nestLabels, serverNests, expandServerVaults, remoteRead, NEST_INDEX_TTL_MS, NEST_PROBE_BACKOFF_MS } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
@@ -67,6 +90,9 @@ beforeEach(() => {
   advertised = new Set();
   replies = {};
   calls = [];
+  nestsByToken = {};
+  callTokens = [];
+  savedMap = emptyServerMap();
   opened = 0;
   closed = 0;
   out = [];
@@ -390,6 +416,34 @@ describe("<server>/<nest> targets", () => {
       Date.now = now;
     }
     expect(fetches()).toBe(3); // expired
+  });
+
+  it("reaches a nest through the server alias with only that nest's key saved, and signs in with it", async () => {
+    const [strategy, chameleon] = nests;
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", strategy.id), { token: "cnst_strategy" });
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", chameleon.id), { token: "cnst_chameleon" });
+    advertised = new Set(["nest_index", "context_delete"]);
+    // Each nest-scoped key sees only its own nest.
+    nestsByToken = { cnst_strategy: { nests: [strategy] }, cnst_chameleon: { nests: [chameleon] } };
+    replies = { context_delete: { id: "nodes/a", deleted: true } };
+
+    expect(await serverNests("cn", server.spec)).toEqual(nests);
+    await remoteDelete({ ...server, alias: "cn/chameleon-collective", nest: "chameleon-collective" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: chameleon.id } });
+    expect(callTokens.at(-1)).toBe("cnst_chameleon");
+    expect(closed).toBe(opened);
+  });
+
+  it("uses the server-wide key for a nest with no key of its own, and the alias's account", async () => {
+    savedMap = upsertServer(savedMap, "https://cn.example", { token: "cnst_me" });
+    savedMap = upsertServer(savedMap, "https://cn.example", { token: "cnst_client" }, "client");
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests }, context_delete: { id: "nodes/a", deleted: true } };
+    await remoteDelete({ ...server, alias: "cn/strategy", nest: "strategy" }, "nodes/a");
+    expect(callTokens.at(-1)).toBe("cnst_me");
+    const client = { ...server.spec, account: "client" } as RemoteNestSpec;
+    await remoteDelete({ alias: "cn/strategy", spec: client, nest: "strategy" }, "nodes/a");
+    expect(callTokens.at(-1)).toBe("cnst_client");
   });
 
   it("serverNests returns null for a single-nest endpoint (no nest_index)", async () => {
