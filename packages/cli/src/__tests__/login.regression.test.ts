@@ -156,6 +156,19 @@ describe("ctx login / logout (regression)", () => {
     expect(ctx(["logout", "nope"]).stderr).toContain("neither a server URL nor a registered HTTP remote alias");
   });
 
+  it("logout <server alias> with only nest keys saved forgets those nest keys", () => {
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin"], KEY_NEST).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--nest", "n2", "--key-stdin"], KEY_SELF).status).toBe(0);
+    expect(ctx(["login", SELF, "--key-stdin"], KEY_HOSTED).status).toBe(0);
+    expect(ctx(["vault", "add", "po", "--url", `${HOSTED}/mcp`, "--yes"]).status).toBe(0);
+    const out = ctx(["logout", "po"]).stdout;
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n1.`);
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n2.`);
+    const list = ctx(["login", "--list"]).stdout;
+    expect(list).not.toContain(HOSTED);
+    expect(list).toContain(SELF);
+  });
+
   it("--account keeps a second account's keys apart: login, --list, vault add, logout <alias> and --account", () => {
     const registry = () => readFileSync(join(home, ".contextnest", "config.yaml"), "utf-8");
     expect(ctx(["login", HOSTED, "--key-stdin"], KEY_HOSTED).status).toBe(0);

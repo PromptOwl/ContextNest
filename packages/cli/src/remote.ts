@@ -130,6 +130,11 @@ function nestCachePath(baseAlias: string): string {
   return pathMod.join(getRegistryDir(), "cache", `nests-${baseAlias}.json`);
 }
 
+/** What a cached nest list was fetched for: the URL, and the account whose keys saw it. */
+function nestCacheUrl(spec: Extract<RemoteNestSpec, { transport: "http" }>): string {
+  return spec.account ? `${spec.url}#${spec.account}` : spec.url;
+}
+
 /**
  * How long a failed nest-list probe is remembered. The plugin lists vaults on
  * every prompt; without this, an offline server costs a full timeout (or three,
@@ -156,12 +161,12 @@ export async function serverNests(
   const write = (entry: object) => {
     try {
       fs.mkdirSync(pathMod.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: spec.url, ...entry }));
+      fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: nestCacheUrl(spec), ...entry }));
     } catch {
       // best-effort
     }
   };
-  const cached = readNestCache(baseAlias, spec.url);
+  const cached = readNestCache(baseAlias, nestCacheUrl(spec));
   if (!opts.fresh) {
     if (cached) {
       const age = Date.now() - cached.at;
@@ -354,8 +359,10 @@ async function connectWithLogin(
       if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
         if (storeError) throw new ContextNestError(storeError.message, "CONFIG_ERROR");
         // A key saved for one nest signs in only as `<alias>/<nest>`, never for the whole server.
-        const oneNest = nestId || /\/nests\/[^/]+\/mcp\/?$/.test(spec.url) ? "" : ` A key saved for one nest works as --vault ${target.alias}/<nest>.`;
-        throw new ContextNestError(`${err.message} Or sign in once: \`ctx login <server>\`.${oneNest}`, err.code);
+        const serverAlias = !nestId && !/\/nests\/[^/]+\/mcp\/?$/.test(spec.url);
+        let message = `${err.message} Or sign in once: \`ctx login <server>\`.`;
+        if (serverAlias) message += ` A key saved for one nest works as --vault ${target.alias}/<nest>.`;
+        throw new ContextNestError(message, err.code);
       }
       throw err;
     }
@@ -1186,7 +1193,7 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
         };
       } catch (err) {
         // Never drop nests silently: show the last known list, or say why there is none.
-        const stale = readNestCache(v.alias, spec.url)?.nests ?? null;
+        const stale = readNestCache(v.alias, nestCacheUrl(spec))?.nests ?? null;
         const why =
           err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED"
             ? "server refused the key — `ctx login <server>`"

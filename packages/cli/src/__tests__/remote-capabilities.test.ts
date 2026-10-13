@@ -32,14 +32,19 @@ let closed = 0;
 let nestsByToken: Record<string, unknown> = {};
 /** The saved key each run() went out with (undefined: none). */
 let callTokens: Array<string | undefined> = [];
+/** Saved keys the fake server refuses at connect. */
+let revokedTokens = new Set<string>();
 
 vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@promptowl/contextnest-engine")>();
   return {
     ...actual,
     connectRemoteNest: async (_alias: string, _spec: unknown, env?: Record<string, string>) => {
-      opened += 1;
       const token = env?.CONTEXTNEST_LOGIN_TOKEN;
+      if (token && revokedTokens.has(token)) {
+        throw new ContextNestError(`rejected ${token}`, "REMOTE_AUTH_FAILED");
+      }
+      opened += 1;
       return {
         toolNames: async () => advertised as ReadonlySet<string>,
         run: async (op: string, input: Record<string, unknown>) => {
@@ -92,6 +97,7 @@ beforeEach(() => {
   calls = [];
   nestsByToken = {};
   callTokens = [];
+  revokedTokens = new Set();
   savedMap = emptyServerMap();
   opened = 0;
   closed = 0;
@@ -432,6 +438,30 @@ describe("<server>/<nest> targets", () => {
     expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: chameleon.id } });
     expect(callTokens.at(-1)).toBe("cnst_chameleon");
     expect(closed).toBe(opened);
+  });
+
+  it("lists the nests the working keys see when one is revoked; fails only when every key does", async () => {
+    const [strategy, chameleon] = nests;
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", strategy.id), { token: "cnst_strategy" });
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", chameleon.id), { token: "cnst_chameleon" });
+    advertised = new Set(["nest_index"]);
+    nestsByToken = { cnst_strategy: { nests: [strategy] }, cnst_chameleon: { nests: [chameleon] } };
+    revokedTokens = new Set(["cnst_strategy"]);
+    expect(await serverNests("cn", server.spec, undefined, { fresh: true })).toEqual([chameleon]);
+    revokedTokens = new Set(["cnst_strategy", "cnst_chameleon"]);
+    await expect(serverNests("cn", server.spec, undefined, { fresh: true })).rejects.toMatchObject({
+      code: "REMOTE_AUTH_FAILED",
+    });
+    expect(closed).toBe(opened);
+  });
+
+  it("keeps a nest list per account: an alias switched to another account never reads the old one", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    await serverNests("cn", server.spec);
+    replies = { nest_index: { nests: [nests[0]] } };
+    const client = { ...server.spec, account: "client" } as RemoteNestSpec;
+    expect(await serverNests("cn", client)).toEqual([nests[0]]);
   });
 
   it("uses the server-wide key for a nest with no key of its own, and the alias's account", async () => {

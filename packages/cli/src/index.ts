@@ -141,6 +141,7 @@ import {
   emptyServerMap,
   isNestScope,
   splitAccountKey,
+  tokensForServerEndpoint,
   assertServerMapWritable,
   keyForEndpoint,
   keysUnderServer,
@@ -3734,12 +3735,16 @@ program
         // A remote alias: forget the saved key it signs in with (and, if server-wide, that server's nest keys).
         const spec = readRegistry().remotes?.[server];
         if (spec?.transport !== "http") throw new Error(`"${server}" is neither a server URL nor a registered HTTP remote alias.`);
-        const key = keyForEndpoint(map, spec.url, account ?? spec.account);
-        if (!key) {
+        account ??= spec.account;
+        const key = keyForEndpoint(map, spec.url, account);
+        // A server alias with only nest keys saved signs in with those: forget them all.
+        const onlyNestKeys = !key && tokensForServerEndpoint(map, spec.url, account).length > 0;
+        if (!key && !onlyNestKeys) {
           console.log(chalk.yellow(`No saved key is used by "${server}" (${spec.url}).`));
           return;
         }
-        ({ scope: server, account } = splitAccountKey(key));
+        if (key) ({ scope: server, account } = splitAccountKey(key));
+        else server = normalizeServerUrl(spec.url).slice(0, -"/mcp".length);
       }
       const wanted = accountKey(opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server), account);
       const targets = opts.nest ? [wanted].filter((k) => map.servers[k]) : keysUnderServer(map, server, account);
