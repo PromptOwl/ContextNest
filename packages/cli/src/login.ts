@@ -17,6 +17,10 @@ const DEFAULT_POLL_INTERVAL_S = 2;
 const DEFAULT_EXPIRES_S = 600;
 /** Consecutive transient poll failures (network, 5xx, non-JSON) tolerated. */
 const MAX_POLL_RETRIES = 5;
+/** The server's key-label length cap. */
+const MAX_KEY_LABEL = 60;
+/** Labels tried ("<label>", "<label> #2", …) before a duplicate-label 409 is reported. */
+const MAX_LABEL_TRIES = 20;
 
 export interface DeviceLoginIO {
   fetch?: typeof fetch;
@@ -38,6 +42,9 @@ export interface DeviceLoginResult {
 export class LoginError extends Error {
   override name = "LoginError";
 }
+
+/** The server has no browser (device) login; a pasted key is the way in. */
+export class NoBrowserLoginError extends LoginError {}
 
 class TransientError extends Error {}
 
@@ -66,7 +73,7 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
 
   const startRes = await postJson("/auth/device", { deviceName: keyLabel });
   if (!startRes.ok) {
-    throw new LoginError(
+    throw new NoBrowserLoginError(
       `This server doesn't offer browser login (${await errorText(startRes)}).\n` +
         `  Paste a key instead: ctx login ${serverUrl} --key-stdin  (create one in the web UI → Connect)`,
     );
@@ -130,11 +137,18 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
   if (!cookie) throw new LoginError("Server did not return a session cookie.");
   const ex = (await exRes.json().catch(() => ({}))) as { user?: { email?: string } };
 
-  const mintRes = await postJson("/auth/keys", { label: keyLabel }, { Cookie: cookie });
-  if (!mintRes.ok) throw new LoginError(`Could not create an API key (${await errorText(mintRes)}).`);
-  const minted = (await mintRes.json().catch(() => ({}))) as { api_key?: string };
-  if (!minted.api_key) throw new LoginError("Server did not return an API key.");
-  return { token: minted.api_key, keyLabel, ...(ex.user?.email ? { email: ex.user.email } : {}) };
+  // Labels are unique per account (409 on a repeat) and capped in length, so a
+  // second login from this machine mints "<label> #2", then "#3", …
+  for (let n = 1; ; n++) {
+    const suffix = n === 1 ? "" : ` #${n}`;
+    const label = keyLabel.slice(0, MAX_KEY_LABEL - suffix.length) + suffix;
+    const mintRes = await postJson("/auth/keys", { label }, { Cookie: cookie });
+    if (mintRes.status === 409 && n < MAX_LABEL_TRIES) continue;
+    if (!mintRes.ok) throw new LoginError(`Could not create an API key (${await errorText(mintRes)}).`);
+    const minted = (await mintRes.json().catch(() => ({}))) as { api_key?: string };
+    if (!minted.api_key) throw new LoginError("Server did not return an API key.");
+    return { token: minted.api_key, keyLabel: label, ...(ex.user?.email ? { email: ex.user.email } : {}) };
+  }
 }
 
 /**

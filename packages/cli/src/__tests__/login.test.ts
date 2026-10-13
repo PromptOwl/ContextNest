@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { ContextNestError, type RemoteNestSpec } from "@promptowl/contextnest-engine";
-import { LoginError, deviceLogin, parsePastedKey, resolvePushKey } from "../login.js";
+import { LoginError, NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "../login.js";
 import { LOGIN_TOKEN_ENV, connectTarget, wantsLoginKey } from "../remote.js";
 
 const SERVER = "https://nest.example.com";
@@ -79,6 +79,9 @@ describe("deviceLogin", () => {
   it("says browser login is unavailable and points at --key-stdin", async () => {
     const f = scriptedFetch({ "/auth/device": [{ status: 403, body: { error: "PromptOwl sign-in is restricted" } }] });
     await expect(deviceLogin(SERVER, io(f))).rejects.toThrow(/403: PromptOwl sign-in is restricted[\s\S]*--key-stdin/);
+    // Typed, so `ctx login` can fall back to a pasted key on a terminal.
+    const again = scriptedFetch({ "/auth/device": [{ status: 404 }] });
+    await expect(deviceLogin(SERVER, io(again))).rejects.toBeInstanceOf(NoBrowserLoginError);
   });
 
   it("stops on a denied approval", async () => {
@@ -110,6 +113,33 @@ describe("deviceLogin", () => {
       deviceLogin(SERVER, { fetch: f.fetch, now: () => t, sleep: async (ms) => void (sleeps.push(ms), (t += ms)) }),
     ).rejects.toThrow(/timed out/);
     expect(sleeps).toEqual([5000, 5000, 5000]);
+  });
+
+  it("a repeat login from the same machine mints '<label> #2' instead of failing on the duplicate label", async () => {
+    const taken = { status: 409, body: { error: 'You already have a key named "ctx CLI (box)".' } };
+    const f = scriptedFetch({
+      "/auth/device": [START],
+      "/auth/device/poll": [APPROVED],
+      "/auth/promptowl": [EXCHANGE],
+      "/auth/keys": [taken, MINT],
+    });
+    const res = await deviceLogin(SERVER, io(f));
+    expect(res).toMatchObject({ token: "cnst_minted", keyLabel: "ctx CLI (box) #2" });
+    const labels = f.calls.filter((c) => c.path === "/auth/keys").map((c) => JSON.parse(String(c.init.body)).label);
+    expect(labels).toEqual(["ctx CLI (box)", "ctx CLI (box) #2"]);
+  });
+
+  it("keeps the key label within the server's 60-character cap, suffix included", async () => {
+    const long = `ctx CLI (${"h".repeat(80)})`;
+    const f = scriptedFetch({
+      "/auth/device": [START],
+      "/auth/device/poll": [APPROVED],
+      "/auth/promptowl": [EXCHANGE],
+      "/auth/keys": [{ status: 409, body: {} }, MINT],
+    });
+    const { keyLabel } = await deviceLogin(SERVER, io(f, { deviceName: long }));
+    expect(keyLabel.length).toBe(60);
+    expect(keyLabel.endsWith(" #2")).toBe(true);
   });
 
   it("fails clearly when the exchange sets no session cookie or the mint returns no key", async () => {

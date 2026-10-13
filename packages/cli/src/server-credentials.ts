@@ -115,6 +115,12 @@ export function tokenForServer(map: ServerMap, url?: string): string | null {
  * `https://a.io/xy`, and never across origins.
  */
 export function tokenForEndpoint(map: ServerMap, endpoint: string): string | null {
+  const key = keyForEndpoint(map, endpoint);
+  return key ? map.servers[key].token : null;
+}
+
+/** The saved entry `endpoint` authenticates with (see tokenForEndpoint), or null. */
+export function keyForEndpoint(map: ServerMap, endpoint: string): string | null {
   let target: string;
   try {
     target = normalizeServerUrl(endpoint);
@@ -127,7 +133,7 @@ export function tokenForEndpoint(map: ServerMap, endpoint: string): string | nul
       if (!best || key.length > best.length) best = key;
     }
   }
-  return best ? map.servers[best].token : null;
+  return best;
 }
 
 /**

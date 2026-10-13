@@ -88,12 +88,13 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx vault default <alias>` / `ctx vault remove <alias>` / `ctx vault which`
 
 ### Hosted nests
-- `ctx login <server>` — Sign in once in the browser; the CLI mints its own API key and keeps it in your OS keyring (or the encrypted file store — never plaintext). `--key-stdin` saves an existing `cnst_…` key instead
+- `ctx login <server>` — Sign in once in the browser; the CLI mints its own API key and keeps it in your OS keyring (or the encrypted file store — never plaintext). `--key-stdin` saves an existing `cnst_…` key instead (hidden prompt on a terminal; a server without browser login falls back to it)
+- `ctx login <server> --as <alias> [--set-default]` — Sign in and register the server as a vault in one step: `ctx vault list` then shows every nest as `<alias>/<nest>`. With `--nest <id>` the alias points at that nest
 - `ctx vault add <alias> --url <server>/mcp` — Register the server; with a saved login no `--bearer-env` is needed. Then `ctx --vault <alias> query …`
 - `ctx push --server <server> --nest <id>` — Uses the saved key when `--key` / `CONTEXTNEST_API_KEY` are absent
 - `ctx login --list [server]` — Show the servers and nests you're logged into (never prints keys)
 - `ctx login <server> --nest <id> --key-stdin` — Save a key for one nest only; it wins over the server-wide key for that nest. Hosted (`https://nest.promptowl.ai`), self-hosted and nest-scoped keys all live side by side, so you never log out to switch
-- `ctx logout <server> [--nest <id>] | --all` — Forget a server's keys (with its nest-scoped keys), one nest's key, or everything; `--all` also resets an unreadable store. Revoke keys on the server in the web UI
+- `ctx logout <server|alias> [--nest <id>] | --all` — Forget a server's keys (with its nest-scoped keys), one nest's key, or everything; `--all` also resets an unreadable store. Revoke keys on the server in the web UI
 
 ### Document Management
 - `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)

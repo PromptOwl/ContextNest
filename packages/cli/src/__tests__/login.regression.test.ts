@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,6 +123,30 @@ describe("ctx login / logout (regression)", () => {
     expect(ctx(["logout", "--all"]).stdout).toContain(`Logged out of ${SELF}`);
     expect(ctx(["logout", "--all"]).stdout).toContain("No saved server keys.");
     expect(ctx(["login", "--list"]).stdout).toContain("Not logged in");
+  });
+
+  it("login --as registers the alias with no auth (the key stays in the store); logout <alias> forgets its key", () => {
+    const registry = () => readFileSync(join(home, ".contextnest", "config.yaml"), "utf-8");
+    expect(ctx(["login", HOSTED, "--key-stdin", "--as", "po", "--set-default", "--yes"], KEY_HOSTED).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin", "--as", "po-n1", "--yes"], KEY_NEST).status).toBe(0);
+    const reg = registry();
+    expect(reg).toContain(`${HOSTED}/mcp`);
+    expect(reg).toContain(`${HOSTED}/nests/n1/mcp`);
+    expect(reg).toMatch(/default: po\b/);
+    expect(reg).not.toContain("cnst_");
+    expect(reg).not.toContain("bearer_env");
+
+    // A taken alias is refused before anything is saved.
+    const taken = ctx(["login", SELF, "--key-stdin", "--as", "po"], KEY_SELF);
+    expect(taken.status).toBe(1);
+    expect(taken.stderr).toContain("already a registered vault");
+    expect(ctx(["login", "--list"]).stdout).not.toContain(SELF);
+
+    // The nest alias signs in with the nest-scoped key, so only that one goes.
+    expect(ctx(["logout", "po-n1"]).stdout).toContain(`Logged out of ${HOSTED}/nests/n1.`);
+    expect(ctx(["login", "--list"]).stdout).toContain(`${HOSTED}  (default)`);
+    expect(ctx(["logout", "po"]).stdout).toContain(`Logged out of ${HOSTED}.`);
+    expect(ctx(["logout", "nope"]).stderr).toContain("neither a server URL nor a registered HTTP remote alias");
   });
 
   it("a corrupt saved map is refused and left alone; logout --all resets it", async () => {
