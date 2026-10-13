@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
@@ -131,9 +131,26 @@ import type {
 import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
-import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
+import {
+  emptyServerMap,
+  isNestScope,
+  assertServerMapWritable,
+  keyForEndpoint,
+  keysUnderServer,
+  loadServerMap,
+  nestScopeUrl,
+  normalizeServerUrl,
+  removeServer,
+  saveServerMap,
+  savedTokenFor,
+  upsertServer,
+  type ServerCredential,
+  type ServerMap,
+} from "./server-credentials.js";
+import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
@@ -3441,6 +3458,275 @@ program
     }
   });
 
+// ─── ctx login / logout ──────────────────────────────────────────────────────
+
+/** A pasted key: piped stdin is read to EOF; on a terminal it is one hidden line, done at Enter. */
+async function readStdin(): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    // A key is ~70 bytes; refuse a runaway pipe instead of buffering all of it.
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of stdin) {
+      size += (chunk as Buffer).length;
+      if (size > 4096) throw new Error("Too much input on stdin — pipe in just the key (cnst_…).");
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+  }
+  process.stderr.write(chalk.dim("Paste the key and press Enter — it stays hidden. Ctrl-C to cancel.\n> "));
+  return new Promise((resolve, reject) => {
+    let key = "";
+    const finish = () => {
+      stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.off("error", onError);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stderr.write("\n");
+    };
+    const onData = (s: string) => {
+      for (const ch of s) {
+        if (ch === "\u0003") {
+          finish();
+          console.error(chalk.yellow("Cancelled — nothing was saved."));
+          process.exit(130);
+        } else if (ch === "\r" || ch === "\n") {
+          if (key.trim()) {
+            finish();
+            resolve(key);
+            return;
+          }
+          process.stderr.write(chalk.dim("\nNothing pasted yet — paste the key and press Enter, or Ctrl-C to cancel.\n> "));
+        } else if (ch === "\u007f" || ch === "\b") {
+          key = key.slice(0, -1);
+        } else {
+          key += ch;
+        }
+      }
+    };
+    // A terminal that closes or errors mid-prompt must not leave login hanging.
+    const onError = (err: Error) => {
+      finish();
+      reject(err);
+    };
+    const onEnd = () => onError(new Error("Input closed before a key was pasted."));
+    stdin.setEncoding("utf-8");
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+    stdin.once("end", onEnd);
+    stdin.once("error", onError);
+  });
+}
+
+program
+  .command("login [server]")
+  .description("Sign in to a ContextNest server once; push and remote --vault aliases reuse the saved key")
+  .option("--key-stdin", "Read an existing API key (cnst_…) from stdin instead of the browser flow")
+  .option("--nest <id>", "Save the key for this one nest only (with --key-stdin); it wins over the server-wide key")
+  .option("--label <text>", "Label for this credential (default: your account email)")
+  .option("--list", "Show the servers and nests you're logged into (never prints keys)")
+  .option("--as <alias>", "Also register the server (all its nests), or the --nest, as a remote vault alias")
+  .option("--set-default", "With --as: make that alias the default vault")
+  .action(async (
+    server: string | undefined,
+    opts: { keyStdin?: boolean; nest?: string; label?: string; list?: boolean; as?: string; setDefault?: boolean },
+  ) => {
+    try {
+      if (opts.list) {
+        const map = await loadServerMap();
+        const keys = (server ? keysUnderServer(map, server) : Object.keys(map.servers)).sort();
+        if (keys.length === 0) {
+          console.log(chalk.yellow(server ? `No saved key for ${normalizeServerUrl(server)}.` : "Not logged in to any server."));
+          return;
+        }
+        for (const key of keys) {
+          const cred = map.servers[key];
+          const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
+          console.log(`${key}${scope}`);
+          const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
+          if (meta) console.log(chalk.dim(`  ${meta}`));
+        }
+        return;
+      }
+      if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
+      assertSafeEndpoint(server, "<server>");
+      if (opts.nest && !opts.keyStdin) {
+        throw new Error(
+          "Browser login signs in to the whole server. To save a key for one nest, paste it:\n" +
+            `  ctx login ${server} --nest ${opts.nest} --key-stdin`,
+        );
+      }
+      const serverUrl = normalizeServerUrl(server);
+      const url = opts.nest ? nestScopeUrl(serverUrl, opts.nest) : serverUrl;
+      if (opts.setDefault && !opts.as) throw new Error("--set-default goes with --as <alias>.");
+      // Check the alias before signing in, not after a key has been minted.
+      if (opts.as) {
+        const reg = readRegistry();
+        if (reg.vaults[opts.as] || (reg.remotes?.[opts.as] && !isForce())) {
+          throw new Error(`"${opts.as}" is already a registered vault — pick another alias, or pass --force to replace a remote.`);
+        }
+      }
+      // Registered with no auth, so the alias borrows the key — the key never enters the registry.
+      // Confirmed before signing in, so declining never leaves a saved key without its alias.
+      const aliasSpec: RemoteNestSpec = { transport: "http", url: `${url}/mcp` };
+      if (opts.as) {
+        await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
+      }
+      // Fail on an unusable store now, before the server mints a key.
+      await assertServerMapWritable();
+      let token: string | undefined;
+      let label = opts.label;
+      let mintedLabel: string | undefined;
+      if (!opts.keyStdin) {
+        // The name the server shows for this key (what you'd revoke). Asked on a
+        // terminal only; Enter keeps the default, and scripts always get it.
+        const defaultName = `ctx CLI (${hostname()})`;
+        let keyName = defaultName;
+        while (process.stdin.isTTY) {
+          keyName = await promptText("Name for the API key this login creates", defaultName);
+          if (keyName.length <= 60) break;
+          console.log(chalk.yellow("  Key names can be at most 60 characters."));
+        }
+        try {
+          const res = await deviceLogin(url, {
+            deviceName: keyName,
+            prompt: (verificationUrl, userCode) => {
+              console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(verificationUrl)}`);
+              if (userCode) console.log(`  Code: ${chalk.bold(userCode)}`);
+              openUrlInBrowser(verificationUrl);
+              console.log(chalk.dim("\n  Waiting for approval… (Ctrl-C to cancel)"));
+            },
+          });
+          token = res.token;
+          mintedLabel = res.keyLabel;
+          label ??= res.email ? `${res.email} · key "${res.keyLabel}"` : `key "${res.keyLabel}"`;
+        } catch (err) {
+          // No browser login on this server: on a terminal, take a pasted key instead.
+          if (!(err instanceof NoBrowserLoginError && process.stdin.isTTY)) throw err;
+          console.log(chalk.yellow(`${err.message.split("\n")[0]} Create a key in its web UI (Connect) and paste it.`));
+        }
+      }
+      token ??= parsePastedKey(await readStdin());
+      // The OS keyring can take a second or two (Windows starts PowerShell).
+      console.log(chalk.dim("  Saving the key to the secure store…"));
+      let map: ServerMap;
+      let where: string;
+      try {
+        map = upsertServer(await loadServerMap(), url, {
+          token,
+          ...(label ? { label } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+        where = await saveServerMap(map);
+      } catch (err) {
+        if (!mintedLabel) throw err;
+        throw new Error(
+          `${(err as Error).message}\n  The server already created key "${mintedLabel}" — revoke it in its web UI.`,
+        );
+      }
+      console.log(
+        chalk.green(`\nLogged in to ${url}${label ? ` (${label})` : ""}.`) +
+          (opts.nest ? chalk.dim("  (this nest only)") : map.default === url ? chalk.dim("  (default)") : ""),
+      );
+      console.log(chalk.dim(`  Key saved to ${where}.`));
+      if (opts.as) {
+        let reg: ReturnType<typeof addRemote>;
+        try {
+          reg = addRemote(opts.as, aliasSpec, { setDefault: opts.setDefault, force: isForce() });
+        } catch (err) {
+          throw new Error(
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${opts.as} --url ${aliasSpec.url}`,
+          );
+        }
+        console.log(
+          chalk.green(`Registered remote "${chalk.bold(opts.as)}"${reg.default === opts.as ? " (default)" : ""} → ${aliasSpec.url}`),
+        );
+        console.log(
+          chalk.dim(
+            opts.nest
+              ? `  Next: ctx --vault ${opts.as} list`
+              : `  Next: ctx vault list   (each nest shows as ${opts.as}/<nest>; use --vault ${opts.as}/<nest> for one)`,
+          ),
+        );
+        return;
+      }
+      // A nest-scoped key only matches its own nest's URL, so it gets just that line.
+      const next = opts.nest
+        ? [`This nest:  ctx vault add <alias> --url ${url}/mcp`]
+        : [
+            `All nests:  ctx vault add <alias> --url ${url}/mcp`,
+            `            then \`ctx vault list\` shows each one as <alias>/<nest>; use --vault <alias>/<nest> for one`,
+            `One nest:   ctx vault add <alias> --url ${url}/nests/<id>/mcp`,
+          ];
+      console.log(chalk.dim(`\n  Next — connect with this key (no --bearer-env needed):`));
+      for (const line of next) console.log(chalk.dim(`    ${line}`));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout [server]")
+  .description(
+    "Forget keys saved by `ctx login` for a server URL or a remote alias, including that server's nest-scoped keys (they stay valid on the server — revoke them in the web UI)",
+  )
+  .option("--nest <id>", "Forget only the key saved for this nest")
+  .option("--all", "Forget every saved server key")
+  .action(async (server: string | undefined, opts: { nest?: string; all?: boolean }) => {
+    try {
+      if (opts.all) {
+        if (server || opts.nest) throw new Error("--all forgets every server; drop the <server> / --nest.");
+        // Don't parse first: --all is the way out of a corrupt or newer-format map.
+        let forgotten: [string, ServerCredential][] = [];
+        try {
+          forgotten = Object.entries((await loadServerMap()).servers);
+        } catch {
+          /* unreadable — wipe it anyway */
+        }
+        await saveServerMap(emptyServerMap());
+        if (forgotten.length === 0) {
+          console.log(chalk.yellow("No saved server keys."));
+          return;
+        }
+        for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+        return;
+      }
+      if (!server) throw new Error("Name the <server> or remote alias to log out of, or pass --all.");
+      let map = await loadServerMap();
+      if (!/^https?:\/\//i.test(server)) {
+        // A remote alias: forget the saved key it signs in with (and, if server-wide, that server's nest keys).
+        const spec = readRegistry().remotes?.[server];
+        if (spec?.transport !== "http") throw new Error(`"${server}" is neither a server URL nor a registered HTTP remote alias.`);
+        const key = keyForEndpoint(map, spec.url);
+        if (!key) {
+          console.log(chalk.yellow(`No saved key is used by "${server}" (${spec.url}).`));
+          return;
+        }
+        server = key;
+      }
+      const targets = opts.nest ? [nestScopeUrl(server, opts.nest)].filter((k) => map.servers[k]) : keysUnderServer(map, server);
+      if (targets.length === 0) {
+        console.log(chalk.yellow(`No saved key for ${opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server)}.`));
+        return;
+      }
+      const forgotten = targets.map((k) => [k, map.servers[k]] as const);
+      for (const k of targets) map = removeServer(map, k);
+      await saveServerMap(map);
+      for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+function printLoggedOut(url: string, cred: ServerCredential): void {
+  console.log(chalk.green(`Logged out of ${url}.`));
+  console.log(chalk.dim(`  The key still works until you revoke it in the server's web UI${cred.label ? ` — ${cred.label}` : ""}.`));
+}
+
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
 /** Print the terminal result of a gated push. Success stays on stdout. */
@@ -3477,7 +3763,7 @@ program
   .description("Push the local vault to a hosted ContextNest server")
   .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
   .requiredOption("--nest <id>", "Target nest ID")
-  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer `ctx login` or the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .option(
     "--no-wait",
@@ -3498,13 +3784,22 @@ program
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
-    const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
-    if (!apiKey) {
-      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+    // Refuse to put documents and a bearer token on the wire in the clear —
+    // checked first, so a refused URL never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest)));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
       process.exit(1);
     }
-    // Refuse to put documents and a bearer token on the wire in the clear.
-    assertSafeEndpoint(opts.server, "--server");
+    if (!apiKey) {
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
+      process.exit(1);
+    }
 
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
@@ -3580,6 +3875,9 @@ program
       if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
+        if (res.status === 401 && !opts.key && !process.env.CONTEXTNEST_API_KEY) {
+          console.error(chalk.dim("  The key saved by `ctx login` was rejected — check `ctx login --list`, then log in again."));
+        }
         process.exit(1);
       }
 
