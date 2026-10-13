@@ -404,5 +404,39 @@ describe("parseStewardMappings", () => {
       expect(() => parseStewardMappings([bad])).toThrow(ContextNestError);
     }
     expect(() => parseStewardMappings(["@x=a@example.com", "@x=b@example.com"])).toThrow(/@x is mapped twice/);
+    expect(() => parseStewardMappings(["@x=a@example.com", "@X=b@example.com"])).toThrow(/@x is mapped twice/);
+  });
+
+  it("matches placeholders without case, on both sides", async () => {
+    const mixed = parseRecipeManifest(
+      "```yaml recipe\nid: seam\nkind:\n  stewards:\n    - scope: nest\n      role: reviewer\n      principal: \"@Seam-Owner\"\n```\n",
+    ).kind!;
+    const plan = await planKindApply("seam", mixed, target, {
+      stewards: parseStewardMappings(["@SEAM-owner=o@example.com"]),
+    });
+    expect(plan.steps.find((s) => s.kind === "steward")!.action).toBe("apply");
+  });
+});
+
+describe("case and error text", () => {
+  it("refuses a setting the server marks secret whatever its case", async () => {
+    routes[key("GET", "/nests/n1/plugins")] = {
+      status: 200,
+      body: { plugins: [{ name: "github", secretKeys: ["REPOS"] }], load_errors: [] },
+    };
+    const plan = await planKindApply("seam", kind(), target);
+    expect(plan.steps.find((s) => s.kind === "plugin")!.action).toBe("skip");
+  });
+
+  it("keeps the text of an error that isn't JSON", async () => {
+    const htmlError: typeof fetch = async (input, init) => {
+      if ((init?.method ?? "GET") === "POST" && new URL(String(input)).pathname.endsWith("/edge-types")) {
+        return new Response("<html><body><h1>502 Bad Gateway</h1></body></html>", { status: 502 });
+      }
+      return fakeFetch(input, init);
+    };
+    const t = { ...target, fetch: htmlError };
+    const plan = await executeKindPlan(await planKindApply("seam", kind(), t), t);
+    expect(plan.steps.find((s) => s.kind === "edge-type")!.error).toBe("502 502 Bad Gateway");
   });
 });

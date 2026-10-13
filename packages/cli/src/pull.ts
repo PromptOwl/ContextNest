@@ -526,10 +526,12 @@ export function parseKindSection(raw: unknown): KindSection {
     const role = oneOf(entry.role, STEWARD_ROLES, `${where}.role`);
     // A recipe names a seat, never a person: the person is a decision made
     // where the kind is applied.
-    const principal = str(entry.principal, `${where}.principal`);
-    if (!/^@[a-z0-9][a-z0-9._-]*$/i.test(principal)) {
-      throw invalid(`${where}.principal must be a placeholder like "@seam-owner", not "${principal}"`);
+    const rawPrincipal = str(entry.principal, `${where}.principal`);
+    if (!/^@[a-z0-9][a-z0-9._-]*$/i.test(rawPrincipal)) {
+      throw invalid(`${where}.principal must be a placeholder like "@seam-owner", not "${rawPrincipal}"`);
     }
+    // Lowercased so `--steward @seam-owner=…` maps "@Seam-Owner" too.
+    const principal = rawPrincipal.toLowerCase();
     let target: string | undefined;
     if (scope === "nest") {
       if (entry.target !== undefined && entry.target !== null) throw invalid(`${where}.target is not allowed for scope "nest"`);

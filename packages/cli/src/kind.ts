@@ -74,6 +74,8 @@ interface Reply {
   status: number;
   ok: boolean;
   body: any;
+  /** The raw body, for errors that aren't JSON. */
+  text: string;
 }
 
 async function call(target: KindTarget, method: string, path: string, body?: unknown): Promise<Reply> {
@@ -90,7 +92,13 @@ async function call(target: KindTarget, method: string, path: string, body?: unk
   // A validated server that redirects would carry the bearer token and the
   // kind's contents to a destination nobody checked.
   assertNotRedirected(res, "--server");
-  const parsed = await res.json().catch(() => null);
+  const text = await res.text().catch(() => "");
+  let parsed: any = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Not JSON: keep the text, so an error still says something.
+  }
   // The plan reads state from GETs: an HTML 200 (a proxy or login page) must
   // not read as "nothing defined yet".
   if (method === "GET" && res.ok && (parsed === null || typeof parsed !== "object")) {
@@ -99,11 +107,16 @@ async function call(target: KindTarget, method: string, path: string, body?: unk
       "INTERNAL",
     );
   }
-  return { status: res.status, ok: res.ok, body: parsed };
+  return { status: res.status, ok: res.ok, body: parsed, text };
 }
 
 function serverError(reply: Reply): string {
-  const message = reply.body && typeof reply.body.error === "string" ? reply.body.error : "";
+  const message =
+    reply.body && typeof reply.body.error === "string"
+      ? reply.body.error
+      : reply.body === null
+        ? reply.text.slice(0, 2000).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200)
+        : "";
   return `${reply.status}${message ? ` ${message}` : ""}`;
 }
 
@@ -119,7 +132,9 @@ export function parseStewardMappings(values: string[]): Record<string, string> {
     if (!match) {
       throw new ContextNestError(`--steward "${value}" must look like @placeholder=person@example.com`, "VALIDATION_FAILED");
     }
-    const [, placeholder, rawEmail] = match;
+    const [, rawPlaceholder, rawEmail] = match;
+    // Placeholders compare without case, like the kind's own (see pull.ts).
+    const placeholder = rawPlaceholder.toLowerCase();
     const email = rawEmail.trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       throw new ContextNestError(`--steward ${placeholder}: "${rawEmail}" is not an email address`, "VALIDATION_FAILED");
@@ -308,7 +323,8 @@ export async function planKindApply(
       }
       // The recipe parser refuses secret-looking settings; the server knows
       // exactly which keys are secret, so check against that too.
-      const secret = Object.keys(p.settings ?? {}).filter((k) => server.secretKeys.includes(k));
+      const secretKeys = new Set(server.secretKeys.map((k) => k.toLowerCase()));
+      const secret = Object.keys(p.settings ?? {}).filter((k) => secretKeys.has(k.toLowerCase()));
       if (secret.length) {
         warn(
           `Refusing plugin "${p.name}": ${secret.join(", ")} is a secret setting of "${p.name}" — set it on the server, never in a recipe`,
