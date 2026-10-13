@@ -896,6 +896,17 @@ describe("[regression] ctx verify", () => {
     expect(res.stdout).toMatch(/content_hash_mismatch/);
     expect(res.stdout).toMatch(/integrity error/);
   });
+
+  // r24 B1: the crawl now skips a document it cannot read, and ctx verify's
+  // own crawl did not report the skip — so a vault whose documents could not
+  // be read verified green. It names each one, and fails.
+  it("names a document whose frontmatter does not parse, and exits non-zero", () => {
+    const file = join(tmp, "nodes", "sealed.md");
+    writeFileSync(file, readFileSync(file, "utf-8").replace(/^title: .*$/m, "title: [Sealed"));
+    const res = runCtxResult(tmp, ["verify", "--json"]);
+    expect(res.status).toBe(1);
+    expect(JSON.parse(res.stdout).errors).toContainEqual(expect.objectContaining({ type: "unreadable_document", document: "nodes/sealed" }));
+  });
 });
 
 // ─── validate ─────────────────────────────────────────────────────────────────
@@ -921,6 +932,42 @@ describe("[regression] ctx validate", () => {
     const parsed = JSON.parse(res.stdout);
     expect(parsed.valid).toBe(false);
     expect(parsed.errors[0].errors[0].field).toBe("title");
+  });
+
+  it("flags a pack whose query won't parse, with the operator hint", () => {
+    runCtx(tmp, ["add", "nodes/clean", "--title", "Clean Doc"]);
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(
+      join(tmp, "packs", "bad.yml"),
+      "id: bad\nlabel: Bad\nquery: \"#a OR #b\"\n",
+      "utf-8",
+    );
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toContain("✗ pack:bad");
+    expect(res.stdout).toContain('spell OR as "|"');
+  });
+
+  it("reports a pack file that is not valid YAML or not a valid pack, and reads .yaml packs", () => {
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(join(tmp, "packs", "broken.yml"), "id: [broken\n", "utf-8");
+    writeFileSync(join(tmp, "packs", "nolabel.yml"), "id: nolabel\nquery: \"#a\"\n", "utf-8");
+    writeFileSync(join(tmp, "packs", "ext.yaml"), "id: ext\nlabel: Ext\nquery: \"#a OR #b\"\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toContain("✗ packs/broken.yml");
+    expect(res.stdout).toContain("invalid YAML");
+    expect(res.stdout).toContain("✗ packs/nolabel.yml");
+    expect(res.stdout).toContain("label");
+    expect(res.stdout).toContain("✗ pack:ext");
+  });
+
+  it("passes a vault whose packs are all valid", () => {
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(join(tmp, "packs", "ok.yml"), "id: ok\nlabel: Ok\nquery: \"#a | #b\"\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/and [1-9]\d* packs valid/);
   });
 });
 
@@ -2363,10 +2410,23 @@ describe("[regression] import pubmed + enrich pubtator", () => {
           res.writeHead(200, { "Content-Type": type });
           res.end(body);
         };
+        const query = decodeURIComponent(url.replace(/\+/g, " "));
         if (url.includes("/esearch.fcgi")) {
-          const pmc = url.includes("db=pmc");
-          // pmc: two hits; pubmed (PMID lookup): one.
-          send("application/json", JSON.stringify({ esearchresult: pmc ? { idlist: ["9990001", "9990002"], count: "2" } : { idlist: ["30056182"], count: "1" } }));
+          // The import search (PubMed, restricted to PMC full text): two hits;
+          // any other PubMed search (PMID lookup by DOI/PMCID): one.
+          const search = query.includes('"pubmed pmc"[sb]');
+          send("application/json", JSON.stringify({ esearchresult: search ? { idlist: ["99900001", "99900002"], count: "2" } : { idlist: ["30056182"], count: "1" } }));
+        } else if (url.includes("/esummary.fcgi")) {
+          // PMID → PMC id + MEDLINE publication types.
+          const ids = (/[?&]id=([^&]*)/.exec(query)?.[1] ?? "").split(",");
+          const result: Record<string, unknown> = { uids: ids };
+          for (const id of ids) {
+            result[id] = {
+              pubtype: ["Journal Article", "Systematic Review", "Meta-Analysis"],
+              articleids: id.startsWith("999") ? [{ idtype: "pmc", value: `PMC999000${id.slice(-1)}` }] : [],
+            };
+          }
+          send("application/json", JSON.stringify({ result }));
         } else if (url.includes("/efetch.fcgi")) {
           const id = /id=(\d+)/.exec(url)?.[1] ?? "0";
           // Second article: different DOI + no PMID so enrich has to resolve it.
@@ -2405,13 +2465,23 @@ describe("[regression] import pubmed + enrich pubtator", () => {
       execFileAsync("node", [distPath, ...args], { cwd: tmp, env, encoding: "utf-8" });
     try {
       const imp = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
-      expect(imp.stdout).toMatch(/2 match\(es\) in PMC; fetched 2/);
+      expect(imp.stdout).toMatch(/2 match\(es\) in PubMed with PMC full text; fetched 2/);
       expect(imp.stdout).toMatch(/Published 2 document\(s\)/);
       expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
       expect(existsSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"))).toBe(true);
-      const esearch = stub.requests.find((u) => u.includes("esearch") && u.includes("db=pmc"))!;
-      expect(esearch).toContain("retmax=2");
+      // PubMed (not PMC) is searched — PMC's esearch ignores [mh]/[pt].
+      expect(stub.requests.some((u) => u.includes("esearch") && u.includes("db=pmc"))).toBe(false);
+      const esearch = stub.requests.find((u) => u.includes("esearch") && u.includes("db=pubmed"))!;
+      expect(esearch).toContain("retmax=4");
       expect(esearch).toContain("api_key=test-key-123");
+      const twin1 = readFileSync(join(tmp, "nodes", "papers", "pmid-99900001.md"), "utf-8");
+      expect(twin1).toContain("'#pubtype-systematic-review'");
+      expect(twin1).toContain("publication_types:");
+
+      // --license: both stub articles are CC BY, so cc-by-nc imports nothing.
+      const nc = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--license", "cc-by-nc", "-y"]);
+      expect(nc.stdout).toMatch(/skipped 2 for licence/);
+      expect(nc.stdout).toMatch(/Nothing to import/);
 
       // Unchanged → skipped; the global --force republishes.
       const again = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);

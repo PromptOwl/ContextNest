@@ -28,8 +28,17 @@ import {
   serializeDocument,
   validateDocument,
   withVaultLock,
+  enforcedStructure,
+  checkDocument,
+  checkUpdate,
+  structureView,
+  missingFolders,
+  scaffoldFolders,
+  assertWritableDocumentId,
+  assertNotMachineryPath,
+  comparableSegment,
 } from "@promptowl/contextnest-engine";
-import type { ContextNode, Frontmatter, NestStorage } from "@promptowl/contextnest-engine";
+import type { ContextNode, Frontmatter, NestStorage, Violation } from "@promptowl/contextnest-engine";
 
 // ─── Manifest ───────────────────────────────────────────────────────────────
 
@@ -98,6 +107,12 @@ function safeRelPath(value: string, where: string): string {
 function localDocId(value: string, where: string): string {
   const id = normalizeDocumentId(safeRelPath(value, where));
   if (!id.startsWith("nodes/")) throw invalid(`${where} "${value}" must be a document under nodes/`);
+  // The engine's write guard: never under .context/, .versions/ or _suggestions/.
+  try {
+    assertWritableDocumentId(id);
+  } catch (err) {
+    throw invalid(`${where} "${value}": ${(err as Error).message}`);
+  }
   return id;
 }
 
@@ -145,9 +160,20 @@ export function parseRecipeManifest(body: string): RecipeManifest {
     const to = safeRelPath(str(entry.to, `files[${i}].to`), `files[${i}].to`);
     // A template is YAML. No dot-segment keeps a recipe out of .git/hooks,
     // .claude/, .vscode/ and .context/ (places that run code or hold vault
-    // state); no nodes/ or packs/ keeps it from writing past governance.
-    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || /^(nodes|packs)\//.test(to)) {
-      throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/ and dot-folders`);
+    // state); no nodes/ or packs/ keeps it from writing past governance —
+    // compared as a case-insensitive volume or Windows would read the name.
+    const root = comparableSegment(to.split("/")[0]);
+    // _suggestions/ at any depth holds staged edits: a template there would be one.
+    const machinery = (() => {
+      try {
+        assertNotMachineryPath(to);
+        return false;
+      } catch {
+        return true;
+      }
+    })();
+    if (!/\.ya?ml$/i.test(to) || to.split("/").some((seg) => seg.startsWith(".")) || root === "nodes" || root === "packs" || machinery) {
+      throw invalid(`files[${i}].to "${to}" must be a .yaml/.yml path outside nodes/, packs/, _suggestions/ and dot-folders`);
     }
     return { from: normalizeDocumentId(str(entry.from, `files[${i}].from`)), to, extract: "yaml" as const };
   });
@@ -457,26 +483,51 @@ export async function applyPull(storage: NestStorage, steps: PullStep[]): Promis
 
 async function applyPullLocked(storage: NestStorage, steps: PullStep[]): Promise<PullStep[]> {
   const written: PullStep[] = [];
+  // A recipe names its own destinations, so an enforced vault's structure
+  // rules (§11.1.1) judge every one before it lands.
+  const rules = await enforcedStructure(storage);
+  const refuse = (step: PullStep, violations: Violation[]) =>
+    Object.assign(step, {
+      action: "conflict",
+      content: undefined,
+      note: `${step.to}: ${violations.map((v) => v.message).join(" ")}`,
+    });
   for (const step of steps) {
     if ((step.action !== "create" && step.action !== "update") || step.content === undefined) continue;
     if (step.kind === "document" || step.kind === "skill") {
       const changed = () =>
         Object.assign(step, { action: "conflict", content: undefined, note: `${step.to} changed while the pull ran — left untouched` });
+      let local: ContextNode | null = null;
       if (step.action === "update") {
-        const local = await readLocal(storage, step.to);
+        local = await readLocal(storage, step.to);
         if (!local || pulledFrom(local)?.id !== step.from || !untouched(local)) {
           changed();
           continue;
         }
       }
+      if (rules) {
+        const incoming = parseDocument(`${step.to}.md`, step.content, step.to);
+        const after = structureView(step.to, incoming);
+        const violations = local
+          ? checkUpdate(rules, structureView(step.to, local), after)
+          : checkDocument(rules, after);
+        if (violations.length > 0) {
+          refuse(step, violations);
+          continue;
+        }
+      }
+      const created = rules && !local ? await missingFolders(storage, step.to) : null;
       try {
         await storage.writeDocument(step.to, step.content, { exclusive: step.action === "create" });
+        if (rules && created) await scaffoldFolders(storage, rules, created);
       } catch (err) {
         if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) throw err;
         changed();
         continue;
       }
     } else {
+      // Not judged by the structure rules: parseRecipeManifest keeps template
+      // files out of nodes/ (and packs/, dot-folders), where the rules apply.
       // Re-checked at write time: a file that appeared since planning is kept.
       if (await storage.hasVaultFile(step.to)) continue;
       await storage.writeVaultFile(step.to, step.content);

@@ -183,6 +183,14 @@ export interface Action {
   json?: (data: unknown) => void;
   /** File assertions; `path` is relative to the vault root. */
   files?: Array<{ path: string; exists?: boolean; contains?: string }>;
+  /**
+   * Assert over the vault on disk AFTER this action's command runs — the
+   * post-command counterpart to `mutate`. Use it for on-disk proofs the CLI's
+   * own output can't surface, e.g. that a forgotten secret is absent from every
+   * version-history file, or that an encrypted body is scrambled at rest.
+   * `vaultDir` is the journey's isolated vault root.
+   */
+  check?: (vaultDir: string) => void;
 }
 
 /**
@@ -235,6 +243,7 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
       for (const m of a.stderr ?? [])
         expect(matches(r.stderr, m), `${at} — stderr missing ${m}:\n${r.stderr}`).toBe(true);
       if (a.json) a.json(parseJson(r.stdout));
+      if (a.check) a.check(vault);
       for (const f of a.files ?? []) {
         const p = join(vault, f.path);
         if (f.exists !== undefined)

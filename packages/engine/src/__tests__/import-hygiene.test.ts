@@ -128,6 +128,21 @@ describe("planImportPaths — distinct files never collapse onto one id", () => 
     expect(plan[0].warnings.join("\n")).toMatch(/already exists in the vault/);
   });
 
+  it("checks the vault for many files at once, not one round trip at a time", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const onDisk = new Set(["nodes/a.md"]);
+    const isTaken = async (p: string) => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return onDisk.has(p);
+    };
+    const plan = await planImportPaths(["nodes/a.md", "nodes/b.md", "nodes/c.md"], isTaken);
+    expect(peak).toBeGreaterThan(1);
+    expect(plan.map((p) => p.path)).toEqual(["nodes/a-2.md", "nodes/b.md", "nodes/c.md"]);
+  });
+
   it("keeps all-non-Latin names apart", async () => {
     const plan = await planImportPaths(["nodes/日本語.md", "nodes/Ελληνικά.md"], async () => false);
     expect(plan.map((p) => p.path)).toEqual(["nodes/untitled.md", "nodes/untitled-2.md"]);
@@ -466,5 +481,31 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     for (const doc of await ctx.storage.discoverDocuments({ includeRetired: true })) {
       expect(validateDocument(doc).errors, doc.id).toEqual([]);
     }
+  });
+});
+
+describe("planImportPaths — QA round 12", () => {
+  it("a generated INDEX.md or README.md keeps its name, so it is never read as a node", () => {
+    expect(slugifyImportPath("nodes/notes/INDEX.md")).toBe("nodes/notes/INDEX.md");
+    expect(slugifyImportPath("README.md")).toBe("README.md");
+    // Only those two: an agent-config name is slugified like any other.
+    expect(slugifyImportPath("nodes/CLAUDE.md")).toBe("nodes/claude.md");
+  });
+
+  it("a ./ spelling of a renamed document takes its history along", async () => {
+    const plan = await planImportPaths(["nodes/./x.md", "nodes/.versions/x/v1.md"], async (p) => p === "nodes/x.md");
+    expect(plan.map((p) => p.path)).toEqual(["nodes/x-2.md", "nodes/.versions/x-2/v1.md"]);
+  });
+
+  it("many names colliding on one slug cost a linear number of lookups", async () => {
+    let calls = 0;
+    // The vault already holds x.md and x-2.md … x-400.md.
+    const plan = await planImportPaths(Array(400).fill("nodes/x.md"), async (p) => {
+      calls++;
+      const m = /^nodes\/x(?:-(\d+))?\.md$/.exec(p);
+      return !!m && Number(m[1] ?? 1) <= 400;
+    });
+    expect(new Set(plan.map((p) => p.path)).size).toBe(400);
+    expect(calls).toBeLessThan(2000);
   });
 });

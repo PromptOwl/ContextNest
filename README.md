@@ -500,6 +500,55 @@ on it keep working. Opt in with `ctx config set review on`. Re-running
 `ctx init` on an existing vault keeps its setting. Remote nests (`--vault
 <server>/<nest>`) use the server's own governance and are not gated.
 
+### Structure rules
+
+A nest owner can lay down hard rules for the vault's layout in
+`.context/config.yaml` (full guide: [docs/structure-rules.md](docs/structure-rules.md)): which folders may exist, which node types each takes,
+the shape of folder and file names, the template a folder's files start from
+(and the headings they must keep), and the subfolders and files every matching
+folder must have.
+
+```yaml
+structure:
+  enforce: true    # false (default): report-only
+  closed: true     # only declared folders may exist and hold documents
+folders:
+  "clients/{client}":
+    folder_name: "/[a-z]+-[0-9]{3}/"          # token pattern or /regex/
+    types: [document]
+    files: { overview: { template: client-overview } }   # required file
+  "clients/{client}/meetings":
+    required: true                             # created with its parent
+    file_name: "{date}-{slug}"                 # tokens: {slug} {date} {yyyy} {n}
+    template: meeting-note
+templates:
+  meeting-note:
+    body: "## Attendees\n## Decisions\n## Action items\n"
+    required_sections: [Decisions, Action items]
+  client-overview:
+    body: "## Summary\n## Contacts\n"
+```
+
+- With `enforce: true`, every write surface refuses what breaks a rule: `ctx add/update/delete/import/pull`, every MCP write tool (the deprecated ones too), `context_import_pdf`, and every publish — whichever surface approves a held write, its first publish is judged in full and scaffolds its new folders. A refusal names the rule and the expected format. Report-only rules (`enforce: false`, or no `enforce`) write and refuse nothing; any other value of `enforce` or `structure` is an error, never off.
+- Existing content is grandfathered: an edit is refused only for what it newly breaks (a re-type into a refused type, a dropped required heading).
+- An enforced write that creates a folder also creates its required subfolders and files (drafts from their templates). A required file can be deleted only as the last document in its folder. `ctx add` without `--body` starts from the folder's template.
+- File names come from titles (lowercased, words joined by `-`), so a rule like `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
+- A `/regex/` must stay inside a small grammar: quantifiers on single characters or `[classes]` (bounds of at most 3 digits), groups with `|` that are never repeated, literal `{ } [ ]` escaped, no lookaround or backreferences, at most 200 characters (spec §11.1.1 has the exact grammar). It is matched in linear time, never by the backtracking regex engine — token patterns too — so no pattern can stall a write.
+- Re-running `ctx init` on a vault keeps its rules (a config that is not valid YAML is refused, not overwritten), and a starter leaves out what they refuse.
+- Existing `folders:` blocks keep working: a `template` naming no entry under `templates` is a label, and folder names are matched literally.
+- No write puts a document under `.context/`, `.versions/` or `_suggestions/` (any depth) or the vault-root `packs/`, and `context_import` never writes `.context/` — an import cannot rewrite the rules or the review gate. Ids use `/`, never `\`, stay under 1024 characters with no name over 251 bytes, and under enforced rules spell the content root exactly `nodes/` (not `NODES/`).
+- Folder names in rules match case-insensitively; at most 256 folder rules; a `template` name not defined under `templates` is reported as a warning by `ctx structure`.
+
+| Command | Effect |
+|---|---|
+| `ctx structure` | Show the rules (`--json` for agents; works on remote nests too) |
+| `ctx structure --folder <path>` | The rule governing one folder, with its template |
+| `ctx structure --report` | Existing content that breaks the rules |
+
+Rules are set by editing `.context/config.yaml` (or `setStructure()` from the
+engine, which rewrites only the rule blocks). Engines older than this feature
+ignore the keys.
+
 ### Choosing a vault
 
 By default `ctx` operates on the vault in (or above) the current directory. To
@@ -647,7 +696,9 @@ curated, as query tags:
 
 | Tag | From |
 |---|---|
-| `#pubtype-review-article`, `#pubtype-srma` | `article-type`, `custom-meta document_type` |
+| `#pubtype-systematic-review`, `#pubtype-meta-analysis`, `#pubtype-srma` (SR + MA), `#pubtype-guideline`, `#pubtype-rct`, `#pubtype-review` | MEDLINE publication types from PubMed (`ctx import pubmed`, `ctx enrich pubtator`); raw list in `metadata.publication_types` |
+| `#pubtype-review-article`, `#pubtype-srma` | JATS `article-type`, `custom-meta document_type` — when the PubMed types are unknown (plain `ctx import jats`) |
+| `#article-type-review-article` | JATS `article-type`, once PubMed's types are known (also `metadata.article_type`) |
 | `#year-2019`, `#journal-clin-gastroenterol-hepatol` | `pub-date`, `journal-id` |
 | `#fecal-microbiota-transplantation` | `<kwd>` keywords |
 | `#license-cc-by-nc-nd` | `<license>` / `<ali:license_ref>` |
@@ -664,7 +715,7 @@ papers are re-linked when the paper they cite arrives.
 ```bash
 ctx import jats ./corpus/                 # every .xml / .nxml under the folder
 ctx import jats paper.nxml --keep-xml     # also store the original under assets/jats/
-ctx import pubmed --term "fecal microbiota transplantation[mh] AND open access[filter]" --max 50
+ctx import pubmed --term "chronic pain[majr] AND systematic review[pt]" --license commercial --max 50
 ctx enrich pubtator                       # NCBI entities + relations, MeSH-normalised
 ctx query "#fmt #pubtype-srma -#status-retracted"
 ```
@@ -674,17 +725,30 @@ changed file cuts a new version, and a batch shares one checkpoint. A file
 holding several `<article>`s (a `pmc-articleset` dump) is imported article by
 article. The twin is *derived*: a re-import (`--force`, or changed XML)
 regenerates its body, tags and NLM metadata from the XML and carries over
-only enrichment (`metadata.entities` / `relations` / `pubtator`, `#mesh-`
-tags, a resolved `pmid`/`pmcid`) — hand edits to a twin do not survive. `import
-pubmed` and `enrich pubtator` call NCBI's public services (3 requests/s; set
-`NCBI_API_KEY` or `--api-key` for 10/s). Only the PMC open-access subset is
-fetchable; each twin records its licence.
+only enrichment (`metadata.entities` / `relations` / `pubtator` /
+`publication_types` and the tags derived from them, a resolved `pmid`/`pmcid`)
+— hand edits to a twin do not survive. `import pubmed` and `enrich pubtator`
+call NCBI's public services (3 requests/s; set `NCBI_API_KEY` or `--api-key`
+for 10/s). Each twin records its licence.
+
+`ctx import pubmed` searches **PubMed** — where MeSH (`[mh]`, `[majr]`) and
+publication-type (`[pt]`) qualifiers work; PMC's own search silently ignores
+them — restricted to records with PMC full text (`"pubmed pmc"[sb]` is added
+unless the term already has it), then fetches each hit's JATS from PMC.
+`#pubtype-*` tags come from the record's MEDLINE publication types, not the
+JATS `article-type` (which says "review-article" for most systematic reviews).
+`--license <list>` keeps only articles under those licences — `cc-by`, `cc0`,
+`cc-by-nc`, `cc-by-sa`, … or `commercial` (CC BY + CC0 + public domain). PMC's
+licence filters skip downloads; the licence the JATS itself declares decides,
+so an article with no declared licence is dropped. `--max` counts articles
+*imported*: up to 6× as many candidates are considered so licence drops do not
+shrink the batch, and the drops are listed as skipped.
 
 | Command | Description |
 |---|---|
 | `ctx import jats <paths...> [--folder nodes/papers] [--keep-xml] [--no-relink]` | Import JATS files or folders as markdown twins (the global `--force` republishes unchanged twins) |
-| `ctx import pubmed --term <query> [--max 25] [--api-key]` | Search PMC (open access) and import the hits |
-| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations and `#mesh-` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
+| `ctx import pubmed --term <query> [--max 25] [--license <list>] [--api-key]` | Search PubMed (PMC full text only), keep the licences asked for, and import the hits with MEDLINE `#pubtype-*` tags |
+| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations, `#mesh-` tags and MEDLINE `#pubtype-*` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
 
 ---
 
@@ -759,6 +823,7 @@ cloud:
 | `context_nests` | List every nest in the central registry |
 | `context_skill` | Render a `type: skill` node as a harness-ready skill file |
 | `context_skill_install` | Build the file manifest that installs a vault skill locally |
+| `context_structure` | The nest's structure rules: allowed folders, node types, name formats, templates (`folder` for one folder's rule, `report` for what breaks them) |
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
 | `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
 | `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |

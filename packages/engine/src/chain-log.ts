@@ -42,9 +42,7 @@ export class ChainEventLog {
    */
   async appendBatch(events: HashChainEvent[]): Promise<void> {
     const validated = events.map((e) => hashChainEventSchema.parse(e));
-    for (const event of validated) {
-      await this.storage.appendChainEvent(event);
-    }
+    await this.storage.appendChainEvents(validated);
   }
 
   /** Read every event, validated. Malformed historical entries are dropped silently. */

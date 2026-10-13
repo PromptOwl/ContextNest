@@ -18,6 +18,17 @@ import { ContextNestError, CorruptHistoryError } from "./errors.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
+/**
+ * Largest document (serialized characters, UTF-16 units — not bytes) a new
+ * version is stored as a diff for, on either side of the diff. Above it the
+ * version is a keyframe: a diff would first replay the chain
+ * to rebuild the previous version, then run `createPatch` over the whole text
+ * in one synchronous call — seconds of blocked event loop on a 10 MB document.
+ * ponytail: costs a full copy per version of such a document; a cheaper diff
+ * (common prefix/suffix trimmed before createPatch) if that storage matters.
+ */
+const MAX_DIFF_CHARS = 2 ** 20;
+
 /** What {@link VersionManager.historyOrRepair} found, and what it had to do. */
 export interface ResilientHistory {
   /** The parsed history, or null when there is none to read. */
@@ -90,6 +101,8 @@ export class VersionManager {
     hint = 0,
     /** History the caller already read under the same lock; omit to read it. */
     knownHistory?: DocumentHistory | null,
+    /** `maxRecordedVersion` the caller already listed, nothing sealed since. */
+    knownSealed?: number,
   ): Promise<number> {
     const history =
       knownHistory !== undefined ? knownHistory : (await this.historyOrRepair(docId)).history;
@@ -97,7 +110,7 @@ export class VersionManager {
       (max, entry) => Math.max(max, entry.version),
       0,
     );
-    const sealed = await this.storage.maxRecordedVersion(docId);
+    const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
     return Math.max(hint, recorded, sealed) + 1;
   }
 
@@ -109,9 +122,10 @@ export class VersionManager {
   private async restartNoteFor(
     docId: string,
     history: DocumentHistory | null,
+    knownSealed?: number,
   ): Promise<string | null> {
     if (history) return null;
-    const sealed = await this.storage.maxRecordedVersion(docId);
+    const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
     if (sealed === 0) return null; // genuinely new document, not a restart
     return `Chain restarted — no readable history.yaml, and versions up to v${sealed} were already sealed`;
   }
@@ -142,6 +156,8 @@ export class VersionManager {
        * lock, with nothing appended since; `null` = none. Omit to read it here.
        */
       knownHistory?: DocumentHistory | null;
+      /** `maxRecordedVersion` the caller already listed, nothing sealed since. */
+      knownSealed?: number;
     } = {},
   ): Promise<VersionEntry> {
     // Resilient read: an unreadable history is moved aside and treated as
@@ -154,20 +170,21 @@ export class VersionManager {
     // Decided BEFORE this version's own artifact is written below: counting
     // the v{N}.md we are about to seal made every brand-new document's first
     // entry claim "Chain restarted" (it saw its own keyframe as prior history).
-    const restartNote = await this.restartNoteFor(node.id, readHistory);
+    const restartNote = await this.restartNoteFor(node.id, readHistory, options.knownSealed);
     const history = readHistory || {
       keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
       versions: [],
     };
 
     const currentVersion = node.frontmatter.version || 1;
+    const fullContent = serializeDocument(node);
     let isKeyframe =
       options.keyframe === true ||
       history.versions.length === 0 ||
       currentVersion % history.keyframe_interval === 1 ||
-      currentVersion === 1;
+      currentVersion === 1 ||
+      fullContent.length > MAX_DIFF_CHARS;
 
-    const fullContent = serializeDocument(node);
     const editedAt = new Date().toISOString();
 
     let contentForHash: string;
@@ -188,6 +205,13 @@ export class VersionManager {
           history,
         );
       } catch {
+        isKeyframe = true;
+      }
+      // Shrinking back under the bound still diffs against the large previous
+      // text — the same synchronous createPatch. A keyframe instead (cheap to
+      // reach: that previous version was itself a size keyframe).
+      if (previousContent !== null && previousContent.length > MAX_DIFF_CHARS) {
+        previousContent = null;
         isKeyframe = true;
       }
     }
@@ -301,6 +325,10 @@ export class VersionManager {
   }
 
   /**
+   * NOTE (structure rules, §11.1.1): this re-anchors the sealed head on the
+   * live document without any structure check — grandfathering judges writes
+   * against that head, so a caller must judge the live document in full first.
+   *
    * Make a document's LATEST version readable again after a chain graft.
    *
    * A history grafted by an older import — duplicate version numbers, keyframe

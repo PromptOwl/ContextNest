@@ -91,6 +91,14 @@ ctx add nodes/<slug> --type document --title "<headline>" --tags "<comma,separat
   --body "**Why it matters:** <one sentence>\n\n<details>"
 ```
 
+If the vault has structure rules (the session overview lists them; `ctx
+structure` shows them), file the node where they allow: run `ctx structure
+--folder <folder> --json` first, use an allowed `--type`, a title that fits
+the folder's file-name format (the file name is the title in kebab-case), and
+start the body from the folder's `template_body`, keeping every
+`required_sections` heading. A refused write names the rule it broke; fix the
+write — never work around a rule.
+
 `ctx update <id> --body` **replaces the whole body**, so read the node first
 (`ctx read <id> --raw`) and preserve everything you are not changing.
 

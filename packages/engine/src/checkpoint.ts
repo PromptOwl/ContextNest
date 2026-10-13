@@ -301,58 +301,63 @@ export class CheckpointManager {
   ): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
       // includeRetired only adds rejected docs, which the published filter drops
-      // anyway — and it is the set regenerateIndex needs.
-      const crawled = await this.storage.discoverDocuments({ includeRetired: true });
+      // anyway — and it is the set regenerateIndex needs. A document the crawl
+      // cannot read is not gone: its last sealed entry is carried forward.
+      const unreadable: string[] = [];
+      const crawled = await this.storage.discoverDocuments({ includeRetired: true, onUnreadable: (id) => unreadable.push(id) });
       onCrawl?.(crawled);
       const publishedDocuments = crawled.filter(isPublished);
       // Snapshot before the reads: a write that lands during the seal stays
       // marked for the next one.
       const touched = this.storage.touchedHistorySnapshot();
       const chainState = await this.storage.readCheckpointChainState();
-      let documentHistories: Map<string, SealHistory>;
-      if (chainState.kind === "head") {
-        // Every publish seals, so the head already holds the chain hash of each
-        // document at the version it had then. Reading every history.yaml
-        // again made each publish cost one read per document in the vault —
-        // a full walk of a network-backed mount under the vault lock. Read
-        // only the documents the head cannot vouch for.
-        //
-        // A hash the head sealed is carried forward as is. If the head sealed
-        // a mismatched hash (the torn-snapshot fallback below), later seals at
-        // that version keep it, where a full re-read would have healed it.
-        // `verify` still flags it, and the next version bump re-reads the doc.
-        const head = chainState.checkpoint;
-        documentHistories = new Map();
-        const stale: string[] = [];
-        for (const doc of publishedDocuments) {
-          const hash = head.document_chain_hashes[doc.id];
-          const version = doc.frontmatter.version || 1;
-          const fresh = justSealed?.get(doc.id);
-          if (hash && head.document_versions[doc.id] === version && !touched.has(doc.id)) {
-            documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
-          } else if (fresh && fresh.version === version) {
-            documentHistories.set(doc.id, { versions: [fresh] });
-          } else {
-            stale.push(doc.id);
-          }
+      // Every publish seals, so the head already holds the chain hash of each
+      // document at the version it had then, and `justSealed` holds the ones
+      // this publish appended. Read history.yaml only for documents neither
+      // vouches for: a full walk of a network-backed mount under the vault lock
+      // is what every publish (and every first import, which has no head) paid.
+      //
+      // A hash the head sealed is carried forward as is. If the head sealed
+      // a mismatched hash (the torn-snapshot fallback below), later seals at
+      // that version keep it, where a full re-read would have healed it.
+      // `verify` still flags it, and the next version bump re-reads the doc.
+      const head = chainState.kind === "head" ? chainState.checkpoint : undefined;
+      const documentHistories = new Map<string, SealHistory>();
+      const stale: string[] = [];
+      for (const doc of publishedDocuments) {
+        const hash = head?.document_chain_hashes[doc.id];
+        const version = doc.frontmatter.version || 1;
+        const fresh = justSealed?.get(doc.id);
+        if (hash && head?.document_versions[doc.id] === version && !touched.has(doc.id)) {
+          documentHistories.set(doc.id, { versions: [{ version, chain_hash: hash }] });
+        } else if (fresh && fresh.version === version) {
+          documentHistories.set(doc.id, { versions: [fresh] });
+        } else {
+          stale.push(doc.id);
         }
-        await mapInBatches(stale, async (id) => {
-          try {
-            const history = await this.storage.readHistory(id);
-            if (history) documentHistories.set(id, history);
-          } catch {
-            // Unreadable: no hash for this doc, the same as the full crawl
-            // (called without `onUnreadable`) skipping it. `verify` reports it.
-          }
-        });
-      } else {
-        documentHistories = await this.storage.findAllHistories();
+      }
+      await mapInBatches(stale, async (id) => {
+        try {
+          const history = await this.storage.readHistory(id);
+          if (history) documentHistories.set(id, history);
+        } catch {
+          // Unreadable: no hash for this doc, the same as the full crawl
+          // (called without `onUnreadable`) skipping it. `verify` reports it.
+        }
+      });
+      // A document the crawl could not read keeps the entry the head sealed.
+      const carried = new Map<string, Pick<VersionEntry, "version" | "chain_hash">>();
+      for (const id of unreadable) {
+        const version = head?.document_versions[id];
+        const hash = head?.document_chain_hashes[id];
+        if (version !== undefined && hash) carried.set(id, { version, chain_hash: hash });
       }
       const checkpoint = await this.sealCheckpoint(
         triggeredBy,
         publishedDocuments,
         documentHistories,
         chainState,
+        carried,
       );
       this.storage.clearTouchedHistories(touched);
       return checkpoint;
@@ -368,6 +373,8 @@ export class CheckpointManager {
     publishedDocuments: ContextNode[],
     documentHistories: ReadonlyMap<string, SealHistory>,
     knownChainState?: CheckpointChainState,
+    /** Entries carried forward for documents the crawl could not read (§8.4). */
+    carried?: ReadonlyMap<string, Pick<VersionEntry, "version" | "chain_hash">>,
   ): Promise<Checkpoint> {
     {
       // Re-read inside the lock so the checkpoint number and previous-hash
@@ -420,6 +427,13 @@ export class CheckpointManager {
           docHistory.versions.find((v) => v.version === sealedVersion) ??
           docHistory.versions[docHistory.versions.length - 1];
         documentChainHashes[doc.id] = entry.chain_hash;
+      }
+      // An unreadable document keeps the entry the head sealed for it: the
+      // snapshot never records a deletion that never happened.
+      for (const [id, entry] of carried ?? []) {
+        if (id in documentVersions) continue;
+        documentVersions[id] = entry.version;
+        documentChainHashes[id] = entry.chain_hash;
       }
 
       const checkpointHash = computeCheckpointHash(
