@@ -1,0 +1,3419 @@
+/**
+ * Structure rules enforced through the operation catalog (`createEngineApi`):
+ * every write op refuses what breaks an enforced rule, scaffolds required
+ * structure, grandfathers existing content, and `context_structure` reads the
+ * rules back. The pure checker is covered by structure-rules.test.ts.
+ */
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink, rename, readdir } from "node:fs/promises";
+import { createPatch } from "diff";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { publishDocument, publishDocuments } from "../publish.js";
+import { computeContentHash, sha256Bytes } from "../integrity.js";
+import { sealedHead } from "../structure-store.js";
+import { MemoryKeyStore, setDefaultVaultKeyStore } from "../encryption/key-store.js";
+import { encryptVault } from "../encryption/migrate.js";
+import yaml from "js-yaml";
+import { NestStorage } from "../storage.js";
+import { GraphQueryEngine } from "../graph-query-engine.js";
+import { VersionManager } from "../versioning.js";
+import { parseDocument, serializeDocument } from "../parser.js";
+import { extractWikiLinks } from "../wiki-graph.js";
+import {
+  setStructure,
+  approveReview,
+  approveSuggestion,
+  stageSuggestion,
+  czarDirectEdit,
+  rollbackDocument,
+  compileStructure,
+  scaffoldFirstPublish,
+  type RbacHook,
+  type StructureConfig,
+} from "../index.js";
+import { createEngineApi, getOperation, listOperations, type OperationContext } from "../api/index.js";
+import { textPdf, textPdfV2, toBase64 } from "./fixtures/pdf-fixtures.js";
+
+const RULES: StructureConfig = {
+  structure: { enforce: true, closed: true },
+  folders: {
+    "clients/{client}": {
+      folder_name: "/[a-z]+-[0-9]{3}/",
+      types: ["document"],
+      files: { overview: { template: "client-overview" } },
+    },
+    "clients/{client}/meetings": {
+      required: true,
+      types: ["document"],
+      file_name: "{date}-{slug}",
+      template: "meeting-note",
+    },
+    "clients/{client}/contracts": { required: true, types: ["pdf"] },
+    decisions: { types: ["document"], file_name: "adr-{n}-{slug}" },
+  },
+  templates: {
+    "meeting-note": {
+      body: "## Attendees\n## Decisions\n## Action items\n",
+      required_sections: ["Decisions", "Action items"],
+    },
+    "client-overview": { body: "## Summary\n## Contacts\n" },
+  },
+};
+
+const MEETING = "## Attendees\nAll.\n## Decisions\nShip.\n## Action items\nNone.\n";
+
+const api = createEngineApi();
+let dir: string;
+let storage: NestStorage;
+let ctx: OperationContext;
+
+async function writeConfig(extra: Record<string, unknown>) {
+  await writeFile(
+    join(dir, ".context", "config.yaml"),
+    yaml.dump({ version: 1, name: "rules-test", ...extra }, { lineWidth: -1 }),
+    "utf-8",
+  );
+}
+
+const exists = (rel: string) =>
+  access(join(dir, rel)).then(
+    () => true,
+    () => false,
+  );
+
+/** Run an op and return the error it throws (fails the test if it doesn't). */
+async function refusal(name: string, input: Record<string, unknown>, c: OperationContext = ctx) {
+  try {
+    await api.run(name, input, c);
+  } catch (err) {
+    return err as Error & { code?: string };
+  }
+  throw new Error(`${name} was expected to be refused but succeeded`);
+}
+
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "cn-structure-ops-"));
+  storage = new NestStorage(dir);
+  await storage.init("rules-test");
+  ctx = {
+    storage,
+    query: new GraphQueryEngine(storage),
+    versions: new VersionManager(storage),
+    actor: "tester@example.com",
+  };
+});
+afterEach(async () => {
+  await rm(dir, { recursive: true, force: true });
+});
+
+// ─── context_create ─────────────────────────────────────────────────────────
+
+describe("context_create under enforced rules", () => {
+  beforeEach(() => writeConfig(RULES));
+
+  it("refuses a document in an undeclared folder and writes nothing", async () => {
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(err.code).toBe("VALIDATION_FAILED");
+    expect(err.message).toMatch(/"notes\/" is not an allowed folder/);
+    expect(err.message).toMatch(/ctx structure/);
+    expect(await exists("nodes/notes/idea.md")).toBe(false);
+    expect(await exists("nodes/notes")).toBe(false);
+  });
+
+  it("refuses a title that does not fit the folder's name format", async () => {
+    const err = await refusal("context_create", {
+      title: "Kickoff",
+      content: MEETING,
+      folder: "clients/acme-042/meetings",
+    });
+    expect(err.message).toMatch(/\{date\}-\{slug\}/);
+  });
+
+  it("refuses an explicit id that breaks a rule", async () => {
+    const err = await refusal("context_create", {
+      id: "nodes/decisions/use-postgres",
+      title: "Use Postgres",
+      content: "x",
+    });
+    expect(err.message).toMatch(/adr-\{n\}-\{slug\}/);
+  });
+
+  it("refuses a body missing a required section", async () => {
+    const err = await refusal("context_create", {
+      title: "2026-10-07 Kickoff",
+      content: "## Attendees\n",
+      folder: "clients/acme-042/meetings",
+    });
+    expect(err.message).toMatch(/Decisions/);
+  });
+
+  it("refuses a type the folder does not allow", async () => {
+    const err = await refusal("context_create", {
+      title: "MSA",
+      content: "x",
+      folder: "clients/acme-042/contracts",
+    });
+    expect(err.message).toMatch(/pdf/);
+  });
+
+  it("refuses a bad placeholder folder name", async () => {
+    const err = await refusal("context_create", {
+      title: "2026-10-07 Kickoff",
+      content: MEETING,
+      folder: "clients/acme/meetings",
+    });
+    expect(err.message).toMatch(/clients\/acme/);
+  });
+
+  it("refuses a held-for-review create the same way (checked before the hold)", async () => {
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes", review: true });
+    expect(err.message).toMatch(/not an allowed folder/);
+  });
+
+  it("accepts a conforming document and scaffolds the new client folder", async () => {
+    const res = await api.run<{ id: string }>(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" },
+      ctx,
+    );
+    expect(res.id).toBe("nodes/clients/acme-042/meetings/2026-10-07-kickoff");
+    // Required sibling subfolder and required file, created with the folder.
+    expect(await exists("nodes/clients/acme-042/contracts")).toBe(true);
+    const overview = await storage.readDocument("nodes/clients/acme-042/overview");
+    expect(overview.frontmatter.status).toBe("draft");
+    expect(overview.body).toContain("## Summary");
+  });
+
+  it("does not re-scaffold (or overwrite) a folder that already exists", async () => {
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+    await api.run(
+      "context_update",
+      { id: "nodes/clients/acme-042/overview", content: "## Summary\nEdited.\n## Contacts\n" },
+      ctx,
+    );
+    await api.run("context_create", { title: "2026-10-08 Follow up", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+    const overview = await storage.readDocument("nodes/clients/acme-042/overview");
+    expect(overview.body).toContain("Edited.");
+  });
+
+  it("a held-for-review create is not scaffolded — nothing beyond the held write lands before approval", async () => {
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(false);
+  });
+
+  it.each([
+    [{ title: "Evil", content: "x", folder: "packs" }],
+    [{ title: "Evil", content: "x", folder: "_suggestions" }],
+    [{ id: "nodes/context", title: "Evil", content: "x" }],
+    [{ id: "nodes/forbidden/INDEX", title: "Evil", content: "x" }],
+  ])("look-alikes of system paths are not a way around closed rules: %j", async (input) => {
+    const err = await refusal("context_create", input);
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("a trusted host's skip flag bypasses the rules", async () => {
+    const res = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Idea", content: "x", folder: "notes" },
+      { ...ctx, structure: "skip" },
+    );
+    expect(res.id).toBe("nodes/notes/idea");
+  });
+
+  it("the skip flag cannot be passed as operation input", async () => {
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes", structure: "skip" });
+    expect(err.code).toBe("VALIDATION_FAILED");
+    expect(err.message).toMatch(/unrecognized parameter/);
+  });
+});
+
+describe(".context/ is never a document path", () => {
+  it.each([".context/evil", ".CONTEXT/evil", "nodes/.context/evil", ".context./evil"])(
+    "context_create refuses id %s even with no rules",
+    async (id) => {
+      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+      expect(err.code).toBe("VALIDATION_FAILED");
+      expect(err.message).toMatch(/\.context/);
+    },
+  );
+
+  it("context_import_pdf refuses it too (documents[] takes no id, and its folder is slugified)", async () => {
+    const err = await refusal("context_import_pdf", { bytes_base64: toBase64(textPdf()), id: ".context/evil" });
+    expect(err.message).toMatch(/\.context/);
+    expect(await exists(".context/evil.md")).toBe(false);
+  });
+});
+
+describe("a backslash is never part of a written id", () => {
+  it.each(["nodes/notes\\evil", "notes\\evil"])("context_create refuses %s", async (id) => {
+    const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+    expect(err.code).toMatch(/VALIDATION_FAILED|INVALID_DOCUMENT_ID/);
+  });
+});
+
+describe("reserved paths are never document paths, in any layout", () => {
+  it.each(["_suggestions/evil", "packs/evil", "nodes/x/.versions/y/v1", "nodes/x/_suggestions/evil"])(
+    "context_create refuses id %s in a flat vault, rules or not",
+    async (id) => {
+      const flatDir = await mkdtemp(join(tmpdir(), "cn-structure-flat-"));
+      const flat = new NestStorage(flatDir);
+      await flat.init("flat", "obsidian");
+      const flatCtx = { ...ctx, storage: flat, query: new GraphQueryEngine(flat), versions: new VersionManager(flat) };
+      try {
+        const err = await refusal("context_create", { id, title: "Evil", content: "x" }, flatCtx);
+        expect(err.code).toBe("VALIDATION_FAILED");
+        expect((await flat.discoverDocuments()).map((d) => d.id)).not.toContain(id);
+      } finally {
+        await rm(flatDir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("malformed but unenforced rules never stop a write", () => {
+  it.each([
+    [{ templates: ["meeting"] }],
+    [{ structure: { enforce: false }, folders: { notes: { types: "document" } } }],
+  ])("%j: writes succeed and context_structure reports the error", async (extra) => {
+    await writeConfig(extra as never);
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+    const out = await api.run<any>("context_structure", {}, ctx);
+    expect(out.error).toBeTruthy();
+  });
+
+  it("the same malformed rule in an enforced vault refuses writes with CONFIG_ERROR", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { notes: { types: "document" } } });
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(err.code).toBe("CONFIG_ERROR");
+    expect(err.message).toMatch(/folders\.notes\.types/);
+  });
+});
+
+describe("publishing never reaches a reserved path", () => {
+  it("context_import ids[] and context_publish refuse ids under packs/ and .versions/", async () => {
+    await writeFile(join(dir, "packs", "evil.md"), "---\ntitle: Evil\n---\nx\n", "utf-8");
+    const res = await api.run<{ published: unknown[]; failed: { id?: string }[] }>(
+      "context_import",
+      { ids: ["packs/evil"] },
+      ctx,
+    );
+    expect(res.published).toEqual([]);
+    expect(res.failed.map((f) => f.id)).toEqual(["packs/evil"]);
+    const err = await refusal("context_publish", { id: "packs/evil" });
+    expect(err.message).toMatch(/reserved/);
+  });
+
+  it.each(["nodes/x/.verſions/y", "packſ/x", ".context::$INDEX_ALLOCATION/x", "nodes/a\u0000b"])(
+    "the write guard sees through %j (long s, NTFS streams, control characters)",
+    async (id) => {
+      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+      expect(err.code).toMatch(/VALIDATION_FAILED|INVALID_DOCUMENT_ID/);
+      expect(err.message).not.toContain(dir);
+    },
+  );
+});
+
+describe("context_import files[] honours the reserved paths too", () => {
+  it.each([["structured"], ["obsidian"]])("a %s vault refuses a document under the root packs/", async (layout) => {
+    const vdir = await mkdtemp(join(tmpdir(), "cn-structure-import-packs-"));
+    const v = new NestStorage(vdir);
+    await v.init("v", layout as "structured" | "obsidian");
+    const vctx = { ...ctx, storage: v, query: new GraphQueryEngine(v), versions: new VersionManager(v) };
+    try {
+      const res = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        { files: [{ path: "packs/evil.md", content: "---\ntitle: Evil\ntype: persona\n---\nx\n" }] },
+        vctx,
+      );
+      expect(res.failed.map((f) => f.id)).toEqual(["packs/evil.md"]);
+      expect((await v.discoverDocuments()).map((d) => d.id)).not.toContain("packs/evil");
+    } finally {
+      await rm(vdir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("report-only and absent rules", () => {
+  it("enforce: false lets every write through", async () => {
+    await writeConfig({ ...RULES, structure: { enforce: false, closed: true } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+  });
+
+  it("a vault with no rules behaves exactly as before", async () => {
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+  });
+
+  it("report-only mode writes nothing beyond the document — no scaffolding", async () => {
+    await writeConfig({ ...RULES, structure: { enforce: false } });
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(false);
+    expect(await exists("nodes/clients/acme-042/contracts")).toBe(false);
+  });
+
+  it("the spec's own §11.1 config (template label, legacy keys, no structure) keeps every write working", async () => {
+    await writeConfig({ folders: { decisions: { template: "adr" }, Engineering: { description: "x" }, _drafts: {} } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+    const out = await api.run<any>("context_structure", { folder: "decisions" }, ctx);
+    expect(out.error).toBeUndefined();
+    expect(out.resolved).toMatchObject({ template: "adr" });
+  });
+
+  it("a bad rule in report-only mode refuses nothing", async () => {
+    await writeConfig({ folders: { d: { file_name: "/(a+)+/" } } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x" }, ctx);
+    expect(res.id).toBe("nodes/idea");
+  });
+
+  it("a bad rule refuses writes with CONFIG_ERROR but reads keep working", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { d: { file_name: "/(a+)+/" } } });
+    const err = await refusal("context_create", { title: "Idea", content: "x" });
+    expect(err.code).toBe("CONFIG_ERROR");
+    expect(err.message).toMatch(/folders\.d\.file_name/);
+    const listed = await api.run<{ documents: unknown[] }>("context_list", {}, ctx);
+    expect(Array.isArray(listed.documents)).toBe(true);
+  });
+});
+
+// ─── context_update (grandfathering) ────────────────────────────────────────
+
+describe("context_update — grandfathering", () => {
+  beforeEach(async () => {
+    // Content that predates the rules: written before the config gains them.
+    await api.run("context_create", { title: "Old note", content: "legacy", folder: "notes" }, ctx);
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" },
+      ctx,
+    );
+    await writeConfig(RULES);
+  });
+
+  it("a misfiled document stays editable", async () => {
+    const res = await api.run<{ id: string }>("context_update", { id: "nodes/notes/old-note", content: "edited" }, ctx);
+    expect(res.id).toBe("nodes/notes/old-note");
+  });
+
+  it("re-typing into a disallowed type is refused", async () => {
+    const err = await refusal("context_update", {
+      id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff",
+      type: "prompt",
+    });
+    expect(err.message).toMatch(/prompt/);
+  });
+
+  it("dropping a required section is refused and the file is untouched", async () => {
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    const before = await readFile(join(dir, `${id}.md`), "utf-8");
+    const err = await refusal("context_update", { id, content: "## Attendees\n## Action items\n" });
+    expect(err.message).toMatch(/Decisions/);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).toBe(before);
+  });
+});
+
+// ─── context_delete ─────────────────────────────────────────────────────────
+
+describe("context_delete", () => {
+  beforeEach(async () => {
+    await writeConfig(RULES);
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+  });
+
+  it("refuses to delete a required file on its own", async () => {
+    const err = await refusal("context_delete", { id: "nodes/clients/acme-042/overview" });
+    expect(err.message).toMatch(/delete the folder/);
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it("the required file goes last: once the folder holds nothing else it can be deleted", async () => {
+    await api.run("context_delete", { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" }, ctx);
+    const res = await api.run<{ deleted: boolean }>("context_delete", { id: "nodes/clients/acme-042/overview" }, ctx);
+    expect(res.deleted).toBe(true);
+  });
+
+  it("deletes an ordinary document", async () => {
+    const res = await api.run<{ deleted: boolean }>(
+      "context_delete",
+      { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" },
+      ctx,
+    );
+    expect(res.deleted).toBe(true);
+  });
+});
+
+// ─── context_import ─────────────────────────────────────────────────────────
+
+describe("context_import", () => {
+  beforeEach(() => writeConfig(RULES));
+
+  it("documents[]: a non-conforming document fails on its own, the rest land", async () => {
+    const res = await api.run<{ published: { id: string }[]; failed: { title?: string; error: string }[] }>(
+      "context_import",
+      {
+        documents: [
+          { title: "Stray", content: "x", folder: "notes" },
+          { title: "ADR 1 Use PG", content: "x", folder: "decisions" },
+        ],
+      },
+      ctx,
+    );
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0].title).toBe("Stray");
+    expect(res.failed[0].error).toMatch(/not an allowed folder/);
+    expect(res.published.map((p) => p.id)).toEqual(["nodes/decisions/adr-1-use-pg"]);
+  });
+
+  it("files[]: a non-conforming document file is refused, a conforming one lands", async () => {
+    const doc = (title: string, type = "document") =>
+      serializeDocument({ id: "x", filePath: "", rawContent: "", frontmatter: { title, type: type as any }, body: "x" });
+    const res = await api.run<{ failed: { id?: string; error: string }[]; written: number }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/notes/stray.md", content: doc("Stray") },
+          { path: "nodes/decisions/adr-2-x.md", content: doc("ADR 2") },
+        ],
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/notes/stray.md"]);
+    expect(await exists("nodes/notes/stray.md")).toBe(false);
+    expect(await exists("nodes/decisions/adr-2-x.md")).toBe(true);
+  });
+
+  it("files[]: a refused document takes its history and its folder's other files with it", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/notes/stray.md", content: "---\ntitle: Stray\n---\nx\n" },
+          { path: "nodes/notes/.versions/stray/history.yaml", content: "document_id: x\nversions: []\n" },
+          { path: "nodes/notes/diagram.png", content: "png" },
+          { path: "assets/logo.png", content: "png" },
+        ],
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id).sort()).toEqual([
+      "nodes/notes/.versions/stray/history.yaml",
+      "nodes/notes/diagram.png",
+      "nodes/notes/stray.md",
+    ]);
+    expect(await exists("nodes/notes")).toBe(false);
+    // A structured vault's root-level folders are not content: not judged.
+    expect(await exists("assets/logo.png")).toBe(true);
+  });
+
+  it("files[]: a file is judged where the importer lands it (it renames _suggestions/ to suggestions/)", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/decisions/adr-3-x.md", content: "---\ntitle: ADR 3\n---\nx\n" },
+          { path: "nodes/decisions/_suggestions/adr-3-x/s1.patch", content: "p" },
+        ],
+      },
+      ctx,
+    );
+    // decisions/suggestions/ is not a declared folder, so under closed rules
+    // the patch is refused while its document lands.
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/decisions/_suggestions/adr-3-x/s1.patch"]);
+    expect(await exists("nodes/decisions/adr-3-x.md")).toBe(true);
+  });
+
+  it("files[]: a refused document's PDF sidecar is refused with it", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/decisions/bad.md", content: "---\ntitle: Bad\n---\nx\n" },
+          { path: "nodes/decisions/bad.pdf", content: "%PDF" },
+        ],
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id).sort()).toEqual(["nodes/decisions/bad.md", "nodes/decisions/bad.pdf"]);
+    expect(await exists("nodes/decisions/bad.pdf")).toBe(false);
+  });
+
+  it("files[]: no rename warning for a file that was refused", async () => {
+    const res = await api.run<{ warnings?: string[] }>(
+      "context_import",
+      { files: [{ path: ".context/config.yaml", content: "version: 1\nname: x\n" }] },
+      ctx,
+    );
+    expect((res.warnings ?? []).join(" ")).not.toMatch(/config-2/);
+  });
+
+  it("files[]: an uppercase .MD file is judged as a document", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/Stray.MD", content: "---\ntitle: Stray\n---\nx\n" }] },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/notes/Stray.MD"]);
+  });
+
+  it("files[] with overwrite re-imports a grandfathered document (judged as an update)", async () => {
+    await writeConfig({});
+    await api.run("context_create", { title: "Old note", content: "legacy", folder: "notes" }, ctx);
+    await writeConfig(RULES);
+    const raw = await readFile(join(dir, "nodes", "notes", "old-note.md"), "utf-8");
+    const res = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/old-note.md", content: raw.replace("legacy", "relinked") }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed).toEqual([]);
+  });
+
+  it("files[]: .context/ cannot be written — rules and the review gate stay the owner's", async () => {
+    const before = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
+    const res = await api.run<{ failed: { id?: string; error: string }[] }>(
+      "context_import",
+      {
+        files: [{ path: ".context/config.yaml", content: "version: 1\nname: pwned\n" }],
+        overwrite: true,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual([".context/config.yaml"]);
+    expect(res.failed[0].error).toMatch(/\.context/);
+    expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toBe(before);
+  });
+
+  it(".context/ is refused even without rules, and through path tricks", async () => {
+    await writeConfig({});
+    for (const path of ["./.context/stewards.yaml", "nodes/../.context/config.yaml", ".CONTEXT/config.yaml", "\\.context\\config.yaml"]) {
+      const res = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        { files: [{ path, content: "x" }], overwrite: true },
+        ctx,
+      );
+      expect(res.failed).toHaveLength(1);
+    }
+    expect(await exists(".context/stewards.yaml")).toBe(false);
+  });
+
+  it("a trusted host restoring a whole vault (skip) may land .context/config.yaml and misfiled content", async () => {
+    const res = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      {
+        files: [
+          { path: ".context/config.yaml", content: "version: 1\nname: restored\n" },
+          { path: "nodes/notes/stray.md", content: "---\ntitle: Stray\n---\nx\n" },
+        ],
+        overwrite: true,
+      },
+      { ...ctx, structure: "skip" },
+    );
+    expect(res.failed).toEqual([]);
+    expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toMatch(/restored/);
+  });
+});
+
+// ─── Approvals re-check the rules ───────────────────────────────────────────
+
+describe("context_publish is judged against the rules in force (every approval surface publishes)", () => {
+  it("refuses publishing a never-published draft the rules now refuse", async () => {
+    await api.run("context_create", { title: "Old", content: "x", folder: "notes", publish: false }, ctx);
+    await writeConfig(RULES);
+    const err = await refusal("context_publish", { id: "nodes/notes/old" });
+    expect(err.message).toMatch(/not an allowed folder/);
+  });
+
+  it("refuses publishing an out-of-band edit that drops a required heading", async () => {
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    await writeFile(join(dir, `${id}.md`), raw.replace("## Decisions\nShip.\n", ""), "utf-8");
+    await writeConfig(RULES);
+    const err = await refusal("context_publish", { id });
+    expect(err.message).toMatch(/Decisions/);
+  });
+
+  it("first publish of a held create scaffolds the folders it alone occupies", async () => {
+    await writeConfig(RULES);
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+    await api.run("context_publish", { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" }, ctx);
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+});
+
+describe("approvals are judged against the rules in force", () => {
+  const MEETING_RULES: StructureConfig = {
+    structure: { enforce: true },
+    folders: { meetings: { types: ["document"], template: "m" } },
+    templates: { m: { body: "## Decisions\n", required_sections: ["Decisions"] } },
+  };
+  const ALLOW: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+
+  it("approveReview refuses a held edit that drops a required heading", async () => {
+    const id = "nodes/meetings/kickoff";
+    await api.run("context_create", { title: "Kickoff", content: "## Decisions\nShip.\n", folder: "meetings" }, ctx);
+    const held = await api.run<{ held_for_review?: boolean }>(
+      "context_update",
+      { id, content: "## Notes\nnone\n", review: true },
+      ctx,
+    );
+    expect(held.held_for_review).toBe(true);
+    await writeConfig(MEETING_RULES);
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/Decisions/);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).toContain("Ship.");
+  });
+
+  // Review of 7016294: the held edit was judged against the rebuilt head and
+  // written, and only then did its publish judge it against the sealed head.
+  // A head that does not verify grants nothing, so the publish refused — with
+  // the unpublished edit already in the live file.
+  it("approveReview refused by its publish leaves the live file untouched", async () => {
+    const id = "nodes/meetings/kickoff";
+    await api.run("context_create", { title: "Kickoff", content: "## Notes\nold\n", folder: "meetings" }, ctx);
+    await api.run("context_update", { id, content: "## Notes\nnew\n", review: true }, ctx);
+    const historyPath = join(dir, "nodes/meetings/.versions/kickoff/history.yaml");
+    const history = await readFile(historyPath, "utf-8");
+    await writeFile(historyPath, history.replace(/content_hash: "?sha256:[a-f0-9]{64}"?/, `content_hash: "sha256:${"0".repeat(64)}"`), "utf-8");
+    await writeConfig(MEETING_RULES);
+    const live = await readFile(join(dir, `${id}.md`), "utf-8");
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/Decisions/);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).toBe(live);
+  });
+
+  it("approving a held create scaffolds the folders that document alone occupies", async () => {
+    await writeConfig(RULES);
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(false);
+    await approveReview(storage, id, { actor: "owner" });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+    expect(await exists("nodes/clients/acme-042/contracts")).toBe(true);
+  });
+
+  it("approveSuggestion refuses a drift edit that re-types the node into a refused type", async () => {
+    const id = "nodes/meetings/kickoff";
+    await api.run("context_create", { title: "Kickoff", content: "## Decisions\nShip.\n", folder: "meetings" }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    const staged = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: raw,
+      proposedRawContent: raw.replace("type: document", "type: glossary"),
+      source: "out-of-band-edit",
+      actor: "user",
+      docTier: "standard",
+    });
+    await writeConfig(MEETING_RULES);
+    await expect(
+      approveSuggestion({
+        storage,
+        rbac: ALLOW,
+        documentId: id,
+        suggestionId: staged.meta.suggestion_id,
+        actor: "owner",
+        zone: "default",
+      }),
+    ).rejects.toThrow(/glossary/);
+  });
+});
+
+// ─── context_import_pdf ─────────────────────────────────────────────────────
+
+describe("context_import_pdf", () => {
+  beforeEach(() => writeConfig(RULES));
+
+  it("refuses a PDF where PDFs are not allowed", async () => {
+    const err = await refusal("context_import_pdf", {
+      bytes_base64: toBase64(textPdf()),
+      title: "Q3 Report",
+      folder: "decisions",
+    });
+    expect(err.message).toMatch(/pdf/i);
+    expect(await exists("nodes/decisions/q3-report.md")).toBe(false);
+    expect(await exists("nodes/decisions/q3-report.pdf")).toBe(false);
+  });
+
+  it("accepts a PDF in a folder that allows it", async () => {
+    const res = await api.run<{ id: string }>(
+      "context_import_pdf",
+      { bytes_base64: toBase64(textPdf()), title: "MSA", folder: "clients/acme-042/contracts" },
+      ctx,
+    );
+    expect(res.id).toBe("nodes/clients/acme-042/contracts/msa");
+  });
+});
+
+// ─── context_structure ──────────────────────────────────────────────────────
+
+describe("context_structure", () => {
+  it("is a core catalog operation", () => {
+    const op = getOperation("context_structure");
+    expect(op?.namespace).toBe("core");
+    expect(listOperations("core").map((o) => o.name)).toContain("context_structure");
+  });
+
+  it("returns the rules, the resolved rule for a folder, and the compliance report", async () => {
+    await api.run("context_create", { title: "Old note", content: "x", folder: "notes" }, ctx);
+    await writeConfig(RULES);
+    const out = await api.run<any>(
+      "context_structure",
+      { folder: "clients/acme-042/meetings", report: true },
+      ctx,
+    );
+    expect(out.enforce).toBe(true);
+    expect(out.closed).toBe(true);
+    expect(out.folders.map((f: any) => f.pattern)).toContain("decisions");
+    expect(out.templates["meeting-note"].required_sections).toEqual(["Decisions", "Action items"]);
+    expect(out.resolved).toMatchObject({
+      pattern: "clients/{client}/meetings",
+      file_name: "{date}-{slug}",
+      template_body: "## Attendees\n## Decisions\n## Action items\n",
+    });
+    expect(out.violations.map((v: any) => v.code)).toContain("FOLDER_NOT_ALLOWED");
+  });
+
+  it("a vault without rules answers with an empty, report-only rule set", async () => {
+    const out = await api.run<any>("context_structure", {}, ctx);
+    expect(out).toMatchObject({ enforce: false, closed: false, folders: [], templates: {} });
+    expect(out.resolved).toBeUndefined();
+    expect(out.violations).toBeUndefined();
+  });
+
+  it("reports an unresolved template name as a warning", async () => {
+    await writeConfig({ folders: { decisions: { template: "ADR" } }, templates: { adr: { body: "x" } } });
+    const out = await api.run<any>("context_structure", {}, ctx);
+    expect(out.warnings).toEqual([expect.stringMatching(/ADR/)]);
+  });
+
+  it("a bad rule is reported in the output, not thrown — reading the rules is a read", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { d: { types: ["memo"] } } });
+    const out = await api.run<any>("context_structure", { report: true }, ctx);
+    expect(out.error).toMatch(/memo/);
+    expect(out.folders).toEqual([]);
+  });
+
+  it("the report judges only content folders: a structured vault's root-level folders are not nodes", async () => {
+    await writeConfig(RULES);
+    await writeFile(join(dir, "README-assets.txt"), "x");
+    await api.run("context_import", { files: [{ path: "assets/diagram.png", content: "x" }] }, ctx);
+    const out = await api.run<any>("context_structure", { report: true }, ctx);
+    expect(out.violations.filter((v: any) => v.path.startsWith("assets"))).toEqual([]);
+  });
+});
+
+// ─── setStructure ───────────────────────────────────────────────────────────
+
+describe("setStructure", () => {
+  const CONFIG = [
+    "# my vault",
+    "version: 1",
+    "name: rules-test",
+    "review: 'on'",
+    "folders:",
+    "  old: { description: gone }",
+    "# keep this comment",
+    "servers:",
+    "  jira: { url: 'https://example.com', transport: mcp }",
+    "",
+  ].join("\n");
+
+  beforeEach(() => writeFile(join(dir, ".context", "config.yaml"), CONFIG, "utf-8"));
+
+  it("replaces only the rule blocks and leaves everything else byte-for-byte", async () => {
+    await setStructure(storage, RULES);
+    const raw = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
+    expect(raw).toContain("# my vault");
+    expect(raw).toContain("# keep this comment");
+    expect(raw).toContain("review: 'on'");
+    expect(raw).toContain("  jira: { url: 'https://example.com', transport: mcp }");
+    expect(raw).not.toContain("old:");
+    const cfg = (await storage.readConfig())!;
+    expect(cfg.structure).toEqual({ enforce: true, closed: true });
+    expect(Object.keys(cfg.folders ?? {})).toContain("clients/{client}");
+    expect(cfg.templates?.["meeting-note"]?.required_sections).toEqual(["Decisions", "Action items"]);
+    expect(cfg.servers?.jira?.url).toBe("https://example.com");
+  });
+
+  it("refuses invalid rules without writing", async () => {
+    let caught: any;
+    try {
+      await setStructure(storage, { folders: { d: { file_name: "/(a+)+/" } } });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught?.code).toBe("CONFIG_ERROR");
+    expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toBe(CONFIG);
+  });
+
+  it("an empty rule set removes the blocks", async () => {
+    await setStructure(storage, RULES);
+    await setStructure(storage, {});
+    const cfg = (await storage.readConfig())!;
+    expect(cfg.structure).toBeUndefined();
+    expect(cfg.folders).toBeUndefined();
+    expect(cfg.templates).toBeUndefined();
+    expect(cfg.review).toBe("on");
+  });
+
+  it("preserves CRLF line endings", async () => {
+    await writeFile(join(dir, ".context", "config.yaml"), CONFIG.replace(/\n/g, "\r\n"), "utf-8");
+    await setStructure(storage, RULES);
+    const raw = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
+    expect(raw.replace(/\r\n/g, "")).not.toContain("\n");
+  });
+
+  it("a column-0 comment inside a rule block does not split it", async () => {
+    const cfg = "version: 1\nname: t\ndefaults:\n  status: draft\nfolders:\n  a: {}\n# a note\n  b:\n    types: [glossary]\nreview: 'on'\n";
+    await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
+    await setStructure(storage, RULES);
+    const parsed = yaml.load(await readFile(join(dir, ".context", "config.yaml"), "utf-8")) as any;
+    expect(parsed.defaults).toEqual({ status: "draft" });
+    expect(parsed.review).toBe("on");
+    expect(Object.keys(parsed.folders)).not.toContain("b");
+  });
+
+  it("keeps a BOM and each line's own ending in a mixed-EOL file", async () => {
+    const cfg = "\uFEFFversion: 1\r\nname: t\n# keep\r\nfolders:\n  a: {}\n";
+    await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
+    await setStructure(storage, RULES);
+    const raw = await readFile(join(dir, ".context", "config.yaml"), "utf-8");
+    expect(raw.startsWith("\uFEFFversion: 1\r\nname: t\n# keep\r\n")).toBe(true);
+    expect((await storage.readConfig())?.structure?.enforce).toBe(true);
+  });
+
+  it("refuses with CONFIG_ERROR, writing nothing, when it cannot rewrite safely", async () => {
+    const cfg = "version: 1\nname: t\n...\n";
+    await writeFile(join(dir, ".context", "config.yaml"), cfg, "utf-8");
+    await expect(setStructure(storage, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(join(dir, ".context", "config.yaml"), "utf-8")).toBe(cfg);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the config file's mode and writes through a symlink", async () => {
+    const { chmod, stat, symlink, rename, lstat } = await import("node:fs/promises");
+    const cfg = join(dir, ".context", "config.yaml");
+    await chmod(cfg, 0o600);
+    await setStructure(storage, RULES);
+    expect((await stat(cfg)).mode & 0o777).toBe(0o600);
+    await rename(cfg, join(dir, ".context", "real.yaml"));
+    await symlink("real.yaml", cfg);
+    await setStructure(storage, {});
+    expect((await lstat(cfg)).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses a directory that is not a vault", async () => {
+    const other = new NestStorage(await mkdtemp(join(tmpdir(), "cn-not-vault-")));
+    await expect(setStructure(other, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+  });
+});
+
+describe("QA round 5: ids a file system cannot hold, stream suffixes, the enforce flag", () => {
+  it.each([
+    ["too deep", `nodes/${"a/".repeat(5000)}x`],
+    ["with a name too long", `nodes/${"b".repeat(300)}`],
+  ])("an id %s is refused at once, without the vault path", async (_l, id) => {
+    await writeConfig({ structure: { enforce: true } });
+    const started = Date.now();
+    const err = await refusal("context_create", { id, title: "Deep", content: "x" });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(err.code).toBe("INVALID_DOCUMENT_ID");
+    expect(err.message).not.toContain(dir);
+    expect(err.message.length).toBeLessThan(400);
+  });
+
+  it("a settings path behind an NTFS stream suffix is not importable", async () => {
+    const path = ".context::$INDEX_ALLOCATION/config.yaml";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "version: 1\nname: evil\n" }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual([path]);
+  });
+
+  it.each([["yes"], ["true"], [1]])("enforce: %j is not a boolean — writes fail closed, naming the key", async (flag) => {
+    await writeConfig({ ...RULES, structure: { enforce: flag, closed: true } });
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(err.code).toBe("CONFIG_ERROR");
+    expect(err.message).toContain("structure.enforce");
+  });
+
+  it("a stale temp file from an earlier crash does not fail setStructure", async () => {
+    const { realpath } = await import("node:fs/promises");
+    const tmp = `${await realpath(join(dir, ".context", "config.yaml"))}.${process.pid}.tmp`;
+    await writeFile(tmp, "stale", "utf-8");
+    await setStructure(storage, RULES);
+    await expect(access(tmp)).rejects.toThrow();
+  });
+
+  it("re-initializing a vault keeps its rules, even when the config fails validation", async () => {
+    await writeFile(
+      join(dir, ".context", "config.yaml"),
+      yaml.dump({ version: "not-a-number", name: "x", ...RULES }, { lineWidth: -1 }),
+      "utf-8",
+    );
+    await storage.init("again");
+    expect((await storage.readConfig())?.structure).toEqual(RULES.structure);
+    expect((await storage.readConfig())?.folders).toEqual(RULES.folders);
+  });
+
+  it("re-initializing over a config that is not YAML but names rules is refused, and the file is kept", async () => {
+    const cfg = join(dir, ".context", "config.yaml");
+    const broken = "version: 1\nname: x\nstructure: {enforce: true\nfolders: [unclosed\n";
+    await writeFile(cfg, broken, "utf-8");
+    await expect(storage.init("again")).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(cfg, "utf-8")).toBe(broken);
+  });
+});
+
+describe("architecture round 5: every publish path, update guard, symlinks, trusted restores", () => {
+  const ID = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+  const hold = () =>
+    api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true },
+      ctx,
+    );
+  const firstFailure = (r: { failed: { error: string }[] }) => {
+    if (r.failed.length) throw new Error(r.failed[0].error);
+  };
+  const surfaces: Array<[string, () => Promise<unknown>]> = [
+    ["context_import ids[]", async () => firstFailure(await api.run("context_import", { ids: [ID] }, ctx))],
+    ["context_update publish: true", () => api.run("context_update", { id: ID, publish: true }, ctx)],
+    ["publishDocument", () => publishDocument(storage, ID, { editedBy: "owner" })],
+    ["publishDocuments", async () => firstFailure(await publishDocuments(storage, [ID], { editedBy: "owner" }))],
+  ];
+
+  it.each(surfaces)("%s scaffolds what a held create's folders require", async (_l, approve) => {
+    await writeConfig(RULES);
+    await hold();
+    await approve();
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it.each(surfaces)("%s judges a held create in full against the rules in force", async (_l, approve) => {
+    await writeConfig(RULES);
+    await hold();
+    const meetings = { ...RULES.folders!["clients/{client}/meetings"], types: ["glossary"] };
+    await writeConfig({ ...RULES, folders: { ...RULES.folders, "clients/{client}/meetings": meetings } });
+    await expect(approve()).rejects.toThrow(/glossary/);
+    expect((await storage.readDocument(ID)).frontmatter.status).toBe("pending_review");
+  });
+
+  it.each(["Packs/gear", "nodes/.versions/foo/v1", "x/_suggestions/y"])(
+    "context_update never rewrites %s, a reserved path",
+    async (id) => {
+      const raw = "---\ntitle: Gear\ntype: document\nstatus: draft\n---\nold\n";
+      await mkdir(dirname(join(dir, `${id}.md`)), { recursive: true });
+      await writeFile(join(dir, `${id}.md`), raw, "utf-8");
+      const err = await refusal("context_update", { id, content: "new", publish: false });
+      expect(err.message).toMatch(/reserved/);
+      expect(await readFile(join(dir, `${id}.md`), "utf-8")).toBe(raw);
+    },
+  );
+
+  it("a trusted restore (structure: skip) still never lands a document under a reserved path", async () => {
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "packs/evil.md", content: "---\ntitle: Evil\n---\nx\n" }], overwrite: true },
+      { ...ctx, structure: "skip" },
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["packs/evil.md"]);
+    expect(await exists("packs/evil.md")).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("setStructure refuses a config symlinked outside the vault", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "cn-structure-outside-"));
+    try {
+      const cfg = join(dir, ".context", "config.yaml");
+      const target = join(outside, "config.yaml");
+      const original = await readFile(cfg, "utf-8");
+      await writeFile(target, original, "utf-8");
+      await rm(cfg);
+      await symlink(target, cfg);
+      await expect(setStructure(storage, RULES)).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+      expect(await readFile(target, "utf-8")).toBe(original);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("architecture round 6: czar edits, rollbacks, damaged history, import overwrites", () => {
+  const CZAR: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+  const MEETINGS: StructureConfig = { structure: { enforce: true }, folders: { meetings: { types: ["document"] } } };
+  const published = (title: string) => `---\ntitle: ${title}\ntype: document\nstatus: published\n---\nx\n`;
+
+  it.each([
+    ["an undeclared folder", "nodes/undeclared/x", "VALIDATION_FAILED"],
+    ["a reserved path", "packs/x", "VALIDATION_FAILED"],
+    ["outside the vault", "../cn-structure-czar-escape", "INVALID_DOCUMENT_ID"],
+  ])("czarDirectEdit refuses %s, writing nothing", async (_l, documentId, code) => {
+    await rm(join(dir, `${documentId}.md`), { force: true });
+    await writeConfig(RULES);
+    await expect(
+      czarDirectEdit({ storage, rbac: CZAR, documentId, newRawContent: published("X"), actor: "czar", zone: "z" }),
+    ).rejects.toMatchObject({ code });
+    expect(await exists(`${documentId}.md`)).toBe(false);
+  });
+
+  it("rollbackDocument refuses restoring a type the folder no longer allows", async () => {
+    const id = "nodes/meetings/k";
+    await api.run("context_create", { id, title: "K", content: "x", type: "glossary" }, ctx);
+    await api.run("context_update", { id, type: "document" }, ctx);
+    await writeConfig(MEETINGS);
+    await expect(
+      rollbackDocument({ storage, rbac: CZAR, documentId: id, targetVersion: 1, actor: "czar", zone: "z", docTier: "primary" }),
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect((await storage.readDocument(id)).frontmatter.type).toBe("document");
+  });
+
+  it.each([
+    ["a lost keyframe", () => rm(join(dir, "nodes", "meetings", ".versions", "k", "v1.md"))],
+    ["a corrupt history.yaml", () => writeFile(join(dir, "nodes", "meetings", ".versions", "k", "history.yaml"), ": [not yaml", "utf-8")],
+  ])("a publishing update still recovers from %s under enforced rules", async (_l, damage) => {
+    await writeConfig(MEETINGS);
+    const id = "nodes/meetings/k";
+    await api.run("context_create", { id, title: "K", content: "x" }, ctx);
+    await damage();
+    const res = await api.run<{ status: string }>("context_update", { id, content: "y" }, ctx);
+    expect(res.status).toBe("published");
+  });
+
+  it("damaged history is judged in full, never more leniently", async () => {
+    const id = "nodes/meetings/k";
+    await api.run("context_create", { id, title: "K", content: "x", type: "glossary" }, ctx);
+    await rm(join(dir, "nodes", "meetings", ".versions", "k", "v1.md"));
+    await writeConfig(MEETINGS);
+    const err = await refusal("context_publish", { id });
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("an import overwriting a never-published document is judged as its first publish, before it lands", async () => {
+    await api.run("context_create", { title: "Old", content: "x", folder: "notes", publish: false }, ctx);
+    const before = await readFile(join(dir, "nodes", "notes", "old.md"), "utf-8");
+    await writeConfig(RULES);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/old.md", content: "---\ntitle: Old\nstatus: published\n---\nnew\n" }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/notes/old.md"]);
+    expect(await readFile(join(dir, "nodes", "notes", "old.md"), "utf-8")).toBe(before);
+  });
+
+  it("publishDocuments scaffolds a new folder that several first publishes share", async () => {
+    await writeConfig(RULES);
+    const ids: string[] = [];
+    for (const title of ["2026-10-07 Kickoff", "2026-10-08 Review"]) {
+      const r = await api.run<{ id: string }>(
+        "context_create",
+        { title, content: MEETING, folder: "clients/acme-042/meetings", review: true },
+        ctx,
+      );
+      ids.push(r.id);
+    }
+    const res = await publishDocuments(storage, ids, { editedBy: "owner" });
+    expect(res.failed).toEqual([]);
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("a long name a file system holds (240 bytes) is still writable", async () => {
+    const id = `nodes/${"c".repeat(240)}`;
+    const res = await api.run<{ id: string }>("context_create", { id, title: "Long", content: "x" }, ctx);
+    expect(res.id).toBe(id);
+  });
+
+  it.skipIf(process.platform === "win32")("setStructure writes through a symlink into a folder named ..cfg", async () => {
+    const cfg = join(dir, ".context", "config.yaml");
+    await mkdir(join(dir, "..cfg"));
+    await rename(cfg, join(dir, "..cfg", "config.yaml"));
+    await symlink(join(dir, "..cfg", "config.yaml"), cfg);
+    await setStructure(storage, RULES);
+    expect(await readFile(join(dir, "..cfg", "config.yaml"), "utf-8")).toContain("structure");
+  });
+});
+
+describe("QA round 6: root spellings, deep ids, the enforce switch, re-init, history", () => {
+  it.each(["Nodes/docs/x", "NODES/notes/y", "nodes:evil/notes/x", "nodes./x"])(
+    "enforced rules refuse %s — another spelling of nodes/",
+    async (id) => {
+      await writeConfig({ structure: { enforce: true } });
+      const err = await refusal("context_create", { id, title: "Evil", content: "x" });
+      expect(err.code).toBe("VALIDATION_FAILED");
+      expect(err.message).toMatch(/nodes\//);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("a 500-deep id publishes under enforced rules without holding the lock for seconds", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { "{a}": { files: { overview: {} } } } });
+    // As deep as the platform's path limit holds (macOS: 1024 bytes for a
+    // whole path), with room for history and index files under it.
+    const room = (process.platform === "darwin" ? 1023 : 4095) - dir.length - 120;
+    const id = `nodes/${"a/".repeat(Math.min(500, Math.floor(room / 2)))}x`;
+    const started = Date.now();
+    await api.run("context_create", { id, title: "Deep", content: "x" }, ctx);
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it.each([[true], [[{ enforce: true }]], ["enforce"]])("structure: %j is no switch — writes fail closed", async (value) => {
+    await writeConfig({ structure: value });
+    const err = await refusal("context_create", { title: "Idea", content: "x", folder: "notes" });
+    expect(err.code).toBe("CONFIG_ERROR");
+    expect(err.message).toContain("structure");
+  });
+
+  it("context_structure reports enforcement as writes see it", async () => {
+    await writeConfig({ ...RULES, structure: { enforce: "yes" } });
+    const out = await api.run<{ enforce: boolean; error?: string }>("context_structure", {}, ctx);
+    expect(out.enforce).toBe(true);
+    expect(out.error).toMatch(/structure\.enforce/);
+  });
+
+  it.each([
+    ["an indented key", "version: 1\nname: x\n  structure:\n    enforce: true\n: ["],
+    ["a quoted key", '"structure": [unclosed\n'],
+    ["flow style", "{structure: {enforce: true}, folders: [\n"],
+    ["an explicit key", "? structure\n: [x\n"],
+  ])("re-init over a config that is not YAML and names rules as %s is refused", async (_l, broken) => {
+    const cfg = join(dir, ".context", "config.yaml");
+    await writeFile(cfg, broken, "utf-8");
+    await expect(storage.init("again")).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(cfg, "utf-8")).toBe(broken);
+  });
+
+  it("a refused publish leaves a corrupt history.yaml where it was", async () => {
+    await api.run("context_create", { title: "Old", content: "x", folder: "notes" }, ctx);
+    const history = join(dir, "nodes", "notes", ".versions", "old", "history.yaml");
+    await writeFile(history, ": [not yaml", "utf-8");
+    await writeConfig(RULES);
+    await refusal("context_publish", { id: "nodes/notes/old" });
+    expect(await readFile(history, "utf-8")).toBe(": [not yaml");
+  });
+
+  it("approving held creates one at a time still scaffolds the folder they share", async () => {
+    await writeConfig(RULES);
+    const ids: string[] = [];
+    for (const title of ["2026-10-07 Kickoff", "2026-10-08 Review"]) {
+      const r = await api.run<{ id: string }>(
+        "context_create",
+        { title, content: MEETING, folder: "clients/acme-042/meetings", review: true },
+        ctx,
+      );
+      ids.push(r.id);
+    }
+    await approveReview(storage, ids[0], { actor: "owner" });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it("planted empty history leaves a non-conforming draft judged in full", async () => {
+    // A draft in an allowed folder that misses a required section. History
+    // with no head grants nothing, so the draft's first publish is still
+    // judged in full.
+    await api.run(
+      "context_create",
+      { title: "2026-10-07 Kickoff", content: "## Notes\nx\n", folder: "clients/acme-042/meetings", publish: false },
+      ctx,
+    );
+    await writeConfig(RULES);
+    const path = "nodes/clients/acme-042/meetings/.versions/2026-10-07-kickoff/history.yaml";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "document: x\nversions: []\n" }] },
+      ctx,
+    );
+    expect(res.failed).toEqual([]);
+    const err = await refusal("context_publish", { id: "nodes/clients/acme-042/meetings/2026-10-07-kickoff" });
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+});
+
+describe("architecture round 7: machinery paths for delete and forget, 8.3 names, scaffolding gaps", () => {
+  const CZAR: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+  const KEYFRAME = "nodes/meetings/.versions/k/v1";
+
+  it.each([
+    ["context_delete", { id: KEYFRAME, purge: true }],
+    ["context_delete", { id: KEYFRAME }],
+    ["context_forget", { id: KEYFRAME, reason_code: "user_request" }],
+  ])("%s %j never touches a sealed keyframe", async (op, input) => {
+    await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+    const before = await readFile(join(dir, `${KEYFRAME}.md`), "utf-8");
+    const err = await refusal(op, input);
+    expect(err.message).toMatch(/reserved/);
+    expect(await readFile(join(dir, `${KEYFRAME}.md`), "utf-8")).toBe(before);
+    const forgotten = await api.run<{ events?: unknown[] }>("context_forget_log", {}, ctx).catch(() => ({ events: [] }));
+    expect(JSON.stringify(forgotten)).not.toContain(".versions");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "a ~digit name that resolves into vault machinery is refused, as an NTFS short name would",
+    async () => {
+      await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+      // A symlink stands in for an NTFS short name: VERSIO~1 resolving to .versions.
+      await symlink(join(dir, "nodes", "meetings", ".versions"), join(dir, "nodes", "meetings", "VERSIO~1"));
+      const keyframe = join(dir, "nodes", "meetings", ".versions", "k", "v1.md");
+      const before = await readFile(keyframe, "utf-8");
+      const attempts: Array<[string, Record<string, unknown>]> = [
+        ["context_update", { id: "nodes/meetings/VERSIO~1/k/v1", content: "evil" }],
+        ["context_create", { id: "nodes/meetings/VERSIO~1/k/v9", title: "Evil", content: "x" }],
+        ["context_delete", { id: "nodes/meetings/VERSIO~1/k/v1", purge: true }],
+        ["context_forget", { id: "nodes/meetings/VERSIO~1/k/v1", reason_code: "user_request" }],
+      ];
+      for (const [op, input] of attempts) {
+        const err = await refusal(op, input);
+        expect(err.message, op).toMatch(/reserved/);
+      }
+      expect(await readFile(keyframe, "utf-8")).toBe(before);
+    },
+  );
+
+  it("a czar direct edit that creates a document scaffolds its new folders", async () => {
+    await writeConfig(RULES);
+    const id = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+    await czarDirectEdit({
+      storage,
+      rbac: CZAR,
+      documentId: id,
+      newRawContent: `---\ntitle: 2026-10-07 Kickoff\ntype: document\nstatus: published\n---\n${MEETING}`,
+      actor: "czar",
+      zone: "z",
+    });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it("an approved held create scaffolds in a flat (obsidian) vault too", async () => {
+    const vdir = await mkdtemp(join(tmpdir(), "cn-structure-flat-"));
+    try {
+      const v = new NestStorage(vdir);
+      await v.init("flat", "obsidian");
+      const vctx = { ...ctx, storage: v, query: new GraphQueryEngine(v), versions: new VersionManager(v) };
+      await writeFile(join(vdir, ".context", "config.yaml"), yaml.dump({ version: 1, name: "flat", ...RULES }), "utf-8");
+      const r = await api.run<{ id: string }>(
+        "context_create",
+        { id: "clients/acme-042/meetings/2026-10-07-kickoff", title: "2026-10-07 Kickoff", content: MEETING, review: true },
+        vctx,
+      );
+      expect(r.id).toBe("clients/acme-042/meetings/2026-10-07-kickoff");
+      await approveReview(v, r.id, { actor: "owner" });
+      await expect(access(join(vdir, "clients", "acme-042", "overview.md"))).resolves.toBeUndefined();
+    } finally {
+      await rm(vdir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("QA round 7: heading cost, batch scaffolding cost, planted history, rules-off vaults", () => {
+  const KICKOFF = "nodes/clients/acme-042/meetings/2026-10-07-kickoff";
+  const VICTIM = "nodes/clients/acme-042/meetings/2026-10-08-review";
+
+  it("a vault with no rules writes a Nodes/ folder like any other (only enforced rules change a write)", async () => {
+    const res = await api.run<{ id: string }>("context_create", { id: "Nodes/docs/x", title: "X", content: "x" }, ctx);
+    expect(res.id).toBe("Nodes/docs/x");
+  });
+
+  it("structure: false is off", async () => {
+    await writeConfig({ structure: false, folders: { notes: { types: ["glossary"] } } });
+    const res = await api.run<{ id: string }>("context_create", { title: "Idea", content: "x", folder: "notes" }, ctx);
+    expect(res.id).toBe("nodes/notes/idea");
+  });
+
+  it("re-init over any config that is not YAML is refused (it may hold rules however they are spelled)", async () => {
+    const cfg = join(dir, ".context", "config.yaml");
+    const broken = '"\\u0073tructure": [unclosed\n';
+    await writeFile(cfg, broken, "utf-8");
+    await expect(storage.init("again")).rejects.toMatchObject({ code: "CONFIG_ERROR" });
+    expect(await readFile(cfg, "utf-8")).toBe(broken);
+  });
+
+  it.skipIf(process.platform === "win32")("an import of an over-long path fails without naming the vault path", async () => {
+    const res = await api.run<{ failed: { error: string }[] }>(
+      "context_import",
+      { files: [{ path: `nodes/.versions/${"a".repeat(300)}/history.yaml`, content: "x" }] },
+      ctx,
+    );
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0].error).not.toContain(dir);
+  });
+
+  it("a held create beside a later draft still scaffolds the folder they share when approved", async () => {
+    await writeConfig(RULES);
+    await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings", review: true }, ctx);
+    await api.run("context_create", { title: "2026-10-08 Review", content: MEETING, folder: "clients/acme-042/meetings", publish: false }, ctx);
+    await approveReview(storage, KICKOFF, { actor: "owner" });
+    expect(await exists("nodes/clients/acme-042/overview.md")).toBe(true);
+  });
+
+  it.each([["the plain path", ".versions"], ["a ./ segment", ".versions/."]])(
+    "planted history (%s) never makes a non-conforming draft look grandfathered",
+    async (_l, store) => {
+      // A donor's real history, planted under a draft that misses a required section.
+      await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, ctx);
+      await api.run("context_create", { title: "2026-10-08 Review", content: "## Notes\nx\n", folder: "clients/acme-042/meetings", publish: false }, ctx);
+      const donor = join(dir, "nodes", "clients", "acme-042", "meetings", ".versions", "2026-10-07-kickoff");
+      await writeConfig(RULES);
+      const folder = "nodes/clients/acme-042/meetings";
+      const files = await Promise.all(
+        ["history.yaml", "v1.md"].map(async (name) => ({
+          path: `${folder}/${store}/2026-10-08-review/${name}`,
+          content: await readFile(join(donor, name), "utf-8"),
+        })),
+      );
+      const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+      // A conforming donor head grants nothing a full check would not: the
+      // history may land, and the draft is still refused.
+      expect(res.failed).toEqual([]);
+      const err = await refusal("context_publish", { id: VICTIM });
+      expect(err.code).toBe("VALIDATION_FAILED");
+    },
+  );
+
+  it("a chunked import may send a document before its history", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cn-structure-chunk-src-"));
+    try {
+      const s = new NestStorage(src);
+      await s.init("src");
+      const sctx = { ...ctx, storage: s, query: new GraphQueryEngine(s), versions: new VersionManager(s) };
+      await api.run("context_create", { title: "2026-10-07 Kickoff", content: MEETING, folder: "clients/acme-042/meetings" }, sctx);
+      const rel = "nodes/clients/acme-042/meetings";
+      const read = (p: string) => readFile(join(src, p), "utf-8");
+      await writeConfig(RULES);
+      const doc = await api.run<{ failed: unknown[] }>(
+        "context_import",
+        { files: [{ path: `${rel}/2026-10-07-kickoff.md`, content: await read(`${rel}/2026-10-07-kickoff.md`) }], publish: false },
+        ctx,
+      );
+      expect(doc.failed).toEqual([]);
+      const history = await api.run<{ failed: unknown[] }>(
+        "context_import",
+        {
+          files: await Promise.all(
+            ["history.yaml", "v1.md"].map(async (n) => ({
+              path: `${rel}/.versions/2026-10-07-kickoff/${n}`,
+              content: await read(`${rel}/.versions/2026-10-07-kickoff/${n}`),
+            })),
+          ),
+          publish: false,
+        },
+        ctx,
+      );
+      expect(history.failed).toEqual([]);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("scaffolding a wide, deep batch of first publishes stays linear", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { t: { files: { overview: {} } } } });
+    const ids: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const id = `nodes/t/b${i}/${"a/".repeat(100)}x`;
+      await mkdir(join(dir, dirname(id)), { recursive: true });
+      await writeFile(join(dir, `${id}.md`), "---\ntitle: X\ntype: document\nstatus: published\n---\nx\n", "utf-8");
+      ids.push(id);
+    }
+    const rules = compileStructure(yaml.load(await readFile(join(dir, ".context", "config.yaml"), "utf-8")) as never);
+    const started = Date.now();
+    await scaffoldFirstPublish(storage, rules, ids);
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(await exists("nodes/t/overview.md")).toBe(true);
+  });
+});
+
+describe("architecture round 8: imported history heads, imported forgets, sidecars, legacy ~ ids", () => {
+  const AGENDA: StructureConfig = {
+    structure: { enforce: true },
+    folders: { meetings: { types: ["document"], template: "m" } },
+    templates: { m: { body: "## Agenda\n", required_sections: ["Agenda"] } },
+  };
+  const R = "nodes/meetings/r";
+  /** A genuine history whose head lacks the required Agenda — made before the rules. */
+  const donorHistory = async (target: string) => {
+    await api.run("context_create", { id: "nodes/meetings/donor", title: "Donor", content: "## Notes\nx\n" }, ctx);
+    const from = join(dir, "nodes", "meetings", ".versions", "donor");
+    const name = target.split("/").pop()!;
+    return Promise.all(
+      ["history.yaml", "v1.md"].map(async (n) => ({
+        path: `nodes/meetings/.versions/${name}/${n}`,
+        content: await readFile(join(from, n), "utf-8"),
+      })),
+    );
+  };
+  const failedIds = (r: { failed: { id?: string }[] }) => r.failed.map((f) => f.id).sort();
+
+  it("history for a conforming document already here must itself conform — never a donor head", async () => {
+    const files = await donorHistory(R);
+    await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n", publish: false }, ctx);
+    await writeConfig(AGENDA);
+    const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(failedIds(res)).toEqual(files.map((f) => f.path).sort());
+    const overwrite = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${R}.md`, content: "---\ntitle: R\nstatus: published\n---\n## Notes\nx\n" }], overwrite: true },
+      ctx,
+    );
+    expect(failedIds(overwrite)).toEqual([`${R}.md`]);
+  });
+
+  it("history sent with its (conforming) document in one call must conform too", async () => {
+    const files = await donorHistory(R);
+    await writeConfig(AGENDA);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${R}.md`, content: "---\ntitle: R\n---\n## Agenda\nx\n" }, ...files], publish: false },
+      ctx,
+    );
+    expect(failedIds(res)).toEqual(files.map((f) => f.path).sort());
+  });
+
+  it("orphan history (no document yet) must conform; a piece with no history yet grants nothing", async () => {
+    const files = await donorHistory(R);
+    await writeConfig(AGENDA);
+    const orphan = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(failedIds(orphan)).toEqual(files.map((f) => f.path).sort());
+    const partial = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: files.filter((f) => f.path.endsWith("v1.md")), publish: false },
+      ctx,
+    );
+    // A keyframe with no history beside it is no head: it may land, and the
+    // donor history that would give it one is still refused.
+    expect(partial.failed).toEqual([]);
+    const again = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(failedIds(again)).toContain(files.find((f) => f.path.endsWith("history.yaml"))!.path);
+  });
+
+  it.each([["nodes/x/../meetings/k"], ["nodes/meetings/.versions/k/v1"]])(
+    "an imported forget of %s touches nothing",
+    async (target) => {
+      await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+      const keyframe = join(dir, "nodes", "meetings", ".versions", "k", "v1.md");
+      const before = await readFile(keyframe, "utf-8");
+      const event = {
+        event_id: "evt-1",
+        event_type: "document.forgotten",
+        document_id: target,
+        actor: "importer",
+        timestamp: "2026-01-01T00:00:00Z",
+        action_metadata: { scope: "node", reason_code: "user_request", versions: [1] },
+      };
+      await api.run(
+        "context_import",
+        { files: [{ path: ".versions/chain_events.yaml", content: yaml.dump([event]) }] },
+        ctx,
+      ).catch(() => undefined);
+      expect(await readFile(keyframe, "utf-8")).toBe(before);
+      expect((await storage.readDocument("nodes/meetings/k")).frontmatter.status).not.toBe("forgotten");
+    },
+  );
+
+  it("an import cannot overwrite a sealed PDF binary of a node it does not bring", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "papers", title: "Paper", bytes_base64: toBase64(textPdf()) }, ctx);
+    const sidecar = join(dir, `${res.id}.pdf`);
+    const before = await readFile(sidecar);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: "not the sealed bytes" }], overwrite: true },
+      ctx,
+    );
+    expect(failedIds(imp)).toEqual([`${res.id}.pdf`]);
+    expect((await readFile(sidecar)).equals(before)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("a ~digit id that resolves to no machinery is an ordinary name: forgotten, deleted, written", async () => {
+    for (const name of ["draft~2", "draft~3"]) {
+      await mkdir(join(dir, "nodes", "notes"), { recursive: true });
+      await writeFile(join(dir, "nodes", "notes", `${name}.md`), `---\ntitle: ${name}\ntype: document\nstatus: draft\n---\nx\n`, "utf-8");
+    }
+    await api.run("context_forget", { id: "nodes/notes/draft~2", reason_code: "user_request" }, ctx);
+    expect((await storage.readDocument("nodes/notes/draft~2")).frontmatter.status).toBe("forgotten");
+    await api.run("context_delete", { id: "nodes/notes/draft~3", purge: true }, ctx);
+    expect(await exists("nodes/notes/draft~3.md")).toBe(false);
+    // Nothing to alias on this volume: an ordinary name, written, edited and published.
+    const res = await api.run<{ id: string }>("context_create", { id: "nodes/notes/draft~4", title: "D", content: "x" }, ctx);
+    expect(res.id).toBe("nodes/notes/draft~4");
+    await writeFile(join(dir, "nodes", "notes", "plan~5.md"), "---\ntitle: Plan\ntype: document\nstatus: draft\n---\nx\n", "utf-8");
+    await api.run("context_update", { id: "nodes/notes/plan~5", content: "edited", publish: false }, ctx);
+    await api.run("context_publish", { id: "nodes/notes/plan~5" }, ctx);
+  });
+});
+
+describe("QA round 8: aliases, erase limits, scaffold scale", () => {
+  it("a settings path hidden behind an ignorable code point is not importable", async () => {
+    const path = ".con\u200Ctext/config.yaml";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "version: 1\nname: evil\n" }], overwrite: true },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual([path]);
+  });
+
+  it("history files spelled with trailing dots are judged as the set they are", async () => {
+    await api.run("context_create", { id: "nodes/meetings/donor", title: "Donor", content: "## Notes\nx\n" }, ctx);
+    await writeConfig({
+      structure: { enforce: true },
+      folders: { meetings: { types: ["document"], template: "m" } },
+      templates: { m: { body: "## Agenda\n", required_sections: ["Agenda"] } },
+    });
+    const from = join(dir, "nodes", "meetings", ".versions", "donor");
+    const files = await Promise.all(
+      [["history.yaml", "history.yaml."], ["v1.md", "v1.md."]].map(async ([src, as]) => ({
+        path: `nodes/meetings/.versions./victim/${as}`,
+        content: await readFile(join(from, src), "utf-8"),
+      })),
+    );
+    const res = await api.run<{ failed: { id?: string }[] }>("context_import", { files, publish: false }, ctx);
+    expect(res.failed.map((f) => f.id).sort()).toEqual(files.map((f) => f.path).sort());
+  });
+
+  it.each(["context_delete", "context_forget", "context_get"])(
+    "%s of an id no file system could hold fails without naming the vault path",
+    async (op) => {
+      const err = await refusal(op, { id: `nodes/${"z".repeat(300)}`, reason_code: "user_request" });
+      expect(err.message).not.toContain(dir);
+    },
+  );
+
+  it("scaffolding a batch of thousands of new folders stays linear in CPU", { timeout: 30000 }, async () => {
+    // Ids under a folder that does not exist yet: no directory I/O to hide a
+    // quadratic step (a growing array copied per folder took minutes here).
+    const rules = compileStructure({ structure: { enforce: true }, folders: { t: { files: { overview: {} } } } });
+    const ids = Array.from({ length: 20000 }, (_, i) => `nodes/t/b${i}/c/d/x`);
+    const started = Date.now();
+    await scaffoldFirstPublish(storage, rules, ids);
+    // Linear takes well under a second; the quadratic version took ~20 s.
+    expect(Date.now() - started).toBeLessThan(10000);
+    expect(await exists("nodes/t/overview.md")).toBe(true);
+  });
+});
+
+describe("architecture round 9: the head an import is judged by is the head the vault will hold", () => {
+  const AGENDA: StructureConfig = {
+    structure: { enforce: true },
+    folders: { meetings: { types: ["document"], template: "m" } },
+    templates: { m: { body: "## Agenda\n", required_sections: ["Agenda"] } },
+  };
+  const R = "nodes/meetings/r";
+  const VERSIONS = "nodes/meetings/.versions/r";
+
+  it("a stale diff planted by an earlier call cannot change the head a later import is judged by", async () => {
+    // Genuine history from another vault: v1 has the Agenda, v2 (a diff) drops it.
+    const src = await mkdtemp(join(tmpdir(), "cn-structure-stale-"));
+    try {
+      const s = new NestStorage(src);
+      await s.init("src");
+      const sctx = { ...ctx, storage: s, query: new GraphQueryEngine(s), versions: new VersionManager(s) };
+      await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n" }, sctx);
+      await api.run("context_update", { id: R, content: "## Notes\nx\n" }, sctx);
+      const read = (n: string) => readFile(join(src, VERSIONS, n), "utf-8");
+      const history = yaml.load(await read("history.yaml")) as { versions: unknown[] };
+      const [v1, v2diff] = [await read("v1.md"), await read("v2.diff")];
+
+      await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n", publish: false }, ctx);
+      await writeConfig(AGENDA);
+      const at = (n: string) => `${VERSIONS}/${n}`;
+      const run = (files: { path: string; content: string }[]) =>
+        api.run<{ failed: { id?: string }[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+
+      // Call 1: a v1-only history (conforms) plus a stray v2.diff.
+      const first = await run([
+        { path: at("history.yaml"), content: yaml.dump({ ...history, versions: history.versions.slice(0, 1) }) },
+        { path: at("v1.md"), content: v1 },
+        { path: at("v2.diff"), content: v2diff },
+      ]);
+      expect(first.failed).toEqual([]);
+      // Call 2: the full history, without its diff — the vault replays the stray one.
+      const second = await run([
+        { path: at("history.yaml"), content: yaml.dump(history) },
+        { path: at("v1.md"), content: v1 },
+      ]);
+      expect(second.failed.map((f) => f.id)).toContain(at("history.yaml"));
+      // Call 3: the document without its Agenda is judged against a conforming head.
+      const third = await run([{ path: `${R}.md`, content: "---\ntitle: R\nstatus: published\n---\n## Notes\nx\n" }]);
+      expect(third.failed.map((f) => f.id)).toEqual([`${R}.md`]);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it("history that does not match its own hashes grants nothing: the document is judged in full", async () => {
+    await api.run("context_create", { id: R, title: "R", content: "## Agenda\nx\n" }, ctx);
+    // Rewrite the sealed keyframe (no longer matching its content_hash) and the
+    // live file alike, so the head would grandfather the missing Agenda.
+    for (const file of [join(dir, VERSIONS, "v1.md"), join(dir, `${R}.md`)]) {
+      await writeFile(file, (await readFile(file, "utf-8")).replace("## Agenda\n", "## Notes\n"), "utf-8");
+    }
+    await writeConfig(AGENDA);
+    const err = await refusal("context_publish", { id: R });
+    expect(err.code).toBe("VALIDATION_FAILED");
+  });
+
+  it.skipIf(process.platform === "win32")("a folder named ..x is still inside the vault for the alias check", async () => {
+    await api.run("context_create", { id: "..x/k", title: "K", content: "x" }, ctx);
+    await symlink(join(dir, "..x", ".versions"), join(dir, "..x", "VERSIO~1"));
+    const err = await refusal("context_update", { id: "..x/VERSIO~1/k/v1", content: "evil" });
+    expect(err.message).toMatch(/reserved/);
+  });
+
+  it.skipIf(process.platform === "win32")("a PDF import or a staged suggestion through an alias writes nothing into machinery", async () => {
+    await api.run("context_create", { id: "nodes/meetings/k", title: "K", content: "x" }, ctx);
+    await symlink(join(dir, "nodes", "meetings", ".versions"), join(dir, "nodes", "meetings", "VERSIO~1"));
+    const pdf = await refusal("context_import_pdf", { id: "nodes/meetings/VERSIO~1/k/vx", bytes_base64: toBase64(textPdf()) });
+    expect(pdf.message).toMatch(/reserved/);
+    expect(await exists("nodes/meetings/.versions/k/vx.pdf")).toBe(false);
+    const raw = await readFile(join(dir, "nodes", "meetings", "k.md"), "utf-8");
+    await expect(
+      stageSuggestion({
+        storage,
+        documentId: "nodes/meetings/VERSIO~1/k/v1",
+        approvedRawContent: raw,
+        proposedRawContent: raw.replace("x", "y"),
+        source: "out-of-band-edit",
+        actor: "user",
+        docTier: "standard",
+      }),
+    ).rejects.toThrow(/reserved/);
+  });
+});
+
+describe("QA round 9: decoy sets, deep erases, in-batch sidecars, read limits", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it.each([".versions::$DATA", ".ver\u200Bsions"])(
+    "a decoy under %s cannot vouch for the real history beside it",
+    async (decoy) => {
+      // Donor history whose head has no Summary, made before the rules.
+      await api.run("context_create", { id: "nodes/notes/donor", title: "Donor", content: "## Notes\nx\n" }, ctx);
+      const from = join(dir, "nodes", "notes", ".versions", "donor");
+      const [history, v1] = await Promise.all(["history.yaml", "v1.md"].map((n) => readFile(join(from, n), "utf-8")));
+      await api.run("context_create", { id: "nodes/notes/victim", title: "Victim", content: "## Summary\nx\n", publish: false }, ctx);
+      await writeConfig(SUMMARY);
+      const res = await api.run<{ failed: { id?: string }[]; written: number }>(
+        "context_import",
+        {
+          files: [
+            { path: "nodes/notes/.versions/victim/history.yaml", content: history },
+            { path: "nodes/notes/.versions/victim/v1.md", content: v1 },
+            { path: `nodes/notes/${decoy}/victim/v1.md`, content: "---\ntitle: Victim\n---\n## Summary\nx\n" },
+          ],
+          publish: false,
+        },
+        ctx,
+      );
+      expect(res.failed.map((f) => f.id)).toContain("nodes/notes/.versions/victim/history.yaml");
+      expect(await exists("nodes/notes/.versions/victim/history.yaml")).toBe(false);
+    },
+  );
+
+  it("an imported history that does not rebuild and verify from what the vault will hold is refused", async () => {
+    await writeConfig(SUMMARY);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          {
+            path: "nodes/notes/.versions/x/history.yaml",
+            content: yaml.dump({ document: "nodes/notes/x", versions: [{ version: 1, keyframe: true, edited_by: "a", edited_at: "2026-01-01T00:00:00Z", content_hash: `sha256:${"0".repeat(64)}`, chain_hash: `sha256:${"0".repeat(64)}` }] }),
+          },
+          { path: "nodes/notes/.versions/x/v1.md", content: "---\ntitle: X\n---\n## Summary\nx\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toContain("nodes/notes/.versions/x/history.yaml");
+  });
+
+  it.skipIf(process.platform === "win32")("erasing a deep id with a ~digit segment stays fast", async () => {
+    const deep = `${"a/".repeat(400)}`;
+    await api.run("context_create", { id: `${deep}doc`, title: "Doc", content: "x" }, ctx);
+    const started = Date.now();
+    await refusal("context_delete", { id: `${deep}x~1/${"b/".repeat(800)}z` });
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it("an import never replaces a sealed PDF, even beside its own .md, nor an archived binary with other bytes", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const md = await readFile(join(dir, `${res.id}.md`), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.md`, content: md }, { path: `${res.id}.pdf`, content: "%PDF-1.4 evil" }], overwrite: true },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain(`${res.id}.pdf`);
+    const name = res.id.split("/").pop()!;
+    const folder = res.id.split("/").slice(0, -1).join("/");
+    const archive = `${folder}/.versions/${name}/${"a".repeat(64)}.pdf`;
+    const arch = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: archive, content: "not those bytes" }], overwrite: true },
+      ctx,
+    );
+    expect(arch.failed.map((f) => f.id)).toEqual([archive]);
+  });
+
+  it("reads of an id no file system could hold fail without naming the vault path", async () => {
+    for (const op of ["context_get", "context_versions", "context_reconstruct"]) {
+      const err = await refusal(op, { id: `nodes/${"z".repeat(300)}`, version: 1 });
+      expect(err.message, op).not.toContain(dir);
+    }
+  });
+});
+
+describe("architecture round 10: judged bytes are landed bytes", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const X = "nodes/notes/x";
+  const V = "nodes/notes/.versions/x";
+  const historyFor = (content: string) =>
+    yaml.dump({
+      versions: [
+        {
+          version: 1,
+          keyframe: true,
+          edited_by: "a",
+          edited_at: "2026-01-01T00:00:00Z",
+          content_hash: computeContentHash(content),
+          chain_hash: `sha256:${"0".repeat(64)}`,
+        },
+      ],
+    });
+
+  it("a normalization twin planted earlier never becomes a head that grandfathers a missing section", async () => {
+    const A = "---\ntitle: X\n---\nintro\n## Summary\nok\n";
+    const B = "---\ntitle: X\n---\nintro\r## Summary\nok\n"; // same content_hash as A
+    expect(computeContentHash(A)).toBe(computeContentHash(B));
+    await writeConfig(SUMMARY);
+    await api.run(
+      "context_import",
+      { files: [{ path: `${X}.md`, content: A }, { path: `${V}/v1.md`, content: B }], publish: false },
+      ctx,
+    );
+    await api.run(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/history.yaml`, content: historyFor(A) },
+          { path: `${V}/${"./".repeat(510)}v1.md`, content: A },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    // An overwrite is judged only against the sealed head: B must never be it.
+    const third = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${X}.md`, content: "---\ntitle: X\nstatus: published\n---\nintro\nno summary\n" }], overwrite: true },
+      ctx,
+    );
+    expect(third.failed.map((f) => f.id)).toEqual([`${X}.md`]);
+  });
+
+  it("a history set with a member that cannot land is refused whole", async () => {
+    await writeConfig(SUMMARY);
+    const A = "---\ntitle: X\n---\n## Summary\nok\n";
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/history.yaml`, content: historyFor(A) },
+          { path: `${V}/v1.md`, content: A },
+          { path: `${V}/${"z".repeat(300)}.diff`, content: "x" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(expect.arrayContaining([`${V}/history.yaml`, `${V}/v1.md`]));
+    expect(await exists(`${V}/history.yaml`)).toBe(false);
+  });
+
+  it("an overwrite that brings its own history is judged against that history's head, before it lands", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cn-structure-overlay-"));
+    try {
+      const s = new NestStorage(src);
+      await s.init("src");
+      const sctx = { ...ctx, storage: s, query: new GraphQueryEngine(s), versions: new VersionManager(s) };
+      await api.run("context_create", { id: X, title: "X", content: "## Summary\nok\n" }, sctx);
+      const read = (n: string) => readFile(join(src, V, n), "utf-8");
+      // A legacy document here, without the Summary, made before the rules.
+      await api.run("context_create", { id: X, title: "X", content: "## Notes\nold\n" }, ctx);
+      const live = await readFile(join(dir, `${X}.md`), "utf-8");
+      await writeConfig(SUMMARY);
+      const res = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        {
+          files: [
+            { path: `${X}.md`, content: "---\ntitle: X\n---\n## Notes\nnew\n" },
+            { path: `${V}/history.yaml`, content: await read("history.yaml") },
+            { path: `${V}/v1.md`, content: await read("v1.md") },
+          ],
+          overwrite: true,
+        },
+        ctx,
+      );
+      expect(res.failed.map((f) => f.id)).toContain(`${X}.md`);
+      expect(await readFile(join(dir, `${X}.md`), "utf-8")).toBe(live);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it("a refused PDF takes its .md with it", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const md = await readFile(join(dir, `${res.id}.md`), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${res.id}.md`, content: md.replace(/sha256:[0-9a-f]{64}/, `sha256:${"b".repeat(64)}`) },
+          { path: `${res.id}.pdf`, content: "%PDF-1.4 evil" },
+        ],
+        overwrite: true,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual([`${res.id}.md`, `${res.id}.pdf`].sort());
+    expect(await readFile(join(dir, `${res.id}.md`), "utf-8")).toBe(md);
+  });
+
+  it("sealedHead trusts only a segment whose versions strictly increase", async () => {
+    const entry = (version: number) => ({
+      version,
+      keyframe: true,
+      edited_by: "a",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: computeContentHash("x"),
+      chain_hash: `sha256:${"0".repeat(64)}`,
+    });
+    const head = await sealedHead("d", { versions: [entry(2), entry(1)] } as never, () => "x", () => null);
+    expect(head).toBeNull();
+  });
+});
+
+describe("QA round 10: duplicate spellings of a history file, sidecars against the disk, native name limits", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const pinned = (content: string) =>
+    yaml.dump({
+      versions: [
+        {
+          version: 1,
+          keyframe: true,
+          edited_by: "a",
+          edited_at: "2026-01-01T00:00:00Z",
+          content_hash: computeContentHash(content),
+          chain_hash: `sha256:${"0".repeat(64)}`,
+        },
+      ],
+    });
+
+  it.each([["the unjudged spelling first", false], ["the judged spelling first", true]])(
+    "two spellings of one history file never leave an unjudged head (%s)",
+    async (_l, longFirst) => {
+      await writeConfig(SUMMARY);
+      const V = "nodes/notes/.versions/victim";
+      const long = `${V}/${"./".repeat(520)}`;
+      const B = "---\ntitle: V\n---\n## Notes\nx\n";
+      const G = "---\ntitle: V\n---\n## Summary\nx\n";
+      const short = [
+        { path: `${V}/history.yaml`, content: pinned(B) },
+        { path: `${V}/v1.md`, content: B },
+      ];
+      const dotted = [
+        { path: `${long}history.yaml`, content: pinned(G) },
+        { path: `${long}v1.md`, content: G },
+      ];
+      await api.run(
+        "context_import",
+        {
+          files: [{ path: "nodes/notes/victim.md", content: G }, ...(longFirst ? [...dotted, ...short] : [...short, ...dotted])],
+          overwrite: true,
+          publish: false,
+        },
+        ctx,
+      );
+      const second = await api.run<{ failed: { id?: string }[] }>(
+        "context_import",
+        { files: [{ path: "nodes/notes/victim.md", content: "---\ntitle: V\nstatus: published\n---\n## Notes\ny\n" }], overwrite: true },
+        ctx,
+      );
+      expect(second.failed.map((f) => f.id)).toEqual(["nodes/notes/victim.md"]);
+    },
+  );
+
+  it.each([["one call, after other files", true], ["a later call", false]])(
+    "a rewritten .md never lets an import replace the PDF on disk (%s)",
+    async (_l, oneCall) => {
+      const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+      const sidecar = join(dir, `${res.id}.pdf`);
+      const sealed = await readFile(sidecar);
+      const evil = "%PDF-1.4 evil";
+      const md = (await readFile(join(dir, `${res.id}.md`), "utf-8")).replace(
+        /sha256:[0-9a-f]{64}/,
+        sha256Bytes(Buffer.from(evil, "utf-8")),
+      );
+      const filler = Array.from({ length: 40 }, (_, i) => ({ path: `assets/f${i}.yaml`, content: "x: 1\n" }));
+      if (oneCall) {
+        await api.run(
+          "context_import",
+          { files: [{ path: `${res.id}.md`, content: md }, ...filler, { path: `${res.id}.pdf`, content: evil }], overwrite: true },
+          ctx,
+        );
+      } else {
+        await api.run("context_import", { files: [{ path: `${res.id}.md`, content: md }], overwrite: true, publish: false }, ctx);
+        const later = await api.run<{ failed: { id?: string }[] }>(
+          "context_import",
+          { files: [{ path: `${res.id}.pdf`, content: evil }], overwrite: true },
+          ctx,
+        );
+        expect(later.failed.map((f) => f.id)).toEqual([`${res.id}.pdf`]);
+      }
+      expect((await readFile(sidecar)).equals(sealed)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform === "win32")("a name NTFS holds (86 CJK characters) is still readable", async () => {
+    const id = `nodes/${"漢".repeat(86)}`;
+    const err = await refusal("context_get", { id });
+    expect(err.code).not.toBe("INVALID_DOCUMENT_ID");
+  });
+});
+
+describe("architecture round 12: one line model, old histories, sidecar fallbacks", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("a lone CR ends a line for the rules as it does for readers (CommonMark): ##\\rSummary is no heading", async () => {
+    await writeConfig(SUMMARY);
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/x.md", content: "---\ntitle: X\n---\n##\rSummary\nok\n" }] },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toEqual(["nodes/notes/x.md"]);
+    const ok = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/y.md", content: "---\ntitle: Y\n---\nintro\r## Summary\rok\n" }] },
+      ctx,
+    );
+    expect(ok.failed).toEqual([]);
+  });
+
+  it("a history set that would reinstate a refused legacy head under the old history.yaml is refused", async () => {
+    // A legacy note (no Summary), sealed before the rules; its keyframe is lost.
+    await api.run("context_create", { id: "nodes/notes/r", title: "R", content: "## Notes\nold\n" }, ctx);
+    const V = "nodes/notes/.versions/r";
+    const legacy = await readFile(join(dir, V, "v1.md"), "utf-8");
+    await rm(join(dir, V, "v1.md"));
+    await writeConfig(SUMMARY);
+    const G = "---\ntitle: R\n---\n## Summary\nok\n";
+    const decoy = yaml.dump({
+      versions: [{ version: 5, keyframe: true, edited_by: "a", edited_at: "2026-01-01T00:00:00Z", content_hash: computeContentHash(G), chain_hash: `sha256:${"0".repeat(64)}` }],
+    });
+    const res = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/history.yaml`, content: decoy },
+          { path: `${V}/v5.md`, content: G },
+          { path: `${V}/v1.md`, content: legacy },
+          { path: `${V}/history.yaml/z`, content: "fails to land" },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.map((f) => f.id)).toContain(`${V}/v1.md`);
+    expect(await exists(`${V}/v1.md`)).toBe(false);
+  });
+
+  it("with no bytes on disk a sidecar lands, and verify holds it to the .md", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    await rm(join(dir, `${res.id}.pdf`));
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: "%PDF-1.4 other" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed).toEqual([]);
+    const report = await api.run<{ errors: { type: string }[] }>("context_verify", {}, ctx);
+    expect(report.errors.map((e) => e.type)).toContain("sidecar_drift");
+  });
+
+  it("a companion PDF beside an ordinary document is an ordinary file", async () => {
+    await api.run("context_create", { id: "nodes/papers/paper", title: "Paper", content: "x" }, ctx);
+    await writeFile(join(dir, "nodes", "papers", "paper.pdf"), "old", "utf-8");
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/papers/paper.pdf", content: "new" }], overwrite: true },
+      ctx,
+    );
+    expect(imp.failed).toEqual([]);
+  });
+
+  it("a document refused with its PDF takes its history with it", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const name = res.id.split("/").pop()!;
+    const folder = res.id.split("/").slice(0, -1).join("/");
+    const history = await readFile(join(dir, folder, ".versions", name, "history.yaml"), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${res.id}.pdf`, content: "%PDF-1.4 evil" },
+          { path: `${res.id}.md`, content: await readFile(join(dir, `${res.id}.md`), "utf-8") },
+          { path: `${folder}/.versions/${name}/history.yaml`, content: history },
+        ],
+        overwrite: true,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain(`${folder}/.versions/${name}/history.yaml`);
+  });
+
+  it("a read of a leaf no .md file could carry fails without naming the vault path", async () => {
+    const err = await refusal("context_get", { id: `nodes/${"q".repeat(253)}` });
+    expect(err.message).not.toContain(dir);
+  });
+
+  it("an imported PDF lands sealed in an encrypted vault", async () => {
+    const store = new MemoryKeyStore();
+    setDefaultVaultKeyStore(store);
+    try {
+      await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+      await api.run("context_import", { files: [{ path: "nodes/decks/p.pdf", content: "%PDF-1.4 SECRET-PDF-TOKEN" }] }, ctx);
+      expect(await readFile(join(dir, "nodes", "decks", "p.pdf"), "latin1")).not.toContain("SECRET-PDF-TOKEN");
+      expect((await storage.readVaultBinary("nodes/decks/p.pdf")).toString("utf-8")).toBe("%PDF-1.4 SECRET-PDF-TOKEN");
+    } finally {
+      setDefaultVaultKeyStore(null);
+    }
+  });
+
+  it("a segment longer than 1000 entries is not trusted, and not even read", async () => {
+    const entry = (version: number) => ({
+      version,
+      keyframe: version === 1,
+      edited_by: "a",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: computeContentHash("x"),
+      chain_hash: `sha256:${"0".repeat(64)}`,
+    });
+    const history = (n: number) => ({ versions: Array.from({ length: n }, (_, i) => entry(i + 1)) }) as never;
+    let reads = 0;
+    const read = () => {
+      reads++;
+      return null;
+    };
+    expect(await sealedHead("d", history(1001), read, read)).toBeNull();
+    expect(reads).toBe(0);
+    await sealedHead("d", history(1000), read, read);
+    expect(reads).toBeGreaterThan(0);
+  });
+
+  it("a history file that fails to land on disk keeps its set's history.yaml out too", async () => {
+    await api.run("context_create", { id: "nodes/notes/f", title: "F", content: "body\n" }, ctx);
+    const V = "nodes/notes/.versions/f";
+    const before = await readFile(join(dir, V, "history.yaml"), "utf-8");
+    // A directory where a version file goes: a real I/O failure at write.
+    await mkdir(join(dir, V, "v9.md"));
+    const res = await api.run<{ failed: { id?: string; error?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/v9.md`, content: "x" },
+          { path: `${V}/history.yaml`, content: yaml.dump({ versions: [] }) },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(res.failed.find((f) => f.id === `${V}/history.yaml`)?.error).toMatch(/did not land/);
+    expect(await readFile(join(dir, V, "history.yaml"), "utf-8")).toBe(before);
+  });
+});
+
+describe("QA round 12: fence twins, forgotten exports, replay budget, archives, error paths", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const NOTE = "---\ntitle: f\ntype: document\nstatus: draft\n---\ngone\n";
+
+  async function exportFiles(root: string, sub = ""): Promise<{ path: string; content: string }[]> {
+    const out: { path: string; content: string }[] = [];
+    for (const e of await readdir(join(root, sub), { withFileTypes: true })) {
+      const rel = sub ? `${sub}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (rel !== ".context" && !/^\.versions\/(checkpoints|nest)/.test(rel)) out.push(...(await exportFiles(root, rel)));
+      } else if (rel !== "context.yaml") {
+        out.push({ path: rel, content: await readFile(join(root, rel), "utf-8") });
+      }
+    }
+    return out;
+  }
+
+  it("a lone CR that opens a fence hides the heading below it from the rules too (QA fence4)", async () => {
+    await writeConfig(SUMMARY);
+    await api.run("context_create", { id: "nodes/notes/f", title: "f", content: "## Summary\nreal summary\n" }, ctx);
+    const err = await refusal("context_update", { id: "nodes/notes/f", content: "x\r```\n## Summary\nreal summary\n" });
+    expect(err.code).toBe("VALIDATION_FAILED");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/f.md", content: NOTE }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/notes/f.md"]);
+  });
+
+  it("an export holding a forgotten document restores under enforced rules, fresh and over itself", async () => {
+    await writeConfig(SUMMARY);
+    for (const id of ["gone", "kept"]) {
+      await api.run("context_create", { id: `nodes/notes/${id}`, title: id, content: `## Summary\nv1 ${id}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${id}`, content: `## Summary\nv2 ${id}\n` }, ctx);
+    }
+    await api.run("context_forget", { id: "nodes/notes/gone", reason_code: "legal" }, ctx);
+    const files = await exportFiles(dir);
+    const other = await mkdtemp(join(tmpdir(), "cn-structure-ops-b-"));
+    try {
+      const s2 = new NestStorage(other);
+      await s2.init("b");
+      await writeFile(join(other, ".context", "config.yaml"), yaml.dump({ version: 1, name: "b", ...SUMMARY }), "utf-8");
+      const c2: OperationContext = { storage: s2, query: new GraphQueryEngine(s2), versions: new VersionManager(s2), actor: "t" };
+      const fresh = await api.run<{ failed: unknown[] }>("context_import", { files, publish: false }, c2);
+      expect(fresh.failed, JSON.stringify(fresh.failed)).toEqual([]);
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+    const self = await api.run<{ failed: unknown[] }>("context_import", { files, publish: false, overwrite: true }, ctx);
+    expect(self.failed).toEqual([]);
+  });
+
+  it("a forgotten stub with content in it is still judged in full", async () => {
+    await writeConfig(SUMMARY);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/s.md", content: "---\ntitle: s\nstatus: forgotten\n---\nsmuggled\n" }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/notes/s.md"]);
+  });
+
+  it("a segment whose replay would cost more than its budget is not trusted", async () => {
+    const kf = `---\ntitle: X\n---\n${"y".repeat(8 * 2 ** 20)}\n`;
+    const noop = createPatch("x", "a\n", "a\n");
+    const entry = (version: number) => ({
+      version,
+      keyframe: version === 1,
+      edited_by: "a",
+      edited_at: "2026-01-01T00:00:00Z",
+      content_hash: computeContentHash(version === 1 ? kf : noop),
+      chain_hash: `sha256:${"0".repeat(64)}`,
+    });
+    const history = (n: number) => ({ versions: Array.from({ length: n }, (_, i) => entry(i + 1)) }) as never;
+    const keyframe = (v: number) => (v === 1 ? kf : null);
+    const diff = (v: number) => (v > 1 ? noop : null);
+    expect(await sealedHead("d", history(3), keyframe, diff)).toBe(kf);
+    expect(await sealedHead("d", history(20), keyframe, diff)).toBeNull();
+  });
+
+  it("an archived PDF that fails its hash is refused alone: the history beside it still lands", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const name = res.id.split("/").pop()!;
+    const V = `${res.id.split("/").slice(0, -1).join("/")}/.versions/${name}`;
+    const history = await readFile(join(dir, V, "history.yaml"), "utf-8");
+    const archive = `${V}/${"b".repeat(64)}.pdf`;
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${V}/history.yaml`, content: history }, { path: archive, content: "mangled" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id), JSON.stringify(imp.failed)).toEqual([archive]);
+  });
+
+  it("a PDF node with no history on disk takes the sidecar its .md names (a chunked restore)", async () => {
+    const res = await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx);
+    const name = res.id.split("/").pop()!;
+    await rm(join(dir, `${res.id}.pdf`));
+    await rm(join(dir, dirname(res.id), ".versions", name), { recursive: true });
+    const ok = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${res.id}.pdf`, content: Buffer.from(textPdf()).toString("utf-8") }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(ok.failed).toEqual([]);
+  });
+
+  it("a write that fails on disk reports an error without the vault path", async () => {
+    await mkdir(join(dir, "nodes", "d", "q.md"), { recursive: true });
+    const imp = await api.run<{ failed: { error: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/d/q.md", content: "---\ntitle: Q\n---\nx\n" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed).toHaveLength(1);
+    expect(imp.failed[0].error).not.toContain(dir);
+  });
+});
+
+describe("architecture round 13: bytes on disk first, status-quo histories, flat stores", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const ZERO = `sha256:${"0".repeat(64)}`;
+  const pdfNode = async () =>
+    (await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx)).id;
+  const versionsOf = (id: string) => join(dir, dirname(id), ".versions", id.split("/").pop()!);
+  const hex = (bytes: Uint8Array | string) => sha256Bytes(typeof bytes === "string" ? Buffer.from(bytes, "utf-8") : bytes).slice("sha256:".length);
+
+  it("a .md retyped over an unverifiable history does not free its PDF", async () => {
+    const id = await pdfNode();
+    await rm(join(versionsOf(id), "v1.md"));
+    const md = await readFile(join(dir, `${id}.md`), "utf-8");
+    await writeFile(join(dir, `${id}.md`), md.replace("type: pdf", "type: document"), "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${id}.pdf`, content: "%PDF-1.4 evil" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual([`${id}.pdf`]);
+  });
+
+  it("bytes a sidecar held before an import replaces them are archived, whatever the .md now says", async () => {
+    const id = await pdfNode();
+    // An earlier call retyped the node and planted a history that verifies.
+    const doc = (await readFile(join(dir, `${id}.md`), "utf-8")).replace("type: pdf", "type: document");
+    await writeFile(join(dir, `${id}.md`), doc, "utf-8");
+    await writeFile(join(versionsOf(id), "v2.md"), doc, "utf-8");
+    const history = yaml.load(await readFile(join(versionsOf(id), "history.yaml"), "utf-8")) as { versions: unknown[] };
+    history.versions.push({ version: 2, keyframe: true, edited_by: "x", edited_at: "2026-01-01T00:00:00Z", content_hash: computeContentHash(doc), chain_hash: ZERO });
+    await writeFile(join(versionsOf(id), "history.yaml"), yaml.dump(history), "utf-8");
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${id}.pdf`, content: "%PDF-1.4 new" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed).toEqual([]);
+    expect(await readFile(join(dir, `${id}.pdf`), "utf-8")).toBe("%PDF-1.4 new");
+    const archived = join(versionsOf(id), `${hex(textPdf())}.pdf`);
+    expect(Buffer.from(await readFile(archived)).equals(Buffer.from(textPdf()))).toBe(true);
+  });
+
+  it("a chunked restore lands a PDF node whose .md arrived in an earlier chunk", async () => {
+    const id = await pdfNode();
+    const V = `${dirname(id)}/.versions/${id.split("/").pop()}`;
+    const files = [
+      { path: `${id}.md`, content: await readFile(join(dir, `${id}.md`), "utf-8") },
+      { path: `${id}.pdf`, content: Buffer.from(textPdf()).toString("utf-8") },
+      ...(await readdir(join(dir, V))).map((n) => ({ path: `${V}/${n}`, content: "" })),
+    ];
+    for (const f of files.slice(2)) f.content = await readFile(join(dir, f.path), "utf-8");
+    await rm(join(dir, `${id}.md`));
+    await rm(join(dir, `${id}.pdf`));
+    await rm(join(dir, V), { recursive: true });
+    const one = await api.run<{ failed: unknown[] }>("context_import", { files: files.slice(0, 1), publish: false }, ctx);
+    expect(one.failed).toEqual([]);
+    const two = await api.run<{ failed: unknown[] }>("context_import", { files: files.slice(1), publish: false, overwrite: true }, ctx);
+    expect(two.failed, JSON.stringify(two.failed)).toEqual([]);
+  });
+
+  it("a legacy note's history can take a new conforming version: the status quo is not newly refused", async () => {
+    await api.run("context_create", { id: "nodes/notes/r", title: "R", content: "## Notes\nold\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/r";
+    const G = "---\ntitle: R\n---\n## Summary\nok\n";
+    const history = yaml.load(await readFile(join(dir, V, "history.yaml"), "utf-8")) as { versions: { version: number }[] };
+    const next = history.versions.at(-1)!.version + 1;
+    history.versions.push({ version: next, keyframe: true, edited_by: "x", edited_at: "2026-01-01T00:00:00Z", content_hash: computeContentHash(G), chain_hash: ZERO } as never);
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${V}/v${next}.md`, content: G }, { path: `${V}/history.yaml`, content: yaml.dump(history) }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed, JSON.stringify(imp.failed)).toEqual([]);
+  });
+
+  it("a nested name under a document's store is refused, and takes its history with it", async () => {
+    const V = "nodes/notes/.versions/x";
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${V}/v2.diff/junk`, content: "j" }, { path: `${V}/history.yaml`, content: yaml.dump({ versions: [] }) }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual([`${V}/history.yaml`, `${V}/v2.diff/junk`]);
+    expect(await exists(`${V}/v2.diff`)).toBe(false);
+  });
+
+  it("a version artifact that is not a file reads as an error, never as missing", async () => {
+    await api.run("context_create", { id: "nodes/a", title: "A", content: "x\n" }, ctx);
+    await mkdir(join(dir, "nodes", ".versions", "a", "v2.diff"), { recursive: true });
+    await mkdir(join(dir, "nodes", ".versions", "a", "v3.md"), { recursive: true });
+    await expect(storage.readDiff("nodes/a", 2)).rejects.toMatchObject({ code: "CORRUPT_HISTORY" });
+    await expect(storage.readKeyframe("nodes/a", 3)).rejects.toMatchObject({ code: "CORRUPT_HISTORY" });
+    expect(await storage.readDiff("nodes/a", 9)).toBeNull();
+  });
+
+  it("a forgotten PDF's bytes are refused at any path", async () => {
+    const id = await pdfNode();
+    await api.run("context_forget", { id, reason_code: "user_request" }, ctx);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/elsewhere/copy.pdf", content: Buffer.from(textPdf()).toString("utf-8") }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/elsewhere/copy.pdf"]);
+  });
+
+  it("a document refused before judging takes its PDF with it", async () => {
+    await api.run("context_create", { id: "nodes/gone", title: "Gone", content: "x\n" }, ctx);
+    await api.run("context_forget", { id: "nodes/gone", reason_code: "user_request" }, ctx);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/gone.md", content: "---\ntitle: Gone\n---\nback\n" },
+          { path: "nodes/gone.pdf", content: "%PDF-1.4 x" },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual(["nodes/gone.md", "nodes/gone.pdf"]);
+  });
+
+  it("frontmatter closed by a lone CR parses as the normalized view does", async () => {
+    const raw = "---\rtitle: T\rtype: document\r---\r## Summary\rok\r";
+    const node = parseDocument("nodes/t.md", raw, "nodes/t");
+    expect(node.frontmatter.title).toBe("T");
+    expect(node.body.startsWith("## Summary")).toBe(true);
+  });
+
+  it("link extraction shares the one line model: a lone CR ends a line", () => {
+    expect(extractWikiLinks("```\r[[hidden]]\r```\r[[shown]]")).toEqual(["shown"]);
+  });
+});
+
+describe("architecture round 15: stubs grant nothing, restores over the status quo, kept names", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const ZERO = `sha256:${"0".repeat(64)}`;
+  const entry = (version: number, content: string) => ({
+    version,
+    keyframe: true,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: ZERO,
+  });
+
+  it("a forged forget stub is no baseline: a document over one is judged in full", async () => {
+    await writeConfig(SUMMARY);
+    const stub = "---\ntitle: s\nstatus: forgotten\n---\n";
+    const V = "nodes/notes/.versions/s";
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/v1.md`, content: stub },
+          { path: `${V}/history.yaml`, content: yaml.dump({ versions: [entry(1, stub)] }) },
+          { path: "nodes/notes/s.md", content: "---\ntitle: s\n---\nno summary\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain("nodes/notes/s.md");
+  });
+
+  it("a grandfathered document's own export restores over it", async () => {
+    await api.run("context_create", { id: "nodes/notes/old", title: "Old", content: "## Notes\nlegacy\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/old";
+    const files = [
+      { path: "nodes/notes/old.md", content: await readFile(join(dir, "nodes/notes/old.md"), "utf-8") },
+      ...(await Promise.all(
+        (await readdir(join(dir, V))).map(async (n) => ({ path: `${V}/${n}`, content: await readFile(join(dir, V, n), "utf-8") })),
+      )),
+    ];
+    const imp = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+    expect(imp.failed, JSON.stringify(imp.failed)).toEqual([]);
+  });
+
+  it("a kept README.md never writes into a different-case file beside it", async () => {
+    await api.run("context_create", { id: "nodes/x/readme", title: "readme", content: "node\n" }, ctx);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/x/README.md", content: "# readme\n" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/x/README.md"]);
+  });
+
+  it("verify reports an unreadable version artifact instead of failing the vault", async () => {
+    await api.run("context_create", { id: "nodes/v", title: "V", content: "one\n" }, ctx);
+    await api.run("context_update", { id: "nodes/v", content: "two\n" }, ctx);
+    await api.run("context_create", { id: "nodes/f", title: "F", content: "gone\n" }, ctx);
+    await api.run("context_forget", { id: "nodes/f", reason_code: "user_request" }, ctx);
+    const history = yaml.load(await readFile(join(dir, "nodes/.versions/v/history.yaml"), "utf-8")) as { versions: { version: number; keyframe?: boolean }[] };
+    const diffVersion = history.versions.find((e) => !e.keyframe)!.version;
+    await rm(join(dir, "nodes/.versions/v", `v${diffVersion}.diff`), { force: true });
+    await mkdir(join(dir, "nodes/.versions/v", `v${diffVersion}.diff`));
+    await mkdir(join(dir, "nodes/.versions/f/v1.md"), { recursive: true });
+    const report = await api.run<{ valid: boolean; errors: { type: string; document?: string }[] }>("context_verify", {}, ctx);
+    expect(report.valid).toBe(false);
+    expect(report.errors.find((e) => e.document === "nodes/v")?.type).not.toBe("decryption_failed");
+    expect(report.errors.some((e) => e.document === "nodes/f" && e.type === "forgotten_content_present")).toBe(true);
+  });
+
+  it("an unreadable history on disk refuses its set; an unparseable one is replaced", async () => {
+    await writeConfig(SUMMARY);
+    const A = "---\ntitle: A\n---\nbody\n";
+    await mkdir(join(dir, "nodes/.versions/a/history.yaml"), { recursive: true });
+    const io = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/.versions/a/v1.md", content: A }, { path: "nodes/.versions/a/history.yaml", content: yaml.dump({ versions: [entry(1, A)] }) }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(io.failed.map((f) => f.id).sort()).toEqual(["nodes/.versions/a/history.yaml", "nodes/.versions/a/v1.md"]);
+    expect(await exists("nodes/.versions/a/v1.md")).toBe(false);
+    await mkdir(join(dir, "nodes/.versions/b"), { recursive: true });
+    await writeFile(join(dir, "nodes/.versions/b/history.yaml"), "{{ not yaml", "utf-8");
+    const fix = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: "nodes/.versions/b/v1.md", content: A }, { path: "nodes/.versions/b/history.yaml", content: yaml.dump({ versions: [entry(1, A)] }) }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(fix.failed, JSON.stringify(fix.failed)).toEqual([]);
+  });
+
+  it("a replay is budgeted by the work it does: nine full rewrites of a 400 KB note stay trusted", async () => {
+    const text = (i: number) => `---\ntitle: X\n---\n${Array.from({ length: 40 }, (_, l) => `${i}-${l}-`.padEnd(10_000, String(i))).join("\n")}\n`;
+    const versions = Array.from({ length: 10 }, (_, i) => text(i));
+    const artifacts = versions.map((v, i) => (i === 0 ? v : createPatch("x", versions[i - 1], v)));
+    const history = {
+      versions: artifacts.map((a, i) => ({ ...entry(i + 1, a), keyframe: i === 0 })),
+    } as never;
+    const head = await sealedHead("d", history, (v) => (v === 1 ? artifacts[0] : null), (v) => (v > 1 ? artifacts[v - 1] : null));
+    expect(head).toBe(versions[9]);
+  });
+
+  it("a forgotten PDF's bytes are refused under any name, and a broken-frontmatter copy of a forgotten body too", async () => {
+    const id = (await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx)).id;
+    const body = "This erased body is long enough to be remembered by its hash after the forget.\n";
+    await api.run("context_create", { id: "nodes/secret", title: "Secret", content: body }, ctx);
+    const copy = await readFile(join(dir, "nodes/secret.md"), "utf-8");
+    await api.run("context_forget", { id, reason_code: "user_request" }, ctx);
+    await api.run("context_forget", { id: "nodes/secret", reason_code: "user_request" }, ctx);
+    const broken = copy.replace(/^title:.*$/m, "title: [unclosed");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/elsewhere/copy.bin", content: Buffer.from(textPdf()).toString("utf-8") },
+          { path: "nodes/secret.md", content: broken },
+          { path: "nodes/elsewhere/secret.md", content: broken },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual(["nodes/elsewhere/copy.bin", "nodes/elsewhere/secret.md", "nodes/secret.md"]);
+  });
+});
+
+describe("QA round 15: chunked PDF restores, replay cost, kept names, store squatting", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  async function exportOf(root: string, sub: string): Promise<{ path: string; content: string }[]> {
+    const out: { path: string; content: string }[] = [];
+    for (const e of await readdir(join(root, sub), { withFileTypes: true })) {
+      const rel = `${sub}/${e.name}`;
+      if (e.isDirectory()) out.push(...(await exportOf(root, rel)));
+      else if (e.name !== "INDEX.md") out.push({ path: rel, content: await readFile(join(root, rel), "utf-8") });
+    }
+    return out;
+  }
+
+  async function freshVault(): Promise<{ root: string; c: OperationContext }> {
+    const root = await mkdtemp(join(tmpdir(), "cn-structure-ops-c-"));
+    const s2 = new NestStorage(root);
+    await s2.init("c");
+    return { root, c: { storage: s2, query: new GraphQueryEngine(s2), versions: new VersionManager(s2), actor: "t" } };
+  }
+
+  it("a two-version PDF node restores in any chunk order", async () => {
+    await api.run("context_import_pdf", { id: "nodes/decks/p", bytes_base64: toBase64(textPdf()) }, ctx);
+    await api.run("context_import_pdf", { id: "nodes/decks/p", bytes_base64: toBase64(textPdfV2()) }, ctx);
+    const files = await exportOf(dir, "nodes/decks");
+    const group = (p: string) =>
+      /\/p\.md$/.test(p) ? "md" : /\/p\.pdf$/.test(p) ? "pdf" : p.endsWith("history.yaml") ? "hist" : "art";
+    for (const order of [
+      ["hist", "pdf", "art", "md"],
+      ["hist", "md", "pdf", "art"],
+      ["md", "hist", "pdf", "art"],
+      ["art", "hist", "md", "pdf"],
+    ]) {
+      const { root, c } = await freshVault();
+      try {
+        for (const g of order) {
+          const r = await api.run<{ failed: unknown[] }>("context_import", { files: files.filter((f) => group(f.path) === g), publish: false }, c);
+          expect(r.failed, `${order.join(">")} @${g}: ${JSON.stringify(r.failed)}`).toEqual([]);
+        }
+        const v = await api.run<{ valid: boolean; errors: unknown[] }>("context_verify", {}, c);
+        expect(v.valid, `${order.join(">")}: ${JSON.stringify(v.errors)}`).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("a PDF node with a held revision restores history-first", async () => {
+    await api.run("context_import_pdf", { id: "nodes/decks/p", bytes_base64: toBase64(textPdf()) }, ctx);
+    await api.run("context_import_pdf", { id: "nodes/decks/p", bytes_base64: toBase64(textPdfV2()), publish: false }, ctx);
+    const files = await exportOf(dir, "nodes/decks");
+    const { root, c } = await freshVault();
+    try {
+      const hist = await api.run<{ failed: unknown[] }>("context_import", { files: files.filter((f) => f.path.includes(".versions/")), publish: false }, c);
+      expect(hist.failed).toEqual([]);
+      const rest = await api.run<{ failed: unknown[] }>("context_import", { files: files.filter((f) => !f.path.includes(".versions/")), publish: false }, c);
+      expect(rest.failed, JSON.stringify(rest.failed)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("one import replays no more history than its host allows, and says so", async () => {
+    await writeConfig(SUMMARY);
+    const files: { path: string; content: string }[] = [];
+    for (const n of ["a", "b", "c"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Summary\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Summary\n${"y".repeat(5000)}\n` }, ctx);
+      const V = `nodes/notes/.versions/${n}`;
+      files.push({ path: `${V}/history.yaml`, content: await readFile(join(dir, V, "history.yaml"), "utf-8") });
+    }
+    const tight = { ...ctx, limits: { importReplayChars: 12_000 } };
+    const imp = await api.run<{ failed: { error: string }[] }>("context_import", { files, overwrite: true, publish: false }, tight);
+    expect(imp.failed).toHaveLength(3);
+    for (const f of imp.failed) expect(f.error).toMatch(/split/i);
+    const roomy = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+    expect(roomy.failed).toEqual([]);
+  });
+
+  it("a long replay yields to the event loop", async () => {
+    const A = `---\ntitle: X\n---\n${"y\n".repeat(200_000)}`;
+    const B = `${A}z\n`;
+    const there = createPatch("x", A, B);
+    const back = createPatch("x", B, A);
+    const artifact = (v: number) => (v === 1 ? A : v % 2 === 0 ? there : back);
+    const history = {
+      versions: Array.from({ length: 30 }, (_, i) => ({
+        version: i + 1,
+        keyframe: i === 0,
+        edited_by: "a",
+        edited_at: "2026-01-01T00:00:00Z",
+        content_hash: computeContentHash(artifact(i + 1)),
+        chain_hash: `sha256:${"0".repeat(64)}`,
+      })),
+    } as never;
+    // Turns of the event loop that ran while the replay was in progress:
+    // without yields there are none, whatever the machine's speed.
+    let turns = 0;
+    let running = true;
+    const tick = () => {
+      if (!running) return;
+      turns++;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+    const head = sealedHead("d", history, (v) => (v === 1 ? A : null), (v) => (v > 1 ? artifact(v) : null));
+    const before = turns;
+    try {
+      expect(await head).toBe(B);
+    } finally {
+      running = false;
+    }
+    expect(turns - before).toBeGreaterThanOrEqual(5);
+  });
+
+  it("the rules report does not hold a forget stub to its folder's sections", async () => {
+    await writeConfig(SUMMARY);
+    await api.run("context_create", { id: "nodes/notes/f", title: "f", content: "## Summary\nok\n" }, ctx);
+    await api.run("context_forget", { id: "nodes/notes/f", reason_code: "user_request" }, ctx);
+    const out = await api.run<{ violations: { path: string }[] }>("context_structure", { report: true }, ctx);
+    expect(out.violations.map((v) => v.path)).not.toContain("notes/f");
+  });
+
+  it("a kept name is never renamed into a node, nor written beside another spelling in the batch", async () => {
+    await writeFile(join(dir, "nodes", "INDEX.md"), "# index\n", "utf-8");
+    const renamed = await api.run<{ failed: { id?: string }[] }>("context_import", { files: [{ path: "nodes/INDEX.md", content: "# other\n" }], publish: false }, ctx);
+    expect(renamed.failed.map((f) => f.id)).toEqual(["nodes/INDEX.md"]);
+    expect(await exists("nodes/INDEX-2.md")).toBe(false);
+    const twins = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/b/README.md", content: "# r\n" }, { path: "nodes/b/Readme.md", content: "---\ntitle: r\n---\nx\n" }], publish: false },
+      ctx,
+    );
+    expect(twins.failed.map((f) => f.id)).toEqual(["nodes/b/README.md"]);
+  });
+
+  it("a file cannot take the place of a document's history folder", async () => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/notes/.versions/x", content: "squat" }, { path: ".versions/context_latest.yaml", content: "version: 0\n" }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/notes/.versions/x"]);
+  });
+});
+
+describe("architecture round 17: bounded patch search, the batch's own files, parsed baselines", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const entry = (version: number, content: string, keyframe = true) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("a hunk that fits nowhere is given up on quickly, not searched line by line", async () => {
+    const kf = "x\n".repeat(40_000);
+    const context = Array(6_000).fill(" x");
+    context[context.length - 1] = " y";
+    const patch = `--- a\n+++ b\n@@ -1,6000 +1,6000 @@\n${context.join("\n")}\n`;
+    const history = { versions: [entry(1, kf), entry(2, patch, false)] } as never;
+    const start = performance.now();
+    expect(await sealedHead("d", history, (v) => (v === 1 ? kf : null), (v) => (v === 2 ? patch : null))).toBeNull();
+    expect(performance.now() - start).toBeLessThan(1500);
+  });
+
+  it("a set that brings a version file is replayed, even when its history matches the one here", async () => {
+    await api.run("context_create", { id: "nodes/notes/d", title: "D", content: "## Summary\none\n" }, ctx);
+    await api.run("context_update", { id: "nodes/notes/d", content: "## Summary\ntwo\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/d";
+    const history = yaml.load(await readFile(join(dir, V, "history.yaml"), "utf-8")) as { versions: { version: number; keyframe?: boolean }[] };
+    const diff = history.versions.find((e) => !e.keyframe)!.version;
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: `${V}/v${diff}.diff`, content: "garbage" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual([`${V}/v${diff}.diff`]);
+  });
+
+  it("a head that does not parse is no baseline for an import", async () => {
+    const V = "nodes/notes/.versions/b";
+    const broken = "---\ntitle: [unclosed\n---\nno summary\n";
+    await mkdir(join(dir, V), { recursive: true });
+    await writeFile(join(dir, V, "v1.md"), broken, "utf-8");
+    await writeFile(join(dir, V, "history.yaml"), yaml.dump({ versions: [entry(1, broken)] }), "utf-8");
+    await writeConfig(SUMMARY);
+    const next = "---\ntitle: b\n---\nstill no summary\n";
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      {
+        files: [
+          { path: `${V}/v2.md`, content: next },
+          { path: `${V}/history.yaml`, content: yaml.dump({ versions: [entry(1, broken), entry(2, next)] }) },
+        ],
+        overwrite: true,
+        publish: false,
+      },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toContain(`${V}/history.yaml`);
+  });
+
+  it("a file named .versions is refused: it would block every document in its folder", async () => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/other/.versions", content: "squat" }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/other/.versions"]);
+  });
+
+  it("a type the rules exempt is no baseline: retyping a source to a document is judged in full", async () => {
+    await writeConfig({ structure: { enforce: true }, folders: { sources: { types: ["document", "source"], template: "n" } }, templates: SUMMARY.templates });
+    const made = await api.run<{ id: string }>(
+      "context_create",
+      { id: "sources/s", title: "S", type: "source", content: "body\n", source: { transport: "mcp", server: "harvest", tools: ["list_projects"] } },
+      ctx,
+    );
+    expect(made.id, made.id).toMatch(/^sources\//);
+    const err = await refusal("context_update", { id: made.id, type: "document", content: "no summary\n" });
+    expect(err.message).toMatch(/Summary/);
+    await api.run("context_update", { id: made.id, type: "document", content: "## Summary\nok\n" }, ctx);
+  });
+
+  it("the sealed bytes restore over a sidecar that matches neither the .md nor its sealed version", async () => {
+    const id = (await api.run<{ id: string }>("context_import_pdf", { folder: "decks", title: "P", bytes_base64: toBase64(textPdf()) }, ctx)).id;
+    await writeFile(join(dir, `${id}.pdf`), "%PDF-1.4 drifted", "utf-8");
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files: [{ path: `${id}.pdf`, content: Buffer.from(textPdf()).toString("utf-8") }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed, JSON.stringify(imp.failed)).toEqual([]);
+    const name = id.split("/").pop()!;
+    const drifted = sha256Bytes(Buffer.from("%PDF-1.4 drifted", "utf-8")).slice("sha256:".length);
+    expect(await exists(`${dirname(id)}/.versions/${name}/${drifted}.pdf`)).toBe(true);
+  });
+
+  it("a kept name's twin is found however the file system folds it", async () => {
+    await mkdir(join(dir, "nodes", "t"), { recursive: true });
+    await writeFile(join(dir, "nodes", "t", "readme.md."), "x", "utf-8");
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/t/README.md", content: "# r\n" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/t/README.md"]);
+  });
+
+  it("a forgotten version's text is refused under any name", async () => {
+    await api.run("context_create", { id: "nodes/k", title: "K", content: "secret body\n" }, ctx);
+    const kf = await readFile(join(dir, "nodes/.versions/k/v1.md"), "utf-8");
+    await api.run("context_forget", { id: "nodes/k", reason_code: "user_request" }, ctx);
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: "nodes/elsewhere/copy.txt", content: kf }], publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual(["nodes/elsewhere/copy.txt"]);
+  });
+
+  it("every parser of a .versions path agrees on planned import paths", async () => {
+    const { versionsArtifact, storeOwner, historyMember } = await import("../api/import-verdicts.js");
+    const { isVersionArtifactPath, slugifyImportPath } = await import("../import-hygiene.js");
+    for (const raw of ["nodes/a/.versions/x/v2.diff", "nodes/./a/.versions/x/history.yaml", ".versions/x/v1.md", "a/b/.versions/Doc Name/v3.md", "nodes/.versions/x/" + "f".repeat(64) + ".pdf"]) {
+      const path = slugifyImportPath(raw);
+      const v = versionsArtifact(path);
+      expect(v, raw).not.toBeNull();
+      expect(storeOwner(path), raw).toBe(v!.owner);
+      expect(isVersionArtifactPath(path), raw).toBe(true);
+      expect(historyMember(path), raw).toBe(/\.pdf$/.test(path) ? null : v!.owner);
+    }
+  });
+});
+
+describe("QA round 17: reads in the budget, bulk publish budgeted, the vault's own lock", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("reading and hashing a history is charged to the budget, not only replaying it", async () => {
+    const a = "---\ntitle: v\n---\n## Summary\nA\n";
+    const b = a.replace("\nA\n", "\nB\n");
+    // Junk ahead of the hunk header: costly to read and hash, free to replay.
+    const there = `${"J".repeat(50_000)}\n${createPatch("v", a, b)}`;
+    const back = `${"J".repeat(50_000)}\n${createPatch("v", b, a)}`;
+    const diff = (v: number) => (v % 2 === 0 ? there : back);
+    const history = { versions: [entry(1, a, true), ...Array.from({ length: 10 }, (_, i) => entry(i + 2, diff(i + 2)))] } as never;
+    const budget = { left: 100_000 };
+    expect(await sealedHead("d", history, (v) => (v === 1 ? a : null), (v) => (v > 1 ? diff(v) : null), budget)).toBeNull();
+    expect(budget).toMatchObject({ spent: true });
+    // The same history, with room for it, rebuilds.
+    expect(await sealedHead("d", history, (v) => (v === 1 ? a : null), (v) => (v > 1 ? diff(v) : null), { left: 10_000_000 })).toBe(a);
+  });
+
+  it("a reader that returns something other than text is no head, and the replay queue keeps working", async () => {
+    const a = "---\ntitle: x\n---\nA\n";
+    const history = { versions: [entry(1, a, true), entry(2, "x")] } as never;
+    expect(await sealedHead("d", history, () => a, (() => 5) as never)).toBeNull();
+    expect(await sealedHead("d", history, () => a, () => Promise.reject(new Error("EACCES")))).toBeNull();
+    expect(await sealedHead("d", { versions: [entry(1, a, true)] } as never, () => a, () => null)).toBe(a);
+  });
+
+  it("a bulk publish of grandfathered documents shares the import's replay budget", async () => {
+    for (const n of ["a", "b", "c"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Notes\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Notes\n${"y".repeat(5000)}\n` }, ctx);
+    }
+    await writeConfig(SUMMARY);
+    const ids = ["nodes/notes/a", "nodes/notes/b", "nodes/notes/c"];
+    const tight = { ...ctx, limits: { importReplayChars: 12_000 } };
+    const cut = await api.run<{ failed: { id?: string; error: string }[] }>("context_import", { ids }, tight);
+    expect(cut.failed.length).toBeGreaterThan(0);
+    for (const f of cut.failed) expect(f.error).toMatch(/separate call/);
+    const roomy = await api.run<{ failed: unknown[] }>("context_import", { ids }, ctx);
+    expect(roomy.failed).toEqual([]);
+  });
+
+  it("an import cannot write the vault's own lock, or any dot-named entry of the root .versions/", async () => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path: ".versions/.lock/owner", content: "not-your-token" }, { path: "nodes/.versions/.hidden/v1.md", content: "x" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id).sort()).toEqual([".versions/.lock/owner", "nodes/.versions/.hidden/v1.md"]);
+    expect(await exists(".versions/.lock")).toBe(false);
+    const start = performance.now();
+    await api.run("context_create", { id: "nodes/after", title: "after", content: "y\n" }, ctx);
+    expect(performance.now() - start).toBeLessThan(5_000);
+  });
+});
+
+describe("architecture round 19: patch search priced per comparison, reads outside the replay queue", () => {
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("hunks that only fit far from where they say are not trusted: each comparison costs its own weight", async () => {
+    // Every diff says line 1 but fits only at the last line, 200k lines away.
+    const kf = `${"a\n".repeat(200_000)}b\n`;
+    const there = "--- x\n+++ x\n@@ -1,1 +1,1 @@\n-b\n+c\n";
+    const back = "--- x\n+++ x\n@@ -1,1 +1,1 @@\n-c\n+b\n";
+    const diff = (v: number) => (v % 2 === 0 ? there : back);
+    const history = { versions: [entry(1, kf, true), ...Array.from({ length: 40 }, (_, i) => entry(i + 2, diff(i + 2)))] } as never;
+    const start = performance.now();
+    expect(await sealedHead("d", history, (v) => (v === 1 ? kf : null), (v) => (v > 1 ? diff(v) : null))).toBeNull();
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it("junk ahead of a patch's hunks does not buy it a longer search", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    const kf = `${"a\n".repeat(200_000)}b\n`;
+    const padded = `${"J".repeat(4_000_000)}\n--- x\n+++ x\n@@ -1,1 +1,1 @@\n-b\n+c\n`;
+    expect(applyPatchBounded(kf, padded).result).toBe(false);
+  });
+
+  it("a read still pending for one document does not hold up another's", async () => {
+    const a = "---\ntitle: x\n---\nA\n";
+    const one = { versions: [entry(1, a, true)] } as never;
+    let release!: (v: string | null) => void;
+    const stuck = sealedHead("stuck", one, () => new Promise<string | null>((r) => (release = r)), () => null);
+    try {
+      const start = performance.now();
+      expect(await sealedHead("free", one, () => a, () => null)).toBe(a);
+      expect(performance.now() - start).toBeLessThan(1000);
+    } finally {
+      release(null);
+      await stuck;
+    }
+  });
+
+  it("a version artifact over the size a reader allows is refused before it is read", async () => {
+    await api.run("context_create", { id: "nodes/big", title: "Big", content: `${"x".repeat(5000)}\n` }, ctx);
+    await expect(storage.readKeyframe("nodes/big", 1, { maxBytes: 100 })).rejects.toMatchObject({ code: "CORRUPT_HISTORY" });
+    expect(await storage.readKeyframe("nodes/big", 1, { maxBytes: 1_000_000 })).toContain("xxxx");
+  });
+});
+
+describe("QA round 19: a patch applies where it says, ledger names stay files, reads sized to what is left", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("a hunk of added lines ahead of a context line that fits nowhere is given up on at once", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    const kf = "\n".repeat(100_000);
+    const patch = `--- x\n+++ x\n@@ -1,1 +1,2001 @@\n${"+a\n".repeat(2000)} nowhere\n`;
+    const { result, compared } = applyPatchBounded(kf, patch);
+    expect(result).toBe(false);
+    // One comparison — at the line the hunk names — not one per line of text.
+    expect(compared).toBeLessThan(1_000);
+  });
+
+  it("a hunk that fits only away from the line it names does not apply", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    expect(applyPatchBounded("a\nb\nc\n", "--- x\n+++ x\n@@ -1,1 +1,1 @@\n-c\n+d\n").result).toBe(false);
+    const A = "one\r\ntwo\r\nthree\r\n";
+    const B = "one\r\n2\r\nthree\r\n";
+    expect(applyPatchBounded(A, createPatch("x", A, B)).result).toBe(B);
+  });
+
+  it.each([
+    ".versions/context_history.yaml/x",
+    ".versions/chain_events.yaml/v1.md",
+    ".versions/context_latest.yaml/history.yaml",
+    ".versions/context_history.yaml./x",
+  ])("an import cannot put a folder at the root ledger path of %s", async (path) => {
+    const imp = await api.run<{ failed: { id?: string }[] }>(
+      "context_import",
+      { files: [{ path, content: "x" }], overwrite: true, publish: false },
+      ctx,
+    );
+    expect(imp.failed.map((f) => f.id)).toEqual([path]);
+    expect(await exists(path.split("/").slice(0, 2).join("/"))).toBe(false);
+    await api.run("context_create", { id: "nodes/after", title: "after", content: "y\n" }, ctx);
+  });
+
+  it("each read for a sealed head is sized to the room the budget has left", async () => {
+    const big = "x".repeat(5000);
+    const asked: (number | undefined)[] = [];
+    const budget = { left: 1000 };
+    const reader = (_v: number, maxBytes?: number) => {
+      asked.push(maxBytes);
+      return big;
+    };
+    expect(await sealedHead("d", { versions: [entry(1, big, true)] } as never, reader, () => null, budget)).toBeNull();
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toBeLessThanOrEqual(5 * 1000);
+    expect(budget).toMatchObject({ spent: true });
+  });
+
+  it("a sealed-head reader over its room spends the budget rather than reading", async () => {
+    await api.run("context_create", { id: "nodes/big", title: "Big", content: `${"x".repeat(50_000)}\n` }, ctx);
+    const { sealedReaders } = await import("../structure-store.js");
+    const history = await storage.readHistory("nodes/big");
+    const budget = { left: 1000 };
+    const r = sealedReaders(storage, "nodes/big");
+    expect(await sealedHead("nodes/big", history!, r.keyframe, r.diff, budget)).toBeNull();
+    expect(budget).toMatchObject({ spent: true });
+  });
+
+  it("documents an over-budget import brings need no replay: they publish, not linger as drafts", async () => {
+    const ids: string[] = [];
+    for (const n of ["a", "b", "c"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Notes\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Notes\n${"y".repeat(5000)}\n` }, ctx);
+      ids.push(`nodes/notes/${n}`);
+    }
+    await writeConfig(SUMMARY);
+    const tight = { ...ctx, limits: { importReplayChars: 12_000 } };
+    const r = await api.run<{ published: { id: string }[]; failed: { id?: string; title?: string; error: string }[] }>(
+      "context_import",
+      { ids, documents: [{ title: "New", content: "## Summary\nhi\n", folder: "notes" }] },
+      tight,
+    );
+    expect(r.failed.length).toBeGreaterThan(0);
+    for (const f of r.failed) expect(f.error).toMatch(/separate call/);
+    expect(r.published.map((p) => p.id)).toContain("nodes/notes/new");
+  });
+
+  it("an over-budget bulk publish publishes a prefix of its ids, the same on every run", async () => {
+    const ids: string[] = [];
+    for (const n of ["a", "b", "c", "d", "e", "f"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `## Notes\n${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `## Notes\n${"y".repeat(5000)}\n` }, ctx);
+      ids.push(`nodes/notes/${n}`);
+    }
+    await writeConfig(SUMMARY);
+    const r = await publishDocuments(storage, ids, { editedBy: "x", replayBudget: { left: 70_000 } });
+    const done = r.published.map((p) => p.id).sort();
+    expect(done.length).toBeGreaterThan(0);
+    expect(r.failed.length).toBeGreaterThan(0);
+    expect(done).toEqual(ids.slice(0, done.length));
+    for (const f of r.failed) expect(f.error).toMatch(/separate call/);
+  });
+
+  it("an unreadable replay limit is the default, not unlimited", async () => {
+    const { importReplayBudget, DEFAULT_IMPORT_REPLAY_CHARS } = await import("../api/import-verdicts.js");
+    expect(importReplayBudget({ ...ctx, limits: { importReplayChars: Number.NaN } }).left).toBe(DEFAULT_IMPORT_REPLAY_CHARS);
+    expect(importReplayBudget({ ...ctx, limits: { importReplayChars: 5 } }).left).toBe(5);
+  });
+});
+
+describe("structureReport: the compliance report for any rules, saved or draft", () => {
+  it("judges the vault's content against the rules it is given, as context_structure report does", async () => {
+    const { structureReport } = await import("../index.js");
+    await api.run("context_create", { id: "nodes/notes/kickoff", title: "Kickoff", content: "x\n" }, ctx);
+    const draft = compileStructure({ folders: { notes: { file_name: "{date}-{slug}" } } });
+    const violations = await structureReport(storage, draft);
+    expect(violations.map((v) => [v.code, v.path])).toEqual([["FILE_NAME", "notes/kickoff"]]);
+    await setStructure(storage, { folders: { notes: { file_name: "{date}-{slug}" } } });
+    const viaOp = await api.run<{ violations: unknown[] }>("context_structure", { report: true }, ctx);
+    expect(viaOp.violations).toEqual(violations);
+  });
+});
+
+describe("architecture round 21: headers bounded, reads sized everywhere, conforming documents not replayed", () => {
+  const ALLOW: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("a hunk whose header points past the text, or out of order, does not apply — and costs nothing", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    const start = performance.now();
+    expect(applyPatchBounded("hello\n", "--- x\n+++ x\n@@ -50000000,0 +50000001,1 @@\n+x\n").result).toBe(false);
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(applyPatchBounded("a\nb\nc\n", "--- x\n+++ x\n@@ -3,1 +3,1 @@\n-c\n+C\n@@ -1,1 +1,1 @@\n-a\n+A\n").result).toBe(false);
+    const A = "a\nb\n";
+    expect(applyPatchBounded(A, createPatch("x", A, "z\na\nb\n")).result).toBe("z\na\nb\n");
+    expect(applyPatchBounded(A, createPatch("x", A, "a\nb\nz\n")).result).toBe("a\nb\nz\n");
+    expect(applyPatchBounded("", createPatch("x", "", "first\n")).result).toBe("first\n");
+    // CRLF, several hunks, and a text without a final newline still apply where they say.
+    const C = "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\n";
+    const D = C.replace("two", "2").replace("nine", "9");
+    expect(applyPatchBounded(C, createPatch("x", C, D)).result).toBe(D);
+    expect(applyPatchBounded("a\nb", createPatch("x", "a\nb", "a\nb\n")).result).toBe("a\nb\n");
+    expect(applyPatchBounded("a\nb\n", createPatch("x", "a\nb\n", "a\nc")).result).toBe("a\nc");
+  });
+
+  it("an import's history verdicts read the disk only within the room left", async () => {
+    await api.run("context_create", { id: "nodes/notes/a", title: "a", content: `## Summary\n${"x".repeat(20_000)}\n` }, ctx);
+    await api.run("context_update", { id: "nodes/notes/a", content: `## Summary\n${"y".repeat(20_000)}\n` }, ctx);
+    await writeConfig(SUMMARY);
+    const asked: (number | undefined)[] = [];
+    const real = storage.readKeyframe.bind(storage);
+    storage.readKeyframe = (id: string, v: number, opts?: { maxBytes?: number }) => {
+      asked.push(opts?.maxBytes);
+      return real(id, v, opts);
+    };
+    const V = "nodes/notes/.versions/a";
+    // The set brings a diff, so its head is rebuilt from the call's files over the disk's.
+    const files = ["v2.diff", "history.yaml"].map((n) => ({ path: `${V}/${n}`, content: "" }));
+    for (const f of files) f.content = await readFile(join(dir, f.path), "utf-8");
+    // Room enough to rebuild the disk's head, so the set's own rebuild reads too.
+    await api.run("context_import", { files, overwrite: true, publish: false }, { ...ctx, limits: { importReplayChars: 200_000 } });
+    // The set's own rebuild reads the keyframe it lacks from disk, within its room.
+    expect(asked.length).toBeGreaterThan(0);
+    for (const m of asked) expect(m).toBeLessThanOrEqual(5 * 200_000);
+  });
+
+  it("a document that passes the full check is not replayed, so a spent budget does not refuse it", async () => {
+    await api.run("context_create", { id: "nodes/notes/ok", title: "ok", content: "## Summary\nfine\n" }, ctx);
+    await api.run("context_update", { id: "nodes/notes/ok", content: "## Summary\nstill fine\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const r = await publishDocuments(storage, ["nodes/notes/ok"], { editedBy: "x", replayBudget: { left: 10 } });
+    expect(r.failed).toEqual([]);
+  });
+
+  it("a document cut short by the budget is told to publish separately, never to run the same call again", async () => {
+    await api.run("context_create", { id: "nodes/notes/bad", title: "bad", content: "no summary\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const r = await publishDocuments(storage, ["nodes/notes/bad"], { editedBy: "x", replayBudget: { left: 0, spent: true } });
+    expect(r.failed).toHaveLength(1);
+    expect(r.failed[0].error).toMatch(/publish it in a separate call/);
+    expect(r.failed[0].error).not.toMatch(/again/);
+  });
+
+  it("a history over the read limit is refused with one message, not wrapped twice", async () => {
+    await api.run("context_create", { id: "nodes/notes/h", title: "h", content: "x\n" }, ctx);
+    const err = await storage.readHistory("nodes/notes/h", { maxBytes: 10 }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message.match(/could not be read/g)).toHaveLength(1);
+  });
+
+  it("a suggestion that no longer applies, its frontmatter moved on, is reported stale", async () => {
+    const id = "nodes/notes/fm";
+    await api.run("context_create", { id, title: "Fm", content: "Body.\n" }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    const staged = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: raw,
+      proposedRawContent: raw.replace("Body.", "Body, edited."),
+      source: "out-of-band-edit",
+      actor: "user",
+      docTier: "standard",
+    });
+    await api.run("context_update", { id, tags: ["#one", "#two", "#three"] }, ctx);
+    await expect(
+      approveSuggestion({ storage, rbac: ALLOW, documentId: id, suggestionId: staged.meta.suggestion_id, actor: "owner", zone: "default" }),
+    ).rejects.toThrow(/no longer applies/);
+  });
+});
+
+describe("QA round 21: held edits stale alike everywhere, room for any script, one prefix", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("a held edit that no longer applies after a frontmatter-only edit is stale in the listing, the proposal and approval", async () => {
+    const { listReviewHolds, currentReviewProposal } = await import("../index.js");
+    const id = "nodes/notes/held";
+    await api.run("context_create", { id, title: "Held", content: "Line one.\nLine two.\n" }, ctx);
+    const held = await api.run<{ held_for_review?: boolean }>("context_update", { id, content: "Line one, edited.\nLine two.\n", review: true }, ctx);
+    expect(held.held_for_review).toBe(true);
+    expect((await listReviewHolds(storage, id)).map((h) => h.stale)).toEqual([false]);
+    // The owner adds a description: the body is the same, every body line moves down.
+    await api.run("context_update", { id, description: "A line the frontmatter did not have." }, ctx);
+    expect((await listReviewHolds(storage, id)).map((h) => h.stale)).toEqual([true]);
+    expect(await currentReviewProposal(storage, id)).toBeNull();
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/stale/i);
+  });
+
+  it("a second held edit after a frontmatter-only edit never silently drops the first: the first stays listed stale", async () => {
+    const { listReviewHolds } = await import("../index.js");
+    const id = "nodes/notes/two";
+    await api.run("context_create", { id, title: "Two", content: "Body.\n" }, ctx);
+    await api.run("context_update", { id, content: "Body, edited by the agent.\n", review: true }, ctx);
+    await api.run("context_update", { id, description: "Owner's description." }, ctx);
+    await api.run("context_update", { id, tags: ["#later"], review: true }, ctx);
+    const holds = await listReviewHolds(storage, id);
+    // Either the second carries the first (one live hold with both edits), or
+    // the first is listed stale — never a live hold that can no longer apply.
+    for (const h of holds.filter((x) => !x.stale)) {
+      const { currentReviewProposal } = await import("../index.js");
+      const p = await currentReviewProposal(storage, id);
+      expect(p, `live hold ${h.suggestion_id} must apply`).not.toBeNull();
+    }
+    expect(holds.some((h) => h.stale)).toBe(true);
+  });
+
+  it("an encrypted document in a non-Latin script gets its full character allowance", async () => {
+    const store = new MemoryKeyStore();
+    setDefaultVaultKeyStore(store);
+    try {
+      await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+      const text = `${"漢字".repeat(5_000)}\n`;
+      await api.run("context_create", { id: "nodes/cjk", title: "cjk", content: text }, ctx);
+      const { sealedReaders } = await import("../structure-store.js");
+      const history = await storage.readHistory("nodes/cjk");
+      const kf = await storage.readKeyframe("nodes/cjk", 1);
+      const budget = { left: kf!.length };
+      const r = sealedReaders(storage, "nodes/cjk");
+      expect(await sealedHead("nodes/cjk", history!, r.keyframe, r.diff, budget)).toBe(kf);
+      expect(budget).not.toMatchObject({ spent: true });
+    } finally {
+      setDefaultVaultKeyStore(null);
+    }
+  });
+
+  it("an over-budget bulk publish publishes the same prefix in two copies of the same vault", async () => {
+    const { cp } = await import("node:fs/promises");
+    const ids: string[] = [];
+    for (const n of ["a", "b", "c", "d", "e", "f"]) {
+      await api.run("context_create", { id: `nodes/notes/${n}`, title: n, content: `no summary ${"x".repeat(5000)}\n` }, ctx);
+      await api.run("context_update", { id: `nodes/notes/${n}`, content: `still none ${"y".repeat(5000)}\n` }, ctx);
+      ids.push(`nodes/notes/${n}`);
+    }
+    // Grandfathered: they broke no rule when written, so each needs its head.
+    await writeConfig(SUMMARY);
+    const twin = `${dir}-twin`;
+    await cp(dir, twin, { recursive: true });
+    try {
+      const run = async (root: string) =>
+        (await publishDocuments(new NestStorage(root), ids, { editedBy: "x", replayBudget: { left: 70_000 } })).published.map((p) => p.id).sort();
+      const one = await run(dir);
+      const two = await run(twin);
+      expect(one.length).toBeGreaterThan(0);
+      expect(one.length).toBeLessThan(ids.length);
+      expect(two).toEqual(one);
+    } finally {
+      await rm(twin, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("architecture round 22 review: the disk's head only when a verdict needs it", () => {
+  const SUMMARY: StructureConfig = {
+    structure: { enforce: true },
+    folders: { notes: { types: ["document"], template: "n" } },
+    templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+  };
+
+  it("restoring a conforming document's whole history reads none of the disk's artifacts", async () => {
+    await api.run("context_create", { id: "nodes/notes/c", title: "c", content: "## Summary\none\n" }, ctx);
+    await api.run("context_update", { id: "nodes/notes/c", content: "## Summary\ntwo\n" }, ctx);
+    await writeConfig(SUMMARY);
+    const V = "nodes/notes/.versions/c";
+    const names = (await readdir(join(dir, V))).filter((n) => /^(history\.yaml|v\d+\.(md|diff))$/.test(n));
+    const files = await Promise.all(names.map(async (n) => ({ path: `${V}/${n}`, content: await readFile(join(dir, V, n), "utf-8") })));
+    let reads = 0;
+    const kf = storage.readKeyframe.bind(storage);
+    const df = storage.readDiff.bind(storage);
+    storage.readKeyframe = (...a: Parameters<typeof kf>) => (reads++, kf(...a));
+    storage.readDiff = (...a: Parameters<typeof df>) => (reads++, df(...a));
+    const imp = await api.run<{ failed: unknown[] }>("context_import", { files, overwrite: true, publish: false }, ctx);
+    expect(imp.failed).toEqual([]);
+    expect(reads).toBe(0);
+  });
+});
+
+describe("QA round 22: no shared read slots, one rebuild per restored history, held edits by what they propose", () => {
+  const entry = (version: number, content: string, keyframe = false) => ({
+    version,
+    keyframe,
+    edited_by: "x",
+    edited_at: "2026-01-01T00:00:00Z",
+    content_hash: computeContentHash(content),
+    chain_hash: `sha256:${"0".repeat(64)}`,
+  });
+
+  it("reads still pending for four documents do not hold up a fifth's", async () => {
+    const a = "---\ntitle: x\n---\nA\n";
+    const one = { versions: [entry(1, a, true)] } as never;
+    const releases: Array<(v: string | null) => void> = [];
+    const stuck = [1, 2, 3, 4].map((i) => sealedHead(`stuck${i}`, one, () => new Promise<string | null>((r) => releases.push(r)), () => null));
+    try {
+      const fifth = sealedHead("free", one, () => a, () => null);
+      const late = new Promise((r) => setTimeout(() => r("waiting"), 2000));
+      expect(await Promise.race([fifth, late])).toBe(a);
+    } finally {
+      for (const r of releases) r(null);
+      await Promise.all(stuck);
+    }
+  });
+
+  it("restoring a document's own history over itself rebuilds that history once, not twice", async () => {
+    const SUMMARY: StructureConfig = {
+      structure: { enforce: true },
+      folders: { notes: { types: ["document"], template: "n" } },
+      templates: { n: { body: "## Summary\n", required_sections: ["Summary"] } },
+    };
+    const id = "nodes/notes/r";
+    await api.run("context_create", { id, title: "r", content: `## Summary\n${"a".repeat(40_000)}\n` }, ctx);
+    for (const c of "bcde") await api.run("context_update", { id, content: `## Summary\n${c.repeat(40_000)}\n` }, ctx);
+    await writeConfig(SUMMARY);
+    // What one rebuild of this history costs.
+    const { sealedReaders } = await import("../structure-store.js");
+    const probe = { left: 1e12 };
+    const r = sealedReaders(storage, id);
+    expect(await sealedHead(id, (await storage.readHistory(id))!, r.keyframe, r.diff, probe)).not.toBeNull();
+    const once = 1e12 - probe.left;
+    const V = "nodes/notes/.versions/r";
+    const names = (await readdir(join(dir, V))).filter((n) => /^(history\.yaml|v\d+\.(md|diff))$/.test(n));
+    const files = await Promise.all(names.map(async (n) => ({ path: `${V}/${n}`, content: await readFile(join(dir, V, n), "utf-8") })));
+    const imp = await api.run<{ failed: unknown[] }>(
+      "context_import",
+      { files, overwrite: true, publish: false },
+      { ...ctx, limits: { importReplayChars: Math.ceil(once * 1.5) } },
+    );
+    expect(imp.failed).toEqual([]);
+  });
+
+  it("a held edit on repetitive text that would land on another line after a frontmatter shift is stale, not misapplied", async () => {
+    const { listReviewHolds } = await import("../index.js");
+    const id = "nodes/notes/rep";
+    const lines = Array.from({ length: 40 }, () => "x");
+    await api.run("context_create", { id, title: "rep", content: `${lines.join("\n")}\n` }, ctx);
+    const edited = [...lines];
+    edited[21] = "HELD";
+    await api.run("context_update", { id, content: `${edited.join("\n")}\n`, review: true }, ctx);
+    await api.run("context_update", { id, description: "One more frontmatter line." }, ctx);
+    expect((await listReviewHolds(storage, id)).map((h) => h.stale)).toEqual([true]);
+    await expect(approveReview(storage, id, { actor: "owner" })).rejects.toThrow(/stale/i);
+    expect(await readFile(join(dir, `${id}.md`), "utf-8")).not.toContain("HELD");
+  });
+
+  it("a suggestion on repetitive text that would land on another line is refused, not misapplied", async () => {
+    const ALLOW: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
+    const id = "nodes/notes/rep2";
+    const lines = Array.from({ length: 40 }, () => "x");
+    await api.run("context_create", { id, title: "rep2", content: `${lines.join("\n")}\n` }, ctx);
+    const raw = await readFile(join(dir, `${id}.md`), "utf-8");
+    const proposed = raw.split("\n");
+    proposed[proposed.length - 20] = "SUGGESTED";
+    const staged = await stageSuggestion({
+      storage,
+      documentId: id,
+      approvedRawContent: raw,
+      proposedRawContent: proposed.join("\n"),
+      source: "out-of-band-edit",
+      actor: "user",
+      docTier: "standard",
+    });
+    await api.run("context_update", { id, description: "One more frontmatter line." }, ctx);
+    await expect(
+      approveSuggestion({ storage, rbac: ALLOW, documentId: id, suggestionId: staged.meta.suggestion_id, actor: "owner", zone: "default" }),
+    ).rejects.toThrow(/no longer applies/);
+  });
+
+  it.skipIf(process.platform === "win32")("a version file that is not a regular file is refused before it is read", async () => {
+    await api.run("context_create", { id: "nodes/notes/dev", title: "dev", content: "x\n" }, ctx);
+    const V = join(dir, "nodes/notes/.versions/dev");
+    await rm(join(V, "v1.md"), { force: true });
+    await symlink("/dev/zero", join(V, "v1.md"));
+    const started = performance.now();
+    await expect(storage.readKeyframe("nodes/notes/dev", 1, { maxBytes: 1024 })).rejects.toMatchObject({ code: "CORRUPT_HISTORY" });
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("any text, and an edit of it, round-trips through a patch applied only where it says", async () => {
+    const { applyPatchBounded } = await import("../reconstruct.js");
+    // Seeded, so a failure reproduces: line endings LF, CRLF and lone CR, mixed,
+    // no final newline, empty text, repeated lines.
+    let seed = 0x2f6e2b1;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const ends = ["\n", "\r\n", "\r", ""];
+    const words = ["a", "b", "x", "x", "x", "line", "", "# H", "  "];
+    const text = () => {
+      const n = rand(12);
+      let s = "";
+      for (let i = 0; i < n; i++) s += words[rand(words.length)] + ends[rand(ends.length - 1)];
+      return rand(4) === 0 ? s.replace(/[\r\n]$/, "") : s;
+    };
+    for (let i = 0; i < 3000; i++) {
+      const a = text();
+      const lines = a.split("\n");
+      for (let k = rand(4); k >= 0; k--) lines.splice(rand(lines.length + 1), rand(2), words[rand(words.length)]);
+      const b = rand(5) === 0 ? text() : lines.join(ends[rand(2)]);
+      const got = applyPatchBounded(a, createPatch("x", a, b)).result;
+      expect(got, JSON.stringify({ i, a, b })).toBe(b);
+    }
+  });
+});

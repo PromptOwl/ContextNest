@@ -473,13 +473,32 @@ export interface NestConfig {
   defaults?: {
     status?: Status;
   };
+  /** Structure rules switches (§11.1) — see `structure.ts`. */
+  structure?: {
+    /** Refuse writes that break a rule. Absent/false: report-only. */
+    enforce?: boolean;
+    /** Only declared folders may exist and hold documents. */
+    closed?: boolean;
+  };
+  /**
+   * Folder rules, keyed by a folder path PATTERN (`clients/{client}/meetings`);
+   * a plain folder name is a literal pattern. Every field but `description`
+   * and `template` is a structure rule (§11.1, `structure.ts`).
+   */
   folders?: Record<
     string,
     {
       description?: string;
       template?: string;
+      types?: string[];
+      folder_name?: string;
+      file_name?: string;
+      required?: boolean;
+      files?: Record<string, { template?: string; type?: string }>;
     }
   >;
+  /** Named templates for `folders.*.template` / `files.*.template` (§11.1). */
+  templates?: Record<string, { body?: string; required_sections?: string[] }>;
   servers?: Record<
     string,
     {
@@ -739,6 +758,9 @@ export interface VerificationReport {
       | "checkpoint_hash_mismatch"
       | "body_drift"
       | "unreadable_history"
+      // A document whose frontmatter does not parse, or whose sealed bytes do
+      // not open with the vault's key — skipped by every crawl, named here.
+      | "unreadable_document"
       // A recorded version can no longer be rebuilt from its keyframe+diff
       // chain (§6.1), even when every stored hash still agrees — e.g. an
       // import overwrote version artifacts and rewrote their fingerprints

@@ -4,7 +4,7 @@
  */
 
 import type { ContextNode, RelationshipEdge } from "./types.js";
-import { codeMask } from "./markdown-mask.js";
+import { codeMask, splitLines } from "./markdown-mask.js";
 import {
   buildWikiTitleIndex,
   contextLinkTarget,
@@ -186,10 +186,9 @@ export function buildBacklinks(documents: ContextNode[]): Map<string, string[]> 
  * Returns the content from the matched heading to the next heading of same or higher level.
  */
 export function extractSection(body: string, anchor: string): string | null {
-  // Slice from the raw lines so the returned section keeps its original line
-  // endings; scan a CR-stripped copy so the patterns still anchor (see above).
-  const lines = body.split("\n");
-  const headings = topLevelHeadings(lines.map((l) => l.replace(/\r$/, "")));
+  // One line model with the checker (splitLines); the section comes back LF-joined.
+  const lines = splitLines(body);
+  const headings = topLevelHeadings(lines);
 
   const start = headings.findIndex((h) => h.anchor === anchor);
   if (start === -1) return null;
@@ -203,6 +202,55 @@ export function extractSection(body: string, anchor: string): string | null {
   }
 
   return lines.slice(headings[start].line, endLine).join("\n").trim();
+}
+
+
+/**
+ * Anchors of a body's top-level headings — the same parser section links
+ * (`#section`) resolve against, so "this heading exists" means the same thing
+ * everywhere. Text inside an HTML comment is not a heading.
+ */
+export function headingAnchors(body: string): Set<string> {
+  const lines = maskHtmlComments(splitLines(body));
+  return new Set(topLevelHeadings(lines).map((h) => h.anchor));
+}
+
+/** The anchor a heading with this text gets (see {@link headingAnchors}). */
+export function headingAnchor(text: string): string {
+  return toAnchor(text);
+}
+
+/** Blank every line touched by an HTML comment (linear: indexOf, no regex). */
+function maskHtmlComments(lines: string[]): string[] {
+  let inside = false;
+  return lines.map((line) => {
+    let kept = "";
+    let rest = line;
+    let touched = false;
+    while (rest.length > 0) {
+      if (inside) {
+        const end = rest.indexOf("-->");
+        touched = true;
+        if (end === -1) {
+          rest = "";
+          break;
+        }
+        rest = rest.slice(end + 3);
+        inside = false;
+      } else {
+        const start = rest.indexOf("<!--");
+        if (start === -1) {
+          kept += rest;
+          break;
+        }
+        kept += rest.slice(0, start);
+        rest = rest.slice(start + 4);
+        inside = true;
+        touched = true;
+      }
+    }
+    return touched && kept.trim() === "" ? "" : touched ? kept : line;
+  });
 }
 
 interface Heading {
@@ -235,10 +283,13 @@ function topLevelHeadings(lines: string[]): Heading[] {
     const atx = /^ {0,3}(#{1,6})\s/.exec(lines[i]);
     if (atx) {
       const depth = atx[1].length;
-      // Drop an optional closing sequence: `## Title ##`. Trailing whitespace
-      // goes first so the pattern can anchor to the end with nothing ambiguous
-      // in front of it.
-      const text = lines[i].slice(atx[0].length).trimEnd().replace(/#+$/, "");
+      // Drop an optional closing sequence: `## Title ##`. A loop, not
+      // `/#+$/`: unanchored at the start, that regex retries from every `#`
+      // of a long run followed by other text — quadratic.
+      let text = lines[i].slice(atx[0].length).trimEnd();
+      let end = text.length;
+      while (end > 0 && text[end - 1] === "#") end--;
+      text = text.slice(0, end);
       headings.push({ depth, anchor: toAnchor(text), line: i });
       continue;
     }
