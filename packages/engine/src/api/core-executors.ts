@@ -443,6 +443,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
       candidates: searchCfg.candidates,
       fullMatchFirst: searchCfg.full_match_first,
       fieldBoosts: searchCfg.field_boosts,
+      fusionWeights: searchCfg.fusion_weights,
       maxChars: searchCfg.embeddings!.max_chars,
       reranker,
       rerankTopN,

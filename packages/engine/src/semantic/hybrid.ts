@@ -37,15 +37,21 @@ export interface RankedHit {
 }
 
 /**
- * Reciprocal rank fusion: score(d) = Σ 1 / (k + rank_i(d)), rank 1-based.
- * Ties keep first-appearance order (list 0 before list 1), so fusion is
- * deterministic for identical inputs.
+ * Weighted reciprocal rank fusion: score(d) = Σ w_i / (k + rank_i(d)), rank
+ * 1-based, w_i = weights[i] (default 1 — plain RRF). Ties keep
+ * first-appearance order (list 0 before list 1), so fusion is deterministic
+ * for identical inputs.
  */
-export function rrfFuse(lists: string[][], k = RRF_K): Array<{ id: string; score: number }> {
+export function rrfFuse(
+  lists: string[][],
+  k = RRF_K,
+  weights: number[] = [],
+): Array<{ id: string; score: number }> {
   const score = new Map<string, number>();
-  for (const list of lists) {
-    list.forEach((id, i) => score.set(id, (score.get(id) ?? 0) + 1 / (k + i + 1)));
-  }
+  lists.forEach((list, li) => {
+    const w = weights[li] ?? 1;
+    list.forEach((id, i) => score.set(id, (score.get(id) ?? 0) + w / (k + i + 1)));
+  });
   // Map iteration order = first appearance; Array.sort is stable.
   return [...score.entries()].map(([id, s]) => ({ id, score: s })).sort((a, b) => b.score - a.score);
 }
@@ -58,6 +64,8 @@ export interface SemanticSearchOptions {
   candidates?: number;
   fullMatchFirst?: boolean;
   fieldBoosts?: Partial<FieldBoosts>;
+  /** Hybrid RRF weights per list (default 1:1). */
+  fusionWeights?: { lexical?: number; semantic?: number };
   maxChars?: number;
   reranker?: Reranker;
   rerankTopN?: number;
@@ -119,7 +127,10 @@ export async function semanticSearch(query: string, opts: SemanticSearchOptions)
       .search(q)
       .slice(0, candidates);
     const lexScore = new Map(lexical.map((h) => [h.document.id, h.score]));
-    const fused = rrfFuse([lexical.map((h) => h.document.id), vecTop.map((h) => h.id)]);
+    const fused = rrfFuse([lexical.map((h) => h.document.id), vecTop.map((h) => h.id)], RRF_K, [
+      opts.fusionWeights?.lexical ?? 1,
+      opts.fusionWeights?.semantic ?? 1,
+    ]);
     const seeds = exactSeeds(q, published);
     const seedSet = new Set(seeds);
     const fusedScore = new Map(fused.map((f) => [f.id, f.score]));

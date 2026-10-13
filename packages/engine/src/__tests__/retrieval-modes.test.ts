@@ -228,6 +228,36 @@ describe("reciprocal rank fusion", () => {
     expect(fused[0].score).toBeCloseTo(1 / 62 + 1 / 61, 10);
   });
 
+  it("Given weights 1:2, Then each list contributes w/(k0+rank) and the heavier list's top doc wins", () => {
+    const lists = [
+      ["lex-top", "shared"],
+      ["sem-top", "shared"],
+    ];
+    // Unweighted: lex-top and sem-top tie, first appearance (lex) wins.
+    expect(rrfFuse(lists)[1].id).toBe("lex-top");
+    const fused = rrfFuse(lists, RRF_K, [1, 2]);
+    expect(fused.map((f) => f.id)).toEqual(["shared", "sem-top", "lex-top"]);
+    expect(fused.find((f) => f.id === "sem-top")!.score).toBeCloseTo(2 / 61, 12);
+    expect(fused.find((f) => f.id === "shared")!.score).toBeCloseTo(1 / 62 + 2 / 62, 12);
+  });
+
+  it("config search.fusion_weights reaches hybrid context_search", async () => {
+    const { ctx, dir } = await makeVault(
+      "search:\n  fusion_weights: { lexical: 0, semantic: 1 }\n  embeddings:\n    provider: stub\n    model: concepts-v1\n",
+    );
+    try {
+      await api.run("context_create", { id: "nodes/kw", title: "Keyword", content: "zebra zebra zebra" }, ctx);
+      await api.run("context_create", { id: "nodes/para", title: "Para", content: "furious client complaint" }, ctx);
+      await api.run("context_embed", {}, ctx);
+      // lexical weight 0: the keyword-only hit gets rrf 0 from lexical, the
+      // semantic neighbour leads.
+      const out = await api.run<SearchOut>("context_search", { query: "zebra upset", mode: "hybrid" }, ctx);
+      expect(out.results[0].id).toBe("nodes/para");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("ties break deterministically by first appearance", () => {
     expect(rrfFuse([["x"], ["y"]]).map((f) => f.id)).toEqual(["x", "y"]);
   });
