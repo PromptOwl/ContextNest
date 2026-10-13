@@ -114,7 +114,8 @@ them over the legacy tools below.
 | `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
 | `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
 | `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |
-| `context_search` | Full-text search with graph traversal |
+| `context_search` | Search published nodes, best match first. `mode`: `lexical` (stemmed BM25, default), `semantic` (embeddings), `hybrid` (RRF of both, exact title/#tag matches pinned); `rerank` re-scores the top hits. Each hit carries `score` + per-signal `scores` |
+| `context_embed` | Build/refresh the embedding index for semantic/hybrid search — published nodes only, re-embeds only new/changed versions, prunes the rest (`rebuild` to start over) |
 | `context_query` | Selector query with graph traversal. `include_drafts` for authoring surfaces |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |
 | `context_versions` | List a document's version history (new capability — nothing exposed this before) |

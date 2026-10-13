@@ -295,8 +295,40 @@ export type { DocumentFilters } from "./filters.js";
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";
 
 // Resolver
-export { Resolver, forgottenView } from "./resolver.js";
-export type { ResolverOptions } from "./resolver.js";
+export { Resolver, forgottenView, DEFAULT_FIELD_BOOSTS, LEGACY_FIELD_BOOSTS } from "./resolver.js";
+export type { ResolverOptions, FieldBoosts } from "./resolver.js";
+
+// Retrieval modes (semantic / hybrid search, embedding index)
+export {
+  SEARCH_MODES,
+  parseSearchConfig,
+  searchConfigSchema,
+  type SearchMode,
+  type SearchConfig,
+  type EmbeddingsConfig,
+  type RerankConfig,
+} from "./semantic/config.js";
+export {
+  registerEmbeddingProvider,
+  registerReranker,
+  createEmbeddingProvider,
+  createReranker,
+  type EmbeddingProvider,
+  type Reranker,
+  type EmbedKind,
+} from "./semantic/providers.js";
+export { createBedrockEmbeddingProvider, createBedrockReranker, type BedrockInvoke } from "./semantic/bedrock.js";
+export { EmbeddingStore, EMBEDDINGS_DIR, embeddingText, contentHash } from "./semantic/embedding-store.js";
+export {
+  rrfFuse,
+  exactSeeds,
+  semanticSearch,
+  rerankHits,
+  buildEmbeddings,
+  RRF_K,
+  type RankedHit,
+  type HitScores,
+} from "./semantic/hybrid.js";
 
 // Inline extraction
 export {

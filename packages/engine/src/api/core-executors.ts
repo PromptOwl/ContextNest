@@ -42,6 +42,10 @@ import {
 import { addTombstone, buildTombstoneIndex, expandsWithin, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
 import { Resolver } from "../resolver.js";
+import { parseSearchConfig, type SearchConfig, type SearchMode } from "../semantic/config.js";
+import { createEmbeddingProvider, createReranker } from "../semantic/providers.js";
+import { EmbeddingStore } from "../semantic/embedding-store.js";
+import { buildEmbeddings, rerankHits, semanticSearch, type RankedHit } from "../semantic/hybrid.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
 import {
   normalizeDocumentId,
@@ -401,18 +405,120 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // intersection/union walk the left side first, so
   // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
-  if (!query) return { results: [], count: 0, total: 0 };
+  if (!query) return { results: [], count: 0, total: 0, mode: "lexical" };
+  const config = await ctx.storage.readConfig();
+  const searchCfg = parseSearchConfig(config?.search);
   const docs = await ctx.storage.discoverDocuments();
-  const hits = new Resolver({ documents: docs })
-    .search(query)
-    .filter((h) => isPublished(h.document));
+  const { mode, store } = await chooseSearchMode(ctx, input.mode, searchCfg);
+
+  if (input.rerank && !searchCfg.rerank) {
+    throw new ContextNestError(
+      "rerank needs a `search.rerank` block (provider + model) in .context/config.yaml",
+      "VALIDATION_FAILED",
+    );
+  }
+  const reranker = input.rerank && searchCfg.rerank ? createReranker(searchCfg.rerank) : undefined;
+  const rerankTopN = searchCfg.rerank?.top_n;
+
+  let hits: RankedHit[];
+  let stale: number | undefined;
+  if (mode === "lexical") {
+    hits = new Resolver({
+      documents: docs,
+      fullMatchFirst: searchCfg.full_match_first,
+      fieldBoosts: searchCfg.field_boosts,
+    })
+      .search(query)
+      .filter((h) => isPublished(h.document))
+      .map((h) => ({ document: h.document, score: h.score, scores: { lexical: h.score } }));
+    if (reranker) {
+      hits = await rerankHits(query, hits, reranker, rerankTopN ?? 50, searchCfg.embeddings?.max_chars);
+    }
+  } else {
+    const out = await semanticSearch(query, {
+      mode,
+      docs,
+      store: store!,
+      provider: createEmbeddingProvider(searchCfg.embeddings!),
+      candidates: searchCfg.candidates,
+      fullMatchFirst: searchCfg.full_match_first,
+      fieldBoosts: searchCfg.field_boosts,
+      maxChars: searchCfg.embeddings!.max_chars,
+      reranker,
+      rerankTopN,
+    });
+    hits = out.hits.filter((h) => isPublished(h.document));
+    stale = out.stale;
+  }
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
-    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score, scores: h.scores })),
     // Counted before the `limit` slice. `total` is the deprecated alias.
     count: hits.length,
     total: hits.length,
+    mode,
+    ...(stale !== undefined ? { embeddings_stale: stale } : {}),
   };
+};
+
+/**
+ * Which mode a search runs in. An explicit `mode` is honoured or refused with
+ * the fix; with none, `search.mode` from config applies ONLY once an index
+ * exists — a vault that opted into hybrid but never ran `ctx embed` keeps
+ * working, lexically. Default: lexical.
+ */
+async function chooseSearchMode(
+  ctx: Parameters<OperationExecutor>[0],
+  requested: SearchMode | undefined,
+  cfg: SearchConfig,
+): Promise<{ mode: SearchMode; store?: EmbeddingStore }> {
+  const wanted = requested ?? cfg.mode ?? "lexical";
+  if (wanted === "lexical") return { mode: "lexical" };
+  if (!cfg.embeddings) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" needs a \`search.embeddings\` block (provider + model) in .context/config.yaml`,
+      "VALIDATION_FAILED",
+    );
+  }
+  const e = cfg.embeddings;
+  const store = await EmbeddingStore.load(ctx.storage.root, e.provider, e.model, e.dimensions);
+  if (store.size === 0) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" needs an embedding index — run \`ctx embed\` (MCP: context_embed) first`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return { mode: wanted, store };
+}
+
+const embed: OperationExecutor = async (ctx, input: any) => {
+  const config = await ctx.storage.readConfig();
+  const cfg = parseSearchConfig(config?.search);
+  if (!cfg.embeddings) {
+    throw new ContextNestError(
+      "No `search.embeddings` block (provider + model) in .context/config.yaml — nothing to embed with",
+      "VALIDATION_FAILED",
+    );
+  }
+  // Vectors leak content. An encrypted vault seals its documents at rest, so
+  // it must not grow a plaintext semantic copy of them beside the ciphertext.
+  if (await ctx.storage.isEncrypted()) {
+    throw new ContextNestError(
+      "Embeddings are not supported on an encrypted vault: the index would store a plaintext-derived copy of sealed content",
+      "VALIDATION_FAILED",
+    );
+  }
+  const e = cfg.embeddings;
+  const store = await EmbeddingStore.load(ctx.storage.root, e.provider, e.model, e.dimensions);
+  const docs = await ctx.storage.discoverDocuments();
+  return buildEmbeddings(docs, store, createEmbeddingProvider(e), {
+    rebuild: input.rebuild === true,
+    batchSize: e.batch_size,
+    maxChars: e.max_chars,
+    onProgress: ctx.onProgress,
+  });
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
@@ -1950,6 +2056,7 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_query: query,
   context_resolve: resolve,
   context_search: search,
+  context_embed: locked(embed),
   context_get: get,
   context_list: list,
   context_folders: folders,  

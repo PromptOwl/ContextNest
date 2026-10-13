@@ -827,7 +827,8 @@ cloud:
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
 | `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
 | `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |
-| `context_search` | Full-text search with graph traversal |
+| `context_search` | Search published nodes, best match first. `mode`: `lexical` (stemmed BM25, default), `semantic` (embeddings), `hybrid` (RRF of both, exact title/#tag matches pinned); `rerank` re-scores the top hits. Each hit carries `score` + per-signal `scores` |
+| `context_embed` | Build/refresh the embedding index for semantic/hybrid search — published nodes only, re-embeds only new/changed versions, prunes the rest (`rebuild` to start over) |
 | `context_query` | Selector query with graph traversal (`include_drafts`) |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |
 | `context_versions` | List a document's version history |

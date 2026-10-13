@@ -105,6 +105,8 @@ export interface SearchHitView {
   type?: string;
   /** BM25 relevance score; absent from a remote nest running an older engine. */
   score?: number;
+  /** Per-signal scores (lexical / semantic / rrf / rerank); engine >= 2.13. */
+  scores?: { lexical?: number; semantic?: number; rrf?: number; rerank?: number };
   /** Server-level remote only: the `--vault <server>/<nest>` holding this hit. */
   vault?: string;
 }
@@ -117,6 +119,7 @@ export function searchJsonEntry(d: SearchHitView) {
     description: d.description,
     type: d.type || "document",
     ...(typeof d.score === "number" ? { score: d.score } : {}),
+    ...(d.scores ? { scores: d.scores } : {}),
     ...(d.vault ? { vault: d.vault } : {}),
   };
 }

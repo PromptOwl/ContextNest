@@ -26,6 +26,7 @@ import {
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { viewMetaSchema } from "../view-schema.js";
+import { SEARCH_MODES } from "../semantic/config.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
@@ -110,16 +111,43 @@ const searchOp: OperationDescriptor = {
   name: "context_search",
   namespace: "core",
   description:
-    "Full-text keyword search across node content, titles, tags, and metadata.",
+    "Search published nodes (content, titles, tags, metadata), best match first. `mode`: lexical " +
+    "(stemmed BM25 keyword search — the default), semantic (embedding similarity; finds paraphrases), or " +
+    "hybrid (reciprocal-rank fusion of both, exact title/#tag matches pinned first). semantic/hybrid need " +
+    "`search.embeddings` in the vault config and an index built with context_embed. `rerank` re-scores the " +
+    "top hits with the configured reranker.",
   input: z.object({
     query: z.string().min(1).describe("Search terms"),
     limit: z.number().int().positive().optional().describe("Max results"),
+    mode: z
+      .enum(SEARCH_MODES)
+      .optional()
+      .describe("lexical | semantic | hybrid. Omitted: the vault's search.mode once an index exists, else lexical"),
+    rerank: z.boolean().optional().describe("Re-score the top hits with the configured search.rerank model"),
     ...clientField,
   }),
   output: z.object({
     // Best hit first: documents matching every query term, then partial
     // matches, each tier by descending BM25 `score`.
-    results: z.array(nodeSummary.extend({ score: z.number().optional() })),
+    results: z.array(
+      nodeSummary.extend({
+        score: z.number().optional(),
+        // Per-signal scores behind `score`: lexical = BM25, semantic = cosine,
+        // rrf = fused, rerank = reranker relevance. Only those that applied.
+        scores: z
+          .object({
+            lexical: z.number().optional(),
+            semantic: z.number().optional(),
+            rrf: z.number().optional(),
+            rerank: z.number().optional(),
+          })
+          .optional(),
+      }),
+    ),
+    /** The mode that actually ran (a configured default falls back to lexical until an index exists). */
+    mode: z.enum(SEARCH_MODES).optional(),
+    /** semantic/hybrid: published nodes with no current vector (new/changed since the last context_embed). */
+    embeddings_stale: z.number().int().nonnegative().optional(),
     // Every match before `limit` was applied, so a capped page never reads
     // as the whole answer and a caller can say "N more". Same name as the
     // hosted REST and MCP search responses.
@@ -129,6 +157,33 @@ const searchOp: OperationDescriptor = {
   }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["search"],
+};
+
+// ─── context_embed ───────────────────────────────────────────────────────────
+
+const embedOp: OperationDescriptor = {
+  name: "context_embed",
+  namespace: "core",
+  description:
+    "Build or refresh the vault's embedding index for semantic/hybrid context_search. Embeds PUBLISHED " +
+    "nodes only (drafts and superseded versions never), keyed by node id + version + content hash, so only " +
+    "new or changed nodes are re-embedded and unpublished ones are pruned. Uses the `search.embeddings` " +
+    "provider in .context/config.yaml; the index lives in .context/embeddings/ (git-ignored, rebuildable).",
+  input: z.object({
+    rebuild: z.boolean().optional().describe("Discard the index and re-embed every published node"),
+    ...clientField,
+  }),
+  output: z.object({
+    provider: z.string(),
+    model: z.string(),
+    path: z.string().describe("Vault-relative index location"),
+    total: z.number().int().describe("Vectors in the index after this run"),
+    embedded: z.number().int().describe("Nodes sent to the provider this run"),
+    reused: z.number().int().describe("Nodes whose vector was still current"),
+    pruned: z.number().int().describe("Vectors dropped: node no longer published or gone"),
+    dimensions: z.number().int(),
+  }),
+  errors: ["VALIDATION_FAILED", "CONFIG_ERROR"],
 };
 
 // ─── context_query ───────────────────────────────────────────────────────────
@@ -1457,6 +1512,7 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   listOp,
   foldersOp,
   searchOp,
+  embedOp,
   createOp,
   updateOp,
   publishOp,

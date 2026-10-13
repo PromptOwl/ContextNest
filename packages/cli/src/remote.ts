@@ -595,13 +595,17 @@ export async function remoteQuery(
 export async function remoteSearch(
   target: RemoteTarget,
   query: string,
-  opts: { json?: boolean; limit?: number },
+  opts: { json?: boolean; limit?: number; mode?: string; rerank?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     const limit = searchLimit(opts.limit);
+    // mode/rerank are sent only when asked for: a server on an older engine
+    // refuses unknown keys, and a plain search must keep working against it.
     const out = await conn.run<{ results: NodeSummary[]; count?: number; total?: number }>("context_search", {
       query,
       ...(limit ? { limit } : {}),
+      ...(opts.mode ? { mode: opts.mode } : {}),
+      ...(opts.rerank ? { rerank: true } : {}),
     });
     // Rendering shared with the local branch (doc-views.ts). A remote may
     // send `count`, only the deprecated `total`, or (an older engine) neither

@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
-import { Resolver, processSearchTerm } from "../resolver.js";
+import { Resolver, processSearchTerm, DEFAULT_FIELD_BOOSTS, LEGACY_FIELD_BOOSTS } from "../resolver.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import {
   registerEmbeddingProvider,
@@ -165,6 +165,50 @@ describe("lexical search — full-match-first tier is an option", () => {
   it("Given fullMatchFirst:false, Then order is pure BM25 score", () => {
     const hits = new Resolver({ documents: docs, fullMatchFirst: false }).search("alpha beta gamma");
     for (let i = 1; i < hits.length; i++) expect(hits[i - 1].score).toBeGreaterThanOrEqual(hits[i].score);
+  });
+});
+
+describe("lexical search — field boosts (benchmark: big title boost hurt NDCG)", () => {
+  // One incidental title word vs a document that is about the topic in its body.
+  const titled = {
+    ...node("nodes/rollout-retro", "Lunch menu, parking passes and the offsite agenda for next quarter, plus who brings snacks to the Friday demo."),
+    frontmatter: { title: "Rollout retro", type: "document", status: "published", version: 1 },
+  };
+  const onTopic = {
+    ...node(
+      "nodes/canary-guide",
+      "How we run a canary rollout: ship to five percent, watch error budgets, then widen the rollout in stages. " +
+        "A rollout halts automatically when latency regresses; the rollout owner decides on rollback.",
+    ),
+    frontmatter: { title: "Canary guide", type: "document", status: "published", version: 1 },
+  };
+
+  it("default boosts are mild: title and tags 1.25, description and body 1", () => {
+    expect(DEFAULT_FIELD_BOOSTS).toEqual({ title: 1.25, tags: 1.25, description: 1, body: 1 });
+  });
+
+  it("Given an on-topic body and an incidental title word, When searching that word, Then the on-topic doc ranks first", () => {
+    const hits = new Resolver({ documents: [titled, onTopic] }).search("rollout");
+    expect(hits.map((h) => h.document.id)).toEqual(["nodes/canary-guide", "nodes/rollout-retro"]);
+  });
+
+  it("Given the legacy boosts (title 3), Then the incidental title hit wins — the defect the new default fixes", () => {
+    const hits = new Resolver({ documents: [titled, onTopic], fieldBoosts: LEGACY_FIELD_BOOSTS }).search("rollout");
+    expect(hits[0].document.id).toBe("nodes/rollout-retro");
+  });
+
+  it("config search.field_boosts reaches context_search", async () => {
+    const { ctx, dir } = await makeVault("search:\n  field_boosts:\n    title: 10\n");
+    try {
+      await api.run("context_create", { id: "nodes/a", title: "Rollout retro", content: "lunch parking snacks" }, ctx);
+      await api.run("context_create", {
+        id: "nodes/b", title: "Canary guide", content: "canary rollout then widen the rollout; rollout halts on regressions",
+      }, ctx);
+      const out = await api.run<SearchOut>("context_search", { query: "rollout" }, ctx);
+      expect(out.results[0].id).toBe("nodes/a");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

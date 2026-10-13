@@ -77,6 +77,8 @@ import {
   enforcedStructure,
   checkDocument,
   parseDocument,
+  SEARCH_MODES,
+  type SearchMode,
 } from "@promptowl/contextnest-engine";
 import type { IntegrityFailure, RemoteNestSpec } from "@promptowl/contextnest-engine";
 import {
@@ -267,7 +269,8 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
     title: "Find & retrieve context",
     commands: [
       ["list", "Browse documents (filter with --type / --status / --tag)"],
-      ["search", "Full-text search across the vault"],
+      ["search", "Search the vault: lexical (default), semantic or hybrid (--mode)"],
+      ["embed", "Build or refresh the embedding index for semantic/hybrid search"],
       ["query", "Pull context for an agent by selector — graph-aware and token-cheap"],
       ["resolve", "List the documents a selector matches"],
       ["pack", "Bundle documents into reusable context packs"],
@@ -3113,9 +3116,15 @@ importCmd
 
 program
   .command("search <query>")
-  .description("Full-text search across vault documents, best match first")
-  .option("--json", "Output as JSON (each hit carries its relevance score)")
+  .description("Search vault documents, best match first")
+  .option("--json", "Output as JSON (each hit carries its relevance score, plus per-signal scores)")
   .option("--limit <n>", "Max results (default 10; 0 = all)", parseLimit)
+  .option(
+    "--mode <mode>",
+    "lexical (stemmed keyword) | semantic (embeddings) | hybrid (both, fused). Default: config search.mode once `ctx embed` has run, else lexical",
+    parseSearchMode,
+  )
+  .option("--rerank", "Re-score the top hits with the configured search.rerank model")
   .action(async (query, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -3124,9 +3133,14 @@ program
     }
     const storage = getStorage();
     const limit = searchLimit(opts.limit);
-    const out = await cliApi().run<{ results: SearchHitView[]; count?: number; total?: number }>(
+    const out = await cliApi().run<{ results: SearchHitView[]; count?: number; total?: number; mode?: string }>(
       "context_search",
-      { query, ...(limit ? { limit } : {}) },
+      {
+        query,
+        ...(limit ? { limit } : {}),
+        ...(opts.mode ? { mode: opts.mode } : {}),
+        ...(opts.rerank ? { rerank: true } : {}),
+      },
       opContext(storage, "cli@contextnest.local"),
     );
     // Rendering shared with the remote branch (doc-views.ts).
@@ -3140,6 +3154,53 @@ program
       const held = countHeldMatches(await storage.discoverDocuments(), query);
       if (held > 0) console.log(chalk.dim(`\n${heldSearchHint(held)}`));
     }
+  });
+
+function parseSearchMode(v: string): SearchMode {
+  if (!(SEARCH_MODES as readonly string[]).includes(v)) {
+    throw new InvalidArgumentError(`--mode must be one of: ${SEARCH_MODES.join(", ")}`);
+  }
+  return v as SearchMode;
+}
+
+// ─── ctx embed ────────────────────────────────────────────────────────────────
+
+program
+  .command("embed")
+  .description(
+    "Build or refresh the embedding index for semantic/hybrid search. Embeds published documents only; " +
+      "unchanged ones are reused, changed ones re-embedded, unpublished ones pruned. Provider from " +
+      "search.embeddings in .context/config.yaml; index in .context/embeddings/ (git-ignored).",
+  )
+  .option("--rebuild", "Discard the index and re-embed every published document")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const storage = getStorage();
+    const progress =
+      !opts.json && process.stderr.isTTY
+        ? (done: number, total: number) => process.stderr.write(`\r  embedding ${done}/${total}`)
+        : undefined;
+    const out = await cliApi().run<{
+      provider: string;
+      model: string;
+      path: string;
+      total: number;
+      embedded: number;
+      reused: number;
+      pruned: number;
+      dimensions: number;
+    }>("context_embed", opts.rebuild ? { rebuild: true } : {}, opContext(storage, "cli@contextnest.local", progress));
+    if (progress) process.stderr.write("\n");
+    if (opts.json) {
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    console.log(
+      chalk.green(
+        `Embedded ${out.embedded}, reused ${out.reused}, pruned ${out.pruned} — ${out.total} published document(s) indexed`,
+      ),
+    );
+    console.log(chalk.dim(`  ${out.provider} ${out.model} (${out.dimensions}d) → ${out.path}`));
   });
 
 // ─── ctx pack ──────────────────────────────────────────────────────────────────
