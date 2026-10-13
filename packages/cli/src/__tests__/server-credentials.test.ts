@@ -5,7 +5,10 @@ import { join } from "node:path";
 import type { KeyringBackend } from "../keyring.js";
 import {
   SERVERS_ACCOUNT,
+  accountKey,
   assertServerMapWritable,
+  splitAccountKey,
+  tokensForServerEndpoint,
   emptyServerMap,
   isNestScope,
   keysUnderServer,
@@ -108,6 +111,44 @@ describe("server map (pure)", () => {
     expect(removeServer(m, SELF).default).toBe(HOSTED);
     expect(isNestScope(`${HOSTED}/nests/n1`)).toBe(true);
     expect(isNestScope(HOSTED)).toBe(false);
+  });
+
+  it("lists every key that opens a server endpoint, server-wide first", () => {
+    let m = upsertServer(emptyServerMap(), nestScopeUrl(HOSTED, "n1"), { token: "n1-only" });
+    expect(tokensForServerEndpoint(m, `${HOSTED}/mcp`)).toEqual(["n1-only"]);
+    m = upsertServer(m, HOSTED, { token: "hosted" });
+    m = upsertServer(m, SELF, { token: "self" });
+    expect(tokensForServerEndpoint(m, `${HOSTED}/mcp`)).toEqual(["hosted", "n1-only"]);
+    expect(tokensForServerEndpoint(m, `${SELF}/mcp`)).toEqual(["self"]);
+    expect(tokensForServerEndpoint(m, "https://other.example/mcp")).toEqual([]);
+    expect(tokensForServerEndpoint(m, "garbage")).toEqual([]);
+    // Only a server-level endpoint fans out; one nest's endpoint keeps the longest match.
+    expect(tokensForServerEndpoint(m, `${HOSTED}/nests/n1/mcp`)).toEqual([]);
+    expect(tokensForServerEndpoint(m, HOSTED)).toEqual([]);
+  });
+
+  it("keeps a named account's keys apart from the unnamed one on the same server", () => {
+    let m = upsertServer(emptyServerMap(), HOSTED, { token: "me" });
+    m = upsertServer(m, HOSTED, { token: "client" }, "client");
+    m = upsertServer(m, nestScopeUrl(HOSTED, "n1"), { token: "client-n1" }, "client");
+    expect(Object.keys(m.servers).sort()).toEqual([HOSTED, `${HOSTED}#client`, `${HOSTED}/nests/n1#client`]);
+    expect(m.default).toBe(HOSTED);
+    expect(tokenForEndpoint(m, `${HOSTED}/mcp`)).toBe("me");
+    expect(tokenForEndpoint(m, `${HOSTED}/mcp`, "client")).toBe("client");
+    expect(tokenForEndpoint(m, `${HOSTED}/nests/n1`, "client")).toBe("client-n1");
+    expect(tokenForEndpoint(m, `${HOSTED}/nests/n1`)).toBe("me");
+    expect(tokenForEndpoint(m, `${HOSTED}/mcp`, "nobody")).toBeNull();
+    expect(keysUnderServer(m, HOSTED)).toEqual([HOSTED]);
+    expect(keysUnderServer(m, HOSTED, "client").sort()).toEqual([`${HOSTED}#client`, `${HOSTED}/nests/n1#client`]);
+    expect(tokensForServerEndpoint(m, `${HOSTED}/mcp`, "client")).toEqual(["client", "client-n1"]);
+    expect(isNestScope(`${HOSTED}/nests/n1#client`)).toBe(true);
+    // A named account never becomes the default, nor is promoted to it.
+    expect(upsertServer(emptyServerMap(), HOSTED, { token: "x" }, "client").default).toBeUndefined();
+    m = removeServer(m, HOSTED);
+    expect(m.default).toBeUndefined();
+    expect(Object.keys(removeServer(m, `${HOSTED}#client`).servers)).toEqual([`${HOSTED}/nests/n1#client`]);
+    expect(splitAccountKey(`${HOSTED}#client`)).toEqual({ scope: HOSTED, account: "client" });
+    for (const bad of ["", "a b", "a/b", "a#b"]) expect(() => accountKey(HOSTED, bad)).toThrow(/account/);
   });
 
   it("validates nest ids", () => {

@@ -8,12 +8,17 @@
  * Keyed by normalized server URL so one machine can hold keys for several
  * servers at once (hosted + self-hosted + a client's). A key can also be saved
  * for one nest (`<server>/nests/<id>`); lookups take the longest match, so a
- * nest-scoped key wins over the server-wide one for that nest only.
+ * nest-scoped key wins over the server-wide one for that nest only. A second
+ * account on the same server (`ctx login --account <name>`) keeps its keys
+ * under `<scope>#<name>`; an alias picks it with its registry `account`. A ctx
+ * that predates accounts never matches those entries (its prefix match needs
+ * a `/`), so it keeps using the unnamed account's keys.
  *
  * Writes are read-modify-write on that one secret and not locked: two
  * `ctx login` runs finishing at the same instant can drop one entry (re-run
  * it). Logins are interactive and rare, so a lock isn't worth its failure modes.
  */
+import { ACCOUNT_NAME_PATTERN } from "@promptowl/contextnest-engine";
 import {
   CredentialStore,
   CredentialStoreError,
@@ -75,35 +80,77 @@ export function nestScopeUrl(server: string, nestId: string): string {
   return `${normalizeServerUrl(server)}/nests/${encodeURIComponent(id)}`;
 }
 
-/** True when `key` is a nest-scoped entry (`…/nests/<id>`), not a server-wide one. */
-export function isNestScope(key: string): boolean {
-  return /\/nests\/[^/]+$/.test(key);
+/** Map key for `scope` (a normalized server or nest URL) under `account`; the unnamed account is the bare URL. */
+export function accountKey(scope: string, account?: string): string {
+  if (account === undefined) return scope;
+  if (!ACCOUNT_NAME_PATTERN.test(account)) throw new Error(`Invalid account name: "${account}"`);
+  return `${scope}#${account}`;
 }
 
-/** Add or replace the credential for `url`. The first server-wide key added becomes the default. */
-export function upsertServer(map: ServerMap, url: string, cred: ServerCredential): ServerMap {
-  const key = normalizeServerUrl(url);
+/** A map key split into its URL and account. A normalized URL never holds a `#`. */
+export function splitAccountKey(key: string): { scope: string; account?: string } {
+  const i = key.indexOf("#");
+  return i < 0 ? { scope: key } : { scope: key.slice(0, i), account: key.slice(i + 1) };
+}
+
+/** True when `key` is a nest-scoped entry (`…/nests/<id>`), not a server-wide one. */
+export function isNestScope(key: string): boolean {
+  return /\/nests\/[^/]+$/.test(splitAccountKey(key).scope);
+}
+
+/** The map key for `url` (a URL, or a key already holding `#<account>`). */
+function mapKey(url: string, account?: string): string {
+  const { scope, account: own } = splitAccountKey(url);
+  return accountKey(normalizeServerUrl(scope), account ?? own);
+}
+
+/** Add or replace the credential for `url`. The first server-wide key of the unnamed account becomes the default. */
+export function upsertServer(map: ServerMap, url: string, cred: ServerCredential, account?: string): ServerMap {
+  const key = mapKey(url, account);
   return {
     version: map.version || SERVER_MAP_VERSION,
-    default: map.default ?? (isNestScope(key) ? undefined : key),
+    default: map.default ?? (isNestScope(key) || splitAccountKey(key).account ? undefined : key),
     servers: { ...map.servers, [key]: cred },
   };
 }
 
-/** Remove `url`. If it was the default, promote the next remaining server (or clear). */
+/** Remove `url` (or a `<url>#<account>` key). If it was the default, promote the next remaining server (or clear). */
 export function removeServer(map: ServerMap, url: string): ServerMap {
-  const key = normalizeServerUrl(url);
+  const key = mapKey(url);
   const servers = { ...map.servers };
   delete servers[key];
   let def = map.default;
-  if (def === key) def = Object.keys(servers).find((k) => !isNestScope(k));
+  if (def === key) def = Object.keys(servers).find((k) => !isNestScope(k) && !splitAccountKey(k).account);
   return { version: map.version || SERVER_MAP_VERSION, servers, ...(def ? { default: def } : {}) };
 }
 
-/** Saved keys for `url`: the server-wide key and every nest-scoped key under it. */
-export function keysUnderServer(map: ServerMap, url: string): string[] {
-  const key = normalizeServerUrl(url);
-  return Object.keys(map.servers).filter((k) => k === key || k.startsWith(`${key}/nests/`));
+/** Saved keys of `account` for `url`: the server-wide key and every nest-scoped key under it. */
+export function keysUnderServer(map: ServerMap, url: string, account?: string): string[] {
+  const base = normalizeServerUrl(url);
+  return Object.keys(map.servers).filter((k) => {
+    const { scope, account: own } = splitAccountKey(k);
+    return own === account && (scope === base || scope.startsWith(`${base}/nests/`));
+  });
+}
+
+/**
+ * Every saved token of `account` that can open a server-level endpoint
+ * (`<server>/mcp`): the server-wide key first, then each nest-scoped one. The
+ * server accepts a nest-scoped key there and limits it to its nest, so a
+ * server alias reaches a nest with only that nest's key saved. Empty for any
+ * other endpoint (a single nest's `/nests/<id>/mcp` uses tokenForEndpoint).
+ */
+export function tokensForServerEndpoint(map: ServerMap, endpoint: string, account?: string): string[] {
+  let target: string;
+  try {
+    target = normalizeServerUrl(endpoint);
+  } catch {
+    return [];
+  }
+  if (!target.endsWith("/mcp") || /\/nests\/[^/]+\/mcp$/.test(target)) return [];
+  const server = target.slice(0, -"/mcp".length);
+  const keys = keysUnderServer(map, server, account).sort((a, b) => Number(isNestScope(a)) - Number(isNestScope(b)));
+  return [...new Set(keys.map((k) => map.servers[k].token))];
 }
 
 /** Token for `url` (exact server), or the default server when `url` is omitted. Null if none. */
@@ -119,13 +166,13 @@ export function tokenForServer(map: ServerMap, url?: string): string | null {
  * whole path segments, so `https://a.io/x` never lends its key to
  * `https://a.io/xy`, and never across origins.
  */
-export function tokenForEndpoint(map: ServerMap, endpoint: string): string | null {
-  const key = keyForEndpoint(map, endpoint);
+export function tokenForEndpoint(map: ServerMap, endpoint: string, account?: string): string | null {
+  const key = keyForEndpoint(map, endpoint, account);
   return key ? map.servers[key].token : null;
 }
 
-/** The saved entry `endpoint` authenticates with (see tokenForEndpoint), or null. */
-export function keyForEndpoint(map: ServerMap, endpoint: string): string | null {
+/** The saved entry of `account` that `endpoint` authenticates with (see tokenForEndpoint), or null. */
+export function keyForEndpoint(map: ServerMap, endpoint: string, account?: string): string | null {
   let target: string;
   try {
     target = normalizeServerUrl(endpoint);
@@ -134,7 +181,9 @@ export function keyForEndpoint(map: ServerMap, endpoint: string): string | null 
   }
   let best: string | null = null;
   for (const key of Object.keys(map.servers)) {
-    if (target === key || target.startsWith(`${key}/`)) {
+    const { scope, account: own } = splitAccountKey(key);
+    if (own !== account) continue;
+    if (target === scope || target.startsWith(`${scope}/`)) {
       if (!best || key.length > best.length) best = key;
     }
   }
@@ -211,12 +260,29 @@ export async function saveServerMap(map: ServerMap, opts: CredentialStoreOptions
  * CONTEXTNEST_CREDENTIALS_KEY, corrupt file) throws with the reason — it must
  * not masquerade as "not logged in".
  */
-export async function savedTokenFor(endpoint: string, opts: CredentialStoreOptions = {}): Promise<string | null> {
+export async function savedTokenFor(
+  endpoint: string,
+  opts: CredentialStoreOptions = {},
+  account?: string,
+): Promise<string | null> {
+  return tokenForEndpoint(await readSavedMap(opts), endpoint, account);
+}
+
+/** Every saved token that opens the server-level `endpoint` (see tokensForServerEndpoint). */
+export async function savedTokensForServer(
+  endpoint: string,
+  account?: string,
+  opts: CredentialStoreOptions = {},
+): Promise<string[]> {
+  return tokensForServerEndpoint(await readSavedMap(opts), endpoint, account);
+}
+
+async function readSavedMap(opts: CredentialStoreOptions): Promise<ServerMap> {
   let json: string | null;
   try {
     json = await new CredentialStore(opts).get(SERVERS_ACCOUNT);
   } catch (err) {
     throw new CredentialStoreError(`Saved \`ctx login\` keys exist but couldn't be read: ${(err as Error).message}`);
   }
-  return tokenForEndpoint(parseServerMap(json), endpoint);
+  return parseServerMap(json);
 }

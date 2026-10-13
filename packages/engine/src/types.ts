@@ -596,6 +596,8 @@ export type RemoteNestSpec =
       /** Streamable-HTTP MCP endpoint URL. */
       url: string;
       auth?: RemoteNestAuth;
+      /** With no `auth`: which `ctx login --account` the CLI signs in as (unset = the unnamed account). */
+      account?: string;
       description?: string;
       /** Per-call timeout in milliseconds (default 10000). */
       timeout_ms?: number;

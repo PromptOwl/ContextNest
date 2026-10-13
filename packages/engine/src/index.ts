@@ -218,6 +218,7 @@ export type { SyntaxConfig } from "./config.js";
 // tests, but is not part of the public API surface.
 export {
   ALIAS_PATTERN,
+  ACCOUNT_NAME_PATTERN,
   getRegistryDir,
   getRegistryPath,
   readRegistry,

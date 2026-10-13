@@ -48,7 +48,7 @@ import {
   printStructure,
   type StructureOutput,
 } from "./doc-views.js";
-import { savedTokenFor } from "./server-credentials.js";
+import { savedTokenFor, savedTokensForServer } from "./server-credentials.js";
 
 export interface RemoteTarget {
   alias: string;
@@ -130,6 +130,11 @@ function nestCachePath(baseAlias: string): string {
   return pathMod.join(getRegistryDir(), "cache", `nests-${baseAlias}.json`);
 }
 
+/** What a cached nest list was fetched for: the URL, and the account whose keys saw it. */
+function nestCacheUrl(spec: Extract<RemoteNestSpec, { transport: "http" }>): string {
+  return spec.account ? `${spec.url}#${spec.account}` : spec.url;
+}
+
 /**
  * How long a failed nest-list probe is remembered. The plugin lists vaults on
  * every prompt; without this, an offline server costs a full timeout (or three,
@@ -148,25 +153,26 @@ export async function serverNests(
   baseAlias: string,
   spec: RemoteNestSpec,
   conn?: RemoteNestConnection,
-  opts: { fresh?: boolean } = {},
+  /** `retry`: probe even inside the failure backoff — a command naming a nest, not a listing. */
+  opts: { fresh?: boolean; retry?: boolean } = {},
 ): Promise<IndexedNest[] | null> {
   if (spec.transport !== "http") return null;
   const file = nestCachePath(baseAlias);
   const write = (entry: object) => {
     try {
       fs.mkdirSync(pathMod.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: spec.url, ...entry }));
+      fs.writeFileSync(file, JSON.stringify({ at: Date.now(), url: nestCacheUrl(spec), ...entry }));
     } catch {
       // best-effort
     }
   };
-  const cached = readNestCache(baseAlias, spec.url);
+  const cached = readNestCache(baseAlias, nestCacheUrl(spec));
   if (!opts.fresh) {
     if (cached) {
       const age = Date.now() - cached.at;
       // A failed probe only short-circuits the next probes, not a caller that
       // already holds a live connection (that is proof the server is back).
-      if (cached.failed && !conn && age < NEST_PROBE_BACKOFF_MS) {
+      if (cached.failed && !conn && !opts.retry && age < NEST_PROBE_BACKOFF_MS) {
         throw new ContextNestError(
           `Remote "${baseAlias}" was unreachable less than ${NEST_PROBE_BACKOFF_MS / 1000}s ago — not retrying yet.`,
           "REMOTE_UNREACHABLE",
@@ -181,7 +187,7 @@ export async function serverNests(
       : null;
   let nests: IndexedNest[] | null;
   try {
-    nests = conn ? await fetchNests(conn) : await withRemote({ alias: baseAlias, spec }, fetchNests);
+    nests = conn ? await fetchNests(conn) : await nestsOverSavedKeys(baseAlias, spec, fetchNests);
   } catch (err) {
     // Keep the last good list: a listing can still show it while the server is down.
     if (!conn) write({ failed: true, ...(cached?.nests ? { nests: cached.nests } : {}) });
@@ -189,6 +195,45 @@ export async function serverNests(
   }
   write({ nests });
   return nests;
+}
+
+/**
+ * The nests every saved key of the alias's account can see, one connection per
+ * key. A nest-scoped key — perhaps another user's, shared for one nest — sees
+ * only its nest, so the server-wide key alone can miss it. A key that fails is
+ * skipped while another still answers.
+ */
+async function nestsOverSavedKeys(
+  alias: string,
+  spec: RemoteNestSpec,
+  fetchNests: (c: RemoteNestConnection) => Promise<IndexedNest[] | null>,
+): Promise<IndexedNest[] | null> {
+  let tokens: string[] = [];
+  const http = wantsLoginKey(spec) ? spec : undefined;
+  if (http) {
+    try {
+      tokens = await savedTokensForServer(http.url, http.account);
+    } catch {
+      // Unreadable store: withRemote's connect reports it if the server wants a key.
+    }
+  }
+  if (!http || tokens.length === 0) return withRemote({ alias, spec }, fetchNests);
+  const lists = await Promise.allSettled(
+    tokens.map(async (token) => {
+      const c = await connectWithToken(alias, http, token, connectRemoteNest);
+      try {
+        return await fetchNests(c);
+      } finally {
+        await c.close();
+      }
+    }),
+  );
+  const ok = lists.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+  if (ok.length === 0) throw (lists[0] as PromiseRejectedResult).reason;
+  if (ok.every((n) => n === null)) return null;
+  const byId = new Map<string, IndexedNest>();
+  for (const n of ok.flat()) if (n && !byId.has(n.id)) byId.set(n.id, n);
+  return [...byId.values()];
 }
 
 type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean };
@@ -204,7 +249,7 @@ function readNestCache(baseAlias: string, url: string): NestCache | undefined {
 }
 
 /** `--vault <server>/<nest>` → the nest id to send. Throws with the choices on a miss. */
-async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnection): Promise<string> {
+async function resolveTargetNest(target: RemoteTarget): Promise<string> {
   const base = target.alias.slice(0, target.alias.indexOf("/"));
   const wanted = target.nest!;
   // Exact label or id first. A plain name only counts when exactly one nest
@@ -219,9 +264,10 @@ async function resolveTargetNest(target: RemoteTarget, conn: RemoteNestConnectio
     const named = nests.filter((n) => n.name.toLowerCase() === wanted.toLowerCase());
     return named.length === 1 ? named[0] : undefined;
   };
-  let nests = await serverNests(base, target.spec, conn);
+  // Resolved before connecting: the nest decides which saved key to sign in with.
+  let nests = await serverNests(base, target.spec, undefined, { retry: true });
   // A nest created or shared since the cache was written: ask once more, fresh.
-  if (nests && !find(nests)) nests = await serverNests(base, target.spec, conn, { fresh: true });
+  if (nests && !find(nests)) nests = await serverNests(base, target.spec, undefined, { fresh: true });
   if (nests === null) {
     throw new ContextNestError(
       `"${base}" is a single-nest endpoint, not a server — drop the "/${wanted}" suffix.`,
@@ -251,18 +297,24 @@ export function wantsLoginKey(spec: RemoteNestSpec): spec is Extract<RemoteNestS
   return spec.transport === "http" && !spec.auth;
 }
 
+/** Saved-key lookup for an endpoint, under the alias's `account`. */
+export type LoginLookup = (url: string, account?: string) => Promise<string | null>;
+
 /**
  * Connect to a remote. An HTTP remote registered without auth borrows the key
  * `ctx login` saved for its server, so `ctx vault add <alias> --url <server>/mcp`
- * needs no --bearer-env once you're logged in.
+ * needs no --bearer-env once you're logged in. With `nestId` (a server alias
+ * naming one nest) the key is the one saved for that nest, else the server-wide
+ * one: the server accepts a nest-scoped key on `<server>/mcp` for its nest.
  */
 export async function connectTarget(
   target: RemoteTarget,
-  lookup: (url: string) => Promise<string | null> = savedTokenFor,
+  lookup: LoginLookup = (url, account) => savedTokenFor(url, {}, account),
   connect: typeof connectRemoteNest = connectRemoteNest,
+  nestId?: string,
 ): Promise<RemoteNestConnection> {
   try {
-    return await connectWithLogin(target, lookup, connect);
+    return await connectWithLogin(target, lookup, connect, nestId);
   } catch (err) {
     throw nestPathHint(target.spec, err);
   }
@@ -284,15 +336,17 @@ export function nestPathHint(spec: RemoteNestSpec, err: unknown): unknown {
 
 async function connectWithLogin(
   target: RemoteTarget,
-  lookup: (url: string) => Promise<string | null>,
+  lookup: LoginLookup,
   connect: typeof connectRemoteNest,
+  nestId: string | undefined,
 ): Promise<RemoteNestConnection> {
   const { spec } = target;
   if (!wantsLoginKey(spec)) return connect(target.alias, spec);
   let token: string | null = null;
   let storeError: Error | undefined;
   try {
-    token = await lookup(spec.url);
+    const url = nestId ? `${spec.url.replace(/\/mcp\/?$/, "")}/nests/${encodeURIComponent(nestId)}` : spec.url;
+    token = await lookup(url, spec.account);
   } catch (err) {
     storeError = err as Error;
   }
@@ -304,16 +358,30 @@ async function connectWithLogin(
     } catch (err) {
       if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
         if (storeError) throw new ContextNestError(storeError.message, "CONFIG_ERROR");
-        throw new ContextNestError(`${err.message} Or sign in once: \`ctx login <server>\`.`, err.code);
+        // A key saved for one nest signs in only as `<alias>/<nest>`, never for the whole server.
+        const serverAlias = !nestId && !/\/nests\/[^/]+\/mcp\/?$/.test(spec.url);
+        let message = `${err.message} Or sign in once: \`ctx login <server>\`.`;
+        if (serverAlias) message += ` A key saved for one nest works as --vault ${target.alias}/<nest>.`;
+        throw new ContextNestError(message, err.code);
       }
       throw err;
     }
   }
+  return connectWithToken(target.alias, spec, token, connect);
+}
+
+/** Connect to an HTTP remote with a saved `ctx login` key. */
+async function connectWithToken(
+  alias: string,
+  spec: Extract<RemoteNestSpec, { transport: "http" }>,
+  token: string,
+  connect: typeof connectRemoteNest,
+): Promise<RemoteNestConnection> {
   try {
     // The engine reads bearers from env-var references only, so hand it the key
     // under a private name rather than widening the registry format.
     return await connect(
-      target.alias,
+      alias,
       { ...spec, auth: { bearer_env: LOGIN_TOKEN_ENV } },
       { ...process.env, [LOGIN_TOKEN_ENV]: token },
     );
@@ -321,7 +389,7 @@ async function connectWithLogin(
     // The engine's message would point at our internal env var; point at the fix instead.
     if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
       throw new ContextNestError(
-        `Remote nest "${target.alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
+        `Remote nest "${alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
         "REMOTE_AUTH_FAILED",
       );
     }
@@ -337,10 +405,10 @@ async function withRemote<T>(
   target: RemoteTarget,
   fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
 ): Promise<T> {
-  const conn = await connectTarget(target);
+  const nestId = target.nest ? await resolveTargetNest(target) : undefined;
+  const conn = await connectTarget(target, undefined, undefined, nestId);
   try {
-    if (!target.nest) return await fn(conn);
-    const nestId = await resolveTargetNest(target, conn);
+    if (!nestId) return await fn(conn);
     return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) }, nestId);
   } catch (err) {
     // A write through a server-level alias with no nest named: say how to name one.
@@ -1125,7 +1193,7 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
         };
       } catch (err) {
         // Never drop nests silently: show the last known list, or say why there is none.
-        const stale = readNestCache(v.alias, spec.url)?.nests ?? null;
+        const stale = readNestCache(v.alias, nestCacheUrl(spec))?.nests ?? null;
         const why =
           err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED"
             ? "server refused the key — `ctx login <server>`"
