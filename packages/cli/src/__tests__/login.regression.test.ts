@@ -156,6 +156,36 @@ describe("ctx login / logout (regression)", () => {
     expect(ctx(["logout", "nope"]).stderr).toContain("neither a server URL nor a registered HTTP remote alias");
   });
 
+  it("--account keeps a second account's keys apart: login, --list, vault add, logout <alias> and --account", () => {
+    const registry = () => readFileSync(join(home, ".contextnest", "config.yaml"), "utf-8");
+    expect(ctx(["login", HOSTED, "--key-stdin"], KEY_HOSTED).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--key-stdin", "--account", "client", "--as", "po-client", "--yes"], KEY_SELF).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin", "--account", "client"], KEY_NEST).status).toBe(0);
+    expect(registry()).toMatch(/account: client/);
+
+    const list = ctx(["login", "--list", HOSTED]).stdout;
+    expect(list).toContain(`${HOSTED}  (default)`);
+    expect(list).toContain(`${HOSTED}#client`);
+    expect(list).toContain(`${HOSTED}/nests/n1#client`);
+    expect(list).not.toContain("cnst_");
+
+    // A bad name is refused before any key is read or saved, and in the registry.
+    expect(ctx(["login", HOSTED, "--key-stdin", "--account", "a b"], KEY_SELF).stderr).toContain("Invalid account name");
+    const badAdd = ctx(["vault", "add", "x", "--url", `${HOSTED}/mcp`, "--account", "a/b", "--yes"]);
+    expect(badAdd.status).toBe(1);
+    expect(ctx(["vault", "add", "y", "--url", `${HOSTED}/mcp`, "--bearer-env", "K", "--account", "c"]).status).toBe(1);
+
+    // The alias logs out its own account's keys only.
+    const out = ctx(["logout", "po-client"]).stdout;
+    expect(out).toContain(`Logged out of ${HOSTED}#client.`);
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n1#client.`);
+    expect(ctx(["login", "--list"]).stdout).toContain(`${HOSTED}  (default)`);
+    expect(ctx(["login", "--list"]).stdout).not.toContain("#client");
+
+    expect(ctx(["logout", HOSTED, "--account", "client"]).stdout).toContain(`No saved key for ${HOSTED}#client`);
+    expect(ctx(["logout", HOSTED]).stdout).toContain(`Logged out of ${HOSTED}.`);
+  });
+
   it("a corrupt saved map is refused and left alone; logout --all resets it", async () => {
     loginAll();
     await store().set(SERVERS_ACCOUNT, "{corrupt");

@@ -18,6 +18,7 @@
  * `ctx login` runs finishing at the same instant can drop one entry (re-run
  * it). Logins are interactive and rare, so a lock isn't worth its failure modes.
  */
+import { ACCOUNT_NAME_PATTERN } from "@promptowl/contextnest-engine";
 import {
   CredentialStore,
   CredentialStoreError,
@@ -82,7 +83,7 @@ export function nestScopeUrl(server: string, nestId: string): string {
 /** Map key for `scope` (a normalized server or nest URL) under `account`; the unnamed account is the bare URL. */
 export function accountKey(scope: string, account?: string): string {
   if (account === undefined) return scope;
-  if (!/^[A-Za-z0-9._@+-]{1,64}$/.test(account)) throw new Error(`Invalid account name: "${account}"`);
+  if (!ACCOUNT_NAME_PATTERN.test(account)) throw new Error(`Invalid account name: "${account}"`);
   return `${scope}#${account}`;
 }
 
@@ -136,15 +137,18 @@ export function keysUnderServer(map: ServerMap, url: string, account?: string): 
  * Every saved token of `account` that can open a server-level endpoint
  * (`<server>/mcp`): the server-wide key first, then each nest-scoped one. The
  * server accepts a nest-scoped key there and limits it to its nest, so a
- * server alias reaches a nest with only that nest's key saved.
+ * server alias reaches a nest with only that nest's key saved. Empty for any
+ * other endpoint (a single nest's `/nests/<id>/mcp` uses tokenForEndpoint).
  */
 export function tokensForServerEndpoint(map: ServerMap, endpoint: string, account?: string): string[] {
-  let server: string;
+  let target: string;
   try {
-    server = normalizeServerUrl(endpoint).replace(/\/mcp$/, "");
+    target = normalizeServerUrl(endpoint);
   } catch {
     return [];
   }
+  if (!target.endsWith("/mcp") || /\/nests\/[^/]+\/mcp$/.test(target)) return [];
+  const server = target.slice(0, -"/mcp".length);
   const keys = keysUnderServer(map, server, account).sort((a, b) => Number(isNestScope(a)) - Number(isNestScope(b)));
   return [...new Set(keys.map((k) => map.servers[k].token))];
 }

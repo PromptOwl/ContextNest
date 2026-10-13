@@ -533,6 +533,15 @@ describe("<server>/<nest> targets", () => {
     expect(fetches()).toBe(2);
   });
 
+  it("a command naming a nest probes inside the backoff; only listings wait it out", async () => {
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: new ContextNestError("connect ECONNREFUSED", "REMOTE_UNREACHABLE") };
+    await expect(serverNests("cn", server.spec)).rejects.toThrow(/ECONNREFUSED/);
+    replies = { nest_index: { nests }, context_delete: { id: "nodes/a", deleted: true } };
+    await remoteDelete({ ...server, alias: "cn/strategy", nest: "strategy" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: "id-strategy-000" } });
+  });
+
   it("a live connection ignores a remembered failure (the server is evidently back)", async () => {
     advertised = new Set(["nest_index"]);
     replies = { nest_index: new ContextNestError("timeout", "REMOTE_UNREACHABLE") };

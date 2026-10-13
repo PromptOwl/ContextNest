@@ -122,6 +122,9 @@ describe("server map (pure)", () => {
     expect(tokensForServerEndpoint(m, `${SELF}/mcp`)).toEqual(["self"]);
     expect(tokensForServerEndpoint(m, "https://other.example/mcp")).toEqual([]);
     expect(tokensForServerEndpoint(m, "garbage")).toEqual([]);
+    // Only a server-level endpoint fans out; one nest's endpoint keeps the longest match.
+    expect(tokensForServerEndpoint(m, `${HOSTED}/nests/n1/mcp`)).toEqual([]);
+    expect(tokensForServerEndpoint(m, HOSTED)).toEqual([]);
   });
 
   it("keeps a named account's keys apart from the unnamed one on the same server", () => {
