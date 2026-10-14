@@ -78,6 +78,10 @@ The block is validated when search uses it, never when the config is loaded, so 
 - `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) → plain HTTPS. No extra install.
 - Otherwise the engine lazily imports `@aws-sdk/client-bedrock-runtime` and uses the standard AWS credential chain. Install that package next to `ctx` (`npm i -g @aws-sdk/client-bedrock-runtime`). It is never a dependency of the base install.
 
+### Throttling
+
+Bedrock quotas are per minute and can be small. On a default account, Cohere Rerank 3.5 on-demand is 25 requests per minute, and Cohere Embed v4 has per-minute token quotas. Every Bedrock and OpenAI-compatible call therefore retries `ThrottlingException`, `TooManyRequestsException`, `ServiceUnavailableException` and HTTP 429/502/503. It uses exponential backoff with full jitter (1s base, 60s cap per wait, 8 attempts) and honours `Retry-After` when present. `ctx embed` backs off per batch the same way, and an interrupted run resumes from the last saved batch.
+
 ## The index
 
 `ctx embed` (MCP: `context_embed`) builds or refreshes it.

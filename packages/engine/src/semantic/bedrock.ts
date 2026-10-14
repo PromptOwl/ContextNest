@@ -22,6 +22,82 @@ export type BedrockInvoke = (modelId: string, body: Record<string, unknown>) => 
 
 const SDK_SPECIFIER = ["@aws-sdk", "client-bedrock-runtime"].join("/");
 
+/**
+ * Retry policy for throttling / transient unavailability. Bedrock quotas are
+ * per MINUTE and can be tiny (Cohere Rerank 3.5 on-demand: 25 requests/min
+ * on a default account), so a long benchmark or a large `ctx embed` WILL hit
+ * them; failing the whole run on the first ThrottlingException is wrong.
+ * Exponential backoff with full jitter, capped, honouring Retry-After.
+ */
+export interface RetryOptions {
+  /** Total attempts including the first (default 8). */
+  attempts?: number;
+  /** First backoff ceiling in ms (default 1000). */
+  baseMs?: number;
+  /** Max single wait in ms (default 60000). */
+  capMs?: number;
+  /** Injected in tests. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+}
+
+const RETRYABLE_NAMES = new Set([
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "ServiceUnavailableException",
+  "ModelNotReadyException",
+]);
+
+/** An HTTP/SDK error carrying what the retry policy needs. */
+export class BedrockHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfterMs?: number,
+    readonly errorName?: string,
+  ) {
+    super(message);
+    this.name = errorName ?? "BedrockHttpError";
+  }
+}
+
+/** Retry-After as seconds or an HTTP date → ms (undefined if absent/unparseable). */
+export function parseRetryAfter(value: string | null | undefined, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const secs = Number(value);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+function retryInfo(err: unknown): { retryable: boolean; retryAfterMs?: number } {
+  const e = err as any;
+  const name: string | undefined = e?.errorName ?? e?.name ?? e?.__type;
+  const status: number | undefined = e?.status ?? e?.$metadata?.httpStatusCode;
+  const retryable =
+    (name !== undefined && RETRYABLE_NAMES.has(name)) || status === 429 || status === 503 || status === 502;
+  const header = e?.$response?.headers?.["retry-after"] ?? e?.$response?.headers?.["Retry-After"];
+  return { retryable, retryAfterMs: e?.retryAfterMs ?? parseRetryAfter(header) };
+}
+
+export async function withBedrockRetry<T>(fn: () => Promise<T>, opts: RetryOptions = {}): Promise<T> {
+  const attempts = opts.attempts ?? 8;
+  const base = opts.baseMs ?? 1000;
+  const cap = opts.capMs ?? 60_000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const random = opts.random ?? Math.random;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const { retryable, retryAfterMs } = retryInfo(err);
+      if (!retryable || attempt >= attempts) throw err;
+      const backoff = random() * Math.min(cap, base * 2 ** (attempt - 1));
+      await sleep(Math.min(cap, Math.max(backoff, retryAfterMs ?? 0)));
+    }
+  }
+}
+
 function regionOf(cfg: { region?: string }): string {
   return cfg.region ?? process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1";
 }
@@ -40,7 +116,12 @@ export function defaultBedrockInvoke(region: string): BedrockInvoke {
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
-        throw new Error(`Bedrock ${modelId} → HTTP ${res.status}: ${text.slice(0, 300)}`);
+        throw new BedrockHttpError(
+          `Bedrock ${modelId} → HTTP ${res.status}: ${text.slice(0, 300)}`,
+          res.status,
+          parseRetryAfter(res.headers.get("retry-after")),
+          res.headers.get("x-amzn-errortype")?.split(":")[0] || undefined,
+        );
       }
       return res.json();
     }
@@ -86,8 +167,13 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R
   return out;
 }
 
-export function createBedrockEmbeddingProvider(cfg: EmbeddingsConfig, invoke?: BedrockInvoke): EmbeddingProvider {
-  const call = invoke ?? defaultBedrockInvoke(regionOf(cfg));
+export function createBedrockEmbeddingProvider(
+  cfg: EmbeddingsConfig,
+  invoke?: BedrockInvoke,
+  retry?: RetryOptions,
+): EmbeddingProvider {
+  const raw = invoke ?? defaultBedrockInvoke(regionOf(cfg));
+  const call: BedrockInvoke = (m, b) => withBedrockRetry(() => raw(m, b), retry);
   const model = cfg.model;
   if (!isCohere(model) && !isTitan(model)) {
     throw new Error(
@@ -131,8 +217,9 @@ export function createBedrockEmbeddingProvider(cfg: EmbeddingsConfig, invoke?: B
   };
 }
 
-export function createBedrockReranker(cfg: RerankConfig, invoke?: BedrockInvoke): Reranker {
-  const call = invoke ?? defaultBedrockInvoke(regionOf(cfg));
+export function createBedrockReranker(cfg: RerankConfig, invoke?: BedrockInvoke, retry?: RetryOptions): Reranker {
+  const raw = invoke ?? defaultBedrockInvoke(regionOf(cfg));
+  const call: BedrockInvoke = (m, b) => withBedrockRetry(() => raw(m, b), retry);
   return {
     name: cfg.provider,
     model: cfg.model,

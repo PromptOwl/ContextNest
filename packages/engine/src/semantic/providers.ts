@@ -13,7 +13,13 @@
  */
 import { ConfigError } from "../errors.js";
 import type { EmbeddingsConfig, RerankConfig } from "./config.js";
-import { createBedrockEmbeddingProvider, createBedrockReranker } from "./bedrock.js";
+import {
+  BedrockHttpError,
+  createBedrockEmbeddingProvider,
+  createBedrockReranker,
+  parseRetryAfter,
+  withBedrockRetry,
+} from "./bedrock.js";
 
 /** Which side of retrieval a text is on — asymmetric models embed them differently. */
 export type EmbedKind = "document" | "query";
@@ -74,7 +80,12 @@ function apiKey(cfg: { api_key_env?: string }, fallbackEnv: string): string | un
   return process.env[cfg.api_key_env ?? fallbackEnv] || undefined;
 }
 
-async function postJson(url: string, body: unknown, key: string | undefined): Promise<any> {
+/** POST JSON, retrying 429/502/503 with the same backoff as Bedrock (Retry-After honoured). */
+function postJson(url: string, body: unknown, key: string | undefined): Promise<any> {
+  return withBedrockRetry(() => postJsonOnce(url, body, key));
+}
+
+async function postJsonOnce(url: string, body: unknown, key: string | undefined): Promise<any> {
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -85,7 +96,11 @@ async function postJson(url: string, body: unknown, key: string | undefined): Pr
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`${url} → HTTP ${res.status}: ${text.slice(0, 300)}`);
+    throw new BedrockHttpError(
+      `${url} → HTTP ${res.status}: ${text.slice(0, 300)}`,
+      res.status,
+      parseRetryAfter(res.headers.get("retry-after")),
+    );
   }
   return res.json();
 }

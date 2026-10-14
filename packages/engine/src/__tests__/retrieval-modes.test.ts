@@ -23,7 +23,13 @@ import {
 } from "../semantic/providers.js";
 import { rrfFuse, RRF_K, DEFAULT_FUSION_WEIGHTS } from "../semantic/hybrid.js";
 import { EMBEDDINGS_DIR } from "../semantic/embedding-store.js";
-import { createBedrockEmbeddingProvider, createBedrockReranker } from "../semantic/bedrock.js";
+import {
+  createBedrockEmbeddingProvider,
+  createBedrockReranker,
+  withBedrockRetry,
+  parseRetryAfter,
+  BedrockHttpError,
+} from "../semantic/bedrock.js";
 
 interface Hit {
   id: string;
@@ -513,5 +519,94 @@ describe("Bedrock providers — request shape", () => {
     );
     expect(await r.rerank("q", ["d0", "d1"], 2)).toEqual([{ index: 1, score: 0.9 }, { index: 0, score: 0.1 }]);
     expect(sent).toEqual({ query: "q", documents: ["d0", "d1"], top_n: 2, api_version: 2 });
+  });
+});
+
+// ─── 5. Throttling: retry with backoff (Bedrock quotas are per MINUTE) ──────
+
+describe("Bedrock retry on throttling", () => {
+  function throttle(name = "ThrottlingException", extra: Record<string, unknown> = {}) {
+    return Object.assign(new Error("Rate exceeded"), { name, $metadata: { httpStatusCode: 429 }, ...extra });
+  }
+
+  it("Given ThrottlingException twice, When reranking, Then it backs off and succeeds on the third attempt", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const r = createBedrockReranker(
+      { provider: "bedrock", model: "cohere.rerank-v3-5:0" },
+      async () => {
+        calls++;
+        if (calls <= 2) throw throttle();
+        return { results: [{ index: 0, relevance_score: 0.7 }] };
+      },
+      { sleep: async (ms) => void waits.push(ms), random: () => 1 },
+    );
+    expect(await r.rerank("q", ["d0"], 1)).toEqual([{ index: 0, score: 0.7 }]);
+    expect(calls).toBe(3);
+    expect(waits).toEqual([1000, 2000]); // exponential, full jitter at random()=1
+  });
+
+  it("embedding retries an HTTP 429 and honours Retry-After", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const p = createBedrockEmbeddingProvider(
+      { provider: "bedrock", model: "cohere.embed-v4:0" },
+      async (_m, body) => {
+        if (++calls === 1) throw new BedrockHttpError("HTTP 429", 429, 7000);
+        return { embeddings: { float: (body.texts as string[]).map(() => [1]) } };
+      },
+      { sleep: async (ms) => void waits.push(ms), random: () => 0 },
+    );
+    expect(await p.embed(["a"], "document")).toEqual([[1]]);
+    expect(waits).toEqual([7000]);
+  });
+
+  it("caps each wait and gives up after the attempt limit, rethrowing the throttle", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    await expect(
+      withBedrockRetry(
+        async () => {
+          calls++;
+          throw throttle("TooManyRequestsException");
+        },
+        { attempts: 8, capMs: 60_000, sleep: async (ms) => void waits.push(ms), random: () => 1 },
+      ),
+    ).rejects.toThrow(/Rate exceeded/);
+    expect(calls).toBe(8);
+    expect(Math.max(...waits)).toBeLessThanOrEqual(60_000);
+    expect(waits.at(-1)).toBe(60_000);
+  });
+
+  it("does not retry a non-transient error (e.g. ValidationException)", async () => {
+    let calls = 0;
+    await expect(
+      withBedrockRetry(
+        async () => {
+          calls++;
+          throw Object.assign(new Error("bad input"), { name: "ValidationException", $metadata: { httpStatusCode: 400 } });
+        },
+        { sleep: async () => {} },
+      ),
+    ).rejects.toThrow(/bad input/);
+    expect(calls).toBe(1);
+  });
+
+  it("retries ServiceUnavailableException", async () => {
+    let calls = 0;
+    const out = await withBedrockRetry(
+      async () => {
+        if (++calls < 3) throw throttle("ServiceUnavailableException", { $metadata: { httpStatusCode: 503 } });
+        return "ok";
+      },
+      { sleep: async () => {} },
+    );
+    expect(out).toBe("ok");
+  });
+
+  it("parses Retry-After as seconds or an HTTP date", () => {
+    expect(parseRetryAfter("3")).toBe(3000);
+    expect(parseRetryAfter(new Date(10_000).toUTCString(), 4_000)).toBe(6000);
+    expect(parseRetryAfter(undefined)).toBeUndefined();
   });
 });
