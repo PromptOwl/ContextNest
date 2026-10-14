@@ -419,6 +419,11 @@ const search: OperationExecutor = async (ctx, input: any) => {
   }
   const reranker = input.rerank && searchCfg.rerank ? createReranker(searchCfg.rerank) : undefined;
   const rerankTopN = searchCfg.rerank?.top_n;
+  const rerankOpts = {
+    unit: searchCfg.rerank?.unit,
+    maxPassages: searchCfg.rerank?.max_passages,
+    batchSize: searchCfg.rerank?.batch_size,
+  };
 
   let hits: RankedHit[];
   let stale: number | undefined;
@@ -433,7 +438,11 @@ const search: OperationExecutor = async (ctx, input: any) => {
       .filter((h) => isPublished(h.document))
       .map((h) => ({ document: h.document, score: h.score, scores: { lexical: h.score } }));
     if (reranker) {
-      hits = await rerankHits(query, hits, reranker, rerankTopN ?? 50, searchCfg.embeddings?.max_chars);
+      hits = await rerankHits(query, hits, reranker, {
+        ...rerankOpts,
+        topN: rerankTopN,
+        maxChars: searchCfg.embeddings?.max_chars,
+      });
     }
   } else {
     const out = await semanticSearch(query, {
@@ -449,13 +458,19 @@ const search: OperationExecutor = async (ctx, input: any) => {
       maxChars: searchCfg.embeddings!.max_chars,
       reranker,
       rerankTopN,
+      rerank: rerankOpts,
     });
     hits = out.hits.filter((h) => isPublished(h.document));
     stale = out.stale;
   }
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
-    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score, scores: h.scores })),
+    results: kept.map((h) => ({
+      ...toSummary(h.document),
+      score: h.score,
+      scores: h.scores,
+      ...(h.passage !== undefined ? { passage: h.passage } : {}),
+    })),
     // Counted before the `limit` slice. `total` is the deprecated alias.
     count: hits.length,
     total: hits.length,

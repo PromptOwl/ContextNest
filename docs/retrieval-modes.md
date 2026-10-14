@@ -8,7 +8,19 @@
 | `semantic` | Cosine similarity between the query embedding and each published document's embedding. | `search.embeddings` + `ctx embed` |
 | `hybrid` | Weighted reciprocal rank fusion (k0 = 60, w/(k0+rank), weights from `search.fusion_weights`, default lexical 1 : semantic 2) of the lexical and semantic lists (top `candidates` of each, default 100). Exact matches stay deterministic: a document whose title equals the query, or that carries a `#tag` written in the query, is pinned above the fused list. | same as semantic |
 
-`--rerank` (`rerank: true`) re-scores the top `search.rerank.top_n` (default 50) non-seed hits with the configured reranker. Seeds stay pinned.
+`--rerank` (`rerank: true`) re-scores the top `search.rerank.top_n` (default 100) non-seed hits with the configured reranker. Seeds stay pinned.
+
+### Rerank on passages, not whole documents
+
+By default (`search.rerank.unit: passage`), the reranker never sees a whole document:
+
+1. Each candidate's description and body are split into windows of about 300 tokens (1,200 characters). Splits follow paragraphs, then sentences, and consecutive windows overlap by about 150 characters. The title is prefixed to every window.
+2. The windows are reranked in requests of at most `batch_size` (100) sources. A query sends at most `max_passages` (1,000) windows in total, shared evenly across documents, earliest windows first.
+3. Each document scores as its best window, and that window is returned as `passage` on the hit (`--json`), ready to quote in an answer.
+
+Why: a cross-encoder judges a (query, passage) pair. Fed a whole 3–4k-token article, the off-topic text dilutes the paragraph that answers the question. Bedrock Knowledge Bases rerank ~300-token chunks. On MultiHop-RAG (529 queries, NDCG@10), Bedrock KB vector + Cohere Rerank 3.5 over its top-100 chunks scored 0.795. A local proxy of ctx hybrid + rerank over the top-50 whole documents scored about 0.766. Passage rerank plus the larger top-100 is aimed at that gap. `unit: document` keeps the old behaviour.
+
+**Cost:** requests per query = ceil(windows / 100). For 100 candidates of about 2.6k tokens each, that is about 10 windows per document, so 1,000 windows and **10 rerank requests per query**. Each request counts against Bedrock's per-minute quota (Cohere Rerank 3.5 on-demand is 25 per minute on a default account, so about 2.5 queries per minute), and throttling is retried with backoff. Lower `top_n` or `max_passages` to trade quality for cost.
 
 Every hit carries `score` (what the list is ordered by) and `scores` (`lexical`, `semantic`, `rrf`, `rerank` — whichever applied). The response says which `mode` actually ran.
 
@@ -58,7 +70,10 @@ search:
   rerank:
     provider: bedrock
     model: cohere.rerank-v3-5:0
-    top_n: 50
+    top_n: 100                 # non-seed hits reranked
+    unit: passage              # passage (default) | document
+    max_passages: 1000         # windows per query across all docs
+    batch_size: 100            # sources per rerank request
 ```
 
 OpenAI-compatible endpoints (OpenAI, Ollama, vLLM, LM Studio):

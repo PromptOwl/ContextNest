@@ -21,7 +21,8 @@ import {
   type EmbeddingProvider,
   type Reranker,
 } from "../semantic/providers.js";
-import { rrfFuse, RRF_K, DEFAULT_FUSION_WEIGHTS } from "../semantic/hybrid.js";
+import { rrfFuse, RRF_K, DEFAULT_FUSION_WEIGHTS, rerankHits, DEFAULT_RERANK_TOP_N, type RankedHit } from "../semantic/hybrid.js";
+import { splitPassages } from "../semantic/passages.js";
 import { EMBEDDINGS_DIR } from "../semantic/embedding-store.js";
 import {
   createBedrockEmbeddingProvider,
@@ -688,6 +689,92 @@ describe("embedding requests are capped by total characters", () => {
       expect(out.embedded).toBe(4);
       for (const call of embedCalls) expect(call.reduce((n, t) => n + t.length, 0)).toBeLessThanOrEqual(300);
       expect(embedCalls.length).toBeGreaterThan(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── 7. Passage-level rerank ─────────────────────────────────────────────────
+
+describe("rerank on passages, not whole documents", () => {
+  const QUERY = "adrenal tumor surgery outcomes";
+  const words = QUERY.split(" ");
+  /** Stub cross-encoder: query-word hits, diluted by passage length (as real ones are by off-topic text). */
+  function dilutingReranker(log: string[][] = []): Reranker {
+    return {
+      name: "stub",
+      model: "dilute",
+      async rerank(_q, documents, topN) {
+        log.push(documents);
+        return documents
+          .map((d, index) => {
+            const lower = d.toLowerCase();
+            const hits = words.filter((w) => lower.includes(w)).length;
+            return { index, score: hits / (1 + d.length / 1000) };
+          })
+          .sort((a, b) => b.score - a.score)
+          .slice(0, topN);
+      },
+    };
+  }
+  const filler = Array.from({ length: 18 }, (_, i) =>
+    `Paragraph ${i}: quarterly logistics, staffing rotas, cafeteria menus, parking and travel policy notes for the regional office.`.repeat(3),
+  ).join("\n\n");
+  const deep = "The adrenal tumor surgery cohort showed strong outcomes: complication rates fell by half after laparoscopic resection.";
+  const longDoc = node("nodes/long-report", `${filler}\n\n${deep}\n\n${filler}`);
+  const shortDoc = node("nodes/short-note", "Surgery scheduling for the clinic is on Tuesdays.");
+  const asHits = (docs: any[]): RankedHit[] => docs.map((d, i) => ({ document: d, score: 1 - i / 10, scores: {} }));
+
+  it("splitPassages makes ~300-token, paragraph-aware windows that cover the text", () => {
+    const windows = splitPassages(longDoc.body);
+    expect(windows.length).toBeGreaterThan(5);
+    for (const w of windows) expect(w.length).toBeLessThanOrEqual(1200);
+    expect(windows.some((w) => w.includes(deep))).toBe(true);
+  });
+
+  it("Given a long doc with the answer deep inside, When reranking by passage, Then it outranks a short loosely-related doc and returns that passage", async () => {
+    const out = await rerankHits(QUERY, asHits([shortDoc, longDoc]), dilutingReranker());
+    expect(out[0].document.id).toBe("nodes/long-report");
+    expect(out[0].passage).toContain(deep);
+    expect(typeof out[0].scores.rerank).toBe("number");
+  });
+
+  it("Given unit: document, Then the same long doc is diluted and loses (the gap passage rerank closes)", async () => {
+    const out = await rerankHits(QUERY, asHits([shortDoc, longDoc]), dilutingReranker(), { unit: "document" });
+    expect(out[0].document.id).toBe("nodes/short-note");
+    expect(out[0].passage).toBeUndefined();
+  });
+
+  it("defaults: top_n 100, ≤100 sources per request, ≤1000 windows per query", async () => {
+    expect(DEFAULT_RERANK_TOP_N).toBe(100);
+    // 100 candidates of ~2.6k tokens (~10.4k chars) each.
+    const para = "Market news paragraph with figures, quotes and context about the companies involved in the deal. ".repeat(4);
+    const docs = Array.from({ length: 100 }, (_, i) =>
+      node(`nodes/news-${i}`, Array.from({ length: 26 }, () => para).join("\n\n").slice(0, 10_400)),
+    );
+    const log: string[][] = [];
+    await rerankHits("deal figures", asHits(docs), dilutingReranker(log));
+    const total = log.reduce((n, b) => n + b.length, 0);
+    for (const batch of log) expect(batch.length).toBeLessThanOrEqual(100);
+    expect(total).toBeLessThanOrEqual(1000);
+    expect(log.length).toBe(Math.ceil(total / 100));
+    expect(log.length).toBe(10); // 1000 windows / 100 per request
+  });
+
+  it("context_search --json carries the best passage per hit", async () => {
+    const { ctx, dir } = await makeVault(
+      "search:\n  embeddings:\n    provider: stub\n    model: concepts-v1\n  rerank:\n    provider: dilute\n    model: d\n",
+    );
+    registerReranker("dilute", () => dilutingReranker());
+    try {
+      await api.run("context_create", { id: "nodes/long-report", title: "Ops report", content: longDoc.body }, ctx);
+      await api.run("context_create", { id: "nodes/short-note", title: "Clinic note", content: shortDoc.body }, ctx);
+      const out = await api.run<{ results: Array<Hit & { passage?: string }> }>(
+        "context_search", { query: "surgery outcomes", rerank: true }, ctx,
+      );
+      expect(out.results[0].id).toBe("nodes/long-report");
+      expect(out.results[0].passage).toContain(deep);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

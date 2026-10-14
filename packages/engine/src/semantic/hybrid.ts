@@ -15,11 +15,12 @@ import { Resolver, exactSeeds, type FieldBoosts } from "../resolver.js";
 export { exactSeeds };
 import type { EmbeddingProvider, Reranker } from "./providers.js";
 import { requestBatches, DEFAULT_MAX_REQUEST_CHARS } from "./bedrock.js";
+import { splitPassages } from "./passages.js";
 import { EmbeddingStore, embeddable, embeddingText, keyFor, normalize, DEFAULT_MAX_CHARS } from "./embedding-store.js";
 
 export const RRF_K = 60;
 export const DEFAULT_CANDIDATES = 100;
-export const DEFAULT_RERANK_TOP_N = 50;
+export const DEFAULT_RERANK_TOP_N = 100;
 
 /**
  * Default hybrid RRF weights: semantic counts double. Chosen on a dev-set
@@ -45,8 +46,10 @@ export interface RankedHit {
   /** The score the list is ordered by (mode-dependent). */
   score: number;
   scores: HitScores;
-  /** True for an exact title/tag seed (hybrid only). */
+  /** True for an exact title/tag seed. */
   seed?: boolean;
+  /** Passage rerank: the best-matching ~300-token window of this document. */
+  passage?: string;
 }
 
 /**
@@ -83,6 +86,7 @@ export interface SemanticSearchOptions {
   maxChars?: number;
   reranker?: Reranker;
   rerankTopN?: number;
+  rerank?: Omit<RerankOptions, "topN" | "maxChars">;
 }
 
 export interface SemanticSearchResult {
@@ -163,38 +167,102 @@ export async function semanticSearch(query: string, opts: SemanticSearchOptions)
     });
   }
 
-  if (opts.reranker) hits = await rerankHits(q, hits, opts.reranker, opts.rerankTopN ?? DEFAULT_RERANK_TOP_N, maxChars);
+  if (opts.reranker) {
+    hits = await rerankHits(q, hits, opts.reranker, { ...opts.rerank, topN: opts.rerankTopN, maxChars });
+  }
   return { hits, stale };
+}
+
+export type RerankUnit = "passage" | "document";
+export const DEFAULT_MAX_PASSAGES = 1000;
+export const DEFAULT_RERANK_BATCH = 100;
+
+export interface RerankOptions {
+  /** Non-seed hits to rerank (default DEFAULT_RERANK_TOP_N = 100). */
+  topN?: number;
+  /** passage (default): rerank ~300-token windows, doc score = best window. document: whole docs. */
+  unit?: RerankUnit;
+  /** Per-document text cap before splitting (the embedding max_chars). */
+  maxChars?: number;
+  /** Max windows sent per query, across all documents (default 1000). */
+  maxPassages?: number;
+  /** Max sources per reranker request (default 100). */
+  batchSize?: number;
+  passageChars?: number;
 }
 
 /**
  * Rerank the top-N non-seed hits; seeds stay pinned (determinism), and hits
  * below N keep their order after the reranked block.
+ *
+ * Passage unit: each candidate is split into ~300-token windows
+ * (splitPassages); windows are reranked in requests of ≤ `batchSize`
+ * sources, at most `maxPassages` per query (an even per-document share,
+ * earliest windows first); a document scores as its best window, and that
+ * window is returned as `passage`. Cohere relevance scores are absolute per
+ * (query, passage), so scores from separate requests compare directly.
+ * Request count per query = ceil(windows / batchSize) — e.g. 100 candidates
+ * of ~2.6k tokens ≈ 10 windows each → 1000 windows → 10 requests.
  */
 export async function rerankHits(
   query: string,
   hits: RankedHit[],
   reranker: Reranker,
-  topN: number,
-  maxChars = DEFAULT_MAX_CHARS,
+  opts: RerankOptions = {},
 ): Promise<RankedHit[]> {
+  const topN = opts.topN ?? DEFAULT_RERANK_TOP_N;
+  const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
+  const batchSize = opts.batchSize ?? DEFAULT_RERANK_BATCH;
   const seeds = hits.filter((h) => h.seed);
   const rest = hits.filter((h) => !h.seed);
   const head = rest.slice(0, topN);
   const tail = rest.slice(topN);
   if (head.length === 0) return hits;
-  const results = await reranker.rerank(query, head.map((h) => embeddingText(h.document, maxChars)), head.length);
-  const seen = new Set<number>();
-  const reranked: RankedHit[] = [];
-  for (const r of results) {
-    if (seen.has(r.index) || !head[r.index]) continue;
-    seen.add(r.index);
-    const h = head[r.index];
-    reranked.push({ ...h, score: r.score, scores: { ...h.scores, rerank: r.score } });
+
+  // Sources: one per document, or one per window (owner index + text).
+  const sources: Array<{ doc: number; text: string; passage?: string }> = [];
+  if ((opts.unit ?? "passage") === "document") {
+    head.forEach((h, i) => sources.push({ doc: i, text: embeddingText(h.document, maxChars) }));
+  } else {
+    const perDoc = Math.max(1, Math.floor((opts.maxPassages ?? DEFAULT_MAX_PASSAGES) / head.length));
+    head.forEach((h, i) => {
+      const title = String(h.document.frontmatter.title ?? "").trim();
+      const body = [h.document.frontmatter.description ?? "", h.document.body ?? ""]
+        .filter((p) => p && p.trim())
+        .join("\n\n")
+        .slice(0, maxChars);
+      const windows = splitPassages(body, opts.passageChars).slice(0, perDoc);
+      if (windows.length === 0) windows.push("");
+      // The title rides on every window: a passage out of context loses what it is about.
+      for (const w of windows) sources.push({ doc: i, text: title ? `${title}\n\n${w}` : w, passage: w });
+    });
   }
+
+  const best = new Map<number, { score: number; passage?: string }>();
+  for (let start = 0; start < sources.length; start += batchSize) {
+    const batch = sources.slice(start, start + batchSize);
+    const results = await reranker.rerank(query, batch.map((s) => s.text), batch.length);
+    for (const r of results) {
+      const src = batch[r.index];
+      if (!src) continue;
+      const prev = best.get(src.doc);
+      if (!prev || r.score > prev.score) best.set(src.doc, { score: r.score, passage: src.passage });
+    }
+  }
+
+  const scored = head
+    .map((h, i) => ({ h, i, b: best.get(i) }))
+    .filter((x) => x.b !== undefined)
+    .sort((a, b) => b.b!.score - a.b!.score || a.i - b.i);
+  const reranked: RankedHit[] = scored.map(({ h, b }) => ({
+    ...h,
+    score: b!.score,
+    scores: { ...h.scores, rerank: b!.score },
+    ...(b!.passage !== undefined ? { passage: b!.passage } : {}),
+  }));
   // Anything the reranker dropped keeps its fused order after the reranked block.
   head.forEach((h, i) => {
-    if (!seen.has(i)) reranked.push(h);
+    if (!best.has(i)) reranked.push(h);
   });
   return [...seeds, ...reranked, ...tail];
 }

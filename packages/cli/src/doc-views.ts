@@ -107,6 +107,8 @@ export interface SearchHitView {
   score?: number;
   /** Per-signal scores (lexical / semantic / rrf / rerank); engine >= 2.13. */
   scores?: { lexical?: number; semantic?: number; rrf?: number; rerank?: number };
+  /** Passage rerank: the best-matching window of the document. */
+  passage?: string;
   /** Server-level remote only: the `--vault <server>/<nest>` holding this hit. */
   vault?: string;
 }
@@ -120,6 +122,7 @@ export function searchJsonEntry(d: SearchHitView) {
     type: d.type || "document",
     ...(typeof d.score === "number" ? { score: d.score } : {}),
     ...(d.scores ? { scores: d.scores } : {}),
+    ...(d.passage !== undefined ? { passage: d.passage } : {}),
     ...(d.vault ? { vault: d.vault } : {}),
   };
 }

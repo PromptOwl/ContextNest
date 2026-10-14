@@ -21,7 +21,10 @@
  *     rerank:
  *       provider: bedrock
  *       model: cohere.rerank-v3-5:0
- *       top_n: 50
+ *       top_n: 100             # non-seed hits reranked
+ *       unit: passage          # passage (default): ~300-token windows, doc = best window | document
+ *       max_passages: 1000     # windows per query, all docs
+ *       batch_size: 100        # sources per rerank request
  *
  * Like the structure rules, this block is parsed only where it is used (here),
  * never in `nestConfigSchema`: a typo in it must not brick every read of the
@@ -56,6 +59,9 @@ export const rerankConfigSchema = z
   .object({
     ...providerFields,
     top_n: z.number().int().positive().optional(),
+    unit: z.enum(["passage", "document"]).optional(),
+    max_passages: z.number().int().positive().optional(),
+    batch_size: z.number().int().positive().optional(),
   })
   .strict();
 

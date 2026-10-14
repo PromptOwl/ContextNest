@@ -318,12 +318,16 @@ export {
   type EmbedKind,
 } from "./semantic/providers.js";
 export { createBedrockEmbeddingProvider, createBedrockReranker, type BedrockInvoke } from "./semantic/bedrock.js";
+export { splitPassages, DEFAULT_PASSAGE_CHARS } from "./semantic/passages.js";
 export { EmbeddingStore, EMBEDDINGS_DIR, embeddingText, contentHash } from "./semantic/embedding-store.js";
 export {
   rrfFuse,
   exactSeeds,
   semanticSearch,
   rerankHits,
+  DEFAULT_RERANK_TOP_N,
+  type RerankUnit,
+  type RerankOptions,
   buildEmbeddings,
   RRF_K,
   DEFAULT_FUSION_WEIGHTS,

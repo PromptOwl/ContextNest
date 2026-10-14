@@ -142,6 +142,8 @@ const searchOp: OperationDescriptor = {
             rerank: z.number().optional(),
           })
           .optional(),
+        // Passage rerank only: the best-matching ~300-token window of the node.
+        passage: z.string().optional(),
       }),
     ),
     /** The mode that actually ran (a configured default falls back to lexical until an index exists). */
