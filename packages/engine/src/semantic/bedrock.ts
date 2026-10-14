@@ -70,12 +70,33 @@ export function parseRetryAfter(value: string | null | undefined, now = Date.now
   return Number.isNaN(at) ? undefined : Math.max(0, at - now);
 }
 
+/** Error names the SDK / undici / AbortSignal.timeout use for a dropped or slow request. */
+const TRANSIENT_NAMES = new Set(["TimeoutError", "RequestTimeout", "RequestTimeoutException", "AbortError"]);
+const TRANSIENT_CODES = new Set(["ECONNRESET", "ETIMEDOUT", "EPIPE", "ECONNABORTED", "EAI_AGAIN", "UND_ERR_SOCKET"]);
+/** Messages of transport failures with no structured code (smithy, node http, undici fetch). */
+const TRANSIENT_MESSAGE = /pending stream has been canceled|socket hang up|^terminated$|other side closed|ECONNRESET|ETIMEDOUT|EPIPE/i;
+
+/** A dropped connection / timed-out request: safe to resend (embed and rerank are idempotent). */
+export function isTransientTransportError(err: unknown): boolean {
+  for (let e: any = err, depth = 0; e && depth < 4; e = e.cause, depth++) {
+    if (TRANSIENT_NAMES.has(e.name)) return true;
+    if (typeof e.code === "string" && TRANSIENT_CODES.has(e.code)) return true;
+    if (typeof e.message === "string" && TRANSIENT_MESSAGE.test(e.message)) return true;
+  }
+  return false;
+}
+
 function retryInfo(err: unknown): { retryable: boolean; retryAfterMs?: number } {
   const e = err as any;
   const name: string | undefined = e?.errorName ?? e?.name ?? e?.__type;
   const status: number | undefined = e?.status ?? e?.$metadata?.httpStatusCode;
   const retryable =
-    (name !== undefined && RETRYABLE_NAMES.has(name)) || status === 429 || status === 503 || status === 502;
+    (name !== undefined && RETRYABLE_NAMES.has(name)) ||
+    status === 429 ||
+    status === 503 ||
+    status === 502 ||
+    status === 504 ||
+    isTransientTransportError(err);
   const header = e?.$response?.headers?.["retry-after"] ?? e?.$response?.headers?.["Retry-After"];
   return { retryable, retryAfterMs: e?.retryAfterMs ?? parseRetryAfter(header) };
 }
@@ -98,6 +119,37 @@ export async function withBedrockRetry<T>(fn: () => Promise<T>, opts: RetryOptio
   }
 }
 
+/**
+ * Per-request timeout. A Cohere batch of long documents can take well over a
+ * minute; a timeout is retried like any transient error.
+ */
+export const BEDROCK_REQUEST_TIMEOUT_MS = 300_000;
+
+/** Upper bound on characters sent in one embedding request (all texts summed). */
+export const DEFAULT_MAX_REQUEST_CHARS = 200_000;
+
+/**
+ * Split texts into request batches of at most `maxItems` texts and
+ * `maxChars` total characters (a single over-long text still goes alone).
+ * Returns index ranges [start, end).
+ */
+export function requestBatches(texts: string[], maxItems: number, maxChars: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  let start = 0;
+  let chars = 0;
+  for (let i = 0; i < texts.length; i++) {
+    const len = texts[i].length;
+    if (i > start && (i - start >= maxItems || chars + len > maxChars)) {
+      out.push([start, i]);
+      start = i;
+      chars = 0;
+    }
+    chars += len;
+  }
+  if (start < texts.length) out.push([start, texts.length]);
+  return out;
+}
+
 function regionOf(cfg: { region?: string }): string {
   return cfg.region ?? process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1";
 }
@@ -113,6 +165,7 @@ export function defaultBedrockInvoke(region: string): BedrockInvoke {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -135,7 +188,15 @@ export function defaultBedrockInvoke(region: string): BedrockInvoke {
             "@aws-sdk/client-bedrock-runtime installed next to ctx (npm i -g @aws-sdk/client-bedrock-runtime).",
         );
       }
-      const client = new mod.BedrockRuntimeClient({ region });
+      // maxAttempts 1: withBedrockRetry owns retries (8 attempts, backoff,
+      // Retry-After), so the SDK's own 3 attempts would multiply into 24.
+      // requestHandler as an options object is the SDK v3 shorthand for a
+      // NodeHttpHandler with these settings.
+      const client = new mod.BedrockRuntimeClient({
+        region,
+        maxAttempts: 1,
+        requestHandler: { requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS, connectionTimeout: 10_000 },
+      });
       return { send: (cmd: unknown) => client.send(cmd), Command: mod.InvokeModelCommand };
     })();
     const { send, Command } = await sdkClient;
@@ -196,10 +257,11 @@ export function createBedrockEmbeddingProvider(
           return out.embedding as number[];
         });
       }
-      // Cohere: up to 96 texts per request.
+      // Cohere: up to 96 texts and `max_request_chars` characters per request.
       const vectors: number[][] = [];
-      for (let i = 0; i < texts.length; i += 96) {
-        const batch = texts.slice(i, i + 96);
+      const maxChars = cfg.max_request_chars ?? DEFAULT_MAX_REQUEST_CHARS;
+      for (const [a, b] of requestBatches(texts, 96, maxChars)) {
+        const batch = texts.slice(a, b);
         const out = await call(model, {
           texts: batch,
           input_type: kind === "query" ? "search_query" : "search_document",

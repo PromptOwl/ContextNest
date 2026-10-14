@@ -15,6 +15,7 @@ import { ConfigError } from "../errors.js";
 import type { EmbeddingsConfig, RerankConfig } from "./config.js";
 import {
   BedrockHttpError,
+  BEDROCK_REQUEST_TIMEOUT_MS,
   createBedrockEmbeddingProvider,
   createBedrockReranker,
   parseRetryAfter,
@@ -80,7 +81,7 @@ function apiKey(cfg: { api_key_env?: string }, fallbackEnv: string): string | un
   return process.env[cfg.api_key_env ?? fallbackEnv] || undefined;
 }
 
-/** POST JSON, retrying 429/502/503 with the same backoff as Bedrock (Retry-After honoured). */
+/** POST JSON, retrying 429/502/503/504 and dropped connections/timeouts with the same backoff as Bedrock (Retry-After honoured). */
 function postJson(url: string, body: unknown, key: string | undefined): Promise<any> {
   return withBedrockRetry(() => postJsonOnce(url, body, key));
 }
@@ -88,6 +89,7 @@ function postJson(url: string, body: unknown, key: string | undefined): Promise<
 async function postJsonOnce(url: string, body: unknown, key: string | undefined): Promise<any> {
   const res = await fetch(url, {
     method: "POST",
+    signal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
     headers: {
       "content-type": "application/json",
       ...(key ? { authorization: `Bearer ${key}` } : {}),

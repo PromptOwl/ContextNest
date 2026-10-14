@@ -54,6 +54,7 @@ search:
     dimensions: 1024           # optional output dimension
     batch_size: 32
     max_chars: 20000           # text embedded per document is cut here
+    max_request_chars: 200000  # total characters per embedding request; batches split to fit
   rerank:
     provider: bedrock
     model: cohere.rerank-v3-5:0
@@ -80,7 +81,11 @@ The block is validated when search uses it, never when the config is loaded, so 
 
 ### Throttling
 
-Bedrock quotas are per minute and can be small. On a default account, Cohere Rerank 3.5 on-demand is 25 requests per minute, and Cohere Embed v4 has per-minute token quotas. Every Bedrock and OpenAI-compatible call therefore retries `ThrottlingException`, `TooManyRequestsException`, `ServiceUnavailableException` and HTTP 429/502/503. It uses exponential backoff with full jitter (1s base, 60s cap per wait, 8 attempts) and honours `Retry-After` when present. `ctx embed` backs off per batch the same way, and an interrupted run resumes from the last saved batch.
+Bedrock quotas are per minute and can be small. On a default account, Cohere Rerank 3.5 on-demand is 25 requests per minute, and Cohere Embed v4 has per-minute token quotas. Every Bedrock and OpenAI-compatible call therefore retries `ThrottlingException`, `TooManyRequestsException`, `ServiceUnavailableException` and HTTP 429/502/503. It uses exponential backoff with full jitter (1s base, 60s cap per wait, 8 attempts) and honours `Retry-After` when present.
+
+Dropped connections and timeouts are retried the same way. That covers smithy's "pending stream has been canceled", `TimeoutError`, `ECONNRESET`, `ETIMEDOUT`, `EPIPE`, "socket hang up" and undici's "terminated". Each request times out after 300s. The AWS SDK client runs with `maxAttempts: 1`, so its retries don't multiply ours.
+
+Each embedding request is also capped at `max_request_chars` total characters (default 200,000). A `batch_size` batch of long documents is split to fit, and a single over-long document is sent on its own. `ctx embed` backs off per request, and an interrupted run resumes from the last saved batch.
 
 ## The index
 

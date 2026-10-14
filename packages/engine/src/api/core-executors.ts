@@ -520,6 +520,7 @@ const embed: OperationExecutor = async (ctx, input: any) => {
     rebuild: input.rebuild === true,
     batchSize: e.batch_size,
     maxChars: e.max_chars,
+    maxRequestChars: e.max_request_chars,
     onProgress: ctx.onProgress,
   });
 };

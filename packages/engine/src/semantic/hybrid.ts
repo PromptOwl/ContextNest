@@ -14,6 +14,7 @@ import { Resolver, exactSeeds, type FieldBoosts } from "../resolver.js";
 
 export { exactSeeds };
 import type { EmbeddingProvider, Reranker } from "./providers.js";
+import { requestBatches, DEFAULT_MAX_REQUEST_CHARS } from "./bedrock.js";
 import { EmbeddingStore, embeddable, embeddingText, keyFor, normalize, DEFAULT_MAX_CHARS } from "./embedding-store.js";
 
 export const RRF_K = 60;
@@ -223,6 +224,8 @@ export async function buildEmbeddings(
     rebuild?: boolean;
     batchSize?: number;
     maxChars?: number;
+    /** Total characters per provider call; batches are split to fit (default 200k). */
+    maxRequestChars?: number;
     saveEvery?: number;
     onProgress?: (done: number, total: number) => void;
   } = {},
@@ -254,9 +257,10 @@ export async function buildEmbeddings(
 
   let done = 0;
   let batches = 0;
-  for (let i = 0; i < todo.length; i += batchSize) {
-    const batch = todo.slice(i, i + batchSize);
-    const vectors = await provider.embed(batch.map((t) => embeddingText(t.doc, maxChars)), "document");
+  const texts = todo.map((t) => embeddingText(t.doc, maxChars));
+  for (const [a, b] of requestBatches(texts, batchSize, opts.maxRequestChars ?? DEFAULT_MAX_REQUEST_CHARS)) {
+    const batch = todo.slice(a, b);
+    const vectors = await provider.embed(texts.slice(a, b), "document");
     if (vectors.length !== batch.length) {
       throw new Error(`provider returned ${vectors.length} vectors for ${batch.length} documents`);
     }

@@ -17,6 +17,7 @@
  *       dimensions: 1024       # optional output dimension
  *       batch_size: 32
  *       max_chars: 20000       # text sent per document is cut here
+ *       max_request_chars: 200000   # total characters per embedding request (batches split to fit)
  *     rerank:
  *       provider: bedrock
  *       model: cohere.rerank-v3-5:0
@@ -47,6 +48,7 @@ export const embeddingsConfigSchema = z
     dimensions: z.number().int().positive().optional(),
     batch_size: z.number().int().positive().optional(),
     max_chars: z.number().int().positive().optional(),
+    max_request_chars: z.number().int().positive().optional(),
   })
   .strict();
 

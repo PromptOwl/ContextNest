@@ -29,6 +29,8 @@ import {
   withBedrockRetry,
   parseRetryAfter,
   BedrockHttpError,
+  isTransientTransportError,
+  requestBatches,
 } from "../semantic/bedrock.js";
 
 interface Hit {
@@ -608,5 +610,86 @@ describe("Bedrock retry on throttling", () => {
     expect(parseRetryAfter("3")).toBe(3000);
     expect(parseRetryAfter(new Date(10_000).toUTCString(), 4_000)).toBe(6000);
     expect(parseRetryAfter(undefined)).toBeUndefined();
+  });
+});
+
+// ─── 6. Transport errors and request size (first real-scale run) ────────────
+
+describe("transient transport errors are retried", () => {
+  const cases: Array<[string, unknown]> = [
+    ["smithy canceled stream", new Error("The pending stream has been canceled (caused by: socket hang up)")],
+    ["TimeoutError", Object.assign(new Error("Request timed out"), { name: "TimeoutError" })],
+    ["ECONNRESET code", Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })],
+    ["undici fetch terminated", new TypeError("terminated")],
+    ["fetch failed with ETIMEDOUT cause", Object.assign(new TypeError("fetch failed"), { cause: { code: "ETIMEDOUT" } })],
+    ["EPIPE", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })],
+  ];
+
+  it.each(cases)("%s is transient", (_label, err) => {
+    expect(isTransientTransportError(err)).toBe(true);
+  });
+
+  it("a plain validation error is not transient", () => {
+    expect(isTransientTransportError(new Error("Malformed input request"))).toBe(false);
+  });
+
+  it("Given 'pending stream has been canceled' on the first call, When embedding, Then it backs off and succeeds", async () => {
+    let calls = 0;
+    const waits: number[] = [];
+    const p = createBedrockEmbeddingProvider(
+      { provider: "bedrock", model: "cohere.embed-v4:0" },
+      async (_m, body) => {
+        if (++calls === 1) throw new Error("The pending stream has been canceled");
+        return { embeddings: { float: (body.texts as string[]).map(() => [1]) } };
+      },
+      { sleep: async (ms) => void waits.push(ms), random: () => 1 },
+    );
+    expect(await p.embed(["a", "b"], "document")).toEqual([[1], [1]]);
+    expect(calls).toBe(2);
+    expect(waits).toEqual([1000]);
+  });
+});
+
+describe("embedding requests are capped by total characters", () => {
+  it("requestBatches splits on item count and on total characters", () => {
+    const texts = ["x".repeat(60), "x".repeat(60), "x".repeat(60), "x".repeat(10)];
+    expect(requestBatches(texts, 32, 100)).toEqual([[0, 1], [1, 2], [2, 4]]);
+    expect(requestBatches(texts, 2, 1_000)).toEqual([[0, 2], [2, 4]]);
+    // An over-long single text still goes, alone.
+    expect(requestBatches(["x".repeat(500)], 32, 100)).toEqual([[0, 1]]);
+  });
+
+  it("Cohere sends no request over max_request_chars", async () => {
+    const sizes: number[] = [];
+    const p = createBedrockEmbeddingProvider(
+      { provider: "bedrock", model: "cohere.embed-v4:0", max_request_chars: 250 },
+      async (_m, body) => {
+        const t = body.texts as string[];
+        sizes.push(t.reduce((n, x) => n + x.length, 0));
+        return { embeddings: { float: t.map(() => [1]) } };
+      },
+    );
+    const out = await p.embed(Array.from({ length: 10 }, () => "y".repeat(100)), "document");
+    expect(out).toHaveLength(10);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(250);
+    expect(sizes).toHaveLength(5);
+  });
+
+  it("context_embed splits batch_size batches that exceed max_request_chars", async () => {
+    embedCalls = [];
+    const { ctx, dir } = await makeVault(
+      "search:\n  embeddings:\n    provider: stub\n    model: concepts-v1\n    batch_size: 32\n    max_request_chars: 300\n",
+    );
+    try {
+      for (let i = 0; i < 4; i++) {
+        await api.run("context_create", { id: `nodes/long-${i}`, title: `Long ${i}`, content: "refund ".repeat(30) }, ctx);
+      }
+      const out = await api.run<{ embedded: number }>("context_embed", {}, ctx);
+      expect(out.embedded).toBe(4);
+      for (const call of embedCalls) expect(call.reduce((n, t) => n + t.length, 0)).toBeLessThanOrEqual(300);
+      expect(embedCalls.length).toBeGreaterThan(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
