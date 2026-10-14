@@ -55,18 +55,17 @@ export function processSearchTerm(term: string): string | null {
 }
 
 /**
- * Per-field BM25 boosts. A title or tag hit says something about what a node
- * is ABOUT, but MiniSearch normalizes each field by its own length, so a short
- * title already scores a one-term hit high; a big multiplier on top let one
- * incidental title word outrank documents that are on topic in the body.
- * Benchmark (BEIR SciFact, NDCG@10): {title:3, tags:2, description:1.5} 0.630
- * with stemming vs 0.668 unboosted. Default is now a mild lift; title LOOKUP
- * is served by the exact title/#tag seeds (exactSeeds), not by a big boost.
- * Override per vault with `search.field_boosts`.
+ * Per-field BM25 boosts — all 1.0 by default. MiniSearch normalizes each field
+ * by its own length, so a short title already scores a one-term hit high; any
+ * multiplier on top let one incidental title word outrank documents that are
+ * on topic in the body. Benchmarks (NDCG@10, plain BM25 sum, see
+ * docs/retrieval-modes.md): title 1.25 cost SciFact 0.662 → 0.593 and
+ * MultiHop-RAG 0.706 → 0.606. Title LOOKUP is served by the exact title/#tag
+ * seeds (exactSeeds), not by a boost. Override with `search.field_boosts`.
  */
 export const DEFAULT_FIELD_BOOSTS: Readonly<FieldBoosts> = Object.freeze({
-  title: 1.25,
-  tags: 1.25,
+  title: 1,
+  tags: 1,
   description: 1,
   body: 1,
 });
@@ -140,6 +139,12 @@ export interface ResolverOptions {
   minRelativeScore?: number;
   /** Per-field BM25 boosts; missing fields take DEFAULT_FIELD_BOOSTS. */
   fieldBoosts?: Partial<FieldBoosts>;
+  /**
+   * Keep MiniSearch's coordination factor (score × matched-term count) —
+   * the pre-2.13 ranking. Default false: plain BM25 sum, which benchmarks
+   * better (MultiHop-RAG NDCG@10 0.657 → 0.706). Config: `search.coordination`.
+   */
+  coordination?: boolean;
 }
 
 /** One full-text hit: the document plus its MiniSearch (BM25) score. */
@@ -156,8 +161,10 @@ export class Resolver {
   private reconstructVersion?: (docId: string, version: number) => Promise<string>;
   private fullMatchFirst: boolean;
   private minRelativeScore: number;
+  private coordination: boolean;
 
   constructor(options: ResolverOptions) {
+    this.coordination = options.coordination ?? false;
     this.fullMatchFirst = options.fullMatchFirst ?? true;
     this.minRelativeScore = options.minRelativeScore ?? MIN_RELATIVE_SCORE;
     this.documents = new Map();
@@ -344,15 +351,27 @@ export class Resolver {
   search(query: string): SearchHit[] {
     const q = query.trim();
     if (!q) return [];
-    const partial = this.searchIndex.search(q);
-    if (partial.length === 0) return [];
+    const raw = this.searchIndex.search(q);
+    if (raw.length === 0) return [];
+    // MiniSearch multiplies each OR hit's BM25 sum by the number of query
+    // terms it matched (a coordination factor). Unless `coordination` is on,
+    // divide it back out: plain BM25 sum, so a doc hitting one rare,
+    // discriminative term is not outscored by one hitting many common ones.
     const full = new Set(this.searchIndex.search(q, { combineWith: "AND" }).map((r) => r.id));
+    // The noise floor stays on MiniSearch's raw (coordinated) score, where
+    // MIN_RELATIVE_SCORE was calibrated: the SET of hits is unchanged, only
+    // their order is. A weak one-term mention stays dropped either way.
+    const floor = raw[0].score * this.minRelativeScore;
+    const kept = raw.filter((r) => full.has(r.id) || r.score >= floor);
+    const partial = this.coordination
+      ? kept
+      : kept
+          .map((r) => ({ ...r, score: r.score / Math.max(1, r.queryTerms.length) }))
+          .sort((a, b) => b.score - a.score);
     const tier = (id: unknown) => (this.fullMatchFirst && full.has(id) ? 1 : 0);
-    const floor = partial[0].score * this.minRelativeScore;
-    // MiniSearch returns score-descending; the sort is stable, so this only
+    // `partial` is score-descending; the sort is stable, so this only
     // lifts the full-match tier without reshuffling within it.
     const hits = partial
-      .filter((r) => full.has(r.id) || r.score >= floor)
       .sort((a, b) => tier(b.id) - tier(a.id) || b.score - a.score)
       .map((r) => ({ document: this.documents.get(r.id as string), score: r.score }))
       .filter((h): h is SearchHit => h.document !== undefined);

@@ -76,6 +76,7 @@ export interface SemanticSearchOptions {
   candidates?: number;
   fullMatchFirst?: boolean;
   fieldBoosts?: Partial<FieldBoosts>;
+  coordination?: boolean;
   /** Hybrid RRF weights per list (default DEFAULT_FUSION_WEIGHTS, 1:2). */
   fusionWeights?: { lexical?: number; semantic?: number };
   maxChars?: number;
@@ -134,6 +135,7 @@ export async function semanticSearch(query: string, opts: SemanticSearchOptions)
       documents: published,
       fullMatchFirst: opts.fullMatchFirst,
       fieldBoosts: opts.fieldBoosts,
+      coordination: opts.coordination,
       minRelativeScore: 0,
     })
       .search(q)

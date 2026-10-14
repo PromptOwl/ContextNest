@@ -427,6 +427,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
       documents: docs,
       fullMatchFirst: searchCfg.full_match_first,
       fieldBoosts: searchCfg.field_boosts,
+      coordination: searchCfg.coordination,
     })
       .search(query)
       .filter((h) => isPublished(h.document))
@@ -443,6 +444,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
       candidates: searchCfg.candidates,
       fullMatchFirst: searchCfg.full_match_first,
       fieldBoosts: searchCfg.field_boosts,
+      coordination: searchCfg.coordination,
       fusionWeights: searchCfg.fusion_weights,
       maxChars: searchCfg.embeddings!.max_chars,
       reranker,

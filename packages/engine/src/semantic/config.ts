@@ -4,7 +4,8 @@
  *   search:
  *     mode: lexical            # default for searches that name no mode: lexical | semantic | hybrid
  *     full_match_first: true   # lexical: pin all-terms matches above partial ones
- *     field_boosts: { title: 1.25, tags: 1.25, description: 1, body: 1 }   # BM25 per-field boosts (these are the defaults)
+ *     coordination: false      # true = legacy MiniSearch score x matched-term count
+ *     field_boosts: { title: 1, tags: 1, description: 1, body: 1 }   # BM25 per-field boosts (these are the defaults)
  *     candidates: 100          # per-list depth fused by RRF
  *     fusion_weights: { lexical: 1, semantic: 2 }   # hybrid: w/(60+rank) per list (default 1:2)
  *     embeddings:
@@ -60,6 +61,7 @@ export const searchConfigSchema = z
   .object({
     mode: z.enum(SEARCH_MODES).optional(),
     full_match_first: z.boolean().optional(),
+    coordination: z.boolean().optional(),
     field_boosts: z
       .object({
         title: z.number().nonnegative().optional(),

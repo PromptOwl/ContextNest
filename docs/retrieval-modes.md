@@ -4,7 +4,7 @@
 
 | Mode | What ranks | Needs |
 | --- | --- | --- |
-| `lexical` (default) | BM25 over title/description/body/tags, English-stemmed (Porter) at index and query time, stopwords dropped. Field boosts default to title 1.25, tags 1.25, description 1, body 1 (`search.field_boosts`). Documents matching every term are pinned first unless `search.full_match_first: false`. | nothing |
+| `lexical` (default) | BM25 over title/description/body/tags, English-stemmed (Porter) at index and query time, stopwords dropped. Scores are the plain BM25 sum over matched terms (no coordination factor, `search.coordination`). Field boosts are all 1 by default (`search.field_boosts`). Documents matching every term are pinned first unless `search.full_match_first: false`. | nothing |
 | `semantic` | Cosine similarity between the query embedding and each published document's embedding. | `search.embeddings` + `ctx embed` |
 | `hybrid` | Weighted reciprocal rank fusion (k0 = 60, w/(k0+rank), weights from `search.fusion_weights`, default lexical 1 : semantic 2) of the lexical and semantic lists (top `candidates` of each, default 100). Exact matches stay deterministic: a document whose title equals the query, or that carries a `#tag` written in the query, is pinned above the fused list. | same as semantic |
 
@@ -14,7 +14,14 @@ Every hit carries `score` (what the list is ordered by) and `scores` (`lexical`,
 
 ## Defaults
 
-The field boosts used to be title 3, tags 2, description 1.5. MiniSearch already length-normalizes each field, so a single incidental title word outranked documents that discuss the topic in their body. On BEIR SciFact that cost about 0.04 NDCG@10. The lower default fixes this. Title lookup ("find the node called X") is served by exact-match seeds instead. In every mode, a document whose title equals the query, or that carries a `#tag` written in the query, is pinned first. Vaults that want the old weighting can set `search.field_boosts: { title: 3, tags: 2, description: 1.5 }`.
+### Why lexical ranking changed (benchmarks, NDCG@10)
+
+Two defaults moved, both measured on BEIR SciFact and NFCorpus and on MultiHop-RAG (the dev sets; the held-out sets were not touched):
+
+1. **No coordination factor.** MiniSearch multiplies each hit's BM25 sum by the number of query terms it matched. On long questions, that let a document touching many common words outrank one holding the single rare, discriminative term. Dividing the factor back out gives the plain BM25 sum: MultiHop-RAG 0.657 → 0.706, SciFact 0.668 → 0.662, NFCorpus 0.323 → 0.327. The noise floor (`MIN_RELATIVE_SCORE`) still applies to MiniSearch's raw score, where it was calibrated, so the set of hits is unchanged and only their order differs. Set `search.coordination: true` for the old ranking.
+2. **Field boosts all 1.** The old boosts (title 3, tags 2, description 1.5) let one incidental title word outrank documents that are on topic in their body. Once coordination is removed, any title boost hurts: title 1.25 gives SciFact 0.593 and MultiHop-RAG 0.606. Title lookup ("find the node called X") is served by exact-match seeds instead. In every mode, a document whose title equals the query, or that carries a `#tag` written in the query, is pinned first. Vaults that want the old weighting can set `search.field_boosts: { title: 3, tags: 2, description: 1.5 }`.
+
+For reference, on SciFact the shipped engine 3.0.0 scored 0.604 and a plain stemmed BM25 baseline scored 0.690.
 
 
 With no `--mode`, search is **lexical**. A vault can opt into a different default with `search.mode`, and that default takes effect only once an index exists. Until `ctx embed` has run, a vault configured for `hybrid` still answers lexically instead of failing. An explicit `--mode semantic|hybrid` with no config or no index is an error that names the fix.
@@ -36,7 +43,8 @@ At 1:1, fusion fell below dense-only on SciFact, because the lexical list's weak
 search:
   mode: hybrid                 # optional default; lexical if omitted
   full_match_first: true       # lexical all-terms tier (default true)
-  field_boosts: { title: 1.25, tags: 1.25, description: 1, body: 1 }   # BM25 per-field boosts (defaults shown)
+  coordination: false          # true = legacy MiniSearch score x matched-term count
+  field_boosts: { title: 1, tags: 1, description: 1, body: 1 }   # BM25 per-field boosts (defaults shown)
   candidates: 100              # per-list depth fused by RRF
   fusion_weights: { lexical: 1, semantic: 2 }   # hybrid: each list adds w/(60+rank); default 1:2
   embeddings:

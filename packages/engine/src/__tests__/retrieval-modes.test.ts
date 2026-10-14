@@ -183,8 +183,8 @@ describe("lexical search — field boosts (benchmark: big title boost hurt NDCG)
     frontmatter: { title: "Canary guide", type: "document", status: "published", version: 1 },
   };
 
-  it("default boosts are mild: title and tags 1.25, description and body 1", () => {
-    expect(DEFAULT_FIELD_BOOSTS).toEqual({ title: 1.25, tags: 1.25, description: 1, body: 1 });
+  it("default boosts are all 1 (any title boost lowered NDCG once coordination was removed)", () => {
+    expect(DEFAULT_FIELD_BOOSTS).toEqual({ title: 1, tags: 1, description: 1, body: 1 });
   });
 
   it("Given an on-topic body and an incidental title word, When searching that word, Then the on-topic doc ranks first", () => {
@@ -209,6 +209,38 @@ describe("lexical search — field boosts (benchmark: big title boost hurt NDCG)
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("lexical search — no coordination factor (plain BM25 sum)", () => {
+  // Eight notes share the common vocabulary; one doc carries the rare,
+  // discriminative term. MiniSearch's default multiplies a hit's score by how
+  // many query terms it matched, which buries the rare-term doc under any doc
+  // touching many common words.
+  const filler = Array.from({ length: 8 }, (_, i) =>
+    node(`nodes/filler-${i}`, `patient treatment study results ${"lorem ".repeat(i % 5)}`),
+  );
+  const rare = node("nodes/rare", "Pheochromocytoma resection: perioperative outcomes in a small cohort.");
+  const common = node("nodes/common", "patient treatment study results and follow up notes");
+  const docs = [...filler, rare, common];
+  const query = "pheochromocytoma patient treatment study results risk";
+
+  it("Given a long query, Then the doc with the rare discriminative term beats one matching many common terms", () => {
+    const hits = new Resolver({ documents: docs }).search(query);
+    expect(hits[0].document.id).toBe("nodes/rare");
+  });
+
+  it("Given coordination:true (legacy), Then the many-common-terms doc wins — the defect this removes", () => {
+    const hits = new Resolver({ documents: docs, coordination: true }).search(query);
+    expect(hits[0].document.id).toMatch(/^nodes\/filler-/);
+  });
+
+  it("scores are the plain BM25 sum: coordination:true is exactly matched-terms × the default score", () => {
+    const plain = new Resolver({ documents: docs }).search(query);
+    const legacy = new Resolver({ documents: docs, coordination: true }).search(query);
+    const p = plain.find((h) => h.document.id === "nodes/common")!.score;
+    const l = legacy.find((h) => h.document.id === "nodes/common")!.score;
+    expect(l / p).toBeCloseTo(4, 6); // patient, treatment, study, results
   });
 });
 
