@@ -1257,6 +1257,199 @@ const J6: Journey = {
   ],
 };
 
+/** The rows `ctx review list --json` returns for nodes awaiting a decision. */
+type ReviewRow = { id: string; kind: string };
+const reviewIds = (data: unknown) => (data as ReviewRow[]).map((r) => r.id).sort();
+
+/**
+ * J7 — "I govern my vault with a review gate."
+ * The reviewer's promise: with the gate on, nothing new goes live on its own —
+ * every write is HELD until a person decides. This journey turns review on, adds
+ * nodes that hold as pending instead of publishing, lists the queue of what's
+ * waiting, waves one node through to published, and turns another away — then
+ * proves the rejected node never reaches readers (gone from the node list, off
+ * the queue, absent from query and search).
+ *
+ * The review gate is left ON here (unlike J2–J6, which turn it off): the gate IS
+ * the subject. Two nodes are added so approve and reject act on a real queue, and
+ * the rejected node is a distinct body word ("guide") so its absence from search
+ * is an unambiguous "readers can't see it" proof.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J7: Journey = {
+  id: "J7",
+  title: "Govern a vault with a review gate (reviewer)",
+  cases: [
+    {
+      id: "J7-01",
+      title: "Turning review on puts the vault in governed mode",
+      actions: [
+        // A structured vault defaults to review ON — init says so outright.
+        {
+          args: ["init", "--name", "governed-vault"],
+          stdout: ["Initialized", "Review is on"],
+        },
+        // Turning it on explicitly is the reviewer's deliberate act and is
+        // idempotent — the governed state is confirmed either way.
+        { args: ["config", "set", "review", "on"], stdout: ["review: on"] },
+      ],
+    },
+    {
+      id: "J7-02",
+      title: "A newly added node is held for review, not published",
+      actions: [
+        {
+          // The gate holds the write instead of publishing it, and says plainly
+          // that it is invisible to readers until approved.
+          args: [
+            "add", "nodes/draft-policy",
+            "--type", "document",
+            "--title", "Draft Policy",
+            "--tags", "#policy",
+            "--body", "A policy awaiting review.",
+            "-y",
+          ],
+          stdout: [
+            "Held for review",
+            "nodes/draft-policy",
+            "not visible to search or agents until approved",
+          ],
+          files: [{ path: "nodes/draft-policy.md", exists: true }],
+        },
+        // Held means pending_review in the node list — not published.
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/draft-policy")).toBe("pending_review");
+          },
+        },
+        // "Not published" is reader-facing: while held, the node answers neither
+        // full-text search nor a tag query (the gate's own promise). J7-04 runs
+        // the SAME two lookups after approval and they find it — so the pair pins
+        // the visibility flip to the approval, not to anything else.
+        {
+          args: ["search", "policy"],
+          stdout: ["No results found", "not searchable until approved"],
+          stdoutNot: ["nodes/draft-policy"],
+        },
+        {
+          args: ["query", "#policy"],
+          stdout: [/\b0 nodes\b/],
+          stdoutNot: ["nodes/draft-policy"],
+        },
+        // The reviewer can still read a held node to decide on it.
+        {
+          args: ["read", "nodes/draft-policy"],
+          stdout: ["A policy awaiting review.", "pending_review"],
+        },
+      ],
+    },
+    {
+      id: "J7-03",
+      title: "The review list shows every node waiting for a decision",
+      actions: [
+        // A second held node, so there is a real queue to review.
+        {
+          args: [
+            "add", "nodes/draft-guide",
+            "--type", "document",
+            "--title", "Draft Guide",
+            "--tags", "#policy",
+            "--body", "A guide awaiting review.",
+            "-y",
+          ],
+          stdout: ["Held for review", "nodes/draft-guide"],
+          files: [{ path: "nodes/draft-guide.md", exists: true }],
+        },
+        // Both held nodes appear in the queue.
+        {
+          args: ["review", "list"],
+          stdout: ["nodes/draft-policy", "nodes/draft-guide"],
+        },
+        {
+          args: ["review", "list", "--json"],
+          json: (data) => {
+            expect(reviewIds(data)).toEqual(["nodes/draft-guide", "nodes/draft-policy"]);
+            expect((data as ReviewRow[]).every((r) => r.kind === "new")).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J7-04",
+      title: "Approving a held node publishes it and drops it from the queue",
+      actions: [
+        {
+          args: ["review", "approve", "nodes/draft-policy"],
+          stdout: ["Published nodes/draft-policy"],
+        },
+        // It's published knowledge now...
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/draft-policy")).toBe("published");
+          },
+        },
+        // ...and reader-visible: the same search and query that found nothing
+        // while it was held (J7-02) now return it. This is the approval payoff.
+        {
+          args: ["search", "policy"],
+          stdout: ["1 result(s)", "nodes/draft-policy"],
+        },
+        {
+          args: ["query", "#policy"],
+          stdout: ["nodes/draft-policy", /\b1 nodes\b/],
+        },
+        // ...and off the review queue, which now holds only the other node.
+        {
+          args: ["review", "list", "--json"],
+          json: (data) => {
+            expect(reviewIds(data)).toEqual(["nodes/draft-guide"]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J7-05",
+      title: "Rejecting a held node keeps it out of the published vault and off the queue",
+      actions: [
+        {
+          args: ["review", "reject", "nodes/draft-guide"],
+          stdout: ["Rejected nodes/draft-guide", "status: rejected"],
+        },
+        // The queue is empty — nothing left to decide.
+        {
+          args: ["review", "list", "--json"],
+          json: (data) => {
+            expect(reviewIds(data)).toEqual([]);
+          },
+        },
+        // The rejected node is not published knowledge: it drops out of the node
+        // list entirely, leaving only the approved one.
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/draft-policy")).toBe("published");
+            expect(statusOf(data, "nodes/draft-guide")).toBeUndefined();
+          },
+        },
+        // And readers can't reach it: a tag query returns only the approved node...
+        {
+          args: ["query", "#policy"],
+          stdout: ["nodes/draft-policy", /\b1 nodes\b/],
+          stdoutNot: ["nodes/draft-guide"],
+        },
+        // ...and a full-text search for a word unique to the rejected node's body
+        // ("guide") finds nothing — while the approved node stayed searchable in
+        // J7-04. Same vault, same gate: approved content reaches readers, rejected
+        // content does not.
+        { args: ["search", "guide"], stdout: ["No results found"] },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -1280,5 +1473,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J6 — keep a vault on house-style (structure rules)", () => {
     runJourney({ installDir: INSTALL, scratch }, J6);
+  });
+
+  it("J7 — govern a vault with a review gate", () => {
+    runJourney({ installDir: INSTALL, scratch }, J7);
   });
 });
