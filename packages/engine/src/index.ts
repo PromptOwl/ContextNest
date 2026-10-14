@@ -325,6 +325,7 @@ export {
   exactSeeds,
   semanticSearch,
   rerankHits,
+  selectPassages,
   DEFAULT_RERANK_TOP_N,
   type RerankUnit,
   type RerankOptions,

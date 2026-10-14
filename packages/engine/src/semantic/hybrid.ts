@@ -10,11 +10,12 @@
  * neighbour (spec nodes/dev/spec-retrieval-modes, 2026-09-08 reframe).
  */
 import type { ContextNode } from "../types.js";
-import { Resolver, exactSeeds, type FieldBoosts } from "../resolver.js";
+import { Resolver, exactSeeds, processSearchTerm, type FieldBoosts } from "../resolver.js";
 
 export { exactSeeds };
 import type { EmbeddingProvider, Reranker } from "./providers.js";
 import { requestBatches, DEFAULT_MAX_REQUEST_CHARS } from "./bedrock.js";
+import MiniSearch from "minisearch";
 import { splitPassages } from "./passages.js";
 import { EmbeddingStore, embeddable, embeddingText, keyFor, normalize, DEFAULT_MAX_CHARS } from "./embedding-store.js";
 
@@ -174,7 +175,7 @@ export async function semanticSearch(query: string, opts: SemanticSearchOptions)
 }
 
 export type RerankUnit = "passage" | "document";
-export const DEFAULT_MAX_PASSAGES = 1000;
+export const DEFAULT_MAX_PASSAGES = 100;
 export const DEFAULT_RERANK_BATCH = 100;
 
 export interface RerankOptions {
@@ -184,7 +185,7 @@ export interface RerankOptions {
   unit?: RerankUnit;
   /** Per-document text cap before splitting (the embedding max_chars). */
   maxChars?: number;
-  /** Max windows sent per query, across all documents (default 1000). */
+  /** Max windows sent per query, across all documents (default 100 = one request). */
   maxPassages?: number;
   /** Max sources per reranker request (default 100). */
   batchSize?: number;
@@ -192,17 +193,75 @@ export interface RerankOptions {
 }
 
 /**
+ * Pick which windows go to the reranker — locally, no API call. Every
+ * candidate is split into ~300-token windows, and the windows are scored
+ * against the query with the same stemmed BM25 the lexical search uses
+ * (an index over the windows themselves; ties go to the earlier window).
+ * Round 1 gives each document its single best window; only when the budget
+ * exceeds the document count do later rounds add each document's next-best
+ * window, highest local score first. Default budget = 100 = one rerank
+ * request per query, the same budget as Bedrock KB's reranker.
+ */
+export function selectPassages(
+  query: string,
+  head: RankedHit[],
+  budget: number,
+  maxChars = DEFAULT_MAX_CHARS,
+  passageChars?: number,
+): Array<{ doc: number; text: string; passage: string }> {
+  const perDoc = head.map((h) => {
+    const title = String(h.document.frontmatter.title ?? "").trim();
+    const body = [h.document.frontmatter.description ?? "", h.document.body ?? ""]
+      .filter((p) => p && p.trim())
+      .join("\n\n")
+      .slice(0, maxChars);
+    const windows = splitPassages(body, passageChars);
+    return { title, windows: windows.length ? windows : [""] };
+  });
+
+  const index = new MiniSearch<{ id: string; text: string }>({
+    fields: ["text"],
+    idField: "id",
+    processTerm: processSearchTerm,
+  });
+  index.addAll(perDoc.flatMap((d, i) => d.windows.map((w, j) => ({ id: `${i}:${j}`, text: `${d.title}\n${w}` }))));
+  const local = new Map<string, number>();
+  for (const r of index.search(query)) local.set(r.id as string, r.score);
+
+  // Each doc's windows, best local score first (earlier window on ties).
+  const ranked = perDoc.map((d, i) =>
+    d.windows
+      .map((w, j) => ({ j, w, s: local.get(`${i}:${j}`) ?? 0 }))
+      .sort((a, b) => b.s - a.s || a.j - b.j),
+  );
+  const out: Array<{ doc: number; text: string; passage: string; s: number }> = [];
+  for (let round = 0; out.length < budget; round++) {
+    const picks = ranked
+      .map((wins, i) => ({ i, pick: wins[round] }))
+      .filter((x) => x.pick !== undefined);
+    if (picks.length === 0) break;
+    // Round 1 keeps candidate order (the fused ranking decides who fits a
+    // short budget); later rounds go by local window score.
+    if (round > 0) picks.sort((a, b) => b.pick.s - a.pick.s || a.i - b.i);
+    for (const { i, pick } of picks) {
+      if (out.length >= budget) break;
+      const title = perDoc[i].title;
+      out.push({ doc: i, text: title ? `${title}\n\n${pick.w}` : pick.w, passage: pick.w, s: pick.s });
+    }
+  }
+  return out.map(({ doc, text, passage }) => ({ doc, text, passage }));
+}
+
+/**
  * Rerank the top-N non-seed hits; seeds stay pinned (determinism), and hits
  * below N keep their order after the reranked block.
  *
- * Passage unit: each candidate is split into ~300-token windows
- * (splitPassages); windows are reranked in requests of ≤ `batchSize`
- * sources, at most `maxPassages` per query (an even per-document share,
- * earliest windows first); a document scores as its best window, and that
- * window is returned as `passage`. Cohere relevance scores are absolute per
- * (query, passage), so scores from separate requests compare directly.
- * Request count per query = ceil(windows / batchSize) — e.g. 100 candidates
- * of ~2.6k tokens ≈ 10 windows each → 1000 windows → 10 requests.
+ * Passage unit (default): each candidate contributes its locally best
+ * ~300-token window (selectPassages — BM25 over the windows, no API call);
+ * the windows go to the reranker in requests of ≤ `batchSize`, and a
+ * document scores as its best window, returned as `passage`. With the
+ * defaults (top_n 100, max_passages 100, batch_size 100) that is ONE
+ * rerank request per query. max_passages > top_n adds next-best windows.
  */
 export async function rerankHits(
   query: string,
@@ -219,23 +278,12 @@ export async function rerankHits(
   const tail = rest.slice(topN);
   if (head.length === 0) return hits;
 
-  // Sources: one per document, or one per window (owner index + text).
+  // Sources: one per document, or the locally best window(s) of each.
   const sources: Array<{ doc: number; text: string; passage?: string }> = [];
   if ((opts.unit ?? "passage") === "document") {
     head.forEach((h, i) => sources.push({ doc: i, text: embeddingText(h.document, maxChars) }));
   } else {
-    const perDoc = Math.max(1, Math.floor((opts.maxPassages ?? DEFAULT_MAX_PASSAGES) / head.length));
-    head.forEach((h, i) => {
-      const title = String(h.document.frontmatter.title ?? "").trim();
-      const body = [h.document.frontmatter.description ?? "", h.document.body ?? ""]
-        .filter((p) => p && p.trim())
-        .join("\n\n")
-        .slice(0, maxChars);
-      const windows = splitPassages(body, opts.passageChars).slice(0, perDoc);
-      if (windows.length === 0) windows.push("");
-      // The title rides on every window: a passage out of context loses what it is about.
-      for (const w of windows) sources.push({ doc: i, text: title ? `${title}\n\n${w}` : w, passage: w });
-    });
+    sources.push(...selectPassages(query, head, opts.maxPassages ?? DEFAULT_MAX_PASSAGES, maxChars, opts.passageChars));
   }
 
   const best = new Map<number, { score: number; passage?: string }>();

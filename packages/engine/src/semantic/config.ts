@@ -22,8 +22,8 @@
  *       provider: bedrock
  *       model: cohere.rerank-v3-5:0
  *       top_n: 100             # non-seed hits reranked
- *       unit: passage          # passage (default): ~300-token windows, doc = best window | document
- *       max_passages: 1000     # windows per query, all docs
+ *       unit: passage          # passage (default): each doc's locally best ~300-token window | document
+ *       max_passages: 100      # windows per query (100 = one request); > top_n adds next-best windows
  *       batch_size: 100        # sources per rerank request
  *
  * Like the structure rules, this block is parsed only where it is used (here),

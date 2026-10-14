@@ -21,7 +21,15 @@ import {
   type EmbeddingProvider,
   type Reranker,
 } from "../semantic/providers.js";
-import { rrfFuse, RRF_K, DEFAULT_FUSION_WEIGHTS, rerankHits, DEFAULT_RERANK_TOP_N, type RankedHit } from "../semantic/hybrid.js";
+import {
+  rrfFuse,
+  RRF_K,
+  DEFAULT_FUSION_WEIGHTS,
+  rerankHits,
+  selectPassages,
+  DEFAULT_RERANK_TOP_N,
+  type RankedHit,
+} from "../semantic/hybrid.js";
 import { splitPassages } from "../semantic/passages.js";
 import { EMBEDDINGS_DIR } from "../semantic/embedding-store.js";
 import {
@@ -746,20 +754,39 @@ describe("rerank on passages, not whole documents", () => {
     expect(out[0].passage).toBeUndefined();
   });
 
-  it("defaults: top_n 100, ≤100 sources per request, ≤1000 windows per query", async () => {
+  it("defaults: 100 candidates × ~10 windows each → ONE rerank call of 100 passages", async () => {
     expect(DEFAULT_RERANK_TOP_N).toBe(100);
     // 100 candidates of ~2.6k tokens (~10.4k chars) each.
     const para = "Market news paragraph with figures, quotes and context about the companies involved in the deal. ".repeat(4);
     const docs = Array.from({ length: 100 }, (_, i) =>
       node(`nodes/news-${i}`, Array.from({ length: 26 }, () => para).join("\n\n").slice(0, 10_400)),
     );
+    expect(splitPassages(docs[0].body).length).toBeGreaterThanOrEqual(9);
     const log: string[][] = [];
-    await rerankHits("deal figures", asHits(docs), dilutingReranker(log));
-    const total = log.reduce((n, b) => n + b.length, 0);
-    for (const batch of log) expect(batch.length).toBeLessThanOrEqual(100);
-    expect(total).toBeLessThanOrEqual(1000);
-    expect(log.length).toBe(Math.ceil(total / 100));
-    expect(log.length).toBe(10); // 1000 windows / 100 per request
+    const out = await rerankHits("deal figures", asHits(docs), dilutingReranker(log));
+    expect(log).toHaveLength(1);
+    expect(log[0]).toHaveLength(100);
+    expect(out.every((h) => typeof h.passage === "string")).toBe(true);
+  });
+
+  it("the window sent is chosen locally by stemmed BM25 (the deep relevant paragraph, not the first)", () => {
+    const [pick] = selectPassages(QUERY, asHits([longDoc]), 100);
+    expect(pick.passage).toContain(deep);
+  });
+
+  it("ties go to the earlier window", () => {
+    const body = ["alpha one.", "x".repeat(1150), "alpha two."].join("\n\n");
+    const [pick] = selectPassages("zzz-no-match", asHits([node("nodes/t", body)]), 100);
+    expect(pick.passage.startsWith("alpha one.")).toBe(true);
+  });
+
+  it("Given max_passages > top_n, Then extra windows are spread round-robin by local score", () => {
+    const a = node("nodes/a", [`adrenal surgery ${"a ".repeat(500)}`, `adrenal ${"b ".repeat(500)}`, "zzz ".repeat(250)].join("\n\n"));
+    const b = node("nodes/b", [`adrenal surgery outcomes ${"c ".repeat(500)}`, "yyy ".repeat(250)].join("\n\n"));
+    const picks = selectPassages(QUERY, asHits([a, b]), 3);
+    expect(picks.map((p) => p.doc)).toEqual([0, 1, 0]); // round 1: one each; round 2: a's next-best
+    const budget2 = selectPassages(QUERY, asHits([a, b]), 2);
+    expect(budget2.map((p) => p.doc)).toEqual([0, 1]);
   });
 
   it("context_search --json carries the best passage per hit", async () => {
