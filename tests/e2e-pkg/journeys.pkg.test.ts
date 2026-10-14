@@ -11,6 +11,18 @@
  * commands. This file is the first proof of the harness (J1). Further journeys
  * (J2..Jn) are added here as additional `Journey` entries.
  *
+ * Cases within a journey share one vault and run top to bottom — a journey is a
+ * single accumulating story, so a case is NOT runnable on its own: each depends
+ * on state the earlier cases built (starting with the first case's `init`).
+ * Vitest's `-t` filter selects whole journeys (the `it()` per journey), not
+ * individual cases.
+ *
+ * On assertions: prefer `--json` for checking WHAT a command returned (node ids,
+ * statuses, counts) — it survives copy-edits to the human output. Assert the
+ * human strings only where the exact wording is itself the contract under test
+ * (e.g. the review gate's "Held for review …" / "Rejected … (status: rejected)"
+ * messages a user relies on).
+ *
  * Run via `pnpm test:pkg` (builds the CLI, packs, installs, drives the bin).
  */
 
@@ -1261,6 +1273,10 @@ const J6: Journey = {
 type ReviewRow = { id: string; kind: string };
 const reviewIds = (data: unknown) => (data as ReviewRow[]).map((r) => r.id).sort();
 
+/** The hits `ctx search --json` returns (a bare array of scored nodes). */
+type SearchHit = { id: string };
+const searchIds = (data: unknown) => (data as SearchHit[]).map((h) => h.id).sort();
+
 /**
  * J7 — "I govern my vault with a review gate."
  * The reviewer's promise: with the gate on, nothing new goes live on its own —
@@ -1325,20 +1341,21 @@ const J7: Journey = {
           },
         },
         // "Not published" is reader-facing: while held, the node answers neither
-        // full-text search nor a tag query (the gate's own promise). J7-04 runs
-        // the SAME two lookups after approval and they find it — so the pair pins
-        // the visibility flip to the approval, not to anything else.
+        // full-text search nor a tag query (the gate's own promise). Asserted via
+        // --json so a copy-edit to the human "No results"/"0 nodes" text can't
+        // break it. The result is empty because the ONLY matching node is held —
+        // draft-guide (added in J7-03) does not match "policy" and isn't present
+        // yet regardless; do not reorder the cases past this point.
+        //
+        // J7-04 runs the SAME two lookups after approval and they DO find it — so
+        // the before/after pair pins the visibility flip to the approval itself.
+        { args: ["search", "policy", "--json"], json: (data) => expect(searchIds(data)).toEqual([]) },
         {
-          args: ["search", "policy"],
-          stdout: ["No results found", "not searchable until approved"],
-          stdoutNot: ["nodes/draft-policy"],
+          args: ["query", "#policy", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
         },
-        {
-          args: ["query", "#policy"],
-          stdout: [/\b0 nodes\b/],
-          stdoutNot: ["nodes/draft-policy"],
-        },
-        // The reviewer can still read a held node to decide on it.
+        // The reviewer CAN still read a held node to decide on it — the body is
+        // the user's own text (stable) and the status is the pending_review enum.
         {
           args: ["read", "nodes/draft-policy"],
           stdout: ["A policy awaiting review.", "pending_review"],
@@ -1391,15 +1408,15 @@ const J7: Journey = {
             expect(statusOf(data, "nodes/draft-policy")).toBe("published");
           },
         },
-        // ...and reader-visible: the same search and query that found nothing
-        // while it was held (J7-02) now return it. This is the approval payoff.
+        // ...and reader-visible: the same --json lookups that were empty while it
+        // was held (J7-02) now return it. This is the approval payoff.
         {
-          args: ["search", "policy"],
-          stdout: ["1 result(s)", "nodes/draft-policy"],
+          args: ["search", "policy", "--json"],
+          json: (data) => expect(searchIds(data)).toEqual(["nodes/draft-policy"]),
         },
         {
-          args: ["query", "#policy"],
-          stdout: ["nodes/draft-policy", /\b1 nodes\b/],
+          args: ["query", "#policy", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/draft-policy"]),
         },
         // ...and off the review queue, which now holds only the other node.
         {
@@ -1434,17 +1451,19 @@ const J7: Journey = {
             expect(statusOf(data, "nodes/draft-guide")).toBeUndefined();
           },
         },
-        // And readers can't reach it: a tag query returns only the approved node...
+        // And readers can't reach it. Asserted via --json: the tag query resolves
+        // to exactly the approved node (draft-guide absent) — a positive-identity
+        // check, unlike a `stdoutNot` that would pass vacuously on an error line.
         {
-          args: ["query", "#policy"],
-          stdout: ["nodes/draft-policy", /\b1 nodes\b/],
-          stdoutNot: ["nodes/draft-guide"],
+          args: ["query", "#policy", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/draft-policy"]),
         },
         // ...and a full-text search for a word unique to the rejected node's body
-        // ("guide") finds nothing — while the approved node stayed searchable in
+        // ("guide") returns nothing — while the approved node stayed searchable in
         // J7-04. Same vault, same gate: approved content reaches readers, rejected
-        // content does not.
-        { args: ["search", "guide"], stdout: ["No results found"] },
+        // content does not. (The harness asserts exit 0 on every action, so this
+        // also confirms the search itself succeeded rather than erroring out.)
+        { args: ["search", "guide", "--json"], json: (data) => expect(searchIds(data)).toEqual([]) },
       ],
     },
   ],
