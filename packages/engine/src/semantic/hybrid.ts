@@ -309,8 +309,9 @@ export async function rerankHits(
     const batch = sources.slice(start, start + batchSize);
     const results = await reranker.rerank(query, batch.map((s) => s.text), batch.length);
     for (const r of results) {
-      const src = batch[r.index];
-      if (!src) continue;
+      // A custom endpoint may answer out of range or with a non-number.
+      const src = Number.isInteger(r.index) ? batch[r.index] : undefined;
+      if (!src || !Number.isFinite(r.score)) continue;
       const prev = best.get(src.doc);
       if (!prev || r.score > prev.score) best.set(src.doc, { score: r.score, passage: src.passage });
     }

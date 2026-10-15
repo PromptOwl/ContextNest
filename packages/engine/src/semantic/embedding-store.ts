@@ -18,7 +18,7 @@
  * with `ctx embed --rebuild`, and must never be committed.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ContextNode } from "../types.js";
 import { isPublished } from "../parser.js";
@@ -53,9 +53,12 @@ export function contentHash(text: string): string {
 }
 
 export function keyFor(doc: ContextNode, maxChars?: number): EmbeddingKey {
+  // NaN never equals itself: a non-numeric version would be re-embedded every
+  // run and never served.
+  const version = Number(doc.frontmatter.version ?? 0);
   return {
     id: doc.id,
-    version: Number(doc.frontmatter.version ?? 0),
+    version: Number.isFinite(version) ? version : 0,
     content_hash: contentHash(embeddingText(doc, maxChars)),
   };
 }
@@ -66,6 +69,9 @@ function slug(provider: string, model: string, dimensions?: number): string {
 }
 
 export function normalize(v: ArrayLike<number>): Float32Array {
+  if (v == null || typeof v.length !== "number") {
+    throw new Error("embedding provider returned something that is not a vector");
+  }
   const out = Float32Array.from(v);
   let n = 0;
   for (let i = 0; i < out.length; i++) n += out[i] * out[i];
@@ -209,8 +215,13 @@ export class EmbeddingStore {
     const head = Buffer.alloc(4);
     head.writeUInt32LE(json.length, 0);
     const tmp = `${this.path}.tmp-${process.pid}-${randomUUID()}`;
-    await writeFile(tmp, Buffer.concat([head, json, Buffer.from(all.buffer, all.byteOffset, all.byteLength)]));
-    await rename(tmp, this.path);
+    try {
+      await writeFile(tmp, Buffer.concat([head, json, Buffer.from(all.buffer, all.byteOffset, all.byteLength)]));
+      await rename(tmp, this.path);
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
   }
 }
 

@@ -90,7 +90,7 @@ search:
     api_key_env: OPENAI_API_KEY           # the NAME of an env var, never the key itself
 ```
 
-`config.yaml` is shared with the vault, so it is treated as untrusted. `api_key_env` must name a variable ending in `_API_KEY`, `base_url` must be an http(s) URL, and `region` must look like an AWS region (it becomes part of the Bedrock hostname). With a custom `base_url` no key is sent unless `api_key_env` names one: the `OPENAI_API_KEY` / `RERANK_API_KEY` fallback goes only to the default OpenAI host. Before you use a vault you did not write, check where its `search` block sends your queries and which key it names.
+`config.yaml` is shared with the vault, so it is treated as untrusted. `api_key_env` must name a variable ending in `_API_KEY`, `base_url` must be an http(s) URL, and `region` must look like an AWS region (it becomes part of the Bedrock hostname). A `base_url` host other than `api.openai.com` or this machine (localhost, 127.x, ::1) is refused unless you list it in the `CONTEXTNEST_TRUSTED_ENDPOINTS` environment variable (comma-separated hostnames), because queries, document text and any named key go there. Requests never follow redirects. With a custom `base_url` no key is sent unless `api_key_env` names one: the `OPENAI_API_KEY` / `RERANK_API_KEY` fallback goes only to the default OpenAI host.
 
 The block is validated when search uses it, never when the config is loaded, so a typo here cannot break other commands.
 

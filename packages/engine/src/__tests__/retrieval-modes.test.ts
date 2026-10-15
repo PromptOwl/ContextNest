@@ -33,7 +33,7 @@ import {
 } from "../semantic/hybrid.js";
 import { splitPassages } from "../semantic/passages.js";
 import { parseSearchConfig } from "../semantic/config.js";
-import { EMBEDDINGS_DIR } from "../semantic/embedding-store.js";
+import { EMBEDDINGS_DIR, keyFor } from "../semantic/embedding-store.js";
 import {
   createBedrockEmbeddingProvider,
   createBedrockReranker,
@@ -968,5 +968,67 @@ describe("search config cannot steer secrets", () => {
       );
       expect(auth).toEqual([undefined]);
     });
+  });
+});
+
+describe("vault-chosen endpoints need the user's trust", () => {
+  const hosts: string[] = [];
+  beforeEach(() => {
+    hosts.length = 0;
+    vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
+      hosts.push(new URL(url).hostname);
+      expect(init.redirect).toBe("error");
+      return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1] }] }));
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  const cfg = { provider: "openai", model: "m", base_url: "https://attacker.example/v1", api_key_env: "OPENAI_API_KEY" };
+
+  it("Given a base_url host the user never listed, Then nothing is sent", async () => {
+    vi.stubEnv("CONTEXTNEST_TRUSTED_ENDPOINTS", "");
+    await expect(createOpenAiEmbeddingProvider(cfg).embed(["q"], "query")).rejects.toThrow(/CONTEXTNEST_TRUSTED_ENDPOINTS/);
+    expect(hosts).toEqual([]);
+  });
+
+  it("Given the host in CONTEXTNEST_TRUSTED_ENDPOINTS, Then it is called", async () => {
+    vi.stubEnv("CONTEXTNEST_TRUSTED_ENDPOINTS", "other.example, Attacker.Example");
+    await createOpenAiEmbeddingProvider(cfg).embed(["q"], "query");
+    expect(hosts).toEqual(["attacker.example"]);
+  });
+
+  it("loopback needs no listing (Ollama / vLLM on this machine)", async () => {
+    await createOpenAiEmbeddingProvider({ provider: "openai", model: "m", base_url: "http://localhost:11434/v1" }).embed(
+      ["q"],
+      "query",
+    );
+    expect(hosts).toEqual(["localhost"]);
+  });
+});
+
+describe("robustness against odd provider answers", () => {
+  it("Given a non-numeric version, Then the vector key uses 0 (not NaN) so it is reused", () => {
+    expect(keyFor(node("nodes/x", "body", "published", { version: "v2" })).version).toBe(0);
+  });
+
+  it("Given a reranker answering out of range or with NaN, Then those results are ignored", async () => {
+    const odd: Reranker = {
+      name: "odd",
+      model: "odd",
+      async rerank() {
+        return [{ index: 7, score: 9 }, { index: 0, score: NaN }, { index: 0.5, score: 9 }, { index: 1, score: 0.4 }];
+      },
+    };
+    const hits = [node("nodes/a", "alpha"), node("nodes/b", "alpha beta")].map((d) => ({
+      document: d,
+      score: 1,
+      scores: {},
+    }));
+    const out = await rerankHits("alpha", hits, odd, { unit: "document" });
+    expect(out.map((h) => h.document.id)).toEqual(["nodes/b", "nodes/a"]);
+    expect(out[0].scores.rerank).toBe(0.4);
   });
 });

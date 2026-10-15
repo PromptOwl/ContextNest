@@ -103,6 +103,8 @@ function postJson(url: string, body: unknown, key: string | undefined, call: Cal
 async function postJsonOnce(url: string, body: unknown, key: string | undefined, timeoutMs: number): Promise<any> {
   const res = await fetch(url, {
     method: "POST",
+    // A request carrying a bearer key is never followed to another host.
+    redirect: "error",
     signal: AbortSignal.timeout(timeoutMs),
     headers: {
       "content-type": "application/json",
@@ -121,8 +123,34 @@ async function postJsonOnce(url: string, body: unknown, key: string | undefined,
   return res.json();
 }
 
+export const TRUSTED_ENDPOINTS_ENV = "CONTEXTNEST_TRUSTED_ENDPOINTS";
+
+function isLoopback(host: string): boolean {
+  return host === "localhost" || host === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
+
+/**
+ * The endpoint, checked. `base_url` comes from the vault config, which a
+ * cloned or imported vault controls; queries, document text and (when the
+ * config names one) an API key go there. So only the default OpenAI host and
+ * loopback (Ollama, vLLM on this machine) are called on the vault's say-so;
+ * any other host must be listed by the USER in CONTEXTNEST_TRUSTED_ENDPOINTS
+ * (comma-separated hostnames).
+ */
 function baseUrl(cfg: { base_url?: string }): string {
-  return (cfg.base_url ?? "https://api.openai.com/v1").replace(/\/+$/, "");
+  const url = (cfg.base_url ?? "https://api.openai.com/v1").replace(/\/+$/, "");
+  const host = new URL(url).hostname.toLowerCase();
+  const trusted = (process.env[TRUSTED_ENDPOINTS_ENV] ?? "")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+  if (host !== "api.openai.com" && !isLoopback(host) && !trusted.includes(host)) {
+    throw new ConfigError(
+      `search base_url host "${host}" comes from the vault config and is not trusted — ` +
+        `add it to ${TRUSTED_ENDPOINTS_ENV} (comma-separated hostnames) in your environment to allow it`,
+    );
+  }
+  return url;
 }
 
 export function createOpenAiEmbeddingProvider(cfg: EmbeddingsConfig, call?: CallOptions): EmbeddingProvider {

@@ -188,6 +188,7 @@ export function defaultBedrockInvoke(region: string, timeoutMs = BEDROCK_REQUEST
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
+        redirect: "error",
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) {
