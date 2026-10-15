@@ -1,5 +1,16 @@
 # @promptowl/contextnest-engine
 
+## 3.1.0
+
+### Minor Changes
+
+- `ctx login`: a key saved for one nest (`--nest <id>`) now works through a server alias as `--vault <alias>/<nest>`, even with no server-wide key saved. The alias lists the nests every saved key can see, and a command naming one nest signs in with that nest's key (else the server-wide one). `ctx login --account <name>` keeps a second account's keys on the same server, and an HTTP remote picks it with the new optional registry field `account` (`ctx vault add … --url … --account <name>`); `ctx logout` and `ctx login --list` take `--account` too. Keys saved without `--account` are unchanged.
+
+### Patch Changes
+
+- **Importing a document with a fractional version no longer publishes a fractional version.** A hand-edited `version: 1.1` was bumped to `2.1` on publish, and a host that stores versions in an integer column (Community on Postgres) refused the whole import. Import now repairs a `version` that is not a whole number of at least 1 (rounded down, else `1`) and reports it in `warnings`, like the other frontmatter repairs. As a backstop, every publish rounds a fractional frontmatter version down before bumping it, so no write path can mint one.
+- **Large imports and whole-vault crawls keep their I/O slots busy.** Bounded-parallel work (import staging and checks, bulk publish, history reads, vault scans) ran in fixed batches: each batch waited for its slowest file before the next started, so on a network mount (Cloud Storage via gcsfuse) one slow round trip left the other slots idle. It now runs as a sliding pool — the next file starts as soon as any finishes — with the same bound on files in flight and results still in input order. Hosts can also raise that bound for `context_import` with the new `OperationContext.limits.ioConcurrency` (default 32 file operations; bulk publish runs half as many documents). The value is the host's to set, never a caller input.
+
 ## 3.0.0
 
 ### Major Changes

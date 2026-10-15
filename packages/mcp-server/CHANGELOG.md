@@ -1,5 +1,11 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.10.1
+
+### Patch Changes
+
+- Bundles engine 3.1.0: `context_import` repairs a fractional frontmatter `version` (rounded down, reported in `warnings`) instead of publishing one, and large imports run their file I/O as a sliding pool, so one slow file on a network mount no longer stalls the rest.
+
 ## 2.10.0
 
 ### Minor Changes

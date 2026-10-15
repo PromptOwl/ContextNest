@@ -13,7 +13,7 @@ import type {
   VersionEntry,
 } from "./types.js";
 import { NestStorage, assertWritableDocumentId, assertWritableDocumentPath } from "./storage.js";
-import { VersionManager } from "./versioning.js";
+import { VersionManager, wholeVersion } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { serializeDocument, getChecksumContent, isRejected, parseDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
@@ -103,6 +103,7 @@ export async function publishDocument(
   const firstPublish = rules ? await assertStructurePublish(storage, rules, node) : false;
   const { history: existingHistory, quarantinedAs } =
     await versionManager.historyOrRepair(docId);
+  if (node.frontmatter.version !== undefined) node.frontmatter.version = wholeVersion(node.frontmatter.version) || undefined;
   const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
   if (seeded) {
     await versionManager.createVersion(node, "system:seed", {
@@ -355,6 +356,7 @@ export async function publishDocuments(
       }
       const { history: existingHistory, quarantinedAs } =
         await versionManager.historyOrRepair(docId);
+      if (node.frontmatter.version !== undefined) node.frontmatter.version = wholeVersion(node.frontmatter.version) || undefined;
       const seeded = !existingHistory && !quarantinedAs && (node.frontmatter.version || 0) > 1;
       if (seeded) {
         await versionManager.createVersion(node, "system:seed", {

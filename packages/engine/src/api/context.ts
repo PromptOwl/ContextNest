@@ -87,6 +87,21 @@ export interface OperationLimits {
    * refuse a single large document however the batch is split.
    */
   readonly importReplayChars?: number;
+  /**
+   * File operations `context_import` keeps in flight (writes, reads, checks);
+   * its bulk publish runs half as many documents, each costing several files.
+   * Per call, not shared across concurrent calls. Default `VAULT_IO_CONCURRENCY`
+   * (32) and 16; anything but a finite number >= 1 counts as unset. A host on a
+   * latency-bound network mount (gcsfuse) can raise it. Each slot may hold one
+   * file read whole, so peak memory grows with it (large PDFs especially).
+   */
+  readonly ioConcurrency?: number;
+}
+
+/** `limits.ioConcurrency` as a whole number >= 1, or undefined when unset or invalid. */
+export function ioConcurrency(ctx: OperationContext): number | undefined {
+  const n = ctx.limits?.ioConcurrency;
+  return typeof n === "number" && Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
 }
 
 /**

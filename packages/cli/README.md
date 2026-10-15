@@ -87,6 +87,16 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx vault describe <alias> [description]` — Set or clear a registry description; omit the text to remove it
 - `ctx vault default <alias>` / `ctx vault remove <alias>` / `ctx vault which`
 
+### Hosted nests
+- `ctx login <server>` — Sign in once in the browser; the CLI mints its own API key and keeps it in your OS keyring (or the encrypted file store — never plaintext). `--key-stdin` saves an existing `cnst_…` key instead (hidden prompt on a terminal; a server without browser login falls back to it)
+- `ctx login <server> --as <alias> [--set-default]` — Sign in and register the server as a vault in one step: `ctx vault list` then shows every nest as `<alias>/<nest>`. With `--nest <id>` the alias points at that nest
+- `ctx vault add <alias> --url <server>/mcp` — Register the server; with a saved login no `--bearer-env` is needed. Then `ctx --vault <alias> query …`
+- `ctx push --server <server> --nest <id>` — Uses the saved key when `--key` / `CONTEXTNEST_API_KEY` are absent
+- `ctx login --list [server]` — Show the servers and nests you're logged into (never prints keys)
+- `ctx login <server> --nest <id> --key-stdin` — Save a key for one nest only; it wins over the server-wide key for that nest. Hosted (`https://nest.promptowl.ai`), self-hosted and nest-scoped keys all live side by side, so you never log out to switch. A nest key also works through a server alias as `--vault <alias>/<nest>`, with or without a server-wide key
+- `ctx login <server> --account <name>` — Sign in to the same server as a second account (say, a client's). Point an alias at it with `ctx vault add <alias> --url <server>/mcp --account <name>` (or `ctx login … --account <name> --as <alias>`); `--list` and `ctx logout --account <name>` take it too
+- `ctx logout <server|alias> [--nest <id>] [--account <name>] | --all` — Forget a server's keys (with its nest-scoped keys), one nest's key, or everything; `--all` also resets an unreadable store. Revoke keys on the server in the web UI
+
 ### Document Management
 - `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)
 - `ctx add <path> --type skill` — Create a skill node with trigger, inputs, and guard rails
@@ -333,6 +343,59 @@ pack:
   include: [nodes/methodologies/accountability-method]
   agent_instructions: Load these first.
 ```
+
+### Kinds (`kind:` in a recipe, `ctx kind apply`)
+
+A recipe can also carry a `kind:` section: the server-side half of a package. A pull never sends it anywhere. It validates the section and writes it to `nodes/kinds/<recipe-id>`, a draft with the same lineage as every other pulled document (`derived_from` points at the recipe node), so the kind is reviewed, published and versioned like the documents it ships with. `ctx kind apply` is the separate, explicit step that sends it to a hosted nest.
+
+```yaml recipe
+id: seam                       # must be a plain name when the recipe carries a kind
+includes: [...]
+kind:
+  plugins:                     # PUT /nests/:id/plugins/:name (FEATURE_PLUGINS)
+    - name: github
+      mode: summary            # raw | summary
+      settings:                # plain values only; secret-looking keys or values are refused
+        repos: [org/repo]
+  edge_types:                  # POST /nests/:id/edge-types, upsert by name (FEATURE_WORKFLOW_PLANE)
+    - name: escalates-when
+      description: Escalate the source to the target when the condition holds.   # required by the server
+      is_flow: true
+      condition_schema: { params: [CAC], mode_default: structured }
+  edges:                       # POST /nests/:id/edges (FEATURE_WORKFLOW_PLANE)
+    - from: nodes/playbooks/triage   # node ids as they exist in the target nest
+      to: nodes/agents/escalate
+      type: escalates-when           # declared above, or a stock type: next, on-success, on-failure, depends-on, owned-by
+      condition: { mode: structured, term: CAC, op: ">", value: 500 }   # or { mode: nl|open, text: "..." }
+  schedules:                   # POST /nests/:id/schedules (FEATURE_WORKFLOW_PLANE); one per agent
+    - agent: nodes/agents/escalate   # an agent or skill node
+      every_minutes: 60              # 5 to 10080
+  stewards:                    # POST /nests/:id/stewards
+    - scope: document          # document | tag | nest
+      target: nodes/playbooks/triage   # a document id, or a tag; none for nest
+      role: reviewer           # editor | reviewer | viewer
+      principal: "@seam-owner" # always a placeholder; the person is chosen at apply time
+  runner:
+    handlers: [llm-judge]      # runner handlers the kind expects; informational
+```
+
+Unknown fields anywhere in `kind:` are refused (a structured condition takes only `term`, `op` and `value`), as is any plugin setting or condition value that looks like a secret. Stock edge types are used as they are, never redeclared in `edge_types`. Secrets are set on the server, never in a recipe.
+
+```bash
+ctx kind apply seam --server https://nest.example.com --nest <id> --steward @seam-owner=lead@example.com        # plan only
+ctx kind apply seam --server https://nest.example.com --nest <id> --steward @seam-owner=lead@example.com --yes  # send it
+```
+
+- **Dry run by default.** Without `--yes`, only GETs are sent: they check the key and the nest, and find out which planes are on.
+- **Published kinds only.** `--yes` refuses a kind that is still a draft — review and `ctx publish` it first, or pass `--allow-draft` to apply an unreviewed one deliberately (stewards switch governance on).
+  "Published" means published under the vault's normal rules; it implies a review only when the vault has its review gate on.
+- **Re-runs are safe.** Anything the server already has (a 409) is reported as `exists`; an edge whose edge type failed in the same run is `skipped`, not sent. `--steward` emails are lowercased.
+- Authentication works as it does for `ctx push`: `--key`, `CONTEXTNEST_API_KEY`, or the key saved by `ctx login`; https (or localhost) only, and redirects are refused.
+- A plane the server has switched off answers 404. Its entries are skipped with a warning that names the flag (`FEATURE_WORKFLOW_PLANE`, `FEATURE_PLUGINS`). A plugin the server has not loaded is skipped too.
+- Plugins are configured but **never enabled**. Enable one on the server once its secrets are connected.
+- A schedule that already exists for an agent is left as it is. An edge or steward that already exists (409) is reported as present.
+- Stewards whose placeholder is not mapped with `--steward @placeholder=email` are not applied. Assigning a steward turns governance on for the nest.
+- Server ids come from the title and folder that `ctx push` sent. Edges and schedules name node ids **as they exist in the target nest**, and the server rejects ids it does not have.
 
 ## AI Agent Integration
 

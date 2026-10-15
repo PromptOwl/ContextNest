@@ -11,6 +11,18 @@
  * commands. This file is the first proof of the harness (J1). Further journeys
  * (J2..Jn) are added here as additional `Journey` entries.
  *
+ * Cases within a journey share one vault and run top to bottom — a journey is a
+ * single accumulating story, so a case is NOT runnable on its own: each depends
+ * on state the earlier cases built (starting with the first case's `init`).
+ * Vitest's `-t` filter selects whole journeys (the `it()` per journey), not
+ * individual cases.
+ *
+ * On assertions: prefer `--json` for checking WHAT a command returned (node ids,
+ * statuses, counts) — it survives copy-edits to the human output. Assert the
+ * human strings only where the exact wording is itself the contract under test
+ * (e.g. the review gate's "Held for review …" / "Rejected … (status: rejected)"
+ * messages a user relies on).
+ *
  * Run via `pnpm test:pkg` (builds the CLI, packs, installs, drives the bin).
  */
 
@@ -916,6 +928,547 @@ const J5: Journey = {
   ],
 };
 
+/** The violations a `ctx structure --report --json` payload reports. */
+type StructureViolation = { code: string; path: string; message: string };
+const violationsOf = (data: unknown) =>
+  (data as { violations: StructureViolation[] }).violations;
+
+/**
+ * The house-style rules this journey enforces, appended to `.context/config.yaml`
+ * under the `structure`/`folders`/`templates` keys (spec §11.1.1). There is no
+ * `ctx structure set` command — `setStructure` is the engine-internal writer — so
+ * an owner establishes rules by editing the config, done here via the `mutate`
+ * hook the way J3 authored its pack yml.
+ *
+ * The rules are deliberately small and legible: enforced + closed (only the three
+ * named folders may exist). `decisions/` takes only documents named like an ADR,
+ * `reference/` takes documents or glossary terms, and `meetings/` takes documents
+ * that must follow a template requiring a "Decisions" section. That exercises
+ * every structure dimension the story needs — allowed folders, name formats,
+ * node types, and templates — across the three refusal kinds (bad name, bad type,
+ * bad folder), a template's required-section rule, and compliant writes.
+ */
+const STRUCTURE_RULES = [
+  "structure:",
+  "  enforce: true",
+  "  closed: true",
+  "folders:",
+  "  decisions:",
+  "    types: [document]",
+  // file_name uses the structure-rules WHITELIST grammar (engine structure.ts: a
+  // linear-time position-set matcher), NOT JS RegExp — it accepts bounded repeats
+  // on a char class, e.g. [0-9]{4}. Do not "simplify" this into a quantified
+  // group: that grammar rejects quantified groups, so the rewrite fails to
+  // compile the rules.
+  '    file_name: "/adr-[0-9]{4}-[a-z0-9-]+/"',
+  "  reference:",
+  "    types: [document, glossary]",
+  "  meetings:",
+  "    types: [document]",
+  "    template: meeting-note",
+  "templates:",
+  "  meeting-note:",
+  '    body: "## Attendees\\n## Decisions\\n## Action items\\n"',
+  "    required_sections: [Decisions]",
+  "",
+].join("\n");
+
+const seedStructureRules = (vault: string) => {
+  const cfg = join(vault, ".context", "config.yaml");
+  const existing = readFileSync(cfg, "utf-8");
+  // Append the rule blocks rather than parse-and-merge — valid only because
+  // `ctx init` does not emit structure:/folders:/templates: itself. Fail loudly
+  // if that ever changes, so a silent duplicate YAML key can't turn into a
+  // confusing downstream parse failure that looks like a product bug.
+  if (/^(structure|folders|templates):/m.test(existing)) {
+    throw new Error(
+      "init already wrote structure rule keys — seedStructureRules would duplicate them; switch to a parse-and-merge.",
+    );
+  }
+  writeFileSync(cfg, `${existing}\n${STRUCTURE_RULES}`);
+};
+
+/**
+ * J6 — "I keep my vault on house-style and the CLI enforces it for me."
+ * The nest owner's promise (structure rules, spec §11.1.1): lay down which
+ * folders are allowed, how nodes must be named, and which types belong where —
+ * then every write is judged against those rules. Off-style writes are refused
+ * before they touch disk, compliant ones sail through, and a drift report shows
+ * anything already in the vault that breaks the rules.
+ *
+ * The rules are enforced + closed, so an undeclared folder, a disallowed type,
+ * a badly-named file, and a node that skips a template's required section are
+ * each refused. The review gate is turned OFF (like J2/J3/J5): this journey is
+ * about structure enforcement on the write path, not the approval gate, so a
+ * compliant write should land as published directly without a gate in between.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J6: Journey = {
+  id: "J6",
+  title: "Keep a vault on house-style (nest owner)",
+  cases: [
+    {
+      id: "J6-01",
+      title: "I set the vault's structure rules and see the blueprint of what's allowed",
+      actions: [
+        { args: ["init", "--name", "house-style"], stdout: ["Initialized"] },
+        // Seed the house-style rules, then turn the review gate off so a
+        // compliant write later lands as published, not held. `config set`
+        // rewrites the config but preserves the rule keys appended above.
+        {
+          mutate: seedStructureRules,
+          args: ["config", "set", "review", "off"],
+          stdout: ["review: off"],
+        },
+        // The blueprint names the allowed folders, their types, and the ADR
+        // name format — exactly what an owner would check after setting rules.
+        {
+          args: ["structure"],
+          stdout: [
+            "enforced, closed",
+            "decisions",
+            "/adr-[0-9]{4}-[a-z0-9-]+/",
+            "reference",
+            "document, glossary",
+          ],
+        },
+        {
+          args: ["structure", "--json"],
+          json: (data) => {
+            const d = data as {
+              enforce: boolean;
+              closed: boolean;
+              folders: Array<{ pattern: string }>;
+            };
+            expect(d.enforce).toBe(true);
+            expect(d.closed).toBe(true);
+            expect(d.folders.map((f) => f.pattern).sort()).toEqual([
+              "decisions",
+              "meetings",
+              "reference",
+            ]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J6-02",
+      title: "A node whose name breaks the house naming format is refused",
+      actions: [
+        {
+          // "random-thought" doesn't match the ADR name format decisions/ requires.
+          //
+          // Refusal assertions here pin the stable VALIDATION_FAILED code and the
+          // on-disk absence (the durable contract), plus ONE short fragment of the
+          // engine's message — just enough to prove the RIGHT rule fired (a name
+          // refusal, not a type or folder one), which the code alone can't show.
+          // The fragment is English prose, so a wording change in the engine would
+          // need these updated; that's the deliberate cost of proving the reason.
+          args: [
+            "add", "nodes/decisions/random-thought",
+            "--type", "document",
+            "--title", "Random Thought",
+            "--body", "nope",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", "File names in"],
+          files: [{ path: "nodes/decisions/random-thought.md", exists: false }],
+        },
+      ],
+    },
+    {
+      id: "J6-03",
+      title: "A node of a disallowed type, or in an undeclared folder, is refused",
+      actions: [
+        {
+          // The NAME is compliant (adr-0002-use-redis), so the type is the sole
+          // violation — a prompt isn't allowed in decisions/ (documents only).
+          args: [
+            "add", "nodes/decisions/adr-0002-use-redis",
+            "--type", "prompt",
+            "--title", "Use Redis",
+            "--body", "nope",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", "can't go in"],
+          files: [{ path: "nodes/decisions/adr-0002-use-redis.md", exists: false }],
+        },
+        {
+          // A closed vault only allows the declared folders — scratchpad/ isn't one.
+          args: [
+            "add", "nodes/scratchpad/idea",
+            "--type", "document",
+            "--title", "Idea",
+            "--body", "nope",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", "not an allowed folder"],
+          files: [{ path: "nodes/scratchpad/idea.md", exists: false }],
+        },
+      ],
+    },
+    {
+      id: "J6-04",
+      title: "A node that matches the folder, name, and type rules is accepted and published",
+      actions: [
+        // A properly-named ADR document in decisions/ — every rule satisfied.
+        {
+          args: [
+            "add", "nodes/decisions/adr-0001-use-postgres",
+            "--type", "document",
+            "--title", "Use Postgres",
+            "--body", "We will use Postgres.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/decisions/adr-0001-use-postgres"],
+          files: [{ path: "nodes/decisions/adr-0001-use-postgres.md", exists: true }],
+        },
+        // A glossary term in reference/ — the other allowed folder, and its
+        // second allowed type — so "compliant passes" isn't a one-folder fluke.
+        {
+          args: [
+            "add", "nodes/reference/http-status",
+            "--type", "glossary",
+            "--title", "HTTP Status",
+            "--body", "200 means OK.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/reference/http-status"],
+          files: [{ path: "nodes/reference/http-status.md", exists: true }],
+        },
+        // Both compliant nodes are published knowledge now.
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/decisions/adr-0001-use-postgres")).toBe("published");
+            expect(statusOf(data, "nodes/reference/http-status")).toBe("published");
+          },
+        },
+      ],
+    },
+    {
+      id: "J6-05",
+      title: "I audit the vault for drift and the report flags content that breaks the rules",
+      actions: [
+        // With only compliant nodes, the report is clean.
+        {
+          args: ["structure", "--report"],
+          stdout: ["Compliance", "Everything fits the rules"],
+          stdoutNot: ["FOLDER_NOT_ALLOWED"],
+        },
+        {
+          args: ["structure", "--report", "--json"],
+          json: (data) => {
+            expect(violationsOf(data)).toEqual([]);
+          },
+        },
+        // Drift appears the way it does in real life: a node lands on disk
+        // outside the write path (a sync, a hand edit, a merge) in a folder the
+        // rules forbid. Plant it directly, then re-audit.
+        {
+          mutate: (vault) => {
+            mkdirSync(join(vault, "nodes", "scratchpad"), { recursive: true });
+            // Reuse J4's flat-node writer — it emits exactly the published
+            // document frontmatter a stray node has; no need to re-hand-roll it.
+            writeFileSync(
+              join(vault, "nodes", "scratchpad", "stray.md"),
+              flatNode("nodes/scratchpad/stray", "Stray", "x", "A node that drifted into a forbidden folder."),
+            );
+          },
+          // The report names the offending folder — and the command still exits
+          // 0 (a report, not a gate). Assert the code + path in text, avoiding
+          // the ✗ glyph so Windows stdout decoding can't trip the match.
+          args: ["structure", "--report"],
+          stdout: ["Compliance", "FOLDER_NOT_ALLOWED", "scratchpad"],
+          stdoutNot: ["Everything fits the rules"],
+        },
+        {
+          args: ["structure", "--report", "--json"],
+          json: (data) => {
+            const v = violationsOf(data);
+            expect(v).toHaveLength(1);
+            expect(v[0].code).toBe("FOLDER_NOT_ALLOWED");
+            expect(v[0].path).toBe("scratchpad");
+          },
+        },
+      ],
+    },
+    {
+      id: "J6-06",
+      title: "A node that skips a required section of its folder's template is refused, one that follows it passes",
+      actions: [
+        // meetings/ documents must follow the meeting-note template, which
+        // requires a "Decisions" section. This body omits it → refused, nothing
+        // written (the name and folder and type are all fine; only the template
+        // section is missing, so this isolates the template rule).
+        {
+          args: [
+            "add", "nodes/meetings/2026-01-kickoff",
+            "--type", "document",
+            "--title", "Kickoff",
+            "--body", "## Attendees\nAlice, Bob\n## Action items\nShip it.",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", 'needs a "Decisions" heading'],
+          files: [{ path: "nodes/meetings/2026-01-kickoff.md", exists: false }],
+        },
+        // The same note WITH the required "Decisions" section is accepted.
+        {
+          args: [
+            "add", "nodes/meetings/2026-02-planning",
+            "--type", "document",
+            "--title", "Planning",
+            "--body", "## Attendees\nAlice, Bob\n## Decisions\nUse Postgres.\n## Action items\nShip it.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/meetings/2026-02-planning"],
+          files: [{ path: "nodes/meetings/2026-02-planning.md", exists: true }],
+        },
+        // The per-folder blueprint shows the template an owner must follow,
+        // including the sections it requires.
+        {
+          args: ["structure", "--folder", "meetings"],
+          stdout: ["meeting-note", "required sections: Decisions"],
+        },
+      ],
+    },
+    {
+      id: "J6-07",
+      title: "Editing an existing compliant node to break a rule is refused too, not just new nodes",
+      actions: [
+        // Enforcement covers the update path, not only add: edit the compliant
+        // meetings note from J6-06 to drop its required "Decisions" section. The
+        // edit is refused and the node is left untouched (the section survives) —
+        // so the vault can't drift out of house-style through a later edit.
+        {
+          args: [
+            "update", "nodes/meetings/2026-02-planning",
+            "--body", "## Attendees\nAlice, Bob\n## Action items\nShip it.",
+            "-y",
+          ],
+          status: 1,
+          stderr: ["VALIDATION_FAILED", 'remove the required "Decisions" heading'],
+          files: [{ path: "nodes/meetings/2026-02-planning.md", contains: "## Decisions" }],
+        },
+        // An edit that keeps the section compliant is accepted — a second version.
+        {
+          args: [
+            "update", "nodes/meetings/2026-02-planning",
+            "--body", "## Attendees\nAlice, Bob, Carol\n## Decisions\nUse Postgres and Redis.\n## Action items\nShip it.",
+            "-y",
+          ],
+          stdout: ["Updated and published", "Version: 2"],
+        },
+      ],
+    },
+  ],
+};
+
+/** The rows `ctx review list --json` returns for nodes awaiting a decision. */
+type ReviewRow = { id: string; kind: string };
+const reviewIds = (data: unknown) => (data as ReviewRow[]).map((r) => r.id).sort();
+
+/** The hits `ctx search --json` returns (a bare array of scored nodes). */
+type SearchHit = { id: string };
+const searchIds = (data: unknown) => (data as SearchHit[]).map((h) => h.id).sort();
+
+/**
+ * J7 — "I govern my vault with a review gate."
+ * The reviewer's promise: with the gate on, nothing new goes live on its own —
+ * every write is HELD until a person decides. This journey turns review on, adds
+ * nodes that hold as pending instead of publishing, lists the queue of what's
+ * waiting, waves one node through to published, and turns another away — then
+ * proves the rejected node never reaches readers (gone from the node list, off
+ * the queue, absent from query and search).
+ *
+ * The review gate is left ON here (unlike J2–J6, which turn it off): the gate IS
+ * the subject. Two nodes are added so approve and reject act on a real queue, and
+ * the rejected node is a distinct body word ("guide") so its absence from search
+ * is an unambiguous "readers can't see it" proof.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J7: Journey = {
+  id: "J7",
+  title: "Govern a vault with a review gate (reviewer)",
+  cases: [
+    {
+      id: "J7-01",
+      title: "Turning review on puts the vault in governed mode",
+      actions: [
+        // A structured vault defaults to review ON — init says so outright.
+        {
+          args: ["init", "--name", "governed-vault"],
+          stdout: ["Initialized", "Review is on"],
+        },
+        // Turning it on explicitly is the reviewer's deliberate act and is
+        // idempotent — the governed state is confirmed either way.
+        { args: ["config", "set", "review", "on"], stdout: ["review: on"] },
+      ],
+    },
+    {
+      id: "J7-02",
+      title: "A newly added node is held for review, not published",
+      actions: [
+        {
+          // The gate holds the write instead of publishing it, and says plainly
+          // that it is invisible to readers until approved.
+          args: [
+            "add", "nodes/draft-policy",
+            "--type", "document",
+            "--title", "Draft Policy",
+            "--tags", "#policy",
+            "--body", "A policy awaiting review.",
+            "-y",
+          ],
+          stdout: [
+            "Held for review",
+            "nodes/draft-policy",
+            "not visible to search or agents until approved",
+          ],
+          files: [{ path: "nodes/draft-policy.md", exists: true }],
+        },
+        // Held means pending_review in the node list — not published.
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/draft-policy")).toBe("pending_review");
+          },
+        },
+        // "Not published" is reader-facing: while held, the node answers neither
+        // full-text search nor a tag query (the gate's own promise). Asserted via
+        // --json so a copy-edit to the human "No results"/"0 nodes" text can't
+        // break it. The result is empty because the ONLY matching node is held —
+        // draft-guide (added in J7-03) does not match "policy" and isn't present
+        // yet regardless; do not reorder the cases past this point.
+        //
+        // J7-04 runs the SAME two lookups after approval and they DO find it — so
+        // the before/after pair pins the visibility flip to the approval itself.
+        { args: ["search", "policy", "--json"], json: (data) => expect(searchIds(data)).toEqual([]) },
+        {
+          args: ["query", "#policy", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+        // The reviewer CAN still read a held node to decide on it — the body is
+        // the user's own text (stable) and the status is the pending_review enum.
+        {
+          args: ["read", "nodes/draft-policy"],
+          stdout: ["A policy awaiting review.", "pending_review"],
+        },
+      ],
+    },
+    {
+      id: "J7-03",
+      title: "The review list shows every node waiting for a decision",
+      actions: [
+        // A second held node, so there is a real queue to review.
+        {
+          args: [
+            "add", "nodes/draft-guide",
+            "--type", "document",
+            "--title", "Draft Guide",
+            "--tags", "#policy",
+            "--body", "A guide awaiting review.",
+            "-y",
+          ],
+          stdout: ["Held for review", "nodes/draft-guide"],
+          files: [{ path: "nodes/draft-guide.md", exists: true }],
+        },
+        // Both held nodes appear in the queue.
+        {
+          args: ["review", "list"],
+          stdout: ["nodes/draft-policy", "nodes/draft-guide"],
+        },
+        {
+          args: ["review", "list", "--json"],
+          json: (data) => {
+            expect(reviewIds(data)).toEqual(["nodes/draft-guide", "nodes/draft-policy"]);
+            expect((data as ReviewRow[]).every((r) => r.kind === "new")).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J7-04",
+      title: "Approving a held node publishes it and drops it from the queue",
+      actions: [
+        {
+          args: ["review", "approve", "nodes/draft-policy"],
+          stdout: ["Published nodes/draft-policy"],
+        },
+        // It's published knowledge now...
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/draft-policy")).toBe("published");
+          },
+        },
+        // ...and reader-visible: the same --json lookups that were empty while it
+        // was held (J7-02) now return it. This is the approval payoff.
+        {
+          args: ["search", "policy", "--json"],
+          json: (data) => expect(searchIds(data)).toEqual(["nodes/draft-policy"]),
+        },
+        {
+          args: ["query", "#policy", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/draft-policy"]),
+        },
+        // ...and off the review queue, which now holds only the other node.
+        {
+          args: ["review", "list", "--json"],
+          json: (data) => {
+            expect(reviewIds(data)).toEqual(["nodes/draft-guide"]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J7-05",
+      title: "Rejecting a held node keeps it out of the published vault and off the queue",
+      actions: [
+        {
+          args: ["review", "reject", "nodes/draft-guide"],
+          stdout: ["Rejected nodes/draft-guide", "status: rejected"],
+        },
+        // The queue is empty — nothing left to decide.
+        {
+          args: ["review", "list", "--json"],
+          json: (data) => {
+            expect(reviewIds(data)).toEqual([]);
+          },
+        },
+        // The rejected node is not published knowledge: it drops out of the node
+        // list entirely, leaving only the approved one.
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            expect(statusOf(data, "nodes/draft-policy")).toBe("published");
+            expect(statusOf(data, "nodes/draft-guide")).toBeUndefined();
+          },
+        },
+        // And readers can't reach it. Asserted via --json: the tag query resolves
+        // to exactly the approved node (draft-guide absent) — a positive-identity
+        // check, unlike a `stdoutNot` that would pass vacuously on an error line.
+        {
+          args: ["query", "#policy", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/draft-policy"]),
+        },
+        // ...and a full-text search for a word unique to the rejected node's body
+        // ("guide") returns nothing — while the approved node stayed searchable in
+        // J7-04. Same vault, same gate: approved content reaches readers, rejected
+        // content does not. (The harness asserts exit 0 on every action, so this
+        // also confirms the search itself succeeded rather than erroring out.)
+        { args: ["search", "guide", "--json"], json: (data) => expect(searchIds(data)).toEqual([]) },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -935,5 +1488,13 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J5 — erase a node on request (right to be forgotten)", () => {
     runJourney({ installDir: INSTALL, scratch }, J5);
+  });
+
+  it("J6 — keep a vault on house-style (structure rules)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J6);
+  });
+
+  it("J7 — govern a vault with a review gate", () => {
+    runJourney({ installDir: INSTALL, scratch }, J7);
   });
 });

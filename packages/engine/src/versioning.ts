@@ -30,6 +30,13 @@ const DEFAULT_KEYFRAME_INTERVAL = 10;
 const MAX_DIFF_CHARS = 2 ** 20;
 
 /** What {@link VersionManager.historyOrRepair} found, and what it had to do. */
+/** A frontmatter version as a whole number >= 1, or 0 when absent or unusable. A
+ *  hand-edited `version: 1.1` must not seed v1.1 or mint 2.1: versions are integers. */
+export function wholeVersion(v: unknown): number {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 1 ? n : 0;
+}
+
 export interface ResilientHistory {
   /** The parsed history, or null when there is none to read. */
   history: DocumentHistory | null;
@@ -111,7 +118,7 @@ export class VersionManager {
       0,
     );
     const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
-    return Math.max(hint, recorded, sealed) + 1;
+    return Math.max(wholeVersion(hint), recorded, sealed) + 1;
   }
 
   /**

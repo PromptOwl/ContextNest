@@ -40,6 +40,9 @@ import type { RemoteNestSpec, VaultRegistry, VaultRegistryEntry } from "./types.
  */
 export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
+/** A `ctx login --account` name, as an HTTP remote's `account` and the CLI's saved-key map both take it. */
+export const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9._@+-]{1,64}$/;
+
 /**
  * Names that ALIAS_PATTERN happens to match but that must never be used as a
  * key into `registry.vaults`: they resolve to inherited `Object.prototype`
@@ -132,6 +135,7 @@ const remoteNestSpecSchema = z
       transport: z.literal("http"),
       url: z.string().min(1),
       auth: remoteAuthSchema.optional(),
+      account: z.string().regex(ACCOUNT_NAME_PATTERN, "account must be 1-64 of A-Z a-z 0-9 . _ @ + -").optional(),
       description: z.string().optional(),
       timeout_ms: z.number().int().positive().optional(),
     }),
