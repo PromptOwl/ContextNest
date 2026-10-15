@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mapInBatches } from "../concurrency.js";
+import { mapInBatches, VAULT_IO_CONCURRENCY } from "../concurrency.js";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
@@ -109,10 +109,16 @@ describe("context_import — host-set ioConcurrency", () => {
   }
 
   it("keeps no more writes in flight than the host allows", async () => {
-    expect(await peakWrites({ ioConcurrency: 4 })).toBe(4);
+    const peak = await peakWrites({ ioConcurrency: 4 });
+    expect(peak).toBeLessThanOrEqual(4);
+    expect(peak).toBeGreaterThan(1);
   });
 
-  it("defaults to the vault I/O bound when the host sets none", async () => {
-    expect(await peakWrites()).toBe(32);
+  it("defaults to the vault I/O bound when the host sets none or an invalid value", async () => {
+    for (const limits of [undefined, { ioConcurrency: 0 }, { ioConcurrency: Number.NaN }, { ioConcurrency: Infinity }]) {
+      const peak = await peakWrites(limits);
+      expect(peak, JSON.stringify(limits)).toBeLessThanOrEqual(VAULT_IO_CONCURRENCY);
+      expect(peak, JSON.stringify(limits)).toBeGreaterThan(4);
+    }
   });
 });

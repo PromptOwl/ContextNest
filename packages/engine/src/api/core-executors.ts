@@ -80,7 +80,7 @@ import {
   type InstallScope,
 } from "../skills.js";
 import { applyTypedBlocks } from "../typed-blocks.js";
-import { mapInBatches } from "../concurrency.js";
+import { mapInBatches, VAULT_IO_CONCURRENCY } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
 import { currentReviewProposal, stageReviewHold } from "../review.js";
 import { TITLE_MAX_LENGTH } from "../schemas.js";
@@ -111,7 +111,7 @@ import {
   scaffoldFolders,
   structureReport,
 } from "../structure-store.js";
-import { readIfExists, type OperationContext, type OperationExecutor } from "./context.js";
+import { ioConcurrency, readIfExists, type OperationContext, type OperationExecutor } from "./context.js";
 import {
   archiveReplacedPdf,
   historyMember,
@@ -1319,8 +1319,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         if (set) failedSets.add(set);
       }
     };
-    await mapInBatches(plan.filter((f) => !isHistory(f)), stage, ctx.limits?.ioConcurrency);
-    await mapInBatches(plan.filter(isHistory), stage, ctx.limits?.ioConcurrency);
+    await mapInBatches(plan.filter((f) => !isHistory(f)), stage, ioConcurrency(ctx));
+    await mapInBatches(plan.filter(isHistory), stage, ioConcurrency(ctx));
     // A refused file landed nowhere, so its "written as …" rename warning would mislead.
     const failedRaw = new Set(failed.map((f) => f.id));
     for (const p of plan) if (!failedRaw.has(p.raw)) warnings.push(...p.warnings);
@@ -1438,9 +1438,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       replayBudget,
-      ...(ctx.limits?.ioConcurrency
-        ? { concurrency: Math.max(1, Math.floor(ctx.limits.ioConcurrency / 2)) }
-        : {}),
+      concurrency: Math.max(1, Math.floor((ioConcurrency(ctx) ?? VAULT_IO_CONCURRENCY) / 2)),
       ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
       onProgress: ctx.onProgress,
       ...(input.note ? { note: input.note } : {}),
@@ -1525,7 +1523,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     } catch (err) {
       failed.push({ id: doc.id, error: err instanceof Error ? err.message : String(err) });
     }
-  }, ctx.limits?.ioConcurrency);
+  }, ioConcurrency(ctx));
 
   // Stage 4 (discover): report every document the scan owned, published or not,
   // so a governance layer can record the import without re-reading the vault.

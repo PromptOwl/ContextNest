@@ -521,7 +521,9 @@ describe("VersionManager.nextVersion", () => {
   it("never returns a fractional version from a fractional hint", async () => {
     const { ctx, dir } = await makeContext();
     try {
-      expect(await new VersionManager(ctx.storage).nextVersion("nodes/none", 1.1, null, 0)).toBe(2);
+      const vm = new VersionManager(ctx.storage);
+      expect(await vm.nextVersion("nodes/none", 1.1, null, 0)).toBe(2);
+      expect(await vm.nextVersion("nodes/none", Infinity, null, 0)).toBe(1);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
