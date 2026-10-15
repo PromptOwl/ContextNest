@@ -87,6 +87,13 @@ export interface OperationLimits {
    * refuse a single large document however the batch is split.
    */
   readonly importReplayChars?: number;
+  /**
+   * File operations `context_import` keeps in flight (writes, reads, checks);
+   * its bulk publish runs half as many documents, each costing several files.
+   * Default `VAULT_IO_CONCURRENCY` (32) and 16. A host on a latency-bound
+   * network mount (gcsfuse) can raise it.
+   */
+  readonly ioConcurrency?: number;
 }
 
 /**

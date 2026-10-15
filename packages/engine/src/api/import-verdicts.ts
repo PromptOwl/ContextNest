@@ -62,7 +62,7 @@ export async function importRefusals(
     } catch (err) {
       refused.set(f.raw, err instanceof Error ? err.message : String(err));
     }
-  });
+  }, ctx.limits?.ioConcurrency);
   // A refused document or sidecar takes its whole family — the other of the
   // pair (a .md would name bytes that are not there), its history and its
   // staged edits. A refused history file takes its history.

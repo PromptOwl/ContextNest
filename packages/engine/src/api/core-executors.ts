@@ -1319,8 +1319,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
         if (set) failedSets.add(set);
       }
     };
-    await mapInBatches(plan.filter((f) => !isHistory(f)), stage);
-    await mapInBatches(plan.filter(isHistory), stage);
+    await mapInBatches(plan.filter((f) => !isHistory(f)), stage, ctx.limits?.ioConcurrency);
+    await mapInBatches(plan.filter(isHistory), stage, ctx.limits?.ioConcurrency);
     // A refused file landed nowhere, so its "written as …" rename warning would mislead.
     const failedRaw = new Set(failed.map((f) => f.id));
     for (const p of plan) if (!failedRaw.has(p.raw)) warnings.push(...p.warnings);
@@ -1438,6 +1438,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
       replayBudget,
+      ...(ctx.limits?.ioConcurrency
+        ? { concurrency: Math.max(1, Math.floor(ctx.limits.ioConcurrency / 2)) }
+        : {}),
       ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
       onProgress: ctx.onProgress,
       ...(input.note ? { note: input.note } : {}),
@@ -1522,7 +1525,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     } catch (err) {
       failed.push({ id: doc.id, error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  }, ctx.limits?.ioConcurrency);
 
   // Stage 4 (discover): report every document the scan owned, published or not,
   // so a governance layer can record the import without re-reading the vault.
