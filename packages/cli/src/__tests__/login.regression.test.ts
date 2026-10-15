@@ -1,0 +1,217 @@
+/**
+ * login.regression.test.ts — `ctx login` / `ctx logout` end to end, through
+ * the compiled CLI (dist/index.js) and the encrypted-file credential store.
+ *
+ * Pins the multi-server contract: one machine holds keys for the public
+ * hosted server, a self-hosted one, and nest-scoped keys at the same time;
+ * nothing ever prints a key; a corrupt saved map is refused, never
+ * overwritten, and `logout --all` is the way out.
+ *
+ * --key-stdin only: the browser flow is covered against a mock in login.test.ts.
+ */
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { CredentialStore } from "../credentials.js";
+import { SERVERS_ACCOUNT } from "../server-credentials.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const distPath = join(here, "..", "..", "dist", "index.js");
+
+const HOSTED = "https://nest.promptowl.ai";
+const SELF = "http://localhost:3737";
+const KEY_HOSTED = "cnst_hosted_key_0001";
+const KEY_SELF = "cnst_self_key_0002";
+const KEY_NEST = "cnst_nest_key_0003";
+
+interface RunResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+describe("ctx login / logout (regression)", () => {
+  let home: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "cn-login-"));
+    env = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      CONTEXTNEST_NO_BROWSER: "1",
+      CONTEXTNEST_CONFIG_DIR: join(home, ".contextnest"),
+      CONTEXTNEST_CREDENTIALS_BACKEND: "file",
+      CONTEXTNEST_CREDENTIALS_KEY: "test-passphrase",
+      CONTEXTNEST_VAULT: "",
+      CONTEXTNEST_VAULT_PATH: "",
+    };
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  function ctx(args: string[], input = ""): RunResult {
+    try {
+      const stdout = execFileSync("node", [distPath, ...args], {
+        cwd: home,
+        env,
+        input,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      return { status: 0, stdout, stderr: "" };
+    } catch (err: any) {
+      return {
+        status: typeof err.status === "number" ? err.status : 1,
+        stdout: err.stdout?.toString() ?? "",
+        stderr: err.stderr?.toString() ?? "",
+      };
+    }
+  }
+
+  const store = () => new CredentialStore({ home, env, keyring: null });
+
+  function loginAll(): void {
+    expect(ctx(["login", HOSTED, "--key-stdin"], `${KEY_HOSTED}\n`).status).toBe(0);
+    expect(ctx(["login", SELF, "--key-stdin"], `  ${KEY_SELF}  \n`).status).toBe(0);
+    const scoped = ctx(["login", HOSTED, "--nest", "n1", "--key-stdin"], KEY_NEST);
+    expect(scoped.status).toBe(0);
+    expect(scoped.stdout).toContain(`${HOSTED}/nests/n1`);
+    expect(scoped.stdout).toContain("this nest only");
+  }
+
+  it("holds hosted, self-hosted and nest-scoped keys at once, and --list never prints a key", () => {
+    loginAll();
+    const list = ctx(["login", "--list"]);
+    expect(list.status).toBe(0);
+    expect(list.stdout).toContain(HOSTED);
+    expect(list.stdout).toContain(SELF);
+    expect(list.stdout).toContain(`${HOSTED}/nests/n1`);
+    expect(list.stdout).toMatch(/nest\.promptowl\.ai\s+\(default\)/);
+    expect(list.stdout).not.toContain("cnst_");
+
+    const onlyHosted = ctx(["login", "--list", HOSTED]);
+    expect(onlyHosted.stdout).toContain(`${HOSTED}/nests/n1`);
+    expect(onlyHosted.stdout).not.toContain(SELF);
+  });
+
+  it("refuses a runaway pipe on --key-stdin instead of buffering it", () => {
+    const r = ctx(["login", SELF, "--key-stdin"], `cnst_${"a".repeat(5000)}`);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("Too much input on stdin");
+    expect(ctx(["login", "--list"]).stdout).toContain("Not logged in");
+  });
+
+  it("refuses --nest with the browser flow (that key would be server-wide)", () => {
+    const r = ctx(["login", HOSTED, "--nest", "n1"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("--key-stdin");
+  });
+
+  it("logout --nest drops one scope; logout <server> drops the server and its scopes; others survive", () => {
+    loginAll();
+    expect(ctx(["logout", HOSTED, "--nest", "n1"]).stdout).toContain(`Logged out of ${HOSTED}/nests/n1`);
+    let list = ctx(["login", "--list"]).stdout;
+    expect(list).not.toContain("/nests/n1");
+    expect(list).toContain(HOSTED);
+
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin"], KEY_NEST).status).toBe(0);
+    const out = ctx(["logout", HOSTED]).stdout;
+    expect(out).toContain(`Logged out of ${HOSTED}.`);
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n1.`);
+    list = ctx(["login", "--list"]).stdout;
+    expect(list).not.toContain("promptowl");
+    expect(list).toMatch(/localhost:3737\s+\(default\)/);
+
+    expect(ctx(["logout", "https://unknown.example.com"]).stdout).toContain("No saved key");
+    expect(ctx(["logout", "--all"]).stdout).toContain(`Logged out of ${SELF}`);
+    expect(ctx(["logout", "--all"]).stdout).toContain("No saved server keys.");
+    expect(ctx(["login", "--list"]).stdout).toContain("Not logged in");
+  });
+
+  it("login --as registers the alias with no auth (the key stays in the store); logout <alias> forgets its key", () => {
+    const registry = () => readFileSync(join(home, ".contextnest", "config.yaml"), "utf-8");
+    expect(ctx(["login", HOSTED, "--key-stdin", "--as", "po", "--set-default", "--yes"], KEY_HOSTED).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin", "--as", "po-n1", "--yes"], KEY_NEST).status).toBe(0);
+    const reg = registry();
+    expect(reg).toContain(`${HOSTED}/mcp`);
+    expect(reg).toContain(`${HOSTED}/nests/n1/mcp`);
+    expect(reg).toMatch(/default: po\b/);
+    expect(reg).not.toContain("cnst_");
+    expect(reg).not.toContain("bearer_env");
+
+    // A taken alias is refused before anything is saved.
+    const taken = ctx(["login", SELF, "--key-stdin", "--as", "po"], KEY_SELF);
+    expect(taken.status).toBe(1);
+    expect(taken.stderr).toContain("already a registered vault");
+    expect(ctx(["login", "--list"]).stdout).not.toContain(SELF);
+
+    // The nest alias signs in with the nest-scoped key, so only that one goes.
+    expect(ctx(["logout", "po-n1"]).stdout).toContain(`Logged out of ${HOSTED}/nests/n1.`);
+    expect(ctx(["login", "--list"]).stdout).toContain(`${HOSTED}  (default)`);
+    expect(ctx(["logout", "po"]).stdout).toContain(`Logged out of ${HOSTED}.`);
+    expect(ctx(["logout", "nope"]).stderr).toContain("neither a server URL nor a registered HTTP remote alias");
+  });
+
+  it("logout <server alias> with only nest keys saved forgets those nest keys", () => {
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin"], KEY_NEST).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--nest", "n2", "--key-stdin"], KEY_SELF).status).toBe(0);
+    expect(ctx(["login", SELF, "--key-stdin"], KEY_HOSTED).status).toBe(0);
+    expect(ctx(["vault", "add", "po", "--url", `${HOSTED}/mcp`, "--yes"]).status).toBe(0);
+    const out = ctx(["logout", "po"]).stdout;
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n1.`);
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n2.`);
+    const list = ctx(["login", "--list"]).stdout;
+    expect(list).not.toContain(HOSTED);
+    expect(list).toContain(SELF);
+  });
+
+  it("--account keeps a second account's keys apart: login, --list, vault add, logout <alias> and --account", () => {
+    const registry = () => readFileSync(join(home, ".contextnest", "config.yaml"), "utf-8");
+    expect(ctx(["login", HOSTED, "--key-stdin"], KEY_HOSTED).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--key-stdin", "--account", "client", "--as", "po-client", "--yes"], KEY_SELF).status).toBe(0);
+    expect(ctx(["login", HOSTED, "--nest", "n1", "--key-stdin", "--account", "client"], KEY_NEST).status).toBe(0);
+    expect(registry()).toMatch(/account: client/);
+
+    const list = ctx(["login", "--list", HOSTED]).stdout;
+    expect(list).toContain(`${HOSTED}  (default)`);
+    expect(list).toContain(`${HOSTED}#client`);
+    expect(list).toContain(`${HOSTED}/nests/n1#client`);
+    expect(list).not.toContain("cnst_");
+
+    // A bad name is refused before any key is read or saved, and in the registry.
+    expect(ctx(["login", HOSTED, "--key-stdin", "--account", "a b"], KEY_SELF).stderr).toContain("Invalid account name");
+    const badAdd = ctx(["vault", "add", "x", "--url", `${HOSTED}/mcp`, "--account", "a/b", "--yes"]);
+    expect(badAdd.status).toBe(1);
+    expect(ctx(["vault", "add", "y", "--url", `${HOSTED}/mcp`, "--bearer-env", "K", "--account", "c"]).status).toBe(1);
+
+    // The alias logs out its own account's keys only.
+    const out = ctx(["logout", "po-client"]).stdout;
+    expect(out).toContain(`Logged out of ${HOSTED}#client.`);
+    expect(out).toContain(`Logged out of ${HOSTED}/nests/n1#client.`);
+    expect(ctx(["login", "--list"]).stdout).toContain(`${HOSTED}  (default)`);
+    expect(ctx(["login", "--list"]).stdout).not.toContain("#client");
+
+    expect(ctx(["logout", HOSTED, "--account", "client"]).stdout).toContain(`No saved key for ${HOSTED}#client`);
+    expect(ctx(["logout", HOSTED]).stdout).toContain(`Logged out of ${HOSTED}.`);
+  });
+
+  it("a corrupt saved map is refused and left alone; logout --all resets it", async () => {
+    loginAll();
+    await store().set(SERVERS_ACCOUNT, "{corrupt");
+
+    const list = ctx(["login", "--list"]);
+    expect(list.status).toBe(1);
+    expect(list.stderr).toContain("logout --all");
+    const again = ctx(["login", SELF, "--key-stdin"], KEY_SELF);
+    expect(again.status).toBe(1);
+    expect(await store().get(SERVERS_ACCOUNT)).toBe("{corrupt");
+
+    expect(ctx(["logout", "--all"]).status).toBe(0);
+    expect(ctx(["login", SELF, "--key-stdin"], KEY_SELF).status).toBe(0);
+    expect(ctx(["login", "--list"]).stdout).toContain(SELF);
+  });
+});

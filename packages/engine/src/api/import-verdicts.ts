@@ -29,7 +29,7 @@ import { sealedHeadView, sealedReaders, structurePublishViolations, type ReplayB
 import type { ArtifactReader } from "../reconstruct.js";
 import { importVerdict, type TombstoneIndex } from "../tombstones.js";
 import type { ContextNode, DocumentHistory } from "../types.js";
-import { readIfExists, type OperationContext } from "./context.js";
+import { ioConcurrency, readIfExists, type OperationContext } from "./context.js";
 
 /** A file of the batch, where it lands, and what it holds. */
 export interface PlannedFile {
@@ -62,7 +62,7 @@ export async function importRefusals(
     } catch (err) {
       refused.set(f.raw, err instanceof Error ? err.message : String(err));
     }
-  });
+  }, ioConcurrency(ctx));
   // A refused document or sidecar takes its whole family — the other of the
   // pair (a .md would name bytes that are not there), its history and its
   // staged edits. A refused history file takes its history.

@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
 import readline from "node:readline";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Command, Help, InvalidArgumentError } from "commander";
 
@@ -26,6 +26,7 @@ import {
   GraphQueryEngine,
   publishDocuments,
   ContextNestError,
+  DocumentNotFoundError,
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
@@ -105,7 +106,8 @@ import {
   parseTaskLogStatus,
   taskFieldArgs,
 } from "./task-fields.js";
-import { planPull, applyPull, type PullStep } from "./pull.js";
+import { planPull, applyPull, type PullStep, kindDocId, parseKindDocument } from "./pull.js";
+import { planKindApply, executeKindPlan, renderKindPlan, parseStewardMappings, type KindStep } from "./kind.js";
 import {
   listJsonEntry,
   queryJsonPayload,
@@ -131,9 +133,29 @@ import type {
 import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
-import { generateWelcomeHtml, openInBrowser } from "./welcome-html.js";
+import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
+import {
+  accountKey,
+  emptyServerMap,
+  isNestScope,
+  splitAccountKey,
+  tokensForServerEndpoint,
+  assertServerMapWritable,
+  keyForEndpoint,
+  keysUnderServer,
+  loadServerMap,
+  nestScopeUrl,
+  normalizeServerUrl,
+  removeServer,
+  saveServerMap,
+  savedTokenFor,
+  upsertServer,
+  type ServerCredential,
+  type ServerMap,
+} from "./server-credentials.js";
+import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
@@ -281,6 +303,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
     commands: [
       ["push", "Push the vault to a hosted ContextNest server"],
       ["pull", "Pull a recipe from a remote nest into this vault, as drafts with lineage"],
+      ["kind", "Apply a pulled kind (edge types, edges, schedules, plugins, stewards) to a hosted nest"],
     ],
   },
 ];
@@ -3441,6 +3464,309 @@ program
     }
   });
 
+// ─── ctx login / logout ──────────────────────────────────────────────────────
+
+/** A pasted key: piped stdin is read to EOF; on a terminal it is one hidden line, done at Enter. */
+async function readStdin(): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    // A key is ~70 bytes; refuse a runaway pipe instead of buffering all of it.
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of stdin) {
+      size += (chunk as Buffer).length;
+      if (size > 4096) throw new Error("Too much input on stdin — pipe in just the key (cnst_…).");
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+  }
+  process.stderr.write(chalk.dim("Paste the key and press Enter — it stays hidden. Ctrl-C to cancel.\n> "));
+  return new Promise((resolve, reject) => {
+    let key = "";
+    const finish = () => {
+      stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.off("error", onError);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stderr.write("\n");
+    };
+    const onData = (s: string) => {
+      for (const ch of s) {
+        if (ch === "\u0003") {
+          finish();
+          console.error(chalk.yellow("Cancelled — nothing was saved."));
+          process.exit(130);
+        } else if (ch === "\r" || ch === "\n") {
+          if (key.trim()) {
+            finish();
+            resolve(key);
+            return;
+          }
+          process.stderr.write(chalk.dim("\nNothing pasted yet — paste the key and press Enter, or Ctrl-C to cancel.\n> "));
+        } else if (ch === "\u007f" || ch === "\b") {
+          key = key.slice(0, -1);
+        } else {
+          key += ch;
+        }
+      }
+    };
+    // A terminal that closes or errors mid-prompt must not leave login hanging.
+    const onError = (err: Error) => {
+      finish();
+      reject(err);
+    };
+    const onEnd = () => onError(new Error("Input closed before a key was pasted."));
+    stdin.setEncoding("utf-8");
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+    stdin.once("end", onEnd);
+    stdin.once("error", onError);
+  });
+}
+
+program
+  .command("login [server]")
+  .description("Sign in to a ContextNest server once; push and remote --vault aliases reuse the saved key")
+  .option("--key-stdin", "Read an existing API key (cnst_…) from stdin instead of the browser flow")
+  .option("--nest <id>", "Save the key for this one nest only (with --key-stdin); it wins over the server-wide key")
+  .option("--label <text>", "Label for this credential (default: your account email)")
+  .option("--account <name>", "Save the key under a named account, to sign in to the same server as someone else too")
+  .option("--list", "Show the servers and nests you're logged into (never prints keys)")
+  .option("--as <alias>", "Also register the server (all its nests), or the --nest, as a remote vault alias")
+  .option("--set-default", "With --as: make that alias the default vault")
+  .action(async (
+    server: string | undefined,
+    opts: {
+      keyStdin?: boolean;
+      nest?: string;
+      label?: string;
+      account?: string;
+      list?: boolean;
+      as?: string;
+      setDefault?: boolean;
+    },
+  ) => {
+    try {
+      if (opts.list) {
+        const map = await loadServerMap();
+        const all = Object.keys(map.servers);
+        // Every account's keys for the server.
+        const keys = (server
+          ? all.filter((k) => keysUnderServer(map, server, splitAccountKey(k).account).includes(k))
+          : all
+        ).sort();
+        if (keys.length === 0) {
+          console.log(chalk.yellow(server ? `No saved key for ${normalizeServerUrl(server)}.` : "Not logged in to any server."));
+          return;
+        }
+        for (const key of keys) {
+          const cred = map.servers[key];
+          const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
+          console.log(`${key}${scope}`);
+          const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
+          if (meta) console.log(chalk.dim(`  ${meta}`));
+        }
+        return;
+      }
+      if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
+      assertSafeEndpoint(server, "<server>");
+      if (opts.nest && !opts.keyStdin) {
+        throw new Error(
+          "Browser login signs in to the whole server. To save a key for one nest, paste it:\n" +
+            `  ctx login ${server} --nest ${opts.nest} --key-stdin`,
+        );
+      }
+      const serverUrl = normalizeServerUrl(server);
+      const url = opts.nest ? nestScopeUrl(serverUrl, opts.nest) : serverUrl;
+      accountKey(url, opts.account); // a bad --account fails before signing in
+      const accountNote = opts.account ? ` (account "${opts.account}")` : "";
+      const accountFlag = opts.account ? ` --account ${opts.account}` : "";
+      if (opts.setDefault && !opts.as) throw new Error("--set-default goes with --as <alias>.");
+      // Check the alias before signing in, not after a key has been minted.
+      if (opts.as) {
+        const reg = readRegistry();
+        if (reg.vaults[opts.as] || (reg.remotes?.[opts.as] && !isForce())) {
+          throw new Error(`"${opts.as}" is already a registered vault — pick another alias, or pass --force to replace a remote.`);
+        }
+      }
+      // Registered with no auth, so the alias borrows the key — the key never enters the registry.
+      // Confirmed before signing in, so declining never leaves a saved key without its alias.
+      const aliasSpec: RemoteNestSpec = {
+        transport: "http",
+        url: `${url}/mcp`,
+        ...(opts.account ? { account: opts.account } : {}),
+      };
+      if (opts.as) {
+        await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
+      }
+      // Fail on an unusable store now, before the server mints a key.
+      await assertServerMapWritable();
+      let token: string | undefined;
+      let label = opts.label;
+      let mintedLabel: string | undefined;
+      if (!opts.keyStdin) {
+        // The name the server shows for this key (what you'd revoke). Asked on a
+        // terminal only; Enter keeps the default, and scripts always get it.
+        const defaultName = `ctx CLI (${hostname()})`;
+        let keyName = defaultName;
+        while (process.stdin.isTTY) {
+          keyName = await promptText("Name for the API key this login creates", defaultName);
+          if (keyName.length <= 60) break;
+          console.log(chalk.yellow("  Key names can be at most 60 characters."));
+        }
+        try {
+          const res = await deviceLogin(url, {
+            deviceName: keyName,
+            prompt: (verificationUrl, userCode) => {
+              console.log(`\n  Approve the login in your browser:\n    ${chalk.cyan(verificationUrl)}`);
+              if (userCode) console.log(`  Code: ${chalk.bold(userCode)}`);
+              openUrlInBrowser(verificationUrl);
+              console.log(chalk.dim("\n  Waiting for approval… (Ctrl-C to cancel)"));
+            },
+          });
+          token = res.token;
+          mintedLabel = res.keyLabel;
+          label ??= res.email ? `${res.email} · key "${res.keyLabel}"` : `key "${res.keyLabel}"`;
+        } catch (err) {
+          // No browser login on this server: on a terminal, take a pasted key instead.
+          if (!(err instanceof NoBrowserLoginError && process.stdin.isTTY)) throw err;
+          console.log(chalk.yellow(`${err.message.split("\n")[0]} Create a key in its web UI (Connect) and paste it.`));
+        }
+      }
+      token ??= parsePastedKey(await readStdin());
+      // The OS keyring can take a second or two (Windows starts PowerShell).
+      console.log(chalk.dim("  Saving the key to the secure store…"));
+      let map: ServerMap;
+      let where: string;
+      try {
+        map = upsertServer(
+          await loadServerMap(),
+          url,
+          { token, ...(label ? { label } : {}), updatedAt: new Date().toISOString() },
+          opts.account,
+        );
+        where = await saveServerMap(map);
+      } catch (err) {
+        if (!mintedLabel) throw err;
+        throw new Error(
+          `${(err as Error).message}\n  The server already created key "${mintedLabel}" — revoke it in its web UI.`,
+        );
+      }
+      console.log(
+        chalk.green(`\nLogged in to ${url}${accountNote}${label ? ` (${label})` : ""}.`) +
+          (opts.nest ? chalk.dim("  (this nest only)") : map.default === url ? chalk.dim("  (default)") : ""),
+      );
+      console.log(chalk.dim(`  Key saved to ${where}.`));
+      if (opts.as) {
+        let reg: ReturnType<typeof addRemote>;
+        try {
+          reg = addRemote(opts.as, aliasSpec, { setDefault: opts.setDefault, force: isForce() });
+        } catch (err) {
+          throw new Error(
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${opts.as} --url ${aliasSpec.url}${accountFlag}`,
+          );
+        }
+        console.log(
+          chalk.green(`Registered remote "${chalk.bold(opts.as)}"${reg.default === opts.as ? " (default)" : ""} → ${aliasSpec.url}`),
+        );
+        console.log(
+          chalk.dim(
+            opts.nest
+              ? `  Next: ctx --vault ${opts.as} list`
+              : `  Next: ctx vault list   (each nest shows as ${opts.as}/<nest>; use --vault ${opts.as}/<nest> for one)`,
+          ),
+        );
+        return;
+      }
+      // A nest-scoped key reaches only its own nest, directly or as <alias>/<nest> behind a server alias.
+      const next = opts.nest
+        ? [
+            `This nest:  ctx vault add <alias> --url ${url}/mcp${accountFlag}`,
+            `            or, with a server alias, --vault <alias>/<nest>`,
+          ]
+        : [
+            `All nests:  ctx vault add <alias> --url ${serverUrl}/mcp${accountFlag}`,
+            `            then \`ctx vault list\` shows each one as <alias>/<nest>; use --vault <alias>/<nest> for one`,
+            `One nest:   ctx vault add <alias> --url ${serverUrl}/nests/<id>/mcp${accountFlag}`,
+          ];
+      console.log(chalk.dim(`\n  Next — connect with this key (no --bearer-env needed):`));
+      for (const line of next) console.log(chalk.dim(`    ${line}`));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout [server]")
+  .description(
+    "Forget keys saved by `ctx login` for a server URL or a remote alias, including that server's nest-scoped keys (they stay valid on the server — revoke them in the web UI)",
+  )
+  .option("--nest <id>", "Forget only the key saved for this nest")
+  .option("--account <name>", "Forget the keys of this named account (default: the unnamed one)")
+  .option("--all", "Forget every saved server key")
+  .action(async (server: string | undefined, opts: { nest?: string; account?: string; all?: boolean }) => {
+    try {
+      let account = opts.account;
+      if (opts.all) {
+        if (server || opts.nest || account) {
+          throw new Error("--all forgets every server; drop the <server> / --nest / --account.");
+        }
+        // Don't parse first: --all is the way out of a corrupt or newer-format map.
+        let forgotten: [string, ServerCredential][] = [];
+        try {
+          forgotten = Object.entries((await loadServerMap()).servers);
+        } catch {
+          /* unreadable — wipe it anyway */
+        }
+        await saveServerMap(emptyServerMap());
+        if (forgotten.length === 0) {
+          console.log(chalk.yellow("No saved server keys."));
+          return;
+        }
+        for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+        return;
+      }
+      if (!server) throw new Error("Name the <server> or remote alias to log out of, or pass --all.");
+      let map = await loadServerMap();
+      if (!/^https?:\/\//i.test(server)) {
+        // A remote alias: forget the saved key it signs in with (and, if server-wide, that server's nest keys).
+        const spec = readRegistry().remotes?.[server];
+        if (spec?.transport !== "http") throw new Error(`"${server}" is neither a server URL nor a registered HTTP remote alias.`);
+        account ??= spec.account;
+        const key = keyForEndpoint(map, spec.url, account);
+        // A server alias with only nest keys saved signs in with those: forget them all.
+        const onlyNestKeys = !key && tokensForServerEndpoint(map, spec.url, account).length > 0;
+        if (!key && !onlyNestKeys) {
+          console.log(chalk.yellow(`No saved key is used by "${server}" (${spec.url}).`));
+          return;
+        }
+        if (key) ({ scope: server, account } = splitAccountKey(key));
+        else server = normalizeServerUrl(spec.url).slice(0, -"/mcp".length);
+      }
+      const wanted = accountKey(opts.nest ? nestScopeUrl(server, opts.nest) : normalizeServerUrl(server), account);
+      const targets = opts.nest ? [wanted].filter((k) => map.servers[k]) : keysUnderServer(map, server, account);
+      if (targets.length === 0) {
+        console.log(chalk.yellow(`No saved key for ${wanted}.`));
+        return;
+      }
+      const forgotten = targets.map((k) => [k, map.servers[k]] as const);
+      for (const k of targets) map = removeServer(map, k);
+      await saveServerMap(map);
+      for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
+function printLoggedOut(url: string, cred: ServerCredential): void {
+  console.log(chalk.green(`Logged out of ${url}.`));
+  console.log(chalk.dim(`  The key still works until you revoke it in the server's web UI${cred.label ? ` — ${cred.label}` : ""}.`));
+}
+
 // ─── ctx push ────────────────────────────────────────────────────────────────
 
 /** Print the terminal result of a gated push. Success stays on stdout. */
@@ -3477,7 +3803,7 @@ program
   .description("Push the local vault to a hosted ContextNest server")
   .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
   .requiredOption("--nest <id>", "Target nest ID")
-  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer `ctx login` or the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
   .option("--include-drafts", "Include draft documents (default: published only)", false)
   .option(
     "--no-wait",
@@ -3498,13 +3824,22 @@ program
   .action(async (opts) => {
     // A key on the command line is readable by anyone who can list processes,
     // and lands in shell history. Accept it, but let the env var take over.
-    const apiKey = (opts.key as string | undefined) ?? process.env.CONTEXTNEST_API_KEY;
-    if (!apiKey) {
-      console.error(chalk.red("Missing API key — pass --key or set CONTEXTNEST_API_KEY."));
+    // Refuse to put documents and a bearer token on the wire in the clear —
+    // checked first, so a refused URL never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest), { fresh: true }));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
       process.exit(1);
     }
-    // Refuse to put documents and a bearer token on the wire in the clear.
-    assertSafeEndpoint(opts.server, "--server");
+    if (!apiKey) {
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
+      process.exit(1);
+    }
 
     const storage = getStorage();
     const docs = await storage.discoverDocuments();
@@ -3580,6 +3915,9 @@ program
       if (!res.ok && res.status !== 202) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         console.error(chalk.red(`Push failed (${res.status}): ${err.error || res.statusText}`));
+        if (res.status === 401 && !opts.key && !process.env.CONTEXTNEST_API_KEY) {
+          console.error(chalk.dim("  The key saved by `ctx login` was rejected — check `ctx login --list`, then log in again."));
+        }
         process.exit(1);
       }
 
@@ -4052,12 +4390,17 @@ Example:
     if (conflicts.length > 0) {
       console.log(chalk.red(`${conflicts.length} conflict(s) left untouched — those paths hold documents this recipe did not pull.`));
     }
-    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill");
+    const docs = written.filter((s) => s.kind === "document" || s.kind === "skill" || s.kind === "kind");
     if (docs.length > 0) {
       console.log(chalk.dim("Pulled documents are drafts. Review them, then publish: ctx publish <path>"));
     }
     for (const skill of written.filter((s) => s.kind === "skill")) {
       console.log(chalk.dim(`Install the skill so it can't drift: ctx skill install ${skill.to} --mode loader --write`));
+    }
+    for (const k of written.filter((s) => s.kind === "kind")) {
+      console.log(
+        chalk.dim(`Kind written: ${k.to} — review and publish it, then: ctx kind apply ${fetched.manifest.id} --server <url> --nest <id>`),
+      );
     }
     const files = written.filter((s) => s.kind === "file");
     for (const file of files) {
@@ -4065,6 +4408,142 @@ Example:
         console.log(chalk.dim(`Template written: ${file.to} — fill it in and rename it before syncing.`));
       }
     }
+  });
+
+// ─── ctx kind ────────────────────────────────────────────────────────────────
+
+const kindCommand = program
+  .command("kind")
+  .description("Apply the server-side half of a recipe (a kind) to a hosted nest");
+
+kindCommand
+  .command("apply <kind-id>")
+  .description("Apply a pulled kind to a hosted nest — prints the plan; --yes sends it")
+  .requiredOption("--server <url>", "Hosted engine URL (https://…, or a localhost address)")
+  .requiredOption("--nest <id>", "Target nest ID")
+  .option("--key <apiKey>", "API key (cnst_…). Prefer the CONTEXTNEST_API_KEY env var — argv is visible to other processes")
+  .option(
+    "--steward <mapping>",
+    "Map a steward placeholder to a person: @placeholder=email (repeatable)",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[],
+  )
+  .option("--json", "Print the plan and result as JSON")
+  .option("--allow-draft", "With --yes, apply a kind that is not published yet (it has not been reviewed)")
+  .addHelpText(
+    "after",
+    `
+Reads nodes/kinds/<kind-id> from the local vault (written by \`ctx pull\` when a
+recipe carries a kind: section) and maps it onto the server's REST API: edge
+types, edges and schedules (workflow plane), plugin configuration (plugins
+plane) and steward roles. Planes the server has switched off are skipped with
+a warning. Plugins are configured but never enabled, and secrets are never
+sent: set them on the server. Stewards apply only once each placeholder is
+mapped with --steward.
+
+Dry run by default: nothing but GETs leaves the machine until --yes is passed.
+--yes applies only a PUBLISHED kind — review and \`ctx publish\` it first, or
+pass --allow-draft to apply an unreviewed one deliberately.
+
+Example:
+  ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com
+  ctx kind apply seam --server https://nest.example.com --nest n1 --steward @seam-owner=lead@example.com --yes`,
+  )
+  .action(async (kindId: string, opts: { server: string; nest: string; key?: string; steward: string[]; json?: boolean; allowDraft?: boolean }, cmd: Command) => {
+    // Same key resolution as `ctx push`; the URL is checked first so a
+    // refused server never touches the keyring.
+    assertSafeEndpoint(opts.server, "--server");
+    let apiKey: string | null;
+    try {
+      apiKey = await resolvePushKey(opts.key, process.env, () => savedTokenFor(nestScopeUrl(opts.server, opts.nest), { fresh: true }));
+    } catch (err) {
+      console.error(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+    if (!apiKey) {
+      console.error(
+        chalk.red("Missing API key — run `ctx login <server>` once, pass --key, or set CONTEXTNEST_API_KEY."),
+      );
+      process.exit(1);
+    }
+    const stewards = parseStewardMappings(opts.steward);
+
+    const storage = getStorage();
+    const id = kindDocId(kindId);
+    const node = await storage.readDocument(id).catch((err) => {
+      if (err instanceof DocumentNotFoundError) {
+        throw new ContextNestError(
+          `No kind "${kindId}" in this vault (expected ${id}) — pull a recipe that carries a kind: section first.`,
+          "DOCUMENT_NOT_FOUND",
+        );
+      }
+      throw err;
+    });
+    const kind = parseKindDocument(node.body);
+
+    const execute = cmd.optsWithGlobals().yes === true && !isDryRun();
+    const draft = node.frontmatter.status !== "published";
+    // Applying creates edge types and schedules and can switch governance on
+    // (stewards): an unreviewed kind needs an explicit, separate yes.
+    if (execute && draft && !opts.allowDraft) {
+      console.error(
+        chalk.red(`${id} is ${node.frontmatter.status ?? "draft"}, not published — refusing to apply an unreviewed kind.`) +
+          `\n  Review and publish it (ctx publish ${id}), or pass --allow-draft to apply it anyway.`,
+      );
+      process.exit(1);
+    }
+
+    const target = { server: opts.server.replace(/\/$/, ""), nest: opts.nest, apiKey };
+    const plan = await planKindApply(kindId, kind, target, { stewards });
+
+    if (execute) await executeKindPlan(plan, target);
+    const failed = plan.steps.filter((s) => s.result === "failed");
+
+    if (opts.json) {
+      console.log(
+        JSON.stringify(
+          {
+            kind: kindId,
+            document: id,
+            status: node.frontmatter.status,
+            server: target.server,
+            nest: target.nest,
+            dry_run: !execute,
+            steps: plan.steps,
+            warnings: plan.warnings,
+            runner_handlers: plan.runnerHandlers,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(chalk.bold(`Kind ${kindId} → ${target.server} nest ${target.nest}\n`));
+      if (draft) {
+        console.log(chalk.yellow(`! ${id} is ${node.frontmatter.status}, not published — review it before applying.\n`));
+      }
+      for (const line of renderKindPlan(plan)) console.log(line);
+      console.log("");
+      const planned = plan.steps.filter((s) => s.action === "apply").length;
+      if (!execute) {
+        console.log(chalk.yellow(`Dry run — ${planned} request(s) planned, nothing sent. Rerun with --yes to apply.`));
+      } else {
+        const count = (r: KindStep["result"]) => plan.steps.filter((s) => s.result === r).length;
+        const applied = count("created") + count("updated");
+        const parts = [
+          `${applied} applied`,
+          count("exists") && `${count("exists")} already there`,
+          count("skipped") && `${count("skipped")} skipped`,
+          failed.length && `${failed.length} failed`,
+        ].filter(Boolean);
+        const summary = `${parts.join(", ")} (of ${planned} planned request(s)).`;
+        if (failed.length) console.log(chalk.red(summary));
+        else if (applied === 0) console.log(chalk.yellow(`Nothing applied — ${summary} See the skips and warnings above.`));
+        else console.log(chalk.green(summary));
+      }
+    }
+    // exitCode, not exit(): exit() can cut off a large --json write to a pipe.
+    if (failed.length) process.exitCode = 1;
   });
 
 // ─── ctx vault ───────────────────────────────────────────────────────────────
@@ -4185,6 +4664,7 @@ vaultCmd
   // No local --force: the global one (see the root command) covers it.
   .option("--url <url>", "Register a REMOTE nest at this MCP endpoint (streamable HTTP)")
   .option("--bearer-env <var>", "Env var holding the bearer token for --url (stored as a reference, never the value)")
+  .option("--account <name>", "With --url: sign in with the keys `ctx login --account <name>` saved")
   .option("--mcp-command <cmd>", "Register a REMOTE nest served by this stdio MCP command")
   .option(
     "--mcp-arg <arg>",
@@ -4204,11 +4684,16 @@ vaultCmd
           console.log(chalk.red("A remote nest takes no path argument."));
           process.exit(1);
         }
+        if (opts.account && (!opts.url || opts.bearerEnv)) {
+          console.log(chalk.red("--account goes with --url and no --bearer-env (it picks a `ctx login` account)."));
+          process.exit(1);
+        }
         const spec: RemoteNestSpec = opts.url
           ? {
               transport: "http",
               url: opts.url,
               ...(opts.bearerEnv ? { auth: { bearer_env: opts.bearerEnv } } : {}),
+              ...(opts.account ? { account: opts.account } : {}),
               ...(opts.description ? { description: opts.description } : {}),
             }
           : {

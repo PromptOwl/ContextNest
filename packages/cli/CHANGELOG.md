@@ -1,5 +1,17 @@
 # @promptowl/contextnest-cli
 
+## 3.2.0
+
+### Minor Changes
+
+- `ctx login`: a key saved for one nest (`--nest <id>`) now works through a server alias as `--vault <alias>/<nest>`, even with no server-wide key saved. The alias lists the nests every saved key can see, and a command naming one nest signs in with that nest's key (else the server-wide one). `ctx login --account <name>` keeps a second account's keys on the same server, and an HTTP remote picks it with the new optional registry field `account` (`ctx vault add … --url … --account <name>`); `ctx logout` and `ctx login --list` take `--account` too. Keys saved without `--account` are unchanged.
+- Add `ctx login` / `ctx logout`: sign in to a ContextNest server once in the browser and the CLI keeps its own API key in the secure credential store (OS keyring, else the encrypted file — never plaintext). `ctx push` uses the saved key when neither `--key` nor `CONTEXTNEST_API_KEY` is given, and a remote registered with `ctx vault add <alias> --url <server>/mcp` and no `--bearer-env` authenticates with it. `--key-stdin` saves an existing key without putting it in argv. Keys for several servers (hosted `nest.promptowl.ai`, self-hosted) and nest-scoped keys (`--nest <id>`) are held at once and matched by longest prefix; `ctx login --list` shows them without printing keys; a corrupt saved map is refused rather than overwritten. `ctx login <server> --as <alias>` also registers the server (every nest, as `<alias>/<nest>`) or one nest as a remote vault, and `ctx logout <alias>` forgets the key that alias uses. A pasted key is read from a hidden prompt, and a server without browser login falls back to it. Saved keys are long-lived API keys: one the server rejects asks you to log in again.
+- Recipes can carry a `kind:` section: plugins, edge types, edges, schedules, steward seats (placeholders) and the runner handlers a package expects. The section is validated as strictly as the rest of a manifest, with unknown fields and secret-looking plugin settings refused. `ctx pull` writes it to `nodes/kinds/<recipe-id>` as a draft with lineage. The new `ctx kind apply <id> --server --nest` maps it onto a Community server's REST API. It only prints the plan unless you pass `--yes`, skips any plane the server has switched off with a clear warning, never sends secrets or enables plugins, and applies stewards only once their placeholders are mapped with `--steward @placeholder=email`.
+
+### Patch Changes
+
+- Commands against an HTTP remote registered without auth no longer read the OS keyring on every call when nothing was ever saved by `ctx login`. A non-secret `~/.contextnest/login-state` marker (`none` / `saved`, never the key) records whether any login exists; on Windows this skips the ~1 s PowerShell start per command. If the server still asks for a key, ctx reads the keyring once more, so keys saved by an older ctx are never missed.
+
 ## 3.1.0
 
 ### Minor Changes
