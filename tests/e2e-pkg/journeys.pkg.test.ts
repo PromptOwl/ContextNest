@@ -1522,7 +1522,10 @@ const J8: Journey = {
   // whole journey — so the key is sandboxed and the keyless steps are honest.
   env: {
     CONTEXTNEST_CREDENTIALS_BACKEND: "file",
-    CONTEXTNEST_VAULT_KEY: "",
+    // `undefined` UNSETS the key (removing any ambient value entirely, not just
+    // blanking it) — exercising runInstalled's delete path; "" is the other
+    // supported form the CLI treats as unset. Both mean "no key here".
+    CONTEXTNEST_VAULT_KEY: undefined,
     CONTEXTNEST_VAULT_PASSPHRASE: "",
     CONTEXTNEST_CREDENTIALS_KEY: "",
   },
@@ -1632,7 +1635,7 @@ const J8: Journey = {
           // Even the error must not spill the sealed body, nor dump a raw stack
           // trace — a locked vault degrades to a friendly, leak-free message.
           stdoutNot: [ENC_SECRET],
-          stderrNot: [ENC_SECRET, /\n\s+at /],
+          stderrNot: [ENC_SECRET, /(^|\n)\s+at /],
         },
         // A wrong passphrase is rejected, not silently accepted.
         {
@@ -1644,16 +1647,25 @@ const J8: Journey = {
           }),
           stderr: ["VAULT_KEY_MISMATCH"],
           stdoutNot: [ENC_SECRET],
-          stderrNot: [ENC_SECRET, /\n\s+at /],
+          stderrNot: [ENC_SECRET, /(^|\n)\s+at /],
         },
         // The recovery passphrase printed at init unlocks the vault on a machine
         // without the stored key — the user's way back in.
         {
           args: ["read", "nodes/secret", "--raw"],
-          env: () => ({
-            CONTEXTNEST_CONFIG_DIR: j8KeylessDir(),
-            CONTEXTNEST_VAULT_PASSPHRASE: j8Passphrase,
-          }),
+          env: () => {
+            // This step depends on J8-01 having captured the passphrase. Assert
+            // it explicitly so a reordered/filtered J8-01 fails HERE with a clear
+            // message, not confusingly downstream as a key mismatch on "".
+            expect(
+              j8Passphrase,
+              "J8-01 must capture the recovery passphrase before J8-05 unlocks with it",
+            ).not.toBe("");
+            return {
+              CONTEXTNEST_CONFIG_DIR: j8KeylessDir(),
+              CONTEXTNEST_VAULT_PASSPHRASE: j8Passphrase,
+            };
+          },
           stdout: ["title: My Secret", ENC_SECRET],
         },
       ],
