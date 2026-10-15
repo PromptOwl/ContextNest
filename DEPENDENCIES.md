@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 99 | 11 | 99 |
+| `@promptowl/contextnest-engine` | 100 | 11 | 100 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -22,7 +22,7 @@ The trade-off is explicit: a bundled package cannot be patched by `npm audit fix
 
 - **No install scripts.** None of the published packages define `preinstall`, `install` or `postinstall`. Installing runs no code of ours; `--ignore-scripts` changes nothing.
 - **No native builds.** Everything is plain JavaScript — no `node-gyp`, no prebuilt binaries, no platform-specific downloads.
-- **No network access at runtime** beyond what you explicitly configure for `source` nodes.
+- **No network access at runtime** beyond what you explicitly configure: `source` nodes, and the embedding/rerank provider named in a vault's `search:` config (semantic/hybrid search is opt-in; the optional `@aws-sdk/client-bedrock-runtime` peer is loaded only if Bedrock is configured without an API key).
 - **Where files are written.** The CLI writes only inside the vault you point it at, plus the registry at `~/.contextnest/config.yaml`.
 
 ## Minimal install profile
@@ -48,7 +48,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 101 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -58,6 +58,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `fast-xml-parser` | 4.5.7 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
+| `stemmer` | 2.0.1 | MIT |
 | `toposort` | 2.0.2 | MIT |
 | `unpdf` | 1.7.0 | MIT |
 | `zod` | 3.25.76 | MIT |
@@ -164,6 +165,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `fast-xml-parser` | 4.5.7 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
+| `stemmer` | 2.0.1 | MIT | yes | Porter stemmer for the search term pipeline (index + query), so `migrations` finds `migration`. Zero deps, pure JS, pinned. |
 | `toposort` | 2.0.2 | MIT | yes | Dependency ordering for `source` node graphs. |
 | `unpdf` | 1.7.0 | MIT | yes | Text extraction for `type: pdf` nodes (pdf.js built for serverless runtimes; pure JS, no native deps). Loaded lazily — only when a PDF is imported. |
 | `zod` | 3.25.76 | MIT | yes | Runtime validation of frontmatter and operation inputs (spec §13 rules 1–17). |
@@ -281,7 +283,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 100 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 101 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -307,6 +309,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `minisearch` | 7.2.0 | MIT |
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
+| `stemmer` | 2.0.1 | MIT |
 | `toposort` | 2.0.2 | MIT |
 | `unpdf` | 1.7.0 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |

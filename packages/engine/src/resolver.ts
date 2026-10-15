@@ -3,6 +3,7 @@
  */
 
 import MiniSearch from "minisearch";
+import { stemmer } from "stemmer";
 import type { ContextNode, ContextNestUri, Checkpoint } from "./types.js";
 import { extractSection } from "./inline.js";
 import { stripTagPrefix, isPublished, isForgotten } from "./parser.js";
@@ -39,14 +40,73 @@ const STOPWORDS = new Set(
     "what when where which who whom why will with would you your").split(" "),
 );
 
-/** MiniSearch `processTerm`: lowercase, and drop stopwords (null = not indexed/searched). */
+/**
+ * MiniSearch `processTerm`, applied identically at index and query time:
+ * lowercase, drop stopwords (null = not indexed/searched), then Porter-stem
+ * so "migrations" finds "migration" and "deployed" finds "deploying".
+ * Stopwords are checked BEFORE stemming — "this" stems to "thi", which is not
+ * in the list. Only plain a–z words are stemmed: ids, versions and codes
+ * ("v2", "gpt-4o", "2026") must match exactly.
+ */
 export function processSearchTerm(term: string): string | null {
   const t = term.toLowerCase();
-  return STOPWORDS.has(t) ? null : t;
+  if (STOPWORDS.has(t)) return null;
+  return /^[a-z]+$/.test(t) ? stemmer(t) : t;
 }
 
-/** A title or tag hit says more about what a node is ABOUT than a body mention. */
-const SEARCH_BOOST = { title: 3, tags: 2, description: 1.5 };
+/**
+ * Per-field BM25 boosts — all 1.0 by default. MiniSearch normalizes each field
+ * by its own length, so a short title already scores a one-term hit high; any
+ * multiplier on top let one incidental title word outrank documents that are
+ * on topic in the body. Benchmarks (NDCG@10, plain BM25 sum, see
+ * docs/retrieval-modes.md): title 1.25 cost SciFact 0.662 → 0.593 and
+ * MultiHop-RAG 0.706 → 0.606. Title LOOKUP is served by the exact title/#tag
+ * seeds (exactSeeds), not by a boost. Override with `search.field_boosts`.
+ */
+export const DEFAULT_FIELD_BOOSTS: Readonly<FieldBoosts> = Object.freeze({
+  title: 1,
+  tags: 1,
+  description: 1,
+  body: 1,
+});
+
+/** Pre-2.13 boosts, kept for comparison and for vaults that want them back. */
+export const LEGACY_FIELD_BOOSTS: Readonly<FieldBoosts> = Object.freeze({
+  title: 3,
+  tags: 2,
+  description: 1.5,
+  body: 1,
+});
+
+export interface FieldBoosts {
+  title: number;
+  tags: number;
+  description: number;
+  body: number;
+}
+
+/**
+ * Exact matches for a query: documents whose title equals it (case- and
+ * whitespace-insensitive), that carry a `#tag` written in it, or whose tag
+ * equals the whole query. These are the deterministic seeds every search mode
+ * pins first — a title LOOKUP must not depend on BM25 field boosts, and the
+ * workflow plane's replay guarantee needs exact matches to stay put.
+ */
+export function exactSeeds(query: string, docs: ContextNode[]): string[] {
+  const fold = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const q = fold(query);
+  const asTag = q.replace(/^#/, "").replace(/ /g, "-");
+  const wanted = new Set(
+    (query.match(/#[\p{L}\p{N}_/-]+/gu) ?? []).map((t) => t.slice(1).toLowerCase()),
+  );
+  const seeds: string[] = [];
+  for (const d of docs) {
+    const title = fold(String(d.frontmatter.title ?? ""));
+    const tags = stripTagPrefix(d.frontmatter.tags || []).map((t) => t.toLowerCase());
+    if (title === q || tags.includes(asTag) || tags.some((t) => wanted.has(t))) seeds.push(d.id);
+  }
+  return seeds;
+}
 
 /**
  * Partial (not-every-term) hits scoring below this fraction of the best hit are
@@ -65,6 +125,27 @@ export interface ResolverOptions {
   checkpoints?: Checkpoint[];
   /** Function to reconstruct a specific version of a document */
   reconstructVersion?: (docId: string, version: number) => Promise<string>;
+  /**
+   * Pin documents matching EVERY query term above partial matches (default
+   * true — the long-standing behaviour). `false` ranks by BM25 score alone.
+   * An option, not a constant, because the retrieval benchmark decides
+   * whether the tier helps or hurts; config: `search.full_match_first`.
+   */
+  fullMatchFirst?: boolean;
+  /**
+   * Drop partial hits scoring below this fraction of the best hit (default
+   * 0.05, see MIN_RELATIVE_SCORE). Hybrid fusion passes 0: a weak lexical
+   * hit is still a useful vote once fused with the vector list.
+   */
+  minRelativeScore?: number;
+  /** Per-field BM25 boosts; missing fields take DEFAULT_FIELD_BOOSTS. */
+  fieldBoosts?: Partial<FieldBoosts>;
+  /**
+   * Keep MiniSearch's coordination factor (score × matched-term count) —
+   * the pre-2.13 ranking. Default false: plain BM25 sum, which benchmarks
+   * better (MultiHop-RAG NDCG@10 0.657 → 0.706). Config: `search.coordination`.
+   */
+  coordination?: boolean;
 }
 
 /** One full-text hit: the document plus its MiniSearch (BM25) score. */
@@ -79,8 +160,14 @@ export class Resolver {
   private searchIndex: MiniSearch;
   private checkpoints: Checkpoint[];
   private reconstructVersion?: (docId: string, version: number) => Promise<string>;
+  private fullMatchFirst: boolean;
+  private minRelativeScore: number;
+  private coordination: boolean;
 
   constructor(options: ResolverOptions) {
+    this.coordination = options.coordination ?? false;
+    this.fullMatchFirst = options.fullMatchFirst ?? true;
+    this.minRelativeScore = options.minRelativeScore ?? MIN_RELATIVE_SCORE;
     this.documents = new Map();
     this.tagIndex = new Map();
     this.checkpoints = options.checkpoints || [];
@@ -105,7 +192,7 @@ export class Resolver {
       storeFields: ["id"],
       idField: "id",
       processTerm: processSearchTerm,
-      searchOptions: { boost: SEARCH_BOOST },
+      searchOptions: { boost: { ...DEFAULT_FIELD_BOOSTS, ...options.fieldBoosts } },
     });
 
     const searchDocs = options.documents
@@ -259,23 +346,40 @@ export class Resolver {
    * pass (identical for a doc in both passes: same terms, same sum).
    *
    * Stopwords never match (see STOPWORDS), and partial hits far below the
-   * best score are dropped (see MIN_RELATIVE_SCORE).
+   * best score are dropped (see MIN_RELATIVE_SCORE). With `fullMatchFirst:
+   * false` the tiering is skipped and the order is BM25 score alone.
    */
   search(query: string): SearchHit[] {
     const q = query.trim();
     if (!q) return [];
-    const partial = this.searchIndex.search(q);
-    if (partial.length === 0) return [];
+    const raw = this.searchIndex.search(q);
+    if (raw.length === 0) return [];
+    // MiniSearch multiplies each OR hit's BM25 sum by the number of query
+    // terms it matched (a coordination factor). Unless `coordination` is on,
+    // divide it back out: plain BM25 sum, so a doc hitting one rare,
+    // discriminative term is not outscored by one hitting many common ones.
     const full = new Set(this.searchIndex.search(q, { combineWith: "AND" }).map((r) => r.id));
-    const tier = (id: unknown) => (full.has(id) ? 1 : 0);
-    const floor = partial[0].score * MIN_RELATIVE_SCORE;
-    // MiniSearch returns score-descending; the sort is stable, so this only
+    // The noise floor stays on MiniSearch's raw (coordinated) score, where
+    // MIN_RELATIVE_SCORE was calibrated: the SET of hits is unchanged, only
+    // their order is. A weak one-term mention stays dropped either way.
+    const floor = raw[0].score * this.minRelativeScore;
+    const kept = raw.filter((r) => full.has(r.id) || r.score >= floor);
+    const partial = this.coordination
+      ? kept
+      : kept
+          .map((r) => ({ ...r, score: r.score / Math.max(1, r.queryTerms.length) }))
+          .sort((a, b) => b.score - a.score);
+    const tier = (id: unknown) => (this.fullMatchFirst && full.has(id) ? 1 : 0);
+    // `partial` is score-descending; the sort is stable, so this only
     // lifts the full-match tier without reshuffling within it.
-    return partial
-      .filter((r) => full.has(r.id) || r.score >= floor)
+    const hits = partial
       .sort((a, b) => tier(b.id) - tier(a.id) || b.score - a.score)
       .map((r) => ({ document: this.documents.get(r.id as string), score: r.score }))
       .filter((h): h is SearchHit => h.document !== undefined);
+    // Exact title/#tag matches first (stable: their BM25 order is kept).
+    const seeds = new Set(exactSeeds(q, hits.map((h) => h.document)));
+    if (seeds.size === 0) return hits;
+    return [...hits.filter((h) => seeds.has(h.document.id)), ...hits.filter((h) => !seeds.has(h.document.id))];
   }
 
   /** Get a document by id (no filtering) */

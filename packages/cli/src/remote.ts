@@ -595,18 +595,39 @@ export async function remoteQuery(
 export async function remoteSearch(
   target: RemoteTarget,
   query: string,
-  opts: { json?: boolean; limit?: number },
+  opts: { json?: boolean; limit?: number; mode?: string; rerank?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
     const limit = searchLimit(opts.limit);
+    // mode/rerank are sent only when asked for: a server on an older engine
+    // refuses unknown keys, and a plain search must keep working against it.
     const out = await conn.run<{ results: NodeSummary[]; count?: number; total?: number }>("context_search", {
       query,
       ...(limit ? { limit } : {}),
+      ...(opts.mode ? { mode: opts.mode } : {}),
+      ...(opts.rerank ? { rerank: true } : {}),
     });
     // Rendering shared with the local branch (doc-views.ts). A remote may
     // send `count`, only the deprecated `total`, or (an older engine) neither
     // and no `score`; each degrades to the previous output.
     printSearchResults({ ...out, results: await labelFanout(target, conn, out.results) }, opts);
+  });
+}
+
+/**
+ * `ctx embed` against a remote nest: run its `context_embed` when it offers
+ * one; otherwise refuse — the nest builds its own index, and embedding a
+ * local folder instead would report success for the wrong vault.
+ */
+export async function remoteEmbed<T>(target: RemoteTarget, input: { rebuild?: true }): Promise<T> {
+  return withRemote(target, async (conn) => {
+    if (!(await conn.toolNames()).has("context_embed")) {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" does not expose context_embed — its search index is managed by the nest. Nothing was embedded.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
+    return conn.run<T>("context_embed", input);
   });
 }
 

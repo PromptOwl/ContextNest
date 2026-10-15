@@ -37,6 +37,7 @@ const EXPECTED_TOOLS = [
   "context_list",
   "context_folders",
   "context_search",
+  "context_embed",
   "context_create",
   "context_update",
   "context_publish",
@@ -205,7 +206,8 @@ describe("[regression] MCP server e2e — protocol & smoke", () => {
     ["context_versions", ["id", "title", "include_diff"]],
     ["context_get", ["uri", "id", "title", "include_raw", "allow_rejected"]],
     ["context_init", ["include_nodes", "limit"]],
-    ["context_search", ["query", "limit"]],
+    ["context_search", ["query", "limit", "mode", "rerank"]],
+    ["context_embed", ["rebuild"]],
     ["context_query", ["query", "hops", "full", "include_drafts"]],
     ["context_resolve", ["selector", "max_tokens", "hops"]],
     ["context_import", ["documents", "ids"]],
@@ -1292,8 +1294,8 @@ describe("[regression] MCP server e2e — context_search", () => {
   });
 
   it("no match and a whitespace-only query return empty results, not an error", async () => {
-    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], count: 0, total: 0 });
-    expect(await search({ query: "   " })).toEqual({ results: [], count: 0, total: 0 });
+    expect(await search({ query: "zzqx-no-such-term" })).toEqual({ results: [], count: 0, total: 0, mode: "lexical" });
+    expect(await search({ query: "   " })).toEqual({ results: [], count: 0, total: 0, mode: "lexical" });
   });
 
   it("special characters in the query never break the search", async () => {

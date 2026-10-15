@@ -238,6 +238,8 @@ describe("search — natural-language questions", () => {
     expect(ids).toEqual(["nodes/refunds"]);
   });
 
+  // Served by the exact-title seed, not by a big title boost (field boosts were
+  // lowered after the SciFact benchmark — see DEFAULT_FIELD_BOOSTS).
   it("a title match outranks the same words repeated in another node's body", () => {
     const resolver = new Resolver({
       documents: [

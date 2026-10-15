@@ -669,6 +669,76 @@ describe("[regression] ctx search ranking and --limit", () => {
   );
 });
 
+// Retrieval modes (nodes/dev/spec-retrieval-modes): `ctx embed` + `ctx search
+// --mode`, end to end through the built CLI, against an in-process
+// OpenAI-compatible embeddings server — no network leaves the test.
+describe("[regression] ctx embed + ctx search --mode", () => {
+  const CONCEPTS = [
+    ["angry", "upset", "furious", "complaint"],
+    ["customer", "client", "buyer", "buyers"],
+    ["refund", "reimbursement", "money"],
+  ];
+  const vec = (t: string) => {
+    const w = t.toLowerCase().split(/[^a-z]+/);
+    return [...CONCEPTS.map((c) => w.filter((x) => c.includes(x)).length), 0.01];
+  };
+  let server: Server;
+  let seen: string[] = [];
+
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const body = JSON.parse(raw);
+        seen.push(...body.input);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ data: body.input.map((t: string, index: number) => ({ index, embedding: vec(t) })) }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  });
+  afterAll(() => new Promise<void>((r) => server.close(() => r())));
+
+  beforeEach(() => {
+    seen = [];
+    initVault(tmp);
+    const port = (server.address() as AddressInfo).port;
+    appendFileSync(
+      join(tmp, ".context", "config.yaml"),
+      `\nsearch:\n  embeddings:\n    provider: openai\n    model: stub-embed\n    base_url: http://127.0.0.1:${port}/v1\n`,
+    );
+    runCtx(tmp, ["add", "nodes/escalation", "--title", "Escalation policy", "--body", "When a client is furious, log a complaint."]);
+    runCtx(tmp, ["add", "nodes/refunds", "--title", "Refunds", "--body", "Reimbursement goes back within 5 days."]);
+  });
+
+  it("ctx embed indexes published documents and is incremental", async () => {
+    const first = JSON.parse(await runCtxAsync(tmp, ["embed", "--json"]));
+    expect(first).toMatchObject({ embedded: 2, total: 2, pruned: 0 });
+    expect(existsSync(join(tmp, ".context", "embeddings", ".gitignore"))).toBe(true);
+    const again = JSON.parse(await runCtxAsync(tmp, ["embed", "--json"]));
+    expect(again).toMatchObject({ embedded: 0, reused: 2 });
+  });
+
+  it("--mode semantic finds a paraphrase lexical search misses; --json keeps per-hit scores", async () => {
+    await runCtxAsync(tmp, ["embed", "--json"]);
+    const lexical = JSON.parse(await runCtxAsync(tmp, ["search", "upset buyers", "--json"]));
+    expect(lexical).toEqual([]);
+    const semantic = JSON.parse(await runCtxAsync(tmp, ["search", "upset buyers", "--mode", "semantic", "--json"]));
+    expect(semantic[0].id).toBe("nodes/escalation");
+    expect(typeof semantic[0].scores.semantic).toBe("number");
+    const hybrid = JSON.parse(await runCtxAsync(tmp, ["search", "refunds", "--mode", "hybrid", "--json"]));
+    expect(hybrid[0].id).toBe("nodes/refunds");
+    expect(typeof hybrid[0].scores.rrf).toBe("number");
+  });
+
+  it("rejects an unknown --mode", () => {
+    const res = runCtxResult(tmp, ["search", "x", "--mode", "vibes"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/--mode must be one of: lexical, semantic, hybrid/);
+  });
+});
+
 // ─── update ──────────────────────────────────────────────────────────────────
 
 describe("[regression] ctx update", () => {

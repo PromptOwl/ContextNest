@@ -96,6 +96,16 @@
           ]
         },
         {
+          "name": "stemmer",
+          "version": "2.0.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
           "name": "toposort",
           "version": "2.0.2",
           "license": "MIT",
@@ -1111,6 +1121,7 @@
         "fast-xml-parser",
         "js-yaml",
         "minisearch",
+        "stemmer",
         "toposort",
         "unpdf",
         "zod",
@@ -1118,8 +1129,8 @@
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 99,
-      "minimalTotal": 99,
+      "total": 100,
+      "minimalTotal": 100,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
@@ -1164,6 +1175,16 @@
         {
           "name": "minisearch",
           "version": "7.2.0",
+          "license": "MIT",
+          "depth": 1,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
+          ]
+        },
+        {
+          "name": "stemmer",
+          "version": "2.0.1",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -2416,6 +2437,16 @@
           "via": [
             "@modelcontextprotocol/sdk",
             "body-parser"
+          ]
+        },
+        {
+          "name": "stemmer",
+          "version": "2.0.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "@promptowl/contextnest-engine"
           ]
         },
         {
