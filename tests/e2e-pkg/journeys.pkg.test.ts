@@ -32,12 +32,20 @@ import {
   readFileSync,
   writeFileSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   statSync,
   existsSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { packCli, freshInstall, runJourney, type Journey } from "./journey-harness.js";
+import {
+  packCli,
+  freshInstall,
+  runJourney,
+  type Journey,
+  type RunResult,
+} from "./journey-harness.js";
 
 let INSTALL: string;
 const scratch: string[] = [];
@@ -1469,6 +1477,279 @@ const J7: Journey = {
   ],
 };
 
+/**
+ * J8 — "I keep my vault encrypted at rest."
+ * The privacy-conscious user's promise (opt-in encrypted vaults): node bodies
+ * and version history are sealed with AES-256-GCM on disk, while front matter
+ * stays plaintext so the vault still indexes. This journey starts an encrypted
+ * vault, proves a secret body is scrambled in the raw files, reads and searches
+ * it normally while unlocked, reopens it in a fresh process from the stored key,
+ * shows the locked-out paths (no key, wrong passphrase) and the recovery
+ * passphrase way back in, then decrypts the vault back to plain Markdown.
+ *
+ * KEY ISOLATION (journey-wide `env`): `CONTEXTNEST_CREDENTIALS_BACKEND=file`
+ * with no credentials key keeps the CLI off the OS keychain, so the vault key
+ * lands in the engine's interim 0600 store under the sandboxed config dir —
+ * deterministic, and never touching the real machine's keychain on the CI
+ * matrix. The three ambient vault-key env vars are blanked so a key/passphrase
+ * in the shell can never make a "without the key" step unlock for the wrong
+ * reason. The "without the stored key" steps (J8-05) each point at a FRESH
+ * config dir that never held the key, via the per-action `env` hook.
+ *
+ * The review gate is turned OFF (like J2/J3/J5/J6): this journey is about
+ * encryption at rest, so each write should land as a published version without
+ * a gate in between.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const ENC_SECRET = "TOPSECRET-BODY-42"; // the sealed body — must never surface in a raw file
+// A body for a write that must be REFUSED while the vault is locked (J8-05b).
+// Distinct from ENC_SECRET so a tree scan for it can only hit a leaked write.
+const LOCKED_WRITE_TOKEN = "LOCKEDWRITE-NEVER-LANDS-9000";
+// The recovery passphrase `init --encrypted` prints once — six groups of four
+// upper-alnum chars (e.g. EH5J-32ZG-6D4C-F453-62WF-B7K9).
+const RECOVERY = /([0-9A-Z]{4}-){5}[0-9A-Z]{4}/;
+// A raw V8 stack-trace frame — "    at fn (file:12:3)" or "    at file:12:3".
+// Anchored on a callsite (paren-wrapped frame OR a file:line:col) so a prose
+// line like "  at least one key is required" can't false-positive as a leak.
+const STACK_TRACE = /\n\s+at \S+ \(|\n\s+at .*:\d+:\d+/;
+// J8 is ORDER-DEPENDENT BY DESIGN: all cases share one encrypted vault, and
+// J8-05's recovery-unlock reuses the passphrase J8-01 printed. Running a subset
+// with `-t` breaks that chain; the explicit assert in J8-05 turns that into a
+// clear failure rather than a confusing key mismatch.
+let j8Passphrase = ""; // captured from J8-01's init, used by J8-05's unlock step
+
+/** A fresh config dir that has never held the vault key — a "machine without the key". */
+const j8KeylessDir = () => {
+  const d = mkdtempSync(join(tmpdir(), "cn-journey-j8-nokey-"));
+  scratch.push(d); // cleaned by the suite's afterAll
+  return d;
+};
+
+const J8: Journey = {
+  id: "J8",
+  title: "Encrypted vault lifecycle (privacy-conscious user)",
+  // Keep the CLI off the OS keychain and blank any ambient vault key, for the
+  // whole journey — so the key is sandboxed and the keyless steps are honest.
+  env: {
+    CONTEXTNEST_CREDENTIALS_BACKEND: "file",
+    // `undefined` UNSETS the key (removing any ambient value entirely, not just
+    // blanking it) — exercising runInstalled's delete path; "" is the other
+    // supported form the CLI treats as unset. Both mean "no key here".
+    CONTEXTNEST_VAULT_KEY: undefined,
+    CONTEXTNEST_VAULT_PASSPHRASE: "",
+    CONTEXTNEST_CREDENTIALS_KEY: "",
+  },
+  cases: [
+    {
+      id: "J8-01",
+      title: "Starting an encrypted vault prints a one-time recovery passphrase and marks the vault encrypted",
+      actions: [
+        {
+          args: ["init", "--name", "enc-vault", "--layout", "structured", "--encrypted"],
+          // The headline warning and the once-shown passphrase are the contract
+          // a user relies on; encryption.yaml is the on-disk encrypted marker.
+          stdout: ["ENCRYPTED VAULT", RECOVERY],
+          files: [{ path: ".context/encryption.yaml", exists: true }],
+          // Grab the passphrase for J8-05's "machine without the key" unlock.
+          capture: (r: RunResult) => {
+            j8Passphrase = r.stdout.match(RECOVERY)?.[0] ?? "";
+            expect(j8Passphrase, "init --encrypted should print a recovery passphrase").not.toBe("");
+          },
+        },
+        // Writes should land as published versions, not held behind the gate —
+        // this journey is about encryption, not review.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+      ],
+    },
+    {
+      id: "J8-02",
+      title: "A node's secret content is scrambled in the files on disk",
+      actions: [
+        {
+          args: [
+            "add", "nodes/secret",
+            "--type", "document",
+            "--title", "My Secret",
+            "--tags", "#classified",
+            "--body", ENC_SECRET,
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/secret"],
+          // Front matter stays plaintext and indexable, while the body is sealed
+          // behind the encryption-envelope marker.
+          files: [
+            { path: "nodes/secret.md", contains: "title: My Secret" },
+            { path: "nodes/secret.md", contains: "contextnest_encrypted:" },
+            { path: "nodes/secret.md", contains: "BEGIN CONTEXTNEST ENCRYPTED" },
+          ],
+          // The strong at-rest proof: the secret body text appears NOWHERE on
+          // disk — not the node file, not the sealed search index (context.yaml),
+          // not a version keyframe. The plaintext INDEX.md carries only metadata.
+          // (Reading raw bytes, so any binary file is safe to scan.)
+          check: (vault) => {
+            const leaks = scanTreeForToken(vault, ENC_SECRET).hits;
+            expect(leaks, `secret leaked at rest into: ${leaks.join(", ")}`).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J8-03",
+      title: "While the vault is unlocked, reading and searching the node return its real content",
+      actions: [
+        // The key is in the sandboxed store, so the body decrypts in memory on read.
+        { args: ["read", "nodes/secret", "--raw"], stdout: ["title: My Secret", ENC_SECRET] },
+        // Full-text search matches sealed body content, decrypting in memory...
+        {
+          args: ["search", ENC_SECRET, "--json"],
+          json: (data) => expect(searchIds(data)).toEqual(["nodes/secret"]),
+        },
+        // ...and the (plaintext) tag resolves the node too.
+        {
+          args: ["resolve", "#classified", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/secret"]),
+        },
+      ],
+    },
+    {
+      id: "J8-04",
+      title: "Reopening the vault in a fresh process unlocks it from the stored key and verifies clean",
+      actions: [
+        // Every ctx run is a brand-new process; with the key saved on this
+        // machine no passphrase ceremony is needed. verify must DECRYPT each
+        // body to re-check its hash, so a clean pass proves the stored key
+        // unlocked this fresh invocation — not a cache from an earlier step.
+        { args: ["verify"], stdout: ["nodes/secret", "All integrity checks passed"] },
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+        { args: ["read", "nodes/secret", "--raw"], stdout: [ENC_SECRET] },
+      ],
+    },
+    {
+      id: "J8-05",
+      title: "Without the key the vault stays locked with an unlock hint, a wrong passphrase is refused, and the recovery passphrase unlocks it",
+      actions: [
+        // No key available (a fresh config dir that never held the KEK): the read
+        // is refused and the error names BOTH unlock routes instead of leaking
+        // any content.
+        {
+          args: ["read", "nodes/secret"],
+          status: 1,
+          env: () => ({ CONTEXTNEST_CONFIG_DIR: j8KeylessDir() }),
+          stderr: ["VAULT_LOCKED", /CONTEXTNEST_VAULT_KEY|CONTEXTNEST_VAULT_PASSPHRASE/],
+          // Even the error must not spill the sealed body, nor dump a raw stack
+          // trace — a locked vault degrades to a friendly, leak-free message.
+          stdoutNot: [ENC_SECRET],
+          stderrNot: [ENC_SECRET, STACK_TRACE],
+        },
+        // A wrong passphrase is rejected, not silently accepted. The value is a
+        // WELL-FORMED recovery passphrase (six groups of four, matches RECOVERY)
+        // that is simply not THIS vault's — so it reaches the KEK-derivation /
+        // GCM-auth check and fails as VAULT_KEY_MISMATCH, not a format-validation
+        // path. If a future change adds format pre-validation, this must still
+        // surface a mismatch, not a "malformed passphrase" error.
+        {
+          args: ["read", "nodes/secret", "--raw"],
+          status: 1,
+          env: () => ({
+            CONTEXTNEST_CONFIG_DIR: j8KeylessDir(),
+            CONTEXTNEST_VAULT_PASSPHRASE: "WRON-GWRO-NGWR-ONGW-RONG-WRON",
+          }),
+          stderr: ["VAULT_KEY_MISMATCH"],
+          stdoutNot: [ENC_SECRET],
+          stderrNot: [ENC_SECRET, STACK_TRACE],
+        },
+        // The recovery passphrase printed at init unlocks the vault on a machine
+        // without the stored key — the user's way back in.
+        {
+          args: ["read", "nodes/secret", "--raw"],
+          env: () => {
+            // This step depends on J8-01 having captured the passphrase. Assert
+            // it explicitly so a reordered/filtered J8-01 fails HERE with a clear
+            // message, not confusingly downstream as a key mismatch on "".
+            expect(
+              j8Passphrase,
+              "J8-01 must capture the recovery passphrase before J8-05 unlocks with it",
+            ).not.toBe("");
+            return {
+              CONTEXTNEST_CONFIG_DIR: j8KeylessDir(),
+              CONTEXTNEST_VAULT_PASSPHRASE: j8Passphrase,
+            };
+          },
+          stdout: ["title: My Secret", ENC_SECRET],
+        },
+      ],
+    },
+    {
+      // Added coverage for the at-rest write invariant (storage.ts
+      // readText/sealText): a write that cannot seal must refuse BEFORE any
+      // plaintext touches disk. A fresh config dir locks the vault; the add is
+      // rejected with VAULT_LOCKED, and the whole tree is scanned to prove the
+      // would-be body never landed in cleartext. The real key is untouched, so
+      // J8-06 below still decrypts normally.
+      id: "J8-05b",
+      title: "A write while the vault is locked is refused and leaves no plaintext on disk",
+      actions: [
+        {
+          args: [
+            "add", "nodes/locked-write",
+            "--type", "document",
+            "--title", "Should Not Persist",
+            "--body", LOCKED_WRITE_TOKEN,
+            "-y",
+          ],
+          status: 1,
+          env: () => ({ CONTEXTNEST_CONFIG_DIR: j8KeylessDir() }),
+          stderr: ["VAULT_LOCKED"],
+          stdoutNot: [LOCKED_WRITE_TOKEN],
+          stderrNot: [LOCKED_WRITE_TOKEN, STACK_TRACE],
+          // The strong assertion: the plaintext body appears NOWHERE on disk —
+          // the locked write didn't half-create a cleartext node before failing.
+          check: (vault) => {
+            const leaks = scanTreeForToken(vault, LOCKED_WRITE_TOKEN).hits;
+            expect(leaks, `locked-write plaintext leaked onto disk into: ${leaks.join(", ")}`).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J8-06",
+      title: "Decrypting the vault restores plaintext on disk, removes the encryption marker, and it still verifies",
+      actions: [
+        {
+          args: ["vault", "decrypt", "--yes"],
+          stdout: [/Decrypted \d+ file\(s\)/],
+          // Plaintext on disk now, and the encrypted-vault marker is gone.
+          files: [
+            { path: "nodes/secret.md", contains: ENC_SECRET },
+            { path: ".context/encryption.yaml", exists: false },
+          ],
+        },
+        // Read confirms the body is plain Markdown again...
+        { args: ["read", "nodes/secret", "--raw"], stdout: [ENC_SECRET] },
+        // ...and it is still a well-formed, searchable vault afterwards.
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+        {
+          args: ["search", ENC_SECRET, "--json"],
+          json: (data) => expect(searchIds(data)).toEqual(["nodes/secret"]),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -1496,5 +1777,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J7 — govern a vault with a review gate", () => {
     runJourney({ installDir: INSTALL, scratch }, J7);
+  });
+
+  it("J8 — keep a vault encrypted at rest", () => {
+    runJourney({ installDir: INSTALL, scratch }, J8);
   });
 });
