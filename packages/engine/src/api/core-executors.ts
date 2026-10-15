@@ -412,6 +412,13 @@ const search: OperationExecutor = async (ctx, input: any) => {
   const docs = await ctx.storage.discoverDocuments();
   const { mode, store } = await chooseSearchMode(ctx, input.mode, searchCfg);
 
+  // Rerank sends decrypted text to a third party: not from a sealed vault.
+  if (input.rerank && (await ctx.storage.isEncrypted())) {
+    throw new ContextNestError(
+      "rerank is not supported on an encrypted vault: it would send decrypted content to the reranker",
+      "VALIDATION_FAILED",
+    );
+  }
   if (input.rerank && !searchCfg.rerank) {
     throw new ContextNestError(
       "rerank needs a `search.rerank` block (provider + model) in .context/config.yaml",
@@ -505,6 +512,15 @@ async function chooseSearchMode(
     if (!requested) return { mode: "lexical" };
     throw new ContextNestError(
       `mode "${wanted}" needs a \`search.embeddings\` block (provider + model) in .context/config.yaml`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // context_embed refuses sealed vaults; an index left from before the vault
+  // was encrypted must not keep serving a plaintext-derived copy.
+  if (await ctx.storage.isEncrypted()) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" is not supported on an encrypted vault (embeddings are a plaintext-derived copy)`,
       "VALIDATION_FAILED",
     );
   }

@@ -17,7 +17,7 @@
  * carries its own `.gitignore` (`*`): the index is derived data, rebuildable
  * with `ctx embed --rebuild`, and must never be committed.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ContextNode } from "../types.js";
@@ -113,8 +113,16 @@ export class EmbeddingStore {
     } catch {
       return store; // unreadable index: treat as empty, the next embed rebuilds it
     }
-    const dims = meta.dimensions;
-    if (meta.format !== 2 || buf.byteLength !== meta.entries.length * dims * 4) return store;
+    const dims = meta?.dimensions;
+    if (
+      meta?.format !== 2 ||
+      !Number.isInteger(dims) ||
+      dims <= 0 ||
+      !Array.isArray(meta.entries) ||
+      buf.byteLength !== meta.entries.length * dims * 4
+    ) {
+      return store;
+    }
     store.dimensions = dims;
     store.provider ||= meta.provider;
     store.model ||= meta.model;
@@ -154,6 +162,9 @@ export class EmbeddingStore {
 
   set(key: EmbeddingKey, vector: ArrayLike<number>): void {
     const v = normalize(vector);
+    if (v.length === 0 || !v.every(Number.isFinite)) {
+      throw new Error(`embedding for ${key.id} is empty or has non-finite values — the provider returned a bad vector`);
+    }
     if (this.dimensions && v.length !== this.dimensions) {
       throw new Error(`embedding for ${key.id} has ${v.length} dimensions, index has ${this.dimensions}`);
     }
@@ -197,7 +208,7 @@ export class EmbeddingStore {
     json = Buffer.concat([json, Buffer.alloc((4 - (json.length % 4)) % 4, " ")]);
     const head = Buffer.alloc(4);
     head.writeUInt32LE(json.length, 0);
-    const tmp = `${this.path}.tmp-${process.pid}-${Date.now()}`;
+    const tmp = `${this.path}.tmp-${process.pid}-${randomUUID()}`;
     await writeFile(tmp, Buffer.concat([head, json, Buffer.from(all.buffer, all.byteOffset, all.byteLength)]));
     await rename(tmp, this.path);
   }

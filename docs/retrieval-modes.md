@@ -118,5 +118,5 @@ Each embedding request is also capped at `max_request_chars` total characters (d
 - Stored at `.context/embeddings/<provider>--<model>[--d<dims>].vec`: a JSON header with the keys, then the unit vectors (float32 LE), replaced by a single rename so a search never reads half of a save. There is one file per provider and model, so switching models never mixes vector spaces. The directory writes its own `.gitignore` (`*`) because the index is derived and rebuildable and is never committed.
 - `ctx embed` does not hold the vault write lock while it calls the provider, so writes are not blocked during a long run. It takes the lock only to save, and each save keeps only vectors that still match a published document.
 - Against a remote nest, `ctx embed` runs the nest's `context_embed` if it has one, and otherwise refuses.
-- Encrypted vaults refuse `ctx embed`, because vectors are a plaintext-derived copy of sealed content.
+- Encrypted vaults refuse `ctx embed`, because vectors are a plaintext-derived copy of sealed content. They also refuse `--rerank` (it would send decrypted text to the reranker) and an explicit semantic/hybrid search; a configured `search.mode` falls back to lexical.
 - Each document gets one vector. Long documents are cut at `max_chars`. Section-level chunking is not implemented yet.

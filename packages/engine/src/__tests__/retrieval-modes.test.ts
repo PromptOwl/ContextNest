@@ -502,6 +502,49 @@ describe("context_embed — governed embedding index", () => {
     expect(after).toContain("nodes/escalation");
   });
 
+  it("Given an encrypted vault, Then rerank and explicit semantic search are refused, and config defaults fall back to lexical", async () => {
+    await api.run("context_embed", {}, ctx);
+    vi.spyOn(ctx.storage, "isEncrypted").mockResolvedValue(true);
+    await expect(api.run("context_search", { query: "refund", rerank: true }, ctx)).rejects.toThrow(/encrypted/);
+    await expect(api.run("context_search", { query: "refund", mode: "hybrid" }, ctx)).rejects.toThrow(/encrypted/);
+    expect(rerankCalls).toBe(0);
+    await writeFile(
+      join(dir, ".context", "config.yaml"),
+      `version: 1\nname: test\nsearch:\n  mode: hybrid\n  embeddings:\n    provider: stub\n    model: concepts-v1\n`,
+    );
+    const out = await api.run<SearchOut>("context_search", { query: "refund" }, ctx);
+    expect(out.mode).toBe("lexical");
+  });
+
+  it("Given a truncated or malformed index file, Then it reads as empty instead of failing every search", async () => {
+    await api.run("context_embed", {}, ctx);
+    const index = join(dir, EMBEDDINGS_DIR, "stub--concepts-v1.vec");
+    const good = await readFile(index);
+    for (const bad of [good.subarray(0, 10), Buffer.from([2, 0, 0, 0, 110, 117]), Buffer.alloc(0)]) {
+      await writeFile(index, bad);
+      await expect(
+        api.run("context_search", { query: "refund", mode: "semantic" }, ctx),
+      ).rejects.toThrow(/ctx embed|context_embed/);
+    }
+    const out = await api.run<{ embedded: number }>("context_embed", {}, ctx);
+    expect(out.embedded).toBe(3);
+  });
+
+  it("Given a provider returning NaN, Then embed fails loudly instead of storing it", async () => {
+    registerEmbeddingProvider("stub-nan", () => ({
+      name: "stub-nan",
+      model: "m",
+      async embed(texts) {
+        return texts.map(() => [NaN, 1]);
+      },
+    }));
+    await writeFile(
+      join(dir, ".context", "config.yaml"),
+      `version: 1\nname: test\nsearch:\n  embeddings:\n    provider: stub-nan\n    model: m\n`,
+    );
+    await expect(api.run("context_embed", {}, ctx)).rejects.toThrow(/non-finite/);
+  });
+
   it("search calls providers with the short interactive retry budget", async () => {
     const seen: unknown[] = [];
     registerEmbeddingProvider("stub-budget", (_cfg, call) => {
