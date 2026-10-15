@@ -1503,9 +1503,20 @@ const J7: Journey = {
  * Case ids + titles are the ticket's verbatim lines.
  */
 const ENC_SECRET = "TOPSECRET-BODY-42"; // the sealed body — must never surface in a raw file
+// A body for a write that must be REFUSED while the vault is locked (J8-05b).
+// Distinct from ENC_SECRET so a tree scan for it can only hit a leaked write.
+const LOCKED_WRITE_TOKEN = "LOCKEDWRITE-NEVER-LANDS-9000";
 // The recovery passphrase `init --encrypted` prints once — six groups of four
 // upper-alnum chars (e.g. EH5J-32ZG-6D4C-F453-62WF-B7K9).
 const RECOVERY = /([0-9A-Z]{4}-){5}[0-9A-Z]{4}/;
+// A raw V8 stack-trace frame — "    at fn (file:12:3)" or "    at file:12:3".
+// Anchored on a callsite (paren-wrapped frame OR a file:line:col) so a prose
+// line like "  at least one key is required" can't false-positive as a leak.
+const STACK_TRACE = /\n\s+at \S+ \(|\n\s+at .*:\d+:\d+/;
+// J8 is ORDER-DEPENDENT BY DESIGN: all cases share one encrypted vault, and
+// J8-05's recovery-unlock reuses the passphrase J8-01 printed. Running a subset
+// with `-t` breaks that chain; the explicit assert in J8-05 turns that into a
+// clear failure rather than a confusing key mismatch.
 let j8Passphrase = ""; // captured from J8-01's init, used by J8-05's unlock step
 
 /** A fresh config dir that has never held the vault key — a "machine without the key". */
@@ -1635,9 +1646,14 @@ const J8: Journey = {
           // Even the error must not spill the sealed body, nor dump a raw stack
           // trace — a locked vault degrades to a friendly, leak-free message.
           stdoutNot: [ENC_SECRET],
-          stderrNot: [ENC_SECRET, /(^|\n)\s+at /],
+          stderrNot: [ENC_SECRET, STACK_TRACE],
         },
-        // A wrong passphrase is rejected, not silently accepted.
+        // A wrong passphrase is rejected, not silently accepted. The value is a
+        // WELL-FORMED recovery passphrase (six groups of four, matches RECOVERY)
+        // that is simply not THIS vault's — so it reaches the KEK-derivation /
+        // GCM-auth check and fails as VAULT_KEY_MISMATCH, not a format-validation
+        // path. If a future change adds format pre-validation, this must still
+        // surface a mismatch, not a "malformed passphrase" error.
         {
           args: ["read", "nodes/secret", "--raw"],
           status: 1,
@@ -1647,7 +1663,7 @@ const J8: Journey = {
           }),
           stderr: ["VAULT_KEY_MISMATCH"],
           stdoutNot: [ENC_SECRET],
-          stderrNot: [ENC_SECRET, /(^|\n)\s+at /],
+          stderrNot: [ENC_SECRET, STACK_TRACE],
         },
         // The recovery passphrase printed at init unlocks the vault on a machine
         // without the stored key — the user's way back in.
@@ -1667,6 +1683,38 @@ const J8: Journey = {
             };
           },
           stdout: ["title: My Secret", ENC_SECRET],
+        },
+      ],
+    },
+    {
+      // Added coverage for the at-rest write invariant (storage.ts
+      // readText/sealText): a write that cannot seal must refuse BEFORE any
+      // plaintext touches disk. A fresh config dir locks the vault; the add is
+      // rejected with VAULT_LOCKED, and the whole tree is scanned to prove the
+      // would-be body never landed in cleartext. The real key is untouched, so
+      // J8-06 below still decrypts normally.
+      id: "J8-05b",
+      title: "A write while the vault is locked is refused and leaves no plaintext on disk",
+      actions: [
+        {
+          args: [
+            "add", "nodes/locked-write",
+            "--type", "document",
+            "--title", "Should Not Persist",
+            "--body", LOCKED_WRITE_TOKEN,
+            "-y",
+          ],
+          status: 1,
+          env: () => ({ CONTEXTNEST_CONFIG_DIR: j8KeylessDir() }),
+          stderr: ["VAULT_LOCKED"],
+          stdoutNot: [LOCKED_WRITE_TOKEN],
+          stderrNot: [LOCKED_WRITE_TOKEN, STACK_TRACE],
+          // The strong assertion: the plaintext body appears NOWHERE on disk —
+          // the locked write didn't half-create a cleartext node before failing.
+          check: (vault) => {
+            const leaks = scanTreeForToken(vault, LOCKED_WRITE_TOKEN).hits;
+            expect(leaks, `locked-write plaintext leaked onto disk into: ${leaks.join(", ")}`).toEqual([]);
+          },
         },
       ],
     },
