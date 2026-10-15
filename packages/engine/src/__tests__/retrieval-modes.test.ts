@@ -6,7 +6,7 @@
  * Every provider here is an in-process stub: no test touches the network.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "node:path";
 import { mkdtemp, rm, writeFile, mkdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,6 +18,7 @@ import { createEngineApi, type OperationContext } from "../api/index.js";
 import {
   registerEmbeddingProvider,
   registerReranker,
+  createOpenAiEmbeddingProvider,
   type EmbeddingProvider,
   type Reranker,
 } from "../semantic/providers.js";
@@ -31,6 +32,7 @@ import {
   type RankedHit,
 } from "../semantic/hybrid.js";
 import { splitPassages } from "../semantic/passages.js";
+import { parseSearchConfig } from "../semantic/config.js";
 import { EMBEDDINGS_DIR } from "../semantic/embedding-store.js";
 import {
   createBedrockEmbeddingProvider,
@@ -356,8 +358,30 @@ describe("context_embed — governed embedding index", () => {
     expect(EMBEDDINGS_DIR).toBe(".context/embeddings");
     const gi = await readFile(join(dir, EMBEDDINGS_DIR, ".gitignore"), "utf-8");
     expect(gi.trim()).toBe("*");
-    await stat(join(dir, EMBEDDINGS_DIR, "stub--concepts-v1.json"));
-    await stat(join(dir, EMBEDDINGS_DIR, "stub--concepts-v1.f32"));
+    await stat(join(dir, EMBEDDINGS_DIR, "stub--concepts-v1.vec"));
+  });
+
+  it("embed holds no vault lock while the provider runs, and a forget made meanwhile wins", async () => {
+    let during: (() => Promise<unknown>) | undefined;
+    registerEmbeddingProvider("stub-hook", () => ({
+      name: "stub-hook",
+      model: "concepts-v1",
+      async embed(texts) {
+        const f = during;
+        during = undefined;
+        if (f) await f(); // would time out on the lock if embed held it
+        return texts.map(conceptVector);
+      },
+    }));
+    await writeFile(
+      join(dir, ".context", "config.yaml"),
+      `version: 1\nname: test\nsearch:\n  embeddings:\n    provider: stub-hook\n    model: concepts-v1\n`,
+    );
+    during = () => api.run("context_forget", { id: "nodes/refunds", reason_code: "user_request" }, ctx);
+    const out = await api.run<{ total: number }>("context_embed", {}, ctx);
+    expect(out.total).toBe(2);
+    const index = await readFile(join(dir, EMBEDDINGS_DIR, "stub-hook--concepts-v1.vec"));
+    expect(index.toString("latin1")).not.toContain("nodes/refunds");
   });
 
   it("Given an unchanged vault, When embedding again, Then nothing is re-embedded", async () => {
@@ -447,6 +471,51 @@ describe("context_embed — governed embedding index", () => {
     expect(rerankCalls).toBe(1);
     expect(reranked.results.map((r) => r.id)).toEqual([...plain.results.map((r) => r.id)].reverse());
     expect(typeof reranked.results[0].scores?.rerank).toBe("number");
+  });
+
+  it("Given lexical + rerank, Then an exact title match stays pinned first", async () => {
+    await api.run("context_create", {
+      id: "nodes/release-notes", title: "Notes", content: "release train release train notes",
+    }, ctx);
+    const out = await api.run<SearchOut>("context_search", { query: "Release train", rerank: true }, ctx);
+    expect(rerankCalls).toBe(1);
+    // The reverse reranker would put release-notes first if the seed were reranked.
+    expect(out.results.map((r) => r.id)).toEqual(["nodes/release", "nodes/release-notes"]);
+  });
+
+  it("Given semantic mode, Then an exact title match is pinned first even with no current vector", async () => {
+    await api.run("context_embed", {}, ctx);
+    await api.run("context_create", { id: "nodes/oncall", title: "Pager rota", content: "zzz" }, ctx);
+    const out = await api.run<SearchOut>("context_search", { query: "pager  ROTA", mode: "semantic" }, ctx);
+    expect(out.results[0].id).toBe("nodes/oncall");
+  });
+
+  it("Given a forgotten or deleted doc, Then its vector is purged from the index at once", async () => {
+    await api.run("context_embed", {}, ctx);
+    const index = join(dir, EMBEDDINGS_DIR, "stub--concepts-v1.vec");
+    expect((await readFile(index)).toString("latin1")).toContain("nodes/refunds");
+    await api.run("context_forget", { id: "nodes/refunds", reason_code: "user_request" }, ctx);
+    await api.run("context_delete", { id: "nodes/release" }, ctx);
+    const after = (await readFile(index)).toString("latin1");
+    expect(after).not.toContain("nodes/refunds");
+    expect(after).not.toContain("nodes/release");
+    expect(after).toContain("nodes/escalation");
+  });
+
+  it("search calls providers with the short interactive retry budget", async () => {
+    const seen: unknown[] = [];
+    registerEmbeddingProvider("stub-budget", (_cfg, call) => {
+      seen.push(call);
+      return stubProvider;
+    });
+    await writeFile(
+      join(dir, ".context", "config.yaml"),
+      `version: 1\nname: test\nsearch:\n  embeddings:\n    provider: stub-budget\n    model: concepts-v1\n`,
+    );
+    await api.run("context_embed", {}, ctx);
+    await api.run("context_search", { query: "refund", mode: "semantic" }, ctx);
+    expect(seen[0]).toBeUndefined(); // embed: the long batch defaults
+    expect(seen[1]).toMatchObject({ attempts: 2 });
   });
 
   it("default mode stays lexical even when an index exists, unless config opts in", async () => {
@@ -805,5 +874,56 @@ describe("rerank on passages, not whole documents", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ─── 8. config.yaml is untrusted: where keys may go ─────────────────────────
+
+describe("search config cannot steer secrets", () => {
+  it("Given a region that is not an AWS region, Then the config is refused", () => {
+    expect(() =>
+      parseSearchConfig({ embeddings: { provider: "bedrock", model: "cohere.embed-v4:0", region: "x.evil.com#" } }),
+    ).toThrow(/region/);
+  });
+
+  it("Given an api_key_env that is not *_API_KEY, Then the config is refused", () => {
+    expect(() =>
+      parseSearchConfig({ embeddings: { provider: "openai", model: "m", api_key_env: "GITHUB_TOKEN" } }),
+    ).toThrow(/api_key_env/);
+  });
+
+  it("Given a non-http base_url, Then the config is refused", () => {
+    expect(() => parseSearchConfig({ embeddings: { provider: "openai", model: "m", base_url: "file:///etc" } })).toThrow(
+      /base_url/,
+    );
+  });
+
+  describe("implicit OPENAI_API_KEY", () => {
+    const auth: Array<string | undefined> = [];
+    beforeEach(() => {
+      auth.length = 0;
+      vi.stubEnv("OPENAI_API_KEY", "sk-test");
+      vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
+        auth.push((init.headers as Record<string, string>).authorization);
+        return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1] }] }));
+      });
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+    });
+
+    it("is sent to the default OpenAI host", async () => {
+      await createOpenAiEmbeddingProvider({ provider: "openai", model: "m" }).embed(["a"], "query");
+      expect(auth).toEqual(["Bearer sk-test"]);
+    });
+
+    it("is never sent to a base_url the vault chose", async () => {
+      await createOpenAiEmbeddingProvider({ provider: "openai", model: "m", base_url: "http://127.0.0.1:9/v1" }).embed(
+        ["a"],
+        "query",
+      );
+      expect(auth).toEqual([undefined]);
+    });
   });
 });

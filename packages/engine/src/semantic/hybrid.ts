@@ -111,7 +111,11 @@ function vectorRank(
       stale++;
       continue;
     }
-    if (v.length !== queryVec.length) continue;
+    if (v.length !== queryVec.length) {
+      throw new Error(
+        `query embedding has ${queryVec.length} dimensions, the index has ${v.length} — check search.embeddings.dimensions or run ctx embed --rebuild`,
+      );
+    }
     let dot = 0;
     for (let i = 0; i < v.length; i++) dot += v[i] * queryVec[i];
     ranked.push({ id: d.id, score: dot });
@@ -135,7 +139,21 @@ export async function semanticSearch(query: string, opts: SemanticSearchOptions)
 
   let hits: RankedHit[];
   if (opts.mode === "semantic") {
-    hits = vecTop.map((h) => ({ document: byId.get(h.id)!, score: h.score, scores: { semantic: h.score } }));
+    // Seeds first, as in hybrid (by similarity; one with no current vector
+    // last), then the rest of the vector list.
+    const seedSet = new Set(exactSeeds(q, published));
+    const semAll = new Map(vec.map((h) => [h.id, h.score]));
+    const seedOrder = [...seedSet].sort((a, b) => (semAll.get(b) ?? -2) - (semAll.get(a) ?? -2));
+    const order = [...seedOrder, ...vecTop.map((h) => h.id).filter((id) => !seedSet.has(id))];
+    hits = order.map((id) => {
+      const s = semAll.get(id);
+      return {
+        document: byId.get(id)!,
+        score: s ?? 0,
+        scores: s === undefined ? {} : { semantic: s },
+        ...(seedSet.has(id) ? { seed: true } : {}),
+      };
+    });
   } else {
     const lexical = new Resolver({
       documents: published,
@@ -343,12 +361,15 @@ export async function buildEmbeddings(
     /** Total characters per provider call; batches are split to fit (default 200k). */
     maxRequestChars?: number;
     saveEvery?: number;
+    /** Persist the store (default `store.save()`); context_embed saves under the vault lock. */
+    save?: () => Promise<void>;
     onProgress?: (done: number, total: number) => void;
   } = {},
 ): Promise<BuildResult> {
   const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
   const batchSize = opts.batchSize ?? 32;
   const saveEvery = opts.saveEvery ?? 20;
+  const save = opts.save ?? (() => store.save());
   if (opts.rebuild) store.clear();
 
   const published = embeddable(docs);
@@ -383,9 +404,9 @@ export async function buildEmbeddings(
     batch.forEach((t, j) => store.set(t.key, vectors[j]));
     done += batch.length;
     opts.onProgress?.(done, todo.length);
-    if (++batches % saveEvery === 0) await store.save();
+    if (++batches % saveEvery === 0) await save();
   }
-  await store.save();
+  await save();
   return {
     provider: store.provider,
     model: store.model,

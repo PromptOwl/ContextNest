@@ -6,24 +6,27 @@
  * each entry is keyed by (doc id, version, sha256 of the embedded text), and a
  * vector whose key no longer matches the live published document is ignored at
  * query time and dropped on the next `context_embed`. A new version therefore
- * invalidates its own vector and nothing else.
+ * invalidates its own vector and nothing else. Forget and delete purge the
+ * document's vector at once (purgeEmbeddings).
  *
- * Storage: `.context/embeddings/<provider>--<model>[--d<dims>].{json,f32}` —
- * the `.json` holds the keys (row order), the `.f32` holds the unit-normalized
- * vectors as little-endian float32 rows. Binary because a 50k-document corpus
- * at 1536 dimensions would not fit in one JSON string. One file pair per
- * provider+model, so switching models never mixes vector spaces. The directory
+ * Storage: `.context/embeddings/<provider>--<model>[--d<dims>].vec` — a JSON
+ * header with the keys (row order), then the unit-normalized vectors as
+ * little-endian float32 rows. Binary because a 50k-document corpus at 1536
+ * dimensions would not fit in one JSON string. One file per provider+model,
+ * so switching models never mixes vector spaces. The directory
  * carries its own `.gitignore` (`*`): the index is derived data, rebuildable
  * with `ctx embed --rebuild`, and must never be committed.
  */
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ContextNode } from "../types.js";
 import { isPublished } from "../parser.js";
 
 export const EMBEDDINGS_DIR = ".context/embeddings";
 export const DEFAULT_MAX_CHARS = 20_000;
+/** Index file extension (format 2: one file; format-1 .json/.f32 pairs are ignored and rebuilt). */
+export const INDEX_EXT = ".vec";
 
 export interface EmbeddingKey {
   id: string;
@@ -32,7 +35,7 @@ export interface EmbeddingKey {
 }
 
 interface IndexMeta {
-  format: 1;
+  format: 2;
   provider: string;
   model: string;
   dimensions: number;
@@ -77,27 +80,44 @@ export class EmbeddingStore {
 
   private constructor(
     readonly root: string,
-    readonly provider: string,
-    readonly model: string,
+    public provider: string,
+    public model: string,
     readonly fileStem: string,
   ) {}
 
-  static async load(root: string, provider: string, model: string, dimensions?: number): Promise<EmbeddingStore> {
-    const store = new EmbeddingStore(root, provider, model, slug(provider, model, dimensions));
-    let meta: IndexMeta;
+  static load(root: string, provider: string, model: string, dimensions?: number): Promise<EmbeddingStore> {
+    return EmbeddingStore.read(new EmbeddingStore(root, provider, model, slug(provider, model, dimensions)));
+  }
+
+  /** The index stored as `<stem>.vec`, provider and model taken from its header. */
+  static loadStem(root: string, stem: string): Promise<EmbeddingStore> {
+    return EmbeddingStore.read(new EmbeddingStore(root, "", "", stem));
+  }
+
+  private static async read(store: EmbeddingStore): Promise<EmbeddingStore> {
     let buf: Buffer;
     try {
-      meta = JSON.parse(await readFile(store.metaPath, "utf-8"));
-      buf = await readFile(store.vectorPath);
+      buf = await readFile(store.path);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return store;
       throw err;
     }
-    const dims = meta.dimensions;
-    if (meta.format !== 1 || buf.byteLength !== meta.entries.length * dims * 4) {
-      return store; // unreadable/torn index: treat as empty, the next embed rebuilds it
+    // [u32 LE header length][JSON header, space-padded to 4 bytes][float32 LE rows].
+    // One file, swapped by one rename, so a reader never pairs one run's keys
+    // with another run's vectors.
+    let meta: IndexMeta;
+    try {
+      const len = buf.readUInt32LE(0);
+      meta = JSON.parse(buf.subarray(4, 4 + len).toString("utf-8"));
+      buf = buf.subarray(4 + len);
+    } catch {
+      return store; // unreadable index: treat as empty, the next embed rebuilds it
     }
+    const dims = meta.dimensions;
+    if (meta.format !== 2 || buf.byteLength !== meta.entries.length * dims * 4) return store;
     store.dimensions = dims;
+    store.provider ||= meta.provider;
+    store.model ||= meta.model;
     const all = new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
     meta.entries.forEach((key, i) => {
       store.rows.set(key.id, { key, vector: all.subarray(i * dims, (i + 1) * dims) });
@@ -108,15 +128,12 @@ export class EmbeddingStore {
   get dir(): string {
     return join(this.root, EMBEDDINGS_DIR);
   }
-  get metaPath(): string {
-    return join(this.dir, `${this.fileStem}.json`);
-  }
-  get vectorPath(): string {
-    return join(this.dir, `${this.fileStem}.f32`);
+  get path(): string {
+    return join(this.dir, `${this.fileStem}${INDEX_EXT}`);
   }
   /** Vault-relative path of the index (for reporting). */
   get relativePath(): string {
-    return `${EMBEDDINGS_DIR}/${this.fileStem}.{json,f32}`;
+    return `${EMBEDDINGS_DIR}/${this.fileStem}${INDEX_EXT}`;
   }
 
   get size(): number {
@@ -148,12 +165,21 @@ export class EmbeddingStore {
     this.rows.delete(id);
   }
 
+  /** Drop every row not computed from the current published state of its document. */
+  retainCurrent(docs: ContextNode[], maxChars?: number): void {
+    const live = new Map(embeddable(docs).map((d) => [d.id, keyFor(d, maxChars)]));
+    for (const id of this.ids()) {
+      const key = live.get(id);
+      if (!key || !this.vectorFor(key)) this.rows.delete(id);
+    }
+  }
+
   clear(): void {
     this.rows.clear();
     this.dimensions = 0;
   }
 
-  /** Write both files atomically (tmp + rename), plus the self-ignoring .gitignore. */
+  /** Write the index atomically (tmp + one rename), plus the self-ignoring .gitignore. */
   async save(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
     await writeFile(join(this.dir, ".gitignore"), "*\n");
@@ -166,12 +192,38 @@ export class EmbeddingStore {
       all.set(vector, i * dims);
       i++;
     }
-    const meta: IndexMeta = { format: 1, provider: this.provider, model: this.model, dimensions: dims, entries };
-    const tag = `.tmp-${process.pid}-${Date.now()}`;
-    await writeFile(this.vectorPath + tag, Buffer.from(all.buffer, all.byteOffset, all.byteLength));
-    await writeFile(this.metaPath + tag, JSON.stringify(meta));
-    await rename(this.vectorPath + tag, this.vectorPath);
-    await rename(this.metaPath + tag, this.metaPath);
+    const meta: IndexMeta = { format: 2, provider: this.provider, model: this.model, dimensions: dims, entries };
+    let json = Buffer.from(JSON.stringify(meta), "utf-8");
+    json = Buffer.concat([json, Buffer.alloc((4 - (json.length % 4)) % 4, " ")]);
+    const head = Buffer.alloc(4);
+    head.writeUInt32LE(json.length, 0);
+    const tmp = `${this.path}.tmp-${process.pid}-${Date.now()}`;
+    await writeFile(tmp, Buffer.concat([head, json, Buffer.from(all.buffer, all.byteOffset, all.byteLength)]));
+    await rename(tmp, this.path);
+  }
+}
+
+/**
+ * Remove these documents' vectors from every index in the vault (forget,
+ * delete): erased content must not live on as a derived copy until the next
+ * `context_embed`. Callers hold the vault lock, as `context_embed` does when
+ * it saves, so the two never interleave.
+ */
+export async function purgeEmbeddings(root: string, ids: string[]): Promise<void> {
+  let files: string[];
+  try {
+    files = await readdir(join(root, EMBEDDINGS_DIR));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  for (const f of files.filter((f) => f.endsWith(INDEX_EXT))) {
+    const stem = f.slice(0, -INDEX_EXT.length);
+    const store = await EmbeddingStore.loadStem(root, stem);
+    const held = new Set(store.ids());
+    if (!ids.some((id) => held.has(id))) continue;
+    for (const id of ids) store.delete(id);
+    await store.save();
   }
 }
 

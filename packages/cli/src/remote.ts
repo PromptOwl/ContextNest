@@ -614,6 +614,23 @@ export async function remoteSearch(
   });
 }
 
+/**
+ * `ctx embed` against a remote nest: run its `context_embed` when it offers
+ * one; otherwise refuse — the nest builds its own index, and embedding a
+ * local folder instead would report success for the wrong vault.
+ */
+export async function remoteEmbed<T>(target: RemoteTarget, input: { rebuild?: true }): Promise<T> {
+  return withRemote(target, async (conn) => {
+    if (!(await conn.toolNames()).has("context_embed")) {
+      throw new ContextNestError(
+        `Remote nest "${target.alias}" does not expose context_embed — its search index is managed by the nest. Nothing was embedded.`,
+        "NOT_IMPLEMENTED",
+      );
+    }
+    return conn.run<T>("context_embed", input);
+  });
+}
+
 export async function remoteRead(
   target: RemoteTarget,
   path: string,

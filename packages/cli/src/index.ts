@@ -86,6 +86,7 @@ import {
   remoteList,
   remoteQuery,
   remoteSearch,
+  remoteEmbed,
   remoteRead,
   remoteVerify,
   remoteHistory,
@@ -3175,12 +3176,7 @@ program
   .option("--rebuild", "Discard the index and re-embed every published document")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
-    const storage = getStorage();
-    const progress =
-      !opts.json && process.stderr.isTTY
-        ? (done: number, total: number) => process.stderr.write(`\r  embedding ${done}/${total}`)
-        : undefined;
-    const out = await cliApi().run<{
+    type EmbedOut = {
       provider: string;
       model: string;
       path: string;
@@ -3189,8 +3185,21 @@ program
       reused: number;
       pruned: number;
       dimensions: number;
-    }>("context_embed", opts.rebuild ? { rebuild: true } : {}, opContext(storage, "cli@contextnest.local", progress));
-    if (progress) process.stderr.write("\n");
+    };
+    const input: { rebuild?: true } = opts.rebuild ? { rebuild: true } : {};
+    const remote = remoteTarget(selectedVaultAlias);
+    let out: EmbedOut;
+    if (remote) {
+      out = await remoteEmbed<EmbedOut>(remote, input);
+    } else {
+      const storage = getStorage();
+      const progress =
+        !opts.json && process.stderr.isTTY
+          ? (done: number, total: number) => process.stderr.write(`\r  embedding ${done}/${total}`)
+          : undefined;
+      out = await cliApi().run<EmbedOut>("context_embed", input, opContext(storage, "cli@contextnest.local", progress));
+      if (progress) process.stderr.write("\n");
+    }
     if (opts.json) {
       console.log(JSON.stringify(out, null, 2));
       return;

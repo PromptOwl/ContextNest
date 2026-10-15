@@ -12,10 +12,11 @@
  * `registerReranker`.
  */
 import { ConfigError } from "../errors.js";
-import type { EmbeddingsConfig, RerankConfig } from "./config.js";
+import { API_KEY_ENV_PATTERN, type EmbeddingsConfig, type RerankConfig } from "./config.js";
 import {
   BedrockHttpError,
   BEDROCK_REQUEST_TIMEOUT_MS,
+  type CallOptions,
   createBedrockEmbeddingProvider,
   createBedrockReranker,
   parseRetryAfter,
@@ -41,8 +42,9 @@ export interface Reranker {
   rerank(query: string, documents: string[], topN: number): Promise<Array<{ index: number; score: number }>>;
 }
 
-export type EmbeddingProviderFactory = (cfg: EmbeddingsConfig) => EmbeddingProvider;
-export type RerankerFactory = (cfg: RerankConfig) => Reranker;
+/** `call`: retry/timeout budget (search passes INTERACTIVE_CALL; omitted = the embed defaults). */
+export type EmbeddingProviderFactory = (cfg: EmbeddingsConfig, call?: CallOptions) => EmbeddingProvider;
+export type RerankerFactory = (cfg: RerankConfig, call?: CallOptions) => Reranker;
 
 const embeddingFactories = new Map<string, EmbeddingProviderFactory>();
 const rerankFactories = new Map<string, RerankerFactory>();
@@ -55,41 +57,53 @@ export function registerReranker(name: string, factory: RerankerFactory): void {
   rerankFactories.set(name, factory);
 }
 
-export function createEmbeddingProvider(cfg: EmbeddingsConfig): EmbeddingProvider {
+export function createEmbeddingProvider(cfg: EmbeddingsConfig, call?: CallOptions): EmbeddingProvider {
   const factory = embeddingFactories.get(cfg.provider);
   if (!factory) {
     throw new ConfigError(
       `Unknown search.embeddings.provider "${cfg.provider}" — use one of: ${[...embeddingFactories.keys()].join(", ")}`,
     );
   }
-  return factory(cfg);
+  return factory(cfg, call);
 }
 
-export function createReranker(cfg: RerankConfig): Reranker {
+export function createReranker(cfg: RerankConfig, call?: CallOptions): Reranker {
   const factory = rerankFactories.get(cfg.provider);
   if (!factory) {
     throw new ConfigError(
       `Unknown search.rerank.provider "${cfg.provider}" — use one of: ${[...rerankFactories.keys()].join(", ")}`,
     );
   }
-  return factory(cfg);
+  return factory(cfg, call);
 }
 
 // ─── OpenAI-compatible HTTP (OpenAI, Ollama, vLLM, LM Studio, TEI …) ─────────
 
-function apiKey(cfg: { api_key_env?: string }, fallbackEnv: string): string | undefined {
-  return process.env[cfg.api_key_env ?? fallbackEnv] || undefined;
+/**
+ * The bearer key. A named `api_key_env` must end in _API_KEY (checked again
+ * here for callers that skip parseSearchConfig); the implicit fallback env is
+ * read only when the vault set no `base_url` — a key is never handed to a
+ * URL the vault chose unless the vault names that key.
+ */
+function apiKey(cfg: { api_key_env?: string; base_url?: string }, fallbackEnv: string): string | undefined {
+  if (cfg.api_key_env !== undefined) {
+    if (!API_KEY_ENV_PATTERN.test(cfg.api_key_env)) {
+      throw new ConfigError(`api_key_env "${cfg.api_key_env}" must name an env var ending in _API_KEY`);
+    }
+    return process.env[cfg.api_key_env] || undefined;
+  }
+  return cfg.base_url ? undefined : process.env[fallbackEnv] || undefined;
 }
 
 /** POST JSON, retrying 429/502/503/504 and dropped connections/timeouts with the same backoff as Bedrock (Retry-After honoured). */
-function postJson(url: string, body: unknown, key: string | undefined): Promise<any> {
-  return withBedrockRetry(() => postJsonOnce(url, body, key));
+function postJson(url: string, body: unknown, key: string | undefined, call: CallOptions = {}): Promise<any> {
+  return withBedrockRetry(() => postJsonOnce(url, body, key, call.timeoutMs ?? BEDROCK_REQUEST_TIMEOUT_MS), call);
 }
 
-async function postJsonOnce(url: string, body: unknown, key: string | undefined): Promise<any> {
+async function postJsonOnce(url: string, body: unknown, key: string | undefined, timeoutMs: number): Promise<any> {
   const res = await fetch(url, {
     method: "POST",
-    signal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
     headers: {
       "content-type": "application/json",
       ...(key ? { authorization: `Bearer ${key}` } : {}),
@@ -111,7 +125,7 @@ function baseUrl(cfg: { base_url?: string }): string {
   return (cfg.base_url ?? "https://api.openai.com/v1").replace(/\/+$/, "");
 }
 
-export function createOpenAiEmbeddingProvider(cfg: EmbeddingsConfig): EmbeddingProvider {
+export function createOpenAiEmbeddingProvider(cfg: EmbeddingsConfig, call?: CallOptions): EmbeddingProvider {
   return {
     name: cfg.provider,
     model: cfg.model,
@@ -120,6 +134,7 @@ export function createOpenAiEmbeddingProvider(cfg: EmbeddingsConfig): EmbeddingP
         `${baseUrl(cfg)}/embeddings`,
         { model: cfg.model, input: texts, ...(cfg.dimensions ? { dimensions: cfg.dimensions } : {}) },
         apiKey(cfg, "OPENAI_API_KEY"),
+        call,
       );
       const data = (out?.data ?? []) as Array<{ index?: number; embedding: number[] }>;
       if (data.length !== texts.length) {
@@ -131,7 +146,7 @@ export function createOpenAiEmbeddingProvider(cfg: EmbeddingsConfig): EmbeddingP
 }
 
 /** Cohere/Jina-style `POST {base_url}/rerank` (vLLM and most rerank servers speak it). */
-export function createOpenAiReranker(cfg: RerankConfig): Reranker {
+export function createOpenAiReranker(cfg: RerankConfig, call?: CallOptions): Reranker {
   return {
     name: cfg.provider,
     model: cfg.model,
@@ -140,6 +155,7 @@ export function createOpenAiReranker(cfg: RerankConfig): Reranker {
         `${baseUrl(cfg)}/rerank`,
         { model: cfg.model, query, documents, top_n: topN },
         apiKey(cfg, "RERANK_API_KEY"),
+        call,
       );
       return ((out?.results ?? []) as Array<{ index: number; relevance_score: number }>).map((r) => ({
         index: r.index,
@@ -153,5 +169,5 @@ for (const name of ["openai", "openai-compatible", "ollama", "vllm"]) {
   registerEmbeddingProvider(name, createOpenAiEmbeddingProvider);
   registerReranker(name, createOpenAiReranker);
 }
-registerEmbeddingProvider("bedrock", (cfg) => createBedrockEmbeddingProvider(cfg));
-registerReranker("bedrock", (cfg) => createBedrockReranker(cfg));
+registerEmbeddingProvider("bedrock", (cfg, call) => createBedrockEmbeddingProvider(cfg, undefined, call));
+registerReranker("bedrock", (cfg, call) => createBedrockReranker(cfg, undefined, call));

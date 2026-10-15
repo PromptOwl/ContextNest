@@ -65,7 +65,7 @@ search:
   embeddings:
     provider: bedrock          # bedrock | openai (also: openai-compatible, ollama, vllm)
     model: cohere.embed-v4:0   # or amazon.titan-embed-text-v2:0, us.cohere.embed-v4:0, ...
-    region: us-east-1          # bedrock; else AWS_REGION
+    region: us-east-1          # bedrock; else AWS_REGION (must look like an AWS region)
     dimensions: 1024           # optional output dimension
     batch_size: 32
     max_chars: 20000           # text embedded per document is cut here
@@ -90,6 +90,8 @@ search:
     api_key_env: OPENAI_API_KEY           # the NAME of an env var, never the key itself
 ```
 
+`config.yaml` is shared with the vault, so it is treated as untrusted. `api_key_env` must name a variable ending in `_API_KEY`, `base_url` must be an http(s) URL, and `region` must look like an AWS region (it becomes part of the Bedrock hostname). With a custom `base_url` no key is sent unless `api_key_env` names one: the `OPENAI_API_KEY` / `RERANK_API_KEY` fallback goes only to the default OpenAI host. Before you use a vault you did not write, check where its `search` block sends your queries and which key it names.
+
 The block is validated when search uses it, never when the config is loaded, so a typo here cannot break other commands.
 
 ### Bedrock credentials
@@ -103,14 +105,18 @@ Bedrock quotas are per minute and can be small. On a default account, Cohere Rer
 
 Dropped connections and timeouts are retried the same way. That covers smithy's "pending stream has been canceled", `TimeoutError`, `ECONNRESET`, `ETIMEDOUT`, `EPIPE`, "socket hang up" and undici's "terminated". Each request times out after 300s. The AWS SDK client runs with `maxAttempts: 1`, so its retries don't multiply ours.
 
+Those limits are for `ctx embed`. A search (the query embedding and the rerank) has someone waiting on it, often a prompt hook, so it gets 2 attempts, a 2s backoff cap and a 20s timeout per request, and then fails.
+
 Each embedding request is also capped at `max_request_chars` total characters (default 200,000). A `batch_size` batch of long documents is split to fit, and a single over-long document is sent on its own. `ctx embed` backs off per request, and an interrupted run resumes from the last saved batch.
 
 ## The index
 
 `ctx embed` (MCP: `context_embed`) builds or refreshes it.
 
-- **Only published documents are embedded.** Drafts, held, rejected, and forgotten documents, and superseded versions, are never sent to a provider or stored.
+- **Only published documents are embedded.** Drafts, held, rejected, and forgotten documents are never sent to a provider. `ctx forget` and `ctx delete` remove the document's vector at once. A superseded version's vector is never served and is dropped by the next `ctx embed`.
 - Each vector is keyed by **document id + version + SHA-256 of the embedded text** (title, description, body). A new version invalidates its own vector and nothing else. Search ignores a vector whose key no longer matches (it reports the count as `embeddings_stale`). The next `ctx embed` re-embeds new and changed documents, reuses current ones and prunes the rest. `--rebuild` starts over.
-- Stored at `.context/embeddings/<provider>--<model>[--d<dims>].json` (keys) + `.f32` (unit vectors, float32 LE). There is one pair per provider and model, so switching models never mixes vector spaces. The directory writes its own `.gitignore` (`*`) because the index is derived and rebuildable and is never committed.
+- Stored at `.context/embeddings/<provider>--<model>[--d<dims>].vec`: a JSON header with the keys, then the unit vectors (float32 LE), replaced by a single rename so a search never reads half of a save. There is one file per provider and model, so switching models never mixes vector spaces. The directory writes its own `.gitignore` (`*`) because the index is derived and rebuildable and is never committed.
+- `ctx embed` does not hold the vault write lock while it calls the provider, so writes are not blocked during a long run. It takes the lock only to save, and each save keeps only vectors that still match a published document.
+- Against a remote nest, `ctx embed` runs the nest's `context_embed` if it has one, and otherwise refuses.
 - Encrypted vaults refuse `ctx embed`, because vectors are a plaintext-derived copy of sealed content.
 - Each document gets one vector. Long documents are cut at `max_chars`. Section-level chunking is not implemented yet.

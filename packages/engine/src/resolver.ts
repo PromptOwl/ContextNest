@@ -93,14 +93,15 @@ export interface FieldBoosts {
  * workflow plane's replay guarantee needs exact matches to stay put.
  */
 export function exactSeeds(query: string, docs: ContextNode[]): string[] {
-  const q = query.trim().toLowerCase();
-  const asTag = q.replace(/^#/, "").replace(/\s+/g, "-");
+  const fold = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const q = fold(query);
+  const asTag = q.replace(/^#/, "").replace(/ /g, "-");
   const wanted = new Set(
     (query.match(/#[\p{L}\p{N}_/-]+/gu) ?? []).map((t) => t.slice(1).toLowerCase()),
   );
   const seeds: string[] = [];
   for (const d of docs) {
-    const title = String(d.frontmatter.title ?? "").trim().toLowerCase();
+    const title = fold(String(d.frontmatter.title ?? ""));
     const tags = stripTagPrefix(d.frontmatter.tags || []).map((t) => t.toLowerCase());
     if (title === q || tags.includes(asTag) || tags.some((t) => wanted.has(t))) seeds.push(d.id);
   }

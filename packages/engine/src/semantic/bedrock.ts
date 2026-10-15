@@ -14,7 +14,8 @@
  *     (`npm i -g @aws-sdk/client-bedrock-runtime`) to use SigV4 credentials
  *     (profiles, SSO, instance roles).
  */
-import type { EmbeddingsConfig, RerankConfig } from "./config.js";
+import { AWS_REGION_PATTERN, type EmbeddingsConfig, type RerankConfig } from "./config.js";
+import { ConfigError } from "../errors.js";
 import type { EmbeddingProvider, EmbedKind, Reranker } from "./providers.js";
 
 /** `(modelId, JSON body) → parsed JSON response`. Injected in tests. */
@@ -40,6 +41,23 @@ export interface RetryOptions {
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
 }
+
+/** Retry policy plus the per-request timeout of one provider call. */
+export interface CallOptions extends RetryOptions {
+  /** Per-request timeout in ms (default BEDROCK_REQUEST_TIMEOUT_MS). */
+  timeoutMs?: number;
+}
+
+/**
+ * Budget for calls made while someone waits on the answer (a search: the
+ * query embedding and the rerank). The 8-attempt / 300s defaults are for
+ * `ctx embed` batches; on a search they would hold a prompt hook for minutes.
+ */
+export const INTERACTIVE_CALL: Readonly<CallOptions> = Object.freeze({
+  attempts: 2,
+  capMs: 2_000,
+  timeoutMs: 20_000,
+});
 
 const RETRYABLE_NAMES = new Set([
   "ThrottlingException",
@@ -150,12 +168,17 @@ export function requestBatches(texts: string[], maxItems: number, maxChars: numb
   return out;
 }
 
+/** The region, checked: it is spliced into the hostname the bearer token is sent to. */
 function regionOf(cfg: { region?: string }): string {
-  return cfg.region ?? process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1";
+  const region = cfg.region ?? process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1";
+  if (!AWS_REGION_PATTERN.test(region)) {
+    throw new ConfigError(`Invalid AWS region "${region}" — expected e.g. us-east-1`);
+  }
+  return region;
 }
 
 /** Default transport (see file header). */
-export function defaultBedrockInvoke(region: string): BedrockInvoke {
+export function defaultBedrockInvoke(region: string, timeoutMs = BEDROCK_REQUEST_TIMEOUT_MS): BedrockInvoke {
   let sdkClient: Promise<{ send: (cmd: unknown) => Promise<any>; Command: any }> | undefined;
   return async (modelId, body) => {
     const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
@@ -165,7 +188,7 @@ export function defaultBedrockInvoke(region: string): BedrockInvoke {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -195,7 +218,7 @@ export function defaultBedrockInvoke(region: string): BedrockInvoke {
       const client = new mod.BedrockRuntimeClient({
         region,
         maxAttempts: 1,
-        requestHandler: { requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS, connectionTimeout: 10_000 },
+        requestHandler: { requestTimeout: timeoutMs, connectionTimeout: 10_000 },
       });
       return { send: (cmd: unknown) => client.send(cmd), Command: mod.InvokeModelCommand };
     })();
@@ -231,9 +254,9 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R
 export function createBedrockEmbeddingProvider(
   cfg: EmbeddingsConfig,
   invoke?: BedrockInvoke,
-  retry?: RetryOptions,
+  retry?: CallOptions,
 ): EmbeddingProvider {
-  const raw = invoke ?? defaultBedrockInvoke(regionOf(cfg));
+  const raw = invoke ?? defaultBedrockInvoke(regionOf(cfg), retry?.timeoutMs);
   const call: BedrockInvoke = (m, b) => withBedrockRetry(() => raw(m, b), retry);
   const model = cfg.model;
   if (!isCohere(model) && !isTitan(model)) {
@@ -279,8 +302,8 @@ export function createBedrockEmbeddingProvider(
   };
 }
 
-export function createBedrockReranker(cfg: RerankConfig, invoke?: BedrockInvoke, retry?: RetryOptions): Reranker {
-  const raw = invoke ?? defaultBedrockInvoke(regionOf(cfg));
+export function createBedrockReranker(cfg: RerankConfig, invoke?: BedrockInvoke, retry?: CallOptions): Reranker {
+  const raw = invoke ?? defaultBedrockInvoke(regionOf(cfg), retry?.timeoutMs);
   const call: BedrockInvoke = (m, b) => withBedrockRetry(() => raw(m, b), retry);
   return {
     name: cfg.provider,

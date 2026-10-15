@@ -41,10 +41,11 @@ import {
 } from "../forget.js";
 import { addTombstone, buildTombstoneIndex, expandsWithin, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
-import { Resolver } from "../resolver.js";
+import { Resolver, exactSeeds } from "../resolver.js";
 import { parseSearchConfig, type SearchConfig, type SearchMode } from "../semantic/config.js";
 import { createEmbeddingProvider, createReranker } from "../semantic/providers.js";
-import { EmbeddingStore } from "../semantic/embedding-store.js";
+import { INTERACTIVE_CALL } from "../semantic/bedrock.js";
+import { EmbeddingStore, purgeEmbeddings } from "../semantic/embedding-store.js";
 import { buildEmbeddings, rerankHits, semanticSearch, type RankedHit } from "../semantic/hybrid.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
 import {
@@ -417,7 +418,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
       "VALIDATION_FAILED",
     );
   }
-  const reranker = input.rerank && searchCfg.rerank ? createReranker(searchCfg.rerank) : undefined;
+  const reranker = input.rerank && searchCfg.rerank ? createReranker(searchCfg.rerank, INTERACTIVE_CALL) : undefined;
   const rerankTopN = searchCfg.rerank?.top_n;
   const rerankOpts = {
     unit: searchCfg.rerank?.unit,
@@ -428,15 +429,23 @@ const search: OperationExecutor = async (ctx, input: any) => {
   let hits: RankedHit[];
   let stale: number | undefined;
   if (mode === "lexical") {
-    hits = new Resolver({
+    const lexical = new Resolver({
       documents: docs,
       fullMatchFirst: searchCfg.full_match_first,
       fieldBoosts: searchCfg.field_boosts,
       coordination: searchCfg.coordination,
     })
       .search(query)
-      .filter((h) => isPublished(h.document))
-      .map((h) => ({ document: h.document, score: h.score, scores: { lexical: h.score } }));
+      .filter((h) => isPublished(h.document));
+    // The resolver already put exact title/#tag matches first; flag them so
+    // a rerank keeps them pinned.
+    const seeds = new Set(exactSeeds(query, lexical.map((h) => h.document)));
+    hits = lexical.map((h) => ({
+      document: h.document,
+      score: h.score,
+      scores: { lexical: h.score },
+      ...(seeds.has(h.document.id) ? { seed: true } : {}),
+    }));
     if (reranker) {
       hits = await rerankHits(query, hits, reranker, {
         ...rerankOpts,
@@ -449,7 +458,7 @@ const search: OperationExecutor = async (ctx, input: any) => {
       mode,
       docs,
       store: store!,
-      provider: createEmbeddingProvider(searchCfg.embeddings!),
+      provider: createEmbeddingProvider(searchCfg.embeddings!, INTERACTIVE_CALL),
       candidates: searchCfg.candidates,
       fullMatchFirst: searchCfg.full_match_first,
       fieldBoosts: searchCfg.field_boosts,
@@ -536,6 +545,13 @@ const embed: OperationExecutor = async (ctx, input: any) => {
     batchSize: e.batch_size,
     maxChars: e.max_chars,
     maxRequestChars: e.max_request_chars,
+    // Under the vault lock, and only rows that still match a published
+    // document: a forget/delete/edit that ran while we embedded wins.
+    save: () =>
+      withVaultLock(ctx.storage.root, async () => {
+        store.retainCurrent(await ctx.storage.discoverDocuments(), e.max_chars);
+        await store.save();
+      }),
     onProgress: ctx.onProgress,
   });
 };
@@ -978,6 +994,7 @@ const del: OperationExecutor = async (ctx, input: any) => {
     ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
     ...(input.purge ? { purge: true } : {}),
   });
+  await purgeEmbeddings(ctx.storage.root, [id]);
   await ctx.storage.regenerateIndex();
   return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
 };
@@ -990,6 +1007,7 @@ const forget: OperationExecutor = async (ctx, input: any) => {
     ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
     ...(input.client ? { client: input.client } : {}),
   });
+  await purgeEmbeddings(ctx.storage.root, [id]);
   await ctx.storage.regenerateIndex();
   return {
     id: result.id,
@@ -2075,7 +2093,9 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_query: query,
   context_resolve: resolve,
   context_search: search,
-  context_embed: locked(embed),
+  // Not locked: provider calls can run for minutes and must not block
+  // writers. Each save takes the lock itself (see embed).
+  context_embed: embed,
   context_get: get,
   context_list: list,
   context_folders: folders,  
