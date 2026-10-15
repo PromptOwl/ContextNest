@@ -92,7 +92,8 @@ export interface OperationLimits {
    * its bulk publish runs half as many documents, each costing several files.
    * Per call, not shared across concurrent calls. Default `VAULT_IO_CONCURRENCY`
    * (32) and 16; anything but a finite number >= 1 counts as unset. A host on a
-   * latency-bound network mount (gcsfuse) can raise it.
+   * latency-bound network mount (gcsfuse) can raise it. Each slot may hold one
+   * file read whole, so peak memory grows with it (large PDFs especially).
    */
   readonly ioConcurrency?: number;
 }

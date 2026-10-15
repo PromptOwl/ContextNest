@@ -8,6 +8,7 @@ import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { parseDocument, validateDocument } from "../parser.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { publishDocument, publishDocuments } from "../publish.js";
 import {
   slugifyImportPath,
   sanitizeImportedFrontmatter,
@@ -514,6 +515,46 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     }
     const history = await ctx.storage.readHistory("nodes/draft");
     for (const entry of history!.versions) expect(Number.isInteger(entry.version)).toBe(true);
+  });
+});
+
+// A hand-edited fractional version published outside an import, with no
+// history yet, used to seed a fractional entry (PR #191 review).
+describe("publish — fractional frontmatter version", () => {
+  const write = async (dir: string, name: string, version: string) => {
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", `${name}.md`), `---
+title: ${name}
+type: document
+version: ${version}
+---
+body
+`);
+  };
+  const versionsOf = async (ctx: OperationContext, id: string) =>
+    (await ctx.storage.readHistory(id))!.versions.map((v) => v.version);
+
+  it("publishDocument never seeds or seals a fractional version", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      await write(dir, "one", "1.1");
+      await publishDocument(ctx.storage, "nodes/one", { editedBy: "tester" });
+      expect(await versionsOf(ctx, "nodes/one")).toEqual([2]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("publishDocuments seeds the whole version below a fractional one", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      await write(dir, "two", "2.7");
+      const out = await publishDocuments(ctx.storage, ["nodes/two"], { editedBy: "tester" });
+      expect(out.failed).toEqual([]);
+      expect(await versionsOf(ctx, "nodes/two")).toEqual([2, 3]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
