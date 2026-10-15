@@ -71,16 +71,24 @@ export interface RunResult {
   stderr: string;
 }
 
-/** Run the INSTALLED cli entrypoint via node; returns exit status + streams. */
+/**
+ * Run the INSTALLED cli entrypoint via node; returns exit status + streams.
+ * `extraEnv` is merged over the sandbox env for this one run (a value of
+ * `undefined` unsets that key) — e.g. an encrypted-vault journey points a step
+ * at a key-less config dir, or supplies a recovery passphrase.
+ */
 export function runInstalled(
   installDir: string,
   cwd: string,
   args: string[],
   configDir: string,
+  extraEnv?: Record<string, string | undefined>,
 ): RunResult {
+  const env = { ...sandboxEnv(configDir), ...extraEnv } as NodeJS.ProcessEnv;
+  for (const [k, v] of Object.entries(extraEnv ?? {})) if (v === undefined) delete env[k];
   const res = spawnSync("node", [installedEntry(installDir), ...args], {
     cwd,
-    env: sandboxEnv(configDir),
+    env,
     encoding: "utf-8",
   });
   return {
@@ -179,8 +187,27 @@ export interface Action {
   stdoutNot?: Matcher[];
   /** Every matcher must appear in stderr. */
   stderr?: Matcher[];
+  /** No matcher may appear in stderr — e.g. a friendly error must not leak a
+   * sealed secret or dump a raw stack trace. */
+  stderrNot?: Matcher[];
   /** Assert over stdout parsed as JSON. */
   json?: (data: unknown) => void;
+  /**
+   * Extra env for THIS action's run only, merged over the journey's sandbox env
+   * (a value of `undefined` unsets the key). The journey's isolated vault root is
+   * passed in. Use it when one step must run in a different environment from the
+   * rest of the story — e.g. an encrypted-vault journey pointing a "without the
+   * key" step at a fresh key-less config dir, or handing a later step a recovery
+   * passphrase captured from an earlier one.
+   */
+  env?: (vaultDir: string) => Record<string, string | undefined>;
+  /**
+   * Capture something from this action's result for a later action to use —
+   * e.g. the one-time recovery passphrase `init --encrypted` prints, which a
+   * later "unlock without the stored key" step needs. Runs after the exit-status
+   * check, so it only sees results from a command that ran.
+   */
+  capture?: (result: RunResult) => void;
   /** File assertions; `path` is relative to the vault root. */
   files?: Array<{ path: string; exists?: boolean; contains?: string }>;
   /**
@@ -211,6 +238,14 @@ export interface Journey {
   id: string;
   /** The plain-language user story this journey proves. */
   title: string;
+  /**
+   * Extra env applied to every run in this journey, merged over the sandbox env
+   * (a value of `undefined` unsets the key; a per-action `env` overrides it).
+   * Use it for a journey-wide mode — e.g. an encrypted vault keeps the CLI off
+   * the OS keychain (`CONTEXTNEST_CREDENTIALS_BACKEND=file`) and blanks ambient
+   * vault keys so a "without the key" step can't unlock for the wrong reason.
+   */
+  env?: Record<string, string | undefined>;
   cases: Case[];
 }
 
@@ -231,17 +266,21 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
   for (const c of journey.cases) {
     for (const a of c.actions) {
       if (a.mutate) a.mutate(vault);
-      const r = runInstalled(ctx.installDir, vault, a.args, cfg);
+      const extraEnv = { ...journey.env, ...(a.env ? a.env(vault) : undefined) };
+      const r = runInstalled(ctx.installDir, vault, a.args, cfg, extraEnv);
       const at = `${c.id} — ${c.title} [ctx ${a.args.join(" ")}]`;
       expect(r.status, `${at} — exit ${r.status}: ${r.stderr || r.stdout}`).toBe(
         a.status ?? 0,
       );
+      if (a.capture) a.capture(r);
       for (const m of a.stdout ?? [])
         expect(matches(r.stdout, m), `${at} — stdout missing ${m}:\n${r.stdout}`).toBe(true);
       for (const m of a.stdoutNot ?? [])
         expect(matches(r.stdout, m), `${at} — stdout should not contain ${m}:\n${r.stdout}`).toBe(false);
       for (const m of a.stderr ?? [])
         expect(matches(r.stderr, m), `${at} — stderr missing ${m}:\n${r.stderr}`).toBe(true);
+      for (const m of a.stderrNot ?? [])
+        expect(matches(r.stderr, m), `${at} — stderr should not contain ${m}:\n${r.stderr}`).toBe(false);
       if (a.json) a.json(parseJson(r.stdout));
       if (a.check) a.check(vault);
       for (const f of a.files ?? []) {
