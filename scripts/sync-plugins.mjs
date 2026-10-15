@@ -45,6 +45,10 @@ const TARGETS = [
       { file: "skills/recall/SKILL.md", prompt: "recall" },
     ],
   },
+  {
+    plugin: "gemini",
+    core: true,
+  },
 ];
 
 const CHECK = process.argv.includes("--check");

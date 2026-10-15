@@ -1,0 +1,30 @@
+{
+  "contextnest-lifecycle": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "PATH=\"$HOME/.node/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\" node ./core/pre-invocation.js",
+        "timeout": 20
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.node/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\" node ./core/post-tool-use.js",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "PATH=\"$HOME/.node/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\" node ./core/stop-gate.js",
+        "timeout": 15
+      }
+    ]
+  }
+}
