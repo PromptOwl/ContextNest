@@ -8,6 +8,7 @@ import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { parseDocument, validateDocument } from "../parser.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { publishDocument, publishDocuments } from "../publish.js";
 import {
   slugifyImportPath,
   sanitizeImportedFrontmatter,
@@ -42,7 +43,7 @@ type ImportResult = {
   checkpoint: number | null;
   written?: number;
   warnings?: string[];
-  documents?: Array<{ id: string; title: string; status: string; tags: string[] }>;
+  documents?: Array<{ id: string; title: string; version: number; status: string; tags: string[] }>;
 };
 
 describe("slugifyImportPath", () => {
@@ -248,6 +249,15 @@ describe("sanitizeImportedFrontmatter", () => {
     expect(out.warnings).toHaveLength(1);
     expect(out.warnings[0]).toMatch(/bad tag/);
     expect(out.warnings[0]).toMatch(/tags must start with a letter and contain only letters, digits, _ - :/);
+  });
+
+  it("rounds a version that is not a whole number down, warning once", () => {
+    const fractional = sanitizeImportedFrontmatter(node("---\ntitle: X\nversion: 1.1\n---\nbody\n"), "x");
+    expect(fractional.patch.version).toBe(1);
+    expect(fractional.warnings).toHaveLength(1);
+    expect(fractional.warnings[0]).toMatch(/version "1.1"/);
+    expect(sanitizeImportedFrontmatter(node("---\ntitle: X\nversion: 0\n---\nb\n"), "x").patch.version).toBe(1);
+    expect(sanitizeImportedFrontmatter(node("---\ntitle: X\nversion: abc\n---\nb\n"), "x").patch.version).toBe(1);
   });
 
   it("returns an empty patch for a file with valid frontmatter (regression)", () => {
@@ -480,6 +490,83 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
 
     for (const doc of await ctx.storage.discoverDocuments({ includeRetired: true })) {
       expect(validateDocument(doc).errors, doc.id).toEqual([]);
+    }
+  });
+
+  // CU-wdqcq042mw: a hand-edited `version: 1.1` published as 2.1, and the
+  // host's integer version column refused the whole import.
+  it("publishes a document with a fractional version at a whole version", async () => {
+    const api = createEngineApi();
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(
+      join(dir, "nodes", "draft.md"),
+      "---\ntitle: Draft\ntype: document\nstatus: published\nversion: 1.1\n---\nbody\n",
+    );
+
+    const out = await api.run<ImportResult>(
+      "context_import",
+      { discover: true },
+      ctx,
+    );
+    expect(out.failed).toEqual([]);
+    expect((out.warnings ?? []).filter((w) => /version "1.1"/.test(w))).toHaveLength(1);
+    for (const v of [...out.published.map((p) => p.version), ...(out.documents ?? []).map((d) => d.version)]) {
+      expect(Number.isInteger(v), String(v)).toBe(true);
+    }
+    const history = await ctx.storage.readHistory("nodes/draft");
+    for (const entry of history!.versions) expect(Number.isInteger(entry.version)).toBe(true);
+  });
+});
+
+// A hand-edited fractional version published outside an import, with no
+// history yet, used to seed a fractional entry (PR #191 review).
+describe("publish — fractional frontmatter version", () => {
+  const write = async (dir: string, name: string, version: string) => {
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", `${name}.md`), `---
+title: ${name}
+type: document
+version: ${version}
+---
+body
+`);
+  };
+  const versionsOf = async (ctx: OperationContext, id: string) =>
+    (await ctx.storage.readHistory(id))!.versions.map((v) => v.version);
+
+  it("publishDocument never seeds or seals a fractional version", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      await write(dir, "one", "1.1");
+      await publishDocument(ctx.storage, "nodes/one", { editedBy: "tester" });
+      expect(await versionsOf(ctx, "nodes/one")).toEqual([2]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("publishDocuments seeds the whole version below a fractional one", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      await write(dir, "two", "2.7");
+      const out = await publishDocuments(ctx.storage, ["nodes/two"], { editedBy: "tester" });
+      expect(out.failed).toEqual([]);
+      expect(await versionsOf(ctx, "nodes/two")).toEqual([2, 3]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("VersionManager.nextVersion", () => {
+  it("never returns a fractional version from a fractional hint", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      const vm = new VersionManager(ctx.storage);
+      expect(await vm.nextVersion("nodes/none", 1.1, null, 0)).toBe(2);
+      expect(await vm.nextVersion("nodes/none", Infinity, null, 0)).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

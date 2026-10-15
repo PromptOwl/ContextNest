@@ -358,6 +358,8 @@ export function sanitizeImportedTags(
  *   `document`, warned.
  * - Tags that fail the tag rule → dropped, warned; pasted hashtag lists are
  *   split first so `"#gtm #contextnest"` becomes two tags, not garbage.
+ * - `version` that is not a whole number ≥ 1 (`1.1`, `"2"`, `0`) → rounded
+ *   down, else `1`, warned. Publishing bumps it, so `1.1` would mint 2.1.
  *
  * A document that already carries valid values gets an empty patch, so a
  * caller can write it back verbatim.
@@ -411,6 +413,15 @@ export function sanitizeImportedFrontmatter(
     const unchanged =
       before.length === tags.length && before.every((t, i) => t === tags[i]);
     if (!unchanged) patch.tags = tags;
+  }
+
+  const version = fm.version;
+  if (version !== undefined && !(Number.isInteger(version) && (version as number) >= 1)) {
+    const n = Math.floor(Number(version));
+    patch.version = Number.isFinite(n) && n >= 1 ? n : 1;
+    warnings.push(
+      `${label}: version "${String(version)}" is not a whole number of at least 1; imported as ${patch.version}`,
+    );
   }
 
   return { patch, warnings };
