@@ -485,6 +485,28 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     expect(await readFile(join(dir, "nodes", "Notes.md"), "utf-8")).toContain("keep me");
   });
 
+  // CU-wdqcpzx8ya: a diff rebuilds the previous version first, a round trip per
+  // artifact on a network mount; an import's one-off version skips that.
+  it("stores an import's version as a keyframe; an ids-only publish keeps a diff", async () => {
+    const api = createEngineApi();
+    const doc = (body: string) => `---\ntitle: Notes\ntype: document\nstatus: published\n---\n${body}\n`;
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v1"));
+    await api.run("context_import", { ids: ["nodes/notes"] }, ctx); // v1 (first version: keyframe)
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v2"));
+    await api.run("context_import", { ids: ["nodes/notes"] }, ctx); // v2: ids-only keeps a diff
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v3"));
+    await api.run("context_import", { discover: true }, ctx); // v3: import → keyframe
+
+    const versions = (await ctx.storage.readHistory("nodes/notes"))!.versions;
+    expect(versions.map((v) => [v.version, !!v.keyframe])).toEqual([
+      [1, true],
+      [2, false],
+      [3, true],
+    ]);
+    expect((await ctx.storage.verifyVaultIntegrity()).valid).toBe(true);
+  });
+
   it("sanitizes documents the caller wrote into the vault itself before discover", async () => {
     // A folder importer that writes files directly (no files[] call) and only
     // asks the engine to discover: the frontmatter still gets cleaned, for

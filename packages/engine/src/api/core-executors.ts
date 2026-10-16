@@ -1621,6 +1621,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       // their folders' INDEX.md can change. Other modes write files too.
       indexOnlyBatchFolders:
         !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
+      // An import's version is a one-off: a keyframe skips rebuilding the
+      // previous one to diff against. Ids-only (bulk approval) keeps diffs.
+      keyframe: !!input.discover || !!input.files?.length,
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
