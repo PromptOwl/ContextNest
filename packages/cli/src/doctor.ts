@@ -25,6 +25,8 @@ import {
 import type { VaultListEntry } from "@promptowl/contextnest-engine";
 import { telemetryConsent } from "./telemetry/index.js";
 import { CredentialStore } from "./credentials.js";
+import { loggedInServers } from "./server-credentials.js";
+import { aliasesFor } from "./login-registry.js";
 
 export const CLI_PACKAGE_NAME = "@promptowl/contextnest-cli";
 /** How long `npm view` gets before the doctor gives up and reports `null`. */
@@ -63,6 +65,8 @@ export interface DoctorReport {
     /** The manifest the version was read from, or null when none was readable. */
     path: string | null;
   };
+  /** Servers a `ctx login` key is saved for, and the vault aliases that use each (none = not registered). */
+  logins: Array<{ url: string; account: string | null; aliases: string[]; scopes: string[] }>;
   /** Telemetry/analytics consent for the cwd vault, and where credentials are stored. */
   privacy: { telemetry: boolean; credentials: string };
 }
@@ -315,6 +319,27 @@ export interface BuildDoctorReportOptions {
   timeoutMs?: number;
 }
 
+/** Saved logins against the registry; reads the plain logins file, never the secure store on the hot path. */
+async function inspectLogins(): Promise<DoctorReport["logins"]> {
+  try {
+    const remotes = readRegistry().remotes;
+    return (await loggedInServers()).map((l) => {
+      const aliases = aliasesFor(remotes, l);
+      return {
+        url: l.url,
+        account: l.account ?? null,
+        aliases,
+        scopes: aliases.map((a) => {
+          const r = remotes?.[a];
+          return r && r.transport === "http" ? (r.scope ?? "unmarked") : "unmarked";
+        }),
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
 export async function buildDoctorReport(opts: BuildDoctorReportOptions): Promise<DoctorReport> {
   const env = opts.env ?? process.env;
   const [latest, registry, cwd] = await Promise.all([
@@ -331,6 +356,7 @@ export async function buildDoctorReport(opts: BuildDoctorReportOptions): Promise
     registry,
     cwd,
     plugin: readClaudePluginVersion(claudePluginManifestPath(env)),
+    logins: await inspectLogins(),
     privacy: {
       telemetry: cwd.vault_path !== null && telemetryConsent(cwd.vault_path, env),
       credentials: await new CredentialStore({ env })

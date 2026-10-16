@@ -84,7 +84,7 @@ describe("ctx login registers the server (regression)", () => {
   }
 
   /** Run under a pseudo-terminal, so stderr.isTTY is true. Output of both streams is merged. */
-  function ctxTty(args: string[], extra: Record<string, string> = {}): Promise<Run> {
+  function ctxTty(args: string[], extra: Record<string, string> = {}, input: string | string[] = ""): Promise<Run> {
     const py = "import os,pty,sys;sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))";
     return new Promise((resolve) => {
       const child = execFile(
@@ -94,7 +94,11 @@ describe("ctx login registers the server (regression)", () => {
         (err, stdout, stderr) =>
           resolve({ status: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
       );
-      child.stdin?.end();
+      // Typed like a person: each chunk lands after the program has asked for it.
+      const chunks = Array.isArray(input) ? input : [input];
+      chunks.forEach((chunk, i) => {
+        setTimeout(() => (i === chunks.length - 1 ? child.stdin?.end(chunk) : child.stdin?.write(chunk)), i * 1500);
+      });
     });
   }
 
@@ -224,6 +228,45 @@ describe("ctx login registers the server (regression)", () => {
     expect(rejected.stderr).toContain(`ctx login ${server.url} --account other`);
   });
 
+  describe.skipIf(!HAS_PTY)("signing in again on the spot (terminal)", () => {
+    const rejectSavedKey = () => {
+      server.validKeys.clear(); // the saved key is no longer accepted
+    };
+
+    it("offers to sign in again, then runs the command it was asked to run", async () => {
+      await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
+      rejectSavedKey();
+      // "y" answers the question; the empty line keeps the default key name that `ctx login` asks for.
+      const res = await ctxTty(["--vault", "po/alpha", "list"], {}, ["y\n", "\n"]);
+      const out = res.stdout + res.stderr;
+      expect(out).toContain(`The key saved for ${server.url} was rejected`);
+      expect(out).toContain("Sign in again now?");
+      expect(res.status, out).toBe(0);
+      expect(out).toContain("in-n-alpha-0001"); // the original command ran after the new login
+      expect(server.validKeys.size).toBe(1); // exactly one new key was minted
+    });
+
+    it("answering no keeps the original error and a failing exit code", async () => {
+      await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
+      rejectSavedKey();
+      const res = await ctxTty(["--vault", "po/alpha", "list"], {}, "n\n");
+      expect(res.status).not.toBe(0);
+      expect(res.stdout + res.stderr).toContain(`ctx login ${server.url}`);
+      expect(server.validKeys.size).toBe(0);
+    });
+
+    it("never prompts with --json, and never for a pipe", async () => {
+      await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
+      rejectSavedKey();
+      const json = await ctxTty(["--vault", "po/alpha", "list", "--json"], {}, "y\n");
+      expect(json.status).not.toBe(0);
+      expect(json.stdout + json.stderr).not.toContain("Sign in again now?");
+      const piped = await ctx(["--vault", "po/alpha", "list"], "y\n");
+      expect(piped.status).not.toBe(0);
+      expect(piped.stdout + piped.stderr).not.toContain("Sign in again now?");
+    });
+  });
+
   // ── server down ───────────────────────────────────────────────────────────
 
   it("a down server is listed as not answering (exit 0), and the old nests show once cached", async () => {
@@ -255,6 +298,28 @@ describe("ctx login registers the server (regression)", () => {
     expect((await ctx(["login", "--list"])).stdout).toContain("used by: work");
     const out = await ctx(["logout", server.url]);
     expect(out.stdout).toContain('Vault "work" is still registered');
+  });
+
+  it("login --list --json lists servers and what uses them, and never a key", async () => {
+    await ctx(["login", server.url, "--key-stdin", "--no-register"], KEY);
+    const raw = (await ctx(["login", "--list", "--json"])).stdout;
+    expect(JSON.parse(raw)).toEqual([{ url: server.url, account: null, usedBy: [] }]);
+    await ctx(["vault", "add", "po", "--url", `${server.url}/mcp`, "--yes"]);
+    const after = (await ctx(["login", "--list", "--json"])).stdout;
+    expect(JSON.parse(after)[0].usedBy).toEqual(["po"]);
+    expect(after).not.toContain("cnst_");
+  });
+
+  it("ctx doctor shows each login and the alias that uses it", async () => {
+    const offline = { CONTEXTNEST_DOCTOR_OFFLINE: "1" };
+    await ctx(["login", server.url, "--key-stdin", "--no-register"], KEY);
+    const before = JSON.parse((await ctx(["doctor", "--json"], "", offline)).stdout);
+    expect(before.logins).toEqual([{ url: server.url, account: null, aliases: [], scopes: [] }]);
+    await ctx(["vault", "add", "po", "--url", `${server.url}/mcp`, "--yes"]);
+    const after = JSON.parse((await ctx(["doctor", "--json"], "", offline)).stdout);
+    expect(after.logins).toEqual([{ url: server.url, account: null, aliases: ["po"], scopes: ["server"] }]);
+    const text = (await ctx(["doctor"], "", offline)).stdout;
+    expect(text).toContain("registered as po [server]");
   });
 
   it("a registry written before `scope` existed still lists and works (probed as before)", async () => {

@@ -25,10 +25,12 @@ import {
   readRegistry,
 } from "@promptowl/contextnest-engine";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import readline from "node:readline";
 import pathMod from "node:path";
 import type { ContextNode, RemoteNestConnection, RemoteNestSpec, VaultListEntry } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
-import { loginCommandFor } from "./login-registry.js";
+import { loginCommandFor, nestIdOf, serverOrigin } from "./login-registry.js";
 import { parseRecipeManifest, manifestSources } from "./pull.js";
 import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
@@ -412,12 +414,60 @@ async function connectWithToken(
  * Connect, run, and always close — the standard remote command wrapper.
  * With a `<server>/<nest>` target, every call carries that nest's id.
  */
+/**
+ * A person at a terminal whose saved key was rejected can sign in right there.
+ * The connection is refused before anything runs, so retrying once is safe for
+ * reads and writes alike. Pipes, --json, CI and nest-scoped keys (which are
+ * pasted, not browsed) never prompt: they get the exact command in the error.
+ */
+function canReauthHere(spec: RemoteNestSpec): spec is Extract<RemoteNestSpec, { transport: "http" }> {
+  return (
+    spec.transport === "http" &&
+    !nestIdOf(spec.url) &&
+    Boolean(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY) &&
+    !process.argv.includes("--json") &&
+    !process.env.CI
+  );
+}
+
+async function askYesNo(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await new Promise<string>((resolve) => rl.question(`${question} [Y/n] `, resolve));
+    return answer.trim() === "" || /^y/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** Run `open` (resolve the nest, connect); a rejected key at a terminal gets one chance to sign in again. */
+async function reauthOnce<T>(target: RemoteTarget, open: () => Promise<T>): Promise<T> {
+  try {
+    return await open();
+  } catch (err) {
+    const spec = target.spec;
+    if (!(err instanceof ContextNestError) || err.code !== "REMOTE_AUTH_FAILED" || !canReauthHere(spec)) throw err;
+    const origin = serverOrigin(spec.url);
+    console.error(chalk.yellow(`The key saved for ${origin} was rejected.`));
+    if (!(await askYesNo("Sign in again now?"))) throw err;
+    const login = spawnSync(
+      process.execPath,
+      [process.argv[1], "login", origin, "--no-register", ...(spec.account ? ["--account", spec.account] : [])],
+      { stdio: "inherit" },
+    );
+    if (login.status !== 0) throw err;
+    return await open();
+  }
+}
+
 async function withRemote<T>(
   target: RemoteTarget,
   fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
 ): Promise<T> {
-  const nestId = target.nest ? await resolveTargetNest(target) : undefined;
-  const conn = await connectTarget(target, undefined, undefined, nestId);
+  const { nestId, conn } = await reauthOnce(target, async () => {
+    const id = target.nest ? await resolveTargetNest(target) : undefined;
+    return { nestId: id, conn: await connectTarget(target, undefined, undefined, id) };
+  });
   try {
     if (!nestId) return await fn(conn);
     return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) }, nestId);

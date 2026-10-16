@@ -3648,6 +3648,7 @@ program
   .option("--label <text>", "Label for this credential (default: your account email)")
   .option("--account <name>", "Save the key under a named account, to sign in to the same server as someone else too")
   .option("--list", "Show the servers and nests you're logged into (never prints keys)")
+  .option("--json", "With --list: print the servers (URL, account, which vault aliases use each) as JSON, without opening the key store")
   .option("--as <alias>", "Register the server (all its nests), or the --nest, under this alias (default: derived from the host)")
   .option("--no-register", "Only save the key; don't add the server to your vaults")
   .option("--set-default", "With --as: make that alias the default vault")
@@ -3659,12 +3660,27 @@ program
       label?: string;
       account?: string;
       list?: boolean;
+      json?: boolean;
       as?: string;
       register?: boolean;
       setDefault?: boolean;
     },
   ) => {
     try {
+      if (opts.list && opts.json) {
+        // From the plain logins file: fast, and no key can appear in it.
+        const remotes = readRegistry().remotes;
+        const all = await loggedInServers();
+        const wanted = server ? all.filter((l) => l.url === normalizeServerUrl(server as string)) : all;
+        console.log(
+          JSON.stringify(
+            wanted.map((l) => ({ url: l.url, account: l.account ?? null, usedBy: aliasesFor(remotes, l) })),
+            null,
+            2,
+          ),
+        );
+        return;
+      }
       if (opts.list) {
         const map = await loadServerMap();
         const all = Object.keys(map.servers);
@@ -5189,6 +5205,16 @@ program
     } else {
       row("Current dir", chalk.dim("not inside a vault"));
     }
+    if (report.logins.length === 0) {
+      row("Logins", chalk.dim("none (ctx login <server>)"));
+    }
+    report.logins.forEach((l, i) => {
+      const who = `${l.url}${l.account ? ` (account ${l.account})` : ""}`;
+      const state = l.aliases.length
+        ? `${chalk.green("registered")} as ${l.aliases.map((a, n) => `${a} [${l.scopes[n]}]`).join(", ")}`
+        : `${chalk.yellow("not registered")} — ctx vault add <alias> --url ${l.url}/mcp`;
+      row(i === 0 ? "Logins" : "", `${who}  ${state}`);
+    });
     row(
       "Claude plugin",
       report.plugin.version

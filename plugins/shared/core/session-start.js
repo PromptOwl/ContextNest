@@ -99,6 +99,21 @@ export function run({ env, exec }) {
     }
   }
 
+  // A server the user signed in to but never registered has nests that are invisible here.
+  // Said as a fact for the model to relay; the model is not asked to run anything.
+  const logins = ctxJson(exec, ["login", "--list", "--json"], []);
+  if (Array.isArray(logins)) {
+    for (const l of logins) {
+      if (!l || typeof l.url !== "string" || (Array.isArray(l.usedBy) && l.usedBy.length > 0)) continue;
+      const url = squish(l.url.replace(/`/g, "'"), 120);
+      lines.push(
+        `The user is logged in to ${url}${l.account ? ` (account ${squish(String(l.account).replace(/`/g, "'"), 40)})` : ""} ` +
+          "but has no vault registered for it, so its nests are not listed above. If they ask about it, tell them to run " +
+          `\`ctx vault add <alias> --url ${url}/mcp\` themselves.`,
+      );
+    }
+  }
+
   // The vault captures land in: the pinned one, else the working-directory
   // one. Only that vault's structure rules are shown — fanning out over every
   // registered vault would cost one `ctx` call each on every session start.
