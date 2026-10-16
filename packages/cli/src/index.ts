@@ -48,6 +48,7 @@ import {
   addVault,
   addRemote,
   removeVault,
+  renameVault,
   pruneVaults,
   setDefaultVault,
   setVaultDescription,
@@ -149,6 +150,7 @@ import {
   keyForEndpoint,
   keysUnderServer,
   loadServerMap,
+  loggedInServers,
   nestScopeUrl,
   normalizeServerUrl,
   removeServer,
@@ -159,6 +161,17 @@ import {
   type ServerMap,
 } from "./server-credentials.js";
 import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
+import {
+  aliasesFor,
+  deriveServerAlias,
+  loginHintLine,
+  loginTargetOfAlias,
+  mayShowLoginHint,
+  scopeForEndpoint,
+  serverOrigin,
+  unregisteredLogins,
+} from "./login-registry.js";
+import { hintsDisabled, setHintsEnabled } from "./hints.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
@@ -517,6 +530,7 @@ const VAULT_WRITE_COMMANDS = new Set([
 const REGISTRY_WRITE_COMMANDS = new Set([
   "vault add",
   "vault describe",
+  "vault rename",
   "vault remove",
   "vault default",
   "vault prune",
@@ -529,6 +543,35 @@ function commandPath(cmd: Command): string {
   return parts.join(" ");
 }
 
+/**
+ * A person at a terminal who logged in before `ctx login` registered servers has
+ * a key and no vault for it: say so, on every command, until they register it
+ * or run `ctx hints off`. stderr-on-a-TTY only, so agents, CI and pipes never see it.
+ */
+async function printLoginHint(command: string, json: boolean): Promise<void> {
+  try {
+    if (
+      !mayShowLoginHint({
+        stderrIsTTY: Boolean(process.stderr.isTTY),
+        json,
+        command,
+        env: process.env,
+        disabled: hintsDisabled(),
+      })
+    ) {
+      return;
+    }
+    const reg = readRegistry();
+    const open = unregisteredLogins(await loggedInServers(), reg.remotes);
+    for (const server of open) {
+      const alias = deriveServerAlias(server.url, (a) => Boolean(reg.vaults[a] || reg.remotes?.[a]));
+      console.error(chalk.yellow(loginHintLine(server, alias)));
+    }
+  } catch {
+    // A hint must never break the command it rides on.
+  }
+}
+
 program.hook("preAction", async (_thisCommand, actionCommand) => {
   const opts = actionCommand.optsWithGlobals();
   selectedVaultAlias = opts.vault as string | undefined;
@@ -536,6 +579,7 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
   configureSafety({ dryRun: opts.dryRun, yes: opts.yes, force: opts.force });
 
   const name = commandPath(actionCommand);
+  await printLoginHint(name, Boolean(opts.json));
 
   if (REGISTRY_WRITE_COMMANDS.has(name)) {
     // openRegistrySandbox redirects CONTEXTNEST_CONFIG_DIR under --dry-run and
@@ -3604,7 +3648,8 @@ program
   .option("--label <text>", "Label for this credential (default: your account email)")
   .option("--account <name>", "Save the key under a named account, to sign in to the same server as someone else too")
   .option("--list", "Show the servers and nests you're logged into (never prints keys)")
-  .option("--as <alias>", "Also register the server (all its nests), or the --nest, as a remote vault alias")
+  .option("--as <alias>", "Register the server (all its nests), or the --nest, under this alias (default: derived from the host)")
+  .option("--no-register", "Only save the key; don't add the server to your vaults")
   .option("--set-default", "With --as: make that alias the default vault")
   .action(async (
     server: string | undefined,
@@ -3615,6 +3660,7 @@ program
       account?: string;
       list?: boolean;
       as?: string;
+      register?: boolean;
       setDefault?: boolean;
     },
   ) => {
@@ -3623,8 +3669,9 @@ program
         const map = await loadServerMap();
         const all = Object.keys(map.servers);
         // Every account's keys for the server.
-        const keys = (server
-          ? all.filter((k) => keysUnderServer(map, server, splitAccountKey(k).account).includes(k))
+        const listFor = server;
+        const keys = (listFor
+          ? all.filter((k) => keysUnderServer(map, listFor, splitAccountKey(k).account).includes(k))
           : all
         ).sort();
         if (keys.length === 0) {
@@ -3634,13 +3681,24 @@ program
         for (const key of keys) {
           const cred = map.servers[key];
           const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
-          console.log(`${key}${scope}`);
+          const { scope: keyUrl, account: keyAccount } = splitAccountKey(key);
+          const usedBy = isNestScope(key) ? [] : aliasesFor(readRegistry().remotes, { url: keyUrl, account: keyAccount });
+          const used = usedBy.length ? chalk.dim(`  used by: ${usedBy.join(", ")}`) : "";
+          console.log(`${key}${scope}${used}`);
           const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
           if (meta) console.log(chalk.dim(`  ${meta}`));
         }
         return;
       }
       if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
+      // A registered alias stands for its server (and account): `ctx login promptowl` signs in again.
+      const ofAlias = loginTargetOfAlias(server, readRegistry().remotes);
+      if (ofAlias) {
+        server = ofAlias.server;
+        opts.account ??= ofAlias.account;
+        opts.nest ??= ofAlias.nest;
+        opts.register = false; // it is registered already
+      }
       assertSafeEndpoint(server, "<server>");
       if (opts.nest && !opts.keyStdin) {
         throw new Error(
@@ -3667,6 +3725,7 @@ program
         transport: "http",
         url: `${url}/mcp`,
         ...(opts.account ? { account: opts.account } : {}),
+        scope: opts.nest ? "nest" : "server",
       };
       if (opts.as) {
         await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
@@ -3750,6 +3809,42 @@ program
         );
         return;
       }
+      // Server-wide login with no --as: register the server so every nest is usable now.
+      // The alias carries no key (it borrows the saved one) and never takes the default vault.
+      if (!opts.nest && opts.register !== false) {
+        const reg = readRegistry();
+        const already = Object.entries(reg.remotes ?? {}).find(
+          ([, r]) =>
+            r.transport === "http" && !r.auth && r.account === opts.account && serverOrigin(r.url) === serverUrl,
+        );
+        if (already) {
+          console.log(chalk.dim(`  "${already[0]}" already points at this server: ctx vault list`));
+          return;
+        }
+        const alias = deriveServerAlias(serverUrl, (a) => Boolean(reg.vaults[a] || reg.remotes?.[a]));
+        const spec: RemoteNestSpec = { ...aliasSpec, scope: "server" } as RemoteNestSpec;
+        try {
+          addRemote(alias, spec);
+        } catch (err) {
+          throw new Error(
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${alias} --url ${aliasSpec.url}${accountFlag}`,
+          );
+        }
+        const added = readRegistry();
+        const isDefault = added.default === alias; // the registry's rule: the first entry becomes the default
+        console.log(chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${aliasSpec.url}`));
+        console.log(chalk.dim(`  The key stays in the secure store; config.yaml holds none.`));
+        console.log(chalk.dim(`  Your nests: ctx vault list   (each shows as ${alias}/<nest>)`));
+        console.log(
+          chalk.dim(
+            isDefault
+              ? `  Use one:    ctx --vault ${alias}/<nest> list   (without --vault, ctx reads across all of them)`
+              : `  Use one:    ctx --vault ${alias}/<nest> list   (without --vault, ctx still uses your default vault)`,
+          ),
+        );
+        console.log(chalk.dim(`  Undo:       ctx vault remove ${alias}`));
+        return;
+      }
       // A nest-scoped key reaches only its own nest, directly or as <alias>/<nest> behind a server alias.
       const next = opts.nest
         ? [
@@ -3826,6 +3921,13 @@ program
       for (const k of targets) map = removeServer(map, k);
       await saveServerMap(map);
       for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+      // The registry entry stays: say so, or the user keeps a vault that can only answer "key rejected".
+      if (!opts.nest) {
+        const left = aliasesFor(readRegistry().remotes, { url: normalizeServerUrl(server), account });
+        for (const alias of left) {
+          console.log(chalk.dim(`  Vault "${alias}" is still registered (it will report a missing key). Remove it: ctx vault remove ${alias}`));
+        }
+      }
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
@@ -4700,7 +4802,8 @@ vaultCmd
       }
       if (v.kind === "remote") {
         const endpoint = v.url ?? [v.command, ...(v.args ?? [])].join(" ");
-        console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[remote:${v.transport}]`)}`);
+        const kindLabel = v.transport === "http" ? (v.scope ?? "remote") : `remote:${v.transport}`;
+        console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[${kindLabel}]`)}`);
         if (v.description) console.log(`     ${chalk.dim(v.description)}`);
         console.log(`     ${chalk.dim(endpoint)}`);
         continue;
@@ -4724,6 +4827,33 @@ vaultCmd
       console.log(chalk.yellow("\n  default vault is missing — run ctx vault prune"));
     }
     console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
+  });
+
+program
+  .command("hints <state>")
+  .description("Turn ctx's one-line hints on or off (e.g. 'logged in but not registered'); CONTEXTNEST_NO_HINTS=1 silences one run")
+  .action((state: string) => {
+    if (state !== "on" && state !== "off") {
+      console.error(chalk.red('Say "ctx hints on" or "ctx hints off".'));
+      process.exit(1);
+    }
+    setHintsEnabled(state === "on");
+    console.log(state === "on" ? chalk.green("Hints on.") : chalk.yellow("Hints off. `ctx hints on` brings them back."));
+  });
+
+vaultCmd
+  .command("rename <old> <new>")
+  .description("Rename a vault alias (local or remote); the default pointer follows")
+  .action(async (oldAlias: string, newAlias: string) => {
+    try {
+      await confirmOrExit(`Rename "${oldAlias}" to "${newAlias}" in ${registryPathForLog()}?`);
+      const { wasDefault } = renameVault(oldAlias, newAlias);
+      console.log(chalk.green(`Renamed "${oldAlias}" → "${chalk.bold(newAlias)}"${wasDefault ? " (default)" : ""}`));
+      console.log(chalk.dim(`  Nests behind it now show as ${newAlias}/<nest>; update any --vault ${oldAlias}/… you use.`));
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
   });
 
 vaultCmd
@@ -4764,6 +4894,7 @@ vaultCmd
               url: opts.url,
               ...(opts.bearerEnv ? { auth: { bearer_env: opts.bearerEnv } } : {}),
               ...(opts.account ? { account: opts.account } : {}),
+              ...(scopeForEndpoint(opts.url) ? { scope: scopeForEndpoint(opts.url) } : {}),
               ...(opts.description ? { description: opts.description } : {}),
             }
           : {

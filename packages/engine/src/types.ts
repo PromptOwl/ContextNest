@@ -603,6 +603,11 @@ export type RemoteNestSpec =
       auth?: RemoteNestAuth;
       /** With no `auth`: which `ctx login --account` the CLI signs in as (unset = the unnamed account). */
       account?: string;
+      /**
+       * What the URL is: a `server` (many nests, listed as `<alias>/<nest>`) or one `nest`.
+       * Unset = unknown, decided by probing for `nest_index` as before.
+       */
+      scope?: "server" | "nest";
       description?: string;
       /** Per-call timeout in milliseconds (default 10000). */
       timeout_ms?: number;

@@ -270,7 +270,7 @@ describe("connectTarget", () => {
       throw new ContextNestError("rejected — Check that CONTEXTNEST_LOGIN_TOKEN is exported", "REMOTE_AUTH_FAILED");
     });
     await expect(connectTarget({ alias: "h", spec: http }, async () => "cnst_old", reject as never)).rejects.toThrow(
-      /ctx login <server>` again/,
+      /ctx login https:\/\/nest\.example\.com` again/,
     );
   });
 
@@ -304,7 +304,7 @@ describe("connectTarget", () => {
     // Nothing saved and the server wants a key: point at ctx login.
     await expect(connectTarget({ alias: "h", spec: http }, async () => null, reject as never)).rejects.toMatchObject({
       code: "REMOTE_AUTH_FAILED",
-      message: expect.stringMatching(/ctx login <server>.*--vault h\/<nest>/),
+      message: expect.stringMatching(/ctx login https:\/\/nest\.example\.com.*--vault h\/<nest>/),
     });
     // A single-nest endpoint has no /<nest> to name.
     const one: RemoteNestSpec = { transport: "http", url: `${SERVER}/nests/abc/mcp` };
