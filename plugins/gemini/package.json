@@ -1,0 +1,11 @@
+{
+  "name": "@promptowl/contextnest-gemini-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Context Nest plugin for Gemini CLI & Google Antigravity — vault-aware retrieval + automatic capture via the ctx CLI",
+  "license": "AGPL-3.0",
+  "scripts": {
+    "test": "node tests/adapter.test.mjs"
+  }
+}
