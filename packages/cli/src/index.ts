@@ -163,10 +163,12 @@ import {
 import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
 import {
   aliasesFor,
+  coversServer,
   deriveServerAlias,
   loginHintLine,
   loginTargetOfAlias,
   mayShowLoginHint,
+  nestIdOf,
   scopeForEndpoint,
   serverOrigin,
   unregisteredLogins,
@@ -3667,6 +3669,7 @@ program
     },
   ) => {
     try {
+      if (opts.json && !opts.list) throw new Error("--json goes with --list.");
       if (opts.list && opts.json) {
         // From the plain logins file: fast, and no key can appear in it.
         const remotes = readRegistry().remotes;
@@ -3686,6 +3689,7 @@ program
         const all = Object.keys(map.servers);
         // Every account's keys for the server.
         const listFor = server;
+        const registryRemotes = readRegistry().remotes;
         const keys = (listFor
           ? all.filter((k) => keysUnderServer(map, listFor, splitAccountKey(k).account).includes(k))
           : all
@@ -3698,7 +3702,7 @@ program
           const cred = map.servers[key];
           const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
           const { scope: keyUrl, account: keyAccount } = splitAccountKey(key);
-          const usedBy = isNestScope(key) ? [] : aliasesFor(readRegistry().remotes, { url: keyUrl, account: keyAccount });
+          const usedBy = isNestScope(key) ? [] : aliasesFor(registryRemotes, { url: keyUrl, account: keyAccount });
           const used = usedBy.length ? chalk.dim(`  used by: ${usedBy.join(", ")}`) : "";
           console.log(`${key}${scope}${used}`);
           const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
@@ -3707,6 +3711,7 @@ program
         return;
       }
       if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
+      let signedInByAlias = false;
       // A registered alias stands for its server (and account): `ctx login promptowl` signs in again.
       const ofAlias = loginTargetOfAlias(server, readRegistry().remotes);
       if (ofAlias) {
@@ -3714,6 +3719,7 @@ program
         opts.account ??= ofAlias.account;
         opts.nest ??= ofAlias.nest;
         opts.register = false; // it is registered already
+        signedInByAlias = true;
       }
       assertSafeEndpoint(server, "<server>");
       if (opts.nest && !opts.keyStdin) {
@@ -3728,6 +3734,7 @@ program
       const accountNote = opts.account ? ` (account "${opts.account}")` : "";
       const accountFlag = opts.account ? ` --account ${opts.account}` : "";
       if (opts.setDefault && !opts.as) throw new Error("--set-default goes with --as <alias>.");
+      if (opts.as && opts.register === false) throw new Error("--as names the vault to register; drop --no-register, or drop --as.");
       // Check the alias before signing in, not after a key has been minted.
       if (opts.as) {
         const reg = readRegistry();
@@ -3829,9 +3836,9 @@ program
       // The alias carries no key (it borrows the saved one) and never takes the default vault.
       if (!opts.nest && opts.register !== false) {
         const reg = readRegistry();
-        const already = Object.entries(reg.remotes ?? {}).find(
-          ([, r]) =>
-            r.transport === "http" && !r.auth && r.account === opts.account && serverOrigin(r.url) === serverUrl,
+        // A server-level remote only: one nest of this server registered earlier does not stand for it.
+        const already = Object.entries(reg.remotes ?? {}).find(([, r]) =>
+          coversServer(r, { url: serverUrl, account: opts.account }),
         );
         if (already) {
           console.log(chalk.dim(`  "${already[0]}" already points at this server: ctx vault list`));
@@ -3861,6 +3868,7 @@ program
         console.log(chalk.dim(`  Undo:       ctx vault remove ${alias}`));
         return;
       }
+      if (signedInByAlias && !opts.nest) return; // already registered: nothing more to set up
       // A nest-scoped key reaches only its own nest, directly or as <alias>/<nest> behind a server alias.
       const next = opts.nest
         ? [
@@ -4853,6 +4861,10 @@ program
       console.error(chalk.red('Say "ctx hints on" or "ctx hints off".'));
       process.exit(1);
     }
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan(`Dry run — hints stay as they are.`));
+      return;
+    }
     setHintsEnabled(state === "on");
     console.log(state === "on" ? chalk.green("Hints on.") : chalk.yellow("Hints off. `ctx hints on` brings them back."));
   });
@@ -4864,6 +4876,13 @@ vaultCmd
     try {
       await confirmOrExit(`Rename "${oldAlias}" to "${newAlias}" in ${registryPathForLog()}?`);
       const { wasDefault } = renameVault(oldAlias, newAlias);
+      // Move the nest-list cache with the alias; a stale one under the old name would be picked up by a later alias.
+      try {
+        const cacheDir = pathMod.join(getRegistryDir(), "cache");
+        fs.renameSync(pathMod.join(cacheDir, `nests-${oldAlias}.json`), pathMod.join(cacheDir, `nests-${newAlias}.json`));
+      } catch {
+        // no cache, or a read-only dir: it is only a cache
+      }
       console.log(chalk.green(`Renamed "${oldAlias}" → "${chalk.bold(newAlias)}"${wasDefault ? " (default)" : ""}`));
       console.log(chalk.dim(`  Nests behind it now show as ${newAlias}/<nest>; update any --vault ${oldAlias}/… you use.`));
     } catch (err) {
@@ -4881,6 +4900,7 @@ vaultCmd
   .option("--url <url>", "Register a REMOTE nest at this MCP endpoint (streamable HTTP)")
   .option("--bearer-env <var>", "Env var holding the bearer token for --url (stored as a reference, never the value)")
   .option("--account <name>", "With --url: sign in with the keys `ctx login --account <name>` saved")
+  .option("--server", "With --url: mark the endpoint as a server whose nests are listed as <alias>/<nest> (a /nests/<id>/mcp URL is marked a nest on its own)")
   .option("--mcp-command <cmd>", "Register a REMOTE nest served by this stdio MCP command")
   .option(
     "--mcp-arg <arg>",
@@ -4900,6 +4920,10 @@ vaultCmd
           console.log(chalk.red("A remote nest takes no path argument."));
           process.exit(1);
         }
+        if (opts.server && (!opts.url || scopeForEndpoint(opts.url) === "nest")) {
+          console.log(chalk.red("--server goes with a server --url, not a /nests/<id>/mcp endpoint or --mcp-command."));
+          process.exit(1);
+        }
         if (opts.account && (!opts.url || opts.bearerEnv)) {
           console.log(chalk.red("--account goes with --url and no --bearer-env (it picks a `ctx login` account)."));
           process.exit(1);
@@ -4910,7 +4934,7 @@ vaultCmd
               url: opts.url,
               ...(opts.bearerEnv ? { auth: { bearer_env: opts.bearerEnv } } : {}),
               ...(opts.account ? { account: opts.account } : {}),
-              ...(scopeForEndpoint(opts.url) ? { scope: scopeForEndpoint(opts.url) } : {}),
+              ...(scopeForEndpoint(opts.url) ? { scope: scopeForEndpoint(opts.url) } : opts.server ? { scope: "server" } : {}),
               ...(opts.description ? { description: opts.description } : {}),
             }
           : {
@@ -5208,11 +5232,13 @@ program
     if (report.logins.length === 0) {
       row("Logins", chalk.dim("none (ctx login <server>)"));
     }
+    const registered = readRegistry();
+    const taken = new Set([...Object.keys(registered.vaults), ...Object.keys(registered.remotes ?? {})]);
     report.logins.forEach((l, i) => {
       const who = `${l.url}${l.account ? ` (account ${l.account})` : ""}`;
       const state = l.aliases.length
         ? `${chalk.green("registered")} as ${l.aliases.map((a, n) => `${a} [${l.scopes[n]}]`).join(", ")}`
-        : `${chalk.yellow("not registered")} — ctx vault add <alias> --url ${l.url}/mcp`;
+        : `${chalk.yellow("not registered")} — ctx vault add ${deriveServerAlias(l.url, (a) => taken.has(a))} --url ${l.url}/mcp --server${l.account ? ` --account ${l.account}` : ""}`;
       row(i === 0 ? "Logins" : "", `${who}  ${state}`);
     });
     row(

@@ -47,8 +47,8 @@ describe("deriveServerAlias", () => {
 
 describe("endpoint shape", () => {
   it("tells a server from a nest from neither", () => {
-    expect(scopeForEndpoint("https://h/mcp")).toBe("server");
-    expect(scopeForEndpoint("https://h/mcp/")).toBe("server");
+    expect(scopeForEndpoint("https://h/mcp")).toBeUndefined(); // may be a single-nest server: the probe decides
+    expect(scopeForEndpoint("https://h/mcp/")).toBeUndefined();
     expect(scopeForEndpoint("https://h/nests/abc/mcp")).toBe("nest");
     expect(scopeForEndpoint("https://h/custom/path")).toBeUndefined();
     expect(scopeForEndpoint("not a url")).toBeUndefined();
@@ -93,8 +93,9 @@ describe("registered vs logged in", () => {
     { url: "https://e.example.com" },
   ];
 
-  it("lists only logins no remote covers (a nest remote counts; env-key and other-account ones don't)", () => {
+  it("lists only logins no remote stands for (a lone nest remote doesn't; nor do env-key or other-account ones)", () => {
     expect(unregisteredLogins(logins, remotes).map((l) => `${l.url}${l.account ? "#" + l.account : ""}`)).toEqual([
+      "https://b.example.com",
       "https://c.example.com",
       "https://d.example.com",
       "https://e.example.com",
@@ -102,6 +103,9 @@ describe("registered vs logged in", () => {
   });
   it("everything is unregistered with no remotes at all", () => {
     expect(unregisteredLogins(logins, undefined)).toHaveLength(logins.length);
+  });
+  it("a nest remote still counts as using the key", () => {
+    expect(aliasesFor(remotes, { url: "https://b.example.com" })).toEqual(["one"]);
   });
   it("finds the aliases a key serves", () => {
     expect(aliasesFor(remotes, { url: "https://c.example.com", account: "work" })).toEqual(["worker"]);
@@ -115,6 +119,7 @@ describe("loginTargetOfAlias", () => {
     po: { transport: "http", url: "https://nest.promptowl.ai/mcp", account: "w" },
     n: { transport: "http", url: "https://h/nests/n1/mcp" },
     s: { transport: "stdio", command: "x" },
+    keyed: { transport: "http", url: "https://h/mcp", auth: { bearer_env: "K" } },
   };
   it("resolves an alias to its server, account and nest", () => {
     expect(loginTargetOfAlias("po", remotes)).toEqual({ server: "https://nest.promptowl.ai", account: "w" });
@@ -125,6 +130,7 @@ describe("loginTargetOfAlias", () => {
     expect(loginTargetOfAlias("http://localhost:3737", { "http://localhost:3737": remotes.po })).toBeNull();
     expect(loginTargetOfAlias("nope", remotes)).toBeNull();
     expect(loginTargetOfAlias("s", remotes)).toBeNull();
+    expect(loginTargetOfAlias("keyed", remotes)).toBeNull(); // has its own credential
   });
 });
 
@@ -150,10 +156,10 @@ describe("loginHintLine", () => {
   it("names the server, the fixing command and the switch", () => {
     const line = loginHintLine({ url: "https://nest.promptowl.ai" }, "promptowl");
     expect(line).toContain("logged in to https://nest.promptowl.ai");
-    expect(line).toContain("ctx vault add promptowl --url https://nest.promptowl.ai/mcp");
+    expect(line).toContain("ctx vault add promptowl --url https://nest.promptowl.ai/mcp --server");
     expect(line).toContain("ctx hints off");
     expect(line).not.toContain("\n");
   });
   it("carries the account", () =>
-    expect(loginHintLine({ url: "https://h", account: "w" }, "h")).toContain("/mcp --account w"));
+    expect(loginHintLine({ url: "https://h", account: "w" }, "h")).toContain("/mcp --server --account w"));
 });

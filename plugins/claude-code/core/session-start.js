@@ -101,10 +101,14 @@ export function run({ env, exec }) {
 
   // A server the user signed in to but never registered has nests that are invisible here.
   // Said as a fact for the model to relay; the model is not asked to run anything.
-  const logins = ctxJson(exec, ["login", "--list", "--json"], []);
+  const hintsOff = env.CONTEXTNEST_NO_HINTS && env.CONTEXTNEST_NO_HINTS !== "0";
+  const logins = hintsOff ? [] : ctxJson(exec, ["login", "--list", "--json"], []);
   if (Array.isArray(logins)) {
     for (const l of logins) {
       if (!l || typeof l.url !== "string" || (Array.isArray(l.usedBy) && l.usedBy.length > 0)) continue;
+      // The file is the user's, but it ends up in model context: accept only what ctx itself would write.
+      if (!/^https?:\/\/[^\s`]+$/.test(l.url)) continue;
+      if (l.account != null && !/^[A-Za-z0-9._@+-]{1,64}$/.test(String(l.account))) continue;
       const url = squish(l.url.replace(/`/g, "'"), 120);
       lines.push(
         `The user is logged in to ${url}${l.account ? ` (account ${squish(String(l.account).replace(/`/g, "'"), 40)})` : ""} ` +

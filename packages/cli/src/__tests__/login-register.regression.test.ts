@@ -12,7 +12,7 @@
  * pseudo-terminal (Python's `pty`); they are skipped where that isn't available (Windows).
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -83,22 +83,32 @@ describe("ctx login registers the server (regression)", () => {
     });
   }
 
-  /** Run under a pseudo-terminal, so stderr.isTTY is true. Output of both streams is merged. */
-  function ctxTty(args: string[], extra: Record<string, string> = {}, input: string | string[] = ""): Promise<Run> {
+  /**
+   * Run under a pseudo-terminal, so stderr.isTTY is true. Output of both streams is merged.
+   * `answers` are typed like a person: each one when its prompt has appeared, never on a timer.
+   */
+  function ctxTty(args: string[], extra: Record<string, string> = {}, answers: Array<[RegExp, string]> = []): Promise<Run> {
     const py = "import os,pty,sys;sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))";
     return new Promise((resolve) => {
-      const child = execFile(
-        "python3",
-        ["-c", py, "node", distPath, ...args],
-        { cwd: home, env: { ...env, ...extra }, encoding: "utf-8", timeout: 30_000 },
-        (err, stdout, stderr) =>
-          resolve({ status: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
-      );
-      // Typed like a person: each chunk lands after the program has asked for it.
-      const chunks = Array.isArray(input) ? input : [input];
-      chunks.forEach((chunk, i) => {
-        setTimeout(() => (i === chunks.length - 1 ? child.stdin?.end(chunk) : child.stdin?.write(chunk)), i * 1500);
+      const child = spawn("python3", ["-c", py, "node", distPath, ...args], {
+        cwd: home,
+        env: { ...env, ...extra },
+        stdio: ["pipe", "pipe", "pipe"],
       });
+      let stdout = "";
+      let stderr = "";
+      let next = 0;
+      const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      child.stdout.setEncoding("utf-8").on("data", (d: string) => {
+        stdout += d;
+        while (next < answers.length && answers[next][0].test(stdout)) child.stdin.write(answers[next++][1]);
+      });
+      child.stderr.setEncoding("utf-8").on("data", (d: string) => (stderr += d));
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ status: code ?? 1, stdout, stderr });
+      });
+      if (answers.length === 0) child.stdin.end();
     });
   }
 
@@ -136,6 +146,26 @@ describe("ctx login registers the server (regression)", () => {
     expect(rows.map((v) => v.alias)).toEqual(expect.arrayContaining([`${alias}/alpha`, `${alias}/beta`]));
     expect(rows.find((v) => v.alias === `${alias}/alpha`)?.description).toBe("First nest");
     expect(rows.find((v) => v.alias === alias)?.isDefault).toBe(true); // the registry's rule: the first entry is the default
+  });
+
+  it("registers the server even when one of its nests was added by hand first", async () => {
+    mkdirSync(join(home, ".contextnest"), { recursive: true });
+    writeFileSync(
+      join(home, ".contextnest", "config.yaml"),
+      `version: 1\nvaults: {}\nremotes:\n  just-one:\n    transport: http\n    url: ${server.url}/nests/n-alpha-0001/mcp\n    scope: nest\n`,
+    );
+    const login = await ctx(["login", server.url, "--key-stdin"], KEY);
+    expect(login.status).toBe(0);
+    expect(login.stdout).toMatch(/Registered "/);
+    expect(registry()).toContain("scope: server");
+    expect(registry()).toContain("just-one:");
+  });
+
+  it("--no-register and --as together is refused rather than guessed at", async () => {
+    const res = await ctx(["login", server.url, "--key-stdin", "--no-register", "--as", "zz"], KEY);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toContain("drop --no-register");
+    expect(registry()).not.toContain("zz");
   });
 
   it("never takes the default from a vault the user already has", async () => {
@@ -221,6 +251,17 @@ describe("ctx login registers the server (regression)", () => {
     expect(registry().match(/^\s{2}po:/gm)).toHaveLength(1); // re-login by alias adds no entry
   });
 
+  it("a rejected key stays 'key rejected' on the next listing, not 'not answering'", async () => {
+    await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
+    server.validKeys.clear();
+    forgetNestCache();
+    for (let i = 0; i < 2; i++) {
+      const listing = (await ctx(["vault", "list"])).stdout;
+      expect(listing, `listing ${i + 1}`).toContain("key rejected");
+      expect(listing).not.toContain("not answering");
+    }
+  });
+
   it("an account-bound remote's error carries --account", async () => {
     await ctx(["login", server.url, "--key-stdin", "--account", "other", "--as", "po-o"], KEY2);
     server.validKeys.clear();
@@ -236,11 +277,13 @@ describe("ctx login registers the server (regression)", () => {
     it("offers to sign in again, then runs the command it was asked to run", async () => {
       await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
       rejectSavedKey();
-      // "y" answers the question; the empty line keeps the default key name that `ctx login` asks for.
-      const res = await ctxTty(["--vault", "po/alpha", "list"], {}, ["y\n", "\n"]);
+      const res = await ctxTty(["--vault", "po/alpha", "list"], {}, [
+        [/Sign in now\?/, "y\n"],
+        [/Name for the API key/, "\n"], // keep the default key name `ctx login` asks for
+      ]);
       const out = res.stdout + res.stderr;
       expect(out).toContain(`The key saved for ${server.url} was rejected`);
-      expect(out).toContain("Sign in again now?");
+      expect(out).toContain("Sign in now?");
       expect(res.status, out).toBe(0);
       expect(out).toContain("in-n-alpha-0001"); // the original command ran after the new login
       expect(server.validKeys.size).toBe(1); // exactly one new key was minted
@@ -249,7 +292,7 @@ describe("ctx login registers the server (regression)", () => {
     it("answering no keeps the original error and a failing exit code", async () => {
       await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
       rejectSavedKey();
-      const res = await ctxTty(["--vault", "po/alpha", "list"], {}, "n\n");
+      const res = await ctxTty(["--vault", "po/alpha", "list"], {}, [[/Sign in now\?/, "n\n"]]);
       expect(res.status).not.toBe(0);
       expect(res.stdout + res.stderr).toContain(`ctx login ${server.url}`);
       expect(server.validKeys.size).toBe(0);
@@ -258,12 +301,12 @@ describe("ctx login registers the server (regression)", () => {
     it("never prompts with --json, and never for a pipe", async () => {
       await ctx(["login", server.url, "--key-stdin", "--as", "po"], KEY);
       rejectSavedKey();
-      const json = await ctxTty(["--vault", "po/alpha", "list", "--json"], {}, "y\n");
+      const json = await ctxTty(["--vault", "po/alpha", "list", "--json"]);
       expect(json.status).not.toBe(0);
-      expect(json.stdout + json.stderr).not.toContain("Sign in again now?");
+      expect(json.stdout + json.stderr).not.toContain("Sign in now?");
       const piped = await ctx(["--vault", "po/alpha", "list"], "y\n");
       expect(piped.status).not.toBe(0);
-      expect(piped.stdout + piped.stderr).not.toContain("Sign in again now?");
+      expect(piped.stdout + piped.stderr).not.toContain("Sign in now?");
     });
   });
 
@@ -315,7 +358,7 @@ describe("ctx login registers the server (regression)", () => {
     await ctx(["login", server.url, "--key-stdin", "--no-register"], KEY);
     const before = JSON.parse((await ctx(["doctor", "--json"], "", offline)).stdout);
     expect(before.logins).toEqual([{ url: server.url, account: null, aliases: [], scopes: [] }]);
-    await ctx(["vault", "add", "po", "--url", `${server.url}/mcp`, "--yes"]);
+    await ctx(["vault", "add", "po", "--url", `${server.url}/mcp`, "--server", "--yes"]);
     const after = JSON.parse((await ctx(["doctor", "--json"], "", offline)).stdout);
     expect(after.logins).toEqual([{ url: server.url, account: null, aliases: ["po"], scopes: ["server"] }]);
     const text = (await ctx(["doctor"], "", offline)).stdout;
@@ -332,6 +375,16 @@ describe("ctx login registers the server (regression)", () => {
     const rows = await vaultRows();
     expect(rows.map((v) => v.alias)).toEqual(expect.arrayContaining(["old", "old/alpha"]));
     expect((await ctx(["--vault", "old/beta", "list", "--json"])).stdout).toContain("in-n-beta-0002");
+  });
+
+  it("vault add --url on a bare /mcp stays unmarked unless --server says so; a nest URL marks itself", async () => {
+    await ctx(["vault", "add", "bare", "--url", `${server.url}/mcp`, "--yes"]);
+    await ctx(["vault", "add", "one", "--url", `${server.url}/nests/n-alpha-0001/mcp`, "--yes"]);
+    const rows = await vaultRows();
+    expect(rows.find((v) => v.alias === "bare")).not.toHaveProperty("scope");
+    expect(rows.find((v) => v.alias === "one")).toMatchObject({ scope: "nest" });
+    const bad = await ctx(["vault", "add", "x", "--url", `${server.url}/nests/n/mcp`, "--server", "--yes"]);
+    expect(bad.stdout + bad.stderr).toContain("--server goes with a server --url");
   });
 
   it("a server without nest_index is a plain single nest, even when marked as a server", async () => {
@@ -393,7 +446,7 @@ describe("ctx login registers the server (regression)", () => {
         expect(both).toContain(server.url);
         expect(both).toContain(other.url);
 
-        expect((await ctx(["vault", "add", "first", "--url", `${server.url}/mcp`, "--yes"])).status).toBe(0);
+        expect((await ctx(["vault", "add", "first", "--url", `${server.url}/mcp`, "--server", "--yes"])).status).toBe(0);
         expect(registry()).toContain("scope: server");
         const after = (await ctxTty(["vault", "list"])).stdout;
         expect(after).not.toContain(`logged in to ${server.url}`);
@@ -401,6 +454,11 @@ describe("ctx login registers the server (regression)", () => {
       } finally {
         await other.close();
       }
+    });
+
+    it("a lone nest remote does not stand for the server: the hint stays, until the server is registered", async () => {
+      expect((await ctx(["vault", "add", "one", "--url", `${server.url}/nests/n-alpha-0001/mcp`, "--yes"])).status).toBe(0);
+      expect((await ctxTty(["vault", "list"])).stdout).toMatch(HINT);
     });
 
     it("works for an upgraded user whose logins.json does not exist yet, and does not need it again", async () => {

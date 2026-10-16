@@ -321,8 +321,8 @@ function writeLogins(map: ServerMap, opts: CredentialStoreOptions): void {
     // missing: write it
   }
   try {
-    fs.mkdirSync(pathMod.dirname(file), { recursive: true });
-    fs.writeFileSync(tmp, body);
+    fs.mkdirSync(pathMod.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmp, body, { mode: 0o600 }); // account names can be emails
     fs.renameSync(tmp, file);
   } catch {
     // Only a cache: without it the next check reads the store once.
@@ -358,7 +358,11 @@ export async function loggedInServers(opts: CredentialStoreOptions = {}): Promis
   try {
     return serversOf(await readSavedMap({ ...opts, fresh: true }));
   } catch {
-    return []; // an unreadable store is reported by the commands that need a key, not by a hint
+    // An unreadable store (locked keychain, wrong key) is reported by the commands that need a key,
+    // not by a hint. Remember "nothing known" so the next command doesn't open the store again;
+    // the next successful save or read rewrites the file.
+    writeLogins(emptyServerMap(), opts);
+    return [];
   }
 }
 

@@ -19,6 +19,6 @@ export function hintsDisabled(): boolean {
 }
 
 export function setHintsEnabled(enabled: boolean): void {
-  fs.mkdirSync(getRegistryDir(), { recursive: true });
-  fs.writeFileSync(hintsPath(), JSON.stringify({ hints: enabled }));
+  fs.mkdirSync(getRegistryDir(), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(hintsPath(), JSON.stringify({ hints: enabled }), { mode: 0o600 });
 }

@@ -34,17 +34,16 @@ export function nestIdOf(endpoint: string): string | undefined {
   return m ? decodeURIComponent(m[1]) : undefined;
 }
 
-/** What an endpoint URL says it is: a nest (`/nests/<id>/mcp`), a server (`/mcp`), or nothing certain. */
-export function scopeForEndpoint(endpoint: string): "server" | "nest" | undefined {
-  let path: string;
+/**
+ * What an endpoint URL proves: `/nests/<id>/mcp` is one nest. A bare `/mcp` is also
+ * the path of a self-hosted single-nest server, so it proves nothing: the probe decides.
+ */
+export function scopeForEndpoint(endpoint: string): "nest" | undefined {
   try {
-    path = new URL(endpoint).pathname;
+    return /\/nests\/[^/]+\/mcp\/?$/.test(new URL(endpoint).pathname) ? "nest" : undefined;
   } catch {
     return undefined;
   }
-  if (/\/nests\/[^/]+\/mcp\/?$/.test(path)) return "nest";
-  if (/\/mcp\/?$/.test(path)) return "server";
-  return undefined;
 }
 
 /**
@@ -93,6 +92,16 @@ function coversLogin(remote: RemoteNestSpec, server: LoginServer): boolean {
   }
 }
 
+/** True when `remote` stands for the whole server: a nest-scoped remote leaves the others unlisted. */
+export function coversServer(remote: RemoteNestSpec, server: LoginServer): boolean {
+  if (remote.transport !== "http" || remote.scope === "nest") return false;
+  try {
+    return !nestIdOf(remote.url) && coversLogin(remote, server);
+  } catch {
+    return false;
+  }
+}
+
 /** Aliases whose remote signs in with the key saved for `server`. */
 export function aliasesFor(remotes: Record<string, RemoteNestSpec> | undefined, server: LoginServer): string[] {
   return Object.entries(remotes ?? {})
@@ -100,10 +109,10 @@ export function aliasesFor(remotes: Record<string, RemoteNestSpec> | undefined, 
     .map(([alias]) => alias);
 }
 
-/** Logged-in servers no registry remote covers. */
+/** Logged-in servers no registry remote stands for (a lone nest remote doesn't). */
 export function unregisteredLogins(logins: LoginServer[], remotes: Record<string, RemoteNestSpec> | undefined): LoginServer[] {
   const all = Object.values(remotes ?? {});
-  return logins.filter((l) => !all.some((r) => coversLogin(r, l)));
+  return logins.filter((l) => !all.some((r) => coversServer(r, l)));
 }
 
 /** Commands that settle, or are about, the registration; the hint would only repeat them. */
@@ -133,7 +142,7 @@ export function loginHintLine(server: LoginServer, alias: string): string {
   const account = server.account ? ` --account ${server.account}` : "";
   return (
     `ctx: logged in to ${server.url} but no vault is registered for it — ` +
-    `run: ctx vault add ${alias} --url ${server.url}/mcp${account}   (silence: ctx hints off)`
+    `run: ctx vault add ${alias} --url ${server.url}/mcp --server${account}   (silence: ctx hints off)`
   );
 }
 
@@ -144,7 +153,8 @@ export function loginTargetOfAlias(
 ): { server: string; account?: string; nest?: string } | null {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(arg)) return null;
   const spec = remotes?.[arg];
-  if (!spec || spec.transport !== "http") return null;
+  // An alias with its own credential (bearer_env) never uses a `ctx login` key.
+  if (!spec || spec.transport !== "http" || spec.auth) return null;
   const nest = nestIdOf(spec.url);
   return { server: serverOrigin(spec.url), ...(spec.account ? { account: spec.account } : {}), ...(nest ? { nest } : {}) };
 }

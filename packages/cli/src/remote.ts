@@ -31,6 +31,7 @@ import pathMod from "node:path";
 import type { ContextNode, RemoteNestConnection, RemoteNestSpec, VaultListEntry } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
 import { loginCommandFor, nestIdOf, serverOrigin } from "./login-registry.js";
+import { loggedInServers } from "./server-credentials.js";
 import { parseRecipeManifest, manifestSources } from "./pull.js";
 import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
@@ -176,6 +177,13 @@ export async function serverNests(
       // A failed probe only short-circuits the next probes, not a caller that
       // already holds a live connection (that is proof the server is back).
       if (cached.failed && !conn && !opts.retry && age < NEST_PROBE_BACKOFF_MS) {
+        // Remember WHY it failed: a rejected key must not turn into "not answering" on the next listing.
+        if (cached.reason === "REMOTE_AUTH_FAILED") {
+          throw new ContextNestError(
+            `Remote "${baseAlias}" rejected the key less than ${NEST_PROBE_BACKOFF_MS / 1000}s ago — sign in again.`,
+            "REMOTE_AUTH_FAILED",
+          );
+        }
         throw new ContextNestError(
           `Remote "${baseAlias}" was unreachable less than ${NEST_PROBE_BACKOFF_MS / 1000}s ago — not retrying yet.`,
           "REMOTE_UNREACHABLE",
@@ -193,7 +201,13 @@ export async function serverNests(
     nests = conn ? await fetchNests(conn) : await nestsOverSavedKeys(baseAlias, spec, fetchNests);
   } catch (err) {
     // Keep the last good list: a listing can still show it while the server is down.
-    if (!conn) write({ failed: true, ...(cached?.nests ? { nests: cached.nests } : {}) });
+    if (!conn) {
+      write({
+        failed: true,
+        ...(err instanceof ContextNestError ? { reason: err.code } : {}),
+        ...(cached?.nests ? { nests: cached.nests } : {}),
+      });
+    }
     throw err;
   }
   write({ nests });
@@ -239,7 +253,7 @@ async function nestsOverSavedKeys(
   return [...byId.values()];
 }
 
-type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean };
+type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean; reason?: string };
 
 /** The cached probe for this alias and URL; undefined when there is none or it is unreadable. */
 function readNestCache(baseAlias: string, url: string): NestCache | undefined {
@@ -426,6 +440,7 @@ function canReauthHere(spec: RemoteNestSpec): spec is Extract<RemoteNestSpec, { 
     !nestIdOf(spec.url) &&
     Boolean(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY) &&
     !process.argv.includes("--json") &&
+    !isDryRun() && // a dry run must not mint a key or write the credential store
     !process.env.CI
   );
 }
@@ -448,13 +463,12 @@ async function reauthOnce<T>(target: RemoteTarget, open: () => Promise<T>): Prom
     const spec = target.spec;
     if (!(err instanceof ContextNestError) || err.code !== "REMOTE_AUTH_FAILED" || !canReauthHere(spec)) throw err;
     const origin = serverOrigin(spec.url);
-    console.error(chalk.yellow(`The key saved for ${origin} was rejected.`));
-    if (!(await askYesNo("Sign in again now?"))) throw err;
-    const login = spawnSync(
-      process.execPath,
-      [process.argv[1], "login", origin, "--no-register", ...(spec.account ? ["--account", spec.account] : [])],
-      { stdio: "inherit" },
-    );
+    const hadKey = (await loggedInServers()).some((l) => l.url === origin && l.account === spec.account);
+    console.error(chalk.yellow(hadKey ? `The key saved for ${origin} was rejected.` : `You're not signed in to ${origin}.`));
+    if (!(await askYesNo("Sign in now?"))) throw err;
+    // By alias: it carries the URL and account, and tells login the vault is registered already.
+    const alias = target.alias.split("/")[0];
+    const login = spawnSync(process.execPath, [...process.execArgv, process.argv[1], "login", alias], { stdio: "inherit" });
     if (login.status !== 0) throw err;
     return await open();
   }
