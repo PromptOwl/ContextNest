@@ -1,0 +1,326 @@
+# Large-vault queries for E2 (Determinism)
+#
+# 50 queries probing service-specific facts in a 1060-doc synthesized vault.
+# For E2 only the `question` and `selector` fields are read — gold_facts are
+# unused for the determinism metric but retained for format compatibility.
+#
+# Selector predicates use the service-tag + topic-tag combination that the
+# generator wrote into each doc's frontmatter.
+
+# ============================================================
+# Deploy-rollback questions (10 services)
+# ============================================================
+- id: l01
+  question: "What error rate threshold triggers a deploy rollback for the payments-service?"
+  selector: "#runbook #deploy #payments-service"
+  gold_doc: nodes/runbooks/payments/deploy-rollback
+  gold_facts: ["error rate", "payments-service"]
+
+- id: l02
+  question: "What error rate threshold triggers a deploy rollback for the auth-service?"
+  selector: "#runbook #deploy #auth-service"
+  gold_doc: nodes/runbooks/auth/deploy-rollback
+  gold_facts: ["error rate", "auth-service"]
+
+- id: l03
+  question: "What P99 latency threshold triggers a deploy rollback for the checkout-service?"
+  selector: "#runbook #deploy #checkout-service"
+  gold_doc: nodes/runbooks/checkout/deploy-rollback
+  gold_facts: ["P99 latency", "checkout-service"]
+
+- id: l04
+  question: "Which CI system runs the deploy pipeline for the search-service?"
+  selector: "#runbook #deploy #search-service"
+  gold_doc: nodes/runbooks/search/deploy-rollback
+  gold_facts: ["CI", "search-service"]
+
+- id: l05
+  question: "What is the mean rollback time for the inventory-service?"
+  selector: "#runbook #deploy #inventory-service"
+  gold_doc: nodes/runbooks/inventory/deploy-rollback
+  gold_facts: ["minutes", "inventory-service"]
+
+- id: l06
+  question: "Which team owns the deploy rollback runbook for the messaging-service?"
+  selector: "#runbook #deploy #messaging-service"
+  gold_doc: nodes/runbooks/messaging/deploy-rollback
+  gold_facts: ["team", "messaging-service"]
+
+- id: l07
+  question: "Which monitor triggers a rollback for the notifications-service?"
+  selector: "#runbook #deploy #notifications-service"
+  gold_doc: nodes/runbooks/notifications/deploy-rollback
+  gold_facts: ["monitor", "notifications-service"]
+
+- id: l08
+  question: "What error rate threshold triggers a deploy rollback for the ranker-service?"
+  selector: "#runbook #deploy #ranker-service"
+  gold_doc: nodes/runbooks/ranker/deploy-rollback
+  gold_facts: ["error rate", "ranker-service"]
+
+- id: l09
+  question: "What is the P99 latency threshold for the catalog-service deploy rollback?"
+  selector: "#runbook #deploy #catalog-service"
+  gold_doc: nodes/runbooks/catalog/deploy-rollback
+  gold_facts: ["latency", "catalog-service"]
+
+- id: l10
+  question: "What CI system runs the deploy pipeline for the cart-service?"
+  selector: "#runbook #deploy #cart-service"
+  gold_doc: nodes/runbooks/cart/deploy-rollback
+  gold_facts: ["CI", "cart-service"]
+
+# ============================================================
+# Database migration questions (10 services)
+# ============================================================
+- id: l11
+  question: "Which S3 bucket holds database backups for the billing-service?"
+  selector: "#runbook #database #billing-service"
+  gold_doc: nodes/runbooks/billing/database-migration
+  gold_facts: ["S3 bucket", "billing-service"]
+
+- id: l12
+  question: "Which bastion host is used for database migrations on the shipping-service?"
+  selector: "#runbook #database #shipping-service"
+  gold_doc: nodes/runbooks/shipping/database-migration
+  gold_facts: ["bastion", "shipping-service"]
+
+- id: l13
+  question: "How long before a migration window should #ops be notified for the analytics-service?"
+  selector: "#runbook #database #analytics-service"
+  gold_doc: nodes/runbooks/analytics/database-migration
+  gold_facts: ["minutes", "analytics-service"]
+
+- id: l14
+  question: "What is the database migration rollback SLA for the kafka-relay service?"
+  selector: "#runbook #database #kafka-relay-service"
+  gold_doc: nodes/runbooks/kafka-relay/database-migration
+  gold_facts: ["SLA", "kafka-relay"]
+
+- id: l15
+  question: "What is the migration apply script path for the reports service?"
+  selector: "#runbook #database #reporting-service"
+  gold_doc: nodes/runbooks/reporting/database-migration
+  gold_facts: ["migrate", "reporting"]
+
+- id: l16
+  question: "Which team owns database migrations for the ml-features service?"
+  selector: "#runbook #database #ml-features-service"
+  gold_doc: nodes/runbooks/ml-features/database-migration
+  gold_facts: ["team", "ml-features"]
+
+- id: l17
+  question: "What S3 bucket holds backups for the feed-service?"
+  selector: "#runbook #database #feed-service"
+  gold_doc: nodes/runbooks/feed/database-migration
+  gold_facts: ["S3", "feed"]
+
+- id: l18
+  question: "Which bastion is used for moderation-service database migrations?"
+  selector: "#runbook #database #moderation-service"
+  gold_doc: nodes/runbooks/moderation/database-migration
+  gold_facts: ["bastion", "moderation"]
+
+- id: l19
+  question: "What is the migration rollback SLA for the subscriptions-service?"
+  selector: "#runbook #database #subscriptions-service"
+  gold_doc: nodes/runbooks/subscriptions/database-migration
+  gold_facts: ["SLA", "subscriptions"]
+
+- id: l20
+  question: "Notification window for refunds-service database migrations?"
+  selector: "#runbook #database #refunds-service"
+  gold_doc: nodes/runbooks/refunds/database-migration
+  gold_facts: ["minutes", "refunds"]
+
+# ============================================================
+# Incident response questions (10 services)
+# ============================================================
+- id: l21
+  question: "Which paging tool is used for tax-service incidents?"
+  selector: "#runbook #incident #tax-service"
+  gold_doc: nodes/runbooks/tax/incident-response
+  gold_facts: ["paging", "tax"]
+
+- id: l22
+  question: "Which bridge tool is used for ledger-service incidents?"
+  selector: "#runbook #incident #ledger-service"
+  gold_doc: nodes/runbooks/ledger/incident-response
+  gold_facts: ["bridge", "ledger"]
+
+- id: l23
+  question: "What defines a SEV1 incident for the identity-service?"
+  selector: "#runbook #incident #identity-service"
+  gold_doc: nodes/runbooks/identity/incident-response
+  gold_facts: ["SEV1", "identity"]
+
+- id: l24
+  question: "Postmortem deadline for incidents affecting the oauth-proxy?"
+  selector: "#runbook #incident #oauth-proxy-service"
+  gold_doc: nodes/runbooks/oauth-proxy/incident-response
+  gold_facts: ["hours", "oauth-proxy"]
+
+- id: l25
+  question: "Which paging tool is used for inference-gateway incidents?"
+  selector: "#runbook #incident #inference-gateway-service"
+  gold_doc: nodes/runbooks/inference-gateway/incident-response
+  gold_facts: ["paging", "inference-gateway"]
+
+- id: l26
+  question: "Bridge tool for embedding-service incidents?"
+  selector: "#runbook #incident #embedding-service-service"
+  gold_doc: nodes/runbooks/embedding-service/incident-response
+  gold_facts: ["bridge", "embedding-service"]
+
+- id: l27
+  question: "First 15 minutes of fraud-detector incident response?"
+  selector: "#runbook #incident #fraud-detector-service"
+  gold_doc: nodes/runbooks/fraud-detector/incident-response
+  gold_facts: ["incident", "fraud-detector"]
+
+- id: l28
+  question: "Postmortem window for support-bot incidents?"
+  selector: "#runbook #incident #support-bot-service"
+  gold_doc: nodes/runbooks/support-bot/incident-response
+  gold_facts: ["hours", "support-bot"]
+
+- id: l29
+  question: "SEV1 definition for the agent-runtime service?"
+  selector: "#runbook #incident #agent-runtime-service"
+  gold_doc: nodes/runbooks/agent-runtime/incident-response
+  gold_facts: ["SEV1", "agent-runtime"]
+
+- id: l30
+  question: "Which paging tool is used for warehouse-loader incidents?"
+  selector: "#runbook #incident #warehouse-loader-service"
+  gold_doc: nodes/runbooks/warehouse-loader/incident-response
+  gold_facts: ["paging", "warehouse-loader"]
+
+# ============================================================
+# API design questions (5 services)
+# ============================================================
+- id: l31
+  question: "Deprecation notice period for the personalization-service API?"
+  selector: "#standards #api #personalization-service"
+  gold_doc: nodes/standards/personalization/api-design
+  gold_facts: ["days", "personalization"]
+
+- id: l32
+  question: "Versioning prefix for the i18n-service API endpoints?"
+  selector: "#standards #api #i18n-service"
+  gold_doc: nodes/standards/i18n/api-design
+  gold_facts: ["v1", "i18n"]
+
+- id: l33
+  question: "Pagination style for the recommendations-service API?"
+  selector: "#standards #api #recommendations-service"
+  gold_doc: nodes/standards/recommendations/api-design
+  gold_facts: ["cursor", "recommendations"]
+
+- id: l34
+  question: "Error format used by the experimentation-service API?"
+  selector: "#standards #api #experimentation-service"
+  gold_doc: nodes/standards/experimentation/api-design
+  gold_facts: ["RFC 7807", "experimentation"]
+
+- id: l35
+  question: "Versioning convention for the campaigns-service?"
+  selector: "#standards #api #campaigns-service"
+  gold_doc: nodes/standards/campaigns/api-design
+  gold_facts: ["versioning", "campaigns"]
+
+# ============================================================
+# Security review questions (5 services)
+# ============================================================
+- id: l36
+  question: "Initial response SLA for security reviews on the loyalty-service?"
+  selector: "#standards #security #loyalty-service"
+  gold_doc: nodes/standards/loyalty/security-review
+  gold_facts: ["business days", "loyalty"]
+
+- id: l37
+  question: "Which Jira project hosts security reviews for the gift-cards service?"
+  selector: "#standards #security #gift-cards-service"
+  gold_doc: nodes/standards/gift-cards/security-review
+  gold_facts: ["Jira", "gift-cards"]
+
+- id: l38
+  question: "Full review SLA for security review on the promotions-service?"
+  selector: "#standards #security #promotions-service"
+  gold_doc: nodes/standards/promotions/security-review
+  gold_facts: ["week", "promotions"]
+
+- id: l39
+  question: "What triggers a mandatory security review on the consent-service?"
+  selector: "#standards #security #consent-service"
+  gold_doc: nodes/standards/consent/security-review
+  gold_facts: ["mandatory", "consent"]
+
+- id: l40
+  question: "Initial response SLA for security review on the policy-engine?"
+  selector: "#standards #security #policy-engine-service"
+  gold_doc: nodes/standards/policy-engine/security-review
+  gold_facts: ["business days", "policy-engine"]
+
+# ============================================================
+# ADRs and architecture (10 mixed)
+# ============================================================
+- id: l41
+  question: "What protocol does the canary-controller service use for internal calls?"
+  selector: "#adr #api #canary-controller-service"
+  gold_doc: nodes/adrs/canary-controller/0003-grpc-internal-rest-external
+  gold_facts: ["gRPC", "canary-controller"]
+
+- id: l42
+  question: "What is the architecture overview for the build-cache service?"
+  selector: "#architecture #overview #build-cache-service"
+  gold_doc: nodes/architecture/build-cache/architecture-overview
+  gold_facts: ["build-cache", "service"]
+
+- id: l43
+  question: "What protocol does the secrets-broker service use internally?"
+  selector: "#adr #api #secrets-broker-service"
+  gold_doc: nodes/adrs/secrets-broker/0003-grpc-internal-rest-external
+  gold_facts: ["gRPC", "secrets-broker"]
+
+- id: l44
+  question: "Architecture overview for the vector-index service?"
+  selector: "#architecture #overview #vector-index-service"
+  gold_doc: nodes/architecture/vector-index/architecture-overview
+  gold_facts: ["vector-index", "service"]
+
+- id: l45
+  question: "Recovery time objective for the geo-router service?"
+  selector: "#runbook #disaster-recovery #geo-router-service"
+  gold_doc: nodes/runbooks/geo-router/disaster-recovery
+  gold_facts: ["RTO", "geo-router"]
+
+- id: l46
+  question: "Monitoring dashboards for the deploy-gateway service?"
+  selector: "#runbook #monitoring #deploy-gateway-service"
+  gold_doc: nodes/runbooks/deploy-gateway/monitoring
+  gold_facts: ["dashboard", "deploy-gateway"]
+
+- id: l47
+  question: "Failover procedure for the schema-registry service?"
+  selector: "#runbook #disaster-recovery #schema-registry-service"
+  gold_doc: nodes/runbooks/schema-registry/disaster-recovery
+  gold_facts: ["failover", "schema-registry"]
+
+- id: l48
+  question: "Monitoring alerts for the rate-limiter service?"
+  selector: "#runbook #monitoring #ratelimiter-service"
+  gold_doc: nodes/runbooks/ratelimiter/monitoring
+  gold_facts: ["alert", "ratelimiter"]
+
+- id: l49
+  question: "Onboarding setup steps for the model-registry service?"
+  selector: "#onboarding #getting-started #model-registry-service"
+  gold_doc: nodes/onboarding/model-registry/getting-started
+  gold_facts: ["setup", "model-registry"]
+
+- id: l50
+  question: "Onboarding setup steps for the spam-detector service?"
+  selector: "#onboarding #getting-started #anomaly-detector-service"
+  gold_doc: nodes/onboarding/anomaly-detector/getting-started
+  gold_facts: ["anomaly", "setup"]
