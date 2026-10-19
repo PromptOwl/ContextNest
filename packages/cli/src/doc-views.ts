@@ -1,5 +1,5 @@
 import chalk from "./color.js";
-import { TAG_PATTERN, TAG_RULE, parseUri } from "@promptowl/contextnest-engine";
+import { ContextNestError, TAG_PATTERN, TAG_RULE, parseUri } from "@promptowl/contextnest-engine";
 
 /**
  * Shared view shapes and formatting for commands that run against BOTH a
@@ -184,10 +184,22 @@ export function printSearchResults(
  * re-rooted under nodes/. The engine resolves a bare id for the vault's own
  * layout (as stored at the root of a flat Obsidian vault, else nodes/<id>);
  * normalizeDocumentId's blind nodes/ prefix sent every flat-layout id to a
- * document that isn't there. Creating a document still normalizes.
+ * document that isn't there. Creating a document still normalizes. A URI
+ * pinned to a checkpoint (`@N`) is refused: these commands act on the live
+ * document, and dropping the pin would silently read or change another version.
  */
 export function documentId(path: string): string {
-  const id = path.startsWith("contextnest://") ? parseUri(path).path : path;
+  let id = path;
+  if (path.startsWith("contextnest://")) {
+    const uri = parseUri(path);
+    if (uri.checkpoint !== undefined) {
+      throw new ContextNestError(
+        `${path} is pinned to checkpoint @${uri.checkpoint} — this command acts on the live document; drop the @${uri.checkpoint}.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    id = uri.path;
+  }
   return id.replace(/\.md$/, "").replace(/^\/+/, "");
 }
 

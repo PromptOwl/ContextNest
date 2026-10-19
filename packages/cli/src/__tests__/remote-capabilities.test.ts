@@ -329,6 +329,28 @@ describe("existing-document ids on a remote nest (CU-wdqcq046wd)", () => {
     expect(plain()).toContain("Deleted nodes/a");
   });
 
+  it("retries with the op's other fields intact (update)", async () => {
+    advertised = new Set(["context_update"]);
+    replies = {
+      context_update: (input: { id: string }) => {
+        if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+        return { id: "nodes/a", version: 2, status: "published" };
+      },
+    };
+    await remoteUpdate(target, "a", { tags: "keep" });
+    expect(calls.map((c) => c.input)).toEqual([
+      { id: "a", tags: ["#keep"] },
+      { id: "nodes/a", tags: ["#keep"] },
+    ]);
+  });
+
+  it("refuses a URI pinned to a checkpoint instead of acting on the live document", async () => {
+    advertised = new Set(["context_get"]);
+    const err = await remoteRead(target, "contextnest://my-node@3", {}).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("VALIDATION_FAILED");
+    expect(calls).toEqual([]);
+  });
+
   it("does not retry an id that already names a folder, nor on any other error", async () => {
     advertised = new Set(["context_get"]);
     replies = { context_get: new ContextNestError("Document not found: x/a", "DOCUMENT_NOT_FOUND") };

@@ -633,8 +633,8 @@ export async function remoteEmbed<T>(target: RemoteTarget, input: { rebuild?: tr
 }
 
 /**
- * Run `op` on an existing document the user named, by its id as typed
- * (`documentId`) so a flat-layout nest finds a root-level node. A nest that
+ * Run `op` on an existing document by the id `documentId` derived from what
+ * the user typed, so a flat-layout nest finds a root-level node. A nest that
  * does not resolve a bare id under nodes/ itself (an engine before #183,
  * contextnest-community) refuses a structured node named without the prefix,
  * so a bare id it can't find is retried once as normalizeDocumentId roots it.
@@ -642,10 +642,9 @@ export async function remoteEmbed<T>(target: RemoteTarget, input: { rebuild?: tr
 async function runOnDocument<T>(
   conn: RemoteNestConnection,
   op: string,
-  path: string,
+  id: string,
   input: Record<string, unknown> = {},
 ): Promise<T> {
-  const id = documentId(path);
   try {
     return await conn.run<T>(op, { id, ...input });
   } catch (err) {
@@ -672,7 +671,7 @@ export async function remoteRead(
       frontmatter: Record<string, any>;
       body: string;
       raw?: string;
-    }>(conn, "context_get", path, { include_raw: Boolean(opts.raw) });
+    }>(conn, "context_get", documentId(path), { include_raw: Boolean(opts.raw) });
 
     if (opts.raw) {
       // A nest that returns no `raw` (contextnest-community's context_get has
@@ -817,7 +816,7 @@ export async function remoteHistory(
       keyframe_interval?: number;
       approved_version?: number | null;
       versions: Array<Record<string, unknown>>;
-    }>(conn, "context_versions", path, opts.diff ? { include_diff: true } : {});
+    }>(conn, "context_versions", documentId(path), opts.diff ? { include_diff: true } : {});
 
     if (out.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${out.id}`));
@@ -1002,7 +1001,7 @@ export async function remoteUpdate(
     const updated = await runOnDocument<{ id: string; version: number; status?: string; [k: string]: unknown }>(
       conn,
       "context_update",
-      path,
+      documentId(path),
       {
         ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
         ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
@@ -1181,7 +1180,7 @@ export async function remoteDelete(target: RemoteTarget, path: string): Promise<
     { destructive: true },
   );
   await withRemote(target, async (conn) => {
-    const out = await runOnDocument<{ id: string; deleted: true }>(conn, "context_delete", path);
+    const out = await runOnDocument<{ id: string; deleted: true }>(conn, "context_delete", documentId(path));
     console.log(chalk.green(`Deleted ${out.id} (remote: ${target.alias})`));
   });
 }
@@ -1197,7 +1196,7 @@ export async function remoteMove(target: RemoteTarget, path: string, folder: str
     `Move ${documentId(path)} to folder "${folder}" on remote nest "${target.alias}"? Its id changes; history and links follow.`,
   );
   await withRemote(target, async (conn) => {
-    const out = await runOnDocument<{ id: string; previous_id: string }>(conn, "context_move", path, { folder });
+    const out = await runOnDocument<{ id: string; previous_id: string }>(conn, "context_move", documentId(path), { folder });
     console.log(chalk.green(`Moved ${out.previous_id} → ${out.id} (remote: ${target.alias})`));
   });
 }

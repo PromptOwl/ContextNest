@@ -460,6 +460,11 @@ describe("[regression] ctx read/history/update in an Obsidian (flat) vault", () 
     expect(existsSync(join(tmp, "nodes"))).toBe(false);
     expect(runCtx(tmp, ["history", "my-node"])).toMatch(/my-node/);
   });
+
+  it("delete removes the root-level node it names", () => {
+    runCtx(tmp, ["delete", "my-node", "--yes"]);
+    expect(existsSync(join(tmp, "my-node.md"))).toBe(false);
+  });
 });
 
 // ─── list ────────────────────────────────────────────────────────────────────
