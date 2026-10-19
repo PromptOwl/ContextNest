@@ -497,6 +497,11 @@ export interface NestConfig {
       files?: Record<string, { template?: string; type?: string }>;
     }
   >;
+  /**
+   * Retrieval modes and embedding/rerank providers — validated where used by
+   * `parseSearchConfig()` (semantic/config.ts), never at config load.
+   */
+  search?: unknown;
   /** Named templates for `folders.*.template` / `files.*.template` (§11.1). */
   templates?: Record<string, { body?: string; required_sections?: string[] }>;
   servers?: Record<

@@ -63,6 +63,7 @@ const RATIONALE = {
   "fast-xml-parser": "Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set.",
   "js-yaml": "Reads and writes YAML frontmatter, `context.yaml`, packs and history files.",
   minisearch: "In-memory full-text index behind `ctx search` and the fast selector path.",
+  stemmer: "Porter stemmer for the search term pipeline (index + query), so `migrations` finds `migration`. Zero deps, pure JS, pinned.",
   toposort: "Dependency ordering for `source` node graphs.",
   unpdf: "Text extraction for `type: pdf` nodes (pdf.js built for serverless runtimes; pure JS, no native deps). Loaded lazily — only when a PDF is imported.",
   zod: "Runtime validation of frontmatter and operation inputs (spec §13 rules 1–17).",
@@ -311,7 +312,7 @@ function renderMarkdown(report) {
       "no platform-specific downloads.",
   );
   out.push(
-    "- **No network access at runtime** beyond what you explicitly configure for `source` nodes.",
+    "- **No network access at runtime** beyond what you explicitly configure: `source` nodes, and the embedding/rerank provider named in a vault's `search:` config (semantic/hybrid search is opt-in; the optional `@aws-sdk/client-bedrock-runtime` peer is loaded only if Bedrock is configured without an API key).",
   );
   out.push(
     "- **Where files are written.** The CLI writes only inside the vault you point it at, plus the " +

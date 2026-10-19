@@ -41,7 +41,12 @@ import {
 } from "../forget.js";
 import { addTombstone, buildTombstoneIndex, expandsWithin, isPathForgotten } from "../tombstones.js";
 import yaml from "js-yaml";
-import { Resolver } from "../resolver.js";
+import { Resolver, exactSeeds } from "../resolver.js";
+import { parseSearchConfig, type SearchConfig, type SearchMode } from "../semantic/config.js";
+import { createEmbeddingProvider, createReranker } from "../semantic/providers.js";
+import { INTERACTIVE_CALL } from "../semantic/bedrock.js";
+import { EmbeddingStore, purgeEmbeddings } from "../semantic/embedding-store.js";
+import { buildEmbeddings, rerankHits, semanticSearch, type RankedHit } from "../semantic/hybrid.js";
 import { annotateIntegrity } from "../graph-query-engine.js";
 import {
   normalizeDocumentId,
@@ -51,6 +56,7 @@ import {
   assertNotMachineryPath,
   assertResolvesOutsideMachinery,
   NON_DOCUMENT_BASENAMES,
+  isUnreadableDocumentError,
 } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -255,8 +261,15 @@ async function givenId(ctx: OperationContext, id: string): Promise<string> {
   const file = `${id}.md`.toLowerCase();
   const scaffold = file === "context.md" || [...NON_DOCUMENT_BASENAMES].some((b) => b.toLowerCase() === file);
   if (!scaffold && (await readIfExists(ctx, id).catch(() => null))) return id;
+  // One that is there but will not read (its own YAML, frontmatter or
+  // encryption) is still the one named: the op reports why, rather than a
+  // not-found for the bare id. A vault-level failure still throws here.
   const rooted = `nodes/${id}`;
-  return (await readIfExists(ctx, rooted)) ? rooted : id;
+  const found = await readIfExists(ctx, rooted).catch((err) => {
+    if (isUnreadableDocumentError(err)) return true;
+    throw err;
+  });
+  return found ? rooted : id;
 }
 
 /**
@@ -401,18 +414,170 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // intersection/union walk the left side first, so
   // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
-  if (!query) return { results: [], count: 0, total: 0 };
+  if (!query) return { results: [], count: 0, total: 0, mode: "lexical" };
+  const config = await ctx.storage.readConfig();
+  const searchCfg = parseSearchConfig(config?.search);
   const docs = await ctx.storage.discoverDocuments();
-  const hits = new Resolver({ documents: docs })
-    .search(query)
-    .filter((h) => isPublished(h.document));
+  const { mode, store } = await chooseSearchMode(ctx, input.mode, searchCfg);
+
+  // Rerank sends decrypted text to a third party: not from a sealed vault.
+  if (input.rerank && (await ctx.storage.isEncrypted())) {
+    throw new ContextNestError(
+      "rerank is not supported on an encrypted vault: it would send decrypted content to the reranker",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (input.rerank && !searchCfg.rerank) {
+    throw new ContextNestError(
+      "rerank needs a `search.rerank` block (provider + model) in .context/config.yaml",
+      "VALIDATION_FAILED",
+    );
+  }
+  const reranker = input.rerank && searchCfg.rerank ? createReranker(searchCfg.rerank, INTERACTIVE_CALL) : undefined;
+  const rerankTopN = searchCfg.rerank?.top_n;
+  const rerankOpts = {
+    unit: searchCfg.rerank?.unit,
+    maxPassages: searchCfg.rerank?.max_passages,
+    batchSize: searchCfg.rerank?.batch_size,
+  };
+
+  let hits: RankedHit[];
+  let stale: number | undefined;
+  if (mode === "lexical") {
+    const lexical = new Resolver({
+      documents: docs,
+      fullMatchFirst: searchCfg.full_match_first,
+      fieldBoosts: searchCfg.field_boosts,
+      coordination: searchCfg.coordination,
+    })
+      .search(query)
+      .filter((h) => isPublished(h.document));
+    // The resolver already put exact title/#tag matches first; flag them so
+    // a rerank keeps them pinned.
+    const seeds = new Set(exactSeeds(query, lexical.map((h) => h.document)));
+    hits = lexical.map((h) => ({
+      document: h.document,
+      score: h.score,
+      scores: { lexical: h.score },
+      ...(seeds.has(h.document.id) ? { seed: true } : {}),
+    }));
+    if (reranker) {
+      hits = await rerankHits(query, hits, reranker, {
+        ...rerankOpts,
+        topN: rerankTopN,
+        maxChars: searchCfg.embeddings?.max_chars,
+      });
+    }
+  } else {
+    const out = await semanticSearch(query, {
+      mode,
+      docs,
+      store: store!,
+      provider: createEmbeddingProvider(searchCfg.embeddings!, INTERACTIVE_CALL),
+      candidates: searchCfg.candidates,
+      fullMatchFirst: searchCfg.full_match_first,
+      fieldBoosts: searchCfg.field_boosts,
+      coordination: searchCfg.coordination,
+      fusionWeights: searchCfg.fusion_weights,
+      maxChars: searchCfg.embeddings!.max_chars,
+      reranker,
+      rerankTopN,
+      rerank: rerankOpts,
+    });
+    hits = out.hits.filter((h) => isPublished(h.document));
+    stale = out.stale;
+  }
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
-    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    results: kept.map((h) => ({
+      ...toSummary(h.document),
+      score: h.score,
+      scores: h.scores,
+      ...(h.passage !== undefined ? { passage: h.passage } : {}),
+    })),
     // Counted before the `limit` slice. `total` is the deprecated alias.
     count: hits.length,
     total: hits.length,
+    mode,
+    ...(stale !== undefined ? { embeddings_stale: stale } : {}),
   };
+};
+
+/**
+ * Which mode a search runs in. An explicit `mode` is honoured or refused with
+ * the fix; with none, `search.mode` from config applies ONLY once an index
+ * exists — a vault that opted into hybrid but never ran `ctx embed` keeps
+ * working, lexically. Default: lexical.
+ */
+async function chooseSearchMode(
+  ctx: Parameters<OperationExecutor>[0],
+  requested: SearchMode | undefined,
+  cfg: SearchConfig,
+): Promise<{ mode: SearchMode; store?: EmbeddingStore }> {
+  const wanted = requested ?? cfg.mode ?? "lexical";
+  if (wanted === "lexical") return { mode: "lexical" };
+  if (!cfg.embeddings) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" needs a \`search.embeddings\` block (provider + model) in .context/config.yaml`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // context_embed refuses sealed vaults; an index left from before the vault
+  // was encrypted must not keep serving a plaintext-derived copy.
+  if (await ctx.storage.isEncrypted()) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" is not supported on an encrypted vault (embeddings are a plaintext-derived copy)`,
+      "VALIDATION_FAILED",
+    );
+  }
+  const e = cfg.embeddings;
+  const store = await EmbeddingStore.load(ctx.storage.root, e.provider, e.model, e.dimensions);
+  if (store.size === 0) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" needs an embedding index — run \`ctx embed\` (MCP: context_embed) first`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return { mode: wanted, store };
+}
+
+const embed: OperationExecutor = async (ctx, input: any) => {
+  const config = await ctx.storage.readConfig();
+  const cfg = parseSearchConfig(config?.search);
+  if (!cfg.embeddings) {
+    throw new ContextNestError(
+      "No `search.embeddings` block (provider + model) in .context/config.yaml — nothing to embed with",
+      "VALIDATION_FAILED",
+    );
+  }
+  // Vectors leak content. An encrypted vault seals its documents at rest, so
+  // it must not grow a plaintext semantic copy of them beside the ciphertext.
+  if (await ctx.storage.isEncrypted()) {
+    throw new ContextNestError(
+      "Embeddings are not supported on an encrypted vault: the index would store a plaintext-derived copy of sealed content",
+      "VALIDATION_FAILED",
+    );
+  }
+  const e = cfg.embeddings;
+  const store = await EmbeddingStore.load(ctx.storage.root, e.provider, e.model, e.dimensions);
+  const docs = await ctx.storage.discoverDocuments();
+  return buildEmbeddings(docs, store, createEmbeddingProvider(e), {
+    rebuild: input.rebuild === true,
+    batchSize: e.batch_size,
+    maxChars: e.max_chars,
+    maxRequestChars: e.max_request_chars,
+    // Under the vault lock, and only rows that still match a published
+    // document: a forget/delete/edit that ran while we embedded wins.
+    save: () =>
+      withVaultLock(ctx.storage.root, async () => {
+        store.retainCurrent(await ctx.storage.discoverDocuments(), e.max_chars);
+        await store.save();
+      }),
+    onProgress: ctx.onProgress,
+  });
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
@@ -853,6 +1018,7 @@ const del: OperationExecutor = async (ctx, input: any) => {
     ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
     ...(input.purge ? { purge: true } : {}),
   });
+  await purgeEmbeddings(ctx.storage.root, [id]);
   await ctx.storage.regenerateIndex();
   return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
 };
@@ -865,6 +1031,7 @@ const forget: OperationExecutor = async (ctx, input: any) => {
     ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
     ...(input.client ? { client: input.client } : {}),
   });
+  await purgeEmbeddings(ctx.storage.root, [id]);
   await ctx.storage.regenerateIndex();
   return {
     id: result.id,
@@ -1283,10 +1450,25 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     // what makes re-running the same batch idempotent instead of duplicating.
     // A path the guard refuses (`../`) reads as absent here and fails at its
     // own write below, so it is reported per file rather than sinking the batch.
+    // One listing per folder, not one stat per file (a round trip each on a
+    // network mount); case-folded, so a name a case-insensitive disk holds is taken.
+    const listings = new Map<string, Promise<Set<string>>>();
+    const isTaken = async (p: string): Promise<boolean> => {
+      const cut = p.lastIndexOf("/");
+      const dir = p.slice(0, Math.max(cut, 0));
+      let names = listings.get(dir);
+      if (!names) {
+        names = ctx.storage
+          .vaultEntryNames(dir)
+          .then((n) => new Set(n.map(comparableSegment)), () => new Set<string>());
+        listings.set(dir, names);
+      }
+      return (await names).has(comparableSegment(p.slice(cut + 1)));
+    };
     const plan = (
       await planImportPaths(
         incoming.map((f) => String(f.path ?? "")),
-        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+        input.overwrite ? async () => false : isTaken,
       )
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
     // Every verdict for the whole batch BEFORE anything lands (import-verdicts.ts).
@@ -1447,6 +1629,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       // their folders' INDEX.md can change. Other modes write files too.
       indexOnlyBatchFolders:
         !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
+      // An import's version is a one-off: a keyframe skips rebuilding the
+      // previous one to diff against. Ids-only (bulk approval) keeps diffs.
+      keyframe: !!input.discover || !!input.files?.length,
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
@@ -1951,6 +2136,9 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_query: query,
   context_resolve: resolve,
   context_search: search,
+  // Not locked: provider calls can run for minutes and must not block
+  // writers. Each save takes the lock itself (see embed).
+  context_embed: embed,
   context_get: get,
   context_list: list,
   context_folders: folders,  

@@ -447,6 +447,9 @@ export const nestConfigSchema = z.object({
   // is `structureRulesSchema`, checked by compileStructure() when the rules
   // are used: a bad rule refuses writes only where the rules are enforced.
   structure: z.unknown().optional(),
+  // Retrieval modes (semantic/config.ts). Unchecked here for the same reason
+  // as `structure`: validated by parseSearchConfig() where search uses it.
+  search: z.unknown().optional(),
   folders: z.unknown().optional(),
   templates: z.unknown().optional(),
   servers: z
