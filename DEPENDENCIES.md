@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 100 | 11 | 100 |
+| `@promptowl/contextnest-engine` | 106 | 11 | 106 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,14 +48,14 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 101 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 107 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@promptowl/contextnest-engine` | 3.1.0 | AGPL-3.0 |
-| `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
+| `@modelcontextprotocol/sdk` | 1.31.0 | MIT |
 | `diff` | 9.0.0 | BSD-3-Clause |
-| `fast-xml-parser` | 4.5.7 | MIT |
+| `fast-xml-parser` | 5.11.2 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
 | `minisearch` | 7.2.0 | MIT |
 | `stemmer` | 2.0.1 | MIT |
@@ -64,6 +64,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `zod` | 3.25.76 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 | `@hono/node-server` | 1.19.14 | MIT |
+| `@nodable/entities` | 3.1.0 | MIT |
 | `ajv` | 8.18.0 | MIT |
 | `ajv-formats` | 3.0.1 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
@@ -74,14 +75,19 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT |
 | `express` | 5.2.1 | MIT |
 | `express-rate-limit` | 8.4.1 | MIT |
-| `hono` | 4.12.16 | MIT |
+| `fast-xml-builder` | 1.3.1 | MIT |
+| `hono` | 4.13.13 | MIT |
+| `is-unsafe` | 2.0.2 | MIT |
 | `jose` | 6.1.3 | MIT |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
+| `path-expression-matcher` | 1.6.2 | MIT |
 | `pkce-challenge` | 5.0.1 | MIT |
 | `raw-body` | 3.0.2 | MIT |
-| `strnum` | 1.1.2 | MIT |
+| `strnum` | 2.5.1 | MIT |
+| `xml-naming` | 0.3.0 | MIT |
 | `accepts` | 2.0.0 | MIT |
-| `body-parser` | 2.2.2 | MIT |
+| `anynum` | 1.0.1 | MIT |
+| `body-parser` | 2.3.0 | MIT |
 | `content-disposition` | 1.0.1 | MIT |
 | `cookie` | 0.7.2 | MIT |
 | `cookie-signature` | 1.2.2 | MIT |
@@ -91,7 +97,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `escape-html` | 1.0.3 | MIT |
 | `etag` | 1.8.1 | MIT |
 | `fast-deep-equal` | 3.1.3 | MIT |
-| `fast-uri` | 3.1.0 | BSD-3-Clause |
+| `fast-uri` | 3.1.8 | BSD-3-Clause |
 | `finalhandler` | 2.1.1 | MIT |
 | `fresh` | 2.0.0 | MIT |
 | `http-errors` | 2.0.1 | MIT |
@@ -104,8 +110,8 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `once` | 1.4.0 | ISC |
 | `parseurl` | 1.3.3 | MIT |
 | `path-key` | 3.1.1 | MIT |
-| `proxy-addr` | 2.0.7 | MIT |
-| `qs` | 6.15.0 | BSD-3-Clause |
+| `proxy-addr` | 2.0.8 | MIT |
+| `qs` | 6.16.0 | BSD-3-Clause |
 | `range-parser` | 1.2.1 | MIT |
 | `require-from-string` | 2.0.2 | MIT |
 | `router` | 2.2.0 | MIT |
@@ -113,7 +119,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `serve-static` | 2.2.1 | MIT |
 | `shebang-command` | 2.0.0 | MIT |
 | `statuses` | 2.0.2 | MIT |
-| `type-is` | 2.0.1 | MIT |
+| `type-is` | 2.1.0 | MIT |
 | `vary` | 1.1.2 | MIT |
 | `which` | 2.0.2 | ISC |
 | `bytes` | 3.1.2 | MIT |
@@ -128,23 +134,23 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `shebang-regex` | 3.0.0 | MIT |
 | `wrappy` | 1.0.2 | ISC |
 | `ee-first` | 1.1.1 | MIT |
+| `es-define-property` | 1.0.1 | MIT |
 | `inherits` | 2.0.4 | ISC |
 | `media-typer` | 1.1.0 | MIT |
 | `mime-db` | 1.54.0 | MIT |
 | `safer-buffer` | 2.1.2 | MIT |
 | `setprototypeof` | 1.2.0 | ISC |
-| `side-channel` | 1.1.0 | MIT |
+| `side-channel` | 1.1.1 | MIT |
 | `toidentifier` | 1.0.1 | MIT |
 | `unpipe` | 1.0.0 | MIT |
 | `es-errors` | 1.3.0 | MIT |
 | `object-inspect` | 1.13.4 | MIT |
-| `side-channel-list` | 1.0.0 | MIT |
+| `side-channel-list` | 1.0.1 | MIT |
 | `side-channel-map` | 1.0.1 | MIT |
 | `side-channel-weakmap` | 1.0.2 | MIT |
 | `call-bound` | 1.0.4 | MIT |
 | `get-intrinsic` | 1.3.0 | MIT |
 | `call-bind-apply-helpers` | 1.0.2 | MIT |
-| `es-define-property` | 1.0.1 | MIT |
 | `es-object-atoms` | 1.1.1 | MIT |
 | `function-bind` | 1.1.2 | MIT |
 | `get-proto` | 1.0.1 | MIT |
@@ -160,9 +166,9 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 
 | Package | Version | Licence | Required | Why |
 | --- | --- | --- | --- | --- |
-| `@modelcontextprotocol/sdk` | 1.29.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
+| `@modelcontextprotocol/sdk` | 1.31.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
-| `fast-xml-parser` | 4.5.7 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set. |
+| `fast-xml-parser` | 5.11.2 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
 | `minisearch` | 7.2.0 | MIT | yes | In-memory full-text index behind `ctx search` and the fast selector path. |
 | `stemmer` | 2.0.1 | MIT | yes | Porter stemmer for the search term pipeline (index + query), so `migrations` finds `migration`. Zero deps, pure JS, pinned. |
@@ -176,6 +182,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | Package | Version | Licence | Depth | Pulled in by |
 | --- | --- | --- | --- | --- |
 | `@hono/node-server` | 1.19.14 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `@nodable/entities` | 3.1.0 | MIT | 2 | `fast-xml-parser` |
 | `ajv` | 8.18.0 | MIT | 2 | `@modelcontextprotocol/sdk`, `ajv-formats` |
 | `ajv-formats` | 3.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `argparse` | 2.0.1 | Python-2.0 | 2 | `js-yaml` |
@@ -186,14 +193,19 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT | 2 | `@modelcontextprotocol/sdk`, `eventsource` |
 | `express` | 5.2.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `express-rate-limit` | 8.4.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
-| `hono` | 4.12.16 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `fast-xml-builder` | 1.3.1 | MIT | 2 | `fast-xml-parser` |
+| `hono` | 4.13.13 | MIT | 2 | `@modelcontextprotocol/sdk` |
+| `is-unsafe` | 2.0.2 | MIT | 2 | `fast-xml-parser` |
 | `jose` | 6.1.3 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause | 2 | `@modelcontextprotocol/sdk` |
+| `path-expression-matcher` | 1.6.2 | MIT | 2 | `fast-xml-builder`, `fast-xml-parser` |
 | `pkce-challenge` | 5.0.1 | MIT | 2 | `@modelcontextprotocol/sdk` |
 | `raw-body` | 3.0.2 | MIT | 2 | `@modelcontextprotocol/sdk`, `body-parser` |
-| `strnum` | 1.1.2 | MIT | 2 | `fast-xml-parser` |
+| `strnum` | 2.5.1 | MIT | 2 | `fast-xml-parser` |
+| `xml-naming` | 0.3.0 | MIT | 2 | `fast-xml-builder`, `fast-xml-parser` |
 | `accepts` | 2.0.0 | MIT | 3 | `express` |
-| `body-parser` | 2.2.2 | MIT | 3 | `express` |
+| `anynum` | 1.0.1 | MIT | 3 | `strnum` |
+| `body-parser` | 2.3.0 | MIT | 3 | `express` |
 | `content-disposition` | 1.0.1 | MIT | 3 | `express` |
 | `cookie` | 0.7.2 | MIT | 3 | `express` |
 | `cookie-signature` | 1.2.2 | MIT | 3 | `express` |
@@ -203,7 +215,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `escape-html` | 1.0.3 | MIT | 3 | `express`, `finalhandler`, `send`, `serve-static` |
 | `etag` | 1.8.1 | MIT | 3 | `express`, `send` |
 | `fast-deep-equal` | 3.1.3 | MIT | 3 | `ajv` |
-| `fast-uri` | 3.1.0 | BSD-3-Clause | 3 | `ajv` |
+| `fast-uri` | 3.1.8 | BSD-3-Clause | 3 | `ajv` |
 | `finalhandler` | 2.1.1 | MIT | 3 | `express` |
 | `fresh` | 2.0.0 | MIT | 3 | `express`, `send` |
 | `http-errors` | 2.0.1 | MIT | 3 | `body-parser`, `express`, `raw-body`, `send` |
@@ -216,8 +228,8 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `once` | 1.4.0 | ISC | 3 | `express` |
 | `parseurl` | 1.3.3 | MIT | 3 | `express`, `finalhandler`, `router`, `serve-static` |
 | `path-key` | 3.1.1 | MIT | 3 | `cross-spawn` |
-| `proxy-addr` | 2.0.7 | MIT | 3 | `express` |
-| `qs` | 6.15.0 | BSD-3-Clause | 3 | `body-parser`, `express` |
+| `proxy-addr` | 2.0.8 | MIT | 3 | `express` |
+| `qs` | 6.16.0 | BSD-3-Clause | 3 | `body-parser`, `express` |
 | `range-parser` | 1.2.1 | MIT | 3 | `express`, `send` |
 | `require-from-string` | 2.0.2 | MIT | 3 | `ajv` |
 | `router` | 2.2.0 | MIT | 3 | `express` |
@@ -225,7 +237,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `serve-static` | 2.2.1 | MIT | 3 | `express` |
 | `shebang-command` | 2.0.0 | MIT | 3 | `cross-spawn` |
 | `statuses` | 2.0.2 | MIT | 3 | `express`, `finalhandler`, `http-errors`, `send` |
-| `type-is` | 2.0.1 | MIT | 3 | `body-parser`, `express` |
+| `type-is` | 2.1.0 | MIT | 3 | `body-parser`, `express` |
 | `vary` | 1.1.2 | MIT | 3 | `cors`, `express` |
 | `which` | 2.0.2 | ISC | 3 | `cross-spawn` |
 | `bytes` | 3.1.2 | MIT | 4 | `body-parser`, `raw-body` |
@@ -240,23 +252,23 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `shebang-regex` | 3.0.0 | MIT | 4 | `shebang-command` |
 | `wrappy` | 1.0.2 | ISC | 4 | `once` |
 | `ee-first` | 1.1.1 | MIT | 5 | `on-finished` |
+| `es-define-property` | 1.0.1 | MIT | 5 | `get-intrinsic`, `qs` |
 | `inherits` | 2.0.4 | ISC | 5 | `http-errors` |
 | `media-typer` | 1.1.0 | MIT | 5 | `type-is` |
 | `mime-db` | 1.54.0 | MIT | 5 | `mime-types` |
 | `safer-buffer` | 2.1.2 | MIT | 5 | `iconv-lite` |
 | `setprototypeof` | 1.2.0 | ISC | 5 | `http-errors` |
-| `side-channel` | 1.1.0 | MIT | 5 | `qs` |
+| `side-channel` | 1.1.1 | MIT | 5 | `qs` |
 | `toidentifier` | 1.0.1 | MIT | 5 | `http-errors` |
 | `unpipe` | 1.0.0 | MIT | 5 | `raw-body` |
 | `es-errors` | 1.3.0 | MIT | 6 | `call-bind-apply-helpers`, `dunder-proto`, `es-object-atoms`, `get-intrinsic`, `side-channel`, `side-channel-list`, `side-channel-map`, `side-channel-weakmap` |
 | `object-inspect` | 1.13.4 | MIT | 6 | `side-channel`, `side-channel-list`, `side-channel-map`, `side-channel-weakmap` |
-| `side-channel-list` | 1.0.0 | MIT | 6 | `side-channel` |
+| `side-channel-list` | 1.0.1 | MIT | 6 | `side-channel` |
 | `side-channel-map` | 1.0.1 | MIT | 6 | `side-channel`, `side-channel-weakmap` |
 | `side-channel-weakmap` | 1.0.2 | MIT | 6 | `side-channel` |
 | `call-bound` | 1.0.4 | MIT | 7 | `side-channel-map`, `side-channel-weakmap` |
 | `get-intrinsic` | 1.3.0 | MIT | 7 | `call-bound`, `side-channel-map`, `side-channel-weakmap` |
 | `call-bind-apply-helpers` | 1.0.2 | MIT | 8 | `call-bound`, `dunder-proto`, `get-intrinsic` |
-| `es-define-property` | 1.0.1 | MIT | 9 | `get-intrinsic` |
 | `es-object-atoms` | 1.1.1 | MIT | 9 | `get-intrinsic`, `get-proto` |
 | `function-bind` | 1.1.2 | MIT | 9 | `call-bind-apply-helpers`, `get-intrinsic`, `hasown` |
 | `get-proto` | 1.0.1 | MIT | 9 | `get-intrinsic` |
@@ -283,11 +295,11 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 101 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 107 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
-| `@modelcontextprotocol/sdk` | 1.29.0 | MIT |
+| `@modelcontextprotocol/sdk` | 1.31.0 | MIT |
 | `@promptowl/contextnest-engine` | 3.1.0 | AGPL-3.0 |
 | `zod` | 3.25.76 | MIT |
 | `@hono/node-server` | 1.19.14 | MIT |
@@ -301,8 +313,8 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `eventsource-parser` | 3.0.6 | MIT |
 | `express` | 5.2.1 | MIT |
 | `express-rate-limit` | 8.4.1 | MIT |
-| `fast-xml-parser` | 4.5.7 | MIT |
-| `hono` | 4.12.16 | MIT |
+| `fast-xml-parser` | 5.11.2 | MIT |
+| `hono` | 4.13.13 | MIT |
 | `jose` | 6.1.3 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
@@ -313,9 +325,10 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `toposort` | 2.0.2 | MIT |
 | `unpdf` | 1.7.0 | MIT |
 | `zod-to-json-schema` | 3.25.2 | ISC |
+| `@nodable/entities` | 3.1.0 | MIT |
 | `accepts` | 2.0.0 | MIT |
 | `argparse` | 2.0.1 | Python-2.0 |
-| `body-parser` | 2.2.2 | MIT |
+| `body-parser` | 2.3.0 | MIT |
 | `content-disposition` | 1.0.1 | MIT |
 | `cookie` | 0.7.2 | MIT |
 | `cookie-signature` | 1.2.2 | MIT |
@@ -325,11 +338,13 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `escape-html` | 1.0.3 | MIT |
 | `etag` | 1.8.1 | MIT |
 | `fast-deep-equal` | 3.1.3 | MIT |
-| `fast-uri` | 3.1.0 | BSD-3-Clause |
+| `fast-uri` | 3.1.8 | BSD-3-Clause |
+| `fast-xml-builder` | 1.3.1 | MIT |
 | `finalhandler` | 2.1.1 | MIT |
 | `fresh` | 2.0.0 | MIT |
 | `http-errors` | 2.0.1 | MIT |
 | `ip-address` | 10.1.0 | MIT |
+| `is-unsafe` | 2.0.2 | MIT |
 | `json-schema-traverse` | 1.0.0 | MIT |
 | `merge-descriptors` | 2.0.0 | MIT |
 | `mime-types` | 3.0.2 | MIT |
@@ -337,9 +352,10 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `on-finished` | 2.4.1 | MIT |
 | `once` | 1.4.0 | ISC |
 | `parseurl` | 1.3.3 | MIT |
+| `path-expression-matcher` | 1.6.2 | MIT |
 | `path-key` | 3.1.1 | MIT |
-| `proxy-addr` | 2.0.7 | MIT |
-| `qs` | 6.15.0 | BSD-3-Clause |
+| `proxy-addr` | 2.0.8 | MIT |
+| `qs` | 6.16.0 | BSD-3-Clause |
 | `range-parser` | 1.2.1 | MIT |
 | `require-from-string` | 2.0.2 | MIT |
 | `router` | 2.2.0 | MIT |
@@ -347,10 +363,12 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `serve-static` | 2.2.1 | MIT |
 | `shebang-command` | 2.0.0 | MIT |
 | `statuses` | 2.0.2 | MIT |
-| `strnum` | 1.1.2 | MIT |
-| `type-is` | 2.0.1 | MIT |
+| `strnum` | 2.5.1 | MIT |
+| `type-is` | 2.1.0 | MIT |
 | `vary` | 1.1.2 | MIT |
 | `which` | 2.0.2 | ISC |
+| `xml-naming` | 0.3.0 | MIT |
+| `anynum` | 1.0.1 | MIT |
 | `bytes` | 3.1.2 | MIT |
 | `forwarded` | 0.2.0 | MIT |
 | `iconv-lite` | 0.7.2 | MIT |
@@ -363,23 +381,23 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `shebang-regex` | 3.0.0 | MIT |
 | `wrappy` | 1.0.2 | ISC |
 | `ee-first` | 1.1.1 | MIT |
+| `es-define-property` | 1.0.1 | MIT |
 | `inherits` | 2.0.4 | ISC |
 | `media-typer` | 1.1.0 | MIT |
 | `mime-db` | 1.54.0 | MIT |
 | `safer-buffer` | 2.1.2 | MIT |
 | `setprototypeof` | 1.2.0 | ISC |
-| `side-channel` | 1.1.0 | MIT |
+| `side-channel` | 1.1.1 | MIT |
 | `toidentifier` | 1.0.1 | MIT |
 | `unpipe` | 1.0.0 | MIT |
 | `es-errors` | 1.3.0 | MIT |
 | `object-inspect` | 1.13.4 | MIT |
-| `side-channel-list` | 1.0.0 | MIT |
+| `side-channel-list` | 1.0.1 | MIT |
 | `side-channel-map` | 1.0.1 | MIT |
 | `side-channel-weakmap` | 1.0.2 | MIT |
 | `call-bound` | 1.0.4 | MIT |
 | `get-intrinsic` | 1.3.0 | MIT |
 | `call-bind-apply-helpers` | 1.0.2 | MIT |
-| `es-define-property` | 1.0.1 | MIT |
 | `es-object-atoms` | 1.1.1 | MIT |
 | `function-bind` | 1.1.2 | MIT |
 | `get-proto` | 1.0.1 | MIT |
