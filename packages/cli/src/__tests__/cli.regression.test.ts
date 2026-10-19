@@ -432,6 +432,36 @@ describe("[regression] ctx read", () => {
   });
 });
 
+describe("[regression] ctx read/history/update in an Obsidian (flat) vault", () => {
+  beforeEach(() => {
+    execFileSync("node", [distPath, "init", "--name", "regression-vault", "--layout", "obsidian"], {
+      cwd: tmp,
+      env: ENV,
+      stdio: "ignore",
+    });
+    reviewOff(tmp);
+    writeFileSync(join(tmp, "my-node.md"), "---\ntitle: My Node\n---\n\nFlat body\n", "utf-8");
+    runCtx(tmp, ["index"]);
+  });
+
+  it("opens a root-level node by id, file name and URI — never re-rooted under nodes/", () => {
+    // Regression (CU-wdqcq046wd): read prefixed every bare id with nodes/, so
+    // every node in a flat vault was DOCUMENT_NOT_FOUND: nodes/<id>.
+    for (const ref of ["my-node", "my-node.md", "contextnest://my-node"]) {
+      const out = runCtx(tmp, ["read", ref]);
+      expect(out).toMatch(/My Node/);
+      expect(out).toMatch(/Flat body/);
+    }
+  });
+
+  it("history and update reach the same root-level node", () => {
+    runCtx(tmp, ["update", "my-node", "--body", "Edited body"]);
+    expect(readFileSync(join(tmp, "my-node.md"), "utf-8")).toMatch(/Edited body/);
+    expect(existsSync(join(tmp, "nodes"))).toBe(false);
+    expect(runCtx(tmp, ["history", "my-node"])).toMatch(/my-node/);
+  });
+});
+
 // ─── list ────────────────────────────────────────────────────────────────────
 
 describe("[regression] ctx list", () => {

@@ -44,6 +44,7 @@ import {
   searchLimit,
   printSearchResults,
   titleFromId,
+  documentId,
   parseTagsOption,
   printStructure,
   type StructureOutput,
@@ -631,6 +632,29 @@ export async function remoteEmbed<T>(target: RemoteTarget, input: { rebuild?: tr
   });
 }
 
+/**
+ * Run `op` on an existing document the user named, by its id as typed
+ * (`documentId`) so a flat-layout nest finds a root-level node. A nest that
+ * does not resolve a bare id under nodes/ itself (an engine before #183,
+ * contextnest-community) refuses a structured node named without the prefix,
+ * so a bare id it can't find is retried once as normalizeDocumentId roots it.
+ */
+async function runOnDocument<T>(
+  conn: RemoteNestConnection,
+  op: string,
+  path: string,
+  input: Record<string, unknown> = {},
+): Promise<T> {
+  const id = documentId(path);
+  try {
+    return await conn.run<T>(op, { id, ...input });
+  } catch (err) {
+    const rooted = normalizeDocumentId(id);
+    if (rooted === id || !(err instanceof ContextNestError && err.code === "DOCUMENT_NOT_FOUND")) throw err;
+    return conn.run<T>(op, { id: rooted, ...input });
+  }
+}
+
 export async function remoteRead(
   target: RemoteTarget,
   path: string,
@@ -643,12 +667,12 @@ export async function remoteRead(
     );
   }
   await withRemote(target, async (conn) => {
-    const doc = await conn.run<{
+    const doc = await runOnDocument<{
       id: string;
       frontmatter: Record<string, any>;
       body: string;
       raw?: string;
-    }>("context_get", { id: normalizeDocumentId(path), include_raw: Boolean(opts.raw) });
+    }>(conn, "context_get", path, { include_raw: Boolean(opts.raw) });
 
     if (opts.raw) {
       // A nest that returns no `raw` (contextnest-community's context_get has
@@ -788,15 +812,12 @@ export async function remoteHistory(
   opts: { json?: boolean; diff?: boolean },
 ): Promise<void> {
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{
+    const out = await runOnDocument<{
       id: string;
       keyframe_interval?: number;
       approved_version?: number | null;
       versions: Array<Record<string, unknown>>;
-    }>("context_versions", {
-      id: normalizeDocumentId(path),
-      ...(opts.diff ? { include_diff: true } : {}),
-    });
+    }>(conn, "context_versions", path, opts.diff ? { include_diff: true } : {});
 
     if (out.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${out.id}`));
@@ -973,15 +994,16 @@ export async function remoteUpdate(
   }
   await confirmRemoteWrite(
     target,
-    `Update ${normalizeDocumentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
+    `Update ${documentId(path)} on remote nest "${target.alias}"? The previous content stays recoverable from its version history.`,
   );
   await withRemote(target, async (conn) => {
     if (hasTaskFieldArgs(fields)) await requireTaskSupport(conn, target.alias);
     // Same fields the local branch sends; tags REPLACE, as locally.
-    const updated = await conn.run<{ id: string; version: number; status?: string; [k: string]: unknown }>(
+    const updated = await runOnDocument<{ id: string; version: number; status?: string; [k: string]: unknown }>(
+      conn,
       "context_update",
+      path,
       {
-        id: normalizeDocumentId(path),
         ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
         ...(opts.tags !== undefined ? { tags: parseTagsOption(opts.tags) } : {}),
         ...(opts.status !== undefined ? { status: normalizeStatus(opts.status) } : {}),
@@ -1026,7 +1048,7 @@ export async function remotePublish(
   if (!path) {
     throw new ContextNestError("Nothing to publish — pass a document path.", "VALIDATION_FAILED");
   }
-  const id = normalizeDocumentId(path);
+  const id = documentId(path);
   // Probe capabilities on a connection of its own: confirmRemoteWrite exits the
   // process on a decline, which would skip the close() in withRemote's finally.
   const tools = await withRemote(target, (conn) => conn.toolNames());
@@ -1050,7 +1072,7 @@ export async function remotePublish(
     await withRemote(target, async (conn) => {
       // context_submit_review keys on title, not id — resolve it rather than
       // guess, using the same context_get call remoteRead already makes.
-      const doc = await conn.run<{ frontmatter: { title?: string } }>("context_get", { id });
+      const doc = await runOnDocument<{ frontmatter: { title?: string } }>(conn, "context_get", id);
       const title = doc.frontmatter?.title;
       if (!title) {
         throw new ContextNestError(
@@ -1088,9 +1110,10 @@ export async function remotePublish(
   }
   await confirmRemoteWrite(target, `Publish ${id} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ id: string; version: number; checkpoint: number }>(
+    const out = await runOnDocument<{ id: string; version: number; checkpoint: number }>(
+      conn,
       "context_publish",
-      { id },
+      id,
     );
     console.log(chalk.green(`Published ${out.id} (remote: ${target.alias})`));
     console.log(`  Version: ${out.version}`);
@@ -1119,18 +1142,17 @@ export async function remoteTaskLog(
   path: string,
   opts: { note: string; status?: string; claim?: boolean; agent?: string; json?: boolean },
 ): Promise<void> {
-  const id = normalizeDocumentId(path);
+  const id = documentId(path);
   await confirmRemoteWrite(target, `Log on ${id} on remote nest "${target.alias}"?`);
   await withRemote(target, async (conn) => {
     await requireTaskSupport(conn, target.alias);
     const agent = (opts.agent ?? process.env.CONTEXTNEST_AGENT)?.trim();
-    const out = await conn.run<{
+    const out = await runOnDocument<{
       id: string;
       entry: TaskLogEntry;
       claim?: "assigned" | "already_yours" | "assigned_to_other";
       assignee?: string;
-    }>("context_task_log", {
-      id,
+    }>(conn, "context_task_log", id, {
       note: opts.note,
       ...(opts.status ? { status: opts.status } : {}),
       ...(opts.claim ? { claim: true } : {}),
@@ -1155,13 +1177,11 @@ export async function remoteTaskLog(
 export async function remoteDelete(target: RemoteTarget, path: string): Promise<void> {
   await confirmRemoteWrite(
     target,
-    `Delete ${normalizeDocumentId(path)} and its version history from remote nest "${target.alias}"? This cannot be undone.`,
+    `Delete ${documentId(path)} and its version history from remote nest "${target.alias}"? This cannot be undone.`,
     { destructive: true },
   );
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ id: string; deleted: true }>("context_delete", {
-      id: normalizeDocumentId(path),
-    });
+    const out = await runOnDocument<{ id: string; deleted: true }>(conn, "context_delete", path);
     console.log(chalk.green(`Deleted ${out.id} (remote: ${target.alias})`));
   });
 }
@@ -1174,13 +1194,10 @@ export async function remoteDelete(target: RemoteTarget, path: string): Promise<
 export async function remoteMove(target: RemoteTarget, path: string, folder: string): Promise<void> {
   await confirmRemoteWrite(
     target,
-    `Move ${normalizeDocumentId(path)} to folder "${folder}" on remote nest "${target.alias}"? Its id changes; history and links follow.`,
+    `Move ${documentId(path)} to folder "${folder}" on remote nest "${target.alias}"? Its id changes; history and links follow.`,
   );
   await withRemote(target, async (conn) => {
-    const out = await conn.run<{ id: string; previous_id: string }>("context_move", {
-      id: normalizeDocumentId(path),
-      folder,
-    });
+    const out = await runOnDocument<{ id: string; previous_id: string }>(conn, "context_move", path, { folder });
     console.log(chalk.green(`Moved ${out.previous_id} → ${out.id} (remote: ${target.alias})`));
   });
 }

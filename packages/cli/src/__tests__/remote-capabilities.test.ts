@@ -54,6 +54,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
             throw new ContextNestError(`Tool ${op} not found`, "INTERNAL");
           }
           if (replies[op] instanceof Error) throw replies[op];
+          if (typeof replies[op] === "function") return (replies[op] as (i: typeof input) => unknown)(input);
           if (op === "nest_index" && token && nestsByToken[token]) return nestsByToken[token];
           return replies[op];
         },
@@ -294,6 +295,47 @@ describe("remoteUpdate / remoteMove", () => {
     expect(calls).toEqual([{ op: "context_move", input: { id: "nodes/a", folder: "archive" } }]);
     expect(plain()).toContain("nodes/a → nodes/archive/a");
     expect(closed).toBe(opened);
+  });
+});
+
+describe("existing-document ids on a remote nest (CU-wdqcq046wd)", () => {
+  const doc = { id: "my-node", frontmatter: { title: "My Node" }, body: "Flat body", raw: "raw bytes" };
+
+  it("sends a bare id as typed, so a flat-layout nest finds its root-level node", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: doc };
+    await remoteRead(target, "my-node.md", { raw: true });
+    expect(calls).toEqual([{ op: "context_get", input: { id: "my-node", include_raw: true } }]);
+  });
+
+  it("reduces a contextnest:// URI to its path", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: doc };
+    await remoteRead(target, "contextnest://my-node", { raw: true });
+    expect(calls[0].input.id).toBe("my-node");
+  });
+
+  it("retries a bare id under nodes/ once on a nest that does not resolve it itself", async () => {
+    advertised = new Set(["context_delete"]);
+    replies = {
+      context_delete: (input: { id: string }) => {
+        if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+        return { id: "nodes/a", deleted: true };
+      },
+    };
+    configureSafety({ yes: true }); // delete is destructive: no prompt in tests
+    await remoteDelete(target, "a");
+    expect(calls.map((c) => c.input.id)).toEqual(["a", "nodes/a"]);
+    expect(plain()).toContain("Deleted nodes/a");
+  });
+
+  it("does not retry an id that already names a folder, nor on any other error", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: new ContextNestError("Document not found: x/a", "DOCUMENT_NOT_FOUND") };
+    await expect(remoteRead(target, "x/a", {})).rejects.toThrow(/not found/);
+    replies = { context_get: new ContextNestError("boom", "INTERNAL") };
+    await expect(remoteRead(target, "a", {})).rejects.toThrow(/boom/);
+    expect(calls.map((c) => c.input.id)).toEqual(["x/a", "a"]);
   });
 });
 

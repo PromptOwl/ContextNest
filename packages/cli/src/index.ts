@@ -118,6 +118,7 @@ import {
   printSearchResults,
   type SearchHitView,
   titleFromId,
+  documentId,
   parseTagsOption,
   printStructure,
   type StructureOutput,
@@ -1422,7 +1423,7 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    const id = documentId(path);
     // allow_rejected: `ctx read` has always shown a retired document — reading
     // one is not republishing it, and refusing would hide it from the person
     // deciding whether to revive it.
@@ -2018,7 +2019,7 @@ program
       process.exit(1);
     }
 
-    await confirmOrExit(`Publish ${normalizeDocumentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
+    await confirmOrExit(`Publish ${documentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
 
     const result = await cliApi().run<{
       id: string;
@@ -2028,7 +2029,7 @@ program
     }>(
       "context_publish",
       {
-        id: normalizeDocumentId(path),
+        id: documentId(path),
         ...(opts.message ? { note: opts.message } : {}),
       },
       opContext(storage, opts.author),
@@ -2099,7 +2100,7 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    const id = documentId(path);
     const history = await cliApi().run<{
       id: string;
       keyframe_interval: number;
@@ -2166,7 +2167,7 @@ program
       integrity?: IntegrityFailure;
     }>(
       "context_reconstruct",
-      { id: normalizeDocumentId(path), version: parseInt(version, 10) },
+      { id: documentId(path), version: parseInt(version, 10) },
       opContext(storage, "cli@contextnest.local"),
     );
     // stderr, like `read --raw`: stdout stays the reconstructed bytes.
@@ -2762,7 +2763,7 @@ program
     const status = opts.status !== undefined ? normalizeStatus(opts.status) : undefined;
 
     await confirmOrExit(
-      `Rewrite ${normalizeDocumentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
+      `Rewrite ${documentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
     );
 
     // The gate only concerns writes that would publish: a lifecycle transition
@@ -2781,7 +2782,7 @@ program
     }>(
       "context_update",
       {
-        id: normalizeDocumentId(path),
+        id: documentId(path),
         ...(opts.title !== undefined ? { title: opts.title } : {}),
         // A held write settles its own status (pending_review, or a staged
         // edit); an explicit `published` would contradict the hold.
@@ -2870,14 +2871,14 @@ program
     }
     const storage = getStorage();
     await confirmOrExit(
-      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
+      `Delete ${documentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
         (opts.purge ? " --purge leaves no audit record." : ""),
       { destructive: true },
     );
     const result = await cliApi().run<{ id: string; title: string; tombstoned?: boolean }>(
       "context_delete",
       {
-        id: normalizeDocumentId(path),
+        id: documentId(path),
         reason_code: opts.reason,
         ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
         ...(opts.purge ? { purge: true } : {}),
@@ -2932,7 +2933,7 @@ Example:
       throw new ContextNestError(`ctx forget works against a local vault only for now.`, "NOT_IMPLEMENTED");
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    const id = documentId(path);
     await confirmOrExit(
       `Forget ${id}? Its content is erased from history for good (hashes are kept, so verify still passes). This cannot be undone.`,
       { destructive: true },
@@ -2986,7 +2987,7 @@ program
       }>;
     }>(
       "context_forget_log",
-      path ? { id: normalizeDocumentId(path) } : {},
+      path ? { id: documentId(path) } : {},
       opContext(storage, "cli@contextnest.local"),
     );
     if (opts.json) {

@@ -1,5 +1,5 @@
 import chalk from "./color.js";
-import { TAG_PATTERN, TAG_RULE } from "@promptowl/contextnest-engine";
+import { TAG_PATTERN, TAG_RULE, parseUri } from "@promptowl/contextnest-engine";
 
 /**
  * Shared view shapes and formatting for commands that run against BOTH a
@@ -176,6 +176,19 @@ export function printSearchResults(
     console.log(`  ${chalk.cyan(doc.vault ? `${doc.vault}:${doc.id}` : doc.id)}: ${doc.title}`);
   }
   if (more > 0) console.log(chalk.dim(`\n${footer}`));
+}
+
+/**
+ * The id to send an op for an EXISTING document the user named: a
+ * `contextnest://` URI reduced to its path, no `.md`, no leading `/` — but NOT
+ * re-rooted under nodes/. The engine resolves a bare id for the vault's own
+ * layout (as stored at the root of a flat Obsidian vault, else nodes/<id>);
+ * normalizeDocumentId's blind nodes/ prefix sent every flat-layout id to a
+ * document that isn't there. Creating a document still normalizes.
+ */
+export function documentId(path: string): string {
+  const id = path.startsWith("contextnest://") ? parseUri(path).path : path;
+  return id.replace(/\.md$/, "").replace(/^\/+/, "");
 }
 
 /** Derive a display title from a doc id leaf: "nodes/foo-bar" → "Foo Bar". */

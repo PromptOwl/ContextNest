@@ -260,8 +260,10 @@ async function givenId(ctx: OperationContext, id: string): Promise<string> {
   const file = `${id}.md`.toLowerCase();
   const scaffold = file === "context.md" || [...NON_DOCUMENT_BASENAMES].some((b) => b.toLowerCase() === file);
   if (!scaffold && (await readIfExists(ctx, id).catch(() => null))) return id;
+  // One that is there but will not read is still the one named: the op reports
+  // why, rather than a not-found for the bare id.
   const rooted = `nodes/${id}`;
-  return (await readIfExists(ctx, rooted)) ? rooted : id;
+  return (await readIfExists(ctx, rooted).catch(() => true)) ? rooted : id;
 }
 
 /**
