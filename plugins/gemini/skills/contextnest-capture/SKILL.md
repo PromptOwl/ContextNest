@@ -28,7 +28,7 @@ Explicitly capture valuable knowledge, architectural decisions, or verified fact
 3. **Write the Node:**
    Create the node via the `ctx` CLI:
    ```bash
-   ctx create <id> --title "<Title>" --type <type> --tags "#tag1,#tag2" --body "..."
+   ctx add <id> --title "<Title>" --type <type> --tags "#tag1,#tag2" --body "..."
    ```
 
 4. **Report Status:**

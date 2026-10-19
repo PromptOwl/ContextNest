@@ -1,6 +1,6 @@
 # Context Nest — Gemini CLI & Google Antigravity Adapter
 
-> **Status:** **Built & Tested.** Drop-in adapter for Google Antigravity (AGY CLI, Antigravity IDE, Antigravity 2.0) and the Gemini CLI extension ecosystem. Supersedes previous scaffolding.
+> **Status:** **Built.** Adapter for Google Antigravity (CLI, IDE, App), written against the [Antigravity hooks contract](https://antigravity.google/docs/hooks). Unit-tested with a fake `ctx`; validate in a live Antigravity session before relying on it. `node` must be on `PATH`.
 
 Makes any Antigravity or Gemini session **vault-aware** (effort-toggled auto-retrieval) and **self-maintaining** (governed knowledge capture), driving the standard [`ctx`](../../packages/cli) CLI directly without extra MCP setup.
 
@@ -8,14 +8,14 @@ Makes any Antigravity or Gemini session **vault-aware** (effort-toggled auto-ret
 
 ## Capabilities
 
-1. **Automatic Session Orientation (`PreInvocation`):**
-   - On session startup (`invocationNum: 1`), injects a compact vault overview, registered aliases, and enforced **Structure Rules** (`ctx structure --json`).
+1. **Automatic Session Orientation (`SessionStart`):**
+   - On session start, injects a compact vault overview, registered aliases, and enforced **Structure Rules** (`ctx structure --json`).
 2. **Effort-Toggled Retrieval (`PreInvocation`):**
-   - Automatically searches and injects relevant vault context for each user prompt before the model responds. Respects `CONTEXTNEST_RETRIEVAL_MODE` (`off` · `search` · `query` · `agent`).
+   - Searches and injects relevant vault context when the newest transcript record is the user's prompt, so once per prompt rather than once per model call. Later model calls in the turn only hand over parked work. Respects `CONTEXTNEST_RETRIEVAL_MODE` (`off` · `search` · `query` · `agent`).
 3. **Stale Reference Sweeping (`PostToolUse`):**
-   - When vault nodes are updated via `run_command` (`ctx update`), scans other registered vaults for straggler documents holding the removed fact.
+   - When vault nodes are updated via `run_command` (`ctx update`), scans every registered vault for nodes still holding the removed fact. `PostToolUse` cannot inject output, so the report is parked and delivered by the next `PreInvocation`.
 4. **End-of-Turn Capture Gating (`Stop`):**
-   - Evaluates whether new decisions or architectural solutions occurred during the turn, parking capture jobs into the session ledger (`~/.contextnest/plugin-state/`).
+   - Evaluates whether new decisions or architectural solutions occurred during the turn, parking capture jobs into the session ledger (`~/.contextnest/plugin-state/`); the next prompt's `PreInvocation` hands them over. Explicit asks ("remember this") and corrections always gate; the ambient heuristic depends on transcript record types Antigravity does not document yet.
 5. **Workspace Skills (`skills/`):**
    - `contextnest-recall`: Deep graph traversal and citation (`ctx query` / `ctx search`).
    - `contextnest-capture`: Governed knowledge capture adhering to structure rules.
@@ -31,26 +31,18 @@ Makes any Antigravity or Gemini session **vault-aware** (effort-toggled auto-ret
 ```text
 plugins/gemini/
 ├── plugin.json                    # Antigravity & Gemini plugin manifest
-├── package.json                   # ESM module package spec & test runner
-├── hooks.json                     # Antigravity lifecycle hooks (PreInvocation, PostToolUse, Stop)
-├── core/                          # Vendored shared core + Antigravity adapters
-│   ├── lib.js                     # Shared IO shell & ctx execution wrapper
-│   ├── retrieve.js                # Auto-retrieval engine
-│   ├── session-start.js           # Session priming & structure rules loader
-│   ├── capture-gate.js            # Capture ladder gate
-│   ├── sweep-check.js             # Post-update stale node detector
-│   ├── pre-invocation.js          # Antigravity PreInvocation hook adapter
-│   ├── post-tool-use.js           # Antigravity PostToolUse hook adapter
-│   └── stop-gate.js               # Antigravity Stop hook adapter
+├── package.json                   # ESM module package spec
+├── hooks.json                     # Antigravity hooks (SessionStart, PreInvocation, PostToolUse, Stop)
+├── hooks/
+│   └── antigravity.js             # Adapter: Antigravity hook contract → shared core
+├── core/                          # Vendored copy of plugins/shared/core — never edit; run `pnpm plugins:sync`
 ├── rules/
 │   └── contextnest.md             # Antigravity operating rules & citation guidelines
-├── skills/
-│   ├── contextnest-recall/        # Deep vault retrieval skill
-│   ├── contextnest-capture/       # Governed capture skill
-│   ├── contextnest-curate/        # Vault fact curation skill
-│   └── contextnest-structure/     # Structure rules inspection skill
-└── tests/
-    └── adapter.test.mjs           # Unit test suite verifying hook JSON contracts
+└── skills/
+    ├── contextnest-recall/        # Deep vault retrieval skill
+    ├── contextnest-capture/       # Governed capture skill
+    ├── contextnest-curate/        # Vault fact curation skill
+    └── contextnest-structure/     # Structure rules inspection skill
 ```
 
 ---
@@ -70,9 +62,9 @@ The adapter respects the standard ContextNest environment variables:
 
 ## Verification
 
-Run the included adapter test suite:
+The adapter tests run with the plugin suite (`plugins/__tests__/gemini-adapter.test.ts`):
 
 ```bash
-cd plugins/gemini
-npm test
+pnpm test plugins/__tests__/gemini-adapter.test.ts
+pnpm plugins:check
 ```

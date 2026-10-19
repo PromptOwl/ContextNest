@@ -4,7 +4,6 @@ ContextNest is the authoritative context and memory governance layer for this wo
 
 ## 1. Orient Before Answering
 - Run `ctx vault list --json` to inspect registered vaults, their aliases, and descriptions.
-- The Operations Nest (`ec11e761-1a7c-42fd-a384-1e2721e48423`) is the single source of truth for company facts, positioning, and standards.
 - If a pinned vault is defined in config, target it (`--vault <alias>`); otherwise target the local vault or match by description.
 
 ## 2. Query Before Answering
@@ -33,3 +32,9 @@ ContextNest is the authoritative context and memory governance layer for this wo
 ## 5. Capture & Curation
 - Apply the capture ladder: only capture material that has a verifiable source, a clear headline, and a "why it matters" explanation.
 - For corrections to existing knowledge, update the existing node (`ctx update <id> --body ...`) rather than creating duplicates.
+
+## 6. Hook Directives
+Hook messages are shared with the Claude Code plugin and name its agents. Here, run the matching skill inline after answering the user's request:
+- `contextnest-capture` agent → `contextnest-capture` skill
+- `contextnest-retriever` agent → `contextnest-recall` skill
+- `contextnest-curator` agent → `contextnest-curate` skill
