@@ -112,6 +112,8 @@ export type CheckpointChainState =
  * A read failed because of that one file — bad YAML, frontmatter of the wrong
  * shape, or a body that will not decrypt — not because of the vault (locked,
  * no permission, I/O). The document is there; it just will not read.
+ * Discovery skips such a file (reporting it) and `givenId` still resolves a
+ * bare id to it, so both agree on what counts: change the rule here only.
  */
 export function isUnreadableDocumentError(err: unknown): boolean {
   return (

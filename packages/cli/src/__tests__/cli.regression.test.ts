@@ -466,6 +466,11 @@ describe("[regression] ctx read/history/update in an Obsidian (flat) vault", () 
     expect(existsSync(join(tmp, "my-node.md"))).toBe(false);
   });
 
+  it("forget erases the root-level node it names, and the prompt names it", () => {
+    runCtx(tmp, ["publish", "my-node", "--yes"]);
+    expect(runCtx(tmp, ["forget", "my-node", "--reason", "user_request", "--yes"])).toMatch(/Forgot my-node/);
+  });
+
   it("publish reaches the root-level node", () => {
     expect(runCtx(tmp, ["publish", "my-node", "--yes"])).toMatch(/Published my-node/);
   });
@@ -493,6 +498,18 @@ describe("[regression] bare id in a structured vault holding both <id>.md and no
     runCtx(tmp, ["index"]);
     expect(runCtx(tmp, ["read", "twin"])).toMatch(/Root Twin/);
     expect(runCtx(tmp, ["read", "nodes/twin"])).toMatch(/Nested Twin/);
+  });
+
+  it("delete names the file it resolved before removing it, and leaves the other", () => {
+    runCtx(tmp, ["add", "nodes/twin", "--title", "Nested Twin", "--body", "nested"]);
+    writeFileSync(join(tmp, "twin.md"), "---\ntitle: Root Twin\n---\n\nroot\n", "utf-8");
+    runCtx(tmp, ["index"]);
+    // Resolved before the prompt: the id it names is the one deleted.
+    const res = runCtxResult(tmp, ["delete", "twin", "--yes"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Deleted twin \(Root Twin\)/);
+    expect(existsSync(join(tmp, "twin.md"))).toBe(false);
+    expect(existsSync(join(tmp, "nodes", "twin.md"))).toBe(true);
   });
 });
 

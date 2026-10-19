@@ -640,6 +640,8 @@ const isNotFound = (err: unknown) => err instanceof ContextNestError && err.code
  * does not resolve a bare id under nodes/ itself (an engine before #183,
  * contextnest-community) refuses a structured node named without the prefix,
  * so a bare id it can't find is retried once as normalizeDocumentId roots it.
+ * Writes retry too: a nest raises DOCUMENT_NOT_FOUND while resolving the id,
+ * before it changes anything, so the first attempt wrote nothing.
  */
 async function runOnDocument<T>(
   conn: RemoteNestConnection,

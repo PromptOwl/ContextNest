@@ -344,6 +344,41 @@ describe("existing-document ids on a remote nest (CU-wdqcq046wd)", () => {
     ]);
   });
 
+  /** A nest that only knows `nodes/a`, the way an engine before #183 answers a bare id. */
+  const onlyNodesA = (reply: unknown) => (input: { id: string }) => {
+    if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+    return reply;
+  };
+
+  it("retries publish, move and the submit-for-review lookup the same way", async () => {
+    advertised = new Set(["context_publish", "context_move"]);
+    replies = {
+      context_publish: onlyNodesA({ id: "nodes/a", version: 2, checkpoint: 3 }),
+      context_move: onlyNodesA({ id: "nodes/x/a", previous_id: "nodes/a" }),
+    };
+    await remotePublish(target, "a");
+    await remoteMove(target, "a", "x");
+    expect(calls.map((c) => c.input)).toEqual([
+      { id: "a" },
+      { id: "nodes/a" },
+      { id: "a", folder: "x" },
+      { id: "nodes/a", folder: "x" },
+    ]);
+
+    calls = [];
+    advertised = new Set(["context_get", "context_submit_review"]);
+    replies = {
+      context_get: onlyNodesA({ id: "nodes/a", frontmatter: { title: "A" }, body: "" }),
+      context_submit_review: { submitted: true },
+    };
+    await remotePublish(target, "a");
+    expect(calls.map((c) => [c.op, c.input])).toEqual([
+      ["context_get", { id: "a" }],
+      ["context_get", { id: "nodes/a" }],
+      ["context_submit_review", { title: "A" }],
+    ]);
+  });
+
   it("missing under nodes/ too: reports the id the user typed, not the retried one", async () => {
     advertised = new Set(["context_get"]);
     replies = {

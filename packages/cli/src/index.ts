@@ -661,6 +661,22 @@ function opContext(
   };
 }
 
+/**
+ * The document an irreversible command will act on, as the engine resolves
+ * it, so the confirm prompt names the file at risk: a bare `foo` can be the
+ * vault-root `foo.md` or `nodes/foo.md`. context_versions resolves without
+ * parsing a document that has history, so this refuses nothing the command
+ * itself would not.
+ */
+async function resolvedDocumentId(storage: NestStorage, path: string): Promise<string> {
+  const { id } = await cliApi().run<{ id: string }>(
+    "context_versions",
+    { id: documentId(path) },
+    opContext(storage, "cli@contextnest.local"),
+  );
+  return id;
+}
+
 // Interactively prompt the user to pick a starter recipe using an arrow-key
 // navigable list (↑/↓ to move, Enter to select, Esc to skip). Resolves to the
 // chosen recipe id, or null if the user skips. Callers MUST only invoke this
@@ -2870,15 +2886,16 @@ program
       return;
     }
     const storage = getStorage();
+    const id = await resolvedDocumentId(storage, path);
     await confirmOrExit(
-      `Delete ${documentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
+      `Delete ${id} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
         (opts.purge ? " --purge leaves no audit record." : ""),
       { destructive: true },
     );
     const result = await cliApi().run<{ id: string; title: string; tombstoned?: boolean }>(
       "context_delete",
       {
-        id: documentId(path),
+        id,
         reason_code: opts.reason,
         ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
         ...(opts.purge ? { purge: true } : {}),
@@ -2933,7 +2950,7 @@ Example:
       throw new ContextNestError(`ctx forget works against a local vault only for now.`, "NOT_IMPLEMENTED");
     }
     const storage = getStorage();
-    const id = documentId(path);
+    const id = await resolvedDocumentId(storage, path);
     await confirmOrExit(
       `Forget ${id}? Its content is erased from history for good (hashes are kept, so verify still passes). This cannot be undone.`,
       { destructive: true },
