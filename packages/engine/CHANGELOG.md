@@ -1,5 +1,26 @@
 # @promptowl/contextnest-engine
 
+## 3.2.0
+
+### Minor Changes
+
+- **Retrieval modes: stemmed lexical search, plus opt-in semantic and hybrid search over published versions.**
+
+  - Lexical search now applies English (Porter) stemming at index and query time, so `migrations` finds `migration`. Stopwords are still dropped.
+  - **Ranking change (affects every existing vault, no config needed):** lexical scores are now the plain BM25 sum. MiniSearch's matched-term coordination factor is divided out (`search.coordination: true` restores it), and the default field boosts drop from title 3 / tags 2 / description 1.5 to all 1 (`search.field_boosts`). Exact title/#tag matches are pinned first in every mode, so title lookup keeps working. On MultiHop-RAG, NDCG@10 goes 0.657 → 0.706. See `docs/retrieval-modes.md`.
+  - New `ctx embed` / MCP `context_embed` builds an embedding index of **published** documents only. It is keyed by id + version + content hash, stored in `.context/embeddings/` (git-ignored), and is incremental.
+  - `ctx search --mode lexical|semantic|hybrid [--rerank]` / `context_search` `mode` + `rerank`. Hybrid uses weighted reciprocal rank fusion (k0 = 60, default lexical 1 : semantic 2, `search.fusion_weights`) and pins exact title/#tag matches. Hits carry per-signal `scores`, and the response names the `mode` that ran.
+  - Rerank works on passages by default (`search.rerank.unit: passage`). Each candidate's best ~300-token window is picked locally with stemmed BM25 (no API call), and the windows go to the reranker in one request of up to 100 passages. The hit carries its window as `passage`. The default `top_n` is 100.
+  - Providers are pluggable and optional: Amazon Bedrock (Cohere Embed v4, Titan v2, Cohere Rerank 3.5, using a Bedrock API key over fetch or a lazily imported `@aws-sdk/client-bedrock-runtime`), and any OpenAI-compatible `/embeddings` endpoint (OpenAI, Ollama, vLLM). The base install adds no provider dependency.
+  - The default mode stays lexical. A vault's `search.mode` applies only once an index exists. See `docs/retrieval-modes.md`.
+
+### Patch Changes
+
+- **Dependency updates.** `@modelcontextprotocol/sdk` `^1.29.0` → `^1.31.0` (engine runtime dependency, and the version bundled into the CLI and MCP server), and `fast-xml-parser` `^4.5.7` → `^5.7.0` (engine runtime dependency, used by the JATS/PubMed importers). Transitive security bumps: `body-parser` 2.3.0, `fast-uri` 3.1.8, `hono` 4.13.13, `proxy-addr` 2.0.8.
+- **Importing files checks for name collisions with one listing per folder.** `context_import` with `files[]` used to check every incoming path with its own existence check — a network round trip per file on a Cloud Storage mount, about a third of all storage operations a large import made. It now lists each target folder once and compares names case-folded, so a name a case-insensitive file system already holds (`Notes.md` against an incoming `notes.md`) still counts as taken and the incoming file lands beside it as `notes-2.md`.
+- **Importing publishes each document's new version as a full snapshot.** Storing a version as a diff first rebuilds the previous version from its keyframe and every diff since — on a Cloud Storage mount, a round trip per artifact for every imported document that already carries history. `context_import` with `discover` or `files[]` now stores that version as a keyframe instead, which reads nothing back. Each imported document keeps one extra full copy on disk, and `ctx history --diff` shows no diff for that one version. Publishing by `ids` only (bulk approval) still stores diffs.
+- **`ctx read` and the other commands that act on an existing document find a node at the root of an Obsidian (flat) vault.** `read`, `publish`, `history`, `reconstruct`, `update`, `delete`, `forget` and `forget-log` put `nodes/` in front of every id without a folder, so `ctx read my-node` looked for `nodes/my-node` and failed with `DOCUMENT_NOT_FOUND` for every node in a flat vault. They now send the id as typed (a `contextnest://` URI is reduced to its path, `.md` and a leading `/` are dropped) and let the engine resolve it for the vault's layout: the root-level node when there is one, else `nodes/<id>`. Against a remote nest the same commands, plus `move` and task `log`, retry a bare id once under `nodes/` when the nest answers `DOCUMENT_NOT_FOUND`, so nests that do not resolve a bare id themselves keep working. A `nodes/<id>` document that will not parse is still the one a bare id names, so the command reports why rather than a not-found.
+
 ## 3.1.0
 
 ### Minor Changes
