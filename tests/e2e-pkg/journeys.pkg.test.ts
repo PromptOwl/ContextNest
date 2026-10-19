@@ -43,6 +43,7 @@ import {
   packCli,
   freshInstall,
   runJourney,
+  repoRoot,
   type Journey,
   type RunResult,
 } from "./journey-harness.js";
@@ -1750,6 +1751,196 @@ const J8: Journey = {
   ],
 };
 
+/**
+ * J9 — "I build a knowledge base out of PDFs."
+ * A researcher drops report PDFs into the vault and relies on them like any
+ * other node: the text is pulled out so it is searchable, the original file
+ * stays attached byte-for-byte, a newer edition versions the node while the
+ * previous file is archived, a corrupted attachment is caught by verify, the
+ * extracted text can't be hand-edited, and a scanned PDF imports with a warning.
+ *
+ * Review gate OFF (like J2/J3/J5/J6/J8): each import should land as a published
+ * version, not wait behind the gate — the story is about PDFs, not review.
+ *
+ * Cases accumulate in one vault and run top to bottom; J9-03 searches for the
+ * v1 phrase BEFORE J9-04 re-imports a v2 whose body no longer contains it, so
+ * the cases must not be reordered. Fixtures are the committed PDFs under
+ * fixtures/pdf/ (report.pdf → "Revenue grew 12 percent.", report-v2.pdf → "14
+ * percent.", scanned.pdf → no text layer); paths are absolute so the installed
+ * bin (cwd = vault) resolves them.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const PDF_FIXTURE = (name: string) => join(repoRoot, "fixtures", "pdf", name);
+const PDF_V1 = PDF_FIXTURE("report.pdf"); // "Revenue grew 12 percent."
+const PDF_V2 = PDF_FIXTURE("report-v2.pdf"); // "Revenue grew 14 percent."
+const PDF_SCANNED = PDF_FIXTURE("scanned.pdf"); // image-only, no text layer
+// The import derives this id from the PDF title ("Quarterly Report") + --folder.
+const PDF_NODE = "nodes/reports/quarterly-report";
+const PDF_SIDECAR = "nodes/reports/quarterly-report.pdf";
+// Where a re-import archives the superseded binary (one .pdf per prior version).
+const PDF_ARCHIVE = "nodes/reports/.versions/quarterly-report";
+
+/** The sidecar on disk must be the source PDF, byte-for-byte. */
+const sidecarEquals = (vault: string, fixture: string) =>
+  readFileSync(join(vault, PDF_SIDECAR)).equals(readFileSync(fixture));
+
+const J9: Journey = {
+  id: "J9",
+  title: "Build a knowledge base from PDFs (researcher)",
+  cases: [
+    {
+      id: "J9-01",
+      title: "Import a text PDF; it becomes a node with the text pulled out, and the vault still verifies clean",
+      actions: [
+        { args: ["init", "--name", "pdf-kb", "--layout", "structured"] },
+        // Land imports as published versions, not held behind the review gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: ["import", "pdf", PDF_V1, "--folder", "reports", "--tags", "finance"],
+          // The import line a user reads: id, version, page count, published.
+          stdout: ["Imported", PDF_NODE, "2 pages", "published"],
+          // The node is a type: pdf node carrying the extracted text and its tag,
+          // and the original binary landed beside it.
+          files: [
+            { path: `${PDF_NODE}.md`, contains: "type: pdf" },
+            { path: `${PDF_NODE}.md`, contains: "Revenue grew 12 percent." },
+            { path: `${PDF_NODE}.md`, contains: "#finance" },
+            { path: PDF_SIDECAR, exists: true },
+          ],
+        },
+        // The whole vault re-checks clean, including the PDF node's sidecar hash.
+        { args: ["verify"], stdout: [PDF_NODE, "All integrity checks passed"] },
+      ],
+    },
+    {
+      id: "J9-02",
+      title: "The original PDF stays attached to the node, byte-for-byte",
+      actions: [
+        {
+          args: ["read", PDF_NODE, "--raw"],
+          stdout: ["type: pdf", "Revenue grew 12 percent."],
+          // The attachment is the untouched source file, not a re-encoding.
+          check: (vault) =>
+            expect(sidecarEquals(vault, PDF_V1), "attached PDF differs from the imported source").toBe(true),
+        },
+      ],
+    },
+    {
+      id: "J9-03",
+      title: "A search for a phrase that only appears inside the PDF finds the node",
+      actions: [
+        // "Revenue grew 12 percent." is nowhere but inside the PDF's text layer.
+        {
+          args: ["search", "Revenue grew 12 percent", "--json"],
+          json: (data) => expect(searchIds(data)).toEqual([PDF_NODE]),
+        },
+      ],
+    },
+    {
+      id: "J9-04",
+      title: "Importing a newer edition versions the node (new text) and keeps the previous file archived",
+      actions: [
+        {
+          args: ["import", "pdf", PDF_V2, "--id", PDF_NODE],
+          stdout: ["Updated", PDF_NODE, "v2", "published"],
+          files: [{ path: `${PDF_NODE}.md`, contains: "Revenue grew 14 percent." }],
+          // The live attachment is now the new edition; the old one is archived
+          // under the node's version history, byte-for-byte, not overwritten.
+          check: (vault) => {
+            expect(sidecarEquals(vault, PDF_V2), "live sidecar should be the new edition").toBe(true);
+            const archived = readdirSync(join(vault, PDF_ARCHIVE)).filter((f) => f.endsWith(".pdf"));
+            expect(archived.length, "a superseded PDF should be archived").toBe(1);
+            expect(
+              readFileSync(join(vault, PDF_ARCHIVE, archived[0])).equals(readFileSync(PDF_V1)),
+              "the archived PDF should be the original v1 file",
+            ).toBe(true);
+          },
+        },
+        // The node now reads as the new edition; the old figure is gone from it.
+        {
+          args: ["read", PDF_NODE, "--raw"],
+          stdout: ["Revenue grew 14 percent."],
+          stdoutNot: ["Revenue grew 12 percent."],
+        },
+      ],
+    },
+    {
+      id: "J9-05",
+      title: "A swapped or corrupted attachment is caught by verify",
+      actions: [
+        {
+          // Overwrite the attached PDF with unrelated bytes (a tamper/swap).
+          mutate: (vault) => writeFileSync(join(vault, PDF_SIDECAR), readFileSync(PDF_SCANNED)),
+          args: ["verify", "--json"],
+          status: 1,
+          json: (data) => {
+            const d = data as { valid: boolean; errors: Array<{ type: string; document: string }> };
+            expect(d.valid).toBe(false);
+            expect(
+              d.errors.some((e) => e.type === "sidecar_drift" && e.document === PDF_NODE),
+              "verify should report sidecar_drift for the tampered PDF node",
+            ).toBe(true);
+          },
+        },
+        {
+          // Put the correct file back (the node is at v2) — the vault recovers.
+          mutate: (vault) => writeFileSync(join(vault, PDF_SIDECAR), readFileSync(PDF_V2)),
+          args: ["verify"],
+          stdout: ["All integrity checks passed"],
+        },
+      ],
+    },
+    {
+      id: "J9-06",
+      title: "The pulled-out text can't be hand-edited, but the node's title and tags still can",
+      actions: [
+        {
+          // The binary is the source of truth, so a --body edit is refused…
+          args: ["update", PDF_NODE, "--body", "hand edited text"],
+          status: 1,
+          stderr: ["is a PDF node", "cannot be edited directly"],
+          // …before any write: the extracted text on disk is untouched.
+          files: [{ path: `${PDF_NODE}.md`, contains: "Revenue grew 14 percent." }],
+        },
+        {
+          // …while a metadata edit still goes through (the refusal is body-only).
+          args: ["update", PDF_NODE, "--title", "Q4 Earnings"],
+          stdout: ["Updated and published", PDF_NODE],
+          files: [{ path: `${PDF_NODE}.md`, contains: "title: Q4 Earnings" }],
+        },
+      ],
+    },
+    {
+      id: "J9-07",
+      title: "A scanned (image-only) PDF imports but warns there is no text to search",
+      actions: [
+        {
+          args: ["import", "pdf", PDF_SCANNED, "--id", "nodes/scan"],
+          // It still imports and stores the file, but says the body is empty —
+          // nothing to search. (Assert the words, not the ⚠ glyph: Windows
+          // stdout can mangle it.)
+          stdout: ["Imported", "nodes/scan", "no text layer"],
+          files: [
+            { path: "nodes/scan.md", contains: "text_layer: false" },
+            { path: "nodes/scan.pdf", exists: true },
+          ],
+        },
+        // There really is nothing to search: a text PDF's body carries page
+        // markers (J9-01's node has "<!-- page 1 -->"); this scanned node's body
+        // is empty, so no such marker and none of the report's words appear.
+        {
+          args: ["read", "nodes/scan", "--raw"],
+          stdout: ["type: pdf"],
+          stdoutNot: ["<!-- page 1 -->", "Revenue grew"],
+        },
+        // The whole vault — the versioned report plus the scanned PDF — is healthy.
+        { args: ["verify"], stdout: ["All integrity checks passed"] },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -1781,5 +1972,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J8 — keep a vault encrypted at rest", () => {
     runJourney({ installDir: INSTALL, scratch }, J8);
+  });
+
+  it("J9 — build a knowledge base from PDFs", () => {
+    runJourney({ installDir: INSTALL, scratch }, J9);
   });
 });
