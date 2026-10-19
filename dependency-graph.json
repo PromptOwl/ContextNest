@@ -47,7 +47,7 @@
         },
         {
           "name": "@modelcontextprotocol/sdk",
-          "version": "1.29.0",
+          "version": "1.31.0",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -67,7 +67,7 @@
         },
         {
           "name": "fast-xml-parser",
-          "version": "4.5.7",
+          "version": "5.11.2",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -155,6 +155,16 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "@nodable/entities",
+          "version": "3.1.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -263,13 +273,33 @@
           ]
         },
         {
+          "name": "fast-xml-builder",
+          "version": "1.3.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
+          ]
+        },
+        {
           "name": "hono",
-          "version": "4.12.16",
+          "version": "4.13.13",
           "license": "MIT",
           "depth": 3,
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "is-unsafe",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -290,6 +320,17 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "path-expression-matcher",
+          "version": "1.6.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-builder",
+            "fast-xml-parser"
           ]
         },
         {
@@ -315,11 +356,22 @@
         },
         {
           "name": "strnum",
-          "version": "1.1.2",
+          "version": "2.5.1",
           "license": "MIT",
           "depth": 3,
           "optional": false,
           "via": [
+            "fast-xml-parser"
+          ]
+        },
+        {
+          "name": "xml-naming",
+          "version": "0.3.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-builder",
             "fast-xml-parser"
           ]
         },
@@ -334,8 +386,18 @@
           ]
         },
         {
+          "name": "anynum",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "strnum"
+          ]
+        },
+        {
           "name": "body-parser",
-          "version": "2.2.2",
+          "version": "2.3.0",
           "license": "MIT",
           "depth": 4,
           "optional": false,
@@ -448,7 +510,7 @@
         },
         {
           "name": "fast-uri",
-          "version": "3.1.0",
+          "version": "3.1.8",
           "license": "BSD-3-Clause",
           "depth": 4,
           "optional": false,
@@ -591,7 +653,7 @@
         },
         {
           "name": "proxy-addr",
-          "version": "2.0.7",
+          "version": "2.0.8",
           "license": "MIT",
           "depth": 4,
           "optional": false,
@@ -601,7 +663,7 @@
         },
         {
           "name": "qs",
-          "version": "6.15.0",
+          "version": "6.16.0",
           "license": "BSD-3-Clause",
           "depth": 4,
           "optional": false,
@@ -687,7 +749,7 @@
         },
         {
           "name": "type-is",
-          "version": "2.0.1",
+          "version": "2.1.0",
           "license": "MIT",
           "depth": 4,
           "optional": false,
@@ -841,6 +903,17 @@
           ]
         },
         {
+          "name": "es-define-property",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 6,
+          "optional": false,
+          "via": [
+            "get-intrinsic",
+            "qs"
+          ]
+        },
+        {
           "name": "inherits",
           "version": "2.0.4",
           "license": "ISC",
@@ -892,7 +965,7 @@
         },
         {
           "name": "side-channel",
-          "version": "1.1.0",
+          "version": "1.1.1",
           "license": "MIT",
           "depth": 6,
           "optional": false,
@@ -952,7 +1025,7 @@
         },
         {
           "name": "side-channel-list",
-          "version": "1.0.0",
+          "version": "1.0.1",
           "license": "MIT",
           "depth": 7,
           "optional": false,
@@ -1013,16 +1086,6 @@
           "via": [
             "call-bound",
             "dunder-proto",
-            "get-intrinsic"
-          ]
-        },
-        {
-          "name": "es-define-property",
-          "version": "1.0.1",
-          "license": "MIT",
-          "depth": 10,
-          "optional": false,
-          "via": [
             "get-intrinsic"
           ]
         },
@@ -1129,12 +1192,12 @@
       ],
       "optional": [],
       "maxDepth": 11,
-      "total": 100,
-      "minimalTotal": 100,
+      "total": 106,
+      "minimalTotal": 106,
       "packages": [
         {
           "name": "@modelcontextprotocol/sdk",
-          "version": "1.29.0",
+          "version": "1.31.0",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -1154,7 +1217,7 @@
         },
         {
           "name": "fast-xml-parser",
-          "version": "4.5.7",
+          "version": "5.11.2",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -1242,6 +1305,16 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "@nodable/entities",
+          "version": "3.1.0",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -1350,13 +1423,33 @@
           ]
         },
         {
+          "name": "fast-xml-builder",
+          "version": "1.3.1",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
+          ]
+        },
+        {
           "name": "hono",
-          "version": "4.12.16",
+          "version": "4.13.13",
           "license": "MIT",
           "depth": 2,
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "is-unsafe",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -1377,6 +1470,17 @@
           "optional": false,
           "via": [
             "@modelcontextprotocol/sdk"
+          ]
+        },
+        {
+          "name": "path-expression-matcher",
+          "version": "1.6.2",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-builder",
+            "fast-xml-parser"
           ]
         },
         {
@@ -1402,11 +1506,22 @@
         },
         {
           "name": "strnum",
-          "version": "1.1.2",
+          "version": "2.5.1",
           "license": "MIT",
           "depth": 2,
           "optional": false,
           "via": [
+            "fast-xml-parser"
+          ]
+        },
+        {
+          "name": "xml-naming",
+          "version": "0.3.0",
+          "license": "MIT",
+          "depth": 2,
+          "optional": false,
+          "via": [
+            "fast-xml-builder",
             "fast-xml-parser"
           ]
         },
@@ -1421,8 +1536,18 @@
           ]
         },
         {
+          "name": "anynum",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "strnum"
+          ]
+        },
+        {
           "name": "body-parser",
-          "version": "2.2.2",
+          "version": "2.3.0",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -1535,7 +1660,7 @@
         },
         {
           "name": "fast-uri",
-          "version": "3.1.0",
+          "version": "3.1.8",
           "license": "BSD-3-Clause",
           "depth": 3,
           "optional": false,
@@ -1678,7 +1803,7 @@
         },
         {
           "name": "proxy-addr",
-          "version": "2.0.7",
+          "version": "2.0.8",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -1688,7 +1813,7 @@
         },
         {
           "name": "qs",
-          "version": "6.15.0",
+          "version": "6.16.0",
           "license": "BSD-3-Clause",
           "depth": 3,
           "optional": false,
@@ -1774,7 +1899,7 @@
         },
         {
           "name": "type-is",
-          "version": "2.0.1",
+          "version": "2.1.0",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -1928,6 +2053,17 @@
           ]
         },
         {
+          "name": "es-define-property",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "get-intrinsic",
+            "qs"
+          ]
+        },
+        {
           "name": "inherits",
           "version": "2.0.4",
           "license": "ISC",
@@ -1979,7 +2115,7 @@
         },
         {
           "name": "side-channel",
-          "version": "1.1.0",
+          "version": "1.1.1",
           "license": "MIT",
           "depth": 5,
           "optional": false,
@@ -2039,7 +2175,7 @@
         },
         {
           "name": "side-channel-list",
-          "version": "1.0.0",
+          "version": "1.0.1",
           "license": "MIT",
           "depth": 6,
           "optional": false,
@@ -2100,16 +2236,6 @@
           "via": [
             "call-bound",
             "dunder-proto",
-            "get-intrinsic"
-          ]
-        },
-        {
-          "name": "es-define-property",
-          "version": "1.0.1",
-          "license": "MIT",
-          "depth": 9,
-          "optional": false,
-          "via": [
             "get-intrinsic"
           ]
         },
@@ -2212,7 +2338,7 @@
       "bundled": [
         {
           "name": "@modelcontextprotocol/sdk",
-          "version": "1.29.0",
+          "version": "1.31.0",
           "license": "MIT",
           "depth": 1,
           "optional": false,
@@ -2360,7 +2486,7 @@
         },
         {
           "name": "fast-xml-parser",
-          "version": "4.5.7",
+          "version": "5.11.2",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -2370,7 +2496,7 @@
         },
         {
           "name": "hono",
-          "version": "4.12.16",
+          "version": "4.13.13",
           "license": "MIT",
           "depth": 2,
           "optional": false,
@@ -2481,6 +2607,16 @@
           ]
         },
         {
+          "name": "@nodable/entities",
+          "version": "3.1.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
+          ]
+        },
+        {
           "name": "accepts",
           "version": "2.0.0",
           "license": "MIT",
@@ -2502,7 +2638,7 @@
         },
         {
           "name": "body-parser",
-          "version": "2.2.2",
+          "version": "2.3.0",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -2615,12 +2751,22 @@
         },
         {
           "name": "fast-uri",
-          "version": "3.1.0",
+          "version": "3.1.8",
           "license": "BSD-3-Clause",
           "depth": 3,
           "optional": false,
           "via": [
             "ajv"
+          ]
+        },
+        {
+          "name": "fast-xml-builder",
+          "version": "1.3.1",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -2665,6 +2811,16 @@
           "optional": false,
           "via": [
             "express-rate-limit"
+          ]
+        },
+        {
+          "name": "is-unsafe",
+          "version": "2.0.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-parser"
           ]
         },
         {
@@ -2747,6 +2903,17 @@
           ]
         },
         {
+          "name": "path-expression-matcher",
+          "version": "1.6.2",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-builder",
+            "fast-xml-parser"
+          ]
+        },
+        {
           "name": "path-key",
           "version": "3.1.1",
           "license": "MIT",
@@ -2758,7 +2925,7 @@
         },
         {
           "name": "proxy-addr",
-          "version": "2.0.7",
+          "version": "2.0.8",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -2768,7 +2935,7 @@
         },
         {
           "name": "qs",
-          "version": "6.15.0",
+          "version": "6.16.0",
           "license": "BSD-3-Clause",
           "depth": 3,
           "optional": false,
@@ -2854,7 +3021,7 @@
         },
         {
           "name": "strnum",
-          "version": "1.1.2",
+          "version": "2.5.1",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -2864,7 +3031,7 @@
         },
         {
           "name": "type-is",
-          "version": "2.0.1",
+          "version": "2.1.0",
           "license": "MIT",
           "depth": 3,
           "optional": false,
@@ -2892,6 +3059,27 @@
           "optional": false,
           "via": [
             "cross-spawn"
+          ]
+        },
+        {
+          "name": "xml-naming",
+          "version": "0.3.0",
+          "license": "MIT",
+          "depth": 3,
+          "optional": false,
+          "via": [
+            "fast-xml-builder",
+            "fast-xml-parser"
+          ]
+        },
+        {
+          "name": "anynum",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 4,
+          "optional": false,
+          "via": [
+            "strnum"
           ]
         },
         {
@@ -3018,6 +3206,17 @@
           ]
         },
         {
+          "name": "es-define-property",
+          "version": "1.0.1",
+          "license": "MIT",
+          "depth": 5,
+          "optional": false,
+          "via": [
+            "get-intrinsic",
+            "qs"
+          ]
+        },
+        {
           "name": "inherits",
           "version": "2.0.4",
           "license": "ISC",
@@ -3069,7 +3268,7 @@
         },
         {
           "name": "side-channel",
-          "version": "1.1.0",
+          "version": "1.1.1",
           "license": "MIT",
           "depth": 5,
           "optional": false,
@@ -3129,7 +3328,7 @@
         },
         {
           "name": "side-channel-list",
-          "version": "1.0.0",
+          "version": "1.0.1",
           "license": "MIT",
           "depth": 6,
           "optional": false,
@@ -3190,16 +3389,6 @@
           "via": [
             "call-bound",
             "dunder-proto",
-            "get-intrinsic"
-          ]
-        },
-        {
-          "name": "es-define-property",
-          "version": "1.0.1",
-          "license": "MIT",
-          "depth": 9,
-          "optional": false,
-          "via": [
             "get-intrinsic"
           ]
         },
