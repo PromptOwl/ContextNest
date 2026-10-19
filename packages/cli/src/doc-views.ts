@@ -1,5 +1,5 @@
 import chalk from "./color.js";
-import { TAG_PATTERN, TAG_RULE } from "@promptowl/contextnest-engine";
+import { ContextNestError, TAG_PATTERN, TAG_RULE, parseUri } from "@promptowl/contextnest-engine";
 
 /**
  * Shared view shapes and formatting for commands that run against BOTH a
@@ -105,6 +105,10 @@ export interface SearchHitView {
   type?: string;
   /** BM25 relevance score; absent from a remote nest running an older engine. */
   score?: number;
+  /** Per-signal scores (lexical / semantic / rrf / rerank); engine >= 2.13. */
+  scores?: { lexical?: number; semantic?: number; rrf?: number; rerank?: number };
+  /** Passage rerank: the best-matching window of the document. */
+  passage?: string;
   /** Server-level remote only: the `--vault <server>/<nest>` holding this hit. */
   vault?: string;
 }
@@ -117,6 +121,8 @@ export function searchJsonEntry(d: SearchHitView) {
     description: d.description,
     type: d.type || "document",
     ...(typeof d.score === "number" ? { score: d.score } : {}),
+    ...(d.scores ? { scores: d.scores } : {}),
+    ...(d.passage !== undefined ? { passage: d.passage } : {}),
     ...(d.vault ? { vault: d.vault } : {}),
   };
 }
@@ -170,6 +176,31 @@ export function printSearchResults(
     console.log(`  ${chalk.cyan(doc.vault ? `${doc.vault}:${doc.id}` : doc.id)}: ${doc.title}`);
   }
   if (more > 0) console.log(chalk.dim(`\n${footer}`));
+}
+
+/**
+ * The id to send an op for an EXISTING document the user named: a
+ * `contextnest://` URI reduced to its path, no `.md`, no leading `/` — but NOT
+ * re-rooted under nodes/. The engine resolves a bare id for the vault's own
+ * layout (as stored at the root of a flat Obsidian vault, else nodes/<id>);
+ * normalizeDocumentId's blind nodes/ prefix sent every flat-layout id to a
+ * document that isn't there. Creating a document still normalizes. A URI
+ * pinned to a checkpoint (`@N`) is refused: these commands act on the live
+ * document, and dropping the pin would silently read or change another version.
+ */
+export function documentId(path: string): string {
+  let id = path;
+  if (path.startsWith("contextnest://")) {
+    const uri = parseUri(path);
+    if (uri.checkpoint !== undefined) {
+      throw new ContextNestError(
+        `${path} is pinned to checkpoint @${uri.checkpoint} — this command acts on the live document; drop the @${uri.checkpoint}.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    id = uri.path;
+  }
+  return id.replace(/\.md$/, "").replace(/^\/+/, "");
 }
 
 /** Derive a display title from a doc id leaf: "nodes/foo-bar" → "Foo Bar". */

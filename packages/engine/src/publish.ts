@@ -240,6 +240,12 @@ export interface BulkPublishOptions extends PublishOptions {
    * in the map are read as usual.
    */
   preloaded?: ReadonlyMap<string, ContextNode>;
+  /**
+   * Store each published version as a full keyframe, not a diff. A diff first
+   * rebuilds the previous version (keyframe + every diff since), a round trip
+   * per artifact on a network mount; an import pays that for a one-off version.
+   */
+  keyframe?: boolean;
 }
 
 export interface BulkPublishResult {
@@ -389,6 +395,7 @@ export async function publishDocuments(
         client: options.client,
         knownHistory,
         knownSealed,
+        ...(options.keyframe ? { keyframe: true } : {}),
       });
       published.push({
         id: docId,

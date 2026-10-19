@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-engine",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -55,11 +55,12 @@
     "bench:profile": "node --cpu-prof --cpu-prof-dir=bench/profiles bench/run.mjs --sizes 1000"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "diff": "^9.0.0",
-    "fast-xml-parser": "^4.5.7",
+    "fast-xml-parser": "^5.7.0",
     "js-yaml": "^4.3.2",
     "minisearch": "^7.0.0",
+    "stemmer": "2.0.1",
     "toposort": "^2.0.2",
     "unpdf": "1.7.0",
     "zod": "^3.24.0",
