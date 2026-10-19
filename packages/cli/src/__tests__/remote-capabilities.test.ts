@@ -344,6 +344,17 @@ describe("existing-document ids on a remote nest (CU-wdqcq046wd)", () => {
     ]);
   });
 
+  it("missing under nodes/ too: reports the id the user typed, not the retried one", async () => {
+    advertised = new Set(["context_get"]);
+    replies = {
+      context_get: (input: { id: string }) => {
+        throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+      },
+    };
+    await expect(remoteRead(target, "ghost", {})).rejects.toThrow("Document not found: ghost");
+    expect(calls.map((c) => c.input.id)).toEqual(["ghost", "nodes/ghost"]);
+  });
+
   it("refuses a URI pinned to a checkpoint instead of acting on the live document", async () => {
     advertised = new Set(["context_get"]);
     const err = await remoteRead(target, "contextnest://my-node@3", {}).catch((e) => e);

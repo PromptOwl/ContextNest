@@ -56,6 +56,7 @@ import {
   assertNotMachineryPath,
   assertResolvesOutsideMachinery,
   NON_DOCUMENT_BASENAMES,
+  isUnreadableDocumentError,
 } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -260,10 +261,15 @@ async function givenId(ctx: OperationContext, id: string): Promise<string> {
   const file = `${id}.md`.toLowerCase();
   const scaffold = file === "context.md" || [...NON_DOCUMENT_BASENAMES].some((b) => b.toLowerCase() === file);
   if (!scaffold && (await readIfExists(ctx, id).catch(() => null))) return id;
-  // One that is there but will not read is still the one named: the op reports
-  // why, rather than a not-found for the bare id.
+  // One that is there but will not read (its own YAML, frontmatter or
+  // encryption) is still the one named: the op reports why, rather than a
+  // not-found for the bare id. A vault-level failure still throws here.
   const rooted = `nodes/${id}`;
-  return (await readIfExists(ctx, rooted).catch(() => true)) ? rooted : id;
+  const found = await readIfExists(ctx, rooted).catch((err) => {
+    if (isUnreadableDocumentError(err)) return true;
+    throw err;
+  });
+  return found ? rooted : id;
 }
 
 /**

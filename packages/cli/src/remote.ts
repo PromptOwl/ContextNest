@@ -632,6 +632,8 @@ export async function remoteEmbed<T>(target: RemoteTarget, input: { rebuild?: tr
   });
 }
 
+const isNotFound = (err: unknown) => err instanceof ContextNestError && err.code === "DOCUMENT_NOT_FOUND";
+
 /**
  * Run `op` on an existing document by the id `documentId` derived from what
  * the user typed, so a flat-layout nest finds a root-level node. A nest that
@@ -649,8 +651,11 @@ async function runOnDocument<T>(
     return await conn.run<T>(op, { id, ...input });
   } catch (err) {
     const rooted = normalizeDocumentId(id);
-    if (rooted === id || !(err instanceof ContextNestError && err.code === "DOCUMENT_NOT_FOUND")) throw err;
-    return conn.run<T>(op, { id: rooted, ...input });
+    if (rooted === id || !isNotFound(err)) throw err;
+    // Missing there too: report the id the user typed, not the guess.
+    return conn.run<T>(op, { id: rooted, ...input }).catch((retryErr) => {
+      throw isNotFound(retryErr) ? err : retryErr;
+    });
   }
 }
 

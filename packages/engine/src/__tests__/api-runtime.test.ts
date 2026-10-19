@@ -1488,12 +1488,15 @@ describe("id and title tolerance", () => {
     // node (versions) answers for it, and one that does reports the parse
     // error — never DOCUMENT_NOT_FOUND for the bare id.
     await api.run("context_create", { id: "nodes/broken", title: "Broken", content: "body" }, ctx);
-    writeFileSync(join(dir, "nodes", "broken.md"), "---\ntitle: Broken\ntags: 7\n---\n\nbody\n", "utf-8");
-    const versions = await api.run<{ id: string }>("context_versions", { id: "broken" }, ctx);
-    expect(versions.id).toBe("nodes/broken");
-    const err = (await api.run("context_get", { id: "broken" }, ctx).catch((e) => e)) as { code?: string };
-    expect(err).toBeInstanceOf(Error);
-    expect(err.code).not.toBe("DOCUMENT_NOT_FOUND");
+    // Frontmatter of the wrong shape, then YAML that does not parse at all.
+    for (const raw of ["---\ntitle: Broken\ntags: 7\n---\n\nbody\n", "---\ntitle: [unclosed\n---\n\nbody\n"]) {
+      writeFileSync(join(dir, "nodes", "broken.md"), raw, "utf-8");
+      const versions = await api.run<{ id: string }>("context_versions", { id: "broken" }, ctx);
+      expect(versions.id).toBe("nodes/broken");
+      const err = (await api.run("context_get", { id: "broken" }, ctx).catch((e) => e)) as { code?: string };
+      expect(err).toBeInstanceOf(Error);
+      expect(err.code).not.toBe("DOCUMENT_NOT_FOUND");
+    }
   });
 
   it("finds a retired document by title, not just by id", async () => {

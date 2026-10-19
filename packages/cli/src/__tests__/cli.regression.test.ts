@@ -26,7 +26,7 @@ import {
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -464,6 +464,35 @@ describe("[regression] ctx read/history/update in an Obsidian (flat) vault", () 
   it("delete removes the root-level node it names", () => {
     runCtx(tmp, ["delete", "my-node", "--yes"]);
     expect(existsSync(join(tmp, "my-node.md"))).toBe(false);
+  });
+
+  it("publish reaches the root-level node", () => {
+    expect(runCtx(tmp, ["publish", "my-node", "--yes"])).toMatch(/Published my-node/);
+  });
+
+  it("an id that climbs out of the vault is still refused, and nothing outside is touched", () => {
+    // normalizeDocumentId was not the traversal guard: the engine refuses it.
+    const outside = join(tmp, "..", `cn-outside-${process.pid}.md`);
+    writeFileSync(outside, "---\ntitle: Outside\n---\n\nkeep\n", "utf-8");
+    try {
+      const res = runCtxResult(tmp, ["delete", `../${basename(outside, ".md")}`, "--yes"]);
+      expect(res.status).not.toBe(0);
+      expect(existsSync(outside)).toBe(true);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+});
+
+describe("[regression] bare id in a structured vault holding both <id>.md and nodes/<id>.md", () => {
+  beforeEach(() => initVault(tmp));
+
+  it("resolves to the root-level document, as MCP context_* clients already do", () => {
+    runCtx(tmp, ["add", "nodes/twin", "--title", "Nested Twin", "--body", "nested"]);
+    writeFileSync(join(tmp, "twin.md"), "---\ntitle: Root Twin\n---\n\nroot\n", "utf-8");
+    runCtx(tmp, ["index"]);
+    expect(runCtx(tmp, ["read", "twin"])).toMatch(/Root Twin/);
+    expect(runCtx(tmp, ["read", "nodes/twin"])).toMatch(/Nested Twin/);
   });
 });
 

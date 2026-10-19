@@ -109,6 +109,19 @@ export type CheckpointChainState =
   | { kind: "unreadable"; reason: string };
 
 /**
+ * A read failed because of that one file — bad YAML, frontmatter of the wrong
+ * shape, or a body that will not decrypt — not because of the vault (locked,
+ * no permission, I/O). The document is there; it just will not read.
+ */
+export function isUnreadableDocumentError(err: unknown): boolean {
+  return (
+    err instanceof yaml.YAMLException ||
+    err instanceof FrontmatterShapeError ||
+    (err as { code?: string } | null)?.code === "DECRYPTION_FAILED"
+  );
+}
+
+/**
  * Normalize a user-supplied document path/slug into a canonical document id.
  *
  * Single source of truth shared by every client (CLI, MCP) so a bare slug
@@ -977,11 +990,7 @@ export class NestStorage {
         // not hold is the vault's condition, not the file's: all still throw —
         // a vault never lists empty for want of its key.
         if (err instanceof ForeignVaultKeyError) throw err;
-        const oneFile =
-          err instanceof yaml.YAMLException ||
-          err instanceof FrontmatterShapeError ||
-          (err as { code?: string }).code === "DECRYPTION_FAILED";
-        if (!oneFile) throw err;
+        if (!isUnreadableDocumentError(err)) throw err;
         options.onUnreadable?.(id, err instanceof Error ? err.message : String(err));
         return null;
       }
