@@ -2,6 +2,7 @@
  * contextnest-cli — Command-line tool for Context Nest vault operations.
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
@@ -138,6 +139,7 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
+import { choicesToInitArgs, setupBaseUrl, waitForChoices } from "./setup.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
 import {
@@ -249,6 +251,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   {
     title: "Set up a vault",
     commands: [
+      ["setup", "Pick vault options and agent connect steps on a web page, then create the vault here"],
       ["init", "Create a new vault here (try --starter for a ready-made template)"],
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
@@ -1222,6 +1225,10 @@ program
   // --list-starters (it did: `personal` was missing for a release).
   .option("-s, --starter <recipe>", `Starter recipe: ${listStarters().map((s) => s.id).join(", ")}`)
   .option("--list-starters", "List available starter recipes")
+  .option(
+    "--tools <ids>",
+    "With --starter: agent config files to write, comma-separated (claude, cursor, windsurf, copilot, gemini) or none",
+  )
   .option("--set-default", "Make the new vault the registry default")
   .option(
     "--register",
@@ -1406,7 +1413,16 @@ program
       // so re-check the TTY independently here.
       let agentTools: string[] | undefined;
       const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
-      if (isTty) {
+      if (typeof opts.tools === "string") {
+        const known = detectAgentTools(root).map((t) => t.id);
+        const picked: string[] = opts.tools === "none" ? [] : opts.tools.split(",").map((t: string) => t.trim()).filter(Boolean);
+        const unknown = picked.filter((t) => !known.includes(t));
+        if (unknown.length) {
+          console.log(chalk.red(`Unknown tool: ${unknown.join(", ")}. Known: ${known.join(", ")}, none`));
+          process.exit(1);
+        }
+        agentTools = picked;
+      } else if (isTty) {
         agentTools = await promptToolSelection(detectAgentTools(root));
         if (agentTools.length === 0) {
           console.log(chalk.dim("  No tools selected — no agent config files will be written."));
@@ -3514,6 +3530,41 @@ enrichCmd
   });
 
 // ─── ctx welcome ──────────────────────────────────────────────────────────────
+
+// ─── ctx setup ─────────────────────────────────────────────────────────────────
+
+program
+  .command("setup")
+  .description("Pick vault options on a web page, then create the vault here with ctx init")
+  .option("--no-open", "Print the page URL instead of opening a browser")
+  .addHelpText(
+    "after",
+    "\nThe page is https://nest.promptowl.ai/setup by default. Set CONTEXTNEST_SETUP_URL to use another server.",
+  )
+  .action(async (opts: { open: boolean }) => {
+    const base = setupBaseUrl();
+    const choices = await waitForChoices(base, (url) => {
+      console.log(chalk.bold("\n  Choose your vault options in the browser:"));
+      console.log(`  ${chalk.cyan(url)}\n`);
+      console.log(chalk.dim("  Waiting for the page (Ctrl+C to cancel)…"));
+      if (opts.open) openUrlInBrowser(url);
+    });
+    const args = choicesToInitArgs(
+      choices,
+      listStarters().map((s) => s.id),
+      detectAgentTools(process.cwd()).map((t) => t.id),
+    );
+    console.log(chalk.green("\n  Received. Running:"), chalk.cyan(`ctx init ${args.join(" ")}`));
+    // A child process, not a re-parse: init's prompts, exits and registry
+    // hooks all assume they own the process.
+    const child = spawnSync(process.execPath, [...process.execArgv, process.argv[1]!, "init", ...args], {
+      stdio: "inherit",
+    });
+    if (child.status === 0) {
+      console.log(chalk.dim(`\n  Next: connect your agent — the steps are on the page (${base}/setup?done=1).`));
+    }
+    process.exitCode = child.status ?? 1;
+  });
 
 program
   .command("welcome")
