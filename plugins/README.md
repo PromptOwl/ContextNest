@@ -10,7 +10,7 @@ plugins/
 │                  hook scripts + canonical agent/skill prompts).
 ├── claude-code/   Claude Code plugin (built). Hooks + agents + skill. ← install this
 ├── codex/         OpenAI Codex adapter (planned — README only).
-└── gemini/        Gemini CLI adapter (planned — README only).
+└── gemini/        Gemini CLI & Antigravity adapter (built). Hooks + skills + rules.
 ```
 
 ## How the pieces fit
@@ -33,6 +33,6 @@ Edit `plugins/shared/`, never the vendored `plugins/<agent>/core/` copies.
 | --- | --- | --- |
 | Claude Code | `ctx` CLI via hooks + agents | **Built** |
 | Codex | `ctx` CLI + the [MCP server](../packages/mcp-server) | Planned |
-| Gemini CLI | MCP server + custom commands reusing `core/` | Planned |
+| Gemini CLI & Antigravity | `ctx` CLI via lifecycle hooks + skills + rules | **Built** |
 
 See each subdirectory's README for specifics.

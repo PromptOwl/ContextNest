@@ -450,6 +450,63 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     expect(got.frontmatter.tags).toEqual(["#a", "#b"]);
   });
 
+  // CU-wdqcpzx8ya: a stat per file was a round trip each on a network mount.
+  it("checks collisions with one listing per folder, case-folded", async () => {
+    const api = createEngineApi();
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    // On disk in another case: a case-insensitive file system already holds notes.md.
+    await writeFile(join(dir, "nodes", "Notes.md"), "---\ntitle: Kept\ntype: document\n---\nkeep me\n");
+    const listed: string[] = [];
+    let stats = 0;
+    const storage = ctx.storage as any;
+    const list = storage.vaultEntryNames.bind(storage);
+    storage.vaultEntryNames = (d: string) => (listed.push(d), list(d));
+    const has = storage.hasVaultFile.bind(storage);
+    storage.hasVaultFile = (p: string) => (stats++, has(p));
+
+    const staged = await api.run<ImportResult>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/notes.md", content: "# Newcomer\n" },
+          { path: "nodes/other.md", content: "# Other\n" },
+          { path: "nodes/sub/a.md", content: "# A\n" },
+          { path: "nodes/sub/b.md", content: "# B\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(staged.failed).toEqual([]);
+    expect(stats).toBe(0);
+    expect(listed.filter((d) => d === "nodes")).toHaveLength(1);
+    expect(listed.filter((d) => d === "nodes/sub")).toHaveLength(1);
+    expect(await readFile(join(dir, "nodes", "notes-2.md"), "utf-8")).toContain("# Newcomer");
+    expect(await readFile(join(dir, "nodes", "Notes.md"), "utf-8")).toContain("keep me");
+  });
+
+  // CU-wdqcpzx8ya: a diff rebuilds the previous version first, a round trip per
+  // artifact on a network mount; an import's one-off version skips that.
+  it("stores an import's version as a keyframe; an ids-only publish keeps a diff", async () => {
+    const api = createEngineApi();
+    const doc = (body: string) => `---\ntitle: Notes\ntype: document\nstatus: published\n---\n${body}\n`;
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v1"));
+    await api.run("context_import", { ids: ["nodes/notes"] }, ctx); // v1 (first version: keyframe)
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v2"));
+    await api.run("context_import", { ids: ["nodes/notes"] }, ctx); // v2: ids-only keeps a diff
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v3"));
+    await api.run("context_import", { discover: true }, ctx); // v3: import → keyframe
+
+    const versions = (await ctx.storage.readHistory("nodes/notes"))!.versions;
+    expect(versions.map((v) => [v.version, !!v.keyframe])).toEqual([
+      [1, true],
+      [2, false],
+      [3, true],
+    ]);
+    expect((await ctx.storage.verifyVaultIntegrity()).valid).toBe(true);
+  });
+
   it("sanitizes documents the caller wrote into the vault itself before discover", async () => {
     // A folder importer that writes files directly (no files[] call) and only
     // asks the engine to discover: the frontmatter still gets cleaned, for
