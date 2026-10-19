@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ afterAll(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  rmSync(SANDBOX, { recursive: true, force: true });
 });
 const env = () => ({ CLAUDE_PROJECT_DIR: SANDBOX });
 
@@ -139,6 +140,65 @@ describe("antigravity adapter", () => {
     expect(systemText(delivered)).toMatch(/capture pass was queued/);
   });
 
+  it("Stop: a capture job joins a sweep report parked on the last step instead of replacing it", () => {
+    const ledgerIo = fakeLedgerIo();
+    const exec = fakeExec([
+      ["vault list", [{ alias: "eng", exists: true }]],
+      ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+      ["history nodes/a --json --vault eng", { versions: [{ version: 1 }, { version: 2 }] }],
+      ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+      [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/pitch" }]],
+      ["read nodes/pitch --raw --vault eng", "---\nt: x\n---\nWe brag about Redis speed."],
+    ]);
+    const toolCall = { name: "run_command", args: { CommandLine: "ctx --vault eng update nodes/a --body x" } };
+    run("PostToolUse", { input: { conversationId: "c5", toolCall }, env: env(), exec, ledgerIo });
+    const path = transcript([user("remember this: sessions moved to Postgres"), step]);
+    run("Stop", { input: { conversationId: "c5", transcriptPath: path }, env: env(), exec: fakeExec([]), ledgerIo });
+
+    const next = transcript([user("remember this: sessions moved to Postgres"), step, user("ok")]);
+    const text = systemText(
+      run("PreInvocation", { input: { conversationId: "c5", transcriptPath: next }, env: env(), exec: fakeExec([]), ledgerIo }),
+    );
+    expect(text).toContain('eng:nodes/pitch still contains "redis"');
+    expect(text).toMatch(/capture pass was queued/);
+  });
+
+  it("structured content: only text parts reach search; no text means no search", () => {
+    const calls: string[] = [];
+    const parts = { type: "USER_INPUT", content: [{ text: "auth flow" }, { image: "x.png" }] };
+    run("PreInvocation", {
+      input: { conversationId: "c6", transcriptPath: transcript([parts]) },
+      env: env(),
+      exec: fakeExec([], calls),
+      ledgerIo: fakeLedgerIo(),
+    });
+    expect(calls.some((c) => c.startsWith("search auth flow --json"))).toBe(true);
+
+    const imageOnly = { type: "USER_INPUT", content: [{ image: "x.png" }] };
+    const none: string[] = [];
+    run("PreInvocation", {
+      input: { conversationId: "c6", transcriptPath: transcript([imageOnly]) },
+      env: env(),
+      exec: fakeExec([], none),
+      ledgerIo: fakeLedgerIo(),
+    });
+    expect(none).toEqual([]);
+  });
+
+  it("PreInvocation: a missing or garbage transcript injects nothing", () => {
+    const garbage = join(mkdtempSync(join(SANDBOX, "tx-")), "transcript.jsonl");
+    writeFileSync(garbage, "not json\n{broken");
+    for (const transcriptPath of [undefined, join(SANDBOX, "nope.jsonl"), garbage]) {
+      const out = run("PreInvocation", {
+        input: { conversationId: "c7", transcriptPath },
+        env: env(),
+        exec: fakeExec([]),
+        ledgerIo: fakeLedgerIo(),
+      });
+      expect(out).toEqual({});
+    }
+  });
+
   it("readTranscript counts Antigravity user records as turns; lastRecord reads the tail", () => {
     const path = transcript([user("a"), step, user("b"), step]);
     expect(readTranscript(path).userTurns).toBe(2);
@@ -146,13 +206,15 @@ describe("antigravity adapter", () => {
     expect(lastRecord(undefined)).toBeNull();
   });
 
-  it("Stop shell answers with the required decision even on empty stdin", () => {
-    const stdout = execFileSync("node", [join(pluginDir, "hooks", "antigravity.js"), "Stop"], {
-      input: "",
-      env: { ...process.env, HOME: SANDBOX, USERPROFILE: SANDBOX, CLAUDE_PROJECT_DIR: SANDBOX },
-      encoding: "utf-8",
-    });
-    expect(JSON.parse(stdout)).toEqual({ decision: "stop" });
+  it("Stop shell answers with the required decision on empty or malformed stdin", () => {
+    for (const input of ["", "{not json"]) {
+      const stdout = execFileSync("node", [join(pluginDir, "hooks", "antigravity.js"), "Stop"], {
+        input,
+        env: { ...process.env, HOME: SANDBOX, USERPROFILE: SANDBOX, CLAUDE_PROJECT_DIR: SANDBOX },
+        encoding: "utf-8",
+      });
+      expect(JSON.parse(stdout), input).toEqual({ decision: "stop" });
+    }
   });
 
   it("hooks.json: every command runs the adapter with a handled event, no shell-only syntax", () => {

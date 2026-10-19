@@ -29,8 +29,15 @@ import { run as captureGate } from "../core/capture-gate.js";
 // raw, so the ambient (non-explicit) capture heuristic may under-fire until the
 // assistant/tool record types are mapped too.
 function userText(record) {
-  if (record?.type !== "USER_INPUT" || record.content == null) return "";
-  return typeof record.content === "string" ? record.content : JSON.stringify(record.content);
+  if (record?.type !== "USER_INPUT") return "";
+  const { content } = record;
+  if (typeof content === "string") return content.trim();
+  // Structured content: keep the text parts only — raw JSON is noise to search and the gate.
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((p) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
 }
 
 /** Last JSONL record of a file, reading only its tail. */
@@ -56,19 +63,29 @@ export function lastRecord(path, tailBytes = 256 * 1024) {
 export function readTranscript(path, maxLines = 200) {
   if (!path) return { lines: [], userTurns: 0 };
   try {
+    let userTurns = 0;
     const all = readFileSync(path, "utf-8")
       .split(/\r?\n/)
       .filter((l) => l.trim())
       .map((line) => {
         const text = userText(safeJson(line, null));
-        return text ? JSON.stringify({ type: "user", message: { role: "user", content: text } }) : line;
+        if (!text) return line;
+        userTurns++;
+        return JSON.stringify({ type: "user", message: { role: "user", content: text } });
       });
-    const userTurns = all.filter((l) => l.startsWith('{"type":"user"')).length;
     return { lines: all.slice(-maxLines), userTurns };
   } catch {
     return { lines: [], userTurns: 0 };
   }
 }
+
+/** Both jobs' directives in one slot. Keeps a known turn, so the capture gate's per-turn dedupe still holds. */
+const joinJobs = (older, newer) => ({
+  kind: newer.kind,
+  reason: `${older.reason}\n\n${newer.reason}`,
+  turn: newer.turn ?? older.turn,
+  seeds: newer.seeds?.length ? newer.seeds : older.seeds,
+});
 
 const inject = (text) => (text ? { injectSteps: [{ systemMessage: text }] } : {});
 const contextOf = (out) => out?.hookSpecificOutput?.additionalContext;
@@ -106,29 +123,26 @@ export function run(event, { input, env, exec, ledgerIo = {} }) {
     if (report) {
       // Join any job already waiting rather than replace it: the slot holds one.
       const ledger = loadLedger(sessionId, ledgerIo);
-      const prior = ledger.pending;
-      parkJob(
-        sessionId,
-        ledger,
-        {
-          kind: prior?.kind ?? "change",
-          reason: [prior?.reason, report].filter(Boolean).join("\n\n"),
-          turn: prior?.turn ?? null,
-          seeds: prior?.seeds ?? [],
-        },
-        ledgerIo,
-      );
+      const job = { kind: "change", reason: report, turn: null, seeds: [] };
+      parkJob(sessionId, ledger, ledger.pending ? joinJobs(ledger.pending, job) : job, ledgerIo);
     }
     return {};
   }
 
   if (event === "Stop") {
+    // The capture gate's parkJob replaces the slot; a sweep report parked by a
+    // last-step `ctx update` (no PreInvocation since) must survive it.
+    const parked = loadLedger(sessionId, ledgerIo).pending;
     captureGate({
       input: { transcript_path: input?.transcriptPath, session_id: sessionId },
       env,
       readTranscript,
       ledgerIo,
     });
+    const ledger = loadLedger(sessionId, ledgerIo);
+    if (parked && ledger.pending && ledger.pending.reason !== parked.reason) {
+      parkJob(sessionId, ledger, joinJobs(parked, ledger.pending), ledgerIo);
+    }
     // `decision` is required; anything but "continue" lets the agent stop.
     return { decision: "stop" };
   }
