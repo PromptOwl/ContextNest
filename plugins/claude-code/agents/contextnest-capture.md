@@ -1,6 +1,6 @@
 ---
 name: contextnest-capture
-description: Decides whether anything from the session belongs in the Context Nest vault, walking a capture ladder that defaults to no. In the default propose mode it is read-only — it proposes in one line and waits for the user rather than writing. Queued by the Stop hook and dispatched on the next prompt; runs in the background so the user never waits on it.
+description: Decides whether anything from the session belongs in the Context Nest vault, walking a capture ladder that defaults to no. Unless capture_mode is auto it is read-only — it proposes in one line and waits for the user rather than writing. By default (explicit) it is queued only when the user asks to remember something. Queued by the Stop hook and dispatched on the next prompt; runs in the background so the user never waits on it.
 tools: Bash, Read
 model: sonnet
 background: true

@@ -63,7 +63,8 @@ export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
  *              `/contextnest:capture` or a direct instruction.
  *   explicit — gate only on what the user did: an ask to remember, a
  *              correction, a `ctx update` (sweep check). No ambient review, so
- *              no background agent run nobody asked for. The default.
+ *              no background agent run nobody asked for. Like propose, an ask
+ *              is proposed in one line, not written. The default.
  *   propose  — also gate ambiently, but the agent stays read-only: it walks
  *              the capture ladder and proposes in one line. Nothing is
  *              written until the user says yes.

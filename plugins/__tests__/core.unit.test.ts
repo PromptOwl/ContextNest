@@ -1255,6 +1255,24 @@ describe("sweep-check", () => {
     expect(text).toMatch(/contextnest-curator/);
   });
 
+  it("run: the sweep check runs under explicit capture, and only off silences it", () => {
+    const sweep = (mode: string) =>
+      sweepCheck({
+        input: { tool_input: { command: "ctx update nodes/a --vault eng --body whatever" } },
+        env: { CONTEXTNEST_CAPTURE_MODE: mode },
+        exec: fakeExec([
+          ["vault list", [{ alias: "eng", exists: true }]],
+          ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+          ["history nodes/a --json --vault eng", { versions: [{ version: 1 }, { version: 2 }] }],
+          ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+          [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/b" }]],
+          ["read nodes/b --raw --vault eng", "---\nt: x\n---\nRedis everywhere."],
+        ]),
+      });
+    expect(sweep("explicit")?.hookSpecificOutput?.additionalContext).toContain('eng:nodes/b still contains "redis"');
+    expect(sweep("off")).toBeNull();
+  });
+
   it("run: a held update (review on) is not diffed — its last two versions are an older edit", () => {
     const routes: [string, unknown][] = [
       ["vault list", [{ alias: "eng", exists: true }]],

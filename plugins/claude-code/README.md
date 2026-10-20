@@ -44,7 +44,7 @@ On enable you'll be prompted for the settings below (all optional):
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | **Retrieval effort** | `search` | `off` · `search` (cheap) · `query` (graph) · `agent` (full reasoning) |
-| **Capture behaviour** | `explicit` | `off` (never on its own) · `explicit` (only when you ask or correct something) · `propose` (also reviews turns, writes once you agree) · `auto` (write unattended) |
+| **Capture behaviour** | `explicit` | `off` (never on its own) · `explicit` (only when you ask or correct something; proposes, writes once you agree) · `propose` (also reviews turns, writes once you agree) · `auto` (write unattended) |
 | **When the nest for a new note is unclear** | `ask` | `ask` (capture asks which nest) · `default` (write to the pinned vault, else the registry default) |
 | **Pinned vault** | _(empty)_ | A registered vault alias, or `<server>/<nest>`. Empty → the agents pick the relevant vault(s) automatically |
 | **ctx binary** | `ctx` | Override the CLI command |
