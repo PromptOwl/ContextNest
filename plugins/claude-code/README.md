@@ -3,7 +3,7 @@
 Makes any Claude Code session **vault-aware** and **self-maintaining**:
 
 - **Auto-retrieval** — a `UserPromptSubmit` hook pulls relevant vault material into each prompt (effort-toggled), so Claude answers from your governed knowledge base.
-- **Deliberate capture** — a `Stop` hook queues a capture agent, but only on a real signal (you asked, or you corrected something, or the session has run on past a cooldown). By default that agent *proposes* in one line and writes nothing until you agree.
+- **Deliberate capture** — a `Stop` hook queues a capture agent, but only on a real signal (you asked, or you corrected something, or the session has run on past a cooldown). By default (`explicit`) only your own asks and corrections queue it — the ambient review, a background agent run of roughly 25k tokens, is opt-in via `propose`, where the agent *proposes* in one line and writes nothing until you agree.
 - **Never in your way** — the `Stop` hook never blocks the end of a turn. It parks the job and notes it in the transcript; your next message dispatches it to a background agent that works alongside whatever you asked for next.
 - **Consistent corrections** — when you change something the nests record, the retriever scouts an occurrence map across every candidate nest and curator agents fan out in parallel over it — as many as the work needs — so the change lands everywhere, not in the first search hit. A `PostToolUse` sweep-check backstops it mechanically: after any `ctx update` it diffs the node against its previous version and reports every node, in every nest, still carrying the removed value. That check keys on the *write*, so it works no matter how the request was phrased. Nodes carry **entity tags** for the concrete values they assert, so the sweep also does exact tag-index lookups — catching nodes that paraphrase a fact, which no text search can.
 - **Session overview** — a `SessionStart` hook injects a compact list of your vaults.
@@ -44,7 +44,7 @@ On enable you'll be prompted for the settings below (all optional):
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | **Retrieval effort** | `search` | `off` · `search` (cheap) · `query` (graph) · `agent` (full reasoning) |
-| **Capture behaviour** | `propose` | `off` (never on its own) · `propose` (propose, write once you agree) · `auto` (write unattended) |
+| **Capture behaviour** | `explicit` | `off` (never on its own) · `explicit` (only when you ask or correct something) · `propose` (also reviews turns, writes once you agree) · `auto` (write unattended) |
 | **When the nest for a new note is unclear** | `ask` | `ask` (capture asks which nest) · `default` (write to the pinned vault, else the registry default) |
 | **Pinned vault** | _(empty)_ | A registered vault alias, or `<server>/<nest>`. Empty → the agents pick the relevant vault(s) automatically |
 | **ctx binary** | `ctx` | Override the CLI command |

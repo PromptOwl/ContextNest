@@ -161,7 +161,7 @@ describe("getConfig", () => {
   it("defaults and Claude userConfig precedence", () => {
     expect(cfg({}).retrievalMode).toBe("search");
     expect(cfg({}).autoCapture).toBe(true);
-    expect(cfg({}).captureMode).toBe("propose");
+    expect(cfg({}).captureMode).toBe("explicit");
     expect(cfg({}).vault).toBe("");
     expect(cfg({}).ctxCommand).toBe("ctx");
 
@@ -230,8 +230,8 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
   });
 
   describe("capture_mode supersedes the legacy auto_capture boolean", () => {
-    it("defaults to propose, and the legacy boolean maps onto off/propose", () => {
-      expect(getConfig({}, tempSettings()).captureMode).toBe("propose");
+    it("defaults to explicit, and the legacy boolean maps onto off/propose", () => {
+      expect(getConfig({}, tempSettings()).captureMode).toBe("explicit");
       expect(getConfig(enableTimeEnv, tempSettings()).captureMode).toBe("propose");
       expect(
         getConfig({ CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE: "false" }, tempSettings()).captureMode,
@@ -255,7 +255,7 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
     it("a bogus mode is skipped per layer and cannot mask a valid lower one", () => {
       const opts = tempSettings({ capture_mode: "aggressive" }, { capture_mode: "auto" });
       expect(getConfig({}, opts).captureMode).toBe("auto");
-      expect(getConfig({}, tempSettings({ capture_mode: "aggressive" })).captureMode).toBe("propose");
+      expect(getConfig({}, tempSettings({ capture_mode: "aggressive" })).captureMode).toBe("explicit");
     });
 
     it("normalizes whitespace and casing before validating", () => {
@@ -1510,6 +1510,17 @@ describe("capture-gate", () => {
     ).toMatch(/persist/);
   });
 
+  it("explicit mode (the default) never gates ambiently, but still gates an ask and a correction", () => {
+    const ambient = [userLine("go on"), '{"role":"assistant","content":[{"tool_use":1}]}'];
+    const stop = (lines: string[], env: Record<string, string>) =>
+      captureGate({ input: { transcript_path: "t", session_id: "s1" }, env, readTranscript: tx(lines, 50), ledgerIo: fakeLedgerIo() });
+    for (const env of [{}, { CONTEXTNEST_CAPTURE_MODE: "explicit" }, { CONTEXTNEST_CAPTURE_MODE: "explicit", CONTEXTNEST_CAPTURE_ALWAYS: "1" }]) {
+      expect(stop(ambient, env)).toBeNull();
+      expect(stop([userLine("remember that we deploy on Fridays")], env)?.systemMessage).toMatch(/capture/i);
+      expect(stop([userLine("actually it's Postgres not Redis")], env)?.systemMessage).toMatch(/sweep/i);
+    }
+  });
+
   it("an ambient gate stamps the cooldown, and the next one is suppressed", () => {
     const io = fakeLedgerIo();
     const lines = [userLine("go on"), '{"role":"assistant","content":[{"tool_use":1}]}'];
@@ -1518,7 +1529,7 @@ describe("capture-gate", () => {
     // Far enough past the default cooldown that the first ambient pass fires.
     const first = captureGate({
       input,
-      env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5" },
+      env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5", CONTEXTNEST_CAPTURE_MODE: "propose" },
       readTranscript: tx(lines, 20),
       ledgerIo: io,
     });
@@ -1529,7 +1540,7 @@ describe("capture-gate", () => {
     expect(
       captureGate({
         input,
-        env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5" },
+        env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5", CONTEXTNEST_CAPTURE_MODE: "propose" },
         readTranscript: tx(lines, 21),
         ledgerIo: io,
       }),
@@ -1556,7 +1567,7 @@ describe("capture-gate", () => {
     saveLedger("s1", { lastGatedTurn: 20, captured: [] }, io);
     const out = captureGate({
       input: { transcript_path: "t", session_id: "s1" },
-      env: { CONTEXTNEST_CAPTURE_ALWAYS: "1" },
+      env: { CONTEXTNEST_CAPTURE_ALWAYS: "1", CONTEXTNEST_CAPTURE_MODE: "propose" },
       readTranscript: tx([userLine("hi")], 21),
       ledgerIo: io,
     });

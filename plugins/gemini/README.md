@@ -54,7 +54,7 @@ The adapter respects the standard ContextNest environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `CONTEXTNEST_RETRIEVAL_MODE` | `search` | Auto-retrieval effort: `off` \| `search` \| `query` \| `agent` |
-| `CONTEXTNEST_CAPTURE_MODE` | `propose` | Capture policy: `off` \| `propose` \| `auto` |
+| `CONTEXTNEST_CAPTURE_MODE` | `explicit` | Capture policy: `off` \| `explicit` \| `propose` \| `auto` |
 | `CONTEXTNEST_VAULT_ALIAS` | _(none)_ | Pinned vault alias (note: `_ALIAS`, not `CONTEXTNEST_VAULT`, which the CLI reads) |
 | `CONTEXTNEST_UNCLEAR_NEST` | `ask` | When no nest clearly fits a new note: `ask` \| `default` |
 | `CONTEXTNEST_CTX_COMMAND` | `ctx` | Path or name of the ContextNest CLI binary |

@@ -59,16 +59,19 @@ export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
 
 /**
  * The only accepted capture_mode values, in ascending order of autonomy:
- *   off     — never gate the stop; the vault is only written via an explicit
- *             `/contextnest:capture` or a direct instruction.
- *   propose — gate on a real signal, but the agent stays read-only: it walks
- *             the capture ladder and proposes in one line. Nothing is written
- *             until the user says yes. The default.
- *   auto    — write unattended, still behind the ladder and the cooldown.
+ *   off      — never gate the stop; the vault is only written via an explicit
+ *              `/contextnest:capture` or a direct instruction.
+ *   explicit — gate only on what the user did: an ask to remember, a
+ *              correction, a `ctx update` (sweep check). No ambient review, so
+ *              no background agent run nobody asked for. The default.
+ *   propose  — also gate ambiently, but the agent stays read-only: it walks
+ *              the capture ladder and proposes in one line. Nothing is
+ *              written until the user says yes.
+ *   auto     — write unattended, still behind the ladder and the cooldown.
  * Same validation contract as VALID_RETRIEVAL_MODES: anything else is treated
  * as if the key were absent, so a typo can never silently raise autonomy.
  */
-export const VALID_CAPTURE_MODES = ["off", "propose", "auto"];
+export const VALID_CAPTURE_MODES = ["off", "explicit", "propose", "auto"];
 
 /**
  * What capture does when no nest's description clearly fits a new node:
@@ -219,14 +222,12 @@ export function getConfig(env = process.env, opts = {}) {
     // Effective capture behaviour. An explicit capture_mode wins; otherwise the
     // legacy boolean maps onto the two modes it could express (true was never
     // "write without asking" as a *choice*, it was just "on", so it lands on
-    // the safer of the two). Absent both → the propose default.
+    // the safer of the two). Absent both → explicit: an ambient review is a
+    // background agent run (~25k tokens), so nobody gets one unasked — while
+    // asks, corrections and the sweep check still work.
     captureMode:
       rawCaptureMode ??
-      (rawAuto === undefined
-        ? "propose"
-        : TRUTHY_VALUES.includes(rawAuto)
-          ? "propose"
-          : "off"),
+      (rawAuto === undefined ? "explicit" : TRUTHY_VALUES.includes(rawAuto) ? "propose" : "off"),
     unclearNest:
       pick(
         "unclear_nest",
