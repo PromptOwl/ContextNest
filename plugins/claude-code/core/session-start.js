@@ -106,9 +106,12 @@ export function run({ env, exec }) {
   const target = config.vault && pinnedIsRegistered ? { alias: config.vault } : local;
   if (target) lines.push(...structureLines(exec, withVault(["structure", "--json"], target.alias)));
 
-  lines.push(
-    "Query the vault before answering domain questions (`ctx query`/`/contextnest:recall`); cite nodes as `vault:id`.",
-  );
+  // Nothing connected: the setup hint is the whole message.
+  if (vaults.length > 0 || local) {
+    lines.push(
+      "Query the vault before answering domain questions (`ctx query`/`/contextnest:recall`); cite nodes as `vault:id`.",
+    );
+  }
 
   return wrap(lines.join("\n"));
 }

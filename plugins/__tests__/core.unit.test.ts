@@ -816,6 +816,7 @@ describe("session-start", () => {
     const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
     expect(additional(out)).toMatch(/No vaults are registered/i);
     expect(additional(out)).toContain("/contextnest:setup");
+    expect(additional(out)).not.toMatch(/Query the vault/);
   });
 
   it("does not offer setup once a vault is registered", () => {

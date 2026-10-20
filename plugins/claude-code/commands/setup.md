@@ -34,12 +34,13 @@ Check all three, quietly:
 2. Tell the user, in one short message: run `/mcp`, pick **contextnest**, choose **Authenticate**, and approve in the browser. If `contextnest` does not show in `/mcp`, restart Claude Code first.
 3. Stop here and wait. Once they say it worked, go to Step 4. If `/mcp` offers no **Authenticate** or the sign-in fails, the server has browser sign-in turned off — remove the `contextnest` entry you added (`claude mcp remove contextnest --scope user`) and offer the local CLI path instead.
 4. The sign-in may grant read access only. If a write is later refused for a missing scope, say so plainly and offer the local CLI path for writing.
+5. No CLI on this machine → the plugin's retrieval and capture hooks cannot run and would only slow every prompt. Set `"retrieval_mode": "off"` and `"capture_mode": "off"` in `~/.contextnest/plugin-settings.json` (merge, keep other keys) and tell the user why: in this mode you use the nest's MCP tools directly.
 
 ## Step 3b — local CLI
 
 1. No CLI at all → offer `npm i -g @promptowl/contextnest-cli` (needs Node ≥ 20; installs to the user's npm prefix, no admin rights). If it fails, offer the cloud path instead of debugging the machine.
 2. Sign in and register the server as one alias covering every nest: `<ctx> login <server> --as promptowl` — add `--set-default` only when `vault list` showed no default. If `promptowl` is taken, pick another alias; never pass `--force`. The command opens the browser and waits for approval: run it with a long timeout (10 min) and tell the user to approve the page that opened. On a server without browser login it asks for a pasted key — tell the user to create one in the server's web UI (Connect) and run `! <ctx> login <server> --as promptowl --key-stdin` themselves, so the key never passes through you.
-3. Confirm with `<ctx> vault list --json`: each nest shows as `promptowl/<nest>`.
+3. Confirm with `<ctx> vault list --json`: each nest shows as `promptowl/<nest>`. If `~/.contextnest/plugin-settings.json` has `retrieval_mode` or `capture_mode` set to `off` from an earlier cloud setup, ask whether to turn them back on (`search` / `propose`).
 4. More than one nest → ask with `AskUserQuestion` whether to pin one (each nest as an option, labelled with its description, plus **Don't pin — choose per question**). Pinning writes `vault` the way `/contextnest:config` does.
 
 ## Step 4 — learn the nest, then prove it works

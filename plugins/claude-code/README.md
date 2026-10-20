@@ -24,7 +24,7 @@ Connecting uploads nothing. A local vault stays on your machine unless you run `
 
 ## Requirements
 
-The auto-retrieval and capture hooks need the Context Nest CLI (the cloud path works without it, through the nest's MCP tools). Either install it globally:
+The hooks run on Node ≥ 20; on a machine without Node they fail on every event, so use the nest's MCP server on its own there. The auto-retrieval and capture hooks need the Context Nest CLI (the cloud path works without it, through the nest's MCP tools, and setup turns those hooks off). Either install it globally:
 
 ```bash
 npm i -g @promptowl/contextnest-cli
