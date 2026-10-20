@@ -37,3 +37,4 @@ Hook messages are shared with the Claude Code plugin and name its agents. Here, 
 - `contextnest-capture` agent → `contextnest-capture` skill
 - `contextnest-retriever` agent → `contextnest-recall` skill
 - `contextnest-curator` agent → `contextnest-curate` skill
+- `/contextnest:setup` command → `contextnest-setup` skill

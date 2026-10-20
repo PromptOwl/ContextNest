@@ -21,6 +21,7 @@ Makes any Antigravity or Gemini session **vault-aware** (effort-toggled auto-ret
    - `contextnest-capture`: Governed knowledge capture adhering to structure rules.
    - `contextnest-curate`: Multi-vault fact updates, entity tag sweeps, and refiling.
    - `contextnest-structure`: Inspection of folder taxonomies and template scaffolding.
+   - `contextnest-setup`: Guided first connection — PromptOwl cloud (MCP + browser sign-in, no install), a company server, or a private local vault — plus how much runs on its own (Light / On demand / Hands-free). Offered automatically when no nest is connected; never replaces an existing setup.
 6. **Operating Rules (`rules/contextnest.md`):**
    - Automatic guidance loaded by Antigravity covering vault citation rules (`vault:id`), review SLA escalation ladders, and edit-and-approve safeguards.
 
@@ -42,7 +43,8 @@ plugins/gemini/
     ├── contextnest-recall/        # Deep vault retrieval skill
     ├── contextnest-capture/       # Governed capture skill
     ├── contextnest-curate/        # Vault fact curation skill
-    └── contextnest-structure/     # Structure rules inspection skill
+    ├── contextnest-structure/     # Structure rules inspection skill
+    └── contextnest-setup/         # Guided first-connection skill
 ```
 
 ---
