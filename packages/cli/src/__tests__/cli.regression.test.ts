@@ -838,6 +838,34 @@ describe("[regression] ctx update", () => {
     expect(onDisk).toMatch(/Revised body/);
   });
 
+  it("--body-file - takes the body from stdin, and read --body round-trips it unchanged", () => {
+    const body = 'Line with "quotes", $HOME and `ticks`\r\n\nSecond paragraph';
+    const pipe = (args: string[], input?: string) =>
+      execFileSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    pipe(["update", "nodes/mutable", "--body-file", "-"], `${body}\n`);
+    const first = pipe(["read", "nodes/mutable", "--body"]);
+    expect(first).toContain('"quotes", $HOME and `ticks`');
+    expect(first).toContain("Second paragraph");
+    // Two read → update cycles must not grow or alter the body.
+    pipe(["update", "nodes/mutable", "--body-file", "-"], first);
+    pipe(["update", "nodes/mutable", "--body-file", "-"], pipe(["read", "nodes/mutable", "--body"]));
+    expect(pipe(["read", "nodes/mutable", "--body"])).toBe(first);
+  });
+
+  it("refuses an empty body unless --force, and --body with --body-file", () => {
+    const run = (args: string[], input?: string) =>
+      spawnSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    for (const r of [
+      run(["update", "nodes/mutable", "--body", ""]),
+      run(["update", "nodes/mutable", "--body-file", "-"], "\n"),
+    ]) {
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/empty one/);
+    }
+    expect(run(["update", "nodes/mutable", "--body", "x", "--body-file", "-"], "y").stderr).toMatch(/not both/);
+    expect(run(["update", "nodes/mutable", "--body", "", "--force"]).status).toBe(0);
+  });
+
   it("a title change is persisted to the frontmatter", () => {
     runCtx(tmp, ["update", "nodes/mutable", "--title", "Renamed"]);
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");

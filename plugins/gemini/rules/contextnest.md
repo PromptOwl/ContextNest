@@ -30,7 +30,7 @@ ContextNest is the authoritative context and memory governance layer for this wo
 
 ## 5. Capture & Curation
 - Apply the capture ladder: only capture material that has a verifiable source, a clear headline, and a "why it matters" explanation.
-- For corrections to existing knowledge, update the existing node (`ctx update <id> --body ...`) rather than creating duplicates.
+- For corrections to existing knowledge, update the existing node (`ctx update <id> --body-file -` with the whole body on stdin) rather than creating duplicates.
 
 ## 6. Hook Directives
 Hook messages are shared with the Claude Code plugin and name its agents. Here, run the matching skill inline after answering the user's request:
