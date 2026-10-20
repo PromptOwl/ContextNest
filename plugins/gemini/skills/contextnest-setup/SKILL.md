@@ -9,7 +9,9 @@ Walk the user from "plugin installed" to "nest connected and the agent knows how
 
 Say this once, before connecting anything: **connecting uploads nothing.** Notes in a local vault stay on this machine unless the user runs `ctx push`; only what is written to a hosted nest lives on that server.
 
-A server URL (`<server>`) is accepted only as a plain `https://host[:port][/path]` (`http://` only for localhost/127.0.0.1) with no spaces, quotes or shell characters; otherwise say why and stop. Always pass it to commands in double quotes.
+A server URL (`<server>`) is accepted only as a plain `https://host[:port][/path]` (`http://` only for localhost/127.0.0.1) made solely of the characters `A-Z a-z 0-9 . _ ~ : / -`; otherwise say why and stop. Always pass it to commands in double quotes.
+
+Paths below use `~` for the user's home folder (`%USERPROFILE%` on Windows).
 
 ## Step 1 — see what is already set up
 
@@ -26,7 +28,12 @@ Already connected → show a short summary and ask: done, connect another nest, 
 Ask all three in **one** message, numbered, with the recommended answer first, and accept a short reply (e.g. "1a 2a 3a", or "defaults"):
 
 1. **Where do your notes live?** a) PromptOwl cloud (recommended) → `https://nest.promptowl.ai` · b) only on this computer (private local vault) · c) a company server — reply with its URL.
-2. **How should the assistant use them?** a) **Light** (recommended) — looks up matching notes on each prompt, saves only when asked → `retrieval_mode: search`, `capture_mode: off` · b) **On demand** — cheapest, nothing runs in the background → `off` / `off` · c) **Hands-free** — also proposes notes worth keeping (a background review each time, roughly 25k tokens) → `search` / `propose`. Leave this question out when there is no usable CLI and the answer to 1 is not b — the hooks it configures need `ctx`.
+2. **How should the assistant use them?**
+   - a) **Light** (recommended) — looks up matching notes on each prompt, saves only when asked → `retrieval_mode: search`, `capture_mode: off`.
+   - b) **On demand** — cheapest, nothing runs in the background → `off` / `off`.
+   - c) **Hands-free** — also proposes notes worth keeping (a background review each time, roughly 25k tokens) → `search` / `propose`.
+
+   Leave this question out when there is no usable CLI and the answer to 1 is not b — the hooks it configures need `ctx`.
 3. **Apply to** a) all projects (recommended) · b) this project only. This scopes the plugin settings and the MCP entry; a `ctx` sign-in or a new local vault is still registered for the whole user account — say so when it applies.
 
 Then pick the path: 1b → Step 3c. A server and a CLI of 3.2.0 or later → Step 3b. A server and no usable CLI → Step 3a.
@@ -35,8 +42,8 @@ Then pick the path: 1b → Step 3c. A server and a CLI of 3.2.0 or later → Ste
 
 Tell the user what gets added, then:
 
-- **Gemini CLI:** `gemini mcp add --transport http --scope <user|project> contextnest "<server>/mcp"`, then tell the user to run `/mcp auth contextnest` and approve in the browser.
-- **Antigravity:** add `"contextnest": { "serverUrl": "<server>/mcp" }` under `mcpServers` in `~/.gemini/antigravity/mcp_config.json` (merge; keep every other server), then tell the user: Settings → Customizations → Refresh → **Authenticate** on contextnest.
+- **Gemini CLI:** `gemini mcp add --transport http --scope <user|project> contextnest "<server>/mcp"`, then tell the user to run `/mcp auth contextnest` and approve in the browser. If the command rejects a flag, check `gemini mcp add --help` and adapt — these flags are not confirmed for every version.
+- **Antigravity:** add `"contextnest": { "serverUrl": "<server>/mcp" }` under `mcpServers` in `~/.gemini/antigravity/mcp_config.json` (merge; keep every other server), then tell the user: Settings → Customizations → Refresh → **Authenticate** on contextnest. Copy the file to `mcp_config.json.bak` first; if it exists but is not valid JSON, stop and tell the user rather than rewriting it.
 
 If a server named `contextnest` already exists, ask before using another name. Wait for the user to confirm sign-in worked. If no sign-in is offered, remove only the entry you added and offer Step 3b.
 
@@ -52,7 +59,7 @@ Needs the CLI (as in 3b). Create `~/contextnest` (or a folder the user names; if
 
 ## Step 3d — apply the usage choice
 
-Write `retrieval_mode` and `capture_mode` (merge, keep other keys) to `~/.contextnest/plugin-settings.json` for all projects, or `.claude/contextnest.local.json` in the project root for this project only (the file name is shared with the Claude Code plugin; add it to `.gitignore`). With no CLI, write `off` / `off` and say why: the hooks need `ctx`, so you use the nest's MCP tools directly. On the cloud path with a CLI present, say the hooks cover only `ctx` vaults; this nest is reached through its MCP tools.
+Write `retrieval_mode` and `capture_mode` (merge, keep other keys) to `~/.contextnest/plugin-settings.json` for all projects, or `.claude/contextnest.local.json` in the project root for this project only (the path is shared with the Claude Code plugin, so a `.claude/` folder appearing in a Gemini-only project is expected; add the file to `.gitignore`). With no CLI, write `off` / `off` and say why: the hooks need `ctx`, so you use the nest's MCP tools directly. On the cloud path with a CLI present, say the hooks cover only `ctx` vaults; this nest is reached through its MCP tools.
 
 ## Step 4 — learn the nest, then prove it works
 
