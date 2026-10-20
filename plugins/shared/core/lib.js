@@ -31,6 +31,8 @@ export function winQuote(s) {
   return `"${str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
 }
 
+/** Default per-call `ctx` timeout for hooks, in ms (0 disables). See makeExec. */
+export const CTX_TIMEOUT_MS = 8000;
 /** Default cap on how many registered vaults the cheap tiers fan out across. */
 export const MAX_FANOUT_VAULTS = 5;
 /** Default cap on how many retrieval hits we inject. */
@@ -257,14 +259,25 @@ export function getConfig(env = process.env, opts = {}) {
  * The returned function has the injectable shape the run() handlers expect:
  *   exec(args: string[]) => { status, stdout, stderr }
  *
+ * Every call is capped at `CONTEXTNEST_CTX_TIMEOUT_MS` (default 8s). A hook
+ * runs on the user's prompt, so a hung `ctx` (remote fan-out, keyring, npx
+ * download) must cost one timeout, not one per call: after the first, the
+ * rest of this process's calls fail fast as if ctx were unavailable.
+ *
+ * `opts.timeout` raises the default for a hook that may legitimately run long
+ * (the sweep check); the env override still wins.
+ *
  * @param {ReturnType<typeof getConfig>} config
- * @param {{ cwd?: string, env?: NodeJS.ProcessEnv }} [opts]
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeout?: number }} [opts]
  */
 export function makeExec(config, opts = {}) {
   const cwd = opts.cwd || process.cwd();
   const env = opts.env || process.env;
+  const timeout = envInt(env, "CONTEXTNEST_CTX_TIMEOUT_MS", opts.timeout ?? CTX_TIMEOUT_MS);
+  let timedOut = false;
 
   const attempt = (cmd, args) => {
+    if (timedOut) return { status: 1, stdout: "", stderr: "", code: "ETIMEDOUT" };
     try {
       const stdout = execFileSync(
         WIN32 ? winQuote(cmd) : cmd,
@@ -280,10 +293,12 @@ export function makeExec(config, opts = {}) {
           // not ENOENT, so the npx fallback never fires either. Run through the
           // shell there; cmd.exe does no quoting of its own, hence winQuote.
           shell: WIN32,
+          ...(timeout > 0 ? { timeout } : {}),
         },
       );
       return { status: 0, stdout, stderr: "" };
     } catch (err) {
+      if (err.code === "ETIMEDOUT") timedOut = true;
       return {
         status: typeof err.status === "number" ? err.status : 1,
         stdout: err.stdout ? String(err.stdout) : "",
@@ -303,7 +318,7 @@ export function makeExec(config, opts = {}) {
   };
 }
 
-/** Positive-integer env override, or `fallback` when unset/invalid. */
+/** Non-negative integer env override, or `fallback` when unset/invalid. */
 export function envInt(env, name, fallback) {
   const raw = parseInt(env?.[name] || "", 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
@@ -539,14 +554,15 @@ export function readStdin(stream = process.stdin) {
  * must never break a session, so every error path is swallowed (to stderr only).
  *
  * @param {(ctx:{input:any, env:NodeJS.ProcessEnv, exec:Function}) => any|Promise<any>} run
+ * @param {{ timeout?: number }} [opts] per-call ctx timeout for this hook (see makeExec)
  */
-export async function runAsHook(run) {
+export async function runAsHook(run, opts = {}) {
   try {
     const raw = await readStdin();
     const input = raw ? safeJson(raw, {}) : {};
     const env = process.env;
     const config = getConfig(env);
-    const exec = makeExec(config, { cwd: input.cwd || process.cwd(), env });
+    const exec = makeExec(config, { cwd: input.cwd || process.cwd(), env, timeout: opts.timeout });
     const out = await run({ input, env, exec });
     if (out) process.stdout.write(JSON.stringify(out));
   } catch (err) {
