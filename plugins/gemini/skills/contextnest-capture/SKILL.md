@@ -9,14 +9,12 @@ Explicitly capture valuable knowledge, architectural decisions, or verified fact
 
 ## Steps
 
-1. **Verify the Capture Ladder:**
-   Before creating a node, verify:
+1. **Verify the Capture Ladder:** Before creating a node, verify:
    - Does this already exist in the vault? Run `ctx search "<keyword>" --json`. If so, update the existing node rather than duplicating.
    - Can this be stated with a clear title, a single-sentence headline, and a "why it matters" explanation?
    - Is the source verified?
 
-2. **Check Structure Rules:**
-   Check the destination folder's structure rules:
+2. **Check Structure Rules:** Check the destination folder's structure rules:
    ```bash
    ctx structure --folder <target-folder> --json
    ```
@@ -25,8 +23,7 @@ Explicitly capture valuable knowledge, architectural decisions, or verified fact
    - The file name / title matches the required format (e.g. kebab-case matching title).
    - Any required sections or frontmatter headers are included.
 
-3. **Write the Node:**
-   Create the node via the `ctx` CLI:
+3. **Write the Node:** Create the node via the `ctx` CLI:
    ```bash
    ctx add <id> --title "<Title>" --type <type> --tags "#tag1,#tag2" --body "..."
    ```
