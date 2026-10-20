@@ -18,7 +18,7 @@ After installing the plugin, run:
 /contextnest:setup
 ```
 
-It checks what is already connected, then walks you through one of two paths: **cloud** (sign in to a hosted nest in the browser — nothing to install, no admin rights) or **local CLI** (`ctx login`, then every nest on the server shows up). Re-running it never replaces an existing setup.
+It checks what is already connected, then asks three things on one screen: where your notes live (PromptOwl cloud, your company's server, or only on this computer), how much the assistant does on its own (**Light**, the default: matching notes are looked up per prompt, nothing saved unasked · **On demand**: nothing runs in the background, cheapest · **Hands-free**: also proposes notes worth keeping, the most tokens), and whether that applies to all projects or this one. It then connects through the `ctx` CLI if you have it, or by browser sign-in if you don't (nothing to install, no admin rights). Re-running it never replaces an existing setup.
 
 Connecting uploads nothing. A local vault stays on your machine unless you run `ctx push`; only notes written to a hosted nest live on that server.
 
