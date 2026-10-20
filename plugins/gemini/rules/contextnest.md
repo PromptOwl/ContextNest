@@ -24,8 +24,7 @@ ContextNest is the authoritative context and memory governance layer for this wo
 - Writes that violate structure rules are refused by the engine; never attempt to bypass a refused write.
 
 ## 4. Respect Review Gates & Separation of Duties
-- In vaults with review enabled (default for new vaults), writes are held for steward review:
-  `Held for review: ctx review approve <id>`
+- In vaults with review enabled (default for new vaults), writes are held for steward review: `Held for review: ctx review approve <id>`
 - Never pass `--publish` or attempt to self-approve a held write unless explicitly instructed by a designated owner.
 - An author cannot approve their own change unless the nest explicitly permits self-approval.
 
