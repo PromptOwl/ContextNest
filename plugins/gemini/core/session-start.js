@@ -118,8 +118,8 @@ export function run({ env, exec }) {
  * does NOT do, because "register a nest" read as "upload my vault".
  */
 const SETUP_HINT =
-  "If the user's Context Nest MCP tools are not connected either, offer `/contextnest:setup` — " +
-  "it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
+  "If the user's Context Nest MCP tools are not connected either, offer the guided setup " +
+  "(Claude Code: `/contextnest:setup`) — it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
   "Connecting uploads nothing: local files stay on this machine unless the user runs `ctx push`.";
 
 /** Folder rules shown before eliding the rest to `ctx structure`. */

@@ -16,8 +16,8 @@ Say this once, before connecting anything: **connecting uploads nothing.** Notes
 Check all three, quietly:
 
 1. **MCP** — are tools from a Context Nest MCP server already available to you in this session (e.g. `nest_index`, `context_search`)?
-2. **CLI** — run `ctx --version`. Not found → `npx -y @promptowl/contextnest-cli --version`. Use whichever works as `<ctx>` from here on; neither → no CLI.
-3. **Vaults** — with a CLI, run `<ctx> vault list --json` and `<ctx> login --list`.
+2. **CLI** — run `ctx --version`. Not found → `npx -y @promptowl/contextnest-cli --version`. Use whichever works as `<ctx>` from here on; neither → no CLI. A version below 3.2.0 has no `login` command: treat it as too old for Step 3b and offer `npm i -g @promptowl/contextnest-cli@latest`, or use `npx -y @promptowl/contextnest-cli@latest` as `<ctx>` instead.
+3. **Vaults** — with a CLI, run `<ctx> vault list --json`, and `<ctx> login --list` when the CLI has `login`.
 
 **Already connected** (MCP tools present, or at least one registered vault): show a short summary (what is connected, which vault is default/pinned) and ask with `AskUserQuestion`: **Done** · **Connect another nest** (continue at Step 2) · **Pin a vault** (hand over to `/contextnest:config vault`). Never remove, replace, or re-default anything that already exists.
 
@@ -31,8 +31,9 @@ Check all three, quietly:
 ## Step 3a — cloud (MCP + browser sign-in)
 
 1. Run `claude mcp add --transport http --scope user contextnest <server>/mcp`. If a server named `contextnest` already exists, ask before using another name — never remove the existing one.
-2. Tell the user, in one short message: run `/mcp`, pick **contextnest**, choose **Authenticate**, and approve in the browser — **including write access**, or the agent can read but never save notes. If `contextnest` does not show in `/mcp`, restart Claude Code first.
-3. Stop here and wait. Once they say it worked, go to Step 4.
+2. Tell the user, in one short message: run `/mcp`, pick **contextnest**, choose **Authenticate**, and approve in the browser. If `contextnest` does not show in `/mcp`, restart Claude Code first.
+3. Stop here and wait. Once they say it worked, go to Step 4. If `/mcp` offers no **Authenticate** or the sign-in fails, the server has browser sign-in turned off — remove the `contextnest` entry you added (`claude mcp remove contextnest --scope user`) and offer the local CLI path instead.
+4. The sign-in may grant read access only. If a write is later refused for a missing scope, say so plainly and offer the local CLI path for writing.
 
 ## Step 3b — local CLI
 
