@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
+
+Guided onboarding: install the plugin, run `/contextnest:setup`, and it connects you — no copy-paste prompts.
 
 - **`/contextnest:setup`** — guided first connection: cloud (MCP + browser sign-in, no install, no admin rights) or local CLI (`ctx login --as`). It reads what is already connected first and never replaces it.
 - Setup asks where notes live (PromptOwl cloud, a company server, or a private local vault via `ctx init`), how much runs on its own (Light / On demand / Hands-free, labelled with their token cost; Light is `search` retrieval with capture off), and whether it applies to all projects or one — all on one question screen. Cloud vs CLI is picked from what is installed.
