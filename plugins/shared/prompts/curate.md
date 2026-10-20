@@ -40,7 +40,7 @@ In a vault with review on (the default for new vaults) an update is **held** ins
 
 ### Editing
 
-`ctx update <id> --body` **replaces the entire body**. Every edit is therefore read-modify-write: `ctx read <id> --raw`, change only the affected span, write the whole body back. Preserve wording you were not asked to change.
+An update **replaces the entire body**. Every edit is therefore read-modify-write: `ctx read <id> --body` (the body alone — never strip `--raw` output yourself), change only the affected span, write the whole body back with `ctx update <id> --body-file -` and a quoted heredoc (`<<'EOF'`), never `--body "…\n…"`. Preserve wording you were not asked to change. An empty body is refused; if one is, your read failed — stop.
 
 **Retag in the same update.** Entity tags are stored claims about what a node asserts, and the sweep finds affected nodes through them — so an edit that swaps Redis for Postgres retags `#redis` → `#postgres` in the same `ctx update`. `--tags` also **replaces the whole set**: read the current tags first and carry the topic tags forward, exactly as you do for the body. A tag left pointing at a value the node no longer asserts is the drift this whole sweep exists to remove.
 

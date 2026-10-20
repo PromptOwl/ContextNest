@@ -38,13 +38,18 @@ Then stop. You usually run in the background, so your proposal reaches the user 
 When you do write, use Smart Brevity in the body — headline, then why it matters, then the details — and keep the node under 300 words, one idea each:
 
 ```
-ctx add nodes/<slug> --type document --title "<headline>" --tags "<comma,separated>" \
-  --body "**Why it matters:** <one sentence>\n\n<details>"
+ctx add nodes/<slug> --type document --title "<headline>" --tags "<comma,separated>" --body-file - <<'EOF'
+**Why it matters:** <one sentence>
+
+<details>
+EOF
 ```
+
+Always pass a body through `--body-file -` and a quoted heredoc as above — never `--body "…\n…"`: inside shell quotes `\n` is stored as a literal backslash-n.
 
 If the vault has structure rules (the session overview lists them; `ctx structure` shows them), file the node where they allow: run `ctx structure --folder <folder> --json` first, use an allowed `--type`, a title that fits the folder's file-name format (the file name is the title in kebab-case), and start the body from the folder's `template_body`, keeping every `required_sections` heading. A refused write names the rule it broke; fix the write — never work around a rule.
 
-`ctx update <id> --body` **replaces the whole body**, so read the node first (`ctx read <id> --raw`) and preserve everything you are not changing.
+An update **replaces the whole body**, so read it first with `ctx read <id> --body` (the body alone — never strip `--raw` output yourself), keep everything you are not changing, and write the whole body back with `ctx update <id> --body-file -` and a heredoc. An empty body is refused; if one is, your read failed — stop.
 
 A vault with review on (the default for new vaults) **holds** the write instead of publishing it: `ctx` prints `Held for review: ctx review approve
 <id>`, and the node is not retrievable until the user approves. Never approve

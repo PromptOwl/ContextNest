@@ -88,6 +88,7 @@ import {
   remoteSearch,
   remoteEmbed,
   remoteRead,
+  bodyOnly,
   remoteVerify,
   remoteHistory,
   remoteAdd,
@@ -1432,6 +1433,7 @@ program
   .option("--html", "Render as styled HTML and open in browser")
   .option("--out <file>", "Save HTML to file instead of opening in browser (requires --html)")
   .option("--raw", "Output raw file content (frontmatter + body)")
+  .option("--body", "Output the body only — what `update --body-file` takes back")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -1468,6 +1470,12 @@ program
       // script piping --raw still sees it without corrupting the payload.
       if (got.integrity) console.error(chalk.red(got.integrity.warning));
       console.log(doc.rawContent);
+      return;
+    }
+
+    if (opts.body) {
+      if (got.integrity) console.error(chalk.red(got.integrity.warning));
+      console.log(bodyOnly(doc.body));
       return;
     }
 
@@ -1667,6 +1675,20 @@ skillCmd
 
 // ─── ctx add ───────────────────────────────────────────────────────────────────
 
+/**
+ * `--body-file <path|->`: read the body from a file or stdin into `opts.body`,
+ * so agents can pass newlines, quotes and `$` without shell escaping (an
+ * escaped `\n` inside a quoted `--body` lands in the vault as a literal `\n`).
+ */
+function readBodyFile(opts: { body?: string; bodyFile?: string }): void {
+  if (opts.bodyFile === undefined) return;
+  if (opts.body !== undefined) {
+    throw new ContextNestError("Pass --body or --body-file, not both.", "VALIDATION_FAILED");
+  }
+  // One trailing newline is what a heredoc or an editor adds; --body has none.
+  opts.body = fs.readFileSync(opts.bodyFile === "-" ? 0 : opts.bodyFile, "utf-8").replace(/\r?\n$/, "");
+}
+
 program
   .command("add <path>")
   .description("Create a new document with frontmatter template")
@@ -1674,9 +1696,11 @@ program
   .option("--title <title>", "Document title")
   .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
+  .option("--body-file <file>", "Read the body from a file, or - for stdin (no shell escaping)")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
+    readBodyFile(opts);
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteAdd(remote, path, opts);
@@ -2757,12 +2781,22 @@ program
   .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
+  .option("--body-file <file>", "Read the new body from a file, or - for stdin (no shell escaping)")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .option("--assignee <email>", 'Remote nest: assign to someone on its roster ("" or none unassigns)')
   .option("--due <date>", 'Remote nest: due date YYYY-MM-DD ("" or none clears)')
   .option("--priority <p>", 'Remote nest: urgent|high|medium|low ("" or none clears)')
   .option("--parent <id>", 'Remote nest: parent node id, making this a sub-item ("" or none clears)')
   .action(async (path, opts) => {
+    readBodyFile(opts);
+    // An empty body is what a failed read-modify-write looks like (a strip
+    // that matched nothing), and it would replace the whole document.
+    if (opts.body !== undefined && opts.body.trim() === "" && !isForce()) {
+      throw new ContextNestError(
+        "Refusing to replace the body with an empty one — pass --force if you mean to clear it.",
+        "VALIDATION_FAILED",
+      );
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteUpdate(remote, path, opts);
