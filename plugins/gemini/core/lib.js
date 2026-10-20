@@ -31,6 +31,8 @@ export function winQuote(s) {
   return `"${str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
 }
 
+/** Default per-call `ctx` timeout for hooks, in ms (0 disables). See makeExec. */
+export const CTX_TIMEOUT_MS = 8000;
 /** Default cap on how many registered vaults the cheap tiers fan out across. */
 export const MAX_FANOUT_VAULTS = 5;
 /** Default cap on how many retrieval hits we inject. */
@@ -257,14 +259,22 @@ export function getConfig(env = process.env, opts = {}) {
  * The returned function has the injectable shape the run() handlers expect:
  *   exec(args: string[]) => { status, stdout, stderr }
  *
+ * Every call is capped at `CONTEXTNEST_CTX_TIMEOUT_MS` (default 8s). A hook
+ * runs on the user's prompt, so a hung `ctx` (remote fan-out, keyring, npx
+ * download) must cost one timeout, not one per call: after the first, the
+ * rest of this process's calls fail fast as if ctx were unavailable.
+ *
  * @param {ReturnType<typeof getConfig>} config
  * @param {{ cwd?: string, env?: NodeJS.ProcessEnv }} [opts]
  */
 export function makeExec(config, opts = {}) {
   const cwd = opts.cwd || process.cwd();
   const env = opts.env || process.env;
+  const timeout = envInt(env, "CONTEXTNEST_CTX_TIMEOUT_MS", CTX_TIMEOUT_MS);
+  let timedOut = false;
 
   const attempt = (cmd, args) => {
+    if (timedOut) return { status: 1, stdout: "", stderr: "", code: "ETIMEDOUT" };
     try {
       const stdout = execFileSync(
         WIN32 ? winQuote(cmd) : cmd,
@@ -280,10 +290,12 @@ export function makeExec(config, opts = {}) {
           // not ENOENT, so the npx fallback never fires either. Run through the
           // shell there; cmd.exe does no quoting of its own, hence winQuote.
           shell: WIN32,
+          ...(timeout > 0 ? { timeout } : {}),
         },
       );
       return { status: 0, stdout, stderr: "" };
     } catch (err) {
+      if (err.code === "ETIMEDOUT") timedOut = true;
       return {
         status: typeof err.status === "number" ? err.status : 1,
         stdout: err.stdout ? String(err.stdout) : "",

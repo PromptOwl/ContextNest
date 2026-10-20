@@ -70,6 +70,29 @@ function promptText(input) {
   return String(input?.prompt ?? input?.user_prompt ?? "").trim();
 }
 
+/**
+ * Filler and workflow words that name no subject. A prompt made only of these
+ * ("commit and push", "open the PR", "yes go ahead") is an instruction about
+ * the session, and searching it only injects whatever happens to match "push".
+ */
+const NON_TOPIC_WORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "these", "those", "its", "it's", "you", "your",
+  "now", "then", "also", "again", "just", "please", "thanks", "thank", "okay", "yes", "yeah",
+  "let", "let's", "lets", "can", "could", "would", "should", "will", "want", "need", "make",
+  "sure", "all", "any", "some", "more", "next", "step", "steps", "here", "there", "what", "which",
+  "commit", "commits", "push", "pull", "merge", "rebase", "open", "create", "run", "rerun",
+  "start", "continue", "proceed", "done", "ahead", "check", "fix", "fixes", "do", "did", "go",
+  "work", "working", "move", "same", "them", "they", "our", "how", "why",
+]);
+
+/** True when the prompt names at least one subject worth searching for. */
+export function hasTopic(text) {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9'._-]+/)
+    .some((w) => w.length >= 3 && !NON_TOPIC_WORDS.has(w));
+}
+
 /** search one vault target → [{id,title,type,vault}] */
 function searchVault(exec, query, alias) {
   const hits = ctxJson(exec, withVault(["search", query, "--json"], alias), []);
@@ -236,13 +259,15 @@ export function run({ input, env, exec, ledgerIo = {} }) {
   const ladder = correctionIntent(query) ? CHANGE_LADDER : null;
   const join = (block) => [queued, block, ladder].filter(Boolean).join("\n\n");
 
+  // No subject to look up: hand over only what is parked or the sweep rule.
+  if (!query || !hasTopic(query)) {
+    persist();
+    const block = join(null);
+    return block ? wrap(block) : null;
+  }
   if (mode === "agent") {
     persist();
     return wrap(join(AGENT_DIRECTIVE));
-  }
-  if (!query) {
-    persist();
-    return queued ? wrap(queued) : null;
   }
 
   const hits = searchAll(exec, config, query);

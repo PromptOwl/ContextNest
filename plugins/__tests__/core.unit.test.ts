@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { run as retrieve } from "../shared/core/retrieve.js";
+import { run as retrieve, hasTopic } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
 import {
   run as captureGate,
@@ -584,9 +584,22 @@ describe("retrieve", () => {
   });
 
   it("agent → injects a directive to invoke the retriever", () => {
-    const out = retrieve({ input: { prompt: "x" }, env: env("agent"), exec: fakeExec([]) });
+    const out = retrieve({ input: { prompt: "how does auth work" }, env: env("agent"), exec: fakeExec([]) });
     expect(additional(out)).toMatch(/contextnest-retriever/);
     expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
+  });
+
+  it("a prompt with no subject ('commit and push') searches nothing, in any mode", () => {
+    for (const mode of ["search", "query", "agent"]) {
+      const calls: string[][] = [];
+      const exec = (args: string[]) => (calls.push(args), { status: 0, stdout: "[]", stderr: "" });
+      for (const prompt of ["commit and push", "open the PR", "yes go ahead", "ok"]) {
+        expect(retrieve({ input: { prompt }, env: env(mode), exec })).toBeNull();
+      }
+      expect(calls).toEqual([]);
+    }
+    expect(hasTopic("how does auth work")).toBe(true);
+    expect(hasTopic("commit and push")).toBe(false);
   });
 
   it("search → injects top hits from ctx search (empty registry, default vault)", () => {
@@ -1636,6 +1649,14 @@ describe("makeExec", () => {
     const exec = makeExec({ ctxCommand: process.execPath });
     const res = exec(["-e", "process.exit(3)"]);
     expect(res.status).toBe(3);
+  });
+
+  it("caps a hung call, then fails the rest fast instead of waiting again", () => {
+    const exec = makeExec({ ctxCommand: process.execPath }, { env: { ...process.env, CONTEXTNEST_CTX_TIMEOUT_MS: "300" } });
+    const started = Date.now();
+    expect(exec(["-e", "setTimeout(() => {}, 10000)"]).code).toBe("ETIMEDOUT");
+    expect(exec(["--version"]).code).toBe("ETIMEDOUT");
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 });
 
