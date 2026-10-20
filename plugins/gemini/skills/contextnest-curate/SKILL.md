@@ -19,13 +19,15 @@ Update facts across the vault and prevent stale knowledge drift.
    ctx history <id> --json
    ```
 
-3. **Update Nodes:** Read the existing raw body first to preserve unrelated content:
+3. **Update Nodes:** Read the existing body first to preserve unrelated content:
    ```bash
-   ctx read <id> --raw
+   ctx read <id> --body
    ```
-   Apply the update:
+   Apply the update — the whole body, through stdin (never `--body "…\n…"`, which stores a literal `\n`):
    ```bash
-   ctx update <id> --body "<updated-content>"
+   ctx update <id> --body-file - <<'EOF'
+   <updated-content>
+   EOF
    ```
 
 4. **Refile if Structure Changed:** To move a node to another folder, verify structure rules on the target folder first:
