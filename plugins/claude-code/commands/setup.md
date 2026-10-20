@@ -29,7 +29,7 @@ Ask all three in a single `AskUserQuestion` call; leave out any question `$ARGUM
 
 1. **Where do your notes live?** — **PromptOwl cloud (recommended)** → `https://nest.promptowl.ai` · **Only on this computer** → a private local vault, nothing connects to a server. A company server is typed into "Other" as its URL.
 2. **How should the assistant use them?** — show the cost in each label:
-   - **Light (recommended)** — looks up matching notes on each prompt (no extra AI call, a few hundred tokens only when something matches); notes are saved only when you ask. → `retrieval_mode: search`, `capture_mode: off`.
+   - **Light (recommended)** — looks up matching notes on each prompt (no extra AI call, a few hundred tokens only when something matches); notes are saved only when you ask or correct something. → `retrieval_mode: search`, `capture_mode: explicit`.
    - **On demand — cheapest** — nothing runs in the background; you ask, or use `/contextnest:recall` and `/contextnest:capture`. → `off` / `off`.
    - **Hands-free** — also reviews finished turns and proposes notes worth keeping (each review is a background agent run, roughly 25k tokens). → `search` / `propose`.
 3. **Apply to** — **All projects (recommended)** · **This project only**. This scopes the plugin settings and the MCP entry; a `ctx` sign-in or new local vault is still registered for the whole user account — say so when it applies.

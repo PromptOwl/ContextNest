@@ -204,6 +204,8 @@ export function captureSignal({ transcript, ledger, env, captureMode, unclearNes
   if (explicitCaptureIntent(asked)) {
     return { gate: true, kind: "capture", reason: captureReason(captureMode, unclearNest), explicit: true };
   }
+  // explicit mode stops here: only what the user did gates, never the heuristic.
+  if (captureMode === "explicit") return { gate: false };
 
   const always = /^(1|true|yes|on)$/i.test(env.CONTEXTNEST_CAPTURE_ALWAYS || "");
   if (!always) {
