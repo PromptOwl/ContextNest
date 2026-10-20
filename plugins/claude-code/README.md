@@ -26,9 +26,21 @@ Makes any Claude Code session **vault-aware** and **self-maintaining**:
 Everything runs through the existing [`ctx`](../../packages/cli) CLI internally — no
 MCP wiring required.
 
+## Setup
+
+After installing the plugin, run:
+
+```text
+/contextnest:setup
+```
+
+It checks what is already connected, then walks you through one of two paths: **cloud** (sign in to a hosted nest in the browser — nothing to install, no admin rights) or **local CLI** (`ctx login`, then every nest on the server shows up). Re-running it never replaces an existing setup.
+
+Connecting uploads nothing. A local vault stays on your machine unless you run `ctx push`; only notes written to a hosted nest live on that server.
+
 ## Requirements
 
-The Context Nest CLI must be available. Either install it globally:
+The auto-retrieval and capture hooks need the Context Nest CLI (the cloud path works without it, through the nest's MCP tools). Either install it globally:
 
 ```bash
 npm i -g @promptowl/contextnest-cli

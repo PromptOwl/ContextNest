@@ -750,6 +750,8 @@ describe("session-start", () => {
   it("warns when ctx is unavailable", () => {
     const out = startSession({ input: {}, env: {}, exec: () => ({ status: 1, stdout: "", code: "ENOENT" }) });
     expect(additional(out)).toMatch(/not available/i);
+    expect(additional(out)).toContain("/contextnest:setup");
+    expect(additional(out)).toMatch(/uploads nothing/i);
   });
 
   it("lists registered vaults and marks pinned/default", () => {
@@ -813,6 +815,12 @@ describe("session-start", () => {
   it("notes local resolution when no vaults are registered", () => {
     const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
     expect(additional(out)).toMatch(/No vaults are registered/i);
+    expect(additional(out)).toContain("/contextnest:setup");
+  });
+
+  it("does not offer setup once a vault is registered", () => {
+    const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", [{ alias: "work", exists: true }]]]) });
+    expect(additional(out)).not.toContain("/contextnest:setup");
   });
 });
 

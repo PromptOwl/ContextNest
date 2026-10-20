@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **`/contextnest:setup`** — guided first connection: cloud (MCP + browser sign-in, no install, no admin rights) or local CLI (`ctx login --as`). It reads what is already connected first and never replaces it.
+- The session overview no longer dead-ends on "install ctx" or "no vaults registered": it offers `/contextnest:setup` and says connecting uploads nothing.
+
 ## 0.6.0
 
 One registered server stands for every nest behind it.

@@ -29,10 +29,11 @@ export function run({ env, exec }) {
   // Probe availability + registry in one call.
   const probe = exec(["vault", "list", "--json"]);
   if (!probe || probe.status !== 0) {
+    // No ctx and no npx (no Node, or a locked-down machine): the cloud MCP
+    // path needs neither, so point there instead of at an install.
     return wrap(
       "Context Nest CLI (`ctx`) is not available, so vault auto-retrieval and " +
-        "capture are disabled this session. Install it with " +
-        "`npm i -g @promptowl/contextnest-cli` to enable them.",
+        `capture hooks are disabled this session. ${SETUP_HINT}`,
     );
   }
 
@@ -79,7 +80,7 @@ export function run({ env, exec }) {
     lines.push(
       local
         ? "No vaults are registered; `ctx` resolves the working-directory vault above."
-        : "No vaults are registered; `ctx` will resolve a local `.context` vault from the working directory if present.",
+        : `No vaults are registered, so no nest is connected yet. ${SETUP_HINT}`,
     );
   } else {
     lines.push("Registered vaults:");
@@ -111,6 +112,15 @@ export function run({ env, exec }) {
 
   return wrap(lines.join("\n"));
 }
+
+/**
+ * The one next step for a user with nothing connected. Says what connecting
+ * does NOT do, because "register a nest" read as "upload my vault".
+ */
+const SETUP_HINT =
+  "If the user's Context Nest MCP tools are not connected either, offer `/contextnest:setup` — " +
+  "it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
+  "Connecting uploads nothing: local files stay on this machine unless the user runs `ctx push`.";
 
 /** Folder rules shown before eliding the rest to `ctx structure`. */
 const MAX_RULE_LINES = 15;
