@@ -139,7 +139,7 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
-import { choicesToInitArgs, setupBaseUrl, waitForChoices } from "./setup.js";
+import { choicesToCommand, setupBaseUrl, waitForChoices } from "./setup.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
 import {
@@ -251,7 +251,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   {
     title: "Set up a vault",
     commands: [
-      ["setup", "Pick vault options and agent connect steps on a web page, then create the vault here"],
+      ["setup", "Pick vault options and agent connect steps on a web page, then create a local vault or connect a cloud nest"],
       ["init", "Create a new vault here (try --starter for a ready-made template)"],
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
@@ -3535,7 +3535,7 @@ enrichCmd
 
 program
   .command("setup")
-  .description("Pick vault options on a web page, then create the vault here with ctx init")
+  .description("Pick vault options on a web page, then create the vault here (ctx init) or sign in to a cloud nest (ctx login)")
   .option("--no-open", "Print the page URL instead of opening a browser")
   .addHelpText(
     "after",
@@ -3543,21 +3543,26 @@ program
   )
   .action(async (opts: { open: boolean }) => {
     const base = setupBaseUrl();
-    const choices = await waitForChoices(base, (url) => {
-      console.log(chalk.bold("\n  Choose your vault options in the browser:"));
-      console.log(`  ${chalk.cyan(url)}\n`);
-      console.log(chalk.dim("  Waiting for the page (Ctrl+C to cancel)…"));
-      if (opts.open) openUrlInBrowser(url);
-    });
-    const args = choicesToInitArgs(
+    const tools = detectAgentTools(process.cwd());
+    const choices = await waitForChoices(
+      base,
+      (url) => {
+        console.log(chalk.bold("\n  Choose your vault options in the browser:"));
+        console.log(`  ${chalk.cyan(url)}\n`);
+        console.log(chalk.dim("  Waiting for the page (Ctrl+C to cancel)…"));
+        if (opts.open) openUrlInBrowser(url);
+      },
+      { detected: tools.filter((t) => t.detected).map((t) => t.id) },
+    );
+    const { command, args } = choicesToCommand(
       choices,
       listStarters().map((s) => s.id),
-      detectAgentTools(process.cwd()).map((t) => t.id),
+      tools.map((t) => t.id),
     );
-    console.log(chalk.green("\n  Received. Running:"), chalk.cyan(`ctx init ${args.join(" ")}`));
-    // A child process, not a re-parse: init's prompts, exits and registry
-    // hooks all assume they own the process.
-    const child = spawnSync(process.execPath, [...process.execArgv, process.argv[1]!, "init", ...args], {
+    console.log(chalk.green("\n  Received. Running:"), chalk.cyan(`ctx ${command} ${args.join(" ")}`));
+    // A child process, not a re-parse: init's and login's prompts, exits and
+    // registry hooks all assume they own the process.
+    const child = spawnSync(process.execPath, [...process.execArgv, process.argv[1]!, command, ...args], {
       stdio: "inherit",
     });
     if (child.status === 0) {

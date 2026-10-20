@@ -31,16 +31,39 @@ function text(v: unknown, field: string, max: number, required: boolean): string
   return s;
 }
 
+/** https only, except loopback for testing a local server. */
+function serverOrigin(v: unknown): string {
+  try {
+    const u = new URL(text(v, "server", 200, true));
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+    if (u.protocol === "https:" || (u.protocol === "http:" && loopback)) return u.origin;
+  } catch {
+    // Falls through to the error below.
+  }
+  throw new Error("setup: server must be an https:// URL");
+}
+
 /**
- * Turn the page's choices into `ctx init` arguments. Values ride in
- * `--flag=value` form so a name that starts with `-` stays a value.
+ * Turn the page's choices into a `ctx` command: `init` for a local vault,
+ * `login --as` for a cloud server. Values ride in `--flag=value` form so a
+ * name that starts with `-` stays a value.
  */
-export function choicesToInitArgs(raw: unknown, starterIds: string[], toolIds: string[]): string[] {
+export function choicesToCommand(
+  raw: unknown,
+  starterIds: string[],
+  toolIds: string[],
+): { command: "init" | "login"; args: string[] } {
   if (!raw || typeof raw !== "object") throw new Error("setup: no choices received");
   const c = raw as Record<string, unknown>;
-  const name = text(c.name, "name", 120, true);
   const alias = text(c.alias, "alias", 64, true);
   if (!ALIAS_PATTERN.test(alias)) throw new Error("setup: alias may use only letters, digits, - and _");
+  if (c.mode === "cloud") {
+    const args = [serverOrigin(c.server), `--as=${alias}`];
+    if (c.setDefault === true) args.push("--set-default");
+    return { command: "login", args };
+  }
+  if (c.mode !== undefined && c.mode !== "local") throw new Error("setup: unknown mode");
+  const name = text(c.name, "name", 120, true);
   const description = text(c.description ?? "", "description", 500, false);
   if (c.layout !== "structured" && c.layout !== "obsidian") throw new Error("setup: unknown layout");
   const starter = c.starter ?? "";
@@ -55,14 +78,20 @@ export function choicesToInitArgs(raw: unknown, starterIds: string[], toolIds: s
   if (starter) args.push(`--starter=${starter}`, `--tools=${tools.length ? tools.join(",") : "none"}`);
   if (c.encrypted === true) args.push("--encrypted");
   if (c.setDefault === true) args.push("--set-default");
-  return args;
+  return { command: "init", args };
 }
 
 /**
  * Serve the loopback callback, open the page, and resolve with the parsed
  * choices. `open` gets the page URL (print it as well: a browser may not open).
+ * `detected` (agent tool ids found here) rides in the fragment, so the page
+ * pre-selects them and the server never sees what is installed.
  */
-export function waitForChoices(base: string, open: (url: string) => void, timeoutMs = TIMEOUT_MS): Promise<unknown> {
+export function waitForChoices(
+  base: string,
+  open: (url: string) => void,
+  { detected = [], timeoutMs = TIMEOUT_MS }: { detected?: string[]; timeoutMs?: number } = {},
+): Promise<unknown> {
   const state = randomBytes(16).toString("hex");
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
@@ -97,7 +126,7 @@ export function waitForChoices(base: string, open: (url: string) => void, timeou
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address() as { port: number };
       const q = new URLSearchParams({ cb: `http://127.0.0.1:${port}/callback`, state });
-      open(`${base}/setup?${q}`);
+      open(`${base}/setup?${q}#detected=${detected.join(",")}`);
     });
   });
 }
