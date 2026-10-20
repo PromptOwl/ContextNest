@@ -791,6 +791,17 @@ describe("session-start", () => {
     expect(ctx).toMatch(/working-directory vault/i);
     expect(ctx).toContain("/proj/notes");
     expect(ctx).toMatch(/not registered/i);
+    expect(ctx).toMatch(/Query the vault/);
+  });
+
+  it("keeps the query nudge for a working-directory vault with nothing registered", () => {
+    const ex = fakeExec([
+      ["vault list", []],
+      ["vault which", { kind: "local", path: "/proj/notes", source: "local" }],
+    ]);
+    const ctx = additional(startSession({ input: { cwd: "/proj/notes" }, env: {}, exec: ex }))!;
+    expect(ctx).toMatch(/Query the vault/);
+    expect(ctx).not.toContain("/contextnest:setup");
   });
 
   it("names the alias when the working-directory vault is registered", () => {

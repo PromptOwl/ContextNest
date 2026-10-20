@@ -20,6 +20,15 @@ import {
 } from "./lib.js";
 
 /**
+ * The one next step for a user with nothing connected. Says what connecting
+ * does NOT do, because "register a nest" read as "upload my vault".
+ */
+const SETUP_HINT =
+  "If the user's Context Nest MCP tools are not connected either, offer the guided setup " +
+  "(Claude Code: `/contextnest:setup`) — it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
+  "Connecting uploads nothing: local files stay on this machine unless the user runs `ctx push`.";
+
+/**
  * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function}} ctx
  * @returns {object|null}
  */
@@ -115,15 +124,6 @@ export function run({ env, exec }) {
 
   return wrap(lines.join("\n"));
 }
-
-/**
- * The one next step for a user with nothing connected. Says what connecting
- * does NOT do, because "register a nest" read as "upload my vault".
- */
-const SETUP_HINT =
-  "If the user's Context Nest MCP tools are not connected either, offer the guided setup " +
-  "(Claude Code: `/contextnest:setup`) — it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
-  "Connecting uploads nothing: local files stay on this machine unless the user runs `ctx push`.";
 
 /** Folder rules shown before eliding the rest to `ctx structure`. */
 const MAX_RULE_LINES = 15;
