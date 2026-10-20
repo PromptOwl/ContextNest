@@ -19,7 +19,7 @@ Check all three, quietly:
 2. **CLI** — run `ctx --version`. Not found → `npx -y @promptowl/contextnest-cli --version`. Use whichever works as `<ctx>` from here on; neither → no CLI. A version below 3.2.0 has no `login` command: treat it as too old for Step 3b and offer `npm i -g @promptowl/contextnest-cli@latest`, or use `npx -y @promptowl/contextnest-cli@latest` as `<ctx>` instead.
 3. **Vaults** — with a CLI, run `<ctx> vault list --json`, and `<ctx> login --list` when the CLI has `login`.
 
-An MCP server or claude.ai connector that already points at `<server>` but needs sign-in counts as the cloud path half done: ask Step 2 without its first question, then go to Step 3a item 2 for that server instead of adding another.
+An MCP server or claude.ai connector that already points at `<server>` but needs sign-in counts as the cloud path half done: `<server>` is that connector's server; ask Step 2 without its first question, then go to Step 3a item 2 for that server instead of adding another.
 
 **Already connected** (MCP tools present, or at least one registered vault): if `$ARGUMENTS` names `cloud` or `local`, treat it as **Connect another nest** and go on without asking. Otherwise show a short summary (what is connected, which vault is default/pinned) and ask with `AskUserQuestion`: **Done** · **Connect another nest** (continue at Step 2) · **Pin a vault** (hand over to `/contextnest:config vault`). Never remove, replace, or re-default anything that already exists.
 
@@ -32,7 +32,7 @@ Ask all three in a single `AskUserQuestion` call; leave out any question `$ARGUM
    - **Light (recommended)** — looks up matching notes on each prompt (no extra AI call, a few hundred tokens only when something matches); notes are saved only when you ask. → `retrieval_mode: search`, `capture_mode: off`.
    - **On demand — cheapest** — nothing runs in the background; you ask, or use `/contextnest:recall` and `/contextnest:capture`. → `off` / `off`.
    - **Hands-free** — also reviews finished turns and proposes notes worth keeping (each review is a background agent run, roughly 25k tokens). → `search` / `propose`.
-3. **Apply to** — **All projects (recommended)** · **This project only**.
+3. **Apply to** — **All projects (recommended)** · **This project only**. This scopes the plugin settings and the MCP entry; a `ctx` sign-in or new local vault is still registered for the whole user account — say so when it applies.
 
 Then pick the path: **Only on this computer** → Step 3c. A server and a CLI of 3.2.0 or later → Step 3b. A server and no usable CLI → Step 3a. `cloud` or `local` in `$ARGUMENTS` forces 3a or 3b.
 
@@ -52,7 +52,7 @@ Then pick the path: **Only on this computer** → Step 3c. A server and a CLI of
 
 ## Step 3c — only on this computer
 
-Needs the CLI (install as in Step 3b item 1; if that fails, say a local vault needs it and offer PromptOwl cloud). Create `~/contextnest` (or another folder the user names), and inside it run `<ctx> init --name "My notes"` — add `--set-default` only when `vault list` showed no default — and use the alias it printed as `<alias>` from here on. Nothing leaves the machine. If the second question was skipped, apply **Light** in Step 3d. Then go to Step 3d.
+Needs the CLI (install as in Step 3b item 1; if that fails, say a local vault needs it and offer PromptOwl cloud). Create `~/contextnest` (or another folder the user names; if it already exists and is not empty, ask for another — never `init` over an existing vault), and inside it run `<ctx> init --name "My notes"` — add `--set-default` only when `vault list` showed no default — and use the alias it printed as `<alias>` from here on. Nothing leaves the machine. If the second question was skipped, apply **Light** in Step 3d. Then go to Step 3d.
 
 ## Step 3d — apply the usage choice
 
