@@ -46,6 +46,8 @@ export const MAX_TERMS = 3;
  * CONTEXTNEST_SWEEP_MAX_CANDIDATES when a vault's latency budget differs.
  */
 export const MAX_CANDIDATES = 24;
+/** Per-call ctx timeout for the sweep: it reads many nodes after a large update (hook cap: 45s). */
+export const SWEEP_CTX_TIMEOUT_MS = 30000;
 
 /**
  * Words too common to identify anything. Deliberately short: the real filter is
@@ -416,5 +418,5 @@ export function run({ input, env, exec }) {
 }
 
 if (isMain(import.meta.url)) {
-  runAsHook(run);
+  runAsHook(run, { timeout: SWEEP_CTX_TIMEOUT_MS });
 }

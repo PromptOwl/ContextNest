@@ -85,12 +85,18 @@ const NON_TOPIC_WORDS = new Set([
   "work", "working", "move", "same", "them", "they", "our", "how", "why",
 ]);
 
-/** True when the prompt names at least one subject worth searching for. */
+/**
+ * True when the prompt names at least one subject worth searching for. Any
+ * script counts (a non-ASCII word always does — the word list is English);
+ * an ASCII word needs 3+ letters, so a lone "CI?" is skipped — the price of
+ * not treating "PR" and "OK" as subjects.
+ */
 export function hasTopic(text) {
   return text
     .toLowerCase()
-    .split(/[^a-z0-9'._-]+/)
-    .some((w) => w.length >= 3 && !NON_TOPIC_WORDS.has(w));
+    .split(/[^\p{L}\p{N}'._-]+/u)
+    .map((w) => w.replace(/^['._-]+|['._-]+$/g, ""))
+    .some((w) => (/[^\x00-\x7f]/.test(w) || w.length >= 3) && !NON_TOPIC_WORDS.has(w));
 }
 
 /** search one vault target → [{id,title,type,vault}] */

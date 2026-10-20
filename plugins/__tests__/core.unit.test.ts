@@ -600,6 +600,35 @@ describe("retrieve", () => {
     }
     expect(hasTopic("how does auth work")).toBe(true);
     expect(hasTopic("commit and push")).toBe(false);
+    // Trailing punctuation must not turn a filler word into a subject.
+    for (const p of ["commit and push.", "open the PR.", "yes.", "ok, go ahead!", "'push'"]) {
+      expect(hasTopic(p)).toBe(false);
+    }
+    // Any script counts as a subject — the filler list is English only.
+    for (const p of ["¿cómo funciona la autenticación?", "认证如何工作", "как работает авторизация"]) {
+      expect(hasTopic(p)).toBe(true);
+    }
+  });
+
+  it("a subjectless prompt still hands over a parked job and the correction rule", () => {
+    for (const mode of ["search", "agent"]) {
+      const io = fakeLedgerIo();
+      captureGate({
+        input: { transcript_path: "t", session_id: "s1" },
+        env: {},
+        readTranscript: tx([userLine("remember that we use pnpm")]),
+        ledgerIo: io,
+      });
+      const calls: string[][] = [];
+      const exec = (args: string[]) => (calls.push(args), { status: 0, stdout: "[]", stderr: "" });
+      const parked = retrieve({ input: { prompt: "commit and push.", session_id: "s1" }, env: env(mode), exec, ledgerIo: io });
+      expect(additional(parked)).toMatch(/contextnest-capture/);
+      expect(additional(parked)).not.toMatch(/contextnest-retriever/);
+      // "no, it's" is correction-shaped yet names no subject.
+      const ladder = retrieve({ input: { prompt: "no, it's", session_id: "s2" }, env: env(mode), exec, ledgerIo: io });
+      expect(additional(ladder)).toMatch(/find EVERY occurrence/);
+      expect(calls).toEqual([]);
+    }
   });
 
   it("search → injects top hits from ctx search (empty registry, default vault)", () => {
