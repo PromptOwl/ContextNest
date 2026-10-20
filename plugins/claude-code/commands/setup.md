@@ -25,7 +25,7 @@ An MCP server or claude.ai connector that already points at `<server>` but needs
 
 ## Step 2 — three choices, one question screen
 
-Ask all three in a single `AskUserQuestion` call; leave out any question `$ARGUMENTS` already answers (a URL answers the first).
+Ask all three in a single `AskUserQuestion` call; leave out any question `$ARGUMENTS` already answers (a URL answers the first). With no usable CLI and no plan to install one, also leave out the second — its settings drive hooks that need `ctx` (Step 3d writes them off).
 
 1. **Where do your notes live?** — **PromptOwl cloud (recommended)** → `https://nest.promptowl.ai` · **Only on this computer** → a private local vault, nothing connects to a server. A company server is typed into "Other" as its URL.
 2. **How should the assistant use them?** — show the cost in each label:
@@ -52,17 +52,17 @@ Then pick the path: **Only on this computer** → Step 3c. A server and a CLI of
 
 ## Step 3c — only on this computer
 
-Needs the CLI (install as in Step 3b item 1; if that fails, say a local vault needs it and offer PromptOwl cloud). Create `~/contextnest` (or another folder the user names), and inside it run `<ctx> init --name "My notes"` — add `--set-default` only when `vault list` showed no default. Nothing leaves the machine. Then go to Step 3d.
+Needs the CLI (install as in Step 3b item 1; if that fails, say a local vault needs it and offer PromptOwl cloud). Create `~/contextnest` (or another folder the user names), and inside it run `<ctx> init --name "My notes"` — add `--set-default` only when `vault list` showed no default — and use the alias it printed as `<alias>` from here on. Nothing leaves the machine. If the second question was skipped, apply **Light** in Step 3d. Then go to Step 3d.
 
 ## Step 3d — apply the usage choice
 
-Write the Step 2 choice as `retrieval_mode` and `capture_mode`, the way `/contextnest:config` does (its Step 3 merge rules; `--global` for all projects). With no CLI on this machine, write `off` / `off` whatever was chosen and say why: the hooks need `ctx`, so you use the nest's MCP tools directly instead. Then go to Step 4.
+Write the Step 2 choice as `retrieval_mode` and `capture_mode`, the way `/contextnest:config` does (its Step 3 merge rules; `--global` for all projects). With no CLI on this machine, write `off` / `off` whatever was chosen and say why: the hooks need `ctx`, so you use the nest's MCP tools directly instead. On the cloud path with a CLI present, say plainly that the hooks cover only the vaults `ctx` knows; this nest is reached through its MCP tools. Then go to Step 4.
 
 ## Step 4 — learn the nest, then prove it works
 
 Do not write usage rules from memory — the nest is the source of truth, and it changes without a plugin release.
 
 - MCP: call `nest_index`, then `context_overview`. Read any guide or onboarding node they surface and follow it.
-- CLI: `<ctx> --vault <alias> list --limit 20` and `<ctx> --vault <alias> structure --json`, where `<alias>` is the vault just connected (`promptowl` or the new local vault).
+- CLI: `<ctx> --vault <alias> list --limit 20` and `<ctx> --vault <alias> structure --json`, where `<alias>` is the vault just connected (`promptowl`, or the alias `ctx init` printed).
 
 Then show the user it works with one real read: search for something the nest is about and cite one hit. Finish with three lines at most — what is connected, what the agent now does on its own (per the usage choice), and how to change it (`/contextnest:config`). Ask before writing a test note; never write one unasked.
