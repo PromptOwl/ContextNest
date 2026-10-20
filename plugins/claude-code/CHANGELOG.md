@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **New capture mode `explicit`, the default** (#211). Only what you do queues capture — an ask to remember, a correction, a `ctx update` sweep — never the ambient review (a background agent run of roughly 25k tokens). `propose` keeps the ambient review; `off` still means nothing at all. Existing installs keep the value saved when the plugin was enabled. Setup's **Light** preset now maps to `explicit` (it was `off`, which also silenced "remember this" and the sweep check).
+- **Retrieval skips prompts with no subject** (#209): "commit and push", "open the PR" and the like run no search and inject nothing (no retriever agent in `agent` mode). Every hook `ctx` call is capped at 8s (`CONTEXTNEST_CTX_TIMEOUT_MS`; the sweep check gets 30s), so a slow nest no longer stalls the prompt.
+- **Capture and the curator no longer corrupt notes** (#208): they read with `ctx read --body` and write with `ctx update --body-file -` and a heredoc, so a body keeps its line breaks and an empty body is refused. **Needs a `ctx` CLI with `--body-file`** (the release after CLI 3.3.0); an older CLI fails with "unknown option" instead of writing.
+
 ## 0.7.0
 
 Guided onboarding: install the plugin, run `/contextnest:setup`, and it connects you — no copy-paste prompts.

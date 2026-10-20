@@ -29,7 +29,7 @@ Ask all three in **one** message, numbered, with the recommended answer first, a
 
 1. **Where do your notes live?** a) PromptOwl cloud (recommended) → `https://nest.promptowl.ai` · b) only on this computer (private local vault) · c) a company server — reply with its URL.
 2. **How should the assistant use them?**
-   - a) **Light** (recommended) — looks up matching notes on each prompt, saves only when asked → `retrieval_mode: search`, `capture_mode: off`.
+   - a) **Light** (recommended) — looks up matching notes on each prompt, saves only when you ask or correct something → `retrieval_mode: search`, `capture_mode: explicit`.
    - b) **On demand** — cheapest, nothing runs in the background → `off` / `off`.
    - c) **Hands-free** — also proposes notes worth keeping (a background review each time, roughly 25k tokens) → `search` / `propose`.
 

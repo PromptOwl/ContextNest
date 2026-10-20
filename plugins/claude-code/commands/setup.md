@@ -7,7 +7,7 @@ argument-hint: "[cloud|local] [server-url]"
 
 Walk the user from "plugin installed" to "nest connected and the agent knows how to use it". The user may know nothing about Context Nest — do the work, ask only the choices below, and never hand them a command to copy unless a step says so.
 
-Server: the URL in `$ARGUMENTS` if one was given, else the one chosen in Step 2 (`https://nest.promptowl.ai` for PromptOwl cloud). Call it `<server>` below. Accept it only if it is a plain `https://host[:port][/path]` URL (`http://` only for localhost/127.0.0.1) with no spaces, quotes or shell characters; otherwise say why and stop. Always pass it to commands in double quotes.
+Server: the URL in `$ARGUMENTS` if one was given, else the one chosen in Step 2 (`https://nest.promptowl.ai` for PromptOwl cloud). Call it `<server>` below. Accept it only if it is a plain `https://host[:port][/path]` URL (`http://` only for localhost/127.0.0.1) made solely of the characters `A-Z a-z 0-9 . _ ~ : / -`; otherwise say why and stop. Always pass it to commands in double quotes.
 
 Say this once, before connecting anything: **connecting uploads nothing.** Notes in a local vault stay on this machine unless the user runs `ctx push`; only what is written to a hosted nest lives on that server.
 
