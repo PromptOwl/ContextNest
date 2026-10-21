@@ -16,6 +16,8 @@ Run `ctx vault list --json` first.
   the stale pin in your summary, and fall back to choosing the vault whose
   `description` fits the material. If no vault is pinned, likewise choose by
   `description`.
+- Skip any vault whose `exists` is `false`. A working-directory vault (the
+  session overview names it) is used by running `ctx` with no `--vault`.
 - **A server alias spans several nests.** A row `<server>/<nest>` in that list
   is one nest behind a server-level alias; the bare `<server>` row is all of
   them. Reads can use the bare server; **every write names one nest**

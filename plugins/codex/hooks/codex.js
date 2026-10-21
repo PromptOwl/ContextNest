@@ -30,19 +30,28 @@ const text = (content) =>
     .join("\n")
     .trim();
 
-// ponytail: Codex calls the rollout format unstable. Only three record shapes
+// ponytail: Codex calls the rollout format unstable. Only a few record shapes
 // are read; anything else is dropped, so a format change makes the ambient
 // capture heuristic quieter, never noisier.
 const TOOL_CALLS = new Set(["function_call", "local_shell_call", "custom_tool_call"]);
+
+/** The text the user typed, from either event shape Codex has written; "" otherwise. */
+function typedPrompt(record) {
+  const p = record?.payload;
+  if (record?.type !== "event_msg") return "";
+  if (p?.type === "user_message" && typeof p.message === "string") return p.message.trim();
+  // Codex 0.163+: `item_completed` with a `UserMessage` item.
+  if (p?.type === "item_completed" && p.item?.type === "UserMessage") return text(p.item.content);
+  return "";
+}
 
 /** One Codex rollout record → the Claude-shaped record the capture gate reads, or null. */
 export function toClaude(record) {
   const p = record?.payload;
   // The typed prompt. Response-item user messages also carry injected
   // AGENTS.md and environment context, so they are not counted as turns.
-  if (record?.type === "event_msg" && p?.type === "user_message" && typeof p.message === "string" && p.message.trim()) {
-    return { type: "user", message: { role: "user", content: p.message.trim() } };
-  }
+  const prompt = typedPrompt(record);
+  if (prompt) return { type: "user", message: { role: "user", content: prompt } };
   if (record?.type !== "response_item") return null;
   if (TOOL_CALLS.has(p?.type)) return { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use" }] } };
   if (p?.type === "message" && p.role === "assistant") {
@@ -55,7 +64,8 @@ export const readTranscript = transcriptReader(toClaude);
 
 function rules() {
   try {
-    return readFileSync(RULES, "utf-8");
+    // The sync markers are for maintainers, not the model.
+    return readFileSync(RULES, "utf-8").replace(/<!--[^>]*-->\r?\n?/g, "").trim();
   } catch {
     return "";
   }

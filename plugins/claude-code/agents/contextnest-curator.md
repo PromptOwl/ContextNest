@@ -31,8 +31,9 @@ node belongs to exactly one curator).
   on your list — goes in your report as one line. You do not chase it; the
   dispatcher owns the partition.
 - **No scope given?** Run `ctx vault list --json`, use the pinned alias if
-  registered (stale pin → choose by `description`), and sweep that one nest
-  fully as below.
+  registered (stale pin → choose by `description`; skip rows with `exists:
+  false`; a working-directory vault needs no `--vault`), and sweep that one
+  nest fully as below.
 
 ## 2. Sweep before you touch anything
 

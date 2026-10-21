@@ -69,6 +69,11 @@ function rollout(records: object[]): string {
   return path;
 }
 const typed = (message: string) => ({ type: "event_msg", payload: { type: "user_message", message } });
+// Codex 0.163+ writes the typed prompt as an item_completed event instead.
+const typedItem = (text: string) => ({
+  type: "event_msg",
+  payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text, text_elements: [] }] } },
+});
 const injected = (text: string) => ({
   type: "response_item",
   payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
@@ -82,6 +87,7 @@ describe("codex adapter", () => {
     const text = context(run("SessionStart", { input: {}, env: env(), exec }));
     expect(text).toContain("eng");
     expect(text).toContain("`contextnest-curator` agent → `contextnest-curate` skill");
+    expect(text).not.toContain("<!--");
   });
 
   it("UserPromptSubmit: searches the vault with the prompt", () => {
@@ -113,7 +119,7 @@ describe("codex adapter", () => {
 
   it("Stop: answers nothing, and the next prompt receives the parked capture", () => {
     const ledgerIo = fakeLedgerIo();
-    const transcript_path = rollout([injected("# AGENTS.md instructions"), typed("remember this: we deploy on Fridays")]);
+    const transcript_path = rollout([injected("# AGENTS.md instructions"), typedItem("remember this: we deploy on Fridays")]);
     expect(run("Stop", { input: { session_id: "s3", transcript_path }, env: env(), exec: fakeExec([]), ledgerIo })).toBeNull();
 
     const next = run("UserPromptSubmit", {
@@ -126,7 +132,7 @@ describe("codex adapter", () => {
   });
 
   it("readTranscript: counts typed prompts only, maps tool calls, drops the rest", () => {
-    const path = rollout([injected("<environment_context>"), typed("a"), toolCall, typed("b"), { type: "turn_context" }]);
+    const path = rollout([injected("<environment_context>"), typed("a"), toolCall, typedItem("b"), { type: "turn_context" }]);
     const { lines, userTurns } = readTranscript(path);
     expect(userTurns).toBe(2);
     expect(lines).toHaveLength(3);
