@@ -2166,10 +2166,16 @@ const editPolicyBodyOnDisk = (vault: string) => {
 
 // A suggestion id is minted at `stage` time (timestamp-based), so later
 // approve/reject steps read it from here via the harness's function-form args.
+// Anchored to the "Staged suggestion" line (not a bare `s_` token anywhere in
+// the output) and throws on no match — so a wording change fails loudly right
+// here, instead of letting an empty or stale id silently drive the wrong
+// command downstream. A successful capture overwrites the previous id, so the
+// J11-05 re-stage can't reuse J11-03's.
 let j11Sid = "";
 const captureSid = (r: RunResult) => {
-  const m = r.stdout.match(/s_\S+/);
-  if (m) j11Sid = m[0];
+  const m = r.stdout.match(/Staged suggestion (s_\S+)/);
+  if (!m) throw new Error(`J11: no suggestion id in drift-stage output:\n${r.stdout}`);
+  j11Sid = m[1];
 };
 
 const J11: Journey = {
@@ -2301,6 +2307,11 @@ const J11: Journey = {
           args: () => ["drift", "approve", "nodes/policy", j11Sid],
           status: 1,
           stderr: ["Refusing without confirmation", "Non-interactive session"],
+        },
+        // The refused approve wrote nothing — the node is still its first version.
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
         },
         {
           args: () => ["drift", "approve", "nodes/policy", j11Sid, "-y"],
