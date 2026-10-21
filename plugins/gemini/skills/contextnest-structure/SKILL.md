@@ -3,6 +3,7 @@ name: contextnest-structure
 description: Inspect and validate ContextNest structure rules, allowed folder taxonomies, naming conventions, and frontmatter templates. Use when organizing or planning new vault folders.
 ---
 
+<!-- BEGIN SHARED -->
 # ContextNest Structure Rules Inspection
 
 Validate folder layouts and retrieve required frontmatter templates before adding content.
@@ -27,3 +28,4 @@ Validate folder layouts and retrieve required frontmatter templates before addin
    - What node types are allowed?
    - What regex or format is required for file names?
    - What sections are marked required?
+<!-- END SHARED -->

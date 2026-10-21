@@ -1,8 +1,7 @@
 Something the user just said contradicts what a **Context Nest** vault records.
 Your job is to make the vault consistent again in the fewest edits that do the
 job — and to make sure the correction lands in *every* node that carries the
-stale fact, not just the first one you find. You drive the `ctx` CLI through the
-Bash tool.
+stale fact, not just the first one you find. You drive the `ctx` CLI from the shell.
 
 The failure this exists to prevent: fixing one node, leaving three others
 asserting the old value, and reporting success.

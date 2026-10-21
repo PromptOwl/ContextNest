@@ -10,6 +10,9 @@
  *   1. Copies `plugins/shared/core/*` → `plugins/<agent>/core/*` (byte-identical).
  *   2. Fills the `<!-- BEGIN SHARED -->…<!-- END SHARED -->` region of each
  *      agent/skill markdown file from the matching `plugins/shared/prompts/*.md`.
+ *   3. Renders the portable skills (`plugins/shared/skills/<name>/SKILL.md`, a
+ *      frontmatter wrapper filled from its prompt) and copies them into each
+ *      plugin that has no agents of its own (Gemini, Codex, Muse).
  *
  * Usage:
  *   node scripts/sync-plugins.mjs           # write the vendored copies
@@ -29,6 +32,15 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SHARED_CORE = join(ROOT, "plugins", "shared", "core");
 const SHARED_PROMPTS = join(ROOT, "plugins", "shared", "prompts");
+const SHARED_SKILLS = join(ROOT, "plugins", "shared", "skills");
+
+/** Portable skill → the prompt that fills its body. */
+const SKILLS = {
+  "contextnest-recall": "retriever",
+  "contextnest-capture": "capture",
+  "contextnest-curate": "curate",
+  "contextnest-structure": "structure",
+};
 
 const BEGIN = "<!-- BEGIN SHARED -->";
 const END = "<!-- END SHARED -->";
@@ -46,8 +58,26 @@ const TARGETS = [
     ],
   },
   {
+    plugin: "shared",
+    skills: true,
+  },
+  {
     plugin: "gemini",
     core: true,
+    skills: true,
+    prompts: [{ file: "rules/contextnest.md", prompt: "rules" }],
+  },
+  {
+    plugin: "codex",
+    core: true,
+    skills: true,
+    prompts: [{ file: "rules/contextnest.md", prompt: "rules" }],
+  },
+  {
+    // Instruction tier: Muse Code hook payloads are undocumented, so no core.
+    plugin: "muse",
+    skills: true,
+    prompts: [{ file: "AGENTS.md", prompt: "rules" }],
   },
 ];
 
@@ -93,6 +123,14 @@ for (const target of TARGETS) {
     for (const name of readdirSync(SHARED_CORE)) {
       if (!name.endsWith(".js")) continue;
       reconcile(join(destDir, name), read(join(SHARED_CORE, name)));
+    }
+  }
+
+  if (target.skills) {
+    for (const [name, prompt] of Object.entries(SKILLS)) {
+      const wrapper = read(join(SHARED_SKILLS, name, "SKILL.md"));
+      const body = read(join(SHARED_PROMPTS, `${prompt}.md`));
+      reconcile(join(pluginDir, "skills", name, "SKILL.md"), renderPromptFile(wrapper, body));
     }
   }
 
