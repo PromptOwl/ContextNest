@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 
 import { parseSelector } from "../selector/parser.js";
 import { tokenize } from "../selector/lexer.js";
+import { invalidPackSelectors } from "../packs.js";
 import { InvalidSelectorError } from "../errors.js";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
@@ -218,6 +219,26 @@ describe("selector grammar — bare node ids (nodes/<id>, sources/<id>)", () => 
     );
     expect(() => parseSelector('\"tag:#x\"')).toThrow(/did you mean tag:#x without the quotes/);
     expect(() => parseSelector("folder:nodes")).toThrow(/Unknown filter "folder"/);
+  });
+
+  it("OR / AND / NOT words are hinted as |, +, -, never as a node id or a tag", () => {
+    expect(() => parseSelector("#a OR #b")).toThrow(/spell OR as "\|"/);
+    expect(() => parseSelector("#a or #b")).toThrow(/spell OR as "\|"/);
+    expect(() => parseSelector("#a AND #b")).toThrow(/spell AND as a space or "\+"/);
+    expect(() => parseSelector("#a NOT #b")).toThrow(/spell NOT as "-"/);
+    expect(() => parseSelector("#a OR #b")).not.toThrow(/nodes\/OR|#OR/);
+    // `#OR` is still an ordinary tag.
+    expect(() => parseSelector("#a | #OR")).not.toThrow();
+  });
+
+  it("invalidPackSelectors reports packs whose query doesn't parse", () => {
+    const bad = invalidPackSelectors([
+      { id: "ok", label: "ok", query: "#a | #b" },
+      { id: "none", label: "none" },
+      { id: "or", label: "or", query: "#a OR #b" },
+    ]);
+    expect(bad.map((b) => b.id)).toEqual(["or"]);
+    expect(bad[0].message).toMatch(/spell OR as/);
   });
 
   it("a mis-cased prefix (Nodes/foo) is hinted as nodes/foo, never nodes/Nodes/foo", () => {

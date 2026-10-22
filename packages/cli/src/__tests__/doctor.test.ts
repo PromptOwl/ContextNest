@@ -52,6 +52,7 @@ interface DoctorReport {
   };
   cwd: { path: string; in_vault: boolean; vault_path: string | null; alias: string | null };
   plugin: { version: string | null; path: string | null };
+  privacy: { telemetry: boolean; credentials: string };
 }
 
 /**
@@ -144,6 +145,10 @@ describe("ctx doctor", () => {
 
     // No plugin manifest under the sandboxed CLAUDE_CONFIG_DIR.
     expect(report.plugin.version).toBeNull();
+
+    // Fresh vault: telemetry is opt-in, so off; the credential store is always named.
+    expect(report.privacy.telemetry).toBe(false);
+    expect(report.privacy.credentials).toMatch(/\S/);
   });
 
   it("reports the Claude Code plugin version from installed_plugins.json under CLAUDE_CONFIG_DIR", () => {

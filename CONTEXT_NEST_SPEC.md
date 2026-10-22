@@ -1,9 +1,10 @@
 # Context Nest Specification
 
-**Version**: 1.0
+**Version**: 1.1
 **Author**: ContextNest — PromptOwl, LLC
 **Compatible with**: Obsidian, PromptOwl, any markdown editor
 **File Extension**: `.md` (standard markdown)
+**License**: Apache-2.0 (see [LICENSE-SPEC](LICENSE-SPEC)) — this specification only; the reference implementation in this repository is AGPL-3.0
 
 ---
 
@@ -33,6 +34,7 @@ This specification is intended for developers building tools, integrations, or i
 14. [Extension Points](#14-extension-points)
 15. [Open Source Components](#15-open-source-components)
 16. [References](#16-references)
+17. [Changelog](#17-changelog)
 
 ---
 
@@ -54,9 +56,15 @@ my-context-nest/
 │   ├── api-design.md
 │   ├── brand-guidelines.md
 │   ├── onboarding-overview.md
+│   ├── q3-board-report.md       # A `type: pdf` node — extracted text (see §1.11)
+│   ├── q3-board-report.pdf      # …and its binary sidecar, bound by pdf.sha256
 │   └── .versions/               # Version history (see §6)
-│       └── api-design/
+│       ├── api-design/
+│       │   ├── v1.md
+│       │   └── history.yaml
+│       └── q3-board-report/
 │           ├── v1.md
+│           ├── <sha256-hex>.pdf # Prior binary, content-addressed (§1.11.3)
 │           └── history.yaml
 ├── sources/                     # Context source nodes (see §1.6, §1.9)
 │   ├── current-sprint-tickets.md
@@ -95,6 +103,8 @@ my-context-nest/
 ```
 
 In Obsidian mode, any `.md` file anywhere in the vault is treated as a context node. Hidden directories (`.`-prefixed) and `node_modules` are skipped.
+
+In either layout, only `.md` files are nodes. A `.pdf` beside a node is the binary sidecar of a `type: pdf` node (§1.11) and is never discovered as a node itself.
 
 Every document is standard Markdown with YAML frontmatter. Documents follow the GitHub Markdown spec (version 0.29-gfm). The raw content is never mutated — all editor features (context links, tags, mentions, task checkboxes) are rendered via decoration, not transformation. This ensures documents round-trip without loss between any Markdown-compatible tool (VS Code, Obsidian, any text editor).
 
@@ -185,7 +195,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `description` | string | — | Brief document summary (1-500 characters) |
 | `type` | NodeType | `"document"` | Content classification (see §1.6) |
 | `tags` | string[] | `[]` | Tags with `#` prefix: `["#api", "#guide"]` |
-| `status` | Status | `"draft"` | One of `draft`, `pending_review`, `approved`, `published`, `rejected` (see §1.5.1) |
+| `status` | Status | `"draft"` | One of `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (see §1.5.1; `forgotten` is set only by a forget, §6.3) |
 | `version` | integer | `1` | Version number (>= 1) |
 | `author` | string | — | Author identifier (e.g., email address) |
 | `created_at` | ISO 8601 | file creation time | Creation timestamp |
@@ -195,10 +205,11 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `metadata` | object | `{}` | Extensible metadata (word_count, etc.) |
 | `source` | object | — | Source metadata block. Present only on `type: source` nodes (see §1.9) |
 | `skill` | object | — | Skill metadata block. Present only on `type: skill` nodes (see §1.10) |
+| `pdf` | object | — | PDF metadata block. Present only on `type: pdf` nodes (see §1.11) |
 
 ### 1.5.1 Status Lifecycle
 
-`status` is a five-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
+`status` is a six-value enum. Implementations MUST normalize the raw on-disk value to one of the canonical values before downstream processing (validation, retrieval, indexing).
 
 | Canonical | Meaning | Surfaces to retrieval? |
 |-----------|---------|-----------------------|
@@ -207,6 +218,7 @@ Maintained by @jane.smith with oversight from @team:engineering.
 | `approved` | Reviewer signed off; awaiting publish ceremony. | No — hidden until promoted to `published`. |
 | `published` | Live, retrievable. | Yes — the only canonical status surfaced by default. |
 | `rejected` | Terminal hide. The steward retired the document. | No — implementations MUST refuse `publishDocument` on a rejected document to prevent silent resurrection. |
+| `forgotten` | Erased by the forget protocol (§6.3). The file is an empty stub; only hashes remain. | No — excluded from every retrieval path; selectors return it only for an explicit `status:forgotten`. Set only by a forget, never by a write. |
 
 **Aliases.** Implementations SHOULD accept synonyms from other systems and normalize them to canonical values at parse time. Lookup is case-insensitive. Unknown values fall back to `draft`. The reference implementation ships with:
 
@@ -221,6 +233,8 @@ Maintained by @jane.smith with oversight from @team:engineering.
 The on-disk format always stores canonical values. Aliased values found on disk are auto-canonicalized the next time the document round-trips through a write or through the implementation's index-regeneration command (e.g. `ctx index`).
 
 **Transitions.** No state machine is enforced. Any status may transition to any other (subject to the `rejected → *` revival path requiring an explicit status change before content edits land). Metadata-only transitions (e.g. `published → rejected`) MUST NOT cut a new version; only content-publishing operations bump `version` and emit a checkpoint.
+
+**`forgotten` and older readers.** `forgotten` has no aliases. An implementation that predates it normalizes the unknown value to `draft`, which keeps the empty stub out of default retrieval: the failure mode of an old reader is a hidden empty draft, not resurrected content.
 
 **Legacy `superseded`.** Earlier drafts of this spec defined `superseded` as a fifth canonical value. It is no longer canonical. Implementations MUST treat a raw `status: superseded` value as an alias for `draft` per the table above.
 
@@ -239,8 +253,14 @@ Every document has a `type` that classifies its content:
 | `tool` | Tool documentation and usage guides | API integration guide, deployment workflow |
 | `reference` | External references, links, citations | Research papers, industry standards |
 | `skill` | Reusable agent procedures with triggers, inputs, and guard rails | PR review workflow, bug triage, RFC drafting |
+| `agent` | Agent definitions, as other tools in the ecosystem store them | An agent's role and configuration notes |
+| `artifact` | Generated outputs kept for reference | A produced report, a generated spec |
+| `table` | Tabular data | A pricing matrix, a feature comparison |
+| `pdf` | A PDF document: the body is the text extracted from it, and the PDF itself is kept beside the node as a binary sidecar | A contract, a board deck, a research paper |
+| `task` | A unit of work tracked on a project board. Board fields (`assignee`, `due`, `priority`, `parent`) live in `metadata` | "Ship the onboarding email", a bug to fix |
+| `view` | A governed composition of other nodes: the `view` block lays out blocks that pull in nodes, selector results and (via the serving implementation) summaries, HTML and bound data | A monthly board pack, a team dashboard |
 
-The `source` type is described in detail in §1.9. The `skill` type is described in detail in §1.10.
+The `source` type is described in detail in §1.9, the `skill` type in §1.10, the `pdf` type in §1.11, and the `view` type in §1.12. `agent`, `artifact` and `table` are accepted so that vaults written by other tools validate; this specification attaches no type-specific rules to them — they behave exactly like `document`. `task` likewise carries no type-specific validation rules; its board fields are ordinary `metadata` keys, and whether a task goes through review is an implementation's governance decision, not a validation rule.
 
 ### 1.7 Inline Syntax
 
@@ -668,6 +688,139 @@ Both `type: prompt` and `type: skill` contain instructions for agents, but they 
 | Output | Filled template | Task result |
 
 Use `prompt` for text generation templates. Use `skill` for multi-step procedures that may involve tool calls, have safety constraints, and produce structured output.
+
+### 1.11 PDF Nodes
+
+A PDF node is a markdown document that stands for a PDF. The PDF itself is the source of truth; the node's **body is the text extracted from it**, so the PDF participates in search, selectors, packs and context injection like any other node, while the original file travels with it. The binary is stored beside the node as a **sidecar** and bound to it by SHA-256 in the `pdf` frontmatter block.
+
+```
+nodes/
+├── q3-board-report.md     # type: pdf — frontmatter + extracted text
+└── q3-board-report.pdf    # the PDF, byte for byte
+```
+
+#### 1.11.1 PDF Frontmatter
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `pdf.file` | string | Yes | Vault-relative path of the sidecar, forward slashes. MUST be the node's own path with a `.pdf` extension: node `nodes/q3-board-report` → `nodes/q3-board-report.pdf` |
+| `pdf.sha256` | string | Yes | SHA-256 of the sidecar's exact bytes, `sha256:<64 lowercase hex>`. Binaries are hashed as stored, with none of the text normalization of §8.5 |
+| `pdf.bytes` | integer | Yes | Size of the sidecar in bytes |
+| `pdf.pages` | integer | Yes | Page count |
+| `pdf.text_layer` | boolean | Yes | `false` when no page yielded any text (a scanned PDF). The body is then empty |
+| `pdf.extractor` | string | Yes | The text extractor that produced the body, e.g. `unpdf` |
+| `pdf.extractor_version` | string | Yes | Importer and extractor version — the same bytes may extract differently under another extractor, so the record names the one that ran |
+| `pdf.extracted_at` | ISO 8601 | Yes | When the text was extracted |
+
+The `pdf` block MUST be present when `type` is `pdf`. It MUST NOT be present on other node types.
+
+```yaml
+---
+title: "Q3 Board Report"
+type: pdf
+tags: ["#finance", "#board"]
+status: published
+version: 2
+pdf:
+  file: nodes/q3-board-report.pdf
+  sha256: sha256:9f2c…
+  bytes: 482113
+  pages: 14
+  text_layer: true
+  extractor: unpdf
+  extractor_version: ctx-import-pdf/1 (unpdf 1.7.0)
+  extracted_at: "2026-09-22T14:02:11.000Z"
+checksum: sha256:1b7e…
+---
+
+<!-- page 1 -->
+
+Q3 Board Report
+…
+
+<!-- page 2 -->
+
+…
+```
+
+#### 1.11.2 Body
+
+The body is the extracted text as GitHub Flavored Markdown. Each page's text is preceded by a `<!-- page N -->` marker (1-based), so an agent can cite a page. Implementations SHOULD make extraction deterministic — the same bytes and extractor version always produce the same body — and SHOULD neutralize text in the PDF that would otherwise be read as markup (an `<!--` that would hide the rest of the body, a `contextnest://` link). A PDF with no text layer yields an empty body and `text_layer: false`; this specification does not define OCR.
+
+The body is derived data. Implementations SHOULD refuse direct edits to it: the way to change a PDF node's text is to import a new PDF, which re-extracts it. Frontmatter-only edits (title, tags, description, metadata, status) are permitted and version normally.
+
+#### 1.11.3 Versions and Integrity
+
+Because `pdf.sha256` is frontmatter, it is part of every version's content (§6) and therefore of its `content_hash` and `chain_hash` (§8). The binary is bound into the version chain without any change to the chain itself.
+
+- Importing a different PDF to an existing PDF node creates a new version. Before the new sidecar replaces the old one, the old binary MUST be preserved in the node's version history, content-addressed: `.versions/<doc>/<sha256-hex>.pdf`. Every version's `pdf.sha256` therefore names bytes that still exist — the live sidecar or an archived binary.
+- Importing the same bytes again is not a new version.
+- A PDF node MUST NOT be published unless its sidecar is present and hashes to `pdf.sha256`: publishing seals that hash into the chain, and a hash with no matching bytes behind it is an unbacked claim. The provenance guarantee therefore attaches to *published* versions: an unpublished draft's `pdf` block (for instance one arriving through a bulk import of files) is an assertion until publication checks it, and verification (§8.4) reports a draft whose sidecar is missing or different.
+- A sidecar replaced on disk without a new version no longer hashes to `pdf.sha256`; verification (§8.4) MUST report it (`sidecar_drift`), and a missing sidecar likewise (`sidecar_missing`).
+- Any operation that commits a version of a PDF node — including a rollback to an earlier version — MUST leave the live sidecar holding the binary that version records, archiving whatever it replaces. A commit whose binary no longer exists MUST be refused. Commits other than a PDF import or a rollback (a suggestion approval, a direct edit) MUST NOT change the body or the `pdf` block.
+- Deleting a PDF node MUST delete its sidecar along with its `.md` and version history.
+
+---
+
+### 1.12 View Nodes
+
+A view node composes other content into one page. It holds no content of its own beyond an optional introduction in its body: its `view` frontmatter block is a **layout** — an ordered list of blocks naming what to show and where it comes from. Content is resolved when the view is read.
+
+Because the layout is frontmatter, it is inside every version's `content_hash` (§6, §8). Approving a version of a view therefore approves *what it may show and from where*; the content behind its blocks can move without a new version of the view, and changing a block, selector, reference or pin is a new version.
+
+```yaml
+---
+title: "Monthly Board Pack"
+type: view
+tags: ["#finance", "#board"]
+status: published
+version: 4
+view:
+  render: live-approved
+  audience: [human, agent]
+  layout: stack
+  blocks:
+    - md: { ref: nodes/finance/commentary-oct }
+    - id: metrics
+      list: { select: "#board-metric", fields: [title, status] }
+    - summary: { select: "#customer-risk", style: brief }
+    - table: { from: metrics }
+---
+
+The pack the board reads before each meeting.
+```
+
+#### 1.12.1 View Frontmatter
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `view.blocks` | array | Yes | Ordered blocks (§1.12.2). At least one |
+| `view.render` | string | No | `live-approved` (default): `md` blocks serve the latest published version unless they pin one. `pinned`: every `md` block MUST pin a `version`, so the view replays exactly. Selector-based blocks (`list`, `summary`) always resolve against current content |
+| `view.audience` | array | No | Who the view may be served to: `human`, `agent` (default: both). An implementation decides what each audience reaches it through |
+| `view.layout` | string | No | `stack` (default) or `grid` — a presentation hint |
+
+The `view` block MUST be present when `type` is `view`. It MUST NOT be present on other node types. It MUST NOT carry keys beyond those this section defines, at any depth.
+
+#### 1.12.2 Blocks
+
+A block is an object with an optional `id` (letters, digits, `_`, `-`; starting with a letter) and **exactly one** kind:
+
+| Kind | Fields | Resolves to |
+|------|--------|-------------|
+| `md` | `ref`, `version?` | The body of the node `ref` names |
+| `list` | `select`, `fields?` (any of `id`, `title`, `version`, `status`, `tags`), `limit?` | The nodes the selector (§2) `select` matches |
+| `summary` | `select`, `style?` (`brief`\|`detailed`), `max_nodes?` | A generated summary of the nodes `select` matches |
+| `html` | `ref`, `data_from?` | The artifact node `ref` names, rendered in isolation, fed the output of the blocks `data_from` names |
+| `table`, `kpi`, `chart` | `from`, `title?` | A presentation of the output of block `from` |
+| `callout` | `text`, `tone?` (`info`\|`warning`) | Static text |
+| `metric` | `ref` | The governed metric node `ref` names |
+| `data` | `binding`, `as?` (`table`\|`json`) | Data fetched through the binding node `binding` names |
+
+`ref` and `binding` are **vault references** — a node path (`nodes/finance/arr`) or a `contextnest://` URI (§4) without a checkpoint pin (`@N`) or anchor (`#section`); an `md` block pins a node's version with its own `version` field. A view never names a URL, credential or code to run: live data enters a view only through a node its `data` or `metric` block references, and that node is governed on its own. `from` and `data_from` name the `id` of an **earlier** block, which keeps the blocks acyclic.
+
+#### 1.12.3 Resolution
+
+Reading a view resolves each block. `md`, `list` and `callout` need nothing but the vault, and implementations MUST resolve them under the same visibility rules as retrieval: an `md` block whose node is not currently published — whether or not the block pins a version — and a `list` member that is not published resolve to nothing unless the reader asked for drafts, and forgotten nodes (§6.3) never resolve to content. A pinned version is thus served only while its node is still visible — rejecting or retracting a node stops every view serving any of its versions — and only if it was itself published when it was cut. A failure to read history is an error, not an unavailable block. Status visibility is not access control: an implementation resolves a view over only the nodes the reader may see, and decides whether the reader is in the view's `audience`. A view referenced from an `md` block is served as its body and is not expanded. The remaining kinds need a model, a renderer, an isolated execution context or a binding resolver; this specification defines their fields, not how they are resolved. Implementations SHOULD record, for each read they serve, enough to replay it — each `md` block's `ref@version` and content hash, each `list` block's members and a hash over them, and the hash of the layout itself.
 
 ---
 
@@ -1126,6 +1279,19 @@ Each edge in the `relationships` list carries a `type` field:
 
 The `reference` type is the default. The `depends_on` type is automatically generated when a source node declares dependencies. A single pair of nodes may have both edge types if the source body also contains an inline link to its dependency (which is the recommended pattern per §1.9.4).
 
+### 5.1.1 Graph Traversal (hops)
+
+A query MAY expand the documents a selector matches by walking `relationships` edges in either direction, up to a budget of `hops`. Each step costs hops according to the direction of travel:
+
+| Step | Cost |
+|------|------|
+| Along an edge with an explicit `priority` | the `priority` value |
+| Along `depends_on`, from a source to its dependency | 0 |
+| To a document listed in `hubs` | 0 |
+| Anything else, including backwards along `depends_on` and away from a hub | 1 |
+
+With `hops: 0` the result is therefore the selected documents plus what is reachable at zero cost: their source dependencies and any hub they link to. Walking away from a hub is never free, so selecting a hub does not pull in the documents that link to it. When a traversal reaches fewer documents than the implementation's minimum, it MAY retry with a larger budget; `hopsUsed` reports the deepest hop actually reached. Results are returned in a deterministic order: repeating the same query against the same index returns the same documents in the same order. A query that must return exactly the selector's matches, with no expansion, uses full mode (`--full`).
+
 ### 5.2 External Dependencies
 
 The `external_dependencies` section declares all external services required by the nest's source nodes. It is derived automatically from the `source.transport`, `source.server`, and `source.tools` fields across all published source nodes, cross-referenced with the `servers` registry in `.context/config.yaml` (§11.1).
@@ -1146,7 +1312,7 @@ For tools that support versioning, version history is stored in `.versions/{docu
 
 Version history uses a **keyframe + diff model** for efficiency:
 
-- **Keyframe versions** (version 1, and every `keyframe_interval` versions thereafter, default 10): stored as a full Markdown snapshot file (`v1.md`, `v10.md`, ...).
+- **Keyframe versions** (version 1, and every version *n* where (*n* − 1) is a multiple of `keyframe_interval`, default 10, i.e. versions 1, 11, 21, ...): stored as a full Markdown snapshot file (`v1.md`, `v11.md`, ...). An implementation also writes a keyframe whenever the previous version cannot be reconstructed, so a diff is never recorded against unknown content. An implementation MAY write a keyframe at any other version too (for example, above a document-size bound, where a diff would be costly to compute). Readers MUST locate keyframes by the entry's `keyframe` flag, never by version arithmetic.
 - **All other versions**: stored as a unified diff from the previous version, recorded inline in `history.yaml`.
 - **Reconstruction**: apply diffs forward from the nearest keyframe to reach any target version.
 
@@ -1157,7 +1323,7 @@ my-context-nest/
 │   └── .versions/
 │       └── api-design/
 │           ├── v1.md              # Keyframe snapshot of version 1
-│           ├── v10.md             # Keyframe snapshot of version 10
+│           ├── v11.md             # Keyframe snapshot of version 11
 │           └── history.yaml       # Version metadata + inline diffs
 ├── sources/
 │   ├── current-sprint-tickets.md  # Current version (always latest)
@@ -1168,6 +1334,8 @@ my-context-nest/
 ```
 
 The live document is always the authoritative latest version; the `.versions/` folder is history only.
+
+For `type: pdf` nodes the folder also holds each prior binary, named by its SHA-256 (`<sha256-hex>.pdf`, see §1.11.3). These are content-addressed rather than numbered: a version finds its binary through the `pdf.sha256` in its own frontmatter.
 
 Implementations MUST be able to reconstruct any version by applying diffs forward from the nearest keyframe. Keyframe files are self-contained and safe to read without the diff chain.
 
@@ -1230,7 +1398,7 @@ versions:
     note: "WIP rate limiting section"
     content_hash: sha256:c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
     chain_hash:   sha256:2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6
-  - version: 10
+  - version: 11
     keyframe: true
     edited_by: jane.smith@example.com
     edited_at: 2024-03-01T10:00:00Z
@@ -1239,6 +1407,40 @@ versions:
     content_hash: sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2
     chain_hash:   sha256:b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3
 ```
+
+### 6.3 Forget
+
+A **forget** erases a document's content while leaving its hash chain verifiable. This is the right to be forgotten for an append-only, hash-chained history: deleting a version would break every chain hash after it, and deleting only the live file would leave the content in keyframes and diffs.
+
+**Operation.** `forget` takes a document path and a `reason_code` from a closed set: `user_request`, `legal`, `retention_expiry`, `error`. It never takes free text. The reason for forgetting is not itself stored in the nest. It MAY take a `requested_by` identity.
+
+**Tombstones.** For every version entry of the document, the implementation MUST delete the stored content (the `v{N}.md` keyframe, the `v{N}.diff` change log or inline `diff`, the free-text `note`, archived binaries, staged suggestions) and MUST keep `content_hash` and `chain_hash` unchanged. The entry gains `tombstone: true`, `forgotten_at`, `forgotten_by` and `reason_code`. `chain_hash[n]` is computed from `content_hash[n]`, not from the content, so every later entry and every checkpoint binding still verifies.
+
+**Stub.** The live file is replaced by a stub that carries `title`, `type`, `tags`, `created_at`, `updated_at`, `version`, `checksum` (plus any block its `type` requires, and access-scoping keys), with `status: forgotten` and an empty body. The stub is sealed as a new **keyframe** version marked `forget_stub: true`, and the forget cuts a checkpoint, as a publish does (§7.1). The forgotten document is not published, so it drops out of that checkpoint's maps. Rebuild (§7.3) likewise removes the document from the running maps when it replays a `forget_stub` entry.
+
+**Resolution.** Any `contextnest://` URI for a forgotten path resolves to the stub (`status: forgotten`, empty body), not to null. This applies to floating URIs and pinned `@N` URIs, including a checkpoint that names a now-forgotten version. Consumers MUST NOT treat the stub as content. Reconstructing a forgotten version MUST fail with a distinct error (reference implementation: `VERSION_FORGOTTEN`), never with a neighbouring version's content. Existing checkpoints are not rewritten.
+
+**Audit event.** Every forget appends a `document.forgotten` event to `.versions/chain_events.yaml`. The event records `actor`, `timestamp`, `document_id`, and in `action_metadata` the `reason_code`, `requested_by`, the erased `versions`, the `stub_version` and `checkpoint`, and, as hashes only, the erased content: `content_hashes` (each erased entry's chained hash), `body_hashes` (the body checksum of each erased revision) and `pdf_hashes`. It MUST NOT contain forgotten content.
+
+**Anti-resurrection.** The forget record travels with the nest, because `chain_events.yaml` is part of the directory (§6.2 export). Implementations MUST refuse:
+
+- to publish, create or update a document with `status: forgotten`;
+- to publish or create a document at a path a forget retired, even after the stub was deleted. Content that is meant to exist again is published under a new path, which gives it a new identity and a new chain;
+- to publish, or import, a body whose checksum matches a recorded `body_hash`. Bodies shorter than 16 characters (trimmed) are never recorded, so trivial text does not collide;
+- to import a version artifact, archived binary or `history.yaml` that restores a recorded `content_hash` (an un-tombstoned entry), under any path.
+
+An importing implementation MUST honor tombstones carried by the incoming nest. It merges the incoming forget events into its own log, never overwriting that log — whatever spelling of its path the incoming file uses (one the file system folds to it: case, `./`, `//`, a trailing dot) — and re-applies them to any pre-forget copy it already holds: a document whose history, live text or live body carries content the forget erased. A forget naming a document it holds that carries none of that content MUST NOT be applied or logged — it is no forget of that document, and logged it would retire a live document's path — and the import reports it; so is a record reusing the id of a logged event with a different record. A record scoped to versions is recorded but not applied to a live document by an implementation that forgets whole documents. What is logged is the forget record's own fields, never the incoming event verbatim. A record is a claim, not proof of authority: one carrying hashes a reader can obtain (a document's checksum) still passes, so who may import forget records is the host's to decide.
+
+**Delete.** Deleting a document SHOULD append an audit record of the same shape with `mode: delete` (actor, time, reason code, the deleted entries' `content_hashes`). A delete record is audit-only: it MUST NOT retire the path, refuse any content or cause an importing implementation to delete a local document. Anti-resurrection applies to forgets only. Unlike a forget, a delete also removes the history. An implementation MAY offer an explicit purge that records nothing. The reference implementation provides it as `ctx delete --purge`.
+
+**Verification** of a tombstoned entry is hash-only: the chain check runs, the content check is skipped, and the entry is reported as tombstoned rather than as `content_hash_mismatch`. See §8.4 for the forget-specific checks.
+
+**Not yet implemented** in the reference implementation. These parts of the forget protocol proposed to the Open Memory Protocol are deferred:
+
+- **Version-range forget.** Forgetting a range of a document's versions requires re-keyframing the first retained version so that no diff context line from the range survives.
+- **Lineage flags.** Documents whose `derived_from` names a forgotten one would be flagged `review_required`.
+- **Lifespan keys.** `expires_at` would trigger an automatic forget, and `retain_until` would block a non-`legal` forget until its date.
+- **Legal redaction.** Under reason `legal`, `edited_by` would be replaced with its hash.
 
 ---
 
@@ -1356,6 +1558,8 @@ For each version entry in `history.yaml`:
 
 Format: `sha256:<64-character lowercase hex>`.
 
+Before hashing, content is normalized: a leading UTF-8 byte-order mark is removed and CRLF and lone CR line endings become LF. This keeps hashes stable when a sync tool or editor rewrites line endings, and every implementation MUST apply the same normalization to produce matching hashes. The normalization applies to `content_hash` inputs and to the frontmatter `checksum`; `chain_hash` and `checkpoint_hash` inputs are built from already-normalized values.
+
 #### chain_hash
 
 ```
@@ -1430,6 +1634,7 @@ contextnest:genesis:v1
 - Implementations MUST compute and append `checkpoint_hash` when writing new checkpoint entries.
 - Implementations MUST populate `document_chain_hashes` by reading the `chain_hash` of each document's recorded version from its `history.yaml` at write time.
 - A verifier MUST confirm that each value in `document_chain_hashes` matches the `chain_hash` stored in the corresponding document's `history.yaml` at the recorded version. A mismatch indicates that a document's history was rewritten after the checkpoint was created, and MUST be reported as `cross_chain_mismatch`.
+- **Exception: delete and recreate.** When a document is deleted and a new document is later created at the same path, its new history restarts at version 1 and no longer matches what older checkpoints sealed. A verifier MUST NOT report `cross_chain_mismatch` for an entry whose `edited_at` is later than the checkpoint's `at`, **provided** the entry's own `chain_hash` recomputes correctly from its fields and the preceding entry. An entry that is later than the checkpoint but does not recompute is a tamper (for example, a rewritten hash with a forward-dated timestamp) and MUST be reported.
 - Implementations MAY verify the checkpoint chain on read; failures MUST be surfaced to the caller.
 
 ### 8.4 Verification
@@ -1441,7 +1646,12 @@ Implementations MAY expose a verification command or API that:
 3. Re-computes the `chain_hash` sequence from the genesis sentinel and compares each value to the stored entry.
 4. Reads `.versions/context_history.yaml` and for each checkpoint entry, confirms that each value in `document_chain_hashes` matches the `chain_hash` of the corresponding version in the document's `history.yaml`.
 5. Re-computes the `checkpoint_hash` sequence (incorporating `canonical_chain_hashes`) and compares each value to the stored entry.
-6. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, or `checkpoint_hash_mismatch`).
+6. For every `type: pdf` node, re-hashes the sidecar at `pdf.file` and compares it to `pdf.sha256`, and re-hashes each archived binary under `.versions/<doc>/` against the hash in its file name (§1.11.3).
+7. For the forget protocol (§6.3), treats a `tombstone: true` entry as hash-only: its content check is skipped and its chain check runs. The implementation also reports:
+   - `forgotten_content_present` when erased content is back on disk. That is a keyframe, diff or inline diff for a tombstoned entry; an un-tombstoned entry whose `content_hash` a recorded forget erased; a stub with a body; or a live document at a forgotten path, or with a forgotten body.
+   - `unrecorded_tombstone` when a tombstone, a `forget_stub` entry or a `status: forgotten` document is not accounted for by any recorded forget.
+8. Reports what it could not read rather than passing it: a `history.yaml` that does not parse, or is not a regular file (`unreadable_history`), and a document whose frontmatter does not parse or has the wrong shape, or whose sealed bytes do not open with the vault's key (`unreadable_document`). Every other crawl (listing, search) skips such a document instead of failing for the whole vault, and a checkpoint carries forward the entry the previous checkpoint sealed for it — never recording a deletion that did not happen; a vault whose key is missing or wrong, or whose files are sealed under a key its config does not hold, still fails to read, never reading as empty.
+9. Returns a structured report listing any mismatches, including the affected version or checkpoint number and the type of mismatch (`content_hash_mismatch`, `chain_hash_mismatch`, `cross_chain_mismatch`, `checkpoint_hash_mismatch`, `sidecar_drift`, `sidecar_missing`, `forgotten_content_present`, `unrecorded_tombstone`, `unreadable_history` or `unreadable_document`), plus the list of versions it verified hash-only.
 
 Verification is idempotent and read-only. A clean verification result produces no file changes.
 
@@ -1452,7 +1662,7 @@ All hashes in this section use SHA-256 (FIPS 180-4).
 | Property | Value |
 |----------|-------|
 | Algorithm | SHA-256 |
-| Input encoding | UTF-8 |
+| Input encoding | UTF-8 (binary sidecars, §1.11: the raw bytes) |
 | Output format | `sha256:<64-character lowercase hex>` |
 
 The `sha256:` prefix identifies the algorithm and reserves space for future algorithm agility. When a future version of this specification adds support for additional algorithms, the prefix will change (e.g., `sha3-256:`). Verifiers MUST reject unknown prefixes rather than silently passing verification.
@@ -1685,6 +1895,9 @@ description: "Technical documentation and decisions"
 defaults:
   status: draft
 
+# Human review gate for agent/tool writes (see below). Optional.
+review: 'on'
+
 # Folder configurations (Obsidian-compatible layout)
 folders:
   engineering:
@@ -1725,6 +1938,67 @@ sync:
 
 The `servers` block is the authoritative registry of external services available to source nodes. When a source node declares `source.server: jira`, the runtime resolves the connection URL from this registry. The `external_dependencies` section in `context.yaml` (§5) is auto-generated from the intersection of this registry and the servers actually referenced by published source nodes.
 
+The optional `review` key (`on` | `off`; YAML 1.1 booleans `true`/`false` are accepted as `on`/`off`) is the human review gate. It is read by write surfaces (CLI, MCP server), not enforced by the storage layer. When `on`, a write that would publish is **held** instead:
+
+- A node that is not yet published is written in place with `status: pending_review` and no version; approving it publishes v1.
+- An edit to a published node is staged as a suggestion under `_suggestions/` with `source: manual-suggestion` and a note beginning `review-hold`. The canonical file and hash chain are untouched, so the published version keeps serving. A later held edit to the same node builds on the earlier one and supersedes it.
+
+No version or checkpoint is created until the hold is approved; approval performs exactly the write and publish the hold deferred. A hold is stale, and MUST NOT be approved, when the node's latest version has a different body than the one it was staged against, or when its edit no longer applies to that version exactly where it was made and yields the body it proposed (a frontmatter-only change that moves no line it touches leaves it approvable). A vault without the key predates the gate and publishes immediately.
+
+#### 11.1.1 Structure rules
+
+Three optional keys let a vault owner constrain its layout. A vault without them is unconstrained, exactly as before.
+
+```yaml
+structure:
+  enforce: true      # false or absent: rules are report-only
+  closed: true       # only declared folders (and their ancestors) may exist and hold documents
+
+folders:             # each key is a folder path PATTERN; a plain name is a literal pattern
+  "clients/{client}":
+    folder_name: "/[a-z]+-[0-9]{3}/"   # format of the trailing {placeholder}
+    types: [document]                  # node types allowed directly here ([] = none)
+    files:                             # files every matching folder must contain
+      overview: { template: client-overview }
+  "clients/{client}/meetings":
+    required: true                     # fixed-name subfolder, created with its parent
+    types: [document]
+    file_name: "{date}-{slug}"         # format of file names here
+    template: meeting-note             # body new files here start from
+
+templates:
+  meeting-note:
+    body: "## Attendees\n## Decisions\n## Action items\n"
+    required_sections: [Decisions, Action items]
+```
+
+**Paths.** A rule applies to a document id or folder with any leading `nodes/` removed, so structured and flat layouts are checked alike. `"/"` (or `nodes`) is the vault root. Only these are exempt from the rules, and only at the vault root: `packs/` and `_suggestions/` (their own files), the vault's own `CONTEXT.md`, and `sources/` for `type: source` nodes. An id is never extension-stripped. Documents are judged wherever they are; in a structured vault only `nodes/` holds content folders, so an import's non-document files elsewhere (`assets/`) are not judged.
+
+**Reserved paths.** Independently of any rules, a write MUST NOT create a document whose id contains a `.context`, `.versions` or `_suggestions` segment (at any depth) or starts with `packs/`; segments are compared as a filesystem may resolve them: with full Unicode case folding (`ſ` is `s`), trailing dots and spaces removed and any `:stream` suffix dropped (Windows and NTFS). A written id MUST NOT contain `\` (a separator on Windows, a file-name character elsewhere) or a control character, and an id a file system cannot hold MUST be refused before any file is touched (this implementation: longer than 1024 characters, or a segment longer than 251 UTF-8 bytes — `NAME_MAX` less `.pdf`; reads, deletes and forgets refuse only what the host file system cannot hold — 4096 characters, or a segment over 255 bytes (255 UTF-16 units on Windows) — so a legacy id stays readable and erasable). Every create, update, import, publish and sealed version (an approved suggestion, a rollback, a direct edit) is held to this — an update before it writes, not after — and a host restoring a whole vault is not exempt. A delete or forget — an imported forget included — MUST refuse a `.context`, `.versions` or `_suggestions` path (it would destroy a sealed version or a staged edit) but nothing else here, so a legacy id can still be erased; an imported forget record naming no document of the vault (`../`, a reserved path) is neither logged nor applied. A name holding `~` and a digit may be an NTFS short name (`VERSIO~1`) for a reserved folder: every write and erase of one MUST check where the path resolves, and refuse it when that is vault machinery. Elsewhere `Plan~2` is an ordinary name. Comparisons ignore default-ignorable code points, which HFS+ drops (`.con\u200Ctext` is `.context` there). Fold to refuse, never to exempt: where a rule judges a path, roots and exemptions compare exactly (`Sources/x` and `NODES/x` are folders of their own on a case-sensitive volume), and enforced rules refuse (`FOLDER_NOT_ALLOWED`) a document whose first segment resolves to `nodes` but is spelled otherwise (`NODES/`, `nodes./`, `nodes:x/`) — one volume reads it as `nodes/`, another as a folder no rule judges. A vault without enforced rules writes such a folder like any other. A rule key's leading `nodes/` matches without case.
+
+**Patterns.** A segment is a folder name or a `{placeholder}`. Folder names are matched literally but case-insensitively (Unicode default lower-casing; on a case-insensitive filesystem `NOTES/` is `notes/`), and two keys that differ only in case are one pattern declared twice, so a vault's own names (`Engineering`, `my notes`) are valid keys; a name may not start with `.`. A vault declares at most 256 folder rules. A placeholder whose label is a token (`{yyyy}`) takes that token's format; any other label takes the `folder_name` of the rule declaring that exact folder, else any slug. A placeholder constrains every folder at its position, open or closed, unless a more specific pattern matches it: patterns are compared segment by segment and at the first difference a literal beats a placeholder (declaration order is not significant). A `template` that names nothing under `templates` is a label, as it was before structure rules: no body, no required sections; implementations SHOULD report it as a warning.
+
+**Formats.** `folder_name` and `file_name` are a token pattern or a `/regex/`, matched against the name exactly as it appears in the id (file names: the id's last segment). A required file's name is always allowed. No format is ever run against a name longer than 128 characters; such a name does not match.
+
+- Token patterns are literals (`a-z`, `0-9`, `-`) plus `{slug}` (kebab-case), `{date}` (`YYYY-MM-DD`), `{yyyy}`, `{n}` (digits): at most one `{slug}`, at most 3 variable-width tokens (`{slug}`, `{n}`), and two variable-width tokens never adjacent. They are matched under the same linear-time requirement as a regex below.
+- A regex is evaluated with ECMAScript semantics, no flags (non-Unicode mode), implicitly anchored as `^(?:…)$`. Implementations MUST accept exactly this grammar and refuse anything else:
+  - a literal: any character other than `\ ^ $ . | ? * + ( ) [ ] { }`;
+  - an escape: `\d \w \s \D \W \S`, or `\` followed by one ASCII punctuation character;
+  - a class `[…]` or `[^…]`, closed by its first unescaped `]` (so `[]` and `[^]` are whole classes); its members are any character other than `\` and `]`, or one of the escapes above;
+  - `.`, `^`, `$`;
+  - a quantifier `* + ? {m} {m,} {m,n}` (m ≤ n, each at most 3 digits, optionally followed by `?`) directly after a literal, escape, class or `.` — never after a group, `^`, `$`, `(`, `|` or another quantifier;
+  - a group `( … )` or `(?: … )`, never quantified; `|` separates alternatives inside a group or at the top level, and an alternative may be empty.
+
+  A format — a regex or a token pattern — is at most 200 characters. Implementations MUST NOT run an owner regex on a backtracking engine, and MUST match it in time linear in the name's length for each item of the regex — for instance by carrying the set of positions reachable so far through each item: because no group is quantified, every item turns one set into the next in a single pass. No limit on quantifiers or alternatives is then needed, and a check that meets the cap of 256 rules stays in milliseconds. Implementations SHOULD also memoize each (format, name) result within one check.
+
+**Required sections.** A heading satisfies a required section when its anchor (§4, `#section`) equals the section's anchor. Each section MUST have a non-empty anchor and no two sections of a template may share one.
+
+**Required structure.** `required: true` marks a fixed-name subfolder; `files` lists files every matching folder must contain. A required file may not be of a type that needs data beyond its body (`pdf`, `source`, `skill`), and when it declares a `type`, a document there must have it (`TYPE_NOT_ALLOWED` otherwise). When an enforced write brings a folder into existence, implementations SHOULD also create its `required` subfolders (recursively) and its `files`, each a draft whose body is its template; this is best effort and never fails the write. A write held for review is scaffolded when it is approved, for the folders it then occupies alone. Placeholder folders are never created this way. A required file cannot be deleted while its folder (subfolders included) holds any other document file, whatever its status; deleting it last is allowed. A folder no document lives under is not reported for missing required contents.
+
+**Enforcement.** No `structure` key, `structure: false`, or one whose `enforce` is absent or `false`, means report-only: such rules write and refuse nothing. Any other value — `enforce: "yes"`, `structure: true`, a list — is an error (`CONFIG_ERROR` naming the key), never read as off, and reading the rules reports it as enforced. With `enforce: true`, a create, move or import that would place a document where its folder, type, name or required headings break a rule MUST be refused, and so must the files that belong to a refused imported document (its history, staged edits and PDF sidecar) and files bound for a folder that may not exist. An update — including an import that overwrites a document, the approval of a held edit or a drift suggestion, and a publish of a live file that differs from its last sealed version — is refused only for what it newly breaks: a change to a type the folder does not allow, or removing a required heading the body had. Approval is judged against the rules in force when it happens, whichever operation publishes; a document's first publish is judged in full, and scaffolds the folders no other document occupies. A publishing update, and an import that overwrites a document, is judged as its publish will be, before its file is written. A rollback or a direct edit that seals a version is judged like a publish. History that cannot be rebuilt (a lost keyframe, a corrupt history file) is judged in full, never more leniently, and never blocks the publish that restarts the chain; a refused publish leaves that history as it found it. Grandfathering judges a write against the sealed head only when that head rebuilds from its last keyframe — versions strictly increasing — and every replayed entry matches its own `content_hash`; the head is judged in the view those hashes cover (§8 normalization: BOM dropped, line endings LF), so any bytes with the same hashes get the same verdict, and headings and sections are read with one line model for the live file and the head alike (CRLF, CR and LF each end a line, as in CommonMark); implementations MAY decline to trust a segment longer than a bound, or one whose replay would cost more than a bound (this one: 1000 entries from its keyframe, and 128 Mi characters of text walked, the text's length once per diff plus each line comparison, weighted as many characters), and then the document is judged in full. A replayed diff applies only where its hunks say, in order and inside the text — every diff the engine writes was made against exactly the text it follows — and one that fits only elsewhere, or names lines past the end, does not rebuild the head. A document that passes the full check needs no head to excuse it and is not replayed. Implementations MAY bound the work of one import across every history it reads and replays — judging its files and publishing its documents alike — refusing what is left once it is spent and asking for smaller calls (this one: 512 Mi characters read, hashed or replayed, a host setting; at most 64 Mi characters read for any one history, one version file at a time, none larger than five bytes per character of room left — in that history's cap and in the call's budget — read at all, nor any version file that is not a regular file, and no `history.yaml` on disk over 16 MiB parsed (larger is not trusted); a bulk publish judges its documents in the order given, so which ones an over-budget call publishes is the same on every run, and a document that passes the full check, or has no history, replays nothing and is never cut short — one cut short is reported as not published, to be published in a separate call); a history with no head, a forgotten head, or one that does not rebuild and verify grants nothing, and the document is judged in full. An import MUST judge only files that will land (a file refused for any other reason takes its document's whole history with it, and a history's `history.yaml` is written last, only once every other file of that history has landed), and an import into an enforced vault MUST refuse a document's history that, rebuilt from what the vault will hold after the import (its files over what is already there — under the imported `history.yaml`, and under the one already on disk, which stays if the imported one does not land — where a file counts only if its bytes match the hash that history pins, and only a head other than the one the disk already holds is judged), does not rebuild with every replayed entry matching its `content_hash`, or ends in a version the rules refuse — judged as an update over the head the vault holds now when that head verifies and parses, and in full otherwise (a head that does not parse is no baseline, here as at publish); a history on disk that cannot be read (as opposed to one that does not parse) refuses the files of its set. A history with no head, or a forgotten head, is accepted, and a forget stub (`status: forgotten`, an empty body) owes no required sections — one with content in it is judged in full — and grants nothing as a baseline: what follows a stub is judged in full, as is what follows any document the rules do not judge (a `source` under `sources/`). An archived PDF that is refused does not take its history with it: it takes no part in rebuilding one. (A conforming head grants nothing a full check would not, so a document may arrive before or after its history, and a history's keyframes and diffs may arrive before its `history.yaml`.) Imported paths drop trailing dots and spaces, as Windows does, and keep a generated `INDEX.md` or `README.md` as named (never read as a node) — refused when its folder or the same call holds another spelling of the name, which a case-insensitive file system would overwrite, and never renamed to dodge a collision — and an import MUST refuse any path holding another spelling of `.context`, `.versions` or `_suggestions` (`.versions::$DATA`, `.ver\u200Bsions`) — such a file never lands and never takes part in judging the files beside it. `.versions/<doc>/` is a folder of files: an import MUST refuse a path nested deeper in it, and a file in the place of the folder itself or of `.versions/` (outside the vault root's own ledgers), a folder in the place of one of those ledgers (`context_history.yaml`, `context_latest.yaml`, `chain_events.yaml`, compared as a file system folds names), and any entry of `.versions/` named with a leading dot — no document is, and the vault's own write lock is one. An import MUST NOT replace PDF bytes on disk with other bytes — judged on bytes, since what is protected is what is on disk: the same bytes always land, and with none there nothing is replaced, so the sidecar lands and verification and publication hold it to its `.md` (§1.11, §8.4); a pdf node whose sidecar is missing may thus be rebound to other bytes, its sealed history still recording the old hash, and the sealed bytes may later come back over bytes that are neither the sealed ones nor the `.md`'s, archived as they are replaced — when they are a pdf node's sidecar (a node its `.md` or its history marks as one; a history that does not verify counts), whether or not its `.md` comes along, or an archived `.versions/<doc>/<sha-hex>.pdf`, whose bytes must hash to its name; a new version of a PDF comes through `context_import_pdf`, which archives the one it replaces. A `.pdf` beside a document that neither its `.md` nor its history marks as a pdf node is an ordinary file, but the bytes an import replaces there are first archived as `.versions/<doc>/<sha-hex>.pdf`. A forgotten PDF's bytes, and a forgotten version's text, are refused at any path and under any name, and a `.md` whose frontmatter does not parse is still refused at a forgotten path or with a forgotten body (§6.3.4). Only a published (or approved) document occupies a folder — drafts, held and rejected ones do not — so held creates sharing a new folder scaffold it on the first approval; implementations MAY bound how many unpublished documents they look past (this one: 32). Content that predates the rules stays readable and editable. A rule that cannot be compiled — a key of the wrong shape included — refuses writes (`CONFIG_ERROR`) only in an enforced vault and MUST NOT prevent reads; reading the rules reports the error instead, and the rest of the config stays readable. `.context/` MUST NOT be writable through a bulk import except by a host restoring a whole vault, and an import MUST refuse a document that would not read — frontmatter that does not parse, sealed bytes that do not open with the vault's key — unless the host is restoring a whole vault.
+
+Like `review`, these keys are read by write surfaces, not by the storage layer. An implementation that does not know them ignores them.
+
 ### 11.2 syntax.yml (Optional)
 
 Allows customization of selector token syntax per vault:
@@ -1762,7 +2036,7 @@ When imported to PromptOwl:
 
 ### 12.3 Git Compatibility
 
-- All files are plain text, diff-friendly
+- All files are plain text, diff-friendly — with one exception: the binary sidecar of a `type: pdf` node (§1.11), and the prior binaries archived under `.versions/`. Binaries are permitted ONLY as declared sidecars of `pdf` nodes; the node's extracted-text body is what diffs between versions. Mark them binary for git (`*.pdf binary` in `.gitattributes`) so line-ending conversion never alters bytes that are bound by hash
 - `.context/` folder should be committed
 - `.versions/` folder optional (PromptOwl can reconstruct from git history)
 - CONTEXT.md should be committed (vault identity)
@@ -1780,8 +2054,8 @@ A valid Context Nest document:
 3. Body is valid markdown (GitHub Markdown spec 0.29-gfm)
 4. Context links use valid `contextnest://` URIs
 5. Tags match the allowed pattern: `^#?[a-zA-Z][a-zA-Z0-9_-]*$`
-6. If `type` is present, it MUST be one of the 8 defined node types
-7. If `status` is present, it MUST be one of: `draft`, `published`
+6. If `type` is present, it MUST be one of the 15 defined node types (§1.6)
+7. If `status` is present, it MUST be one of: `draft`, `pending_review`, `approved`, `published`, `rejected`, `forgotten` (after alias normalization, §1.5.1)
 8. If `checksum` is present, it MUST match the pattern `sha256:<64 hex chars>`
 
 ### 13.1 Source Node Validation
@@ -1813,6 +2087,32 @@ In addition to the base validation rules, `type: skill` nodes MUST satisfy:
 23. If a `type: source` node declares `depends_on` referencing source X, and the node's body contains an inline `contextnest://` link to X, implementations SHOULD NOT flag this as redundant — it is the recommended pattern (§1.9.4)
 24. If a `type: source` node's body contains inline `contextnest://` links to other source nodes that are NOT listed in `depends_on`, implementations SHOULD emit a warning suggesting the dependency be declared in frontmatter
 
+### 13.4 PDF Node Validation
+
+In addition to the base validation rules, `type: pdf` nodes MUST satisfy (rules 25–29):
+
+25. The `pdf` block MUST be present in frontmatter
+26. `pdf.file` MUST be the node's own path with a `.pdf` extension (`<node path>.pdf`), vault-relative, with forward slashes and no `..` segments
+27. `pdf.sha256` MUST match the pattern `sha256:<64 hex chars>`
+28. `pdf.bytes` and `pdf.pages` MUST be non-negative integers, `pdf.text_layer` MUST be a boolean, and `pdf.extractor`, `pdf.extractor_version` and `pdf.extracted_at` MUST be non-empty strings
+29. The `pdf` block MUST NOT be present on nodes where `type` is not `pdf`
+
+That the sidecar's bytes hash to `pdf.sha256` is an integrity property, checked by verification (§8.4), not a validation rule: validation reads the document alone.
+
+### 13.5 View Node Validation
+
+In addition to the base validation rules, `type: view` nodes MUST satisfy (rules 30–36):
+
+30. The `view` block MUST be present in frontmatter
+31. The `view` block MUST NOT be present on nodes where `type` is not `view` (an untyped node is a `document`)
+32. `view.blocks` MUST be a non-empty array, and each block MUST declare exactly one kind from §1.12.2
+33. Every `ref` and `binding` MUST be a vault reference — a node path or a `contextnest://` URI, with no other scheme, no leading `/` or `//`, no `\`, no `@` pin or `#` anchor, and no empty, `.` or `..` segments — and no part of the `view` block may carry keys beyond those §1.12 defines
+34. Every `select` MUST parse as a selector (§2)
+35. Block `id`s MUST be unique within the view, and every `from` / `data_from` entry MUST name the `id` of an earlier block
+36. When `view.render` is `pinned`, every `md` block MUST carry a `version`
+
+Whether a reference resolves is not a validation rule: a view may name a node that does not exist yet, and resolution (§1.12.3) reports it.
+
 **Suggested MIME type**: `text/markdown; variant=context-nest`
 
 ---
@@ -1831,6 +2131,7 @@ Tools MAY extend the spec with:
 - Additional relationship edge types beyond `reference` and `depends_on`
 - Additional trace types beyond the three defined in §9.3
 - Additional entries in the `servers` registry in `.context/config.yaml`
+- Additional fields within the `pdf` block (prefixed with tool name: `pdf.promptowl_ocr: true`)
 
 ---
 
@@ -1840,7 +2141,7 @@ The following components are intended to be released as open source:
 
 | Component | License | Description |
 |-----------|---------|-------------|
-| Specification (this document) | CC-BY-4.0 | Open protocol specification |
+| Specification (this document) | Apache-2.0 | Open protocol specification |
 | Context Engine (`@promptowl/context-engine`) | AGPL-3.0 | Reference implementation of selectors, versioning, storage, and source node resolution |
 | MCP Server (`@contextnest/mcp-server`) | AGPL-3.0 | Model Context Protocol server for vault access, including source dependency resolution and hydration relay |
 | CLI (`contextnest-cli`) | AGPL-3.0 | Command-line tools for vault operations |
@@ -1872,4 +2173,25 @@ The following components remain proprietary:
 
 ---
 
-*ContextNest is a product of PromptOwl, LLC This specification covers components intended for open release under CC-BY-4.0. Proprietary components are identified in §15.*
+## 17. Changelog
+
+### 1.2 — draft
+
+- **Structure rules** (§11.1.1). New optional `structure`, extended `folders` (path patterns, `types`, `folder_name`, `file_name`, `required`, `files`) and `templates` config keys: hard rules on folder layout, node-type placement, folder/file-name formats (tokens or a guarded regex), templates with required sections, and required subfolders/files. Enforced by write surfaces when `structure.enforce` is true; existing content is grandfathered. `.context/` is not writable through bulk import.
+- **New node type `view`** (§1.12): a governed composition of other nodes. The required `view` block is a layout of `md`, `list`, `summary`, `html`, `table`, `kpi`, `chart`, `callout`, `metric` and `data` blocks whose references are vault references, never URLs. `md`, `list` and `callout` resolve from the vault under retrieval visibility; the rest are resolved by the serving implementation. Validation rules 30–36 (§13.5). §13 rule 6 corrected to 15 node types.
+- **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and an audit-only record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
+
+### 1.1 — 2026-09
+
+- **New node type `pdf`** (§1.11): a PDF as a first-class document. The body is the extracted text with `<!-- page N -->` markers; the PDF is a binary sidecar beside the node (`<node path>.pdf`), bound by the new `pdf` frontmatter block (`file`, `sha256`, `bytes`, `pages`, `text_layer`, `extractor`, `extractor_version`, `extracted_at`). Prior binaries are archived content-addressed under `.versions/<doc>/`. Validation rules 25–29 (§13.4); verification re-hashes sidecars and reports `sidecar_drift` / `sidecar_missing` (§8.4).
+- §12.3: binaries are permitted in a vault only as declared sidecars of `pdf` nodes.
+- §1.6 lists `agent`, `artifact` and `table`, which conforming implementations already accept, and `pdf`.
+- §13 rule 6 corrected to the full type list (it said "8 types"); rule 7 corrected to the five canonical statuses of §1.5.1 (it listed only `draft` and `published`).
+
+### 1.0
+
+- Initial published specification.
+
+---
+
+*ContextNest is a product of PromptOwl, LLC This specification is released under Apache-2.0. Other open components are licensed as listed in §15; proprietary components are identified there too.*

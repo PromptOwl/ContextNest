@@ -27,18 +27,41 @@ import {
   serializeDocument,
   parseDocument,
   publishDocument,
+  deleteDocumentWithTombstone,
   stageSuggestion,
   listSuggestions,
   approveSuggestion,
   rejectSuggestion,
   isRejected,
+  isPublished,
   normalizeStatus,
   STATUS_ALIASES,
   normalizeDocumentId,
   ContextNestError,
   applyTypedBlocks,
   sourceMetaSchema,
+  viewMetaSchema,
+  readReviewMode,
+  setReviewMode,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  reviewHeldMessage,
+  enforcedStructure,
+  enforceStructure,
+  checkDocument,
+  checkUpdate,
+  structureView,
+  missingFolders,
+  scaffoldFolders,
+  assertStructureDelete,
+  assertWritableDocumentId,
+  assertWritableDocumentPath,
+  assertStructurePublish,
+  currentReviewProposal,
+  stageReviewHold,
   NODE_TYPES,
+  withIntegrityWarning,
 } from "@promptowl/contextnest-engine";
 import type {
   ContextNode,
@@ -52,6 +75,7 @@ import {
 } from "@promptowl/contextnest-engine/api";
 import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
+import { rerootForDiscovery, placementNote, heldReviewNotice } from "./onboarding-hints.js";
 
 /** Engine operation catalog — schemas and implementations for `context_*` tools. */
 const engineApi = createEngineApi();
@@ -110,8 +134,6 @@ function tool<Shape extends z.ZodRawShape>(
     handler as ToolCallback<z.ZodObject<Shape, "strict">>,
   );
 }
-
-const regenerateIndex = () => storage.regenerateIndex();
 
 // Permissive RBAC stub — local single-user MCP context has no real identity
 // layer. All gates pass; engine still records the supplied `actor` in the
@@ -295,11 +317,108 @@ function inputShape(op: OperationDescriptor): Record<string, z.ZodTypeAny> {
   return schema.shape as Record<string, z.ZodTypeAny>;
 }
 
+// ─── Human review gate (engine review.ts) ─────────────────────────────────────
+//
+// With `review: on` in the vault's config, an agent's create/update is held for
+// a human instead of published. The engine never decides this on its own — a
+// surface asks for it with `review: true` — so the gate lives here, at the one
+// place every MCP write passes through. A vault without the key predates the
+// gate and publishes exactly as before.
+
+/** The vault's review setting, read per call so `ctx config set` applies live. */
+async function vaultReviewMode(): Promise<"on" | "off" | undefined> {
+  try {
+    return await readReviewMode(storage);
+  } catch {
+    // An unreadable config is not this gate's to report; the write surfaces it.
+    return undefined;
+  }
+}
+
+/**
+ * Whether a catalog write would publish unless the gate steps in. An explicit
+ * `publish` or `review` is the caller's per-call choice and is honoured (the
+ * CLI's `--publish` equivalent). An update naming a status other than
+ * published is a lifecycle transition that never publishes, so it is not
+ * gated. A create publishes whatever its `status` says (only `publish:false`
+ * stops it), so every create is gated.
+ */
+function wouldPublish(opName: string, args: Record<string, unknown>): boolean {
+  if (args.publish !== undefined || args.review !== undefined) return false;
+  if (opName === "context_create") return true;
+  return args.status === undefined || args.status === "published";
+}
+
+async function runGatedWrite(opName: string, args: Record<string, unknown>) {
+  // An explicit create id outside nodes/ would land where discovery never looks
+  // (list, search and agents would not see it). Re-root it and say so.
+  let placement: string | undefined;
+  if (opName === "context_create" && typeof args.id === "string") {
+    const requested = normalizeDocumentId(args.id);
+    const placed = rerootForDiscovery(requested, await storage.detectLayout());
+    if (placed.rerooted) {
+      args = { ...args, id: placed.id };
+      placement = placementNote(requested, placed.id);
+    }
+  }
+  let input = args;
+  if ((await vaultReviewMode()) === "on" && wouldPublish(opName, args)) {
+    // A held write settles its own status; an explicit `published` would
+    // contradict the hold.
+    const { status: _status, ...rest } = args;
+    input = { ...(args.status === "published" ? rest : args), review: true };
+  }
+  try {
+    const result = (await api.run(opName, withClientDefaults(input), opCtx())) as Record<string, unknown>;
+    const withPlacement = placement ? { ...result, placement } : result;
+    if (result && result.held_for_review === true) {
+      return toolResult({ ...withPlacement, review: heldReviewNotice(String(result.id)) });
+    }
+    return toolResult(withPlacement);
+  } catch (err) {
+    return toolError(err);
+  }
+}
+
+const GATED_OPS = new Set(["context_create", "context_update"]);
+
 for (const op of listOperations("core")) {
   tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
-    runOp(op.name, args),
+    GATED_OPS.has(op.name) ? runGatedWrite(op.name, args) : runOp(op.name, args),
   );
 }
+
+// ─── Tool: context_review ────────────────────────────────────────────────────
+//
+// Hand-written rather than a catalog op on purpose: the review setting is a
+// local vault's UX preference, and a catalog op would appear on every surface
+// that binds the catalog — including hosted servers with governance of their
+// own, where an agent toggling the gate must not be possible.
+
+tool(
+  "context_review",
+  "Human review gate. When review is on, context_create/context_update hold writes for the user (the result carries `held_for_review` and a `review` note to relay). Actions: `list` — what is waiting; `approve` / `reject` — decide a node's held write (needs `id`; only when the user says so); `off` / `on` — turn the gate off or on (only when the user asks, e.g. \"turn off review\").",
+  {
+    action: z.enum(["list", "approve", "reject", "off", "on"]).describe("What to do"),
+    id: z.string().optional().describe("Node id, for approve / reject"),
+  },
+  async ({ action, id }) => {
+    try {
+      if (action === "list") return toolResult(await listPendingReview(storage));
+      if (action === "on" || action === "off") {
+        await setReviewMode(storage, action);
+        return toolResult({ review: action });
+      }
+      if (!id) return validationError(`\`id\` is required for action "${action}".`);
+      // Verbatim, like context_update (a flat vault's ids have no nodes/
+      // prefix); the engine refuses an id that escapes the vault.
+      const decide = action === "approve" ? approveReview : rejectReview;
+      return toolResult(await decide(storage, id, { actor: "mcp@contextnest.local" }));
+    } catch (err) {
+      return toolError(err);
+    }
+  },
+);
 
 /** Description for a deprecated legacy alias, steering agents to the canonical name. */
 function deprecated(canonical: string, description: string): string {
@@ -422,7 +541,12 @@ tool(
       // Segment boundary, not a bare startsWith: "nodes/his" must not match
       // "nodes/history". A trailing slash or .md from a caller pasting a file
       // path is tolerated rather than silently matching nothing.
-      const prefix = normalizeDocumentId(path.replace(/\.md$/, "").replace(/\/+$/, ""));
+      // Trailing slashes trimmed with a loop: an unanchored `\/+$` retries from
+      // every slash of a run, quadratic before any length check.
+      const bare = path.replace(/\.md$/, "");
+      let end = bare.length;
+      while (end > 0 && bare[end - 1] === "/") end--;
+      const prefix = normalizeDocumentId(bare.slice(0, end));
       docs = docs.filter((d) => d.id === prefix || d.id.startsWith(`${prefix}/`));
     }
     if (type) docs = docs.filter((d) => (d.frontmatter.type || "document") === type);
@@ -490,7 +614,7 @@ tool(
           required: false,
           type: "string",
           default: "document",
-          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill"],
+          values: ["document", "snippet", "glossary", "persona", "prompt", "source", "tool", "reference", "skill", "agent", "artifact", "table", "pdf", "task", "view"],
           descriptions: {
             document: "General documentation, guides, overviews",
             snippet: "Short, reusable text fragments",
@@ -501,6 +625,12 @@ tool(
             tool: "Tool documentation",
             reference: "External references",
             skill: "Reusable agent skill with trigger, inputs, steps, and guard rails (requires skill block)",
+            agent: "Agent definition, as stored by other tools (no type-specific rules)",
+            artifact: "Generated output, as stored by other tools (no type-specific rules)",
+            table: "Tabular data, as stored by other tools (no type-specific rules)",
+            pdf: "A PDF: body is the extracted text, the binary is a sidecar bound by the pdf block. Created only by context_import_pdf; the body is read-only",
+            task: "A unit of work on a project board; board fields (assignee, due, priority, parent) live in metadata (no type-specific rules)",
+            view: "A governed composition of other nodes: the view block lays out md/list/summary/html/table/kpi/chart/callout/metric/data blocks; refs and bindings are vault references, never URLs",
           },
         },
         tags: {
@@ -548,6 +678,19 @@ tool(
             guard_rails: { required: false, type: "string[]", description: "Constraints or safety rules for execution" },
           },
         },
+        pdf: {
+          required: "Only when type is 'pdf'; must NOT be present on other types. Written by context_import_pdf — never by hand",
+          fields: {
+            file: { required: true, type: "string", description: "Vault-relative sidecar path — always <node id>.pdf, beside the .md" },
+            sha256: { required: true, type: "string", format: "sha256:<64 lowercase hex chars> of the sidecar bytes" },
+            bytes: { required: true, type: "integer" },
+            pages: { required: true, type: "integer" },
+            text_layer: { required: true, type: "boolean", description: "false for a scanned PDF — the body is then empty" },
+            extractor: { required: true, type: "string" },
+            extractor_version: { required: true, type: "string" },
+            extracted_at: { required: true, type: "string", format: "ISO 8601" },
+          },
+        },
       },
       validation_rules: [
         { rule: 1, description: "Valid YAML frontmatter between --- delimiters" },
@@ -555,7 +698,7 @@ tool(
         { rule: 3, description: "Body must be valid GitHub Flavored Markdown (spec 0.29-gfm)" },
         { rule: 4, description: "Context links must use valid contextnest:// URIs" },
         { rule: 5, description: "Tags must match pattern: ^#?[a-zA-Z][a-zA-Z0-9_-]*$" },
-        { rule: 6, description: "type must be one of the 8 defined node types" },
+        { rule: 6, description: `type must be one of the ${NODE_TYPES.length} defined node types: ${NODE_TYPES.join(", ")}` },
         { rule: 7, description: "status must be one of: draft, pending_review, approved, published, rejected (aliases normalized; unknown → draft)" },
         { rule: 8, description: "checksum format: sha256:<64 lowercase hex chars>" },
         { rule: 9, description: "source block MUST be present when type is 'source'" },
@@ -565,6 +708,11 @@ tool(
         { rule: 13, description: "source.depends_on entries must be valid contextnest:// URIs" },
         { rule: 16, description: "source.cache_ttl must be a positive integer if present" },
         { rule: 17, description: "source block must NOT be present on non-source types" },
+        { rule: 25, description: "pdf block MUST be present when type is 'pdf'" },
+        { rule: 26, description: "pdf.file must be the node's own sidecar: <node id>.pdf" },
+        { rule: 27, description: "pdf.sha256 format: sha256:<64 lowercase hex chars>" },
+        { rule: 28, description: "pdf.bytes and pdf.pages are non-negative integers; pdf.text_layer is a boolean" },
+        { rule: 29, description: "pdf block must NOT be present on non-pdf types" },
       ],
       uri_scheme: {
         format: "contextnest://<path>",
@@ -644,12 +792,14 @@ tool(
               documents: result.documents.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               source_nodes: result.sourceNodes.map((d) => ({
                 id: d.id,
                 title: d.frontmatter.title,
                 source: d.frontmatter.source,
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {
@@ -696,6 +846,7 @@ tool(
                 title: d.frontmatter.title,
                 description: d.frontmatter.description,
                 type: d.frontmatter.type || "document",
+                ...(d.integrity ? { integrity: d.integrity } : {}),
                 body: d.body,
               })),
               traversal: {
@@ -768,12 +919,20 @@ tool(
     const id = normalizeDocumentId(path);
     const vm = new VersionManager(storage);
     const content = await vm.reconstructVersion(id, version);
+    // Plain-text tool, so the verdict can only travel as text: a tampered
+    // version chain puts the warning line ahead of the content (additive —
+    // intact output is byte-identical). Chain only; the live body is not what
+    // this serves. No live node to check against → no verdict.
+    const live = await storage.readDocument(id).catch(() => null);
+    const integrity = live
+      ? await storage.verifyServedDocument(live, { checkBody: false })
+      : undefined;
 
     return {
       content: [
         {
           type: "text" as const,
-          text: content,
+          text: withIntegrityWarning(content, integrity),
         },
       ],
     };
@@ -789,6 +948,25 @@ tool(
  */
 const lockedHandler = <T>(fn: () => Promise<T>): Promise<T> =>
   withVaultLock(storage.root, fn);
+
+/**
+ * Structure rules (§11.1) for the legacy writers below. They write storage
+ * directly instead of through the catalog executors, so without this they
+ * would be a way around every rule. Returns the error result, or null to go on.
+ */
+async function structureRefusal(
+  check: (
+    rules: NonNullable<Awaited<ReturnType<typeof enforcedStructure>>>,
+  ) => ReturnType<typeof checkDocument> | Promise<ReturnType<typeof checkDocument>>,
+) {
+  try {
+    const rules = await enforcedStructure(storage);
+    if (rules) enforceStructure(rules, await check(rules));
+    return null;
+  } catch (err) {
+    return toolError(err);
+  }
+}
 
 // ─── Tool: create_document ─────────────────────────────────────────────────
 
@@ -827,6 +1005,11 @@ tool(
       .describe(
         "Source block (required when type is 'source'): how an agent fetches the live data this node stands for.",
       ),
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required when type is 'view'): the layout of blocks this view composes. Refs and bindings must be vault references, never URLs.",
+      ),
   },
   async ({
     path,
@@ -840,6 +1023,7 @@ tool(
     tools_required,
     output_format,
     source,
+    view,
   }) =>
     lockedHandler(async () => {
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
@@ -847,8 +1031,20 @@ tool(
 
       // Mirror the CLI: bare slugs default into nodes/ so a doc created via MCP
       // lands in the same place as one created via `ctx add` (single source of
-      // truth — normalizeDocumentId in the engine).
-      const id = normalizeDocumentId(path);
+      // truth — normalizeDocumentId in the engine). A folder discovery never
+      // scans would hide the document from list, search and agents, so re-root
+      // it under nodes/ and say so, as `ctx add` does.
+      const requested = normalizeDocumentId(path);
+      const placed = rerootForDiscovery(requested, await storage.detectLayout());
+      const id = placed.id;
+      const placement = placed.rerooted ? placementNote(requested, id) : undefined;
+      // Never under .context/, .versions/, _suggestions/ or the root packs/ —
+      // the same guard every catalog write runs.
+      try {
+        assertWritableDocumentId(id);
+      } catch (err) {
+        return toolError(err);
+      }
 
       // Check if document already exists
       try {
@@ -883,6 +1079,7 @@ tool(
         applyTypedBlocks(frontmatter, {
           type,
           ...(source !== undefined ? { source } : {}),
+          ...(view !== undefined ? { view } : {}),
           ...(trigger !== undefined ? { trigger } : {}),
           ...(tools_required !== undefined ? { tools_required } : {}),
           ...(output_format !== undefined ? { output_format } : {}),
@@ -926,7 +1123,32 @@ tool(
         };
       }
 
+      const refused = await structureRefusal((rules) =>
+        checkDocument(rules, structureView(id, node)),
+      );
+      if (refused) return refused;
+
+      // Review gate, same as context_create: held as pending_review, unversioned
+      // (approval publishes v1). The legacy tool must not be a way around it.
+      if ((await vaultReviewMode()) === "on") {
+        node.frontmatter.status = "pending_review";
+        await storage.writeDocument(id, serializeDocument(node));
+        await storage.regenerateIndex({ changedIds: [id] });
+        return toolResult({
+          id,
+          frontmatter: node.frontmatter,
+          held_for_review: true,
+          message: "Document created and held for review (status: pending_review). Not published.",
+          review: heldReviewNotice(id),
+          ...(placement ? { placement } : {}),
+        });
+      }
+
       const content = serializeDocument(node);
+      // Folders this write creates get their required contents, as with
+      // context_create (a held create above is scaffolded when it is approved).
+      const rules = await enforcedStructure(storage);
+      const created = rules ? await missingFolders(storage, id) : null;
       await storage.writeDocument(id, content);
 
       // Auto-publish: bump version, create version entry & checkpoint.
@@ -950,7 +1172,8 @@ tool(
         throw err;
       }
 
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
+      if (rules && created) await scaffoldFolders(storage, rules, created);
 
       return {
         content: [
@@ -964,6 +1187,7 @@ tool(
                 checkpoint: result.checkpointNumber,
                 chain_hash: result.versionEntry.chain_hash,
                 message: "Document created and published successfully",
+                ...(placement ? { placement } : {}),
               },
               null,
               2,
@@ -1007,7 +1231,7 @@ tool(
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill/view needs that type's block in the same call — `source` for a source node, `trigger` for a skill node, `view` for a view node.",
       ),
     source: sourceMetaSchema
       .strict()
@@ -1015,6 +1239,9 @@ tool(
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
       ),
+    view: viewMetaSchema
+      .optional()
+      .describe("Replacement view block, for a node that is (or is becoming) type:view. Replaces the block wholesale."),
     trigger: z
       .string()
       .optional()
@@ -1035,6 +1262,7 @@ tool(
     content: bodyAlias,
     type,
     source,
+    view,
     trigger,
     tools_required,
     output_format,
@@ -1043,13 +1271,33 @@ tool(
       const resolvedBody = resolveBodyAlias(body, bodyAlias);
       if (!resolvedBody.ok) return validationError(resolvedBody.error);
       const id = normalizeDocumentId(path);
-      const doc = await storage.readDocument(id);
+      // Before any write — the file is written before the publish that would
+      // otherwise be the first to refuse a reserved path.
+      try {
+        await assertWritableDocumentPath(storage.root, id);
+      } catch (err) {
+        return toolError(err);
+      }
+      let doc = await storage.readDocument(id);
 
       // Normalize caller-supplied status to canonical before any guard or
       // write. Aliases (`cancelled`, `superseded`, `review`, `active`, …)
       // collapse here so the disk store and downstream tools only ever see
       // canonical values.
       const normalizedStatus = status !== undefined ? normalizeStatus(status) : undefined;
+
+      // Review gate, same as context_update: a write that would publish is held.
+      // An edit to a published node builds on its current held proposal (so a
+      // second held edit carries the first) and is staged, never written in place.
+      const hold =
+        (normalizedStatus === undefined || normalizedStatus === "published") &&
+        (await vaultReviewMode()) === "on";
+      const holdAsSuggestion = hold && isPublished(doc);
+      const proposal = holdAsSuggestion ? await currentReviewProposal(storage, id) : null;
+      if (proposal) doc = parseDocument(doc.filePath, proposal.proposedRaw, id);
+      // What the edit starts from, before `doc` is mutated in place below —
+      // structure rules refuse only what the edit newly breaks.
+      const before = structureView(id, doc);
 
       // Refuse content edits on rejected docs unless the caller explicitly
       // names a new status (revive to draft/pending_review/approved/published,
@@ -1097,6 +1345,7 @@ tool(
         applyTypedBlocks(doc.frontmatter, {
           type: nextType,
           ...(source !== undefined ? { source } : {}),
+          ...(view !== undefined ? { view } : {}),
           ...(trigger !== undefined ? { trigger } : {}),
           ...(tools_required !== undefined ? { tools_required } : {}),
           ...(output_format !== undefined ? { output_format } : {}),
@@ -1106,7 +1355,13 @@ tool(
       }
       doc.frontmatter.updated_at = new Date().toISOString();
 
-      // Update body if provided
+      // Update body if provided. A pdf node's body is its extracted text —
+      // same refusal as context_update: change the PDF, not the text.
+      if (resolvedBody.body !== undefined && doc.frontmatter.type === "pdf") {
+        return validationError(
+          `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. Use context_import_pdf with this id to import a new version.`,
+        );
+      }
       if (resolvedBody.body !== undefined) {
         doc.body = `\n${resolvedBody.body}\n`;
       }
@@ -1124,6 +1379,52 @@ tool(
           isError: true,
         };
       }
+      const refused = await structureRefusal((rules) =>
+        checkUpdate(rules, before, structureView(id, doc)),
+      );
+      if (refused) return refused;
+      // A publishing edit is judged as its publish will be (a never-published
+      // document in full), before the file is written.
+      if (!hold && (normalizedStatus === undefined || normalizedStatus === "published")) {
+        const refusedPublish = await structureRefusal(async (rules) => {
+          await assertStructurePublish(storage, rules, doc);
+          return [];
+        });
+        if (refusedPublish) return refusedPublish;
+      }
+
+      if (hold) {
+        let suggestionId: string | undefined;
+        if (holdAsSuggestion) {
+          // The proposal keeps its published status: that is what approval publishes.
+          doc.frontmatter.status = "published";
+          const staged = await stageReviewHold(storage, {
+            documentId: id,
+            proposedRawContent: serializeDocument(doc),
+            actor: "mcp@contextnest.local",
+            ...(doc.frontmatter.zone ? { zone: doc.frontmatter.zone } : {}),
+            docTier: doc.frontmatter.governance ?? "standard",
+            supersedes: proposal ? [proposal.suggestionId] : [],
+          });
+          suggestionId = staged?.suggestionId;
+        }
+        // Not published yet, or published but never sealed (no history to
+        // diff against): held in place as pending_review.
+        if (!suggestionId) {
+          doc.frontmatter.status = "pending_review";
+          await storage.writeDocument(id, serializeDocument(doc));
+          await storage.regenerateIndex({ changedIds: [id] });
+        }
+        return toolResult({
+          id,
+          held_for_review: true,
+          ...(suggestionId ? { suggestion_id: suggestionId } : { frontmatter: doc.frontmatter }),
+          message: suggestionId
+            ? "Edit held for review. The published version keeps serving until it is approved."
+            : "Document held for review (status: pending_review). Not published.",
+          review: reviewHeldMessage(id),
+        });
+      }
 
       const content = serializeDocument(doc);
       await storage.writeDocument(id, content);
@@ -1139,7 +1440,7 @@ tool(
         normalizedStatus === "pending_review" ||
         normalizedStatus === "draft"
       ) {
-        await regenerateIndex();
+        await storage.regenerateIndex({ changedIds: [id] });
         const message =
           normalizedStatus === "rejected"
             ? "Document retired (status: rejected). No new version cut."
@@ -1173,7 +1474,7 @@ tool(
         client: defaultClient(),
       });
 
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
 
       return {
         content: [
@@ -1209,18 +1510,28 @@ tool(
     lockedHandler(async () => {
       const id = normalizeDocumentId(path);
 
-      // Verify the document exists before deleting
-      const doc = await storage.readDocument(id);
+      // A required file goes last, as with context_delete (§11.1.1).
+      try {
+        await assertStructureDelete(storage, id);
+      } catch (err) {
+        return toolError(err);
+      }
 
-      await storage.deleteDocument(id);
-      await regenerateIndex();
+      // Same delete as context_delete: throws DOCUMENT_NOT_FOUND for a missing
+      // id, and appends an audit-only record (§6.3.4). Additive: the path
+      // stays reusable, so legacy callers see the same behaviour as before.
+      const result = await deleteDocumentWithTombstone(storage, id, {
+        reasonCode: "user_request",
+        deletedBy: "mcp@contextnest.local",
+      });
+      await storage.regenerateIndex({ changedIds: [id] });
 
       return {
         content: [
           {
             type: "text" as const,
             text: JSON.stringify(
-              { id, title: doc.frontmatter.title, message: "Document deleted successfully" },
+              { id, title: result.title, message: "Document deleted successfully" },
               null,
               2,
             ),
@@ -1253,7 +1564,7 @@ tool(
         client: defaultClient(),
       });
 
-      await regenerateIndex();
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
 
       return {
         content: [
@@ -1395,7 +1706,7 @@ tool(
       comment,
     });
 
-    await regenerateIndex();
+    await storage.regenerateIndex({ changedIds: [id] });
 
     return {
       content: [

@@ -28,19 +28,34 @@ let calls: Array<{ op: string; input: Record<string, unknown> }> = [];
 let opened = 0;
 let closed = 0;
 
+/** `nest_index` answer per saved key, for a server that limits each key to its nests. */
+let nestsByToken: Record<string, unknown> = {};
+/** The saved key each run() went out with (undefined: none). */
+let callTokens: Array<string | undefined> = [];
+/** Saved keys the fake server refuses at connect. */
+let revokedTokens = new Set<string>();
+
 vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@promptowl/contextnest-engine")>();
   return {
     ...actual,
-    connectRemoteNest: async () => {
+    connectRemoteNest: async (_alias: string, _spec: unknown, env?: Record<string, string>) => {
+      const token = env?.CONTEXTNEST_LOGIN_TOKEN;
+      if (token && revokedTokens.has(token)) {
+        throw new ContextNestError(`rejected ${token}`, "REMOTE_AUTH_FAILED");
+      }
       opened += 1;
       return {
         toolNames: async () => advertised as ReadonlySet<string>,
         run: async (op: string, input: Record<string, unknown>) => {
           calls.push({ op, input });
+          callTokens.push(token);
           if (!advertised.has(op)) {
             throw new ContextNestError(`Tool ${op} not found`, "INTERNAL");
           }
+          if (replies[op] instanceof Error) throw replies[op];
+          if (typeof replies[op] === "function") return (replies[op] as (i: typeof input) => unknown)(input);
+          if (op === "nest_index" && token && nestsByToken[token]) return nestsByToken[token];
           return replies[op];
         },
         close: async () => {
@@ -51,7 +66,22 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
   };
 });
 
-const { remoteAdd, remotePublish, remoteVerify } = await import("../remote.js");
+/** What `ctx login` "saved" — in memory, never the real secure store. */
+let savedMap: import("../server-credentials.js").ServerMap;
+
+vi.mock("../server-credentials.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../server-credentials.js")>();
+  return {
+    ...actual,
+    savedTokenFor: async (url: string, _opts: unknown, account?: string) =>
+      actual.tokenForEndpoint(savedMap, url, account),
+    savedTokensForServer: async (url: string, account?: string) =>
+      actual.tokensForServerEndpoint(savedMap, url, account),
+  };
+});
+const { emptyServerMap, upsertServer, nestScopeUrl } = await import("../server-credentials.js");
+
+const { remoteAdd, remotePublish, remoteVerify, remoteUpdate, remoteMove, remoteList, remoteDelete, remoteQuery, nestLabels, serverNests, expandServerVaults, remoteRead, NEST_INDEX_TTL_MS, NEST_PROBE_BACKOFF_MS } = await import("../remote.js");
 const { configureSafety } = await import("../safety.js");
 
 const target = {
@@ -66,6 +96,10 @@ beforeEach(() => {
   advertised = new Set();
   replies = {};
   calls = [];
+  nestsByToken = {};
+  callTokens = [];
+  revokedTokens = new Set();
+  savedMap = emptyServerMap();
   opened = 0;
   closed = 0;
   out = [];
@@ -183,5 +217,526 @@ describe("remoteAdd — folder", () => {
     await remoteAdd(target, "nodes/thing", {});
 
     expect(calls[0].input).not.toHaveProperty("folder");
+  });
+});
+
+describe("remoteAdd — structure template", () => {
+  it("a bodiless add starts from the folder's template when the nest advertises context_structure", async () => {
+    advertised = new Set(["context_create", "context_structure"]);
+    replies.context_structure = { resolved: { template_body: "## Decisions\n" } };
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+
+    await remoteAdd(target, "nodes/m/x", {});
+
+    expect(calls[0]).toMatchObject({ op: "context_structure", input: { folder: "m" } });
+    expect(calls[1].input).toMatchObject({ content: "\n## Decisions\n" });
+  });
+
+  it("asks nothing of a nest that predates structure rules, and an explicit body wins", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = { id: "nodes/m/x", version: 1 };
+    await remoteAdd(target, "nodes/m/x", {});
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+
+    calls = [];
+    advertised = new Set(["context_create", "context_structure"]);
+    await remoteAdd(target, "nodes/m/y", { body: "mine" });
+    expect(calls.map((c) => c.op)).toEqual(["context_create"]);
+    expect(calls[0].input).toMatchObject({ content: "\nmine\n" });
+  });
+});
+
+describe("remoteAdd — push-confirmation gate", () => {
+  it("reports a held create instead of failing, and does not claim it was created", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = new ContextNestError("This nest holds agent writes for review.", "PENDING_CONFIRMATION");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(remoteAdd(target, "nodes/thing", {})).resolves.toBeUndefined();
+
+    expect(plain()).toContain("holds agent writes for review");
+    expect(plain()).not.toContain("Created and published");
+    errSpy.mockRestore();
+  });
+
+  it("still throws any other create error", async () => {
+    advertised = new Set(["context_create"]);
+    replies.context_create = new ContextNestError("exists", "DOCUMENT_ALREADY_EXISTS");
+
+    const err = await remoteAdd(target, "nodes/thing", {}).catch((e) => e);
+
+    expect((err as ContextNestError).code).toBe("DOCUMENT_ALREADY_EXISTS");
+  });
+});
+
+// A remote nest must take the same edits a local vault does (Stacey's
+// partner-nest report: tags couldn't change, move didn't exist).
+describe("remoteUpdate / remoteMove", () => {
+  it("sends --tags (replace) and --status to context_update", async () => {
+    advertised = new Set(["context_update"]);
+    replies = { context_update: { id: "nodes/a", version: 3, status: "draft" } };
+    await remoteUpdate(target, "nodes/a", { tags: "keep, other", status: "cancelled" });
+    expect(calls).toEqual([
+      { op: "context_update", input: { id: "nodes/a", tags: ["#keep", "#other"], status: "rejected" } },
+    ]);
+    expect(plain()).toContain("Status: draft");
+  });
+
+  it("refuses --title rather than sending a selector the nest would ignore", async () => {
+    const err = await remoteUpdate(target, "nodes/a", { title: "New" }).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("NOT_IMPLEMENTED");
+    expect(calls).toEqual([]);
+  });
+
+  it("move calls context_move with id + folder and reports the new id", async () => {
+    advertised = new Set(["context_move"]);
+    replies = { context_move: { id: "nodes/archive/a", previous_id: "nodes/a" } };
+    await remoteMove(target, "nodes/a", "archive");
+    expect(calls).toEqual([{ op: "context_move", input: { id: "nodes/a", folder: "archive" } }]);
+    expect(plain()).toContain("nodes/a → nodes/archive/a");
+    expect(closed).toBe(opened);
+  });
+});
+
+describe("existing-document ids on a remote nest (CU-wdqcq046wd)", () => {
+  const doc = { id: "my-node", frontmatter: { title: "My Node" }, body: "Flat body", raw: "raw bytes" };
+
+  it("sends a bare id as typed, so a flat-layout nest finds its root-level node", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: doc };
+    await remoteRead(target, "my-node.md", { raw: true });
+    expect(calls).toEqual([{ op: "context_get", input: { id: "my-node", include_raw: true } }]);
+  });
+
+  it("reduces a contextnest:// URI to its path", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: doc };
+    await remoteRead(target, "contextnest://my-node", { raw: true });
+    expect(calls[0].input.id).toBe("my-node");
+  });
+
+  it("retries a bare id under nodes/ once on a nest that does not resolve it itself", async () => {
+    advertised = new Set(["context_delete"]);
+    replies = {
+      context_delete: (input: { id: string }) => {
+        if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+        return { id: "nodes/a", deleted: true };
+      },
+    };
+    configureSafety({ yes: true }); // delete is destructive: no prompt in tests
+    await remoteDelete(target, "a");
+    expect(calls.map((c) => c.input.id)).toEqual(["a", "nodes/a"]);
+    expect(plain()).toContain("Deleted nodes/a");
+  });
+
+  it("retries with the op's other fields intact (update)", async () => {
+    advertised = new Set(["context_update"]);
+    replies = {
+      context_update: (input: { id: string }) => {
+        if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+        return { id: "nodes/a", version: 2, status: "published" };
+      },
+    };
+    await remoteUpdate(target, "a", { tags: "keep" });
+    expect(calls.map((c) => c.input)).toEqual([
+      { id: "a", tags: ["#keep"] },
+      { id: "nodes/a", tags: ["#keep"] },
+    ]);
+  });
+
+  /** A nest that only knows `nodes/a`, the way an engine before #183 answers a bare id. */
+  const onlyNodesA = (reply: unknown) => (input: { id: string }) => {
+    if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+    return reply;
+  };
+
+  it("retries publish, move and the submit-for-review lookup the same way", async () => {
+    advertised = new Set(["context_publish", "context_move"]);
+    replies = {
+      context_publish: onlyNodesA({ id: "nodes/a", version: 2, checkpoint: 3 }),
+      context_move: onlyNodesA({ id: "nodes/x/a", previous_id: "nodes/a" }),
+    };
+    await remotePublish(target, "a");
+    await remoteMove(target, "a", "x");
+    expect(calls.map((c) => c.input)).toEqual([
+      { id: "a" },
+      { id: "nodes/a" },
+      { id: "a", folder: "x" },
+      { id: "nodes/a", folder: "x" },
+    ]);
+
+    calls = [];
+    advertised = new Set(["context_get", "context_submit_review"]);
+    replies = {
+      context_get: onlyNodesA({ id: "nodes/a", frontmatter: { title: "A" }, body: "" }),
+      context_submit_review: { submitted: true },
+    };
+    await remotePublish(target, "a");
+    expect(calls.map((c) => [c.op, c.input])).toEqual([
+      ["context_get", { id: "a" }],
+      ["context_get", { id: "nodes/a" }],
+      ["context_submit_review", { title: "A" }],
+    ]);
+  });
+
+  it("missing under nodes/ too: reports the id the user typed, not the retried one", async () => {
+    advertised = new Set(["context_get"]);
+    replies = {
+      context_get: (input: { id: string }) => {
+        throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+      },
+    };
+    await expect(remoteRead(target, "ghost", {})).rejects.toThrow("Document not found: ghost");
+    expect(calls.map((c) => c.input.id)).toEqual(["ghost", "nodes/ghost"]);
+  });
+
+  it("refuses a URI pinned to a checkpoint instead of acting on the live document", async () => {
+    advertised = new Set(["context_get"]);
+    const err = await remoteRead(target, "contextnest://my-node@3", {}).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("VALIDATION_FAILED");
+    expect(calls).toEqual([]);
+  });
+
+  it("does not retry an id that already names a folder, nor on any other error", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: new ContextNestError("Document not found: x/a", "DOCUMENT_NOT_FOUND") };
+    await expect(remoteRead(target, "x/a", {})).rejects.toThrow(/not found/);
+    replies = { context_get: new ContextNestError("boom", "INTERNAL") };
+    await expect(remoteRead(target, "a", {})).rejects.toThrow(/boom/);
+    expect(calls.map((c) => c.input.id)).toEqual(["x/a", "a"]);
+  });
+});
+
+// One server-level alias (`<server>/mcp`) standing for every nest behind it.
+describe("<server>/<nest> targets", () => {
+  const server = {
+    alias: "cn",
+    spec: { transport: "http", url: "https://cn.example/mcp" } as RemoteNestSpec,
+  };
+  const nests = [
+    { id: "id-strategy-000", name: "Strategy" },
+    { id: "id-chameleon-00", name: "Chameleon Collective" },
+  ];
+  let dir: string;
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    // Isolates the nest-list cache from the real ~/.contextnest.
+    dir = mkdtempSync(join(tmpdir(), "ctx-nests-"));
+    process.env.CONTEXTNEST_CONFIG_DIR = dir;
+    configureSafety({ yes: true }); // delete is destructive: no prompt in tests
+  });
+  afterEach(() => {
+    delete process.env.CONTEXTNEST_CONFIG_DIR;
+  });
+
+  // r23 slugre: the label was trimmed with `/^-+|-+$/g`, which retries from
+  // every dash of a run that does not end the name: "a" + 100k dashes + "b"
+  // took 11.8 s. Trimmed with a loop now.
+  it("r23 slugre: a nest name with a long run of dashes is labelled in linear time", () => {
+    const started = performance.now();
+    const labels = nestLabels([{ id: "x", name: `a${"-".repeat(100_000)}b` }]);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect([...labels.values()][0]).toBe(`a${"-".repeat(100_000)}b`);
+  });
+
+  it("labels nests by slugged name, disambiguating collisions with the id", () => {
+    const labels = nestLabels([...nests, { id: "abcdef12-zz", name: "strategy" }]);
+    expect([...labels.values()]).toEqual(["strategy-id-strat", "chameleon-collective", "strategy-abcdef12"]);
+  });
+
+  it("sends the resolved nest id with every call to <server>/<nest>", async () => {
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests }, context_delete: { id: "nodes/a", deleted: true } };
+    await remoteDelete({ ...server, alias: "cn/chameleon-collective", nest: "chameleon-collective" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: "id-chameleon-00" } });
+  });
+
+  it("names the available nests when the one asked for doesn't exist", async () => {
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests } };
+    const err = await remoteDelete({ ...server, alias: "cn/nope", nest: "nope" }, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("cn/chameleon-collective");
+    expect(calls.some((c) => c.op === "context_delete")).toBe(false);
+  });
+
+  it("refuses a nest name two nests share, instead of picking the first", async () => {
+    const twins = [
+      { id: "aaaaaaaa-1", name: "Strategy" },
+      { id: "bbbbbbbb-2", name: "Strategy" },
+    ];
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests: twins }, context_delete: { id: "nodes/a", deleted: true } };
+    const err = await remoteDelete({ ...server, alias: "cn/Strategy", nest: "Strategy" }, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("cn/strategy-aaaaaaaa");
+    expect(calls.some((c) => c.op === "context_delete")).toBe(false);
+    // The disambiguated label still works.
+    await remoteDelete({ ...server, alias: "cn/strategy-bbbbbbbb", nest: "strategy-bbbbbbbb" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: "bbbbbbbb-2" } });
+  });
+
+  it("labels fan-out hits with the --vault that addresses their nest", async () => {
+    advertised = new Set(["nest_index", "context_list"]);
+    replies = {
+      nest_index: { nests },
+      context_list: { documents: [{ id: "nodes/p", title: "P", nest: { id: "id-chameleon-00", name: "Chameleon Collective" } }] },
+    };
+    await remoteList(server, { json: true });
+    expect(JSON.parse(plain())[0].vault).toBe("cn/chameleon-collective");
+  });
+
+  it("turns a nest-less write on a server alias into an actionable error", async () => {
+    advertised = new Set(["context_delete"]);
+    // What the server-level endpoint answers when `nest` is missing.
+    replies = {
+      context_delete: new ContextNestError(
+        'MCP error -32602: Invalid arguments for tool context_delete: [{"code":"invalid_type","path":["nest"],"message":"Required"}]',
+        "INTERNAL",
+      ),
+    };
+    const err = await remoteDelete(server, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("--vault cn/<nest>");
+  });
+
+  it("labels query source nodes with their nest too, not just the matches", async () => {
+    advertised = new Set(["nest_index", "context_query"]);
+    replies = {
+      nest_index: { nests },
+      context_query: {
+        documents: [{ id: "nodes/m", title: "M", nest: { id: "id-strategy-000", name: "Strategy" } }],
+        source_nodes: [{ id: "nodes/s", title: "S", nest: { id: "id-chameleon-00", name: "Chameleon Collective" } }],
+      },
+    };
+    await remoteQuery(server, "#x", { json: true });
+    const out = JSON.parse(plain());
+    expect(out.documents[0].vault).toBe("cn/strategy");
+    expect(out.sourceNodes[0].vault).toBe("cn/chameleon-collective");
+  });
+
+  it("serverNests caches the nest list for NEST_INDEX_TTL_MS and refetches after, or when asked fresh", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    const fetches = () => calls.filter((c) => c.op === "nest_index").length;
+    expect(await serverNests("cn", server.spec)).toEqual(nests);
+    expect(await serverNests("cn", server.spec)).toEqual(nests);
+    expect(fetches()).toBe(1); // second call served from ~/.contextnest/cache
+    await serverNests("cn", server.spec, undefined, { fresh: true });
+    expect(fetches()).toBe(2);
+    const now = Date.now;
+    Date.now = () => now() + NEST_INDEX_TTL_MS + 1;
+    try {
+      await serverNests("cn", server.spec);
+    } finally {
+      Date.now = now;
+    }
+    expect(fetches()).toBe(3); // expired
+  });
+
+  it("reaches a nest through the server alias with only that nest's key saved, and signs in with it", async () => {
+    const [strategy, chameleon] = nests;
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", strategy.id), { token: "cnst_strategy" });
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", chameleon.id), { token: "cnst_chameleon" });
+    advertised = new Set(["nest_index", "context_delete"]);
+    // Each nest-scoped key sees only its own nest.
+    nestsByToken = { cnst_strategy: { nests: [strategy] }, cnst_chameleon: { nests: [chameleon] } };
+    replies = { context_delete: { id: "nodes/a", deleted: true } };
+
+    expect(await serverNests("cn", server.spec)).toEqual(nests);
+    await remoteDelete({ ...server, alias: "cn/chameleon-collective", nest: "chameleon-collective" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: chameleon.id } });
+    expect(callTokens.at(-1)).toBe("cnst_chameleon");
+    expect(closed).toBe(opened);
+  });
+
+  it("lists the nests the working keys see when one is revoked; fails only when every key does", async () => {
+    const [strategy, chameleon] = nests;
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", strategy.id), { token: "cnst_strategy" });
+    savedMap = upsertServer(savedMap, nestScopeUrl("https://cn.example", chameleon.id), { token: "cnst_chameleon" });
+    advertised = new Set(["nest_index"]);
+    nestsByToken = { cnst_strategy: { nests: [strategy] }, cnst_chameleon: { nests: [chameleon] } };
+    revokedTokens = new Set(["cnst_strategy"]);
+    expect(await serverNests("cn", server.spec, undefined, { fresh: true })).toEqual([chameleon]);
+    revokedTokens = new Set(["cnst_strategy", "cnst_chameleon"]);
+    await expect(serverNests("cn", server.spec, undefined, { fresh: true })).rejects.toMatchObject({
+      code: "REMOTE_AUTH_FAILED",
+    });
+    expect(closed).toBe(opened);
+  });
+
+  it("keeps a nest list per account: an alias switched to another account never reads the old one", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    await serverNests("cn", server.spec);
+    replies = { nest_index: { nests: [nests[0]] } };
+    const client = { ...server.spec, account: "client" } as RemoteNestSpec;
+    expect(await serverNests("cn", client)).toEqual([nests[0]]);
+  });
+
+  it("uses the server-wide key for a nest with no key of its own, and the alias's account", async () => {
+    savedMap = upsertServer(savedMap, "https://cn.example", { token: "cnst_me" });
+    savedMap = upsertServer(savedMap, "https://cn.example", { token: "cnst_client" }, "client");
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: { nests }, context_delete: { id: "nodes/a", deleted: true } };
+    await remoteDelete({ ...server, alias: "cn/strategy", nest: "strategy" }, "nodes/a");
+    expect(callTokens.at(-1)).toBe("cnst_me");
+    const client = { ...server.spec, account: "client" } as RemoteNestSpec;
+    await remoteDelete({ alias: "cn/strategy", spec: client, nest: "strategy" }, "nodes/a");
+    expect(callTokens.at(-1)).toBe("cnst_client");
+  });
+
+  it("serverNests returns null for a single-nest endpoint (no nest_index)", async () => {
+    advertised = new Set(["context_list"]);
+    expect(await serverNests("one", { transport: "http", url: "https://x/nests/1/mcp" } as RemoteNestSpec)).toBeNull();
+  });
+
+  it("vault list: a <server>/<nest> row per nest after its server; others untouched; dead servers skipped", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(
+      join(dir, "config.yaml"),
+      "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n  one:\n    transport: http\n    url: https://one.example/nests/1/mcp\n",
+    );
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests: [{ ...nests[0], description: "GTM strategy" }, nests[1]] } };
+    const rows = await expandServerVaults([
+      { alias: "cn", kind: "remote", transport: "http", url: "https://cn.example/mcp", isDefault: true },
+      { alias: "one", kind: "remote", transport: "http", url: "https://one.example/nests/1/mcp", isDefault: false },
+    ]);
+    // `one` answers with nest_index too (same fake) — it would expand the same way,
+    // so prove the shape on `cn` and that local/stdio rows are never probed.
+    expect(rows.slice(0, 3)).toMatchObject([
+      { alias: "cn", description: expect.stringMatching(/All 2 nest/) },
+      { alias: "cn/strategy", parent: "cn", description: "GTM strategy", nest: { id: "id-strategy-000" } },
+      { alias: "cn/chameleon-collective", parent: "cn", description: "Chameleon Collective" },
+    ]);
+    advertised = new Set(); // every server now "unreachable"/single-nest
+    const plainRows = await expandServerVaults([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
+    expect(plainRows).toEqual([{ alias: "loc", kind: "local", path: "/v", isDefault: false, exists: true }]);
+  });
+
+  it("vault list never drops nests silently: last known list (marked stale) on a failed probe, a note when there is none", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(
+      join(dir, "config.yaml"),
+      "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n  cold:\n    transport: http\n    url: https://cold.example/mcp\n",
+    );
+    const cn = { alias: "cn", kind: "remote", transport: "http", url: "https://cn.example/mcp", isDefault: true } as const;
+    const cold = { alias: "cold", kind: "remote", transport: "http", url: "https://cold.example/mcp", isDefault: false } as const;
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    await expandServerVaults([cn]); // caches cn's nests
+
+    replies = { nest_index: new ContextNestError("timed out", "REMOTE_UNREACHABLE") };
+    const now = Date.now;
+    Date.now = () => now() + NEST_INDEX_TTL_MS + 1; // cache expired, server now silent
+    let rows;
+    try {
+      rows = await expandServerVaults([cn, cold]);
+    } finally {
+      Date.now = now;
+    }
+    expect(rows).toMatchObject([
+      { alias: "cn", description: expect.stringMatching(/All 2 nest.*didn't answer; nest list may be out of date/) },
+      { alias: "cn/strategy" },
+      { alias: "cn/chameleon-collective" },
+      { alias: "cold", description: expect.stringMatching(/didn't answer; nests not listed/) },
+    ]);
+  });
+
+  it("the nest-less-write rewrite also matches the server's own prose refusal", async () => {
+    advertised = new Set(["context_delete"]);
+    replies = { context_delete: new ContextNestError("This tool requires a `nest` argument. Use nest_index to see available nests.", "INTERNAL") };
+    const err = await remoteDelete(server, "nodes/a").catch((e) => e);
+    expect((err as Error).message).toContain("--vault cn/<nest>");
+  });
+
+  // QA ticket CU-wdqcq02qyd, area 8: an offline server must not cost a
+  // timeout on every prompt the plugin lists vaults for.
+  it("remembers a failed probe for NEST_PROBE_BACKOFF_MS instead of retrying every listing", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: new ContextNestError("connect ECONNREFUSED", "REMOTE_UNREACHABLE") };
+    const fetches = () => calls.filter((c) => c.op === "nest_index").length;
+    await expect(serverNests("cn", server.spec)).rejects.toThrow(/ECONNREFUSED/);
+    replies = { nest_index: { nests } }; // server is back, but the backoff holds
+    await expect(serverNests("cn", server.spec)).rejects.toThrow(/unreachable less than/);
+    expect(fetches()).toBe(1);
+    const now = Date.now;
+    Date.now = () => now() + NEST_PROBE_BACKOFF_MS + 1;
+    try {
+      expect(await serverNests("cn", server.spec)).toEqual(nests); // backoff over: probes again
+    } finally {
+      Date.now = now;
+    }
+    expect(fetches()).toBe(2);
+  });
+
+  it("a command naming a nest probes inside the backoff; only listings wait it out", async () => {
+    advertised = new Set(["nest_index", "context_delete"]);
+    replies = { nest_index: new ContextNestError("connect ECONNREFUSED", "REMOTE_UNREACHABLE") };
+    await expect(serverNests("cn", server.spec)).rejects.toThrow(/ECONNREFUSED/);
+    replies = { nest_index: { nests }, context_delete: { id: "nodes/a", deleted: true } };
+    await remoteDelete({ ...server, alias: "cn/strategy", nest: "strategy" }, "nodes/a");
+    expect(calls.at(-1)).toEqual({ op: "context_delete", input: { id: "nodes/a", nest: "id-strategy-000" } });
+  });
+
+  it("a live connection ignores a remembered failure (the server is evidently back)", async () => {
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: new ContextNestError("timeout", "REMOTE_UNREACHABLE") };
+    await expect(serverNests("cn", server.spec)).rejects.toThrow();
+    replies = { nest_index: { nests } };
+    const conn = { toolNames: async () => advertised, run: async () => replies.nest_index, close: async () => {} } as any;
+    expect(await serverNests("cn", server.spec, conn)).toEqual(nests);
+    expect(await serverNests("cn", server.spec)).toEqual(nests); // and the success replaced the marker
+  });
+
+  it("vault list leaves the caller's entries untouched", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(join(dir, "config.yaml"), "vaults: {}\nremotes:\n  cn:\n    transport: http\n    url: https://cn.example/mcp\n");
+    advertised = new Set(["nest_index"]);
+    replies = { nest_index: { nests } };
+    const input = [{ alias: "cn", kind: "remote" as const, transport: "http" as const, url: "https://cn.example/mcp", isDefault: true }];
+    const rows = await expandServerVaults(input);
+    expect(rows[0].description).toMatch(/All 2 nest/);
+    expect(input[0]).not.toHaveProperty("description");
+  });
+});
+
+// QA ticket CU-wdqcq02qyd, areas 5 and 7.
+describe("remote read --raw and empty --tags", () => {
+  it("read --raw rebuilds a valid frontmatter + body file when the nest sends no raw", async () => {
+    advertised = new Set(["context_get"]);
+    replies = {
+      context_get: {
+        id: "nodes/a",
+        frontmatter: { title: "A Doc", type: "document", tags: ["#x"], description: undefined },
+        body: "# A\n\nBody text.",
+      },
+    };
+    await remoteRead(target, "nodes/a", { raw: true });
+    const out = plain();
+    expect(out).toMatch(/^---\ntitle: A Doc\ntype: document\ntags:\n  - '#x'\n---\n/);
+    expect(out).toContain("Body text.");
+    const { parseDocument } = await import("@promptowl/contextnest-engine");
+    const round = parseDocument("nodes/a.md", out, "nodes/a");
+    expect(round.frontmatter.title).toBe("A Doc");
+    expect(round.body.trim()).toBe("# A\n\nBody text.");
+  });
+
+  it("read --raw prints the nest's own raw when it sends one", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: { id: "nodes/a", frontmatter: { title: "A" }, body: "b", raw: "---\ntitle: A\n---\nverbatim" } };
+    await remoteRead(target, "nodes/a", { raw: true });
+    expect(plain()).toBe("---\ntitle: A\n---\nverbatim");
+  });
+
+  it('--tags "" sends an empty set: it removes every tag (replace semantics, documented in --help)', async () => {
+    advertised = new Set(["context_update"]);
+    replies = { context_update: { id: "nodes/a", version: 2, status: "published" } };
+    await remoteUpdate(target, "nodes/a", { tags: "" });
+    expect(calls).toEqual([{ op: "context_update", input: { id: "nodes/a", tags: [] } }]);
   });
 });

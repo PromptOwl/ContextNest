@@ -15,8 +15,11 @@ import type {
   ClientMetadata,
   ContextNode,
   Frontmatter,
+  IntegrityFailure,
+  PdfMeta,
   SkillMeta,
   SourceMeta,
+  ViewMeta,
 } from "../types.js";
 import {
   serializeDocument,
@@ -25,17 +28,55 @@ import {
   normalizeStatus,
   isRejected,
   isPublished,
+  isForgotten,
   explicitStatus,
   parseDocument,
 } from "../parser.js";
-import { Resolver } from "../resolver.js";
-import { normalizeDocumentId, assertSafeDocumentId } from "../storage.js";
+import {
+  forgetDocument,
+  forgetLog,
+  deleteDocumentWithTombstone,
+  applyImportedTombstones,
+  assertNotForgotten,
+} from "../forget.js";
+import { addTombstone, buildTombstoneIndex, expandsWithin, isPathForgotten } from "../tombstones.js";
+import yaml from "js-yaml";
+import { Resolver, exactSeeds } from "../resolver.js";
+import { parseSearchConfig, type SearchConfig, type SearchMode } from "../semantic/config.js";
+import { createEmbeddingProvider, createReranker } from "../semantic/providers.js";
+import { INTERACTIVE_CALL } from "../semantic/bedrock.js";
+import { EmbeddingStore, purgeEmbeddings } from "../semantic/embedding-store.js";
+import { buildEmbeddings, rerankHits, semanticSearch, type RankedHit } from "../semantic/hybrid.js";
+import { annotateIntegrity } from "../graph-query-engine.js";
+import {
+  normalizeDocumentId,
+  assertSafeDocumentId,
+  assertWritableDocumentId,
+  assertWritableDocumentPath,
+  assertNotMachineryPath,
+  assertResolvesOutsideMachinery,
+  NON_DOCUMENT_BASENAMES,
+  isUnreadableDocumentError,
+} from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
-import { ContextNestError, RejectedDocumentError } from "../errors.js";
+import {
+  ContextNestError,
+  ForgottenDocumentError,
+  RejectedDocumentError,
+} from "../errors.js";
+import { sha256Bytes } from "../integrity.js";
+import {
+  DEFAULT_PDF_MAX_BYTES,
+  PDF_EXTRACTOR,
+  extractPdf,
+  pdfExtractorVersion,
+  type PdfExtraction,
+} from "../importers/pdf.js";
+import { pdfSidecarPath } from "../pdf-nodes.js";
 import {
   buildInstallManifest,
   renderSkill,
@@ -45,14 +86,49 @@ import {
   type InstallScope,
 } from "../skills.js";
 import { applyTypedBlocks } from "../typed-blocks.js";
-import { mapInBatches } from "../concurrency.js";
+import { mapInBatches, VAULT_IO_CONCURRENCY } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
+import { currentReviewProposal, stageReviewHold } from "../review.js";
+import { TITLE_MAX_LENGTH } from "../schemas.js";
 import {
   isVersionArtifactPath,
   planImportPaths,
   sanitizeImportedFrontmatter,
 } from "../import-hygiene.js";
-import type { OperationContext, OperationExecutor } from "./context.js";
+import {
+  checkDeleteDocument,
+  checkDocument,
+  checkUpdate,
+  compileStructure,
+  describeStructure,
+  structureView,
+  enforceStructure,
+  resolveFolder,
+  type CompiledStructure,
+  type StructureDoc,
+  comparableSegment,
+} from "../structure.js";
+import {
+  assertStructureDelete,
+  enforcedStructure,
+  missingFolders,
+  assertStructurePublish,
+  isEnforced,
+  scaffoldFolders,
+  structureReport,
+} from "../structure-store.js";
+import { ioConcurrency, readIfExists, type OperationContext, type OperationExecutor } from "./context.js";
+import {
+  archiveReplacedPdf,
+  historyMember,
+  importedDoc,
+  importRefusals,
+  importReplayBudget,
+  storeOwner,
+  versionsArtifact,
+  isChainEventLog,
+} from "./import-verdicts.js";
+import { isDeepStrictEqual } from "node:util";
 
 /** Community/engine cap on graph traversal depth (community MAX_HOPS). */
 const MAX_HOPS = 10;
@@ -72,6 +148,12 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     ...(node.frontmatter.type === "source" && node.frontmatter.source
       ? { source: node.frontmatter.source }
       : {}),
+    ...(node.frontmatter.type === "pdf" && node.frontmatter.pdf
+      ? { pdf: node.frontmatter.pdf }
+      : {}),
+    // Before the body, so an agent reading the payload top-down meets the
+    // warning first. Present only when verification failed.
+    ...(node.integrity ? { integrity: node.integrity } : {}),
     ...(includeBody ? { body: node.body } : {}),
     ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
@@ -148,8 +230,8 @@ async function resolveId(
       "VALIDATION_FAILED",
     );
   }
-  if (sel.id) return sanitizeId(sel.id);
-  if (sel.uri) return sanitizeId(parseUri(sel.uri).path);
+  if (sel.id) return givenId(ctx, sanitizeId(sel.id));
+  if (sel.uri) return givenId(ctx, sanitizeId(parseUri(sel.uri).path));
   // includeRetired, or a title lookup cannot see a rejected document at all and
   // falls through to the slug guess below — which quietly resolves to whatever
   // sits at that slug, or to nothing for a doc created with a custom id. The
@@ -160,6 +242,34 @@ async function resolveId(
   );
   if (match) return match.id;
   return normalizeDocumentId(requireSlug(String(sel.title)));
+}
+
+/**
+ * A caller's id is used as given when a document is there (flat-layout ids
+ * carry no nodes/ prefix). A bare one that names none is the id create gave
+ * it — normalizeDocumentId roots it under nodes/ — when that one exists.
+ */
+async function givenId(ctx: OperationContext, id: string): Promise<string> {
+  // Validated before anything is read for it: an id that is refused never
+  // reaches the file system (nor answers with its path).
+  assertSafeDocumentId(id);
+  if (id.includes("/")) return id;
+  // A bare id names the vault root, where README.md, CLAUDE.md, CONTEXT.md …
+  // are scaffold, never documents — `readme` must not resolve to (and an
+  // update must not rewrite) one of them, whatever its case. A root file that
+  // will not read is no reason to miss the nodes/ one either.
+  const file = `${id}.md`.toLowerCase();
+  const scaffold = file === "context.md" || [...NON_DOCUMENT_BASENAMES].some((b) => b.toLowerCase() === file);
+  if (!scaffold && (await readIfExists(ctx, id).catch(() => null))) return id;
+  // One that is there but will not read (its own YAML, frontmatter or
+  // encryption) is still the one named: the op reports why, rather than a
+  // not-found for the bare id. A vault-level failure still throws here.
+  const rooted = `nodes/${id}`;
+  const found = await readIfExists(ctx, rooted).catch((err) => {
+    if (isUnreadableDocumentError(err)) return true;
+    throw err;
+  });
+  return found ? rooted : id;
 }
 
 /**
@@ -188,6 +298,29 @@ function assertValid(node: ContextNode): void {
   }
 }
 
+// ─── Structure rules (§11.1.1, structure.ts) ─────────────────────────────────
+
+/**
+ * The vault's ENFORCED structure rules, or null: report-only and absent rules
+ * change nothing about a write, and a trusted host restoring a vault skips
+ * them (`OperationContext.structure`). Read per write, so a bad rule in an
+ * enforced vault refuses the write with CONFIG_ERROR and never a read.
+ */
+async function structureRules(ctx: OperationContext): Promise<CompiledStructure | null> {
+  if (ctx.structure === "skip") return null;
+  return enforcedStructure(ctx.storage);
+}
+
+const structureDoc = (node: ContextNode): StructureDoc => structureView(node.id, node);
+
+/** An error's message with the vault's location cut out: callers see vault paths only. */
+const vaultError = (ctx: OperationContext, err: unknown) =>
+  (err instanceof Error ? err.message : String(err))
+    .split(ctx.storage.root)
+    .join(".")
+    .split(ctx.storage.root.replace(/\\/g, "/"))
+    .join(".");
+
 /** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
 async function publishAndIndex(
   ctx: OperationContext,
@@ -199,11 +332,13 @@ async function publishAndIndex(
     editedBy: ctx.actor ?? "engine",
     ...(note ? { note } : {}),
     ...(client ? { client } : {}),
+    ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
   });
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
-  // mcp-server/CLI both regenerate here.
-  await ctx.storage.regenerateIndex();
+  // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
+  // INDEX.md needs rewriting.
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
   return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
 }
 
@@ -237,7 +372,12 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
     client: input.client,
   });
   const budget = input.max_tokens ?? 8000;
-  const documents: Array<{ id: string; frontmatter: Frontmatter; body: string }> = [];
+  const documents: Array<{
+    id: string;
+    frontmatter: Frontmatter;
+    integrity?: IntegrityFailure;
+    body: string;
+  }> = [];
   let tokens = 0;
   let truncated = false;
   for (const d of result.documents) {
@@ -247,7 +387,12 @@ const resolve: OperationExecutor = async (ctx, input: any) => {
       break;
     }
     tokens += cost;
-    documents.push({ id: d.id, frontmatter: d.frontmatter, body: d.body });
+    documents.push({
+      id: d.id,
+      frontmatter: d.frontmatter,
+      ...(d.integrity ? { integrity: d.integrity } : {}),
+      body: d.body,
+    });
   }
   return { documents, tokens_used: tokens, truncated };
 };
@@ -269,16 +414,170 @@ const search: OperationExecutor = async (ctx, input: any) => {
   // intersection/union walk the left side first, so
   // `type:document + contextnest://search/foo` comes back in discovery order.
   const query = String(input.query).trim();
-  if (!query) return { results: [], total: 0 };
+  if (!query) return { results: [], count: 0, total: 0, mode: "lexical" };
+  const config = await ctx.storage.readConfig();
+  const searchCfg = parseSearchConfig(config?.search);
   const docs = await ctx.storage.discoverDocuments();
-  const hits = new Resolver({ documents: docs })
-    .search(query)
-    .filter((h) => isPublished(h.document));
+  const { mode, store } = await chooseSearchMode(ctx, input.mode, searchCfg);
+
+  // Rerank sends decrypted text to a third party: not from a sealed vault.
+  if (input.rerank && (await ctx.storage.isEncrypted())) {
+    throw new ContextNestError(
+      "rerank is not supported on an encrypted vault: it would send decrypted content to the reranker",
+      "VALIDATION_FAILED",
+    );
+  }
+  if (input.rerank && !searchCfg.rerank) {
+    throw new ContextNestError(
+      "rerank needs a `search.rerank` block (provider + model) in .context/config.yaml",
+      "VALIDATION_FAILED",
+    );
+  }
+  const reranker = input.rerank && searchCfg.rerank ? createReranker(searchCfg.rerank, INTERACTIVE_CALL) : undefined;
+  const rerankTopN = searchCfg.rerank?.top_n;
+  const rerankOpts = {
+    unit: searchCfg.rerank?.unit,
+    maxPassages: searchCfg.rerank?.max_passages,
+    batchSize: searchCfg.rerank?.batch_size,
+  };
+
+  let hits: RankedHit[];
+  let stale: number | undefined;
+  if (mode === "lexical") {
+    const lexical = new Resolver({
+      documents: docs,
+      fullMatchFirst: searchCfg.full_match_first,
+      fieldBoosts: searchCfg.field_boosts,
+      coordination: searchCfg.coordination,
+    })
+      .search(query)
+      .filter((h) => isPublished(h.document));
+    // The resolver already put exact title/#tag matches first; flag them so
+    // a rerank keeps them pinned.
+    const seeds = new Set(exactSeeds(query, lexical.map((h) => h.document)));
+    hits = lexical.map((h) => ({
+      document: h.document,
+      score: h.score,
+      scores: { lexical: h.score },
+      ...(seeds.has(h.document.id) ? { seed: true } : {}),
+    }));
+    if (reranker) {
+      hits = await rerankHits(query, hits, reranker, {
+        ...rerankOpts,
+        topN: rerankTopN,
+        maxChars: searchCfg.embeddings?.max_chars,
+      });
+    }
+  } else {
+    const out = await semanticSearch(query, {
+      mode,
+      docs,
+      store: store!,
+      provider: createEmbeddingProvider(searchCfg.embeddings!, INTERACTIVE_CALL),
+      candidates: searchCfg.candidates,
+      fullMatchFirst: searchCfg.full_match_first,
+      fieldBoosts: searchCfg.field_boosts,
+      coordination: searchCfg.coordination,
+      fusionWeights: searchCfg.fusion_weights,
+      maxChars: searchCfg.embeddings!.max_chars,
+      reranker,
+      rerankTopN,
+      rerank: rerankOpts,
+    });
+    hits = out.hits.filter((h) => isPublished(h.document));
+    stale = out.stale;
+  }
   const kept = input.limit ? hits.slice(0, input.limit) : hits;
   return {
-    results: kept.map((h) => ({ ...toSummary(h.document), score: h.score })),
+    results: kept.map((h) => ({
+      ...toSummary(h.document),
+      score: h.score,
+      scores: h.scores,
+      ...(h.passage !== undefined ? { passage: h.passage } : {}),
+    })),
+    // Counted before the `limit` slice. `total` is the deprecated alias.
+    count: hits.length,
     total: hits.length,
+    mode,
+    ...(stale !== undefined ? { embeddings_stale: stale } : {}),
   };
+};
+
+/**
+ * Which mode a search runs in. An explicit `mode` is honoured or refused with
+ * the fix; with none, `search.mode` from config applies ONLY once an index
+ * exists — a vault that opted into hybrid but never ran `ctx embed` keeps
+ * working, lexically. Default: lexical.
+ */
+async function chooseSearchMode(
+  ctx: Parameters<OperationExecutor>[0],
+  requested: SearchMode | undefined,
+  cfg: SearchConfig,
+): Promise<{ mode: SearchMode; store?: EmbeddingStore }> {
+  const wanted = requested ?? cfg.mode ?? "lexical";
+  if (wanted === "lexical") return { mode: "lexical" };
+  if (!cfg.embeddings) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" needs a \`search.embeddings\` block (provider + model) in .context/config.yaml`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // context_embed refuses sealed vaults; an index left from before the vault
+  // was encrypted must not keep serving a plaintext-derived copy.
+  if (await ctx.storage.isEncrypted()) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" is not supported on an encrypted vault (embeddings are a plaintext-derived copy)`,
+      "VALIDATION_FAILED",
+    );
+  }
+  const e = cfg.embeddings;
+  const store = await EmbeddingStore.load(ctx.storage.root, e.provider, e.model, e.dimensions);
+  if (store.size === 0) {
+    if (!requested) return { mode: "lexical" };
+    throw new ContextNestError(
+      `mode "${wanted}" needs an embedding index — run \`ctx embed\` (MCP: context_embed) first`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return { mode: wanted, store };
+}
+
+const embed: OperationExecutor = async (ctx, input: any) => {
+  const config = await ctx.storage.readConfig();
+  const cfg = parseSearchConfig(config?.search);
+  if (!cfg.embeddings) {
+    throw new ContextNestError(
+      "No `search.embeddings` block (provider + model) in .context/config.yaml — nothing to embed with",
+      "VALIDATION_FAILED",
+    );
+  }
+  // Vectors leak content. An encrypted vault seals its documents at rest, so
+  // it must not grow a plaintext semantic copy of them beside the ciphertext.
+  if (await ctx.storage.isEncrypted()) {
+    throw new ContextNestError(
+      "Embeddings are not supported on an encrypted vault: the index would store a plaintext-derived copy of sealed content",
+      "VALIDATION_FAILED",
+    );
+  }
+  const e = cfg.embeddings;
+  const store = await EmbeddingStore.load(ctx.storage.root, e.provider, e.model, e.dimensions);
+  const docs = await ctx.storage.discoverDocuments();
+  return buildEmbeddings(docs, store, createEmbeddingProvider(e), {
+    rebuild: input.rebuild === true,
+    batchSize: e.batch_size,
+    maxChars: e.max_chars,
+    maxRequestChars: e.max_request_chars,
+    // Under the vault lock, and only rows that still match a published
+    // document: a forget/delete/edit that ran while we embedded wins.
+    save: () =>
+      withVaultLock(ctx.storage.root, async () => {
+        store.retainCurrent(await ctx.storage.discoverDocuments(), e.max_chars);
+        await store.save();
+      }),
+    onProgress: ctx.onProgress,
+  });
 };
 
 const get: OperationExecutor = async (ctx, input: any) => {
@@ -291,9 +590,20 @@ const get: OperationExecutor = async (ctx, input: any) => {
   // Surfaces that let a steward see and revive a retired document opt out —
   // reading one is not the same as republishing it.
   if (isRejected(node) && !input.allow_rejected) throw new RejectedDocumentError(node.id);
+  // Served, never refused: a document that fails verification is still the one
+  // asked for. The verdict tells the agent not to trust its values.
+  //
+  // Runs on the verify_checksum path too. There, a drifted live file is
+  // replaced by the last-approved keyframe (+ pendingChange); the verdict then
+  // checks what is actually served: the body check runs on the keyframe's own
+  // bytes (clean unless the keyframe itself was altered), and the chain check
+  // still catches a corrupted history behind it. With no keyframe to fall back
+  // to, the drifted live node is served and body_drift is reported.
+  const integrity = await ctx.storage.verifyServedDocument(node);
   return {
     id: node.id,
     frontmatter: node.frontmatter,
+    ...(integrity ? { integrity } : {}),
     body: node.body,
     ...(input.include_raw ? { raw: node.rawContent } : {}),
     ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
@@ -312,6 +622,9 @@ const list: OperationExecutor = async (ctx, input: any) => {
     ...(input.recursive !== undefined ? { recursive: input.recursive } : {}),
   });
   const kept = filterDocuments(docs, { ...input, includeRetired: input.include_retired });
+  // `full` serves bodies, so it gets the same integrity verdict as every other
+  // body-serving path. Summary mode (no body) stays cheap: nothing is hashed.
+  if (input.full === true) await annotateIntegrity(ctx.storage, kept);
   return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
 };
 
@@ -371,6 +684,7 @@ function buildDraftNode(input: {
   inputs?: SkillMeta["inputs"];
   guard_rails?: string[];
   source?: SourceMeta;
+  view?: ViewMeta;
 }): ContextNode {
   const now = new Date().toISOString();
   const folderSegments = String(input.folder ?? "")
@@ -395,12 +709,13 @@ function buildDraftNode(input: {
     // updated_at until its first edit, and every surface renders it blank.
     updated_at: now,
   };
-  // `source` and `skill` are required by one type and forbidden on the others,
+  // `source`, `skill` and `view` are required by one type and forbidden on the others,
   // so they cannot ride along inside `metadata` and cannot be added afterwards
   // — a source node written without its block fails every later update.
   applyTypedBlocks(frontmatter, {
     type,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -418,23 +733,51 @@ const create: OperationExecutor = async (ctx, input: any) => {
       "VALIDATION_FAILED",
     );
   }
-  const node = buildDraftNode({ ...input, content });
+  // Held for review (review.ts): an unpublished node is simply written as
+  // pending_review. An explicit publish:true wins — the flag is the caller's
+  // per-call override (`ctx add --publish`).
+  // A create publishes whatever `status` it names, so any status is held — as
+  // pending_review, the one status approval releases (an explicit `published`
+  // left in would land marked published with no version). A rejected create
+  // never publishes, so there is nothing to hold.
+  const hold = input.review === true && input.publish !== true && input.status !== "rejected";
+  const node = buildDraftNode({
+    ...input,
+    content,
+    ...(hold ? { status: "pending_review" } : {}),
+  });
   // A rejected node cannot be published — publish refuses one by design. Left
   // to fall through, the write below lands and publish then throws, stranding a
   // file on disk with no version and no history, and making the caller's retry
   // fail with DOCUMENT_ALREADY_EXISTS for a create it believes never happened.
   // Refuse before anything is written.
-  const publish = node.frontmatter.status === "rejected" ? false : input.publish !== false;
+  const publish = node.frontmatter.status === "rejected" || hold ? false : input.publish !== false;
   // Publish assigns the version (spec §6), so a published node must go to disk
   // WITHOUT one — pre-setting it makes the first published version 2 and leaves
   // no v1 keyframe. A draft never reaches publish, so it needs its own v1.
-  if (!publish) node.frontmatter.version = 1;
+  // A held node is left unversioned instead, so approving it publishes v1.
+  if (!publish && !hold) node.frontmatter.version = 1;
   const createdStatus = node.frontmatter.status;
   assertValid(node);
+  assertWritableDocumentId(node.id);
+  // Structure rules (§11.1.1), before anything is written — held writes too.
+  const rules = await structureRules(ctx);
+  if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
+  // Refused BEFORE the write, for the same stranded-file reason as rejected:
+  // a path a forget retired, or a body matching erased
+  // content, never takes content again (§6.3.4).
+  await assertNotForgotten(ctx.storage, node);
+  // A held create is not scaffolded now — nothing beyond the held write lands
+  // before a human approves it; its first publish scaffolds (publishDocument).
+  // Scaffolded here, not left to the publish, because a draft (`publish:
+  // false`) is never published; for a publishing create the publish's own
+  // pass finds everything already in place.
+  const created = rules && !hold ? await missingFolders(ctx.storage, node.id) : null;
   // Exclusive write: atomically refuses to clobber an existing doc (mirrors OSS
   // create_document) — no TOCTOU window, and blocks resurrecting a rejected doc
   // the way the pre-check + separate write could race.
   await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
+  if (rules && created) await scaffoldFolders(ctx.storage, rules, created);
   // Governed callers create the node WITHOUT publishing: the write has to clear
   // review before it becomes retrievable. Still regenerate the index so the
   // draft is discoverable to the surfaces that list drafts.
@@ -445,6 +788,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
       version: node.frontmatter.version ?? 1,
       status: createdStatus,
       checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
     };
   }
   const result = await publishAndIndex(ctx, node.id, input.note, input.client);
@@ -468,10 +812,23 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // `nodes/`, which silently redirects every id from a flat-layout vault (they
   // carry no prefix) to a document that doesn't exist. The storage layer
   // already resolves an id for its own layout — all this has to do is refuse
-  // one that would escape the vault root.
-  const id: string = input.id;
-  assertSafeDocumentId(id);
-  const existing = await ctx.storage.readDocument(id);
+  // one that would escape the vault root, and find a bare id where create put it.
+  // An update writes the file before any publish, so a reserved path
+  // (§11.1.1: `.versions/`, `_suggestions/`, the root `packs/`) is refused
+  // here, not left to the publish guard after the edit has landed — and
+  // before the id is resolved, so nothing is read for an id that is refused.
+  await assertWritableDocumentPath(ctx.storage.root, String(input.id));
+  const id: string = await givenId(ctx, String(input.id));
+  if (id !== input.id) await assertWritableDocumentPath(ctx.storage.root, id);
+  const live = await ctx.storage.readDocument(id);
+  // Held for review (review.ts). An edit to a PUBLISHED node must not touch
+  // the canonical file — it is staged as a suggestion instead — and it builds
+  // on the node's current held proposal, if any, so a second held edit carries
+  // the first rather than silently dropping it on approval.
+  const hold = input.review === true && input.publish !== true;
+  const holdAsSuggestion = hold && isPublished(live);
+  const proposal = holdAsSuggestion ? await currentReviewProposal(ctx.storage, id) : null;
+  const existing = proposal ? parseDocument(live.filePath, proposal.proposedRaw, id) : live;
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
   // rejects (no version/checksum/history). Reviving one — moving it to some
@@ -480,6 +837,21 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // of a document that stays rejected.
   if (isRejected(existing) && (input.status === undefined || input.status === "rejected")) {
     throw new RejectedDocumentError(id);
+  }
+  // A forgotten stub never takes content again, under any status (§6.3.4).
+  if (isForgotten(existing)) throw new ForgottenDocumentError(id);
+  // A pdf node's body is the text extracted from its binary; hand-editing it
+  // would leave the two disagreeing under one sealed version. The binary is the
+  // source of truth, so the way to change the text is a new PDF.
+  if (
+    existing.frontmatter.type === "pdf" &&
+    (resolveContentAlias(input) !== undefined || typeof input.append === "string")
+  ) {
+    throw new ContextNestError(
+      `${id} is a PDF node: its body is the text extracted from the PDF and cannot be edited directly. ` +
+        "Import a new version of the PDF instead (context_import_pdf with this id / `ctx import pdf <file> --id <id>`).",
+      "VALIDATION_FAILED",
+    );
   }
   const frontmatter: Frontmatter = { ...existing.frontmatter };
   // A rename leaves the id alone, so this is the id-free rule, not create's
@@ -490,7 +862,17 @@ const update: OperationExecutor = async (ctx, input: any) => {
     assertUsableTitle(String(input.title));
     frontmatter.title = input.title;
   }
-  if (input.status) frontmatter.status = input.status as Frontmatter["status"];
+  // Under a hold an explicit `published` is what the hold defers, not a status
+  // to write — applied, an unpublished node would read published, unversioned.
+  if (input.status && !(hold && input.status === "published")) {
+    frontmatter.status = input.status as Frontmatter["status"];
+  }
+  // An unpublished node held for review is marked as such (a staged edit to a
+  // published node keeps its status: the proposal is what approval publishes).
+  // A rejected node stays rejected unless the caller asked to revive it.
+  else if (hold && !holdAsSuggestion && (input.status === "published" || frontmatter.status !== "rejected")) {
+    frontmatter.status = "pending_review";
+  }
   // An empty string CLEARS the description, the same convention `metadata`
   // uses for null: over a JSON wire an absent key cannot be told apart from
   // "leave this alone", so without it a caller has no way to remove one.
@@ -522,6 +904,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   applyTypedBlocks(frontmatter, {
     type: nextType,
     ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.view !== undefined ? { view: input.view } : {}),
     ...(input.trigger !== undefined ? { trigger: input.trigger } : {}),
     ...(input.tools_required !== undefined ? { tools_required: input.tools_required } : {}),
     ...(input.output_format !== undefined ? { output_format: input.output_format } : {}),
@@ -547,7 +930,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   // mutated and its checksum dropped. The derived default already lands here;
   // this makes it true of the explicit flag too.
   const publish =
-    frontmatter.status === "rejected"
+    frontmatter.status === "rejected" || hold
       ? false
       : (input.publish ?? !(input.status && UNPUBLISHED_STATUSES.has(input.status)));
   // Only an unpublished write may carry a caller-assigned version: publish
@@ -556,6 +939,36 @@ const update: OperationExecutor = async (ctx, input: any) => {
   if (!publish && input.version !== undefined) frontmatter.version = input.version;
   const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
   assertValid(node);
+  // Grandfathered (§11.1): only what this edit newly breaks is refused.
+  const rules = await structureRules(ctx);
+  if (rules) enforceStructure(rules, checkUpdate(rules, structureDoc(existing), structureDoc(node)));
+  // A publishing edit is judged as its publish will be — a never-published
+  // document in full — BEFORE the file is written, so a refusal leaves no edit behind.
+  if (rules && publish) await assertStructurePublish(ctx.storage, rules, node);
+  if (holdAsSuggestion && frontmatter.status !== "rejected") {
+    const staged = await stageReviewHold(ctx.storage, {
+      documentId: id,
+      proposedRawContent: serializeDocument(node),
+      actor: ctx.actor ?? "engine",
+      ...(live.frontmatter.zone ? { zone: live.frontmatter.zone } : {}),
+      docTier: live.frontmatter.governance ?? "standard",
+      ...(input.note ? { note: input.note } : {}),
+      supersedes: proposal ? [proposal.suggestionId] : [],
+    });
+    if (staged) {
+      return {
+        id,
+        version: live.frontmatter.version ?? 1,
+        status: "pending_review",
+        checkpoint: null,
+        held_for_review: true,
+        suggestion_id: staged.suggestionId,
+      };
+    }
+    // No version history to diff against (a hand-marked "published" file that
+    // was never sealed): fall back to an in-place pending write.
+    node.frontmatter.status = "pending_review";
+  }
   await ctx.storage.writeDocument(id, serializeDocument(node));
   if (!publish) {
     await ctx.storage.regenerateIndex();
@@ -564,6 +977,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
       version: frontmatter.version ?? 1,
       status: frontmatter.status ?? "draft",
       checkpoint: null,
+      ...(hold ? { held_for_review: true } : {}),
     };
   }
   const result = await publishAndIndex(ctx, id, input.note, input.client);
@@ -572,14 +986,16 @@ const update: OperationExecutor = async (ctx, input: any) => {
 
 const publish: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  // publishDocument guards rejected docs and seals a checkpoint; regenerate the
-  // index so graph-mode reads see the freshly-published node (same as create/update).
+  // publishDocument guards rejected docs, judges the structure rules (§11.1.1)
+  // and seals a checkpoint; regenerate the index so graph-mode reads see the
+  // freshly-published node (same as create/update).
   const result = await publishDocument(ctx.storage, id, {
     editedBy: ctx.actor ?? "engine",
     ...(input.note ? { note: input.note } : {}),
     ...(input.client ? { client: input.client } : {}),
+    ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
   });
-  await ctx.storage.regenerateIndex();
+  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
   return {
     id,
     version: result.versionEntry.version,
@@ -590,13 +1006,60 @@ const publish: OperationExecutor = async (ctx, input: any) => {
 
 const del: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
-  // Read the title BEFORE removing the file — callers report what they deleted,
-  // and after the delete there is nothing left to ask.
-  const { frontmatter } = await ctx.storage.readDocument(id);
-  // deleteDocument throws DOCUMENT_NOT_FOUND when the id doesn't exist.
-  await ctx.storage.deleteDocument(id);
+  // A required file (§11.1.1) goes last: not while its folder holds anything else.
+  if (ctx.structure !== "skip") await assertStructureDelete(ctx.storage, id);
+  // Reads the title BEFORE removing the file (callers report what they
+  // deleted) and throws DOCUMENT_NOT_FOUND when the id doesn't exist. Unless
+  // `purge` is set, leaves an audit-only record of who deleted it and why
+  // (§6.3.4) — it refuses nothing; use forget to erase.
+  const result = await deleteDocumentWithTombstone(ctx.storage, id, {
+    reasonCode: input.reason_code ?? "user_request",
+    deletedBy: ctx.actor ?? "engine",
+    ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
+    ...(input.purge ? { purge: true } : {}),
+  });
+  await purgeEmbeddings(ctx.storage.root, [id]);
   await ctx.storage.regenerateIndex();
-  return { id, title: frontmatter.title, deleted: true as const };
+  return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
+};
+
+const forget: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const result = await forgetDocument(ctx.storage, id, {
+    reasonCode: input.reason_code,
+    forgottenBy: ctx.actor ?? "engine",
+    ...(input.requested_by ? { requestedBy: input.requested_by } : {}),
+    ...(input.client ? { client: input.client } : {}),
+  });
+  await purgeEmbeddings(ctx.storage.root, [id]);
+  await ctx.storage.regenerateIndex();
+  return {
+    id: result.id,
+    versions: result.versions,
+    stub_version: result.stubVersion,
+    checkpoint: result.checkpoint,
+  };
+};
+
+const forgetLogExec: OperationExecutor = async (ctx, input: any) => {
+  const id = input?.id ? await givenId(ctx, sanitizeId(String(input.id))) : undefined;
+  const records = await forgetLog(ctx.storage, id);
+  return {
+    events: records.map((r) => ({
+      event_id: r.event_id,
+      document_id: r.document_id,
+      scope: r.scope,
+      mode: r.mode,
+      versions: r.versions,
+      reason_code: r.reason_code,
+      forgotten_by: r.forgotten_by,
+      forgotten_at: r.forgotten_at,
+      ...(r.requested_by ? { requested_by: r.requested_by } : {}),
+      ...(r.stub_version !== undefined ? { stub_version: r.stub_version } : {}),
+      ...(r.checkpoint !== undefined ? { checkpoint: r.checkpoint } : {}),
+      erased_hashes: r.content_hashes.length + r.body_hashes.length + r.pdf_hashes.length,
+    })),
+  };
 };
 
 const versions: OperationExecutor = async (ctx, input: any) => {
@@ -626,6 +1089,15 @@ const versions: OperationExecutor = async (ctx, input: any) => {
         content_hash: v.content_hash,
         chain_hash: v.chain_hash,
         ...(v.client ? { client: v.client } : {}),
+        ...(v.tombstone
+          ? {
+              tombstone: true,
+              ...(v.forgotten_at ? { forgotten_at: v.forgotten_at } : {}),
+              ...(v.forgotten_by ? { forgotten_by: v.forgotten_by } : {}),
+              ...(v.reason_code ? { reason_code: v.reason_code } : {}),
+            }
+          : {}),
+        ...(v.forget_stub ? { forget_stub: true } : {}),
         ...(versionManager
           ? { diff: (await versionManager.getDiff(id, v.version)) ?? undefined }
           : {}),
@@ -638,10 +1110,13 @@ const versions: OperationExecutor = async (ctx, input: any) => {
 const reconstruct: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // Surface DOCUMENT_NOT_FOUND for a bogus id/title (the descriptor advertises it).
-  await ctx.storage.readDocument(id);
+  const live = await ctx.storage.readDocument(id);
   try {
     const content = await ctx.versions.reconstructVersion(id, input.version);
-    return { id, version: input.version, content };
+    // A past version is rebuilt from the history, so only the chain speaks
+    // for it — the live body's drift says nothing about v{N}.
+    const integrity = await ctx.storage.verifyServedDocument(live, { checkBody: false });
+    return { id, version: input.version, ...(integrity ? { integrity } : {}), content };
   } catch (err) {
     // reconstructVersion codes its own failures (VERSION_NOT_FOUND,
     // RECONSTRUCTION_FAILED) — pass those through. Anything uncoded that leaks
@@ -657,7 +1132,11 @@ const reconstruct: OperationExecutor = async (ctx, input: any) => {
 
 const verify: OperationExecutor = async (ctx) => {
   const report = await ctx.storage.verifyVaultIntegrity();
-  return { valid: report.valid, errors: report.errors };
+  return {
+    valid: report.valid,
+    errors: report.errors,
+    ...(report.tombstoned ? { tombstoned: report.tombstoned } : {}),
+  };
 };
 
 const init: OperationExecutor = async (ctx, input: any) => {
@@ -719,6 +1198,8 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
   // is what you edit your way out of). Rendering the rejected text itself is what
   // is refused: an installed skill is matched on and executed, not just displayed.
   // Only a rejected node with nothing approved behind it has nothing safe to serve.
+  // A forgotten stub is not a skill anyone may run (§6.3.3).
+  if (isForgotten(live)) throw new ForgottenDocumentError(id);
   let node = live;
   let servedVersion: number | null = null;
   if (isRejected(live)) {
@@ -731,8 +1212,14 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
     servedVersion = approved.version;
   }
   const vaultName = config?.name;
+  // A skill is matched on and EXECUTED, so a tampered one matters most. Live
+  // node: full check; approved version rebuilt from history: chain only.
+  const integrity = await ctx.storage.verifyServedDocument(live, {
+    checkBody: servedVersion === null,
+  });
   return {
     doc: { id: node.id, frontmatter: node.frontmatter, body: node.body },
+    integrity,
     servedVersion,
     vaultName,
     serverAlias: String(input.server_alias ?? vaultName ?? "contextnest"),
@@ -755,16 +1242,15 @@ function asValidationError<T>(fn: () => T): T {
 }
 
 const skill: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope } =
+    await loadSkillNode(ctx, input);
   const rendered = asValidationError(() =>
     renderSkill(doc, { harness, serverAlias, vaultName, vaultId: vaultName ?? serverAlias, scope }),
   );
   return {
     name: rendered.name,
     description: rendered.description,
+    ...(integrity ? { integrity } : {}),
     content: rendered.content,
     relative_path: rendered.relativePath,
     base: rendered.base,
@@ -781,10 +1267,8 @@ function rejectedNote(id: string, version: number): string {
 }
 
 const skillInstall: OperationExecutor = async (ctx, input: any) => {
-  const { doc, servedVersion, vaultName, serverAlias, harness, scope, mode } = await loadSkillNode(
-    ctx,
-    input,
-  );
+  const { doc, integrity, servedVersion, vaultName, serverAlias, harness, scope, mode } =
+    await loadSkillNode(ctx, input);
   const manifest = asValidationError(() =>
     buildInstallManifest(doc, {
       harness,
@@ -795,11 +1279,21 @@ const skillInstall: OperationExecutor = async (ctx, input: any) => {
       mode,
     }),
   );
-  if (servedVersion === null) return manifest;
+  // The installed files are written verbatim; the verdict rides on the result
+  // (and leads `notes`, the text an installing agent relays) so whoever
+  // installs a tampered skill is told before it runs.
+  const flagged = integrity
+    ? { ...manifest, integrity, notes: `${integrity.warning} ${manifest.notes}` }
+    : manifest;
+  if (servedVersion === null) return flagged;
+  // The integrity warning stays FIRST even on the rejected fallback: it is
+  // the caveat that must not be lost if only the first sentence is shown.
   return {
-    ...manifest,
+    ...flagged,
     served_version: servedVersion,
-    notes: `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
+    notes: integrity
+      ? `${integrity.warning} ${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`
+      : `${rejectedNote(doc.id, servedVersion)} ${manifest.notes}`,
   };
 };
 
@@ -871,11 +1365,21 @@ async function writeImportedFile(
       }
     }
   }
+  // A path spelled outside vault machinery must not land in it through a
+  // symlink or junction (history spelled as `.versions/…` is a restore).
+  let spelledMachinery = false;
+  try {
+    assertNotMachineryPath(relPath);
+  } catch {
+    spelledMachinery = true;
+  }
+  if (!spelledMachinery) await assertResolvesOutsideMachinery(ctx.storage.root, relPath.replace(/\.md$/i, ""));
   await ctx.storage.writeVaultFile(relPath, content);
 }
 
 const importDocs: OperationExecutor = async (ctx, input: any) => {
   const failed: { id?: string; title?: string; error: string }[] = [];
+  const replayBudget = importReplayBudget(ctx);
   const titleById = new Map<string, string>();
   // Every repair the import made to something it did not author — a renamed
   // path, a coerced type, a dropped tag. Reported, never fatal.
@@ -888,8 +1392,55 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // Stage 0: land an existing vault's files verbatim. Bounded-parallel because
   // a vault may sit on a network mount where each write is a round trip, and a
   // serial loop then costs one full latency per file.
-  const incoming: { path: string; content: string }[] = input.files ?? [];
+  let incoming: { path: string; content: string }[] = input.files ?? [];
   let written = 0;
+
+  // Structure rules (§11.1) apply to every document this call writes; the
+  // folders those writes create are scaffolded once, after staging.
+  const rules =
+    incoming.length > 0 || (input.documents?.length ?? 0) > 0 ? await structureRules(ctx) : null;
+  const createdFolders = new Map<string, Set<string>>();
+  const noteFolders = async (id: string) => {
+    if (!rules) return;
+    const { root, folders } = await missingFolders(ctx.storage, id);
+    const set = createdFolders.get(root) ?? new Set<string>();
+    for (const f of folders) set.add(f);
+    createdFolders.set(root, set);
+  };
+
+  // Forget protocol (§6.3.4): an exported nest carries its tombstones, and an
+  // import MUST honor them — and this vault's own. The incoming chain-event
+  // log is not landed verbatim (it would overwrite this vault's audit trail);
+  // its forget records are merged in, checked against, and re-applied to any
+  // pre-forget copy this vault already holds.
+  const tombstones =
+    incoming.length > 0 || (input.documents?.length ?? 0) > 0 ? await ctx.storage.readTombstones() : null;
+  const incomingEvents: unknown[] = [];
+  if (tombstones) {
+    incoming = incoming.filter((f) => {
+      if (!isChainEventLog(String(f.path ?? ""))) return true;
+      try {
+        const text = f.content ?? "";
+        const parsed = yaml.load(text);
+        // Aliases expanding it past its own text would be written out in
+        // full by every later append to this vault's log.
+        if (!expandsWithin(parsed, 2 * text.length + 1024)) {
+          throw new ContextNestError("its YAML aliases expand it far beyond its own size", "VALIDATION_FAILED");
+        }
+        const list = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray((parsed as { events?: unknown[] } | null)?.events)
+            ? (parsed as { events: unknown[] }).events
+            : [];
+        incomingEvents.push(...list);
+      } catch (err) {
+        failed.push({ id: String(f.path), error: `unreadable chain-event log: ${vaultError(ctx, err)}` });
+      }
+      return false;
+    });
+    for (const rec of buildTombstoneIndex(incomingEvents).records) addTombstone(tombstones, rec);
+  }
+
   if (incoming.length > 0) {
     // Targets are settled for the WHOLE batch BEFORE the parallel write: two
     // files whose names slugify alike must not race for one path, and a
@@ -899,23 +1450,70 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     // what makes re-running the same batch idempotent instead of duplicating.
     // A path the guard refuses (`../`) reads as absent here and fails at its
     // own write below, so it is reported per file rather than sinking the batch.
+    // One listing per folder, not one stat per file (a round trip each on a
+    // network mount); case-folded, so a name a case-insensitive disk holds is taken.
+    const listings = new Map<string, Promise<Set<string>>>();
+    const isTaken = async (p: string): Promise<boolean> => {
+      const cut = p.lastIndexOf("/");
+      const dir = p.slice(0, Math.max(cut, 0));
+      let names = listings.get(dir);
+      if (!names) {
+        names = ctx.storage
+          .vaultEntryNames(dir)
+          .then((n) => new Set(n.map(comparableSegment)), () => new Set<string>());
+        listings.set(dir, names);
+      }
+      return (await names).has(comparableSegment(p.slice(cut + 1)));
+    };
     const plan = (
       await planImportPaths(
         incoming.map((f) => String(f.path ?? "")),
-        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+        input.overwrite ? async () => false : isTaken,
       )
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
-    await mapInBatches(plan, async (f) => {
+    // Every verdict for the whole batch BEFORE anything lands (import-verdicts.ts).
+    const refusals = await importRefusals(ctx, rules, plan, { overwrite: input.overwrite === true, tombstones, budget: replayBudget });
+    // history.yaml goes last, and only if every other file of its history
+    // landed: the files it names are the files that were judged.
+    const isHistory = (f: { path: string }) => versionsArtifact(f.path)?.name === "history.yaml";
+    const failedSets = new Set<string>();
+    const stage = async (f: (typeof plan)[number]) => {
       try {
+        const pre = refusals.get(f.raw);
+        if (pre) throw new ContextNestError(pre, "VALIDATION_FAILED");
+        const set = versionsArtifact(f.path)?.owner;
+        if (set && isHistory(f) && failedSets.has(set)) {
+          throw new ContextNestError(`${f.raw}: a file of ${set}'s history did not land, so its history.yaml is not written`, "VALIDATION_FAILED");
+        }
+        const doc = importedDoc(f.path, f.content);
+        // Reserved paths (root packs/ …) hold no documents, rules or not.
+        // Not a structure rule, so a trusted restore (`skip`) does not lift it.
+        if (doc) assertWritableDocumentId(doc.id);
+        if (doc && rules) await noteFolders(doc.id);
+        if (/\.pdf$/i.test(f.path) && !storeOwner(f.path)) await archiveReplacedPdf(ctx, f);
         // Into the file's OWN warning list: `mapInBatches` finishes in
         // whatever order the writes complete, and the report is per input file.
         await writeImportedFile(ctx, f, f.warnings);
         written++;
       } catch (err) {
-        failed.push({ id: f.raw, error: err instanceof Error ? err.message : String(err) });
+        failed.push({ id: f.raw, error: vaultError(ctx, err) });
+        const set = historyMember(f.path);
+        if (set) failedSets.add(set);
       }
-    });
-    for (const p of plan) warnings.push(...p.warnings);
+    };
+    await mapInBatches(plan.filter((f) => !isHistory(f)), stage, ioConcurrency(ctx));
+    await mapInBatches(plan.filter(isHistory), stage, ioConcurrency(ctx));
+    // A refused file landed nowhere, so its "written as …" rename warning would mislead.
+    const failedRaw = new Set(failed.map((f) => f.id));
+    for (const p of plan) if (!failedRaw.has(p.raw)) warnings.push(...p.warnings);
+  }
+  if (tombstones && incomingEvents.length > 0) {
+    try {
+      const { refused } = await applyImportedTombstones(ctx.storage, incomingEvents, tombstones, replayBudget);
+      for (const r of refused) failed.push({ id: ".versions/chain_events.yaml", error: r.reason });
+    } catch (err) {
+      failed.push({ id: ".versions/chain_events.yaml", error: vaultError(ctx, err) });
+    }
   }
 
   // Stage 1: write each new doc as a draft (exclusive → dup/invalid go to failed).
@@ -923,11 +1521,24 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     try {
       const node = buildDraftNode(doc);
       assertValid(node);
+      // Before noteFolders: a refused write must not get its folders scaffolded.
+      await assertWritableDocumentPath(ctx.storage.root, node.id);
+      if (rules) enforceStructure(rules, checkDocument(rules, structureDoc(node)));
+      // Same guard as context_create (§6.3.4): a retired path or erased body
+      // must not land even as a draft (`publish: false` returns before Stage 3).
+      await assertNotForgotten(ctx.storage, node, tombstones!);
+      await noteFolders(node.id);
       await ctx.storage.writeDocument(node.id, serializeDocument(node), { exclusive: true });
       batch.push(node.id);
       titleById.set(node.id, doc.title);
     } catch (err) {
-      failed.push({ title: doc.title, error: err instanceof Error ? err.message : String(err) });
+      failed.push({ title: doc.title, error: vaultError(ctx, err) });
+    }
+  }
+
+  if (rules) {
+    for (const [root, folders] of createdFolders) {
+      await scaffoldFolders(ctx.storage, rules, { root, folders: [...folders] });
     }
   }
 
@@ -964,6 +1575,8 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     const callerIds = new Set(batch);
     for (const doc of await ctx.storage.discoverDocuments()) {
       if (exclude.has(doc.id) || callerIds.has(doc.id)) continue;
+      // A forgotten stub is neither published nor held: it is not content.
+      if (isForgotten(doc)) continue;
       const { patch, warnings: repaired } = sanitizeImportedFrontmatter(
         doc,
         doc.id.split("/").pop() ?? doc.id,
@@ -992,7 +1605,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   // An empty call is a caller bug, not an empty result — but a batch where every
   // document failed to stage is a legitimate (fully-failed) result, and a
   // `discover` over a folder with nothing new in it is simply done.
-  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0) {
+  if (batch.length === 0 && failed.length === 0 && !input.discover && written === 0 && incomingEvents.length === 0) {
     throw new ContextNestError(
       "context_import requires documents[], ids[], files[] or discover",
       "VALIDATION_FAILED",
@@ -1006,8 +1619,19 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   if (batch.length > 0) {
     const result = await publishDocuments(ctx.storage, batch, {
       editedBy: ctx.actor ?? "engine",
+      replayBudget,
+      concurrency: Math.max(1, Math.floor((ioConcurrency(ctx) ?? VAULT_IO_CONCURRENCY) / 2)),
+      ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
       onProgress: ctx.onProgress,
+      ...(input.note ? { note: input.note } : {}),
       ...(input.client ? { client: input.client } : {}),
+      // Ids-only (e.g. a bulk approval) writes nothing but these docs, so only
+      // their folders' INDEX.md can change. Other modes write files too.
+      indexOnlyBatchFolders:
+        !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
+      // An import's version is a one-off: a keyframe skips rebuilding the
+      // previous one to diff against. Ids-only (bulk approval) keeps diffs.
+      keyframe: !!input.discover || !!input.files?.length,
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who
@@ -1027,6 +1651,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
                 }
               : null
         : undefined,
+      // The scan just read these under the same lock; reading each again cost
+      // one round trip per document on a network-backed mount.
+      preloaded: new Map(scanned.map((d) => [d.id, d])),
     });
     published = result.published.map((p) => ({ id: p.id, version: p.version }));
     checkpoint = result.checkpointNumber;
@@ -1081,7 +1708,7 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     } catch (err) {
       failed.push({ id: doc.id, error: err instanceof Error ? err.message : String(err) });
     }
-  });
+  }, ioConcurrency(ctx));
 
   // Stage 4 (discover): report every document the scan owned, published or not,
   // so a governance layer can record the import without re-reading the vault.
@@ -1112,6 +1739,386 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
   };
 };
 
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/**
+ * Base64 (standard or URL-safe alphabet, optional padding), tested AFTER
+ * whitespace is stripped. The character class and the padding share no
+ * characters, so the match is linear — a class that also admitted `\s`
+ * followed by a trailing `\s*` backtracks quadratically on a long whitespace
+ * run ending in an invalid character.
+ */
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]*={0,2}$/;
+
+/** Decode the op's `bytes_base64`, refusing malformed input and anything over the cap. */
+function decodePdfInput(b64: string, maxBytes: number): Uint8Array {
+  // Refuse an obviously oversized payload before allocating its decoded copy.
+  // Base64 is 4 chars per 3 bytes, so a payload within the cap is at most
+  // ceil(maxBytes * 4 / 3) chars. The ×1.1 is slack for the line breaks MIME
+  // encoders insert (76-char lines + CRLF ≈ 2.6% overhead, rounded up well
+  // past it), the +1024 for padding and small-file rounding. Only a coarse
+  // pre-filter: the exact byteLength check after decoding is the real limit.
+  if (b64.length > Math.ceil((maxBytes * 4) / 3) * 1.1 + 1024) {
+    throw new ContextNestError(
+      `PDF exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  // Line-wrapped (MIME-style) base64 is common; the wrapping is not data.
+  const compact = b64.replace(/\s+/g, "");
+  if (!BASE64_PATTERN.test(compact)) {
+    throw new ContextNestError("bytes_base64 is not valid base64.", "VALIDATION_FAILED");
+  }
+  const bytes = new Uint8Array(Buffer.from(compact, "base64"));
+  if (bytes.byteLength === 0) {
+    throw new ContextNestError("bytes_base64 decoded to an empty file.", "VALIDATION_FAILED");
+  }
+  if (bytes.byteLength > maxBytes) {
+    throw new ContextNestError(
+      `PDF is ${bytes.byteLength} bytes, which exceeds the ${maxBytes}-byte limit for an import.`,
+      "VALIDATION_FAILED",
+    );
+  }
+  return bytes;
+}
+
+
+/** A file name without directory or `.pdf` extension, for a fallback title. */
+function filenameStem(name: unknown): string | undefined {
+  if (typeof name !== "string") return undefined;
+  const base = name.split(/[/\\]/).pop() ?? "";
+  const stem = base.replace(/\.pdf$/i, "").trim();
+  return /[\p{L}\p{N}]/u.test(stem) ? stem.slice(0, TITLE_MAX_LENGTH) : undefined;
+}
+
+/**
+ * `context_import_pdf`. Decoding and text extraction run BEFORE the vault
+ * lock is taken: they touch no vault state, and parsing a large PDF is real
+ * work that would otherwise hold every other writer on the vault behind it
+ * (VAULT_LOCK_TIMEOUT for a concurrent `ctx update`). A bad PDF also fails
+ * here without ever queueing for the lock. Everything that reads or writes
+ * the vault runs under the lock, in {@link importPdfLocked}.
+ */
+const importPdf: OperationExecutor = async (ctx, input: any) => {
+  const maxBytes = ctx.limits?.pdfMaxBytes ?? DEFAULT_PDF_MAX_BYTES;
+  const bytes = decodePdfInput(String(input.bytes_base64), maxBytes);
+  // Extract BEFORE anything is written: a file that is not a PDF, or one pdf.js
+  // cannot read, fails here with nothing on disk.
+  const extraction = await extractPdf(bytes);
+  return withVaultLock(ctx.storage.root, () => importPdfLocked(ctx, input, bytes, extraction));
+};
+
+async function importPdfLocked(
+  ctx: OperationContext,
+  input: any,
+  bytes: Uint8Array,
+  extraction: PdfExtraction,
+) {
+  // ── Where it lands ──
+  // An explicit id is used as stored if a node is there (flat-layout ids carry
+  // no nodes/ prefix, and re-rooting would miss them), otherwise normalized
+  // the way context_create normalizes one.
+  let id: string;
+  let existing: ContextNode | null;
+  if (input.id) {
+    const raw = sanitizeId(String(input.id));
+    existing = await readIfExists(ctx, raw);
+    id = existing ? raw : normalizeDocumentId(raw);
+    if (!existing && id !== raw) existing = await readIfExists(ctx, id);
+    // On a case-insensitive filesystem `nodes/report` reads `nodes/Report.md`,
+    // and the read hands back the caller's spelling. Every path below — the
+    // sidecar, `pdf.file`, the version history — must use the spelling
+    // discovery reports, or rule 26 fails and delete misses the sidecar (#117).
+    if (existing) {
+      id = await ctx.storage.resolveDocumentIdCasing(id);
+      existing = { ...existing, id };
+    }
+  } else {
+    const title =
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF";
+    const slug =
+      slugify(String(title)) ||
+      slugify(filenameStem(input.filename) ?? "") ||
+      `pdf-${extraction.sha256.slice("sha256:".length, "sha256:".length + 12)}`;
+    const folderSegments = String(input.folder ?? "")
+      .split("/")
+      .map(slugify)
+      .filter(Boolean);
+    id = normalizeDocumentId(["nodes", ...folderSegments, slug].join("/"));
+    existing = await readIfExists(ctx, id);
+    if (existing) {
+      throw new ContextNestError(
+        `Document "${id}" already exists. Pass id: "${id}" to import this PDF as its next version, or a different title/folder.`,
+        "DOCUMENT_ALREADY_EXISTS",
+      );
+    }
+  }
+  assertSafeDocumentId(id);
+  // Before the sidecar is archived or written: those writes precede the node's.
+  await assertWritableDocumentPath(ctx.storage.root, id);
+
+  // Anti-resurrection (§6.3.4): a path a forget retired (stub since deleted)
+  // or a binary a forget erased never comes back through a PDF import.
+  const tombstones = await ctx.storage.readTombstones();
+  if (!existing && isPathForgotten(tombstones, id)) {
+    throw new ForgottenDocumentError(id, "was forgotten — its path cannot take content again; import under a new path");
+  }
+  if (tombstones.pdfHashes.has(extraction.sha256)) {
+    throw new ForgottenDocumentError(id, "carries a PDF binary a forget erased");
+  }
+
+  if (existing) {
+    if (existing.frontmatter.type !== "pdf") {
+      throw new ContextNestError(
+        `${id} is a "${existing.frontmatter.type ?? "document"}" node, not a PDF; a PDF can only be imported as a new node or as a new version of a pdf node.`,
+        "VALIDATION_FAILED",
+      );
+    }
+    if (isRejected(existing)) throw new RejectedDocumentError(id);
+    if (isForgotten(existing)) throw new ForgottenDocumentError(id);
+  }
+
+  const sidecar = pdfSidecarPath(id);
+
+  // A new node must not land on a file already sitting at its sidecar path —
+  // that file is someone's, not this import's to overwrite (or, on a failed
+  // import, to delete).
+  if (!existing && (await ctx.storage.hasVaultFile(sidecar))) {
+    throw new ContextNestError(
+      `A file already exists at ${sidecar}, where this node's PDF would go. Move it, or import under another title/folder/id.`,
+      "DOCUMENT_ALREADY_EXISTS",
+    );
+  }
+
+  // Whatever is on disk at the sidecar path now — archived (content-addressed,
+  // so harmless) before it is replaced, and put back if this import fails.
+  // ALL bytes, not only ones matching the current frontmatter: after a
+  // rollback, or a hand swap, the file on disk may be a binary some other
+  // version records, and overwriting it unarchived would lose that version.
+  let priorOnDisk: Uint8Array | null = null;
+  if (existing) {
+    try {
+      priorOnDisk = await ctx.storage.readVaultBinary(sidecar);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+
+  const publish = input.publish !== false;
+  const existingPdf = existing?.frontmatter.pdf;
+  const sameBytes = existingPdf?.sha256 === extraction.sha256;
+
+  if (existing && existingPdf && sameBytes) {
+    // Same PDF as the current version. A missing or swapped sidecar is put
+    // back — these bytes hash to what the chain records, so that restores the
+    // record rather than rewriting it. Anything the caller ASKED for besides
+    // the bytes (publish a draft, a new title/tags/description) still happens
+    // below; with nothing asked for, this is a no-op.
+    if (!priorOnDisk || sha256Bytes(priorOnDisk) !== existingPdf.sha256) {
+      if (priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+    }
+    const fm = existing.frontmatter;
+    const wantsPublish = publish && fm.status !== "published";
+    const wantsTitle = input.title !== undefined && input.title !== fm.title;
+    // Tags are a set: the same tags in another order are not a change.
+    const wantsTags =
+      input.tags !== undefined &&
+      !isDeepStrictEqual(
+        [...(normalizeUniqueTags(input.tags) ?? [])].sort(),
+        [...new Set(fm.tags ?? [])].sort(),
+      );
+    const wantsDescription =
+      typeof input.description === "string" && input.description !== (fm.description ?? "");
+    // A node written before #117 may record `pdf.file` in the caller's
+    // casing; rewriting it to the on-disk spelling repairs rule 26.
+    const wantsRepair = existingPdf.file !== sidecar;
+    if (!wantsPublish && !wantsTitle && !wantsTags && !wantsDescription && !wantsRepair) {
+      return {
+        id,
+        version: fm.version ?? 1,
+        created: false,
+        unchanged: true,
+        status: fm.status ?? "draft",
+        checkpoint: null,
+        pdf: existingPdf,
+        text_layer: existingPdf.text_layer,
+      };
+    }
+  }
+
+  // Same bytes keep the recorded block and text (re-extracting would only
+  // restamp extracted_at); new bytes get both fresh.
+  const pdf: PdfMeta =
+    sameBytes && existingPdf
+      ? { ...existingPdf, file: sidecar }
+      : {
+          file: sidecar,
+          sha256: extraction.sha256,
+          bytes: extraction.bytes,
+          pages: extraction.pages,
+          text_layer: extraction.textLayer,
+          extractor: PDF_EXTRACTOR,
+          extractor_version: pdfExtractorVersion(),
+          extracted_at: new Date().toISOString(),
+        };
+  const now = new Date().toISOString();
+  const body =
+    sameBytes && existing ? existing.body : extraction.text ? `\n${extraction.text}` : "";
+  let frontmatter: Frontmatter;
+  if (existing) {
+    frontmatter = { ...existing.frontmatter };
+    if (input.title) {
+      assertUsableTitle(String(input.title));
+      frontmatter.title = input.title;
+    }
+    if (input.tags) frontmatter.tags = normalizeUniqueTags(input.tags);
+    if (typeof input.description === "string") {
+      if (input.description === "") delete frontmatter.description;
+      else frontmatter.description = input.description;
+    }
+    frontmatter.pdf = pdf;
+    frontmatter.updated_at = now;
+    // The checksum describes the published body, which this may replace.
+    if (!sameBytes) delete frontmatter.checksum;
+    if (!publish) frontmatter.status = "draft";
+  } else {
+    const title = String(
+      input.title ?? extraction.title ?? filenameStem(input.filename) ?? "Untitled PDF",
+    );
+    assertUsableTitle(title);
+    frontmatter = {
+      title,
+      type: "pdf",
+      ...(input.description ? { description: input.description } : {}),
+      ...(input.tags ? { tags: normalizeUniqueTags(input.tags) } : {}),
+      status: "draft",
+      created_at: now,
+      updated_at: now,
+      pdf,
+    };
+    // Publish assigns the version; a draft needs its own v1 (see context_create).
+    if (!publish) frontmatter.version = 1;
+  }
+  const node: ContextNode = { id, filePath: "", rawContent: "", frontmatter, body };
+  assertValid(node);
+  // Structure rules (§11.1.1): judged before anything is written, as the
+  // publish will judge it — a new PDF in full, a new version of one only for
+  // what it newly breaks.
+  const rules = await structureRules(ctx);
+  if (rules && publish) {
+    // Against the sealed head and, like an update, the live file.
+    await assertStructurePublish(ctx.storage, rules, node);
+    if (existing) enforceStructure(rules, checkUpdate(rules, structureDoc(existing), structureDoc(node)));
+  } else if (rules) {
+    enforceStructure(
+      rules,
+      existing
+        ? checkUpdate(rules, structureDoc(existing), structureDoc(node))
+        : checkDocument(rules, structureDoc(node)),
+    );
+  }
+
+  const created = rules && !existing ? await missingFolders(ctx.storage, id) : null;
+
+  // ── Write: archive what is on disk, sidecar, then the node, then publish ──
+  // The sidecar goes first so the node never points at a binary that is not
+  // there. On failure everything this call wrote is put back.
+  const replacing = !sameBytes;
+  if (replacing && priorOnDisk) await ctx.storage.archivePdfBinary(id, priorOnDisk);
+  // A failure AFTER publish sealed a version (say, at the checkpoint) must not
+  // be rolled back: the history already vouches for the new binary and text.
+  const sealedBefore = await ctx.storage.maxRecordedVersion(id);
+  let wroteSidecar = false;
+  let wroteNode = false;
+  try {
+    if (replacing) {
+      await ctx.storage.writeVaultBinary(sidecar, bytes);
+      wroteSidecar = true;
+    }
+    await ctx.storage.writeDocument(id, serializeDocument(node), { exclusive: !existing });
+    wroteNode = true;
+    if (rules && created) await scaffoldFolders(ctx.storage, rules, created);
+    if (!publish) {
+      await ctx.storage.regenerateIndex();
+      return {
+        id,
+        version: frontmatter.version ?? 1,
+        created: !existing,
+        unchanged: false,
+        status: frontmatter.status ?? "draft",
+        checkpoint: null,
+        pdf,
+        text_layer: pdf.text_layer,
+      };
+    }
+    const result = await publishAndIndex(
+      ctx,
+      id,
+      input.note ?? (!existing ? "Imported PDF" : replacing ? "New PDF version" : "PDF metadata update"),
+      input.client,
+    );
+    return {
+      id,
+      version: result.version,
+      created: !existing,
+      unchanged: false,
+      status: "published",
+      checkpoint: result.checkpoint,
+      pdf,
+      text_layer: pdf.text_layer,
+    };
+  } catch (err) {
+    const sealedAfter = await ctx.storage.maxRecordedVersion(id).catch(() => sealedBefore);
+    if (sealedAfter > sealedBefore) throw err;
+    if (existing) {
+      if (wroteNode) await ctx.storage.writeDocument(id, existing.rawContent).catch(() => undefined);
+      if (wroteSidecar) {
+        if (priorOnDisk) {
+          await ctx.storage.writeVaultBinary(sidecar, priorOnDisk).catch(() => undefined);
+        } else {
+          await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+        }
+      }
+    } else if (!(err instanceof ContextNestError && err.code === "DOCUMENT_ALREADY_EXISTS")) {
+      // A create that lost the exclusive-write race must not delete the
+      // winner's files; otherwise the sidecar is this call's own (a file
+      // already at that path was refused above).
+      if (wroteNode) await ctx.storage.deleteDocument(id).catch(() => undefined);
+      if (wroteSidecar) await ctx.storage.removeVaultFile(sidecar).catch(() => undefined);
+    }
+    throw err;
+  }
+}
+
+/**
+ * `context_structure` — the nest's structure rules (§11.1), the rule
+ * governing one folder, and the compliance report. Read-only, and it ignores
+ * the skip flag: a trusted host still asks what the rules are.
+ */
+const structureExec: OperationExecutor = async (ctx, input: any) => {
+  const config = await ctx.storage.readConfig();
+  let rules: CompiledStructure;
+  try {
+    rules = compileStructure(config);
+  } catch (err) {
+    // Reading the rules is a read: a rule that does not compile is reported,
+    // not thrown, so an agent (and `ctx add`'s template lookup) learns why.
+    if (!(err instanceof ContextNestError && err.code === "CONFIG_ERROR")) throw err;
+    return {
+      enforce: isEnforced(config),
+      closed: config?.structure?.closed === true,
+      folders: [],
+      templates: {},
+      error: err.message,
+    };
+  }
+  const out: Record<string, unknown> = { ...describeStructure(rules) };
+  if (input?.folder !== undefined) out.resolved = resolveFolder(rules, String(input.folder));
+  if (input?.report === true) out.violations = await structureReport(ctx.storage, rules);
+  return out;
+};
+
 /**
  * Serialize a mutating executor on the vault's write lock. Every mutation
  * read-modify-writes the nest-level checkpoint chain; without this, concurrent
@@ -1129,6 +2136,9 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_query: query,
   context_resolve: resolve,
   context_search: search,
+  // Not locked: provider calls can run for minutes and must not block
+  // writers. Each save takes the lock itself (see embed).
+  context_embed: embed,
   context_get: get,
   context_list: list,
   context_folders: folders,  
@@ -1139,10 +2149,15 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_versions: versions,
   context_reconstruct: reconstruct,
   context_verify: verify,
+  context_forget: locked(forget),
+  context_forget_log: forgetLogExec,
   context_init: init,
   context_packs: packs,
   context_nests: nests,
   context_import: locked(importDocs),
+  // Locks internally, AFTER extraction — see importPdf.
+  context_import_pdf: importPdf,
   context_skill: skill,
   context_skill_install: skillInstall,
+  context_structure: structureExec,
 });

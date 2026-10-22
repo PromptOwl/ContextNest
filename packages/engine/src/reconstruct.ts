@@ -1,0 +1,324 @@
+/**
+ * Pure version replay (§6.1): rebuild one recorded version of a document from
+ * its history, a keyframe reader and a diff reader.
+ *
+ * Extracted from `VersionManager.reconstructVersion` so integrity verification
+ * (`NestStorage.verifyHistoryChain`) can replay a chain over its pre-loaded
+ * artifact bytes without importing the storage-backed VersionManager — which
+ * would be a module cycle. The readers return the artifact content for a
+ * version, or null when there is none; they may be sync (a map) or async
+ * (storage reads).
+ */
+
+import { applyPatch, parsePatch, type StructuredPatch } from "diff";
+import type { DocumentHistory } from "./types.js";
+import { ContextNestError, CorruptHistoryError, ForgottenVersionError } from "./errors.js";
+
+/** Artifact content for a version, or null when there is none to read. */
+/**
+ * Bytes a version file may hold per character of room: UTF-8 spends up to 3
+ * bytes on a character (CJK text), and an encrypted artifact's armour about
+ * a third more (measured: 4.06 for CJK) — so text of any script is read up
+ * to its character allowance.
+ */
+export const BYTES_PER_CHAR = 5;
+
+/** Characters hashed or replayed between yields to the event loop. */
+export const YIELD_EVERY = 2 ** 20;
+
+/**
+ * Most characters a replay reads for one history (its keyframes and diffs).
+ * Past it the history is not trusted — and never held whole.
+ */
+export const MAX_REPLAY_READ = 64 * 2 ** 20;
+
+export type ArtifactReader = (
+  version: number,
+  /** Most bytes the file may hold to be read at all — larger is refused unread. */
+  maxBytes?: number,
+) => string | null | Promise<string | null>;
+
+/**
+ * Reconstruct a specific version of a document (§6.1).
+ * Finds nearest keyframe and applies diffs forward.
+ */
+export async function reconstructFromHistory(
+  docId: string,
+  history: DocumentHistory,
+  targetVersion: number,
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
+): Promise<string> {
+  // The walk below starts at the nearest keyframe at or before the target and
+  // replays diffs forward. Ask for a version the history does not contain and
+  // there are no diffs to replay, so it returns the keyframe's content as
+  // though it were the version requested — a silently wrong answer in the one
+  // place that must never give one. Refuse instead.
+  const target = history.versions.find((entry) => entry.version === targetVersion);
+  if (!target) {
+    throw new ContextNestError(
+      `Version ${targetVersion} not found for ${docId}`,
+      "VERSION_NOT_FOUND",
+      "§6",
+    );
+  }
+  // Forget protocol (§6.3.2): the version existed, but its content was
+  // erased on purpose. Say so — never fall back to a neighbouring keyframe.
+  if (target.tombstone) throw new ForgottenVersionError(docId, targetVersion);
+
+  // Find the nearest keyframe at or before target version. A tombstoned
+  // keyframe has no file left, so it cannot anchor a replay.
+  let keyframeVersion = -1;
+  for (const entry of history.versions) {
+    if (entry.keyframe && !entry.tombstone && entry.version <= targetVersion) {
+      keyframeVersion = entry.version;
+    }
+  }
+
+  if (keyframeVersion === -1) {
+    throw new ContextNestError(
+      `No keyframe found at or before version ${targetVersion} for ${docId}`,
+      "VERSION_NOT_FOUND",
+      "§6",
+    );
+  }
+
+  // The entries to replay, keyframe to target.
+  const replay: typeof history.versions = [];
+  for (const entry of history.versions) {
+    if (entry.version <= keyframeVersion) continue;
+    if (entry.version > targetVersion) break;
+    replay.push(entry);
+  }
+
+  // The artifacts the replay needs are known now, so read them a window at a
+  // time — each read is a round trip on a network mount — instead of one by
+  // one. A window is applied and released before the next is read, so at most
+  // REPLAY_READ_WINDOW artifacts are in flight or in memory. Settled, then
+  // consumed in order, so a failure surfaces exactly where the sequential
+  // walk hit it.
+  const readFor = (entry: (typeof replay)[number]) =>
+    entry.tombstone ? null : entry.keyframe ? readKeyframe(entry.version) : readDiff(entry.version);
+  let content: string | null = null;
+  const step = yielder();
+  for (let start = 0; start === 0 || start < replay.length; start += REPLAY_READ_WINDOW) {
+    const window = replay.slice(start, start + REPLAY_READ_WINDOW);
+    // The first window also reads the anchor keyframe.
+    const reads = await Promise.allSettled([
+      ...(start === 0 ? [readKeyframe(keyframeVersion)] : []),
+      ...window.map(readFor),
+    ]);
+    if (start === 0) {
+      content = value(reads.shift()!);
+      if (content === null) {
+        throw new ContextNestError(
+          `Keyframe file for version ${keyframeVersion} not found for ${docId}`,
+          "VERSION_NOT_FOUND",
+          "§6",
+        );
+      }
+    }
+    content = await applyWindow(docId, content!, window, reads, readDiff, step);
+  }
+  return content!;
+}
+
+/**
+ * A work counter that lets the event loop in every {@link YIELD_EVERY}
+ * characters: each diff walks the whole text, so a long chain over a large
+ * document must not hold the process for the whole replay.
+ */
+export function yielder(): (chars: number) => Promise<void> {
+  let sinceYield = 0;
+  return async (chars) => {
+    sinceYield += chars;
+    if (sinceYield >= YIELD_EVERY) {
+      sinceYield = 0;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+}
+
+/**
+ * `applyPatch`, each hunk applied only at the line its header names, in
+ * order, inside the text. Off there, the library looks line by line across
+ * the whole text — lines × hunk length in one synchronous call, added lines
+ * walked at every position without a comparison — and before applying a hunk
+ * it copies every line up to the start its header states, however far past
+ * the end that is: a crafted patch could hold the process, or its memory, for
+ * as long as it likes. The engine's own patches always fit where they say: a
+ * replayed diff was made against exactly the text it follows (createVersion
+ * falls back to a keyframe otherwise). A suggestion or held edit goes through
+ * `applyStagedEdit` (suggestions.ts), which also checks the body it yields —
+ * one that no longer lands where it was made is reported stale. Anything
+ * else does not apply (`false`). `compared` is the work done, in the same
+ * units as characters replayed.
+ */
+export function applyPatchBounded(content: string, patch: string): { result: string | false; compared: number } {
+  let parsed: StructuredPatch[];
+  try {
+    parsed = parsePatch(patch);
+  } catch {
+    return { result: false, compared: 0 };
+  }
+  if (parsed.length !== 1) return { result: false, compared: 0 };
+  // Each hunk's stated lines inside the text (as the library splits it: on
+  // "\n"), and after the hunk before it.
+  let lines = 1;
+  for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) lines++;
+  let from = 0;
+  for (const hunk of parsed[0].hunks) {
+    const start = hunk.oldStart - 1;
+    if (!(start >= from && start + hunk.oldLines <= lines)) return { result: false, compared: 0 };
+    from = start + hunk.oldLines;
+  }
+  let compared = 0;
+  try {
+    const result = applyPatch(content, parsed[0], {
+      compareLine: (_line, line, _op, want) => {
+        compared += COMPARE_WEIGHT + Math.min(line?.length ?? 0, want.length);
+        // The first position tried is the stated one: a miss there is a miss.
+        if (line !== want) throw DOES_NOT_FIT;
+        return true;
+      },
+    });
+    return { result, compared };
+  } catch (err) {
+    if (err === DOES_NOT_FIT) return { result: false, compared };
+    throw err;
+  }
+}
+
+const DOES_NOT_FIT = new Error("the patch does not fit where it says");
+
+/**
+ * What one line comparison costs, in characters replayed: a comparison is
+ * dearer than walking one character of text.
+ */
+const COMPARE_WEIGHT = 32;
+
+/** A settled read's value, or its error rethrown. */
+function value<T>(r: PromiseSettledResult<T>): T {
+  if (r.status === "rejected") throw r.reason;
+  return r.value;
+}
+
+/** Most version artifacts a replay reads at once (plus its anchor keyframe). */
+const REPLAY_READ_WINDOW = 10;
+
+/** Apply one window of replay entries, in order, to `content`. */
+async function applyWindow(
+  docId: string,
+  content: string,
+  window: DocumentHistory["versions"],
+  reads: PromiseSettledResult<string | null>[],
+  readDiff: ArtifactReader,
+  step: (chars: number) => Promise<void>,
+): Promise<string> {
+  for (const [i, entry] of window.entries()) {
+    // A forgotten version between the anchor and the target means the diff
+    // chain runs through erased content. The forget protocol re-keyframes
+    // the first retained version after a range precisely so this cannot
+    // happen; reaching it means the history was altered afterwards.
+    if (entry.tombstone) throw new ForgottenVersionError(docId, entry.version);
+    const read = value(reads[i]);
+    if (entry.keyframe) {
+      // This is another keyframe — use it directly when its file exists
+      if (read !== null) {
+        content = read;
+        continue;
+      }
+    }
+
+    // v{N}.diff on disk, falling back to the patch stored inline on the
+    // entry by histories written before diffs were externalized.
+    const diff = entry.keyframe ? await readDiff(entry.version) : read;
+    const patch = diff ?? entry.diff;
+    if (patch) {
+      const { result, compared } = applyPatchBounded(content, patch);
+      if (typeof result === "string") {
+        content = result;
+        await step(content.length + compared);
+      } else if (result === false) {
+        throw new ContextNestError(
+          `Failed to apply diff for version ${entry.version} of ${docId}`,
+          "RECONSTRUCTION_FAILED",
+          "§6",
+        );
+      }
+    }
+  }
+
+  return content;
+}
+
+/**
+ * Every version a history rebuilds to, in one forward pass: each artifact read
+ * once — sized to what `budget` has left — and each diff applied once to the
+ * running text, every character read and every comparison charged, the event
+ * loop let in every so often. A version whose base does not rebuild (a missing
+ * artifact, a tombstone, a patch that does not fit) is skipped until the next
+ * keyframe. False once the budget is spent: what was visited is then partial.
+ */
+export async function replayEveryVersion(
+  versions: DocumentHistory["versions"],
+  readKeyframe: ArtifactReader,
+  readDiff: ArtifactReader,
+  budget: { left: number; spent?: boolean } | undefined,
+  visit: (text: string) => void,
+): Promise<boolean> {
+  const spend = (chars: number): boolean => {
+    if (!budget) return true;
+    budget.left -= chars;
+    if (budget.left < 0) budget.spent = true;
+    return !budget.spent;
+  };
+  let text: string | null = null;
+  const step = yielder();
+  let read = 0;
+  for (const e of versions) {
+    if (budget?.spent) return false;
+    if (e.tombstone) {
+      text = null;
+      continue;
+    }
+    // One history never reads past MAX_REPLAY_READ, whatever the budget.
+    const left = MAX_REPLAY_READ - read;
+    const room = Math.min(left, budget ? Math.max(0, budget.left) : Infinity);
+    let artifact: string | null;
+    try {
+      const maxBytes = BYTES_PER_CHAR * room;
+      artifact = e.keyframe
+        ? await readKeyframe(e.version, maxBytes)
+        : ((await readDiff(e.version, maxBytes)) ?? e.diff ?? null);
+    } catch (err) {
+      // Larger than the room left spends it, so the call is asked to split;
+      // otherwise unreadable — a version not known here.
+      if (err instanceof CorruptHistoryError && err.ioError === "too-large") {
+        if (budget && room < left) spend(room + 1);
+        return false;
+      }
+      artifact = null;
+    }
+    if (artifact === null) {
+      text = null;
+      continue;
+    }
+    read += artifact.length;
+    if (read > MAX_REPLAY_READ) return false;
+    if (!spend(artifact.length)) return false;
+    let cost = artifact.length;
+    if (e.keyframe) {
+      text = artifact;
+    } else if (text !== null) {
+      if (!spend(text.length)) return false;
+      const { result, compared } = applyPatchBounded(text, artifact);
+      if (!spend(compared)) return false;
+      cost += text.length + compared;
+      text = typeof result === "string" ? result : null;
+    }
+    if (text !== null) visit(text);
+    await step(cost);
+  }
+  return true;
+}

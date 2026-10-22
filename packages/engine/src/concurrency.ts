@@ -17,21 +17,34 @@
 export const VAULT_IO_CONCURRENCY = 32;
 
 /**
- * Map over `items` in bounded-parallel batches, preserving input order.
+ * Map over `items` with at most `concurrency` calls in flight, preserving input
+ * order in the result.
  *
- * Each batch is awaited whole before the next starts, so at most `concurrency`
- * operations are ever in flight. Per-item error handling belongs to `fn`: a
- * rejection propagates and abandons the remaining batches, exactly as a throw
- * inside an `await` loop would.
+ * A sliding pool, not fixed batches: the next item starts as soon as any call
+ * settles. Waiting for a whole batch let one slow round trip on a network mount
+ * idle every other slot. Per-item error handling belongs to `fn`: a rejection
+ * propagates and no further items start, as a throw inside an `await` loop would.
  */
 export async function mapInBatches<T, R>(
   items: T[],
   fn: (item: T) => Promise<R>,
   concurrency: number = VAULT_IO_CONCURRENCY,
 ): Promise<R[]> {
-  const out: R[] = [];
-  for (let i = 0; i < items.length; i += concurrency) {
-    out.push(...(await Promise.all(items.slice(i, i + concurrency).map(fn))));
-  }
+  const out = new Array<R>(items.length);
+  let next = 0;
+  let failed = false;
+  const worker = async (): Promise<void> => {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try {
+        out[i] = await fn(items[i]);
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
+    }
+  };
+  const workers = Math.min(Math.max(1, Math.floor(concurrency) || 1), items.length);
+  await Promise.all(Array.from({ length: workers }, worker));
   return out;
 }

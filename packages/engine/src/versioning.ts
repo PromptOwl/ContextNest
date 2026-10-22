@@ -3,7 +3,7 @@
  * Keyframe + diff model with history.yaml tracking.
  */
 
-import { createPatch, applyPatch } from "diff";
+import { createPatch } from "diff";
 import type {
   ClientMetadata,
   ContextNode,
@@ -12,12 +12,31 @@ import type {
 } from "./types.js";
 import { computeContentHash, computeChainHash } from "./integrity.js";
 import { serializeDocument } from "./parser.js";
+import { reconstructFromHistory } from "./reconstruct.js";
 import { NestStorage } from "./storage.js";
 import { ContextNestError, CorruptHistoryError } from "./errors.js";
 
 const DEFAULT_KEYFRAME_INTERVAL = 10;
 
+/**
+ * Largest document (serialized characters, UTF-16 units — not bytes) a new
+ * version is stored as a diff for, on either side of the diff. Above it the
+ * version is a keyframe: a diff would first replay the chain
+ * to rebuild the previous version, then run `createPatch` over the whole text
+ * in one synchronous call — seconds of blocked event loop on a 10 MB document.
+ * ponytail: costs a full copy per version of such a document; a cheaper diff
+ * (common prefix/suffix trimmed before createPatch) if that storage matters.
+ */
+const MAX_DIFF_CHARS = 2 ** 20;
+
 /** What {@link VersionManager.historyOrRepair} found, and what it had to do. */
+/** A frontmatter version as a whole number >= 1, or 0 when absent or unusable. A
+ *  hand-edited `version: 1.1` must not seed v1.1 or mint 2.1: versions are integers. */
+export function wholeVersion(v: unknown): number {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 1 ? n : 0;
+}
+
 export interface ResilientHistory {
   /** The parsed history, or null when there is none to read. */
   history: DocumentHistory | null;
@@ -84,14 +103,22 @@ export class VersionManager {
    * (see {@link historyOrRepair}) leaves nothing to read but the `v{N}` files
    * it sealed — and restarting at 1 there would collide with every one of them.
    */
-  async nextVersion(docId: string, hint = 0): Promise<number> {
-    const { history } = await this.historyOrRepair(docId);
+  async nextVersion(
+    docId: string,
+    hint = 0,
+    /** History the caller already read under the same lock; omit to read it. */
+    knownHistory?: DocumentHistory | null,
+    /** `maxRecordedVersion` the caller already listed, nothing sealed since. */
+    knownSealed?: number,
+  ): Promise<number> {
+    const history =
+      knownHistory !== undefined ? knownHistory : (await this.historyOrRepair(docId)).history;
     const recorded = (history?.versions ?? []).reduce(
       (max, entry) => Math.max(max, entry.version),
       0,
     );
-    const sealed = await this.storage.maxRecordedVersion(docId);
-    return Math.max(hint, recorded, sealed) + 1;
+    const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
+    return Math.max(wholeVersion(hint), recorded, sealed) + 1;
   }
 
   /**
@@ -102,9 +129,10 @@ export class VersionManager {
   private async restartNoteFor(
     docId: string,
     history: DocumentHistory | null,
+    knownSealed?: number,
   ): Promise<string | null> {
     if (history) return null;
-    const sealed = await this.storage.maxRecordedVersion(docId);
+    const sealed = knownSealed ?? (await this.storage.maxRecordedVersion(docId));
     if (sealed === 0) return null; // genuinely new document, not a restart
     return `Chain restarted — no readable history.yaml, and versions up to v${sealed} were already sealed`;
   }
@@ -122,24 +150,48 @@ export class VersionManager {
       /** Caller metadata recorded on the entry (§9.4). Never hashed — see
        *  `VersionEntry.client`. */
       client?: ClientMetadata;
+      /**
+       * Store this version as a full keyframe even off the keyframe interval.
+       * The forget protocol's stub uses it (§6.3.3): a diff against the
+       * erased content would carry that content's lines as `-` context.
+       */
+      keyframe?: boolean;
+      /** Mark the entry as the empty stub a node-level forget sealed. */
+      forgetStub?: boolean;
+      /**
+       * History the caller already read (via historyOrRepair) under the same
+       * lock, with nothing appended since; `null` = none. Omit to read it here.
+       */
+      knownHistory?: DocumentHistory | null;
+      /** `maxRecordedVersion` the caller already listed, nothing sealed since. */
+      knownSealed?: number;
     } = {},
   ): Promise<VersionEntry> {
     // Resilient read: an unreadable history is moved aside and treated as
     // absent, so this write restarts the chain rather than failing. See
     // historyOrRepair for why that is safe.
-    const { history: readHistory } = await this.historyOrRepair(node.id);
+    const readHistory =
+      options.knownHistory !== undefined
+        ? options.knownHistory
+        : (await this.historyOrRepair(node.id)).history;
+    // Decided BEFORE this version's own artifact is written below: counting
+    // the v{N}.md we are about to seal made every brand-new document's first
+    // entry claim "Chain restarted" (it saw its own keyframe as prior history).
+    const restartNote = await this.restartNoteFor(node.id, readHistory, options.knownSealed);
     const history = readHistory || {
       keyframe_interval: DEFAULT_KEYFRAME_INTERVAL,
       versions: [],
     };
 
     const currentVersion = node.frontmatter.version || 1;
+    const fullContent = serializeDocument(node);
     let isKeyframe =
+      options.keyframe === true ||
       history.versions.length === 0 ||
       currentVersion % history.keyframe_interval === 1 ||
-      currentVersion === 1;
+      currentVersion === 1 ||
+      fullContent.length > MAX_DIFF_CHARS;
 
-    const fullContent = serializeDocument(node);
     const editedAt = new Date().toISOString();
 
     let contentForHash: string;
@@ -157,8 +209,16 @@ export class VersionManager {
         previousContent = await this.reconstructVersion(
           node.id,
           currentVersion - 1,
+          history,
         );
       } catch {
+        isKeyframe = true;
+      }
+      // Shrinking back under the bound still diffs against the large previous
+      // text — the same synchronous createPatch. A keyframe instead (cheap to
+      // reach: that previous version was itself a size keyframe).
+      if (previousContent !== null && previousContent.length > MAX_DIFF_CHARS) {
+        previousContent = null;
         isKeyframe = true;
       }
     }
@@ -207,7 +267,7 @@ export class VersionManager {
     // history.yaml is legitimately absent. "No readable ledger, but sealed
     // artifacts above it" is a restart however the ledger came to be missing.
     const note =
-      [options.note, await this.restartNoteFor(node.id, readHistory)]
+      [options.note, restartNote]
         .filter(Boolean)
         .join(" — ") || undefined;
 
@@ -220,6 +280,7 @@ export class VersionManager {
       ...(note ? { note } : {}),
       content_hash: contentHash,
       chain_hash: chainHash,
+      ...(options.forgetStub ? { forget_stub: true } : {}),
       // AFTER the hashes: `client` is an annotation on the entry, deliberately
       // outside `computeChainHash`'s inputs so every history recorded before
       // this field existed still verifies byte-for-byte.
@@ -243,9 +304,17 @@ export class VersionManager {
   /**
    * Reconstruct a specific version of a document (§6.1).
    * Finds nearest keyframe and applies diffs forward.
+   *
+   * The replay itself lives in {@link reconstructFromHistory} so integrity
+   * verification can run it over pre-loaded bytes without this class.
    */
-  async reconstructVersion(docId: string, targetVersion: number): Promise<string> {
-    const history = await this.storage.readHistory(docId);
+  async reconstructVersion(
+    docId: string,
+    targetVersion: number,
+    /** History already in hand; omit to read it. */
+    knownHistory?: DocumentHistory,
+  ): Promise<string> {
+    const history = knownHistory ?? (await this.storage.readHistory(docId));
     if (!history) {
       throw new ContextNestError(
         `No version history found for ${docId}`,
@@ -253,82 +322,20 @@ export class VersionManager {
         "§6",
       );
     }
-
-    // The walk below starts at the nearest keyframe at or before the target and
-    // replays diffs forward. Ask for a version the history does not contain and
-    // there are no diffs to replay, so it returns the keyframe's content as
-    // though it were the version requested — a silently wrong answer in the one
-    // place that must never give one. Refuse instead.
-    if (!history.versions.some((entry) => entry.version === targetVersion)) {
-      throw new ContextNestError(
-        `Version ${targetVersion} not found for ${docId}`,
-        "VERSION_NOT_FOUND",
-        "§6",
-      );
-    }
-
-    // Find the nearest keyframe at or before target version
-    let keyframeVersion = -1;
-    for (const entry of history.versions) {
-      if (entry.keyframe && entry.version <= targetVersion) {
-        keyframeVersion = entry.version;
-      }
-    }
-
-    if (keyframeVersion === -1) {
-      throw new ContextNestError(
-        `No keyframe found at or before version ${targetVersion} for ${docId}`,
-        "VERSION_NOT_FOUND",
-        "§6",
-      );
-    }
-
-    // Read keyframe content
-    let content = await this.storage.readKeyframe(docId, keyframeVersion);
-    if (content === null) {
-      throw new ContextNestError(
-        `Keyframe file for version ${keyframeVersion} not found for ${docId}`,
-        "VERSION_NOT_FOUND",
-        "§6",
-      );
-    }
-
-    // Apply diffs forward from keyframe to target
-    for (const entry of history.versions) {
-      if (entry.version <= keyframeVersion) continue;
-      if (entry.version > targetVersion) break;
-
-      if (entry.keyframe) {
-        // This is another keyframe — read it directly
-        const kf = await this.storage.readKeyframe(docId, entry.version);
-        if (kf !== null) {
-          content = kf;
-          continue;
-        }
-      }
-
-      // v{N}.diff on disk, falling back to the patch stored inline on the
-      // entry by histories written before diffs were externalized.
-      const patch =
-        (await this.storage.readDiff(docId, entry.version)) ?? entry.diff;
-      if (patch) {
-        const result = applyPatch(content, patch);
-        if (typeof result === "string") {
-          content = result;
-        } else if (result === false) {
-          throw new ContextNestError(
-            `Failed to apply diff for version ${entry.version} of ${docId}`,
-            "RECONSTRUCTION_FAILED",
-            "§6",
-          );
-        }
-      }
-    }
-
-    return content;
+    return reconstructFromHistory(
+      docId,
+      history,
+      targetVersion,
+      (version) => this.storage.readKeyframe(docId, version),
+      (version) => this.storage.readDiff(docId, version),
+    );
   }
 
   /**
+   * NOTE (structure rules, §11.1.1): this re-anchors the sealed head on the
+   * live document without any structure check — grandfathering judges writes
+   * against that head, so a caller must judge the live document in full first.
+   *
    * Make a document's LATEST version readable again after a chain graft.
    *
    * A history grafted by an older import — duplicate version numbers, keyframe
@@ -395,6 +402,62 @@ export class VersionManager {
 
     await this.storage.writeHistory(docId, history);
     return true;
+  }
+
+  /**
+   * Repair what can be repaired in a document's version chain, and report the
+   * readability of every version that remains.
+   *
+   * The only content a damaged chain can be re-anchored on is the live
+   * document, so the repair itself is {@link repairLatestVersion}; older
+   * versions whose bytes an import overwrote are genuinely gone, and no repair
+   * can bring them back. What the engine CAN do for them is say so: the report
+   * names every recorded version that cannot be rebuilt, and the newest one
+   * that can — which is what a product deciding a reader fallback needs. The
+   * engine deliberately does not decide which version readers should get;
+   * that stays with the product on top.
+   *
+   * Invariants, shared with {@link repairLatestVersion}:
+   *   - never creates a version and never renumbers one — only the saved
+   *     history is rewritten;
+   *   - idempotent: a second run repairs nothing and reports the same.
+   *
+   * `unreadable` lists versions by readability, so it includes tombstoned
+   * ones — their content was erased on purpose (§6.3.2), which is not damage
+   * (`ctx verify` does not flag them), but a reader cannot be served them
+   * either way.
+   */
+  async repairVersions(docId: string): Promise<{
+    /** True when repairLatestVersion re-anchored the chain on this run. */
+    repaired: boolean;
+    /** Recorded versions that cannot be rebuilt, ascending. */
+    unreadable: number[];
+    /** Highest recorded version that rebuilds, or null when none does. */
+    newestReadable: number | null;
+  }> {
+    const repaired = await this.repairLatestVersion(docId);
+
+    const history = await this.storage.readHistory(docId);
+    const unreadable: number[] = [];
+    let newestReadable: number | null = null;
+    // A grafted history can record the same version number twice — audit each
+    // number once.
+    const audited = new Set<number>();
+    for (const entry of history?.versions ?? []) {
+      if (audited.has(entry.version)) continue;
+      audited.add(entry.version);
+      try {
+        await this.reconstructVersion(docId, entry.version);
+        if (newestReadable === null || entry.version > newestReadable) {
+          newestReadable = entry.version;
+        }
+      } catch {
+        unreadable.push(entry.version);
+      }
+    }
+    unreadable.sort((a, b) => a - b);
+
+    return { repaired, unreadable, newestReadable };
   }
 
   /**

@@ -39,6 +39,13 @@ function bareIdToUri(value: string): string | null {
   return BARE_ID_PREFIX.test(value) ? `contextnest://${value}` : null;
 }
 
+/** Word operators people type from other query languages → this grammar's spelling. */
+const WORD_OPERATORS: Record<string, string> = {
+  OR: '"|" (e.g. "#a | #b")',
+  AND: 'a space or "+" (e.g. "#a + #b")',
+  NOT: '"-" (e.g. "#a - #b")',
+};
+
 /**
  * The one "did you mean" error for a token that is neither a known atom nor a
  * bare id. Shared by the bare-word branch and the quoted-string branch so
@@ -46,6 +53,14 @@ function bareIdToUri(value: string): string | null {
  * escaping into an opaque INVALID_URI from `parseUri` two layers down.
  */
 function unexpectedToken(bare: string, position: number): InvalidSelectorError {
+  // Boolean words from other search syntaxes (`#a OR #b`). Suggesting
+  // `nodes/OR` or `#OR` would be nonsense; name the operator instead.
+  const operator = WORD_OPERATORS[bare.toUpperCase()];
+  if (operator) {
+    return new InvalidSelectorError(
+      `Unexpected token "${bare}" at position ${position} — selectors spell ${bare.toUpperCase()} as ${operator}`,
+    );
+  }
   // `Nodes/foo` is a mis-cased prefix, not a tag: suggest `nodes/foo`,
   // never `nodes/Nodes/foo`.
   const miscased = /^(nodes|sources)\//i.test(bare) && !BARE_ID_PREFIX.test(bare);

@@ -4,6 +4,7 @@
  */
 
 import yaml from "js-yaml";
+import { FrontmatterShapeError } from "./errors.js";
 import { frontmatterSchema, STATUSES, STATUS_ALIASES } from "./schemas.js";
 import type { ContextNode, Frontmatter, Status, ValidationError, ValidationResult } from "./types.js";
 
@@ -33,9 +34,14 @@ export function normalizeStatus(raw: unknown): Status {
 }
 
 /** Normalize tags to always include the # prefix. Filters out null/undefined entries caused by YAML comment parsing. */
-export function normalizeTags(tags?: unknown[]): string[] | undefined {
-  if (!tags) return undefined;
-  const valid = tags.filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
+export function normalizeTags(tags?: unknown, documentId = "document"): string[] | undefined {
+  if (tags === undefined || tags === null) return undefined;
+  // Obsidian writes a single tag as a scalar (`tags: project`).
+  const list = typeof tags === "string" ? [tags] : tags;
+  if (!Array.isArray(list)) {
+    throw new FrontmatterShapeError(documentId, `tags must be a list of names (got ${typeof tags})`);
+  }
+  const valid = list.filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
   if (valid.length === 0) return undefined;
   return valid.map((tag) => (tag.startsWith("#") ? tag : `#${tag}`));
 }
@@ -86,6 +92,16 @@ export function isRejected(node: ContextNode): boolean {
 }
 
 /**
+ * Predicate: document was erased by the forget protocol (§6.3.3) — the live
+ * file is an empty stub and MUST NOT be treated as content. Excluded from
+ * every retrieval path; selectors surface it only for an explicit
+ * `status:forgotten`.
+ */
+export function isForgotten(node: ContextNode): boolean {
+  return node.frontmatter.status === "forgotten";
+}
+
+/**
  * The EXPLICIT lifecycle status the source author wrote, canonicalized, or
  * `null` when the frontmatter carried no `status:` at all.
  *
@@ -127,7 +143,7 @@ export function isSuperseded(node: ContextNode): boolean {
 /**
  * Retrieval predicate — true when the node may surface to LLMs / context
  * APIs under any retrieval setting. Excludes `pending_review`, `approved`,
- * and `rejected`:
+ * `rejected` and `forgotten` (an erased stub, §6.3):
  *   - `rejected` is terminal hide (steward retired the doc).
  *   - `approved` is reviewer-signed-off but not yet live.
  *   - `pending_review` is submitted-for-review; reviewer has not signed off.
@@ -160,8 +176,9 @@ function splitFrontmatter(raw: string): { data: Record<string, unknown>; body: s
   }
 
   const rest = content.slice(DELIMITER.length);
-  const close = "\n" + DELIMITER;
-  const closeIndex = rest.indexOf(close);
+  // The closing delimiter starts a line — after LF, CRLF or a lone CR, the one
+  // line model of markdown-mask.ts.
+  const closeIndex = rest.search(/[\r\n]---/);
 
   const block = rest.slice(0, closeIndex === -1 ? rest.length : closeIndex);
 
@@ -174,7 +191,7 @@ function splitFrontmatter(raw: string): { data: Record<string, unknown>; body: s
 
   if (closeIndex === -1) return { data, body: "" };
 
-  let body = rest.slice(closeIndex + close.length);
+  let body = rest.slice(closeIndex + 1 + DELIMITER.length);
   // Drop the line break that terminates the closing delimiter's own line.
   if (body[0] === "\r") body = body.slice(1);
   if (body[0] === "\n") body = body.slice(1);
@@ -188,11 +205,14 @@ export function parseDocument(
   id: string,
 ): ContextNode {
   const { data, body } = splitFrontmatter(content);
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new FrontmatterShapeError(id, "frontmatter is not a mapping of fields");
+  }
   const parsed = { data: data as Record<string, any>, content: body };
 
   // Normalize tags to include # prefix
-  if (parsed.data.tags) {
-    parsed.data.tags = normalizeTags(parsed.data.tags);
+  if (parsed.data.tags !== undefined) {
+    parsed.data.tags = normalizeTags(parsed.data.tags, id);
   }
 
   // Coerce auto-parsed Date values back to ISO strings so the runtime shape
@@ -202,6 +222,12 @@ export function parseDocument(
   }
   if (parsed.data.created_at !== undefined) {
     parsed.data.created_at = normalizeDateField(parsed.data.created_at);
+  }
+  // Same for the pdf block's timestamp: a hand-written, unquoted
+  // `extracted_at` loads as a Date and would fail the string schema.
+  const pdfBlock = parsed.data.pdf as Record<string, unknown> | undefined;
+  if (pdfBlock && typeof pdfBlock === "object" && pdfBlock.extracted_at !== undefined) {
+    parsed.data.pdf = { ...pdfBlock, extracted_at: normalizeDateField(pdfBlock.extracted_at) };
   }
 
   // Capture what the author wrote BEFORE the line below overwrites it. A
@@ -269,6 +295,20 @@ export function validateDocument(
       else if (field.startsWith("source.depends_on")) rule = 13;
       else if (field === "source.cache_ttl") rule = 16;
       else if (field === "source" && issue.message.includes("must not")) rule = 17;
+      else if (field === "pdf" && issue.message.includes("required")) rule = 25;
+      else if (field === "pdf.file") rule = 26;
+      else if (field === "pdf.sha256") rule = 27;
+      else if (field.startsWith("pdf.")) rule = 28;
+      else if (field === "pdf" && issue.message.includes("must not")) rule = 29;
+      else if (field === "view" || field.startsWith("view.")) {
+        // View messages name their rule (30–36). An unknown key refused by the
+        // strict schema is rule 33 — the block may carry nothing beyond its
+        // declared fields. Anything else (a bad enum value, a number out of
+        // range) breaks no numbered rule and stays 0, like any shape error.
+        const named = /§13 rule (\d+)/.exec(issue.message);
+        if (named) rule = Number(named[1]);
+        else if (issue.code === "unrecognized_keys") rule = 33;
+      }
 
       errors.push({
         rule,
@@ -277,6 +317,26 @@ export function validateDocument(
         field: field || undefined,
       });
     }
+  }
+
+  // Rule 26: a pdf node's sidecar is its OWN — `<id>.pdf`, beside the .md.
+  // Checked here rather than in the schema because it needs the node id. Without
+  // it a node could declare another node's binary (or any vault file) as its
+  // sidecar, and deleting the node would delete that file.
+  const pdf = node.frontmatter.pdf;
+  if (
+    node.frontmatter.type === "pdf" &&
+    pdf &&
+    typeof pdf.file === "string" &&
+    node.id &&
+    pdf.file !== `${node.id}.pdf`
+  ) {
+    errors.push({
+      rule: 26,
+      path: node.id,
+      message: `pdf.file must be the node's own sidecar "${node.id}.pdf", got "${pdf.file}" (§13 rule 26)`,
+      field: "pdf.file",
+    });
   }
 
   // Rule 4: Context links use valid contextnest:// URIs.

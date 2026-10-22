@@ -41,6 +41,27 @@ its version and licence alongside the installed ones in
 **[DEPENDENCIES.md](DEPENDENCIES.md)**. CI regenerates that file on every run and fails on drift, and
 uploads the machine-readable graph as the `dependency-graph` build artifact.
 
+### What leaves your machine
+
+Nothing, unless you run a command that names a destination or opt in:
+
+| Trigger | Destination | Sent | Default |
+|---|---|---|---|
+| Telemetry | `api.promptowl.ai/v1/telemetry` | Random per-vault id, CLI version, OS, Node version, event name, timestamp. Never vault content. | Off. Opt in with `telemetry: true` in `.context/config.yaml`; `DO_NOT_TRACK=1` / `CONTEXTNEST_TELEMETRY=0` force off. |
+| Opening `.context/welcome.html` | Google Analytics | `vault_init` (starter, CLI version, doc count) + GA defaults (IP, user agent) | Off — same flag. Off = the page makes no network requests. |
+| `ctx push` | The `--server` you name | Published documents + your API key | Only when run |
+| `ctx query @org/pack` | `api.promptowl.ai` | Pack name + your PromptOwl token | Only when run |
+| Remote nests | The server you registered | Queries/writes + the bearer from your env var | Only for remotes you add |
+| `ctx import pubmed` / `enrich pubtator` | NCBI | Search terms / ids | Only when run |
+| `ctx doctor` | npm registry | Version lookup | `CONTEXTNEST_DOCTOR_OFFLINE=1` skips |
+
+Stored PromptOwl credentials live in the OS keyring (macOS Keychain, Windows Credential Manager,
+Linux Secret Service via `secret-tool`). With no keyring (headless/CI/Docker), set
+`CONTEXTNEST_CREDENTIALS_KEY` and they go to `~/.promptowl/credentials.enc.json` (AES-256-GCM,
+scrypt-derived key, mode 0600). Never plaintext: a legacy `~/.promptowl/credentials.json` is
+migrated on first read, then overwritten and deleted; with neither keyring nor key the CLI stops
+and says how to fix it. `PROMPTOWL_ACCESS_TOKEN` skips storage entirely.
+
 ## For the solo developer
 
 Your brain, cached for your agent.
@@ -59,7 +80,9 @@ Skill nodes codify team procedures (PR review, incident response, deployment che
 
 A safe shared brain.
 
-Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **AGPL-licensed open standard — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+
+Need content encrypted at rest? `ctx init --encrypted` (or `ctx vault encrypt` for an existing vault) seals note bodies and version history with AES-256-GCM while front matter stays indexable. Hash chains keep verifying over the plaintext. It is opt-in: default vaults stay plain Markdown. Read the [threat model and key handling](docs/encrypted-vaults.md) first, because **losing the key and the recovery passphrase means losing the data**.
 
 ## How is this different from...
 
@@ -439,6 +462,93 @@ default to "no".
 `--yes` (or `--force`) when there is no TTY. Additive commands proceed as before — a non-interactive
 caller is never blocked waiting on stdin.
 
+### Review gate (on by default)
+
+New vaults hold writes for a human before they publish — like a coding agent
+asking permission, with a "don't ask again" answer always on offer.
+`ctx init` writes `review: on` to `.context/config.yaml`. With it on, `ctx add`,
+`ctx update` and the MCP server's `context_create` / `context_update` save the
+write for review instead of publishing it. Nothing is versioned or sealed into
+a checkpoint until it is approved.
+
+- A new document is saved with `status: pending_review`. An edit to a published
+  document is staged under `_suggestions/`; the published version keeps serving.
+- At a terminal: `Held for review. Publish? [y]es / [n]o / [a]lways (turn review off)`.
+- Without a terminal (agents, CI) nothing blocks — one line:
+  `Held for review: ctx review approve <path>   (turn off: ctx config set review off)`.
+- MCP results carry `held_for_review: true` and a sentence for the agent to relay
+  (the user can say "turn off review"; the `context_review` tool does it). The
+  deprecated `create_document` / `update_document` tools are gated the same way.
+- The gate guards against *unintended* publishes, not a hostile agent: an MCP
+  caller that passes `publish: true` (or `review: false`), calls `context_publish`,
+  or uses `context_review approve` still publishes. The tool descriptions tell
+  agents to do that only when the user says so.
+- Imports (`ctx import`, `context_import`, `context_import_pdf`) are not gated:
+  they are deliberate bulk loads and publish as before.
+
+| Command | Effect |
+|---|---|
+| `ctx review` | List what is waiting (new documents and held edits) |
+| `ctx review approve <path>` | Publish what is held for a document |
+| `ctx review reject <path>` | Discard a held edit (archived) or retire a pending document |
+| `ctx add/update … --publish` | Publish this one write regardless |
+| `ctx config set review off` / `on` | Turn the gate off or on (`ctx config get review`) |
+
+**Existing vaults are unchanged.** A vault whose config has no `review` key was
+created before the gate and keeps publishing immediately, so automations built
+on it keep working. Opt in with `ctx config set review on`. Re-running
+`ctx init` on an existing vault keeps its setting. Remote nests (`--vault
+<server>/<nest>`) use the server's own governance and are not gated.
+
+### Structure rules
+
+A nest owner can lay down hard rules for the vault's layout in
+`.context/config.yaml` (full guide: [docs/structure-rules.md](docs/structure-rules.md)): which folders may exist, which node types each takes,
+the shape of folder and file names, the template a folder's files start from
+(and the headings they must keep), and the subfolders and files every matching
+folder must have.
+
+```yaml
+structure:
+  enforce: true    # false (default): report-only
+  closed: true     # only declared folders may exist and hold documents
+folders:
+  "clients/{client}":
+    folder_name: "/[a-z]+-[0-9]{3}/"          # token pattern or /regex/
+    types: [document]
+    files: { overview: { template: client-overview } }   # required file
+  "clients/{client}/meetings":
+    required: true                             # created with its parent
+    file_name: "{date}-{slug}"                 # tokens: {slug} {date} {yyyy} {n}
+    template: meeting-note
+templates:
+  meeting-note:
+    body: "## Attendees\n## Decisions\n## Action items\n"
+    required_sections: [Decisions, Action items]
+  client-overview:
+    body: "## Summary\n## Contacts\n"
+```
+
+- With `enforce: true`, every write surface refuses what breaks a rule: `ctx add/update/delete/import/pull`, every MCP write tool (the deprecated ones too), `context_import_pdf`, and every publish — whichever surface approves a held write, its first publish is judged in full and scaffolds its new folders. A refusal names the rule and the expected format. Report-only rules (`enforce: false`, or no `enforce`) write and refuse nothing; any other value of `enforce` or `structure` is an error, never off.
+- Existing content is grandfathered: an edit is refused only for what it newly breaks (a re-type into a refused type, a dropped required heading).
+- An enforced write that creates a folder also creates its required subfolders and files (drafts from their templates). A required file can be deleted only as the last document in its folder. `ctx add` without `--body` starts from the folder's template.
+- File names come from titles (lowercased, words joined by `-`), so a rule like `{date}-{slug}` means "title it `2026-10-07 Kickoff`".
+- A `/regex/` must stay inside a small grammar: quantifiers on single characters or `[classes]` (bounds of at most 3 digits), groups with `|` that are never repeated, literal `{ } [ ]` escaped, no lookaround or backreferences, at most 200 characters (spec §11.1.1 has the exact grammar). It is matched in linear time, never by the backtracking regex engine — token patterns too — so no pattern can stall a write.
+- Re-running `ctx init` on a vault keeps its rules (a config that is not valid YAML is refused, not overwritten), and a starter leaves out what they refuse.
+- Existing `folders:` blocks keep working: a `template` naming no entry under `templates` is a label, and folder names are matched literally.
+- No write puts a document under `.context/`, `.versions/` or `_suggestions/` (any depth) or the vault-root `packs/`, and `context_import` never writes `.context/` — an import cannot rewrite the rules or the review gate. Ids use `/`, never `\`, stay under 1024 characters with no name over 251 bytes, and under enforced rules spell the content root exactly `nodes/` (not `NODES/`).
+- Folder names in rules match case-insensitively; at most 256 folder rules; a `template` name not defined under `templates` is reported as a warning by `ctx structure`.
+
+| Command | Effect |
+|---|---|
+| `ctx structure` | Show the rules (`--json` for agents; works on remote nests too) |
+| `ctx structure --folder <path>` | The rule governing one folder, with its template |
+| `ctx structure --report` | Existing content that breaks the rules |
+
+Rules are set by editing `.context/config.yaml` (or `setStructure()` from the
+engine, which rewrites only the rule blocks). Engines older than this feature
+ignore the keys.
+
 ### Choosing a vault
 
 By default `ctx` operates on the vault in (or above) the current directory. To
@@ -502,6 +612,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx vault encrypt` | Encrypt the vault's content at rest in place (AES-256-GCM). Prints a one-time recovery passphrase; rerun to resume an interrupted run. See [encrypted vaults](docs/encrypted-vaults.md) |
+| `ctx vault decrypt` | Decrypt an encrypted vault back to plain Markdown |
 | `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
 
 ### Document Management
@@ -510,10 +622,11 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 |---|---|
 | `ctx init` | Initialize a new vault (supports `--starter` recipes; `--register` to register one created under the OS temp dir) |
 | `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
-| `ctx add <path>` | Create a new document (auto-publishes and regenerates index; refuses a path that already holds a document) |
+| `ctx add <path>` | Create a new document (publishes, or holds it for review when the vault's [review gate](#review-gate-on-by-default) is on; `--publish` to bypass; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
-| `ctx update <path>` | Update a document's title, tags, or body (auto-publishes) |
-| `ctx delete <path>` | Delete a document and its version history |
+| `ctx update <path>` | Update a document's title, tags, or body (publishes, or holds the edit for review when the gate is on; `--publish` to bypass) |
+| `ctx delete <path>` | Delete a document and its version history, recorded in `ctx forget-log` (`--reason`, `--requested-by`; `--purge` for no record) |
+| `ctx forget <path> --reason <code>` | Forget a document (right to be forgotten, spec §6.3): erase every version's content, keep the hashes so `ctx verify` still passes; leaves an empty `status: forgotten` stub. `--reason` is `user_request`, `legal`, `retention_expiry` or `error` |
 | `ctx read <path>` | Read and display a document in the terminal |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
 | `ctx skill <path>` | Render a `type: skill` node for an agent harness and print it |
@@ -535,6 +648,7 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx search <query>` | Full-text search across vault documents (`--limit` to cap) |
 | `ctx resolve <selector>` | Execute a selector query (low-level) |
 
+
 ### Selectors
 
 ```bash
@@ -554,7 +668,8 @@ ctx query "#api + status:published"       # Intersection
 | `ctx history <path>` | Show version history |
 | `ctx history <path> --diff` | Include each version's unified diff from the one before |
 | `ctx reconstruct <path> <version>` | Reconstruct a specific version (a version the history does not contain is refused, not approximated) |
-| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped) |
+| `ctx verify` | Verify integrity of all hash chains (a `history.yaml` that cannot be read is reported, not skipped). In an encrypted vault without its key it reports `encrypted_key_required` and never passes |
+| `ctx forget-log [path]` | The forget audit trail — who forgot or deleted what, when, and under which reason code (never the content) |
 
 Every CLI failure prints as a one-liner — `Error [CODE]: message` for engine
 errors, plain `Error: message` for the rest. Set `CONTEXTNEST_DEBUG=1` to get the
@@ -570,11 +685,76 @@ full stack trace back.
 | `ctx checkpoint list` | List checkpoints |
 | `ctx checkpoint rebuild` | Rebuild checkpoint history |
 
+### Importing literature (JATS / PubMed Central)
+
+Scientific articles arrive as JATS XML — PubMed Central's `*.nxml`, publisher
+deposits, society corpora. `ctx import jats` turns each one into a **markdown
+twin**: a `reference` node whose body is the article (sections as headings,
+one paragraph per line, GFM tables, figure captions, LaTeX kept as `$…$`,
+numbered references) and whose frontmatter carries the graph NLM already
+curated, as query tags:
+
+| Tag | From |
+|---|---|
+| `#pubtype-systematic-review`, `#pubtype-meta-analysis`, `#pubtype-srma` (SR + MA), `#pubtype-guideline`, `#pubtype-rct`, `#pubtype-review` | MEDLINE publication types from PubMed (`ctx import pubmed`, `ctx enrich pubtator`); raw list in `metadata.publication_types` |
+| `#pubtype-review-article`, `#pubtype-srma` | JATS `article-type`, `custom-meta document_type` — when the PubMed types are unknown (plain `ctx import jats`) |
+| `#article-type-review-article` | JATS `article-type`, once PubMed's types are known (also `metadata.article_type`) |
+| `#year-2019`, `#journal-clin-gastroenterol-hepatol` | `pub-date`, `journal-id` |
+| `#fecal-microbiota-transplantation` | `<kwd>` keywords |
+| `#license-cc-by-nc-nd` | `<license>` / `<ali:license_ref>` |
+| `#status-retracted`, `#has-erratum` | `<related-article>` retraction / correction links |
+| `#mesh-d003015` | PubTator entities (after `ctx enrich pubtator`) |
+
+Every paragraph keeps its JATS id as a trailing block anchor (`… ^p_4_2`), so
+an agent can cite `nodes/papers/pmid-31013034#p_4_2` rather than a whole
+paper. `metadata` holds `doi` / `pmid` / `pmcid`, authors, `source_sha256`
+and the parsed reference list; references whose DOI or PMID name another
+paper in the vault become `[[wikilinks]]` (`metadata.cites`), and earlier
+papers are re-linked when the paper they cite arrives.
+
+```bash
+ctx import jats ./corpus/                 # every .xml / .nxml under the folder
+ctx import jats paper.nxml --keep-xml     # also store the original under assets/jats/
+ctx import pubmed --term "chronic pain[majr] AND systematic review[pt]" --license commercial --max 50
+ctx enrich pubtator                       # NCBI entities + relations, MeSH-normalised
+ctx query "#fmt #pubtype-srma -#status-retracted"
+```
+
+Imports are idempotent: unchanged XML (same `source_sha256`) is skipped, a
+changed file cuts a new version, and a batch shares one checkpoint. A file
+holding several `<article>`s (a `pmc-articleset` dump) is imported article by
+article. The twin is *derived*: a re-import (`--force`, or changed XML)
+regenerates its body, tags and NLM metadata from the XML and carries over
+only enrichment (`metadata.entities` / `relations` / `pubtator` /
+`publication_types` and the tags derived from them, a resolved `pmid`/`pmcid`)
+— hand edits to a twin do not survive. `import pubmed` and `enrich pubtator`
+call NCBI's public services (3 requests/s; set `NCBI_API_KEY` or `--api-key`
+for 10/s). Each twin records its licence.
+
+`ctx import pubmed` searches **PubMed** — where MeSH (`[mh]`, `[majr]`) and
+publication-type (`[pt]`) qualifiers work; PMC's own search silently ignores
+them — restricted to records with PMC full text (`"pubmed pmc"[sb]` is added
+unless the term already has it), then fetches each hit's JATS from PMC.
+`#pubtype-*` tags come from the record's MEDLINE publication types, not the
+JATS `article-type` (which says "review-article" for most systematic reviews).
+`--license <list>` keeps only articles under those licences — `cc-by`, `cc0`,
+`cc-by-nc`, `cc-by-sa`, … or `commercial` (CC BY + CC0 + public domain). PMC's
+licence filters skip downloads; the licence the JATS itself declares decides,
+so an article with no declared licence is dropped. `--max` counts articles
+*imported*: up to 6× as many candidates are considered so licence drops do not
+shrink the batch, and the drops are listed as skipped.
+
+| Command | Description |
+|---|---|
+| `ctx import jats <paths...> [--folder nodes/papers] [--keep-xml] [--no-relink]` | Import JATS files or folders as markdown twins (the global `--force` republishes unchanged twins) |
+| `ctx import pubmed --term <query> [--max 25] [--license <list>] [--api-key]` | Search PubMed (PMC full text only), keep the licences asked for, and import the hits with MEDLINE `#pubtype-*` tags |
+| `ctx enrich pubtator [ids...] [--tag-limit 12]` | Attach PubTator 3 entities / relations, `#mesh-` tags and MEDLINE `#pubtype-*` tags to imported papers (the global `--force` re-fetches already-enriched ones) |
+
 ---
 
 ## MCP Server
 
-The MCP server exposes vault operations as 38 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 41 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -643,21 +823,26 @@ cloud:
 | `context_nests` | List every nest in the central registry |
 | `context_skill` | Render a `type: skill` node as a harness-ready skill file |
 | `context_skill_install` | Build the file manifest that installs a vault skill locally |
+| `context_structure` | The nest's structure rules: allowed folders, node types, name formats, templates (`folder` for one folder's rule, `report` for what breaks them) |
 | `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
 | `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
 | `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |
-| `context_search` | Full-text search with graph traversal |
+| `context_search` | Search published nodes, best match first. `mode`: `lexical` (stemmed BM25, default), `semantic` (embeddings), `hybrid` (RRF of both, exact title/#tag matches pinned); `rerank` re-scores the top hits. Each hit carries `score` + per-signal `scores` |
+| `context_embed` | Build/refresh the embedding index for semantic/hybrid search — published nodes only, re-embeds only new/changed versions, prunes the rest (`rebuild` to start over) |
 | `context_query` | Selector query with graph traversal (`include_drafts`) |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |
 | `context_versions` | List a document's version history |
 | `context_reconstruct` | Reconstruct a specific version |
 | `context_packs` | List packs with their `includes` and `excludes` |
 | `context_verify` | Verify every hash chain in the vault |
+| `context_forget` | Forget a node: erase its content from history, keep the hashes (verify still passes), leave a `status: forgotten` stub |
+| `context_forget_log` | The forget audit trail — never the forgotten content |
 | `context_create` | Create a node — own `id`, `publish: false`, initial `status`, `note`, full `skill` block |
 | `context_update` | Update a node — rename, set `status`, stamp a `version`, clear metadata with `null` |
 | `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |
-| `context_delete` | Delete a node and its history; returns the deleted node's `title` |
+| `context_delete` | Delete a node and its history, recorded in the forget audit log (`purge: true` for none); returns the deleted node's `title` |
 | `context_import` | Bulk create-and-publish from `documents` and/or existing `ids` — one checkpoint for the batch |
+| `context_import_pdf` | Import a PDF as a `type: pdf` node — extracted text as the body, the PDF kept beside it and bound by SHA-256; pass `id` to version an existing one |
 
 Every tool above also takes an optional `client` object — `{ agent, session_id, …custom }` —
 naming the agent and session behind the call. A write that publishes records it on the
@@ -674,6 +859,7 @@ spec §9.4.
 | `read_index` | Return the context.yaml index |
 | `read_pack` | Resolve and return a context pack with documents |
 | `list_checkpoints` | List recent checkpoints |
+| `context_review` | Review gate: `list` held writes, `approve` / `reject` one (`id`), turn the gate `off` / `on` |
 
 **Deprecated tools** — still registered and unchanged, so existing clients keep
 working; removed in a future major:
@@ -729,12 +915,12 @@ ctx verify                         # 8. Verify integrity
 
 ## License
 
-All packages are licensed under **AGPL-3.0**:
+The repository is **AGPL-3.0** ([LICENSE](LICENSE)), except the specification, which is **Apache-2.0** ([LICENSE-SPEC](LICENSE-SPEC)):
 
 - **CLI** ([@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli)): **AGPL-3.0**
 - **Engine** ([@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine)): **AGPL-3.0**
 - **MCP Server** ([@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)): **AGPL-3.0**
-- **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard
+- **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard, implementable without AGPL obligations
 
 AGPL-3.0 ensures all improvements stay open source. You are free to use, modify, and distribute Context Nest, but modifications to the source must be shared under the same license. Commercial licensing is available from [PromptOwl](https://promptowl.ai) for organizations that need to embed or redistribute without AGPL obligations.
 

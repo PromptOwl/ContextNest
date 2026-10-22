@@ -22,9 +22,11 @@ import {
   appendFileSync,
   existsSync,
   rmSync,
+  readdirSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -98,12 +100,19 @@ function runCtxResult(
   };
 }
 
+// New vaults hold add/update for review; these suites exercise the publish
+// path, so they turn the gate off (review-gate.regression.test.ts covers it).
+function reviewOff(cwd: string): void {
+  execFileSync("node", [distPath, "config", "set", "review", "off"], { cwd, env: ENV, stdio: "ignore" });
+}
+
 function initVault(cwd: string): void {
   execFileSync(
     "node",
     [distPath, "init", "--name", "regression-vault", "--layout", "structured"],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  reviewOff(cwd);
 }
 
 /** Init a vault from a named starter recipe (scaffolds nodes + packs). */
@@ -113,6 +122,7 @@ function initStarter(cwd: string, recipe: string): void {
     [distPath, "init", "--name", "starter-vault", "--starter", recipe],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  reviewOff(cwd);
 }
 
 interface MockServer {
@@ -207,7 +217,7 @@ function startGatedEngine(pollSequence: Array<Record<string, unknown>>): Promise
             JSON.stringify({
               status: "pending_confirmation",
               pending_id: "pid1",
-              confirm_url: "https://ui.example/confirm/pid1",
+              confirm_url: `/nests/${nest}/pending-pushes/pid1/confirm`,
               poll_url: `/nests/${nest}/pending-pushes/pid1`,
               message: "This nest requires confirmation before the push is applied.",
               expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
@@ -267,6 +277,20 @@ describe("[regression] ctx init", () => {
     expect(out).toMatch(/Available starter recipes/);
     expect(out).toMatch(/developer/);
     expect(existsSync(join(tmp, ".context", "config.yaml"))).toBe(false);
+  });
+
+  it("--layout obsidian scaffolds a flat vault without the structured node directories", () => {
+    const out = runCtx(tmp, ["init", "--name", "regression-vault", "--layout", "obsidian"]);
+    expect(out).toMatch(/Initialized obsidian vault/);
+
+    // The shared scaffold lands under either layout.
+    expect(existsSync(join(tmp, ".context", "config.yaml"))).toBe(true);
+    expect(existsSync(join(tmp, "CONTEXT.md"))).toBe(true);
+    // Obsidian is the flat layout: none of structured's node directories are
+    // created — notes live at the vault root (storage.ts detectLayout()).
+    expect(existsSync(join(tmp, "nodes"))).toBe(false);
+    expect(existsSync(join(tmp, "sources"))).toBe(false);
+    expect(existsSync(join(tmp, "packs"))).toBe(false);
   });
 });
 
@@ -363,6 +387,33 @@ describe("[regression] ctx read", () => {
     expect(out).toMatch(/title:\s*Read Me/);
   });
 
+  it("surfaces a failed integrity check on every view: terminal, --raw (stderr), --html (banner)", () => {
+    const file = join(tmp, "nodes", "readme.md");
+    writeFileSync(file, readFileSync(file, "utf-8").replace("Hello body", "Tampered body"), "utf-8");
+    const warning = /⚠ Integrity check failed/;
+
+    expect(runCtx(tmp, ["read", "nodes/readme"])).toMatch(warning);
+
+    // --raw: stdout is still exactly the stored bytes; the warning is on stderr.
+    const raw = runCtxResult(tmp, ["read", "nodes/readme", "--raw"]);
+    expect(raw.status).toBe(0);
+    expect(raw.stdout.trimEnd()).toBe(readFileSync(file, "utf-8").trimEnd());
+    expect(raw.stderr).toMatch(warning);
+
+    const out = join(tmp, "readme.html");
+    runCtx(tmp, ["read", "nodes/readme", "--html", "--out", out]);
+    const html = readFileSync(out, "utf-8");
+    expect(html).toMatch(/<!-- integrity: failed \(body_drift\) -->/);
+    expect(html).toMatch(/role="alert"[^>]*>⚠ Integrity check failed/);
+  });
+
+  it("an intact document prints no integrity warning on any view", () => {
+    expect(runCtx(tmp, ["read", "nodes/readme"])).not.toMatch(/Integrity check failed/);
+    expect(runCtxResult(tmp, ["read", "nodes/readme", "--raw"]).stderr).not.toMatch(
+      /Integrity check failed/,
+    );
+  });
+
   it("accepts a path with a trailing .md extension", () => {
     const out = runCtx(tmp, ["read", "nodes/readme.md", "--raw"]);
     expect(out).toMatch(/title:\s*Read Me/);
@@ -378,6 +429,87 @@ describe("[regression] ctx read", () => {
     expect(out).toMatch(/Bare slug body/);
     // publish by bare slug resolves too (does not error out).
     expect(() => runCtx(tmp, ["publish", "qaish"])).not.toThrow();
+  });
+});
+
+describe("[regression] ctx read/history/update in an Obsidian (flat) vault", () => {
+  beforeEach(() => {
+    execFileSync("node", [distPath, "init", "--name", "regression-vault", "--layout", "obsidian"], {
+      cwd: tmp,
+      env: ENV,
+      stdio: "ignore",
+    });
+    reviewOff(tmp);
+    writeFileSync(join(tmp, "my-node.md"), "---\ntitle: My Node\n---\n\nFlat body\n", "utf-8");
+    runCtx(tmp, ["index"]);
+  });
+
+  it("opens a root-level node by id, file name and URI — never re-rooted under nodes/", () => {
+    // Regression (CU-wdqcq046wd): read prefixed every bare id with nodes/, so
+    // every node in a flat vault was DOCUMENT_NOT_FOUND: nodes/<id>.
+    for (const ref of ["my-node", "my-node.md", "contextnest://my-node"]) {
+      const out = runCtx(tmp, ["read", ref]);
+      expect(out).toMatch(/My Node/);
+      expect(out).toMatch(/Flat body/);
+    }
+  });
+
+  it("history and update reach the same root-level node", () => {
+    runCtx(tmp, ["update", "my-node", "--body", "Edited body"]);
+    expect(readFileSync(join(tmp, "my-node.md"), "utf-8")).toMatch(/Edited body/);
+    expect(existsSync(join(tmp, "nodes"))).toBe(false);
+    expect(runCtx(tmp, ["history", "my-node"])).toMatch(/my-node/);
+  });
+
+  it("delete removes the root-level node it names", () => {
+    runCtx(tmp, ["delete", "my-node", "--yes"]);
+    expect(existsSync(join(tmp, "my-node.md"))).toBe(false);
+  });
+
+  it("forget erases the root-level node it names, and the prompt names it", () => {
+    runCtx(tmp, ["publish", "my-node", "--yes"]);
+    expect(runCtx(tmp, ["forget", "my-node", "--reason", "user_request", "--yes"])).toMatch(/Forgot my-node/);
+  });
+
+  it("publish reaches the root-level node", () => {
+    expect(runCtx(tmp, ["publish", "my-node", "--yes"])).toMatch(/Published my-node/);
+  });
+
+  it("an id that climbs out of the vault is still refused, and nothing outside is touched", () => {
+    // normalizeDocumentId was not the traversal guard: the engine refuses it.
+    const outside = join(tmp, "..", `cn-outside-${process.pid}.md`);
+    writeFileSync(outside, "---\ntitle: Outside\n---\n\nkeep\n", "utf-8");
+    try {
+      const res = runCtxResult(tmp, ["delete", `../${basename(outside, ".md")}`, "--yes"]);
+      expect(res.status).not.toBe(0);
+      expect(existsSync(outside)).toBe(true);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+});
+
+describe("[regression] bare id in a structured vault holding both <id>.md and nodes/<id>.md", () => {
+  beforeEach(() => initVault(tmp));
+
+  it("resolves to the root-level document, as MCP context_* clients already do", () => {
+    runCtx(tmp, ["add", "nodes/twin", "--title", "Nested Twin", "--body", "nested"]);
+    writeFileSync(join(tmp, "twin.md"), "---\ntitle: Root Twin\n---\n\nroot\n", "utf-8");
+    runCtx(tmp, ["index"]);
+    expect(runCtx(tmp, ["read", "twin"])).toMatch(/Root Twin/);
+    expect(runCtx(tmp, ["read", "nodes/twin"])).toMatch(/Nested Twin/);
+  });
+
+  it("delete names the file it resolved before removing it, and leaves the other", () => {
+    runCtx(tmp, ["add", "nodes/twin", "--title", "Nested Twin", "--body", "nested"]);
+    writeFileSync(join(tmp, "twin.md"), "---\ntitle: Root Twin\n---\n\nroot\n", "utf-8");
+    runCtx(tmp, ["index"]);
+    // Resolved before the prompt: the id it names is the one deleted.
+    const res = runCtxResult(tmp, ["delete", "twin", "--yes"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Deleted twin \(Root Twin\)/);
+    expect(existsSync(join(tmp, "twin.md"))).toBe(false);
+    expect(existsSync(join(tmp, "nodes", "twin.md"))).toBe(true);
   });
 });
 
@@ -618,6 +750,76 @@ describe("[regression] ctx search ranking and --limit", () => {
   );
 });
 
+// Retrieval modes (nodes/dev/spec-retrieval-modes): `ctx embed` + `ctx search
+// --mode`, end to end through the built CLI, against an in-process
+// OpenAI-compatible embeddings server — no network leaves the test.
+describe("[regression] ctx embed + ctx search --mode", () => {
+  const CONCEPTS = [
+    ["angry", "upset", "furious", "complaint"],
+    ["customer", "client", "buyer", "buyers"],
+    ["refund", "reimbursement", "money"],
+  ];
+  const vec = (t: string) => {
+    const w = t.toLowerCase().split(/[^a-z]+/);
+    return [...CONCEPTS.map((c) => w.filter((x) => c.includes(x)).length), 0.01];
+  };
+  let server: Server;
+  let seen: string[] = [];
+
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const body = JSON.parse(raw);
+        seen.push(...body.input);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ data: body.input.map((t: string, index: number) => ({ index, embedding: vec(t) })) }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  });
+  afterAll(() => new Promise<void>((r) => server.close(() => r())));
+
+  beforeEach(() => {
+    seen = [];
+    initVault(tmp);
+    const port = (server.address() as AddressInfo).port;
+    appendFileSync(
+      join(tmp, ".context", "config.yaml"),
+      `\nsearch:\n  embeddings:\n    provider: openai\n    model: stub-embed\n    base_url: http://127.0.0.1:${port}/v1\n`,
+    );
+    runCtx(tmp, ["add", "nodes/escalation", "--title", "Escalation policy", "--body", "When a client is furious, log a complaint."]);
+    runCtx(tmp, ["add", "nodes/refunds", "--title", "Refunds", "--body", "Reimbursement goes back within 5 days."]);
+  });
+
+  it("ctx embed indexes published documents and is incremental", async () => {
+    const first = JSON.parse(await runCtxAsync(tmp, ["embed", "--json"]));
+    expect(first).toMatchObject({ embedded: 2, total: 2, pruned: 0 });
+    expect(existsSync(join(tmp, ".context", "embeddings", ".gitignore"))).toBe(true);
+    const again = JSON.parse(await runCtxAsync(tmp, ["embed", "--json"]));
+    expect(again).toMatchObject({ embedded: 0, reused: 2 });
+  });
+
+  it("--mode semantic finds a paraphrase lexical search misses; --json keeps per-hit scores", async () => {
+    await runCtxAsync(tmp, ["embed", "--json"]);
+    const lexical = JSON.parse(await runCtxAsync(tmp, ["search", "upset buyers", "--json"]));
+    expect(lexical).toEqual([]);
+    const semantic = JSON.parse(await runCtxAsync(tmp, ["search", "upset buyers", "--mode", "semantic", "--json"]));
+    expect(semantic[0].id).toBe("nodes/escalation");
+    expect(typeof semantic[0].scores.semantic).toBe("number");
+    const hybrid = JSON.parse(await runCtxAsync(tmp, ["search", "refunds", "--mode", "hybrid", "--json"]));
+    expect(hybrid[0].id).toBe("nodes/refunds");
+    expect(typeof hybrid[0].scores.rrf).toBe("number");
+  });
+
+  it("rejects an unknown --mode", () => {
+    const res = runCtxResult(tmp, ["search", "x", "--mode", "vibes"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/--mode must be one of: lexical, semantic, hybrid/);
+  });
+});
+
 // ─── update ──────────────────────────────────────────────────────────────────
 
 describe("[regression] ctx update", () => {
@@ -634,6 +836,34 @@ describe("[regression] ctx update", () => {
 
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
     expect(onDisk).toMatch(/Revised body/);
+  });
+
+  it("--body-file - takes the body from stdin, and read --body round-trips it unchanged", () => {
+    const body = 'Line with "quotes", $HOME and `ticks`\r\n\nSecond paragraph';
+    const pipe = (args: string[], input?: string) =>
+      execFileSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    pipe(["update", "nodes/mutable", "--body-file", "-"], `${body}\n`);
+    const first = pipe(["read", "nodes/mutable", "--body"]);
+    expect(first).toContain('"quotes", $HOME and `ticks`');
+    expect(first).toContain("Second paragraph");
+    // Two read → update cycles must not grow or alter the body.
+    pipe(["update", "nodes/mutable", "--body-file", "-"], first);
+    pipe(["update", "nodes/mutable", "--body-file", "-"], pipe(["read", "nodes/mutable", "--body"]));
+    expect(pipe(["read", "nodes/mutable", "--body"])).toBe(first);
+  });
+
+  it("refuses an empty body unless --force, and --body with --body-file", () => {
+    const run = (args: string[], input?: string) =>
+      spawnSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    for (const r of [
+      run(["update", "nodes/mutable", "--body", ""]),
+      run(["update", "nodes/mutable", "--body-file", "-"], "\n"),
+    ]) {
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/empty one/);
+    }
+    expect(run(["update", "nodes/mutable", "--body", "x", "--body-file", "-"], "y").stderr).toMatch(/not both/);
+    expect(run(["update", "nodes/mutable", "--body", "", "--force"]).status).toBe(0);
   });
 
   it("a title change is persisted to the frontmatter", () => {
@@ -753,6 +983,74 @@ describe("[regression] ctx delete", () => {
   });
 });
 
+// ─── forget protocol (spec §6.3) ─────────────────────────────────────────────
+
+describe("[regression] ctx forget", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "Jane's record says GUAVA-ALPHA at intake."]);
+    runCtx(tmp, ["update", "nodes/jane", "--body", "Jane's record says GUAVA-BETA after review."]);
+    runCtx(tmp, ["update", "nodes/jane", "--body", "Jane's record, current revision."]);
+  });
+
+  const grepVault = (needle: string): string[] => {
+    const hits: string[] = [];
+    const walk = (d: string) => {
+      for (const name of readdirSync(d)) {
+        const p = join(d, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (readFileSync(p, "utf-8").includes(needle)) hits.push(p);
+      }
+    };
+    walk(tmp);
+    return hits;
+  };
+
+  it("refuses without --yes and without a closed reason code", () => {
+    expect(runCtxResult(tmp, ["forget", "nodes/jane", "--reason", "user_request"]).status).toBe(1);
+    const bad = runCtxResult(tmp, ["forget", "nodes/jane", "--reason", "she asked", "--yes"]);
+    expect(bad.status).not.toBe(0);
+    expect(grepVault("GUAVA-ALPHA")).not.toEqual([]);
+  });
+
+  it("node forget erases the content, leaves a stub, and verify still passes", () => {
+    const out = runCtx(tmp, [
+      "forget", "nodes/jane", "--reason", "user_request", "--requested-by", "jane@example.com", "--yes",
+    ]);
+    expect(out).toMatch(/Forgot nodes\/jane/);
+    expect(grepVault("GUAVA")).toEqual([]);
+    expect(runCtx(tmp, ["read", "nodes/jane"])).toMatch(/forgotten/);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+    expect(runCtxResult(tmp, ["reconstruct", "nodes/jane", "1"]).status).not.toBe(0);
+
+    const log = JSON.parse(runCtx(tmp, ["forget-log", "nodes/jane", "--json"]));
+    expect(log.events).toHaveLength(1);
+    expect(log.events[0]).toMatchObject({ scope: "node", reason_code: "user_request", requested_by: "jane@example.com" });
+
+    const history = JSON.parse(runCtx(tmp, ["history", "nodes/jane", "--json"]));
+    expect(history.versions.filter((v: { tombstone?: boolean }) => v.tombstone)).toHaveLength(3);
+
+    // Not in default listings; listed on request.
+    expect(runCtx(tmp, ["list", "--json"])).not.toContain("nodes/jane");
+    expect(runCtx(tmp, ["list", "--status", "forgotten", "--json"])).toContain("nodes/jane");
+    // Cannot be edited back into existence.
+    expect(runCtxResult(tmp, ["update", "nodes/jane", "--body", "again"]).status).not.toBe(0);
+  });
+
+  it("delete is logged but the path stays reusable; --purge logs nothing", () => {
+    runCtx(tmp, ["delete", "nodes/jane", "--yes"]);
+    expect(existsSync(join(tmp, "nodes", "jane.md"))).toBe(false);
+    expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events[0]).toMatchObject({ mode: "delete" });
+    runCtx(tmp, ["add", "nodes/jane", "--title", "Jane", "--body", "a brand new body"]);
+
+    runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
+    runCtx(tmp, ["delete", "nodes/scratch", "--purge", "--yes"]);
+    expect(JSON.parse(runCtx(tmp, ["forget-log", "--json"])).events).toHaveLength(1);
+    runCtx(tmp, ["add", "nodes/scratch", "--title", "Scratch", "--body", "scratch pad body text"]);
+    expect(runCtxResult(tmp, ["verify"]).status).toBe(0);
+  });
+});
+
 // ─── verify (integrity) ───────────────────────────────────────────────────────
 
 describe("[regression] ctx verify", () => {
@@ -776,6 +1074,17 @@ describe("[regression] ctx verify", () => {
     expect(res.status).toBe(1);
     expect(res.stdout).toMatch(/content_hash_mismatch/);
     expect(res.stdout).toMatch(/integrity error/);
+  });
+
+  // r24 B1: the crawl now skips a document it cannot read, and ctx verify's
+  // own crawl did not report the skip — so a vault whose documents could not
+  // be read verified green. It names each one, and fails.
+  it("names a document whose frontmatter does not parse, and exits non-zero", () => {
+    const file = join(tmp, "nodes", "sealed.md");
+    writeFileSync(file, readFileSync(file, "utf-8").replace(/^title: .*$/m, "title: [Sealed"));
+    const res = runCtxResult(tmp, ["verify", "--json"]);
+    expect(res.status).toBe(1);
+    expect(JSON.parse(res.stdout).errors).toContainEqual(expect.objectContaining({ type: "unreadable_document", document: "nodes/sealed" }));
   });
 });
 
@@ -802,6 +1111,42 @@ describe("[regression] ctx validate", () => {
     const parsed = JSON.parse(res.stdout);
     expect(parsed.valid).toBe(false);
     expect(parsed.errors[0].errors[0].field).toBe("title");
+  });
+
+  it("flags a pack whose query won't parse, with the operator hint", () => {
+    runCtx(tmp, ["add", "nodes/clean", "--title", "Clean Doc"]);
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(
+      join(tmp, "packs", "bad.yml"),
+      "id: bad\nlabel: Bad\nquery: \"#a OR #b\"\n",
+      "utf-8",
+    );
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toContain("✗ pack:bad");
+    expect(res.stdout).toContain('spell OR as "|"');
+  });
+
+  it("reports a pack file that is not valid YAML or not a valid pack, and reads .yaml packs", () => {
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(join(tmp, "packs", "broken.yml"), "id: [broken\n", "utf-8");
+    writeFileSync(join(tmp, "packs", "nolabel.yml"), "id: nolabel\nquery: \"#a\"\n", "utf-8");
+    writeFileSync(join(tmp, "packs", "ext.yaml"), "id: ext\nlabel: Ext\nquery: \"#a OR #b\"\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(1);
+    expect(res.stdout).toContain("✗ packs/broken.yml");
+    expect(res.stdout).toContain("invalid YAML");
+    expect(res.stdout).toContain("✗ packs/nolabel.yml");
+    expect(res.stdout).toContain("label");
+    expect(res.stdout).toContain("✗ pack:ext");
+  });
+
+  it("passes a vault whose packs are all valid", () => {
+    mkdirSync(join(tmp, "packs"), { recursive: true });
+    writeFileSync(join(tmp, "packs", "ok.yml"), "id: ok\nlabel: Ok\nquery: \"#a | #b\"\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/and [1-9]\d* packs valid/);
   });
 });
 
@@ -1111,6 +1456,11 @@ describe("[regression] html rendering", () => {
     const res = runCtx(tmp, ["welcome", "--no-open"]);
     expect(res).toMatch(/Generated welcome page/);
     expect(existsSync(join(tmp, ".context", "welcome.html"))).toBe(true);
+    // The brand logo must be inlined by tsup's `dataurl` loader — only the built
+    // CLI exercises that; vitest resolves the .png import through Vite instead.
+    expect(readFileSync(join(tmp, ".context", "welcome.html"), "utf-8")).toContain(
+      'src="data:image/png;base64,',
+    );
   });
 });
 
@@ -1144,6 +1494,63 @@ describe("[regression] ctx push", () => {
       expect(body.documents).toHaveLength(1);
       expect(body.documents[0].title).toBe("Pushable");
       expect(body.documents[0].tags).toContain("#engineering");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("lists skipped and failed documents, and exits non-zero when any failed", async () => {
+    const server = await startMockEngine(() => ({
+      published: 0,
+      context_md_updated: false,
+      node_ids: [],
+      skipped: ["Pushable"],
+      failed: [{ title: "Broken", error: "invalid type" }],
+    }));
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toMatch(/Pushable \(already exists, not overwritten\)/);
+      expect(res.stderr).toMatch(/Broken: invalid type/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("includes the folder for a folder-nested document, so a catalog-conformant nest can keep it out of the root", async () => {
+    // "cli flattens every single write" (Misha, #engineering, 2026-09-18):
+    // a document that lives under nodes/<folder>/<slug> locally must not be
+    // pushed as bare title+content — the receiving nest has no way to place
+    // it back under its folder without the folder segment riding along.
+    runCtx(tmp, ["add", "nodes/subteam/nested-doc", "--title", "Nested Doc"]);
+    const server = await startMockEngine((body) => ({
+      published: body.documents.length,
+      context_md_updated: Boolean(body.context_md),
+      node_ids: body.documents.map((_: unknown, i: number) => `node-${i}`),
+    }));
+    try {
+      await runCtxAsync(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+
+      const body = server.lastBody() as {
+        documents: Array<{ title: string; folder?: string }>;
+      };
+      const nested = body.documents.find((d) => d.title === "Nested Doc");
+      expect(nested?.folder).toBe("subteam");
+      // A root-level document must not gain a spurious folder.
+      const root = body.documents.find((d) => d.title === "Pushable");
+      expect(root?.folder).toBeUndefined();
     } finally {
       await server.close();
     }
@@ -1190,9 +1597,27 @@ describe("[regression] ctx push", () => {
         "--yes",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).toMatch(/Pushed 1 document/);
       expect(server.pollCount()).toBeGreaterThanOrEqual(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a confirmed push that created fewer than it held reports the shortfall", async () => {
+    const server = await startGatedEngine([{ status: "applied", doc_count: 3, applied_node_count: 1 }]);
+    try {
+      const res = await runCtxAsyncResult(tmp, [
+        "push",
+        "--server", server.url,
+        "--nest", "nest-1",
+        "--key", "cnst_testkey",
+        "--yes",
+      ]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toMatch(/Pushed 1 document\b/);
+      expect(res.stdout).toMatch(/2 not created/);
     } finally {
       await server.close();
     }
@@ -1228,9 +1653,159 @@ describe("[regression] ctx push", () => {
         "--no-wait",
       ]);
       expect(res.status).toBe(0);
-      expect(res.stdout).toMatch(/Confirm in the UI: https:\/\/ui\.example\/confirm\/pid1/);
+      expect(res.stdout).toContain(`Confirm in the UI: ${server.url}/nest/nest-1`);
       expect(res.stdout).not.toMatch(/Pushed/);
       expect(server.pollCount()).toBe(0);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+// ─── ctx query @org/pack-name — PromptOwl cloud route (QRY-05) ───────────────
+// `ctx query @org/pack` leaves the local vault entirely and injects a hosted
+// pack over HTTP(S). The cloud is mocked with a loopback HTTP server (plaintext
+// to a loopback address is allowed without --force, per assertSafeEndpoint)
+// selected with PROMPTOWL_API_URL, so the full request/response contract — the
+// POST path and body, the rendered success + --json, and the quota/error
+// branches — is pinned without a real hosted engine.
+
+describe("[regression] ctx query — PromptOwl cloud pack route", () => {
+  interface CloudServer {
+    url: string;
+    lastPath: () => string | undefined;
+    lastBody: () => unknown;
+    close: () => Promise<void>;
+  }
+
+  /** An ephemeral cloud stub for the `/v1/packs/:org/:pack/inject` endpoint. */
+  function startMockCloud(
+    reply: () => { status: number; json?: unknown; text?: string },
+  ): Promise<CloudServer> {
+    return new Promise((resolve) => {
+      let path: string | undefined;
+      let captured: unknown;
+      const server: Server = createServer((req, res) => {
+        path = req.url;
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          captured = raw ? JSON.parse(raw) : null;
+          const r = reply();
+          if (r.text !== undefined) {
+            res.writeHead(r.status, { "Content-Type": "text/plain" });
+            res.end(r.text);
+          } else {
+            res.writeHead(r.status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(r.json));
+          }
+        });
+      });
+      server.listen(0, () => {
+        const port = (server.address() as AddressInfo).port;
+        resolve({
+          url: `http://127.0.0.1:${port}`,
+          lastPath: () => path,
+          lastBody: () => captured,
+          close: () => new Promise((rr) => server.close(() => rr())),
+        });
+      });
+    });
+  }
+
+  /** Run the CLI with PROMPTOWL_API_URL pointed at the mock, tolerating failure. */
+  async function runCloud(
+    cwd: string,
+    args: string[],
+    apiUrl: string,
+  ): Promise<{ status: number; stdout: string; stderr: string }> {
+    const env = { ...ENV, PROMPTOWL_API_URL: apiUrl } as NodeJS.ProcessEnv;
+    try {
+      const { stdout, stderr } = await execFileAsync("node", [distPath, ...args], {
+        cwd,
+        env,
+        encoding: "utf-8",
+      });
+      return { status: 0, stdout, stderr };
+    } catch (e: any) {
+      return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    }
+  }
+
+  it("rejects an @selector that is not @org/pack, before any network call", () => {
+    // No slash → a format error up front (exit 1); nothing is fetched.
+    const res = runCtxResult(tmp, ["query", "@notapack"]);
+    expect(res.status).toBe(1);
+    const out = res.stdout + res.stderr;
+    expect(out).toMatch(/Invalid cloud pack format/);
+    expect(out).toMatch(/@org\/pack-name/);
+  });
+
+  it("injects a cloud pack: POSTs the right path and body, renders docs and metering", async () => {
+    const server = await startMockCloud(() => ({
+      status: 200,
+      json: {
+        documents: [
+          { id: "nodes/a", title: "Alpha", body: "A", type: "document", version: 1 },
+          { id: "nodes/b", title: "Beta", body: "B", type: "document", version: 2 },
+        ],
+        metering: { credits_used: 2, remaining_today: 98, plan: "pro" },
+      },
+    }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status, res.stderr).toBe(0);
+      // Routing contract: the org/pack split and the `pack:` selector body.
+      expect(server.lastPath()).toBe("/v1/packs/promptowl/my-pack/inject");
+      expect(server.lastBody()).toEqual({ selector: "pack:my-pack", format: "markdown" });
+      // Rendered surface: each document, then the metering line.
+      expect(res.stdout).toMatch(/nodes\/a: Alpha/);
+      expect(res.stdout).toMatch(/nodes\/b: Beta/);
+      expect(res.stdout).toMatch(/2 credit\(s\) used, 98 remaining today \(pro plan\)/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("--json prints the raw cloud payload verbatim", async () => {
+    const payload = {
+      documents: [{ id: "nodes/a", title: "Alpha", body: "A", type: "document", version: 1 }],
+      metering: { credits_used: 1, remaining_today: 42, plan: "free" },
+    };
+    const server = await startMockCloud(() => ({ status: 200, json: payload }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack", "--json"], server.url);
+      expect(res.status, res.stderr).toBe(0);
+      // A "☁ Fetching…" status line precedes the JSON; parse from the first brace.
+      const json = JSON.parse(res.stdout.slice(res.stdout.indexOf("{")));
+      expect(json).toEqual(payload);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("surfaces a 429 quota response with the upgrade hint and exits non-zero", async () => {
+    const server = await startMockCloud(() => ({
+      status: 429,
+      json: { message: "Query quota exceeded for today", upgrade_url: "https://promptowl.ai/upgrade" },
+    }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status).toBe(1);
+      const out = res.stdout + res.stderr;
+      expect(out).toMatch(/Query quota exceeded for today/);
+      expect(out).toMatch(/Upgrade: https:\/\/promptowl\.ai\/upgrade/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports a non-OK cloud response with its status and body, and exits non-zero", async () => {
+    const server = await startMockCloud(() => ({ status: 500, text: "internal boom" }));
+    try {
+      const res = await runCloud(tmp, ["query", "@promptowl/my-pack"], server.url);
+      expect(res.status).toBe(1);
+      expect(res.stdout + res.stderr).toMatch(/Cloud query failed \(500\): internal boom/);
     } finally {
       await server.close();
     }
@@ -1602,10 +2177,12 @@ describe("[regression] file safety — command coverage", () => {
   // --dry-run sandbox and action log with no other symptom, so assert every
   // listed name still resolves to a real command.
   const CLASSIFIED = [
-    "init", "add", "update", "delete", "publish", "index", "welcome",
+    "init", "add", "update", "delete", "forget", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
     "plugin add", "plugin set", "plugin remove", "plugin pull", "plugin promote",
+    "import pdf",
+    "import jats", "import pubmed", "enrich pubtator",
   ];
 
   it.each(CLASSIFIED)("`ctx %s` still exists", (name) => {
@@ -1849,5 +2426,541 @@ describe("[regression] caller attribution — --agent / --session / --client", (
       "sess-cli-1",
     ]);
     expect(out).toBeDefined();
+  });
+});
+
+// ─── import pdf (CU-wdqcq02pmg) ──────────────────────────────────────────────
+
+describe("[regression] ctx import pdf", () => {
+  const PDF_FIXTURES = join(here, "..", "..", "..", "..", "fixtures", "pdf");
+  const fixture = (name: string) => join(PDF_FIXTURES, name);
+
+  it("imports a text PDF as a type: pdf node with its sidecar, and verify passes", () => {
+    initVault(tmp);
+    const out = runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--folder", "reports", "--tags", "finance"]);
+    expect(out).toMatch(/nodes\/reports\/quarterly-report/);
+    const md = readFileSync(join(tmp, "nodes", "reports", "quarterly-report.md"), "utf-8");
+    expect(md).toMatch(/^type: pdf$/m);
+    expect(md).toMatch(/file: nodes\/reports\/quarterly-report\.pdf/);
+    expect(md).toContain("Revenue grew 12 percent.");
+    expect(md).toContain("#finance");
+    expect(readFileSync(join(tmp, "nodes", "reports", "quarterly-report.pdf"))).toEqual(
+      readFileSync(fixture("report.pdf")),
+    );
+    const verify = runCtxResult(tmp, ["verify"]);
+    expect(verify.status).toBe(0);
+  });
+
+  it("--id versions an existing pdf node; ctx verify catches a swapped sidecar", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--id", "nodes/q3"]);
+    const out = runCtx(tmp, ["import", "pdf", fixture("report-v2.pdf"), "--id", "nodes/q3"]);
+    expect(out).toMatch(/v2/);
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toContain("Revenue grew 14 percent.");
+
+    writeFileSync(join(tmp, "nodes", "q3.pdf"), readFileSync(fixture("scanned.pdf")));
+    const verify = runCtxResult(tmp, ["verify", "--json"]);
+    expect(verify.status).toBe(1);
+    const report = JSON.parse(verify.stdout);
+    expect(report.errors.map((e: { type: string }) => e.type)).toContain("sidecar_drift");
+  });
+
+  it("imports several files in one call and reports a scanned PDF's missing text layer", () => {
+    initVault(tmp);
+    const out = runCtx(tmp, ["import", "pdf", fixture("report.pdf"), fixture("scanned.pdf")]);
+    expect(out).toMatch(/quarterly-report/);
+    expect(out).toMatch(/scanned/);
+    expect(out).toMatch(/no text layer/i);
+    expect(existsSync(join(tmp, "nodes", "scanned.pdf"))).toBe(true);
+  });
+
+  it("fails cleanly on a file that is not a PDF", () => {
+    initVault(tmp);
+    writeFileSync(join(tmp, "notes.txt"), "plain text");
+    const res = runCtxResult(tmp, ["import", "pdf", join(tmp, "notes.txt")]);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr + res.stdout).toMatch(/%PDF-/);
+  });
+
+  it("refuses to hand-edit a pdf node's body while still allowing a metadata edit", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "pdf", fixture("report.pdf"), "--id", "nodes/q3"]);
+
+    // The body is the extracted text — the binary is the source of truth, so an
+    // --body edit is refused (import a new PDF version instead).
+    const edit = runCtxResult(tmp, ["update", "nodes/q3", "--body", "hand edited text"]);
+    expect(edit.status).not.toBe(0);
+    expect(edit.stderr + edit.stdout).toMatch(/is a PDF node/);
+    expect(edit.stderr + edit.stdout).toMatch(/cannot be edited directly/);
+    // The refusal is before any write: the extracted text on disk is untouched.
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toContain("Revenue grew 12 percent.");
+
+    // Metadata still edits — the refusal is body-specific, not a blanket lock.
+    const rename = runCtxResult(tmp, ["update", "nodes/q3", "--title", "Q3 Renamed"]);
+    expect(rename.status).toBe(0);
+    expect(readFileSync(join(tmp, "nodes", "q3.md"), "utf-8")).toMatch(/title: Q3 Renamed/);
+  });
+});
+
+// ─── ctx import jats — markdown twins that render and retrieve ───────────────
+
+describe("[regression] import jats", () => {
+  // CU-wdqcq02c6w: JATS XML → markdown twin. The twin has to come back out
+  // through the surfaces an agent uses: `query` by the NLM-derived tags,
+  // `read --html` with anchors/tables/sup rendered, and a second import must
+  // not cut a version for unchanged XML.
+  const fixture = join(here, "..", "..", "..", "engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+
+  it("imports, is idempotent, and the twin is queryable by evidence-tier tags", () => {
+    initVault(tmp);
+    mkdirSync(join(tmp, "in"));
+    writeFileSync(join(tmp, "in", "paper.xml"), readFileSync(fixture));
+    writeFileSync(join(tmp, "in", "paper-copy.xml"), readFileSync(fixture));
+
+    const first = runCtxResult(tmp, ["import", "jats", join(tmp, "in"), "-y"]);
+    expect(first.status).toBe(0);
+    expect(first.stdout).toContain("nodes/papers/pmid-99900001");
+    expect(first.stdout).toMatch(/Published 1 document\(s\), skipped 1/);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+
+    const second = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "-y"]);
+    expect(second.status).toBe(0);
+    expect(second.stdout).toMatch(/Published 0 document\(s\), skipped 1/);
+    // The GLOBAL --force republishes an unchanged twin (a local --force would be shadowed by it).
+    const forced = runCtxResult(tmp, ["import", "jats", join(tmp, "in", "paper.xml"), "--force"]);
+    expect(forced.status).toBe(0);
+    expect(forced.stdout).toMatch(/pmid-99900001 v2/);
+
+    const srma = JSON.parse(runCtx(tmp, ["query", "#pubtype-srma", "--json"]));
+    expect(srma.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
+    const year = JSON.parse(runCtx(tmp, ["query", "#year-2024 #paper", "--json"]));
+    expect(year.documents.map((d: { id: string }) => d.id)).toContain("nodes/papers/pmid-99900001");
+    const other = JSON.parse(runCtx(tmp, ["query", "#year-1999", "--json"]));
+    expect(other.documents).toHaveLength(0);
+
+    expect(runCtx(tmp, ["validate"])).not.toMatch(/invalid/i);
+  });
+
+  it("renders anchors, tables, sup/sub and LaTeX through read --html", () => {
+    initVault(tmp);
+    runCtx(tmp, ["import", "jats", fixture, "-y"]);
+    const out = join(tmp, "paper.html");
+    const res = runCtxResult(tmp, ["read", "nodes/papers/pmid-99900001", "--html", "--out", out]);
+    expect(res.status).toBe(0);
+    const html = readFileSync(out, "utf-8");
+    expect(html).toContain('<p id="p_1_1">');
+    expect(html).toContain("10<sup>9</sup>");
+    expect(html).toContain("<td>Serum HIV | HBV</td>");
+    expect(html).toContain("$p = \\frac{k}{n}$");
+    expect(html).toContain('<h2 id="references">References</h2>');
+  });
+
+  it("is additive (no TTY consent needed) and honours --dry-run", () => {
+    initVault(tmp);
+    // Import creates, never destroys: off a TTY the command line is consent,
+    // same as `ctx add`. --dry-run runs the whole flow in the sandbox.
+    const dry = runCtxResult(tmp, ["import", "jats", fixture, "--dry-run"]);
+    expect(dry.status).toBe(0);
+    expect(dry.stdout).toMatch(/Published 1 document\(s\)/);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(false);
+
+    const real = runCtxResult(tmp, ["import", "jats", fixture]);
+    expect(real.status).toBe(0);
+    expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+  });
+});
+
+// ─── ctx import pubmed / ctx enrich pubtator — end to end against an NCBI stub ─
+
+describe("[regression] import pubmed + enrich pubtator", () => {
+  // The CLI argument surface (--term, --max, --tag-limit, --api-key fallback
+  // via NCBI_API_KEY) is exercised through the built binary; NCBI itself is a
+  // local stub selected with CONTEXTNEST_EUTILS_BASE / CONTEXTNEST_PUBTATOR_BASE.
+  const fixture = join(here, "..", "..", "..", "engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+  const bioc = readFileSync(join(here, "fixtures", "pubtator-30056182.json"), "utf-8");
+
+  function startNcbiStub(): Promise<{ url: string; requests: string[]; close: () => Promise<void> }> {
+    return new Promise((resolve) => {
+      const requests: string[] = [];
+      const jats = readFileSync(fixture, "utf-8");
+      const server: Server = createServer((req, res) => {
+        const url = req.url ?? "";
+        requests.push(url);
+        const send = (type: string, body: string) => {
+          res.writeHead(200, { "Content-Type": type });
+          res.end(body);
+        };
+        const query = decodeURIComponent(url.replace(/\+/g, " "));
+        if (url.includes("/esearch.fcgi")) {
+          // The import search (PubMed, restricted to PMC full text): two hits;
+          // any other PubMed search (PMID lookup by DOI/PMCID): one.
+          const search = query.includes('"pubmed pmc"[sb]');
+          send("application/json", JSON.stringify({ esearchresult: search ? { idlist: ["99900001", "99900002"], count: "2" } : { idlist: ["30056182"], count: "1" } }));
+        } else if (url.includes("/esummary.fcgi")) {
+          // PMID → PMC id + MEDLINE publication types.
+          const ids = (/[?&]id=([^&]*)/.exec(query)?.[1] ?? "").split(",");
+          const result: Record<string, unknown> = { uids: ids };
+          for (const id of ids) {
+            result[id] = {
+              pubtype: ["Journal Article", "Systematic Review", "Meta-Analysis"],
+              articleids: id.startsWith("999") ? [{ idtype: "pmc", value: `PMC999000${id.slice(-1)}` }] : [],
+            };
+          }
+          send("application/json", JSON.stringify({ result }));
+        } else if (url.includes("/efetch.fcgi")) {
+          const id = /id=(\d+)/.exec(url)?.[1] ?? "0";
+          // Second article: different DOI + no PMID so enrich has to resolve it.
+          const body = id === "9990002"
+            ? jats.replace('<article-id pub-id-type="pmid">99900001</article-id>', "").replace("10.9999/jsg.2024.001", "10.9999/jsg.2024.002")
+            : jats;
+          send("application/xml", `<pmc-articleset>${body.replace(/^<\?xml[^>]*>/, "")}</pmc-articleset>`);
+        } else if (url.includes("/publications/export/biocjson")) {
+          send("application/json", bioc);
+        } else {
+          res.writeHead(404);
+          res.end("no");
+        }
+      });
+      server.listen(0, () => {
+        const port = (server.address() as AddressInfo).port;
+        resolve({
+          url: `http://localhost:${port}`,
+          requests,
+          close: () => new Promise((r) => server.close(() => r())),
+        });
+      });
+    });
+  }
+
+  it("fetches --max articles, imports them, then enriches with --tag-limit and the NCBI_API_KEY fallback", async () => {
+    initVault(tmp);
+    const stub = await startNcbiStub();
+    const env = {
+      ...ENV,
+      CONTEXTNEST_EUTILS_BASE: stub.url,
+      CONTEXTNEST_PUBTATOR_BASE: stub.url,
+      NCBI_API_KEY: "test-key-123",
+    } as NodeJS.ProcessEnv;
+    const run = (args: string[]) =>
+      execFileAsync("node", [distPath, ...args], { cwd: tmp, env, encoding: "utf-8" });
+    try {
+      const imp = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
+      expect(imp.stdout).toMatch(/2 match\(es\) in PubMed with PMC full text; fetched 2/);
+      expect(imp.stdout).toMatch(/Published 2 document\(s\)/);
+      expect(existsSync(join(tmp, "nodes", "papers", "pmid-99900001.md"))).toBe(true);
+      expect(existsSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"))).toBe(true);
+      // PubMed (not PMC) is searched — PMC's esearch ignores [mh]/[pt].
+      expect(stub.requests.some((u) => u.includes("esearch") && u.includes("db=pmc"))).toBe(false);
+      const esearch = stub.requests.find((u) => u.includes("esearch") && u.includes("db=pubmed"))!;
+      expect(esearch).toContain("retmax=4");
+      expect(esearch).toContain("api_key=test-key-123");
+      const twin1 = readFileSync(join(tmp, "nodes", "papers", "pmid-99900001.md"), "utf-8");
+      expect(twin1).toContain("'#pubtype-systematic-review'");
+      expect(twin1).toContain("publication_types:");
+
+      // --license: both stub articles are CC BY, so cc-by-nc imports nothing.
+      const nc = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--license", "cc-by-nc", "-y"]);
+      expect(nc.stdout).toMatch(/skipped 2 for licence/);
+      expect(nc.stdout).toMatch(/Nothing to import/);
+
+      // Unchanged → skipped; the global --force republishes.
+      const again = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"]);
+      expect(again.stdout).toMatch(/Published 0 document\(s\), skipped 2/);
+      const forced = await run(["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--force"]);
+      expect(forced.stdout).toMatch(/pmid-99900001 v2/);
+
+      // The stub only knows PMID 30056182: the DOI-only paper resolves to it
+      // and is enriched; the paper carrying PMID 99900001 is reported, not lost.
+      // --tag-limit 0 means "no #mesh- tags", not "use the default".
+      const zero = await run(["enrich", "pubtator", "--tag-limit", "0", "-y"]);
+      expect(zero.stdout).toMatch(/Enriched 1 document\(s\)/);
+      expect(readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8")).not.toContain("#mesh-");
+
+      const enr = await run(["enrich", "pubtator", "--tag-limit", "1", "--force", "-y"]);
+      expect(enr.stdout).toMatch(/Enriched 1 document\(s\)/);
+      expect(enr.stdout).toMatch(/pmid-99900001 \(PubTator has no record for PMID 99900001\)/);
+      const twin = readFileSync(join(tmp, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"), "utf-8");
+      expect(twin).toContain("pmid: '30056182'");
+      expect((twin.match(/#mesh-/g) ?? []).length).toBe(1);
+      // The PMID lookup for the PMID-less paper went to the stub (PMCID first, DOI as fallback).
+      expect(stub.requests.some((u) => u.includes("db=pubmed") && /%5B(pmcid|doi)%5D/.test(u))).toBe(true);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+// ─── unknown command / option ────────────────────────────────────────────────
+// Commander rejects an unrecognized command or option during parsing, before
+// any action runs. These lock the friendly, stack-trace-free contract: a typo
+// gets a one-line "unknown …" on stderr and a non-zero exit, never a dump.
+
+describe("[regression] unknown command and option", () => {
+  it("a top-level unknown command fails with a friendly error, no stack trace", () => {
+    const { status, stderr } = runCtxResult(tmp, ["frobnicate"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/unknown command 'frobnicate'/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+
+  it("an unknown option on a known command is rejected before it runs", () => {
+    const { status, stderr } = runCtxResult(tmp, ["list", "--bogus"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/unknown option '--bogus'/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── missing-document error hygiene ──────────────────────────────────────────
+// A write/read against a path that was never created surfaces the engine's
+// DOCUMENT_NOT_FOUND, names the id, exits non-zero, and never leaks a stack.
+// Pairs with the "reconstruct names the missing document" case above; this
+// covers the sibling delete/history/publish/update commands.
+
+describe("[regression] missing-document error hygiene", () => {
+  beforeEach(() => initVault(tmp));
+
+  it.each<[string, string[]]>([
+    ["delete", ["delete", "nodes/ghost", "--yes"]],
+    ["history", ["history", "nodes/ghost"]],
+    ["publish", ["publish", "nodes/ghost"]],
+    ["update", ["update", "nodes/ghost", "--title", "X"]],
+  ])("%s on a non-existent document fails cleanly", (_name, args) => {
+    const { status, stderr } = runCtxResult(tmp, args);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/DOCUMENT_NOT_FOUND/);
+    expect(stderr).toMatch(/nodes\/ghost/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── history --diff ──────────────────────────────────────────────────────────
+// `--diff` folds each version's unified diff from the one before into the
+// history render; without it the render stays a plain version list, and a
+// single-version document has nothing to diff and must not choke.
+
+describe("[regression] history --diff", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/edited", "--title", "Edited", "--body", "first body"]);
+    runCtx(tmp, ["update", "nodes/edited", "--body", "second body"]);
+  });
+
+  it("includes the unified diff between successive versions", () => {
+    const diffed = runCtx(tmp, ["history", "nodes/edited", "--diff"]);
+    expect(diffed).toMatch(/@@/);
+    expect(diffed).toMatch(/-first body/);
+    expect(diffed).toMatch(/\+second body/);
+    // The plain render carries no diff hunk — --diff is what turns it on.
+    expect(runCtx(tmp, ["history", "nodes/edited"])).not.toMatch(/@@/);
+  });
+
+  it("renders a single-version document without a diff hunk, exit 0", () => {
+    runCtx(tmp, ["add", "nodes/solo", "--title", "Solo", "--body", "only body"]);
+    const { status, stdout } = runCtxResult(tmp, ["history", "nodes/solo", "--diff"]);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/v1/);
+    expect(stdout).not.toMatch(/@@/);
+  });
+});
+
+// ─── publish --author / --message ────────────────────────────────────────────
+// `--author` sets the authoring identity recorded on the version entry
+// (`edited_by`, surfaced as the `By:` line), distinct from the caller-attribution
+// --agent/--session/--client block; `--message` becomes that version's note.
+
+describe("[regression] publish --author / --message", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/release", "--title", "Release", "--body", "one"]);
+    runCtx(tmp, ["update", "nodes/release", "--body", "two"]);
+  });
+
+  it("records the author and message on the published version", () => {
+    runCtx(tmp, [
+      "publish", "nodes/release",
+      "--author", "alice@example.com",
+      "--message", "release note",
+    ]);
+    const latest = JSON.parse(runCtx(tmp, ["history", "nodes/release", "--json"]))
+      .versions.at(-1);
+    expect(latest.edited_by).toBe("alice@example.com");
+    expect(latest.note).toBe("release note");
+    // The human render surfaces the same author on the By: line.
+    expect(runCtx(tmp, ["history", "nodes/release"])).toMatch(/By: alice@example\.com/);
+  });
+});
+
+// ─── selector grouping with ( ) ──────────────────────────────────────────────
+// Parentheses group a sub-expression so OR can be intersected with a further
+// term regardless of default operator precedence. Complements the individual
+// | / - / + operator cases above.
+
+describe("[regression] selector grouping", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/g1", "--title", "G1", "--tags", "red,big"]);
+    runCtx(tmp, ["add", "nodes/g2", "--title", "G2", "--tags", "blue,big"]);
+    runCtx(tmp, ["add", "nodes/g3", "--title", "G3", "--tags", "red,small"]);
+  });
+
+  const ids = (json: string): string[] =>
+    JSON.parse(json).map((d: { id: string }) => d.id).sort();
+
+  it("intersects a grouped OR with an outer AND term", () => {
+    expect(ids(runCtx(tmp, ["resolve", "(#red | #blue) + #big", "--json"])))
+      .toEqual(["nodes/g1", "nodes/g2"]);
+    expect(ids(runCtx(tmp, ["resolve", "#red + (#big | #small)", "--json"])))
+      .toEqual(["nodes/g1", "nodes/g3"]);
+  });
+});
+
+// ─── read --out output-path guard ────────────────────────────────────────────
+// `--out` names a file for the rendered HTML and only applies with --html.
+// Without --html the CLI renders to the terminal and writes no file, rather
+// than silently emitting a bare-body file the caller didn't ask for.
+
+describe("[regression] read --out without --html", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/page", "--title", "Page", "--body", "body text"]);
+  });
+
+  it("renders to the terminal and writes no file", () => {
+    const target = join(tmp, "page.html");
+    const { status, stdout } = runCtxResult(tmp, ["read", "nodes/page", "--out", target]);
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Page/);
+    expect(existsSync(target)).toBe(false);
+  });
+});
+
+// ─── ctx info ────────────────────────────────────────────────────────────────
+// `info` summarizes the vault: name, path, counts by type and status, tags, and
+// the CONTEXT.md preamble. --json is the machine-readable form agents consume.
+
+describe("[regression] ctx info", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, ["add", "nodes/one", "--title", "One", "--tags", "#a", "--publish"]);
+  });
+
+  it("summarizes counts, tags and name in the human view", () => {
+    const out = runCtx(tmp, ["info"]);
+    expect(out).toMatch(/regression-vault/);
+    expect(out).toMatch(/1 node\(s\)/);
+    expect(out).toMatch(/document: 1/);
+    expect(out).toMatch(/published: 1/);
+    expect(out).toMatch(/#a/);
+  });
+
+  it("--json reports the same summary as a structured envelope", () => {
+    const json = JSON.parse(runCtx(tmp, ["info", "--json"]));
+    expect(json.total).toBe(1);
+    expect(json.by_type).toEqual({ document: 1 });
+    expect(json.by_status).toEqual({ published: 1 });
+    expect(json.tags).toEqual(["#a"]);
+    expect(json.config.name).toBe("regression-vault");
+    expect(typeof json.vault_path).toBe("string");
+  });
+});
+
+// ─── ctx skill show / install ────────────────────────────────────────────────
+// A `type: skill` node renders into an agent-harness SKILL.md. `show` prints an
+// offline snapshot; `install` prints a loader that fetches the node at runtime
+// and, without --write, touches nothing outside the vault. --dry-run keeps the
+// external-write guard honest.
+
+describe("[regression] ctx skill show / install", () => {
+  beforeEach(() => {
+    initVault(tmp);
+    runCtx(tmp, [
+      "add", "nodes/deploy-skill", "--type", "skill",
+      "--title", "Deploy Skill", "--trigger", "when deploying",
+      "--body", "Do the deploy steps.",
+    ]);
+  });
+
+  it("show renders the skill node as a SKILL.md for the harness", () => {
+    const out = runCtx(tmp, ["skill", "show", "nodes/deploy-skill", "--scope", "project"]);
+    expect(out).toMatch(/name: deploy-skill/);
+    expect(out).toMatch(/description: "when deploying"/);
+    expect(out).toMatch(/Do the deploy steps\./);
+    expect(out).toMatch(/skills[\\/]deploy-skill[\\/]SKILL\.md/);
+  });
+
+  it("install without --write prints a loader and writes nothing outside the vault", () => {
+    const out = runCtx(tmp, ["skill", "install", "nodes/deploy-skill", "--scope", "project"]);
+    expect(out).toMatch(/context_skill/);
+    expect(out).toMatch(/Re-run with --write to install these files\./);
+    expect(existsSync(join(tmp, ".claude"))).toBe(false);
+  });
+
+  it("install --write --dry-run reports the target without writing it", () => {
+    // The dry-run report rides the file-safety action log on stderr, which is
+    // what keeps it off stdout (spec: --json output stays parseable).
+    const { status, stderr } = runCtxResult(tmp, [
+      "skill", "install", "nodes/deploy-skill", "--scope", "project", "--write", "--dry-run",
+    ]);
+    expect(status).toBe(0);
+    expect(stderr).toMatch(/Dry run — no files were written/);
+    expect(stderr).toMatch(/skills[\\/]deploy-skill[\\/]SKILL\.md/);
+    expect(existsSync(join(tmp, ".claude"))).toBe(false);
+  });
+
+  it("show on a non-existent skill id fails cleanly", () => {
+    const { status, stderr } = runCtxResult(tmp, ["skill", "show", "nodes/nope", "--scope", "project"]);
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/DOCUMENT_NOT_FOUND/);
+    expect(stderr).not.toMatch(/\n\s+at /);
+  });
+});
+
+// ─── ctx validate — circular source dependency (rule 15) ─────────────────────
+// Two source nodes whose `depends_on` URIs point at each other form a cycle.
+// Each node is individually well-formed, so validate surfaces only the cycle,
+// names the loop, and exits non-zero.
+
+describe("[regression] ctx validate — circular source dependency", () => {
+  beforeEach(() => initVault(tmp));
+
+  const writeSource = (id: string, tool: string, dependsOn: string): void => {
+    const dir = join(tmp, dirname(id));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(tmp, `${id}.md`),
+      [
+        "---",
+        `title: ${id}`,
+        "type: source",
+        "status: published",
+        "source:",
+        "  transport: mcp",
+        "  tools:",
+        `    - ${tool}`,
+        "  depends_on:",
+        `    - contextnest://${dependsOn}`,
+        "---",
+        "",
+        "Body.",
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+  };
+
+  it("names the cycle and exits non-zero", () => {
+    writeSource("nodes/sources/a", "foo", "nodes/sources/b");
+    writeSource("nodes/sources/b", "bar", "nodes/sources/a");
+
+    const { status, stdout } = runCtxResult(tmp, ["validate"]);
+    expect(status).not.toBe(0);
+    expect(stdout).toMatch(/Circular dependency detected: nodes\/sources\/a → nodes\/sources\/b → nodes\/sources\/a/);
+
+    const json = JSON.parse(runCtxResult(tmp, ["validate", "--json"]).stdout);
+    expect(json.valid).toBe(false);
+    const cycle = json.errors.find((e: { path: string }) => e.path === "sources");
+    expect(cycle.errors[0].rule).toBe(15);
+    expect(cycle.errors[0].message).toMatch(/Circular dependency:/);
   });
 });

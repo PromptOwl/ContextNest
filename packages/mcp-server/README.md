@@ -8,7 +8,7 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **38 tools** over stdio transport.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **41 tools** over stdio transport.
 
 > **New in 2.2.1** — `context_folders` lists the vault's folders and their
 > document counts without opening a document, and `context_list` takes a
@@ -110,20 +110,25 @@ them over the legacy tools below.
 | `context_nests` | List every nest in the central registry — alias, path, description, which is default, whether it exists |
 | `context_skill` | Render a `type: skill` node for an agent harness (Claude Code, Cursor, Codex, raw) — trigger becomes the harness matcher |
 | `context_skill_install` | Build the file manifest that installs a vault skill. Loader mode (default) fetches at runtime and cannot drift; `full` embeds an offline copy that will |
+| `context_structure` | The nest's structure rules — allowed folders, node types, folder/file-name formats, templates and required sections/files. `folder` resolves one folder's rule with its template body; `report` lists existing content that breaks the rules. Writes that break an enforced rule are refused |
 | `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
 | `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
 | `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |
-| `context_search` | Full-text search with graph traversal |
+| `context_search` | Search published nodes, best match first. `mode`: `lexical` (stemmed BM25, default), `semantic` (embeddings), `hybrid` (RRF of both, exact title/#tag matches pinned); `rerank` re-scores the top hits. Each hit carries `score` + per-signal `scores` |
+| `context_embed` | Build/refresh the embedding index for semantic/hybrid search — published nodes only, re-embeds only new/changed versions, prunes the rest (`rebuild` to start over) |
 | `context_query` | Selector query with graph traversal. `include_drafts` for authoring surfaces |
 | `context_resolve` | Resolve a selector to full bodies within a token budget |
 | `context_versions` | List a document's version history (new capability — nothing exposed this before) |
 | `context_reconstruct` | Reconstruct a specific version. Refuses a version the history does not contain, instead of returning a neighbour's content |
 | `context_packs` | List packs, each with its `includes` and `excludes` |
-| `context_verify` | Verify every hash chain in the vault |
+| `context_verify` | Verify every hash chain in the vault and rebuild every recorded version (`version_unreconstructable` when one cannot be rebuilt). Forgotten versions verify hash-only (`tombstoned`) |
+| `context_forget` | Forget a node (spec §6.3): erase every version's content, keep the hashes so verify still passes, leave an empty `status: forgotten` stub every URI resolves to. `reason_code` is a closed set, never free text. Later republish/re-import of the content is refused |
+| `context_forget_log` | The forget audit trail: who, when, reason code, which versions. Never the content |
 | `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |
 | `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
 | `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |
-| `context_delete` | Delete a node and its version history; returns the deleted node's `title` |
+| `context_delete` | Delete a node and its version history, recorded in the forget audit log (`purge: true` for none); returns the deleted node's `title` |
+| `context_import_pdf` | Import a PDF (`bytes_base64`) as a `type: pdf` node: extracted text as the body (`<!-- page N -->` markers; empty + `text_layer: false` for a scan), the PDF stored beside it and bound by SHA-256. Pass `id` of an existing pdf node for a new version — the old binary is kept in history |
 | `context_import` | Bulk create-and-publish. Takes `documents` (title + content) and/or `ids` (files already in the vault, published as-is) — a mixed batch seals **one** checkpoint and regenerates the index **once** |
 
 #### `client` — attributing a call

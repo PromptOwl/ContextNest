@@ -65,6 +65,8 @@ function initVault(cwd: string, extra: string[] = []): void {
     [distPath, "init", "--name", "no-vault-guard", "--layout", "structured", ...extra],
     { cwd, env, stdio: "ignore" },
   );
+  // New vaults hold writes for review; this suite is about resolution.
+  execFileSync("node", [distPath, "config", "set", "review", "off"], { cwd, env, stdio: "ignore" });
 }
 
 const tmpDirs: string[] = [];

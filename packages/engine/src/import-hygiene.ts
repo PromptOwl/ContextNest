@@ -13,12 +13,13 @@
  */
 
 import { NODE_TYPES, TAG_PATTERN } from "./schemas.js";
-import type { ContextNode, Frontmatter, NodeType } from "./types.js";
+import { mapInBatches } from "./concurrency.js";
+import type { ContextNode, Frontmatter, NodeType, PdfMeta } from "./types.js";
 
 const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES);
 
 /** Same rule as `buildDraftNode`'s slug: one dash per non-alphanumeric run. */
-function slugify(input: string): string {
+export function slugify(input: string): string {
   return input
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -51,12 +52,25 @@ const EXTENSION = /\.[a-z0-9]{1,8}$/i;
  * looks legitimate.
  */
 export function slugifyImportPath(relPath: string): string {
-  const segments = String(relPath ?? "").split(/[/\\]/).filter(Boolean);
+  // `.` segments dropped: `a/./b` is `a/b` to every file system, so two
+  // spellings of one target must not reach the checks as two paths.
+  const segments = String(relPath ?? "")
+    .split(/[/\\]/)
+    .filter((s) => s !== "" && s !== ".");
   return segments
-    .map((segment, i) => {
+    .map((raw, i) => {
+      // Trailing dots and spaces dropped, as Windows drops them, so every
+      // check downstream sees the name the file system will hold
+      // (`history.yaml.` is `history.yaml`). Dot-only segments (`..`) are left
+      // for the traversal guard. A loop, not `/[. ]+$/`, which is quadratic.
+      let end = raw.length;
+      if (!/^\.+$/.test(raw)) while (end > 0 && (raw[end - 1] === "." || raw[end - 1] === " ")) end--;
+      const segment = raw.slice(0, end) || raw;
       if (segment.startsWith(".")) return segment.toLowerCase();
       if (CLEAN_SEGMENT.test(segment)) return segment;
       const isLast = i === segments.length - 1;
+      // `INDEX.md`, `README.md`: kept as named, or the copy is read as a node.
+      if (isLast && KEPT_IMPORT_NAMES.has(segment)) return segment;
       const ext = isLast ? (segment.match(EXTENSION)?.[0] ?? "") : "";
       const stem = ext ? segment.slice(0, -ext.length) : segment;
       const slug = slugify(stem) || "untitled";
@@ -64,6 +78,13 @@ export function slugifyImportPath(relPath: string): string {
     })
     .join("/");
 }
+
+/**
+ * File names an import keeps with their capitals: a generated `INDEX.md` and a
+ * folder's `README.md` are not nodes, and lowercased they would be. Only these
+ * two — import-verdicts refuses one whose folder holds another spelling of it.
+ */
+export const KEPT_IMPORT_NAMES: ReadonlySet<string> = new Set(["INDEX.md", "README.md"]);
 
 /** Where the last path segment's extension starts, or its length if none. */
 function extensionStart(segment: string): number {
@@ -114,9 +135,10 @@ function versionPathParts(path: string): { prefix: string; suffix: string } | un
  * to prevent.
  */
 function rawDocKey(rawPath: string): string {
+  // `.` segments resolve away, as slugifyImportPath drops them.
   const segments = String(rawPath ?? "")
     .split(/[/\\]/)
-    .filter(Boolean);
+    .filter((s) => s !== "" && s !== ".");
   const i = segments.findIndex((segment) => segment.toLowerCase() === ".versions");
   if (i >= 0 && i + 1 < segments.length) {
     return [...segments.slice(0, i), segments[i + 1]].join("/");
@@ -153,6 +175,9 @@ export async function planImportPaths(
 ): Promise<Array<{ raw: string; path: string; warnings: string[] }>> {
   const claimed = new Map<string, string>(); // target → raw path that owns it
   const renamedStems = new Map<string, string>(); // `<dir>/<stem>` → new stem
+  // Next `-n` to try per `<dir><stem>\0<ext>`: a suffix taken once stays
+  // taken, so a run of collisions on one slug costs linear lookups, not n².
+  const nextSuffix = new Map<string, number>();
   const bases = rawPaths.map((raw) => slugifyImportPath(raw));
   const plan: Array<{ raw: string; path: string; warnings: string[] }> = new Array(rawPaths.length);
   // Stable sort, so documents — and version files among themselves — keep
@@ -164,6 +189,12 @@ export async function planImportPaths(
         Number(versionPathParts(bases[a]) !== undefined) -
         Number(versionPathParts(bases[b]) !== undefined),
     );
+  // First-choice targets checked in parallel up front: on a network mount each
+  // check is a round trip, and asking one at a time made staging N latencies long.
+  const takenAtStart = new Map<string, boolean>();
+  await mapInBatches([...new Set(bases)], async (p) => {
+    takenAtStart.set(p, await isTaken(p));
+  });
 
   for (const i of order) {
     const raw = rawPaths[i];
@@ -183,17 +214,20 @@ export async function planImportPaths(
 
     let target = base;
     let takenBy: string | undefined;
-    for (let n = 2; ; n++) {
+    const key = `${dir}${stem}\0${ext}`;
+    let n = nextSuffix.get(key) ?? 2;
+    for (;;) {
       const owner = claimed.get(target);
       if (owner !== undefined) {
         takenBy ??= owner;
-      } else if (await isTaken(target)) {
+      } else if (takenAtStart.get(target) ?? (await isTaken(target))) {
         takenBy ??= "an existing vault file";
       } else {
         break;
       }
-      target = `${dir}${stem}-${n}${ext}`;
+      target = `${dir}${stem}-${n++}${ext}`;
     }
+    if (target !== base) nextSuffix.set(key, n);
     claimed.set(target, raw);
     if (!parts && target !== base) {
       renamedStems.set(rawDocKey(raw), target.slice(cut, -ext.length || undefined));
@@ -324,6 +358,8 @@ export function sanitizeImportedTags(
  *   `document`, warned.
  * - Tags that fail the tag rule → dropped, warned; pasted hashtag lists are
  *   split first so `"#gtm #contextnest"` becomes two tags, not garbage.
+ * - `version` that is not a whole number ≥ 1 (`1.1`, `"2"`, `0`) → rounded
+ *   down, else `1`, warned. Publishing bumps it, so `1.1` would mint 2.1.
  *
  * A document that already carries valid values gets an empty patch, so a
  * caller can write it back verbatim.
@@ -340,6 +376,19 @@ export function sanitizeImportedFrontmatter(
   const title = fm.title;
   if (typeof title !== "string" || title.trim() === "") {
     patch.title = firstHeading(node.body) ?? fallbackTitle;
+  }
+
+  // A pdf node's sidecar is `<id>.pdf` (§13 rule 26). When the import lands
+  // the node under a different id (slugified, or `-2` on a collision), the
+  // block would still name the OLD path — invalid, and in the collision case
+  // the path of ANOTHER node's binary. Re-point it at the node's own path.
+  // The bytes themselves do not travel through `files` (text only), so say so.
+  const pdf = fm.pdf as Record<string, unknown> | undefined;
+  if (fm.type === "pdf" && pdf && typeof pdf === "object" && pdf.file !== `${node.id}.pdf`) {
+    patch.pdf = { ...(pdf as unknown as PdfMeta), file: `${node.id}.pdf` };
+    warnings.push(
+      `${label}: pdf.file re-pointed from "${String(pdf.file)}" to "${node.id}.pdf" — copy the PDF itself there; binaries do not travel through an import of files`,
+    );
   }
 
   const type = fm.type;
@@ -364,6 +413,15 @@ export function sanitizeImportedFrontmatter(
     const unchanged =
       before.length === tags.length && before.every((t, i) => t === tags[i]);
     if (!unchanged) patch.tags = tags;
+  }
+
+  const version = fm.version;
+  if (version !== undefined && !(Number.isInteger(version) && (version as number) >= 1)) {
+    const n = Math.floor(Number(version));
+    patch.version = Number.isFinite(n) && n >= 1 ? n : 1;
+    warnings.push(
+      `${label}: version "${String(version)}" is not a whole number of at least 1; imported as ${patch.version}`,
+    );
   }
 
   return { patch, warnings };

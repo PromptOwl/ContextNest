@@ -1,0 +1,124 @@
+/**
+ * `search:` block of `.context/config.yaml` — retrieval modes.
+ *
+ *   search:
+ *     mode: lexical            # default for searches that name no mode: lexical | semantic | hybrid
+ *     full_match_first: true   # lexical: pin all-terms matches above partial ones
+ *     coordination: false      # true = legacy MiniSearch score x matched-term count
+ *     field_boosts: { title: 1, tags: 1, description: 1, body: 1 }   # BM25 per-field boosts (these are the defaults)
+ *     candidates: 100          # per-list depth fused by RRF
+ *     fusion_weights: { lexical: 1, semantic: 2 }   # hybrid: w/(60+rank) per list (default 1:2)
+ *     embeddings:
+ *       provider: bedrock      # bedrock | openai (any OpenAI-compatible /embeddings: OpenAI, Ollama, vLLM)
+ *       model: cohere.embed-v4:0
+ *       region: us-east-1      # bedrock only (else AWS_REGION)
+ *       base_url: http://localhost:11434/v1   # openai only
+ *       api_key_env: OPENAI_API_KEY           # openai only: NAME of the env var holding the key (must end in _API_KEY; required with a custom base_url)
+ *       dimensions: 1024       # optional output dimension
+ *       batch_size: 32
+ *       max_chars: 20000       # text sent per document is cut here
+ *       max_request_chars: 200000   # total characters per embedding request (batches split to fit)
+ *     rerank:
+ *       provider: bedrock
+ *       model: cohere.rerank-v3-5:0
+ *       top_n: 100             # non-seed hits reranked
+ *       unit: passage          # passage (default): each doc's locally best ~300-token window | document
+ *       max_passages: 100      # windows per query (100 = one request); > top_n adds next-best windows
+ *       batch_size: 100        # sources per rerank request
+ *
+ * Like the structure rules, this block is parsed only where it is used (here),
+ * never in `nestConfigSchema`: a typo in it must not brick every read of the
+ * vault. Keys are never secrets — a key is named by env var, not inlined,
+ * because config.yaml is committed.
+ */
+import { z } from "zod";
+import { ConfigError } from "../errors.js";
+
+export const SEARCH_MODES = ["lexical", "semantic", "hybrid"] as const;
+export type SearchMode = (typeof SEARCH_MODES)[number];
+
+/**
+ * config.yaml is shared (committed, imported), so it is untrusted input: the
+ * region is spliced into the Bedrock hostname, and a free-form env-var name
+ * would let a vault point any secret (GITHUB_TOKEN, CONTEXTNEST_TOKEN …) at
+ * its own `base_url`. Only an AWS region shape and `*_API_KEY` names pass.
+ */
+export const AWS_REGION_PATTERN = /^[a-z]{2}(-[a-z]+)+-\d{1,2}$/;
+export const API_KEY_ENV_PATTERN = /^[A-Z][A-Z0-9_]*_API_KEY$/;
+
+const providerFields = {
+  provider: z.string().min(1),
+  model: z.string().min(1),
+  region: z.string().regex(AWS_REGION_PATTERN, "must be an AWS region, e.g. us-east-1").optional(),
+  base_url: z
+    .string()
+    .url()
+    .refine((u) => /^https?:\/\//i.test(u), "must be an http(s) URL")
+    .optional(),
+  api_key_env: z
+    .string()
+    .regex(API_KEY_ENV_PATTERN, "must name an env var ending in _API_KEY, e.g. OPENAI_API_KEY")
+    .optional(),
+};
+
+export const embeddingsConfigSchema = z
+  .object({
+    ...providerFields,
+    dimensions: z.number().int().positive().optional(),
+    batch_size: z.number().int().positive().optional(),
+    max_chars: z.number().int().positive().optional(),
+    max_request_chars: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export const rerankConfigSchema = z
+  .object({
+    ...providerFields,
+    top_n: z.number().int().positive().optional(),
+    unit: z.enum(["passage", "document"]).optional(),
+    max_passages: z.number().int().positive().optional(),
+    batch_size: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export const searchConfigSchema = z
+  .object({
+    mode: z.enum(SEARCH_MODES).optional(),
+    full_match_first: z.boolean().optional(),
+    coordination: z.boolean().optional(),
+    field_boosts: z
+      .object({
+        title: z.number().nonnegative().optional(),
+        tags: z.number().nonnegative().optional(),
+        description: z.number().nonnegative().optional(),
+        body: z.number().nonnegative().optional(),
+      })
+      .strict()
+      .optional(),
+    candidates: z.number().int().positive().optional(),
+    fusion_weights: z
+      .object({
+        lexical: z.number().nonnegative().optional(),
+        semantic: z.number().nonnegative().optional(),
+      })
+      .strict()
+      .optional(),
+    embeddings: embeddingsConfigSchema.optional(),
+    rerank: rerankConfigSchema.optional(),
+  })
+  .strict();
+
+export type EmbeddingsConfig = z.infer<typeof embeddingsConfigSchema>;
+export type RerankConfig = z.infer<typeof rerankConfigSchema>;
+export type SearchConfig = z.infer<typeof searchConfigSchema>;
+
+/** Validate the raw `search:` value of config.yaml (absent → `{}`). */
+export function parseSearchConfig(raw: unknown): SearchConfig {
+  if (raw === undefined || raw === null) return {};
+  const result = searchConfigSchema.safeParse(raw);
+  if (!result.success) {
+    const messages = result.error.issues.map((i) => `search.${i.path.join(".")}: ${i.message}`);
+    throw new ConfigError(`Invalid search config in config.yaml: ${messages.join("; ")}`);
+  }
+  return result.data;
+}

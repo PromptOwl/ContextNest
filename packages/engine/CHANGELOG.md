@@ -1,5 +1,479 @@
 # @promptowl/contextnest-engine
 
+## 3.2.0
+
+### Minor Changes
+
+- **Retrieval modes: stemmed lexical search, plus opt-in semantic and hybrid search over published versions.**
+
+  - Lexical search now applies English (Porter) stemming at index and query time, so `migrations` finds `migration`. Stopwords are still dropped.
+  - **Ranking change (affects every existing vault, no config needed):** lexical scores are now the plain BM25 sum. MiniSearch's matched-term coordination factor is divided out (`search.coordination: true` restores it), and the default field boosts drop from title 3 / tags 2 / description 1.5 to all 1 (`search.field_boosts`). Exact title/#tag matches are pinned first in every mode, so title lookup keeps working. On MultiHop-RAG, NDCG@10 goes 0.657 → 0.706. See `docs/retrieval-modes.md`.
+  - New `ctx embed` / MCP `context_embed` builds an embedding index of **published** documents only. It is keyed by id + version + content hash, stored in `.context/embeddings/` (git-ignored), and is incremental.
+  - `ctx search --mode lexical|semantic|hybrid [--rerank]` / `context_search` `mode` + `rerank`. Hybrid uses weighted reciprocal rank fusion (k0 = 60, default lexical 1 : semantic 2, `search.fusion_weights`) and pins exact title/#tag matches. Hits carry per-signal `scores`, and the response names the `mode` that ran.
+  - Rerank works on passages by default (`search.rerank.unit: passage`). Each candidate's best ~300-token window is picked locally with stemmed BM25 (no API call), and the windows go to the reranker in one request of up to 100 passages. The hit carries its window as `passage`. The default `top_n` is 100.
+  - Providers are pluggable and optional: Amazon Bedrock (Cohere Embed v4, Titan v2, Cohere Rerank 3.5, using a Bedrock API key over fetch or a lazily imported `@aws-sdk/client-bedrock-runtime`), and any OpenAI-compatible `/embeddings` endpoint (OpenAI, Ollama, vLLM). The base install adds no provider dependency.
+  - The default mode stays lexical. A vault's `search.mode` applies only once an index exists. See `docs/retrieval-modes.md`.
+
+### Patch Changes
+
+- **Dependency updates.** `@modelcontextprotocol/sdk` `^1.29.0` → `^1.31.0` (engine runtime dependency, and the version bundled into the CLI and MCP server), and `fast-xml-parser` `^4.5.7` → `^5.7.0` (engine runtime dependency, used by the JATS/PubMed importers). Transitive security bumps: `body-parser` 2.3.0, `fast-uri` 3.1.8, `hono` 4.13.13, `proxy-addr` 2.0.8.
+- **Importing files checks for name collisions with one listing per folder.** `context_import` with `files[]` used to check every incoming path with its own existence check — a network round trip per file on a Cloud Storage mount, about a third of all storage operations a large import made. It now lists each target folder once and compares names case-folded, so a name a case-insensitive file system already holds (`Notes.md` against an incoming `notes.md`) still counts as taken and the incoming file lands beside it as `notes-2.md`.
+- **Importing publishes each document's new version as a full snapshot.** Storing a version as a diff first rebuilds the previous version from its keyframe and every diff since — on a Cloud Storage mount, a round trip per artifact for every imported document that already carries history. `context_import` with `discover` or `files[]` now stores that version as a keyframe instead, which reads nothing back. Each imported document keeps one extra full copy on disk, and `ctx history --diff` shows no diff for that one version. Publishing by `ids` only (bulk approval) still stores diffs.
+- **`ctx read` and the other commands that act on an existing document find a node at the root of an Obsidian (flat) vault.** `read`, `publish`, `history`, `reconstruct`, `update`, `delete`, `forget` and `forget-log` put `nodes/` in front of every id without a folder, so `ctx read my-node` looked for `nodes/my-node` and failed with `DOCUMENT_NOT_FOUND` for every node in a flat vault. They now send the id as typed (a `contextnest://` URI is reduced to its path, `.md` and a leading `/` are dropped) and let the engine resolve it for the vault's layout: the root-level node when there is one, else `nodes/<id>`. Against a remote nest the same commands, plus `move` and task `log`, retry a bare id once under `nodes/` when the nest answers `DOCUMENT_NOT_FOUND`, so nests that do not resolve a bare id themselves keep working. A `nodes/<id>` document that will not parse is still the one a bare id names, so the command reports why rather than a not-found.
+
+## 3.1.0
+
+### Minor Changes
+
+- `ctx login`: a key saved for one nest (`--nest <id>`) now works through a server alias as `--vault <alias>/<nest>`, even with no server-wide key saved. The alias lists the nests every saved key can see, and a command naming one nest signs in with that nest's key (else the server-wide one). `ctx login --account <name>` keeps a second account's keys on the same server, and an HTTP remote picks it with the new optional registry field `account` (`ctx vault add … --url … --account <name>`); `ctx logout` and `ctx login --list` take `--account` too. Keys saved without `--account` are unchanged.
+
+### Patch Changes
+
+- **Importing a document with a fractional version no longer publishes a fractional version.** A hand-edited `version: 1.1` was bumped to `2.1` on publish, and a host that stores versions in an integer column (Community on Postgres) refused the whole import. Import now repairs a `version` that is not a whole number of at least 1 (rounded down, else `1`) and reports it in `warnings`, like the other frontmatter repairs. As a backstop, every publish rounds a fractional frontmatter version down before bumping it, so no write path can mint one.
+- **Large imports and whole-vault crawls keep their I/O slots busy.** Bounded-parallel work (import staging and checks, bulk publish, history reads, vault scans) ran in fixed batches: each batch waited for its slowest file before the next started, so on a network mount (Cloud Storage via gcsfuse) one slow round trip left the other slots idle. It now runs as a sliding pool — the next file starts as soon as any finishes — with the same bound on files in flight and results still in input order. Hosts can also raise that bound for `context_import` with the new `OperationContext.limits.ioConcurrency` (default 32 file operations; bulk publish runs half as many documents). The value is the host's to set, never a caller input.
+
+## 3.0.0
+
+### Major Changes
+
+- 12d0667: **An imported forget is applied only to a copy of what it forgot, and logged once.**
+
+  - `context_import` re-applies an imported forget only to a pre-forget copy: a local document whose live text, live body, or any sealed version carries content the forget erased. A record naming a document here that holds none of it is refused (reported under `.versions/chain_events.yaml`) and not logged. A record reusing the id of a logged event with a different record is refused too — the log is deduplicated by id, so it would have been applied with no audit record of its own. A record scoped to versions is recorded but not applied to a live document: the engine forgets whole documents.
+  - This is a correctness filter, not authorization: a record carrying hashes a reader can obtain (a document's own checksum) still passes. Which callers may import forget records is the host's to decide; the engine applies no forget tier here.
+  - Imported forget records are logged as their own fields, never verbatim (a YAML alias chain in one used to expand into a log of hundreds of megabytes), with only distinct `sha256:` hashes kept, and in one read and one write of the log, however many (5000 used to take minutes under the vault lock). An imported chain-event log whose YAML aliases expand it past its own size is refused whole. A forget record that cannot be logged as a valid event is refused, never applied unlogged; an unquoted YAML timestamp is logged as ISO. Rebuilding a copy's versions reads at most 64 Mi characters per history, budget or not. `NestStorage.appendChainEvents` appends a batch; `ChainEventLog.appendBatch` uses it.
+  - **Breaking (API):** `applyImportedTombstones` now returns `{ applied, refused }` instead of `string[]`, and `TombstoneIndex` carries `eventIds`.
+  - Version files (history, keyframes, diffs) are read only when they are regular files, opened without blocking and checked on the open handle: a FIFO in their place no longer hangs verify, reconstruct or update.
+  - A JATS reference DOI, and the CLI's vault alias and nest labels, are trimmed in linear time. A structure-rule format (regex or token pattern) is at most 200 characters; compiling a token pattern walked it from every `{`.
+
+### Minor Changes
+
+- 0cf9677: `ctx import pubmed` searches PubMed, filters by licence, and tags MEDLINE publication types.
+
+  - **Search goes to PubMed, not PMC.** PMC's esearch silently ignores MeSH (`[mh]`, `[majr]`) and publication-type (`[pt]`) qualifiers, so `chronic pain[mh] AND systematic review[pt]` used to import unrelated case reports and trials. The term now runs against db=pubmed restricted to PMC full text (`"pubmed pmc"[sb]` is added unless present); PMIDs map to PMCIDs via esummary and the JATS is fetched from PMC as before. Behaviour change: the summary line reads "N match(es) in PubMed with PMC full text", and a term written for PMC's search syntax may match differently.
+  - **`--license <list>`** (`cc-by,cc0`, `cc-by-nc`, … or `commercial` = CC BY + CC0 + public domain) drops articles under any other licence: a PMC `[uid]` + licence-filter pre-check avoids downloads, and the JATS `<license>` decides (no declared licence → dropped). Drops are reported as skipped.
+  - **`--max` counts imported articles** (after the licence filter); up to 6× as many candidates are considered (2× without `--license`).
+  - **`#pubtype-*` comes from MEDLINE publication types** when PubMed's are known (`import pubmed`, `enrich pubtator`): Systematic Review → `#pubtype-systematic-review`, Meta-Analysis → `#pubtype-meta-analysis`, both → `#pubtype-srma`, (Practice) Guideline → `#pubtype-guideline`, RCT → `#pubtype-rct`, Review → `#pubtype-review`, …; the raw list is `metadata.publication_types`. The JATS `article-type` moves to `#article-type-*` on those twins (still `metadata.article_type`); a publisher `custom-meta document_type` tag is kept. Plain `ctx import jats` is unchanged. Publication types survive re-import like PubTator enrichment, an unchanged twin is republished once when its types become known, and `enrich pubtator` re-visits papers enriched before publication types existed.
+  - Engine: `jatsToDocument(...).meta.license_slug` exposes the normalised licence (`cc-by`, `cc-by-nc`, `cc0`, `cc-mark`, …) the `#license-*` tag carries.
+
+- 12d0667: **Structure rules: a nest owner can enforce folder layout, naming formats, placement and templates.**
+
+  **Behaviour changes in every vault, with or without structure rules:**
+
+  - No NEW documents under a root-level `packs/` folder (packs live there). Existing ones stay readable but can no longer be published.
+  - A new or updated document id may not contain `\` or a control character, or run over 1024 characters. A NEW name may not be over 251 bytes.
+  - Existing documents with such ids stay readable and erasable. One already on disk whose names the file system holds (up to 255 bytes, or UTF-16 units on Windows) can still be updated and published, as long as its id is within 1024 characters.
+  - `encryptVault` refuses to run when sealed files exist but `.context/encryption.yaml` is gone (see `unreadable-documents.md`).
+
+  - New optional `.context/config.yaml` keys (spec §11.1.1): `structure` (`enforce`, `closed`), path-pattern `folders` entries with `types`, `folder_name`, `file_name` (token patterns like `{date}-{slug}` or a guarded `/regex/`), `template`, `required` and `files`, and named `templates` with `required_sections`.
+  - Every write enforces them when `structure.enforce` is true — `context_create`, `context_update`, `context_delete`, `context_import` (both `files[]` and `documents[]`, with a refused document's history and folder files refused too), `context_import_pdf`, approving a held edit (`approveReview`) or drift suggestion (`approveSuggestion`), every publish (`publishDocument`/`publishDocuments` judge it: a first publish in full, a later one against the last sealed version — so `context_publish`, `context_import ids[]`, `context_update publish:true`, review approval and the legacy tools all agree; an import overwrite is judged as its publish before it lands; history that cannot be rebuilt is judged in full and never blocks the publish that repairs it, and a refused publish quarantines nothing; grandfathering trusts only a sealed head that rebuilds, versions strictly increasing, and matches its own content hashes (`sealedHead`), judged in the normalized view those hashes cover, with headings read by one line model (CR, LF and CRLF each end a line, as CommonMark does) for the live file and the head alike; a segment over 1000 entries, or whose replay walks over 128 Mi characters (the text's length once per diff, counted as it replays), is not trusted; one import reads, hashes and replays at most `limits.importReplayChars` (default 512 Mi) across its histories — its verdicts and its bulk publish share it, the bulk publish judging in the order given and never cutting short a document that passes the full check or has no history — and over it `files[]` are refused and asked to split, while a document the publish could not judge is reported "not published — publish it in a separate call" (a `NaN` setting is the default, never unlimited), and no history is read past 64 Mi characters (no version file over 320 MiB (five bytes per character of the 64 Mi cap) is read at all, nor a history.yaml on disk over 16 MiB parsed); histories are read outside the replay queue, one artifact at a time, and no file larger than five bytes per character of room left in its cap and the budget — nor any file that is not a regular file (a FIFO, a device) — read at all; a restored history the same as the one on disk is rebuilt once; a document that passes the full check is never replayed, so the budget only touches documents that break a rule; replays run one at a time and yield to the event loop; every patch application (replay, reconstruct, held edits, suggestion approval) applies a hunk only where its header says, in order and inside the text — every engine patch was made against exactly that text — so no patch can buy a search across the document or a copy past its end; a held edit or suggestion that no longer applies — or would land elsewhere than it was made, checked against the body it proposed (`applyStagedEdit`) — is reported stale — a held edit in the review listing and the current proposal too, so a later hold never builds on one it cannot carry (`applyPatchBounded`); a forget stub (`status: forgotten`, empty body) owes no required sections, so an enforced vault's own export round-trips, and grants nothing as a baseline — nor does a `source` under `sources/` or a head that does not parse; an imported history's head is judged as an update over the head the vault holds now (so a grandfathered document's own export restores over it); an unreadable on-disk history refuses its set, an unparseable one may be replaced; an import judges only files that will land (a refused file takes its history with it, `history.yaml` is written last) and judges a document against the head its history will have after the call, and an import is refused when the history the vault will hold after it (its files over what is there — under its own `history.yaml` and under the one already on disk) does not rebuild and verify, or ends in a version the full check refuses — a document may still arrive before or after its history; an import refuses any path spelling a machinery folder another way (`.versions::$DATA`, `.ver\u200Bsions`), so a decoy never vouches for the files beside it; an import never replaces a sealed PDF binary — sidecar (judged against the bytes on disk, or the sealed head's `pdf.sha256` when none are there) or archive — with other bytes, judged on the bytes on disk, so the same bytes always land, a sidecar with none on disk lands (verify and publish hold it to its `.md`, so chunked restores land in any order), and neither a retyped `.md` nor an unverifiable history frees a pdf node's sidecar; a `.pdf` beside an ordinary document is an ordinary file whose replaced bytes are archived first, and a never-sealed node takes the sidecar its `.md` names; a refused document or sidecar takes its family (the other of the pair, its history), a refused archived PDF does not; a document's `.versions/` folder takes no nested paths and no file in its place, nor in the place of `.versions/`, no folder in the place of a root ledger (`context_history.yaml`, `context_latest.yaml`, `chain_events.yaml` — one would stop every checkpoint or forget), and no dot-named entry (an import could otherwise plant the vault's own write lock); a set that brings a version file is always replayed; the history already on disk is judged with the call's files only where their bytes match its pinned hashes, and only when that changes its head; new PDF versions come through `context_import_pdf`), `ctx pull`, and the deprecated MCP `create_document` / `update_document` / `delete_document`. Refusals are `VALIDATION_FAILED` with a message naming the rule and the expected format; a rule that does not compile refuses writes with `CONFIG_ERROR` only in an enforced vault, never blocks reads, and `context_structure` reports it as `error`. Report-only rules write and refuse nothing. Existing content is grandfathered. Existing `folders:` blocks (template labels, any folder name) keep working.
+  - Owner regexes are restricted to an exact grammar (no repeated groups, ≤ 3-digit quantifier bounds, literal braces/brackets escaped) and matched by a linear-time position-set matcher — never the backtracking engine; token patterns run on it too, and classes follow ECMAScript Annex B (`[\d-z]` is a union, not a range). Malformed rule keys no longer make the config unreadable; they refuse writes only in an enforced vault. The reserved-path guard runs on every publish and folds case fully (`ſ`), drops NTFS `:stream` suffixes and refuses control characters. `NestStorage.init` keeps the rules over a re-init (and refuses a config that is not YAML but names them), and `ctx init` filters starters through them and publishes them as one batch. `enforce` other than `true`/`false`, or a `structure` that is not a mapping, is a CONFIG_ERROR, never off (`isEnforced`; `context_structure` reports it as enforced). First publishes scaffold in one directory crawl per top-level folder and one linear subtree pass (deep ids and wide batches no longer hold the vault lock), and only published or approved documents occupy a folder. `structure: false` is off. Re-init refuses any config that is not valid YAML. Imported file paths are size-checked before writing, reads measure the `.md` file an id names, and import failures report vault-relative paths, so no error reports the vault's absolute path. Imports keep `INDEX.md`/`README.md` names (refused beside another spelling of the name, in the folder or the call, and never renamed); an export's `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` are slugified like any other file and come back as draft nodes, key a `./`-spelled document's history as its slug does, and plan colliding names in linear lookups. Heading parsing and rule-key trimming are linear. `setStructure` refuses a config symlinked outside the vault. Token patterns are limited to ≤ 3 non-adjacent variable-width tokens, rule sets to 256 folder rules, and each (format, name) is evaluated once per check.
+  - No create, update, import or publish touches a document under `.context/`, `.versions/`, `_suggestions/` or the root `packs/`, or with a `\` or control character in its id, or an id over 1024 characters or with a name over 251 bytes (`assertWritableDocumentId`; an update checks before it writes; trusted restores are not exempt; rollbacks, czar direct edits and suggestion approvals too, via `commitNewVersion`). Deletes and forgets — imported forgets included — refuse `.context/`, `.versions/` and `_suggestions/` paths (`assertErasableDocumentId`; `assertNotMachineryPath` also backs `NestStorage.writeDocument`/`deleteDocument`), and an imported forget record naming no document of the vault (`../`) is neither logged nor applied. A name with `~` and a digit is checked where it resolves (`assertResolvesOutsideMachinery`, on every write and erase): an NTFS short name (`VERSIO~1`) for a reserved folder is refused, while `Plan~2` stays an ordinary, writable and erasable name. Name comparisons drop default-ignorable code points (HFS+ ignores them). Rules compare roots and exemptions exactly; enforced rules refuse another spelling of the content root (`NODES/`, `nodes./`, `nodes:x/`) as `FOLDER_NOT_ALLOWED`, since one volume reads it as `nodes/` and another as an unjudged folder. Those root-spelling refusals apply only under enforced rules; there, existing `Nodes/` documents stay editable (grandfathered) but cannot be newly created there. A rule key's `Nodes/` prefix matches without case.
+  - An enforced write that creates a folder also creates its required subfolders and files (drafts from their templates; best effort, never failing the write). A write held for review is scaffolded on its first publish, whichever surface approves it (`scaffoldFirstPublish`). A required file can be deleted only as the last document in its folder.
+  - New core op `context_structure` (`folder`, `report`) — on the MCP server automatically, and as `ctx structure [--folder] [--report] [--json]`, local and remote with identical JSON. `ctx add` without `--body` starts from the folder's template.
+  - New engine exports: `enforcedStructure`, `missingFolders`, `scaffoldFolders`, `scaffoldFirstPublish`, `assertStructurePublish`, `structurePublishViolations`, `isEnforced`, `assertStructureUpdate`, `assertStructureDelete`, `assertWritableDocumentId`, `assertNotMachineryPath`, `assertErasableDocumentId`, `assertResolvesOutsideMachinery`, `assertWritableDocumentPath`, `machineryAliasSegment`, `sealedHead`, `assertFitsFileSystem`, `comparableSegment`, `compileStructure`, `checkDocument`, `checkUpdate`, `checkFolder`, `checkDeleteDocument`, `checkDeleteFolder`, `scaffoldPlan`, `auditStructure`, `resolveFolder`, `describeStructure`, `enforceStructure`, `setStructure` (rewrites only the rule blocks of `config.yaml`), `structureReport` (the compliance report for any rules, saved or a host's draft — Community judges a draft with it before saving), and `OperationContext.structure: "skip"` for trusted hosts restoring a whole vault.
+  - **Security:** an imported `.pdf` in an encrypted vault now lands sealed (it was written as plaintext), and a forgotten PDF's bytes are refused at any path and under any name, not only as an archive, and a `.md` with broken frontmatter is still checked for a forgotten path or body. `context_verify` reports an unreadable version artifact instead of failing the vault. A version artifact that is present but unreadable (a directory, EACCES) is corrupt history, never "missing" (`readKeyframe`/`readDiff`). Heading, section and link scanning and the frontmatter delimiter share one line model (CR, LF, CRLF); `extractSection` returns LF-joined text. `context_import` `files[]` no longer writes anything under `.context/` or a document under the root `packs/` (an import could previously overwrite `config.yaml`, turning off the review gate), and no write op accepts a document id under `.context/` (Windows trailing-dot names included). Trusted hosts restoring a vault pass `structure: "skip"`.
+  - Plugin: session start shows the pinned/working-directory vault's rules; the capture and curator agents check `ctx structure` before writing.
+
+- 12d0667: **One unreadable file no longer takes a vault down, and bare ids find the document they created.**
+
+  - A document whose frontmatter does not parse or has the wrong shape (`tags: 5`, a scalar), or (in an encrypted vault) whose sealed bytes do not open with the vault's key, is skipped by listing and search instead of failing them for the whole vault — and a write no longer reports failure after landing because of one. `context_verify` and `ctx verify` name it as `unreadable_document`. A checkpoint sealed while a document is unreadable carries forward the entry the previous checkpoint held for it, so the chain never records a deletion that did not happen. A single scalar tag (`tags: project`, as Obsidian writes it) now reads as a one-tag list.
+  - A vault whose key is missing or wrong, or whose files are sealed under a key its config does not hold, still refuses to read — never listing empty. `encryptVault` refuses to mint a new key while sealed files are present and the config is gone.
+  - `context_import` refuses a document that would not read (a host restoring a whole vault keeps what it brings).
+  - `context_verify` reports a `history.yaml` that is a folder or a link as `unreadable_history`; it used to drop the document from the check and pass.
+  - A bare id (`doc`) that names no document resolves to the one `context_create` made for it (`nodes/doc`) in `context_update`, `context_get`, `context_delete`, `context_forget` and `context_forget_log`; a document at the bare id itself still wins (flat vaults). Every such id is validated before anything is read for it.
+  - New: `NestStorage.readDocumentText(id, raw)` reads a document from text as the vault would read it from disk; `discoverDocuments` takes `onUnreadable`; `FrontmatterShapeError` and `ForeignVaultKeyError` are exported.
+
+### Patch Changes
+
+- 12d0667: **Publishing a large document no longer freezes the process.** A new version of a document was stored as a diff against the previous one, which meant rebuilding that version from its keyframe and diffs, then diffing the whole text, all without letting other work run. On a 10 MB document with a dozen versions that held the process for seconds, and every other request waited, including requests for other vaults. Three changes: rebuilding a past version now lets other work run as it goes; a version is stored as a full snapshot instead of a diff when the document is over 1 MiB on either side (the new text or the previous one), so publishing it never replays its history or diffs a large text; and the index rebuild after a write skips the link scan for bodies that contain no links. Every version still rebuilds to exactly the same bytes, and existing histories are untouched. The trade-off for documents over 1 MiB: each new version takes a full copy on disk, and `ctx history --diff` / `context_versions` show no diff for those versions.
+- 2272496: A selector with `OR`, `AND` or `NOT` written as words (`#a OR #b`) now fails with a hint naming the right operator (`|`, a space or `+`, `-`) instead of suggesting `nodes/OR` or `#OR`. `ctx validate` also checks every pack's `query` and reports one that won't parse, so a broken pack shows up before someone queries it. It also reports a pack file that is not valid YAML or is missing a required field (both used to crash validate or be skipped silently), and packs saved as `.yaml` are now read alongside `.yml`. In `ctx validate --json`, pack errors carry a string `rule` (`"pack-query"` or `"pack-file"`) where document rules are numbers.
+
+## 2.12.0
+
+### Minor Changes
+
+- ce831be: Add the `view` node type (spec §1.12): a governed composition of other nodes. A view's required `view` frontmatter block is a layout of blocks (`md`, `list`, `summary`, `html`, `table`, `kpi`, `chart`, `callout`, `metric`, `data`) that name what to show and where it comes from. Being frontmatter, the layout is versioned and hashed like any node, so approving a view approves its layout.
+
+  - **Validation (rules 30–36, §13.5):** the block is required on `type: view` and forbidden elsewhere, needs at least one block with exactly one kind each, and is strict at every level. Every `ref`/`binding` must be a node path or `contextnest://` URI, never a URL, so no URL, credential or unknown key can ride inside a view. Refs carry no `@`/`#` suffix: an `md` block pins with `version`. Selectors must parse, `from`/`data_from` must name an earlier block's id, and a `render: pinned` view must pin every `md` block.
+  - **Writes:** `context_create`, `context_update`, `context_import` and the MCP `create_document`/`update_document` tools take a `view` parameter. A node can be created as a view or re-typed to and from one in a single call, as with `source` and `skill`.
+  - **Resolution:** new `resolveView(node, { documents, reconstructVersion?, includeDrafts? })` resolves `md`, `list` and `callout` blocks from the vault under retrieval visibility (published only by default; forgotten nodes never resolve). A pinned version is served only while its node is still published. `documents` is the reader's scope: the engine applies status visibility, and access control and `audience` are the caller's. It returns a structured result, a markdown rendering and what a render receipt needs: each `md` block's `ref@version` and content hash, each `list` block's members and set hash, and `viewFingerprint(view)` over the layout. Other kinds come back as `status: "server"` for the serving implementation.
+
+  This only widens the vocabulary, so no existing document changes bytes or hashes. §13 rule 6 now counts 15 node types (it said 13).
+
+### Patch Changes
+
+- 0d7f082: **Folder import does less storage I/O.** On a network-backed vault (Cloud Storage via gcsfuse) every file operation is a round trip, and a few hundred documents paid several of them each in places where none were needed.
+
+  - `context_import` checks whether its incoming files already exist in the vault in parallel, not one file at a time. Path planning is unchanged: same targets, same `-2`/`-3` collision numbering, same warnings.
+  - A checkpoint sealed with no readable head (the first one in a new or freshly imported nest, or after an unreadable `context_history.yaml`) no longer walks the vault and reads every `history.yaml`. It takes the hashes the publish just sealed and reads history only for published documents those don't cover, as a seal on top of an existing head already did.
+  - `publishDocuments` takes an optional `preloaded` map of documents the caller already read under the same lock; discover-mode `context_import` passes its scan, so each document is no longer read a second time before it is published.
+  - Publishing a document with no history lists its `.versions/` directory once instead of twice (`nextVersion` and `createVersion` accept an optional `knownSealed`).
+
+  Sealed versions, chain hashes and checkpoints are the same as before.
+
+## 2.11.0
+
+### Minor Changes
+
+- 2c90a57: Add `task` to `NODE_TYPES`: a unit of work on a project board. The body is markdown, and board fields (`assignee`, `due`, `priority`, `parent`) are ordinary `metadata` keys. There are no type-specific validation rules (it validates like `document`), and whether a task goes through review is up to the server's governance. This only widens the vocabulary, so no existing document changes bytes or hashes. Spec §1.6 and the MCP `frontmatter_fields.type` enum list it.
+
+### Patch Changes
+
+- 7b09d12: **A PDF import resolves an explicit id to its on-disk casing (#117).**
+
+  On a case-insensitive filesystem (macOS, Windows), `context_import_pdf` / `ctx import pdf --id nodes/report` finds an existing `nodes/Report.md`, but used to carry on under the caller's spelling: it versioned the node as `nodes/report`, wrote the sidecar to `nodes/report.pdf` and recorded `pdf.file: nodes/report.pdf`, which then failed validation rule 26 against the id discovery reports. The import now resolves the id to the spelling each directory lists before it derives the sidecar path, `pdf.file` or the version history from it, and returns that id. `deleteDocument` likewise removes a pdf node's sidecar when the node is addressed in another casing. A node written before this fix, whose `pdf.file` carries the caller's casing, is repaired by a same-bytes re-import, and is still deleted with its sidecar when addressed in that casing. On a case-sensitive filesystem nothing changes.
+
+  New: `NestStorage.resolveDocumentIdCasing(id)`.
+
+## 2.10.0
+
+### Minor Changes
+
+- fbfd50a: **Publishing reads far less from disk, and bulk approval keeps the reviewer's note.**
+
+  - A publish now reads each document's version history once instead of five times, and no longer reads the document back after writing it: the history is reused across picking the next version number, rebuilding the previous version for the diff, and appending the new entry, all under the same lock. The checkpoint takes the chain hash of the entry just appended instead of re-reading the history, and the index rebuild reuses the checkpoint just sealed. Chains, version numbers, diffs and checkpoints are computed exactly as before; only repeated reads are gone. On network-backed storage each of those reads was a round trip.
+  - `context_import` takes an optional `note`, recorded in the version history of every document the call publishes. With `ids` alone (for example a bulk approval) the batch's single index rebuild rewrites only the folders of those documents.
+  - New optional inputs for callers that already hold the data: `knownHistory` on `VersionManager.nextVersion`, `createVersion` and `reconstructVersion`; the just-sealed entries on `CheckpointManager.createCheckpointFromVault`; `latestCheckpoint` on `regenerateIndex`; `indexOnlyBatchFolders` on `publishDocuments`. `publishDocument` now also returns the `checkpoint` it sealed. Calls without them behave as before.
+
+- 1b97da6: **Publishing or approving one document no longer rewrites every folder's index.** The index rebuild that follows a publish now rewrites only the INDEX.md of the folder the document lives in, since a folder's index lists only its own documents; context.yaml is still rebuilt in full. Agent configuration files (CLAUDE.md, GEMINI.md, .cursorrules and the rest) are only written when their content actually changed. On a nest with many folders this makes each publish, and each approval in a bulk review, far cheaper. The rebuild takes a new optional changedIds option to scope it; calls without it behave as before.
+- 6c9738a: **`context_search` returns `count`, the total number of matches, next to `results`.**
+
+  With `limit` set, a capped page could read as the whole answer. `searchOp.output` now has a required `count: z.number().int().nonnegative()`, filled with every published match _before_ the `limit` slice. The name matches the hosted REST and MCP search responses, which already return `count`. `total`, which carried the same number, stays as a deprecated alias so existing clients keep working. `ctx search` (local and remote) reads `count` first and falls back to `total`, so its "… N more — raise --limit" footer now also appears against a hosted nest that sends only `count`.
+
+### Patch Changes
+
+- fbfd50a: **Approving an external edit or suggestion, rolling back, and publishing from the MCP server now read less from disk.** Approving a staged suggestion reads the document's version history once instead of four times, and a rollback or direct edit once instead of three times; version numbering, diffs and chain hashes are computed exactly as before. The MCP server's create, update and publish tools rebuild only the published document's folder index and reuse the checkpoint the publish just sealed, matching `context_publish`.
+- fbfd50a: **A publish no longer re-creates directories that already exist.** Every write on the publish path — the document, its diff or keyframe, its history entry, the checkpoint, each folder index and each agent configuration file — first ran a `mkdir -p` on its directory, about ten per publish, and on network-backed storage each one is a round trip even when the directory is already there. Writes now go straight to the file and create the directory only if it turns out to be missing, then write once more; the checkpoint append, which only ever extends an existing file, no longer touches directories at all. A publish into an existing folder drops from twelve directory calls to the two the vault lock needs. New folders are still created on demand, and nothing is kept in memory.
+- fbfd50a: **Rebuilding a past version reads its files together.** Reconstructing a version read its keyframe and then each diff after it one at a time — up to ten back-to-back reads, each a round trip on network-backed storage. The files it needs are known from the history up front, so they are now read together, up to ten at a time, and applied in the same order — a window is applied and released before the next is read, so memory stays bounded however long the replay. Every publish rebuilds the previous version to compute its diff, so this shortens every publish, as well as version reads and integrity checks. Results and errors are unchanged: a missing or unreadable file fails at the same point it did before.
+- fbfd50a: **Approving a held edit rebuilds the approved content once.** `approveReview` (used by `ctx review approve`, the review gate and the MCP review tools) rebuilt the document's approved content once to check its holds and again to apply the chosen hold, each time reading the version history twice. It now rebuilds it once and reuses it, and the rebuild uses the history it already read: five history reads become two, and the keyframe-and-diff replay runs once instead of twice. Stacking a new held edit (`currentReviewProposal`) and staging one (`stageReviewHold`) benefit the same way.
+- 6c9738a: **Full-text search ignores stopwords, weights titles, and drops weak partial matches, so a natural-language question retrieves the nodes about its topic.**
+
+  Hosts pass the user's question straight through as the search text. Words like "what", "is", "the" and "for" were indexed and OR-matched, so every node containing "the" came back as a hit, and chat hosts cited them. `Resolver.search` (behind `context_search`, `ctx search`, and `contextnest://search/…` in `context_query`) now drops English stopwords from both the index and the query, boosts title (×3), tags (×2) and description (×1.5) over body, and drops partial hits scoring below 5% of the best hit. Documents matching every query term are always kept. A query made only of stopwords returns nothing.
+
+- fbfd50a: **A publish lists the vault once instead of twice.** Sealing the checkpoint and rebuilding the index after a publish each read and parsed every document in the vault. The checkpoint's listing is now handed to the index rebuild, which uses it instead of listing again (`regenerateIndex` takes it as `docs`; `publishDocument` returns it as `vaultDocs`). Applies to `context_publish`, create/update with publish, review approval, bulk `context_import`, and the MCP server's publish tools. Without a document cache (the CLI and the MCP server) this halves the reads a publish makes on a large or network-mounted vault.
+- fbfd50a: **Publishing no longer re-reads the whole forget log each time.** Every publish checks the vault's forget log so forgotten content cannot come back, and that meant reading and parsing the entire log — which grows with every delete and forget — on every publish. The parsed log is now reused until the file's size or modification time changes or it is replaced, so a publish costs one file stat instead of a full read. Only a log of up to 256 KB is kept in memory; a larger one is read on each check as before, so memory use stays bounded. A forget recorded by any process on the same storage changes the file and is picked up on the next check, so the protection is unchanged.
+
+## 2.9.1
+
+### Patch Changes
+
+- f066122: Sealing a checkpoint no longer reads every document's history. Each publish seals one, and it used to read every `history.yaml` in the vault, under the vault lock. On a network-backed mount that is one round trip per document, so a single publish (a governance approval) took close to a minute on a large vault. The seal now reuses the previous checkpoint's chain hash for each document whose version did not change, and reads only the rest. A history that the same storage instance rewrote, moved aside or deleted is always read again, because a repair can re-hash a version without changing its number. Checkpoint contents are the same as before.
+- 40d6eba: Anti-resurrection: `context_import` (and any other write) now refuses erased content under a new title. Forgotten bodies were matched by a hash of the raw body, so the same text wrapped in different blank lines (`ctx add` writes `"\nX\n"`, an import `"X"`) never matched. Bodies are now trimmed before hashing; the untrimmed hash is still checked so forgets recorded by earlier versions keep refusing an exact copy.
+- 40d6eba: An explicit `status:forgotten` selector now returns the forgotten stub from `ctx query`, `context_query` and the query-backed resolve surfaces (spec §6.3.3). The query engine matched the stub and then dropped it in its retrieval gate, and its default (graph) mode reads a published-only `context.yaml` that never holds stubs. A selector that asks for `status:forgotten` in a positive position now runs in full mode and keeps stubs; every other selector still hides them.
+- 40d6eba: `contextnest://search/…` selectors in graph mode (the default for `context_query`, `ctx query` and the deprecated MCP `search` tool) now match body text. They searched only the titles, tags and descriptions in `context.yaml`, so a word that appeared only in a document's body returned nothing. Graph mode now seeds from the same published full-text index `context_search` uses.
+
+## 2.9.0
+
+### Minor Changes
+
+- 88040ab: Opt-in encrypted vault mode. `ctx init --encrypted` and `ctx vault encrypt` (migrate in place, resumable) store note bodies, keyframes, diffs, suggestion patches, history notes, `context.yaml` and pdf binaries encrypted at rest with AES-256-GCM (Node built-in `crypto`, no new dependencies). `ctx vault decrypt` reverses it. Front matter stays plaintext for indexing. The data key is wrapped by a key held in the CLI's secure credential store (OS keychain, or the encrypted file store; interim 0600 file only when neither is available; `CONTEXTNEST_VAULT_KEY` overrides) and by a one-time recovery passphrase shown at init (`CONTEXTNEST_VAULT_PASSPHRASE` to unlock). `content_hash`/`chain_hash` stay defined over the plaintext, so `ctx verify` gives identical results for an encrypted and a plain copy of the same history. Without the key, verify reports `encrypted_key_required` and never passes. New verify findings: `decryption_failed` (GCM tamper detection) and `unencrypted_file`. Default vaults are unchanged. See docs/encrypted-vaults.md for the threat model.
+
+  Also fixes a pre-existing bug where the first version of every new document was annotated "Chain restarted — no readable history.yaml": the restart check counted the keyframe the same call had just written.
+
+- c143ac4: The forget protocol: erase a node and keep `verify` passing (spec §6.3)
+
+  `ctx forget <path> --reason <code> [--requested-by <who>]` (MCP / API:
+  `context_forget`) erases a node's content from its whole history — every
+  keyframe, diff, archived PDF binary, staged suggestion and version note — while
+  keeping each version entry's `content_hash` and `chain_hash` unchanged and
+  marking it `tombstone: true`. Because a chain hash is computed from the content
+  hash, never from the content, every later entry and every checkpoint binding
+  still verifies: `ctx verify` treats a tombstoned entry as hash-only and reports
+  it under `tombstoned`, not as an error. The reason is a closed code
+  (`user_request | legal | retention_expiry | error`), never free text.
+
+  The live file becomes an empty stub with the new sixth status `forgotten`,
+  sealed as a keyframe version and a checkpoint. Every `contextnest://` URI for
+  the path — floating or pinned `@N` — resolves to that stub (status
+  `forgotten`, empty body), not to nothing. Forgotten nodes are excluded from
+  retrieval, search, listings and selectors unless `status:forgotten` is asked
+  for. `forgotten` cannot be set through create/update. Readers that predate it
+  normalize it to `draft`, which keeps the stub out of default retrieval.
+  Reconstructing a forgotten version fails with `VERSION_FORGOTTEN`.
+
+  Every forget appends a `document.forgotten` event to
+  `.versions/chain_events.yaml`: who, when, reason code, requested-by and which
+  versions, plus the erased content's hashes, never the content itself.
+  `ctx forget-log [path]` (`context_forget_log`) reads it back.
+
+  Anti-resurrection: that record refuses the forgotten content wherever it turns
+  up. Publishing or creating at a forgotten path, publishing a body whose checksum
+  matches an erased revision, and importing (`context_import` `files`) a
+  pre-forget live file, keyframe, diff, history or PDF are all refused
+  (`FORGOTTEN_DOCUMENT`), at the original path or under a new name. An import
+  that carries a `chain_events.yaml` has its forget records merged into the
+  receiving vault's log instead of overwriting it, and they are re-applied to any
+  pre-forget copy the receiving vault holds. A copied vault carries its
+  tombstones. `ctx verify` reports `forgotten_content_present` (erased content
+  back on disk) and `unrecorded_tombstone` (a tombstone or `forgotten` status no
+  recorded forget accounts for).
+
+  **`ctx delete` is now logged.** `context_delete` (and the legacy
+  `delete_document` tool) removes the file and its history exactly as before,
+  and also appends an audit-only `document.forgotten` event with `mode: delete`
+  (who, when, reason code, the deleted versions' content hashes), visible in
+  `ctx forget-log`. It refuses nothing: the path can be re-created and a
+  renamed copy of the content keeps verifying, and an import never deletes local
+  documents because of it. The new `reason_code` / `requested_by` inputs
+  (`--reason`, `--requested-by`) go on the record; `purge: true`
+  (`ctx delete --purge`) deletes without one. To erase content and refuse its
+  return, use `ctx forget`.
+
+  Not in this release: version-range forget (§6.3.2 re-keyframing), lineage
+  `review_required` flags (§6.3.4) and the `expires_at` / `retain_until` lifespan
+  keys (§6.3.5).
+
+- 0987465: Add `PENDING_CONFIRMATION` to the operation error catalog (`ERROR_CODES`) and to `context_create`'s declared errors. A governed host that holds agent writes for a reviewer (the Community push-confirmation gate) answers a create with this code: the write was accepted, not failed, and does not exist until a reviewer confirms it. Clients can now branch on the canonical code instead of a host-local string.
+- 668acf7: Human review gate, on by default for new vaults. `ctx init` writes `review: on` to `.context/config.yaml`; with it on, `ctx add` / `ctx update` and MCP `context_create` / `context_update` hold the write for approval instead of publishing it — a new document lands as `pending_review`, an edit to a published document is staged under `_suggestions/` while the published version keeps serving, and nothing is versioned or checkpointed until approved. At a terminal the CLI asks `Held for review. Publish? [y]es / [n]o / [a]lways (turn review off)`; without one it never blocks and prints `Held for review: ctx review approve <path>   (turn off: ctx config set review off)`. MCP results carry `held_for_review` and a sentence telling the agent the user can say "turn off review". New: `ctx review [list|approve|reject]`, `ctx config get|set review`, `--publish` on add/update, the `context_review` MCP tool, and a `review` input on the `context_create` / `context_update` catalog ops. Vaults without the key (created before this release) keep publishing immediately.
+
+  The deprecated MCP `create_document` / `update_document` tools are gated the same way. `ctx review approve|reject` act only on held writes (`pending_review` nodes or held edits), never on plain drafts; `ctx config` / `ctx review` refuse a remote `<server>/<nest>` alias. The Claude Code plugin knows about held writes: the capture and curator agents report them for the user to approve instead of claiming a publish, and the sweep-check hook skips a held `ctx update` rather than diffing an older, unrelated edit.
+
+- 1cdd7b1: Integrity check rebuilds every recorded version, and repair reports what a
+  reader can still be served
+
+  `ctx verify` / `context_verify` proved each version artifact matched what the
+  history _records_ — never that the chain still _replays_. An import that
+  overwrote version artifacts and rewrote their fingerprints to match passed
+  every hash check, yet the diffs no longer applied and older versions read as
+  empty, surfacing only when a reader, export or agent asked for one.
+  Verification now also rebuilds every recorded, non-tombstoned version from its
+  keyframe+diff chain and reports each one that fails as a new error type,
+  `version_unreconstructable`, naming the document and version. Healthy vaults
+  still verify clean; tombstoned versions stay hash-only (§6.3.2), not errors.
+
+  `VersionManager.repairVersions(docId)` repairs what can be repaired and
+  reports the rest: it runs the existing idempotent `repairLatestVersion`
+  re-anchor, then returns `{ repaired, unreadable, newestReadable }` — every
+  recorded version that cannot be rebuilt, and the newest one that can. It never
+  creates a version and never renumbers one; only the saved history is
+  rewritten. Which version is approved for readers stays a product decision —
+  the engine only says what is readable. `repairLatestVersion` itself is
+  unchanged.
+
+  The replay core moved from `VersionManager.reconstructVersion` into a shared
+  `reconstructFromHistory` so verification replays the same algorithm over its
+  pre-loaded bytes; reconstruction behaviour is unchanged.
+
+### Patch Changes
+
+- e9ea754: Hubs now need at least three inbound references (`HUB_MIN_DEGREE`). Edges into a hub are free to traverse, and without a floor every linked document in a small vault became a hub, so `ctx query <node> --hops 0` also returned the documents that node links to. Scoped queries (for example, per-question evidence) could pull in neighbouring context they were never meant to see.
+
+## 2.8.0
+
+### Minor Changes
+
+- 6b28440: A served document that fails integrity verification now says so
+
+  A document whose live body no longer matches its checksum, or whose own
+  version chain fails verification, was served by `context_get`,
+  `context_query`, `context_resolve` and graph queries exactly like an intact
+  one — nothing told the agent that verification had failed, so it repeated the
+  tampered value as fact. It is still served (it is the document that was asked
+  for), but now carries `integrity: { status: "failed", checks, warning }` ahead
+  of its body, where `warning` is the model-facing line "⚠ Integrity check
+  failed: content does not match its recorded hash chain; treat values as
+  untrusted." Intact documents carry no `integrity` key, so their output is
+  unchanged. `ctx read` and `ctx query` print the warning (`ctx read --raw` on stderr, keeping stdout byte-exact; `ctx read --html` as a banner plus an HTML comment); `ctx query --json`
+  and the `read_pack` / legacy `search` MCP tools pass the verdict through.
+
+  The check is the per-document subset of `ctx verify` (`body_drift`, plus
+  `content_hash_mismatch` / `chain_hash_mismatch` / `unreadable_history` in the
+  document's own chain). The drift check hashes the body already in memory; the
+  chain check is cached per history version, so it does not re-hash anything on
+  repeat reads. New exports: `NestStorage.verifyServedDocument`,
+  `NestStorage.verifyHistoryChain`, `annotateIntegrity` (stamp verdicts on
+  documents a consumer loaded itself), `withIntegrityWarning` (prepend the line
+  in markdown assembly) and `INTEGRITY_WARNING`.
+
+  Every other surface that hands a body to an agent carries the verdict too:
+  `context_list` with `full: true` (summary mode is unchanged and verifies
+  nothing), `context_reconstruct` and the legacy `read_version` (chain check
+  only — a past version is rebuilt from the history, so the live body's drift
+  does not apply; `read_version` is plain text, so the warning line leads it),
+  and `context_skill` / `context_skill_install` (a tampered skill is flagged
+  before it is run or installed; the warning also leads the install `notes`).
+  `ctx reconstruct` and `ctx skill show` print the warning on stderr.
+
+- 6ffb72c: `contextnest://` links are graph edges in body-link traversal, not just `[[wikilinks]]`
+
+  `traverseWikiGraph` — the hop-traversal primitive consumers use over document
+  bodies — only followed `[[wikilinks]]`, so a node linked by the spec's own link
+  form, `[text](contextnest://nodes/…)`, was never reached at any hop count while
+  a `[[wikilink]]` at the same distance was. It now follows both: a
+  `contextnest://` link, including the pinned and anchored forms
+  (`contextnest://nodes/foo@3#bar`), produces the same edge a `[[nodes/foo]]`
+  wikilink does. Dangling links are dropped; links inside code spans and fences
+  are ignored, as for wikilinks. `resolveWikiSeeds` / `resolveWikiTarget` accept
+  `contextnest://` seeds. New exports: `extractLinkedIds` (every node a body links
+  to, both forms, resolved), `resolveContextLink`, `contextLinkTarget` (the
+  shared pin/anchor stripping `buildRelationships` now also uses).
+
+  Index-time edges now agree with traversal on _whether_ a link is an edge, not
+  only on where it points: `buildRelationships` (context.yaml, backlinks) no
+  longer emits a `reference` edge for a local `contextnest://` link whose target
+  is not a published document — a dangling node link, a draft, or a
+  tag/folder/search URI. These are counted in the new
+  `RelationshipStats.unresolvedContextLinks` and reported by `ctx index`.
+  Cross-namespace links (with an authority) still produce an edge to their full
+  URI. Self-links via `contextnest://` are dropped, as they already were for
+  wikilinks.
+
+## 2.7.0
+
+### Minor Changes
+
+- 309d2b4: Import scientific literature as markdown twins: `ctx import jats`, `ctx import pubmed`, `ctx enrich pubtator`
+
+  **Engine** gains `jatsToDocument()` — a deterministic, offline JATS XML →
+  markdown converter (PubMed Central `*.nxml`, publisher deposits, AGA's
+  `nigel-enrich` envelope). The twin's frontmatter carries the NLM-curated graph
+  as query tags (`#pubtype-srma`, `#year-2024`, `#journal-…`, keywords,
+  `#license-cc-by`, `#status-retracted`, `#has-erratum`) and `metadata` holds
+  `doi` / `pmid` / `pmcid`, authors, the parsed reference list and
+  `source_sha256`. The body keeps one paragraph per line with its JATS id as a
+  trailing block anchor (`… ^p_4_2`), GFM tables, figure captions, LaTeX math
+  and numbered references. `linkCitations()` / `buildCitationIndex()` turn
+  references that name another paper in the vault into `[[wikilinks]]`.
+
+  **CLI**: `ctx import jats <paths…>` (idempotent on `source_sha256`, one
+  checkpoint per batch, `--keep-xml`, re-links earlier papers when a cited one
+  arrives), `ctx import pubmed --term …` (E-utilities → PMC open-access JATS →
+  same importer), and `ctx enrich pubtator` (NCBI PubTator 3 entities and
+  relations, MeSH-normalised, promoted to `#mesh-` tags). NCBI's 3 req/s limit
+  is throttled and retried; `NCBI_API_KEY` raises it.
+
+  `ctx read --html` now renders `[[wikilinks]]`, trailing block anchors,
+  pandoc-style `^sup^` / `~sub~` and escaped pipes in table cells.
+
+- 2d2f7b0: Add the `pdf` node type — a PDF as a first-class, versioned document (spec 1.1, §1.11)
+
+  A `type: pdf` node's body is the text extracted from the PDF (`<!-- page N -->`
+  before each page), and the PDF itself is stored beside the node as a binary
+  sidecar, `<id>.pdf`. The new `pdf:` frontmatter block — `file`, `sha256`,
+  `bytes`, `pages`, `text_layer`, `extractor`, `extractor_version`,
+  `extracted_at` — binds the binary by SHA-256, and because it is frontmatter it
+  is inside every version's content hash, so the PDF rides the existing hash
+  chain.
+
+  - **Import:** new core operation `context_import_pdf` (`{ bytes_base64, id?,
+title?, filename?, folder?, tags?, description?, publish?, note? }` →
+    `{ id, version, created, unchanged, status, checkpoint, pdf, text_layer }`),
+    exposed automatically as an MCP tool, and `ctx import pdf <file...>` in the
+    CLI. Passing the `id` of an existing pdf node adds a new version; the
+    previous binary is archived at `.versions/<doc>/<sha256-hex>.pdf`.
+    Identical bytes are a no-op. Non-PDF input (no `%PDF-` header) and
+    encrypted PDFs are refused; the size cap is 50 MB by default, set by the
+    host through `OperationContext.limits.pdfMaxBytes`.
+  - **Scanned PDFs** import with an empty body and `text_layer: false` (no OCR).
+  - **Integrity:** `verifyVaultIntegrity`, `context_verify` and `ctx verify`
+    re-hash every sidecar and archived binary and report `sidecar_drift` /
+    `sidecar_missing`.
+  - **Lifecycle:** deleting a pdf node removes its sidecar; `context_update`
+    keeps the `pdf:` block, allows title/tag/metadata/status edits, and refuses
+    body edits and re-typing (import a new PDF instead). `context_create`
+    cannot make a pdf node.
+  - **Governance paths:** rollback restores the version's binary to the
+    sidecar (archiving what it replaces); suggestion approvals and czar direct
+    edits may change a pdf node's metadata but not its text or `pdf:` block.
+    A `context_import` of `files` re-points a renamed pdf node's `pdf.file`
+    (with a warning — the binary itself does not travel as text).
+  - **Publish guard:** a pdf node cannot be published (any path — publish,
+    update, bulk/folder import) unless its sidecar is present and hashes to
+    `pdf.sha256`; `INTEGRITY_ERROR` otherwise.
+  - **Validation:** rules 25–29 — the `pdf:` block is present iff `type: pdf`,
+    and `pdf.file` must be the node's own `<id>.pdf`.
+  - **Engine exports** for hosts: `extractPdf`, `isPdf`, `readPdfBinary` (a
+    version's verified bytes), `readPdfMeta`, `pdfSidecarPath`, `sha256Bytes`,
+    `pdfMetaSchema`, `PdfMeta`, `DEFAULT_PDF_MAX_BYTES`, `PDF_IMPORTER_VERSION`,
+    and `NestStorage.writeVaultBinary` / `readVaultBinary` / `removeVaultFile` /
+    `archivePdfBinary` / `readArchivedPdf` / `verifyPdfSidecars`.
+  - **New dependency:** `unpdf` 1.7.0 (pdf.js for serverless runtimes, pure JS),
+    loaded lazily — only when a PDF is imported. Bundled into the CLI and MCP
+    server as before.
+  - Spec 1.1 also lists `agent`, `artifact` and `table` in §1.6 and corrects
+    §13 rules 6 and 7.
+
+  Plain documents are unaffected: their bytes, checksums and chain hashes are
+  identical, `.pdf` files are never discovered as nodes, and the `source:` /
+  `skill:` rules are unchanged.
+
+### Patch Changes
+
+- d55709f: Graph queries return the same documents in the same order every time, and a hub no longer pulls in everything that links to it
+
+  **Order.** `readDocuments` filled its result map as each parallel file read
+  settled, so the same `ctx query` against the same vault could return the same
+  set in a different order from run to run. It now returns documents in the order
+  requested, which makes graph-mode results stable run to run.
+
+  **Hub direction.** "Edges to a hub are free" was also applied when walking an
+  edge backwards, so seeding a hub (for example with a tag the hub carries) pulled
+  in every document that links to it at zero hop cost, even with `--hops 0`. The
+  free rule now follows the direction of travel: reaching a hub is free, leaving
+  one costs a hop, and walking back along `depends_on` (to a dependent rather than
+  a dependency) costs a hop.
+
+  The spec now documents behavior the engine already had: the keyframe cadence
+  (versions 1, 11, 21, …), hash-input normalization (BOM stripped, line endings
+  to LF), the delete-and-recreate exception to `cross_chain_mismatch`, and the
+  traversal cost rules for `hops` (new §5.1.1).
+
+- Tag validation errors now name the offending tag and the rule it breaks (e.g. `tags[1]: invalid tag "2026-09-17" — …`) instead of zod's bare `Invalid`. `ctx add/update --tags` fails fast with every bad tag listed before any I/O, and the published JSON Schema still advertises the tag `pattern`. `ctx drift reject` no longer points at the nonexistent `ctx read-version`; it suggests `ctx reconstruct <path> <version>`.
+
+## 2.6.0
+
+### Minor Changes
+
+- b4d44bc: Add `client` — caller attribution on every read and write
+
+  Every `core` operation now accepts an optional `client` object naming the
+  calling agent and its session, plus any custom scalar keys:
+
+  ```jsonc
+  {
+    "title": "API Design",
+    "content": "…",
+    "client": { "agent": "claude-code", "session_id": "s-9f2" }
+  }
+  ```
+
+  A write that publishes records it on the version-history entry it seals, so
+  `context_versions` answers "which agent wrote v7, in which session"; a graph
+  read stamps it on the §9.2 access traces it emits; every other operation hands
+  it to extension `authorize` / `onResult` hooks.
+
+  Everything about it is optional: the object, and each field within it. No
+  operation requires it, and an unattributed call is a valid call.
+
+  **MCP** fills both fields from the connection when the caller sends none —
+  `agent` from the `initialize` handshake's `clientInfo.name`, `session_id` from a
+  per-process id (over stdio, one process is one client connection). Caller values
+  win, merged per key, so supplying only `agent` still gains a session id. Set
+  `CONTEXTNEST_NO_ATTRIBUTION=1` to derive nothing, or `CONTEXTNEST_AGENT` /
+  `CONTEXTNEST_SESSION_ID` to override what the connection reports — precedence
+  per key is caller > env > connection. With nothing to record, `client` is left
+  off the record entirely rather than written as `{}`.
+
+  **CLI** gains three global flags: `--agent <name>`, `--session <id>` and a
+  repeatable `--client <key=value>`, with `CONTEXTNEST_AGENT` /
+  `CONTEXTNEST_SESSION_ID` as env fallbacks so a wrapping agent sets them once per
+  session. `ctx history` renders the recorded block on each version, distinct from
+  `By:`, which is the authoring identity. Values from `--client` are stored as
+  strings — coercing `version=1.0` to `1` would lose characters from an audit
+  record.
+
+  `client` is a label, not an identity claim: never authenticated, never used to
+  authorize, and deliberately not an input to any hash chain, so histories
+  recorded before the field existed keep verifying byte-for-byte. It is bounded
+  (scalar values ≤ 512 chars, ≤ 16 custom keys) because it lands in an append-only
+  audit trail, and a near-miss on a reserved key (`sessionId`) is rejected rather
+  than filed as a custom key, which would leave the write silently unattributed.
+  It is distinct from the `metadata` argument, which is frontmatter and describes
+  the document rather than the call.
+
+  Specified in `CONTEXT_NEST_SPEC.md` §9.4 (with §9.4.1 reserved/custom keys and
+  §9.4.2 binding conventions), and the `client` field on version entries in §6.2.
+
 ## 2.5.0
 
 ### Minor Changes

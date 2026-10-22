@@ -8,6 +8,7 @@ import { GraphQueryEngine } from "../graph-query-engine.js";
 import { VersionManager } from "../versioning.js";
 import { parseDocument, validateDocument } from "../parser.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { publishDocument, publishDocuments } from "../publish.js";
 import {
   slugifyImportPath,
   sanitizeImportedFrontmatter,
@@ -42,7 +43,7 @@ type ImportResult = {
   checkpoint: number | null;
   written?: number;
   warnings?: string[];
-  documents?: Array<{ id: string; title: string; status: string; tags: string[] }>;
+  documents?: Array<{ id: string; title: string; version: number; status: string; tags: string[] }>;
 };
 
 describe("slugifyImportPath", () => {
@@ -126,6 +127,21 @@ describe("planImportPaths — distinct files never collapse onto one id", () => 
     const plan = await planImportPaths(["nodes/Existing.md"], async (p) => onDisk.has(p));
     expect(plan[0].path).toBe("nodes/existing-3.md");
     expect(plan[0].warnings.join("\n")).toMatch(/already exists in the vault/);
+  });
+
+  it("checks the vault for many files at once, not one round trip at a time", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const onDisk = new Set(["nodes/a.md"]);
+    const isTaken = async (p: string) => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return onDisk.has(p);
+    };
+    const plan = await planImportPaths(["nodes/a.md", "nodes/b.md", "nodes/c.md"], isTaken);
+    expect(peak).toBeGreaterThan(1);
+    expect(plan.map((p) => p.path)).toEqual(["nodes/a-2.md", "nodes/b.md", "nodes/c.md"]);
   });
 
   it("keeps all-non-Latin names apart", async () => {
@@ -233,6 +249,15 @@ describe("sanitizeImportedFrontmatter", () => {
     expect(out.warnings).toHaveLength(1);
     expect(out.warnings[0]).toMatch(/bad tag/);
     expect(out.warnings[0]).toMatch(/tags must start with a letter and contain only letters, digits, _ - :/);
+  });
+
+  it("rounds a version that is not a whole number down, warning once", () => {
+    const fractional = sanitizeImportedFrontmatter(node("---\ntitle: X\nversion: 1.1\n---\nbody\n"), "x");
+    expect(fractional.patch.version).toBe(1);
+    expect(fractional.warnings).toHaveLength(1);
+    expect(fractional.warnings[0]).toMatch(/version "1.1"/);
+    expect(sanitizeImportedFrontmatter(node("---\ntitle: X\nversion: 0\n---\nb\n"), "x").patch.version).toBe(1);
+    expect(sanitizeImportedFrontmatter(node("---\ntitle: X\nversion: abc\n---\nb\n"), "x").patch.version).toBe(1);
   });
 
   it("returns an empty patch for a file with valid frontmatter (regression)", () => {
@@ -425,6 +450,63 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     expect(got.frontmatter.tags).toEqual(["#a", "#b"]);
   });
 
+  // CU-wdqcpzx8ya: a stat per file was a round trip each on a network mount.
+  it("checks collisions with one listing per folder, case-folded", async () => {
+    const api = createEngineApi();
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    // On disk in another case: a case-insensitive file system already holds notes.md.
+    await writeFile(join(dir, "nodes", "Notes.md"), "---\ntitle: Kept\ntype: document\n---\nkeep me\n");
+    const listed: string[] = [];
+    let stats = 0;
+    const storage = ctx.storage as any;
+    const list = storage.vaultEntryNames.bind(storage);
+    storage.vaultEntryNames = (d: string) => (listed.push(d), list(d));
+    const has = storage.hasVaultFile.bind(storage);
+    storage.hasVaultFile = (p: string) => (stats++, has(p));
+
+    const staged = await api.run<ImportResult>(
+      "context_import",
+      {
+        files: [
+          { path: "nodes/notes.md", content: "# Newcomer\n" },
+          { path: "nodes/other.md", content: "# Other\n" },
+          { path: "nodes/sub/a.md", content: "# A\n" },
+          { path: "nodes/sub/b.md", content: "# B\n" },
+        ],
+        publish: false,
+      },
+      ctx,
+    );
+    expect(staged.failed).toEqual([]);
+    expect(stats).toBe(0);
+    expect(listed.filter((d) => d === "nodes")).toHaveLength(1);
+    expect(listed.filter((d) => d === "nodes/sub")).toHaveLength(1);
+    expect(await readFile(join(dir, "nodes", "notes-2.md"), "utf-8")).toContain("# Newcomer");
+    expect(await readFile(join(dir, "nodes", "Notes.md"), "utf-8")).toContain("keep me");
+  });
+
+  // CU-wdqcpzx8ya: a diff rebuilds the previous version first, a round trip per
+  // artifact on a network mount; an import's one-off version skips that.
+  it("stores an import's version as a keyframe; an ids-only publish keeps a diff", async () => {
+    const api = createEngineApi();
+    const doc = (body: string) => `---\ntitle: Notes\ntype: document\nstatus: published\n---\n${body}\n`;
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v1"));
+    await api.run("context_import", { ids: ["nodes/notes"] }, ctx); // v1 (first version: keyframe)
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v2"));
+    await api.run("context_import", { ids: ["nodes/notes"] }, ctx); // v2: ids-only keeps a diff
+    await writeFile(join(dir, "nodes", "notes.md"), doc("v3"));
+    await api.run("context_import", { discover: true }, ctx); // v3: import → keyframe
+
+    const versions = (await ctx.storage.readHistory("nodes/notes"))!.versions;
+    expect(versions.map((v) => [v.version, !!v.keyframe])).toEqual([
+      [1, true],
+      [2, false],
+      [3, true],
+    ]);
+    expect((await ctx.storage.verifyVaultIntegrity()).valid).toBe(true);
+  });
+
   it("sanitizes documents the caller wrote into the vault itself before discover", async () => {
     // A folder importer that writes files directly (no files[] call) and only
     // asks the engine to discover: the frontmatter still gets cleaned, for
@@ -466,5 +548,108 @@ describe("context_import — hygiene on files[] + discover [CU-wdqcq01c61]", () 
     for (const doc of await ctx.storage.discoverDocuments({ includeRetired: true })) {
       expect(validateDocument(doc).errors, doc.id).toEqual([]);
     }
+  });
+
+  // CU-wdqcq042mw: a hand-edited `version: 1.1` published as 2.1, and the
+  // host's integer version column refused the whole import.
+  it("publishes a document with a fractional version at a whole version", async () => {
+    const api = createEngineApi();
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(
+      join(dir, "nodes", "draft.md"),
+      "---\ntitle: Draft\ntype: document\nstatus: published\nversion: 1.1\n---\nbody\n",
+    );
+
+    const out = await api.run<ImportResult>(
+      "context_import",
+      { discover: true },
+      ctx,
+    );
+    expect(out.failed).toEqual([]);
+    expect((out.warnings ?? []).filter((w) => /version "1.1"/.test(w))).toHaveLength(1);
+    for (const v of [...out.published.map((p) => p.version), ...(out.documents ?? []).map((d) => d.version)]) {
+      expect(Number.isInteger(v), String(v)).toBe(true);
+    }
+    const history = await ctx.storage.readHistory("nodes/draft");
+    for (const entry of history!.versions) expect(Number.isInteger(entry.version)).toBe(true);
+  });
+});
+
+// A hand-edited fractional version published outside an import, with no
+// history yet, used to seed a fractional entry (PR #191 review).
+describe("publish — fractional frontmatter version", () => {
+  const write = async (dir: string, name: string, version: string) => {
+    await mkdir(join(dir, "nodes"), { recursive: true });
+    await writeFile(join(dir, "nodes", `${name}.md`), `---
+title: ${name}
+type: document
+version: ${version}
+---
+body
+`);
+  };
+  const versionsOf = async (ctx: OperationContext, id: string) =>
+    (await ctx.storage.readHistory(id))!.versions.map((v) => v.version);
+
+  it("publishDocument never seeds or seals a fractional version", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      await write(dir, "one", "1.1");
+      await publishDocument(ctx.storage, "nodes/one", { editedBy: "tester" });
+      expect(await versionsOf(ctx, "nodes/one")).toEqual([2]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("publishDocuments seeds the whole version below a fractional one", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      await write(dir, "two", "2.7");
+      const out = await publishDocuments(ctx.storage, ["nodes/two"], { editedBy: "tester" });
+      expect(out.failed).toEqual([]);
+      expect(await versionsOf(ctx, "nodes/two")).toEqual([2, 3]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("VersionManager.nextVersion", () => {
+  it("never returns a fractional version from a fractional hint", async () => {
+    const { ctx, dir } = await makeContext();
+    try {
+      const vm = new VersionManager(ctx.storage);
+      expect(await vm.nextVersion("nodes/none", 1.1, null, 0)).toBe(2);
+      expect(await vm.nextVersion("nodes/none", Infinity, null, 0)).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("planImportPaths — QA round 12", () => {
+  it("a generated INDEX.md or README.md keeps its name, so it is never read as a node", () => {
+    expect(slugifyImportPath("nodes/notes/INDEX.md")).toBe("nodes/notes/INDEX.md");
+    expect(slugifyImportPath("README.md")).toBe("README.md");
+    // Only those two: an agent-config name is slugified like any other.
+    expect(slugifyImportPath("nodes/CLAUDE.md")).toBe("nodes/claude.md");
+  });
+
+  it("a ./ spelling of a renamed document takes its history along", async () => {
+    const plan = await planImportPaths(["nodes/./x.md", "nodes/.versions/x/v1.md"], async (p) => p === "nodes/x.md");
+    expect(plan.map((p) => p.path)).toEqual(["nodes/x-2.md", "nodes/.versions/x-2/v1.md"]);
+  });
+
+  it("many names colliding on one slug cost a linear number of lookups", async () => {
+    let calls = 0;
+    // The vault already holds x.md and x-2.md … x-400.md.
+    const plan = await planImportPaths(Array(400).fill("nodes/x.md"), async (p) => {
+      calls++;
+      const m = /^nodes\/x(?:-(\d+))?\.md$/.exec(p);
+      return !!m && Number(m[1] ?? 1) <= 400;
+    });
+    expect(new Set(plan.map((p) => p.path)).size).toBe(400);
+    expect(calls).toBeLessThan(2000);
   });
 });

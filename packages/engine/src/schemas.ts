@@ -4,6 +4,7 @@
  */
 
 import { z } from "zod";
+import { viewMetaSchema } from "./view-schema.js";
 
 export const NODE_TYPES = [
   "document",
@@ -21,6 +22,18 @@ export const NODE_TYPES = [
   "agent",
   "artifact",
   "table",
+  // A PDF document: the body is the text extracted from it, and the required
+  // `pdf:` block binds the binary sidecar beside the .md by SHA-256 (§1.11).
+  "pdf",
+  // A unit of work on a project board. Body is markdown; board fields
+  // (assignee, due, priority, parent) live in `metadata`. No type-specific
+  // validation rules — it behaves exactly like `document` here, and servers
+  // decide what governance (if any) applies to it.
+  "task",
+  // A governed composition of other nodes. The required `view:` block is a
+  // declarative layout — md/list/summary/html/... blocks naming what to show
+  // and from where (§1.12); the content itself is resolved at read time.
+  "view",
 ] as const;
 
 export const STATUSES = [
@@ -29,6 +42,38 @@ export const STATUSES = [
   "approved",
   "published",
   "rejected",
+  // The sixth status (§6.3, the forget protocol): the node was erased and only
+  // its hashes remain. Set ONLY by the forget operation — never by an author,
+  // so it is absent from WRITABLE_STATUSES and from STATUS_ALIASES. A reader
+  // that predates it normalizes the value to `draft` (unknown → draft), which
+  // keeps the empty stub out of default retrieval.
+  "forgotten",
+] as const;
+
+/**
+ * Statuses a caller may SET through create/update. Everything in STATUSES
+ * except `forgotten`: stamping that on a node by hand would hide it without
+ * erasing anything, which is exactly the fake-forget the protocol exists to
+ * rule out. Use the forget operation instead.
+ */
+export const WRITABLE_STATUSES = [
+  "draft",
+  "pending_review",
+  "approved",
+  "published",
+  "rejected",
+] as const;
+
+/**
+ * Closed set of reasons a forget may cite (§6.3.1). Deliberately not free
+ * text: the reason for forgetting is not itself stored in the nest, so a
+ * code is all the audit trail carries.
+ */
+export const FORGET_REASON_CODES = [
+  "user_request",
+  "legal",
+  "retention_expiry",
+  "error",
 ] as const;
 
 /**
@@ -98,6 +143,9 @@ export const TRANSPORTS = ["mcp", "rest", "cli", "function"] as const;
 /** Governance tier enum (zone-classification-rbac-spec §1) */
 export const GOVERNANCE_TIERS = ["primary", "standard"] as const;
 
+/** Values of the vault-level `review` setting in `.context/config.yaml`. */
+export const REVIEW_MODES = ["on", "off"] as const;
+
 /** Suggestion source enum (bridge-function-spec Story 3.1, Story 1.3) */
 export const SUGGESTION_SOURCES = [
   "out-of-band-edit",
@@ -139,6 +187,9 @@ export const HASH_CHAIN_EVENT_TYPES = [
   "platform_admin.session_opened",
   "platform_admin.session_closed",
   "agent.zone_scope_assigned",
+  // Forget protocol (§6.3): who forgot what range of which node, when, and
+  // under which reason code — hashes only, never the forgotten content.
+  "document.forgotten",
 ] as const;
 
 /** Zone ID pattern: lowercase letter start, then alphanumeric / hyphen / underscore */
@@ -150,15 +201,33 @@ export const ZONE_ID_PATTERN = /^[a-z][a-z0-9_-]*$/;
 // still matches.
 export const TAG_PATTERN = /^#?[a-zA-Z][a-zA-Z0-9_:-]*$/;
 
+/** Longest `title` a document may carry (§1.4, §13 rule 2). */
+export const TITLE_MAX_LENGTH = 200;
+
+/** The tag rule in words a person can act on — `TAG_PATTERN.source` is not that. */
+export const TAG_RULE =
+  'tags start with a letter and contain only letters, digits, "_", ":" or "-" (e.g. #api, #q3-close, #v2)';
+
+/** One message for every surface that rejects a tag: names the value AND the rule. */
+export const describeInvalidTag = (value: unknown): string =>
+  `invalid tag ${JSON.stringify(value)} — ${TAG_RULE}`;
+
 /** Checksum pattern (§13 rule 8) */
 export const CHECKSUM_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 /** contextnest:// URI pattern */
 export const CONTEXT_NEST_URI_PATTERN = /^contextnest:\/\//;
 
-const tagSchema = z
-  .string()
-  .regex(TAG_PATTERN, `Tag must match pattern: ${TAG_PATTERN.source}`);
+// errorMap, not `.refine()`: a refine becomes a ZodEffects and zod-to-json-schema
+// drops the `pattern` from the published MCP tool schema. The errorMap sees the
+// value (`ctx.data`), so the message still names the offending tag.
+export const tagSchema = z
+  .string({
+    errorMap: (issue, ctx) => ({
+      message: issue.code === "invalid_string" ? describeInvalidTag(ctx.data) : ctx.defaultError,
+    }),
+  })
+  .regex(TAG_PATTERN);
 
 const skillInputSchema = z.object({
   name: z.string().min(1),
@@ -203,9 +272,44 @@ export const sourceMetaSchema = z.object({
   cache_ttl: z.number().int().positive().optional(), // Rule 16
 });
 
+/**
+ * The `pdf` block (§1.11) — present iff `type: pdf`.
+ *
+ * It is what makes the binary part of the governed record: `sha256` names the
+ * exact bytes of the sidecar at `file`, and because the block sits in
+ * frontmatter it is inside every version's content_hash, so the PDF is bound
+ * into the version chain without any change to the chain itself.
+ *
+ * Non-strict for the same reason as {@link sourceMetaSchema}: this parses
+ * files already on disk. `file` is only shape-checked here (relative, `.pdf`,
+ * no `..`); that it names the node's OWN sidecar (`<id>.pdf`) needs the node id
+ * and is checked in `validateDocument` (§13 rule 26).
+ */
+export const pdfMetaSchema = z.object({
+  file: z
+    .string()
+    .min(1)
+    .refine(
+      (f) =>
+        f.toLowerCase().endsWith(".pdf") &&
+        !f.startsWith("/") &&
+        !f.includes("\\") &&
+        !/^[a-zA-Z]:/.test(f) &&
+        !f.split("/").some((seg) => seg === ".." || seg === "."),
+      "pdf.file must be a vault-relative path ending in .pdf (forward slashes, no `..`)",
+    ),
+  sha256: z.string().regex(CHECKSUM_PATTERN, "pdf.sha256 must match sha256:<64 hex chars>"),
+  bytes: z.number().int().min(0),
+  pages: z.number().int().min(0),
+  text_layer: z.boolean(),
+  extractor: z.string().min(1),
+  extractor_version: z.string().min(1),
+  extracted_at: z.string().min(1),
+});
+
 export const frontmatterSchema = z
   .object({
-    title: z.string().min(1).max(200),                    // Rule 2
+    title: z.string().min(1).max(TITLE_MAX_LENGTH),       // Rule 2
     description: z.string().min(1).max(500).optional(),
     type: z.enum(NODE_TYPES).optional(),                   // Rule 6
     tags: z.array(tagSchema).optional(),                   // Rule 5
@@ -219,6 +323,8 @@ export const frontmatterSchema = z
     metadata: z.record(z.unknown()).optional(),
     source: sourceMetaSchema.optional(),
     skill: skillMetaSchema.optional(),
+    pdf: pdfMetaSchema.optional(),
+    view: viewMetaSchema.optional(),
     zone: z
       .string()
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
@@ -258,7 +364,73 @@ export const frontmatterSchema = z
         path: ["skill"],
       });
     }
+    // Rule 25: pdf block MUST be present when type is "pdf"
+    if (data.type === "pdf" && !data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block is required when type is 'pdf' (§13 rule 25)",
+        path: ["pdf"],
+      });
+    }
+    // Rule 29: pdf block MUST NOT be present on non-pdf types. An untyped
+    // node defaults to `document`, so it may not carry one either.
+    if (data.type !== "pdf" && data.pdf) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "PDF block must not be present when type is not 'pdf' (§13 rule 29)",
+        path: ["pdf"],
+      });
+    }
+    // Rule 30: view block MUST be present when type is "view"
+    if (data.type === "view" && !data.view) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "View block is required when type is 'view' (§13 rule 30)",
+        path: ["view"],
+      });
+    }
+    // Rule 31: view block MUST NOT be present on non-view types. An untyped
+    // node defaults to `document`, so it may not carry one either.
+    if (data.type !== "view" && data.view) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "View block must not be present when type is not 'view' (§13 rule 31)",
+        path: ["view"],
+      });
+    }
   });
+
+/** The shape of the structure-rule keys (§11.1.1); see compileStructure(). */
+export const structureRulesSchema = z.object({
+  structure: z.object({ enforce: z.boolean().optional(), closed: z.boolean().optional() }).nullish(),
+  folders: z
+    .record(
+      z
+        .object({
+          description: z.string().optional(),
+          template: z.string().optional(),
+          types: z.array(z.string()).optional(),
+          folder_name: z.string().optional(),
+          file_name: z.string().optional(),
+          required: z.boolean().optional(),
+          files: z
+            .record(z.object({ template: z.string().optional(), type: z.string().optional() }).nullable())
+            .nullish(),
+        })
+        .nullable(),
+    )
+    .nullish(),
+  templates: z
+    .record(
+      z
+        .object({
+          body: z.string().optional(),
+          required_sections: z.array(z.string()).optional(),
+        })
+        .nullable(),
+    )
+    .nullish(),
+});
 
 export const nestConfigSchema = z.object({
   version: z.number().int(),
@@ -269,14 +441,17 @@ export const nestConfigSchema = z.object({
       status: z.enum(STATUSES).optional(),
     })
     .optional(),
-  folders: z
-    .record(
-      z.object({
-        description: z.string().optional(),
-        template: z.string().optional(),
-      }),
-    )
-    .optional(),
+  // Structure rules (§11.1.1). Not checked here, on purpose: this schema runs
+  // on every config read — writes and graph reads alike — so any check here
+  // (even of shape) would let one typo in a rule brick the vault. Their shape
+  // is `structureRulesSchema`, checked by compileStructure() when the rules
+  // are used: a bad rule refuses writes only where the rules are enforced.
+  structure: z.unknown().optional(),
+  // Retrieval modes (semantic/config.ts). Unchecked here for the same reason
+  // as `structure`: validated by parseSearchConfig() where search uses it.
+  search: z.unknown().optional(),
+  folders: z.unknown().optional(),
+  templates: z.unknown().optional(),
   servers: z
     .record(
       z.object({
@@ -299,6 +474,16 @@ export const nestConfigSchema = z.object({
     .optional(),
   agent_maintenance_directive: z.string().optional(),
   agent_tools: z.array(z.string()).optional(),
+  // Human review gate for agent/tool writes (see review.ts). `ctx init` writes
+  // `on`; a vault WITHOUT the key keeps the pre-gate publish-by-default
+  // behaviour so existing automations are not silently changed. YAML 1.1
+  // readers (PyYAML, …) round-trip `on`/`off` as booleans, so accept those too.
+  review: z
+    .preprocess(
+      (v) => (v === true ? "on" : v === false ? "off" : typeof v === "string" ? v.toLowerCase() : v),
+      z.enum(REVIEW_MODES),
+    )
+    .optional(),
 });
 
 export const packSchema = z.object({
@@ -405,6 +590,14 @@ export const versionEntrySchema = z.object({
   // historyOrRepair answers by quarantining the file and restarting the chain
   // — a whole chain lost over an annotation that is not even hashed.
   client: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  // Forget protocol (§6.3.2). A tombstoned entry has had its keyframe/diff
+  // erased; its hashes stay so the chain still verifies (hash-only).
+  tombstone: z.boolean().optional(),
+  forgotten_at: z.string().optional(),
+  forgotten_by: z.string().optional(),
+  reason_code: z.enum(FORGET_REASON_CODES).optional(),
+  // The version a node-level forget sealed: the empty stub.
+  forget_stub: z.boolean().optional(),
 });
 
 export const documentHistorySchema = z.object({

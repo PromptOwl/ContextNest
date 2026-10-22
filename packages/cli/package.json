@@ -1,6 +1,6 @@
 {
   "name": "@promptowl/contextnest-cli",
-  "version": "2.5.0",
+  "version": "3.3.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/PromptOwl/ContextNest.git",
@@ -51,12 +51,12 @@
     "chalk": "^5.4.0"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@promptowl/contextnest-engine": "workspace:^",
     "@types/node": "^22.0.0",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.9",
+    "vitest": "^4.1.11",
     "zod": "^3.24.0",
     "@promptowl/contextnest-plugin-sdk": "^0.1.0",
     "js-yaml": "^4.3.2",

@@ -30,6 +30,7 @@ import {
   getConfig,
   isMain,
   listVaults,
+  searchableVaults,
   MAX_LIST_SCAN,
   runAsHook,
   withVault,
@@ -45,6 +46,8 @@ export const MAX_TERMS = 3;
  * CONTEXTNEST_SWEEP_MAX_CANDIDATES when a vault's latency budget differs.
  */
 export const MAX_CANDIDATES = 24;
+/** Per-call ctx timeout for the sweep: it reads many nodes after a large update (hook cap: 45s). */
+export const SWEEP_CTX_TIMEOUT_MS = 30000;
 
 /**
  * Words too common to identify anything. Deliberately short: the real filter is
@@ -137,7 +140,7 @@ export function parseUpdates(command) {
     if (!m) continue;
     const id = m[1].replace(/^["']|["']$/g, "");
     if (!id || id.startsWith("-")) continue;
-    const vault = segment.match(/--vault[= ]\s*["']?([A-Za-z0-9_-]+)/);
+    const vault = segment.match(/--vault[= ]\s*["']?([A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)?)/);
     const key = `${vault ? vault[1] : ""}::${id}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -172,6 +175,20 @@ export function previousBody(exec, id, alias) {
 }
 
 /**
+ * Whether the node's latest write was HELD for review rather than published
+ * (vault `review: on`). A held update seals no version, so the last two
+ * versions describe an older, unrelated edit — diffing them would report
+ * values this write never removed. The sweep belongs to the approval instead.
+ * A stale hold (the node was published past it) does not count.
+ */
+export function isHeldForReview(exec, id, alias) {
+  const items = ctxJson(exec, withVault(["review", "list", "--json"], alias), []);
+  // The command may name a bare slug; the CLI files it under nodes/.
+  const ids = new Set([id, `nodes/${id}`]);
+  return Array.isArray(items) && items.some((i) => ids.has(i?.id) && !i.stale);
+}
+
+/**
  * Nodes across ALL given vault targets — not just the one that was written —
  * that still carry one of `terms`. The written node itself is excluded in its
  * own vault.
@@ -201,11 +218,11 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
   const found = [];
   let truncated = false;
 
+  // The node just written is only excluded in the vault it was written to —
+  // a same-id node in another nest is a legitimate straggler.
+  checked.add(writtenAlias ? `${writtenAlias}:${excludeId}` : excludeId);
+
   for (const alias of targets) {
-    const ref = (id) => (alias ? `${alias}:${id}` : id);
-    // The node just written is only excluded in the vault it was written to —
-    // a same-id node in another nest is a legitimate straggler.
-    if ((alias || null) === (writtenAlias || null)) checked.add(ref(excludeId));
 
     for (const term of terms) {
       const tagged = ctxJson(
@@ -233,13 +250,17 @@ export function findStragglers(exec, terms, excludeId, writtenAlias, targets, bu
       const candidates = [...tagHits, ...(Array.isArray(searched) ? searched : [])];
 
       for (const hit of candidates) {
+        // A server-level alias spans nests: each hit names its own
+        // `<server>/<nest>`, which is where it is read and cited.
+        const where = hit?.vault || alias;
+        const ref = (id) => (where ? `${where}:${id}` : id);
         if (!hit?.id || checked.has(ref(hit.id))) continue;
         if (checked.size >= budget) {
           truncated = true;
           return { found, truncated };
         }
         checked.add(ref(hit.id));
-        const raw = ctxText(exec, withVault(["read", hit.id, "--raw"], alias));
+        const raw = ctxText(exec, withVault(["read", hit.id, "--raw"], where));
         if (!raw) continue;
         if (bodyOf(raw).toLowerCase().includes(term)) {
           found.push({ ref: ref(hit.id), term, stale: false });
@@ -297,15 +318,18 @@ export const MAX_SWEEP_VAULTS = 8;
  * @returns {{targets: (string|null)[], capped: boolean}}
  */
 export function sweepTargets(exec, writtenAlias, env) {
-  const registered = listVaults(exec)
+  const registered = searchableVaults(listVaults(exec))
     .filter((v) => v.exists !== false)
     .map((v) => v.alias);
   const cap = envInt(env, "CONTEXTNEST_SWEEP_MAX_VAULTS", MAX_SWEEP_VAULTS) || MAX_SWEEP_VAULTS;
   const capped = registered.length > cap;
   const targets = new Set(registered.slice(0, cap));
   // The written vault is always examined (it may be an unregistered local
-  // vault, in which case writtenAlias is null and ctx resolves it).
-  targets.add(writtenAlias);
+  // vault, in which case writtenAlias is null and ctx resolves it) — unless it
+  // is a `<server>/<nest>` whose server is already a target: the server row
+  // searches that nest too, so a second pass would only repeat the round trips.
+  const server = writtenAlias?.includes("/") ? writtenAlias.slice(0, writtenAlias.indexOf("/")) : null;
+  if (!server || !targets.has(server)) targets.add(writtenAlias);
   return { targets: [...targets], capped };
 }
 
@@ -343,6 +367,7 @@ export function run({ input, env, exec }) {
     // cannot be read back, there is nothing to check.
     const current = ctxText(exec, withVault(["read", target.id, "--raw"], writtenAlias));
     if (!current) continue;
+    if (isHeldForReview(exec, target.id, writtenAlias)) continue;
 
     const before = previousBody(exec, target.id, writtenAlias);
     if (!before) continue;
@@ -393,5 +418,5 @@ export function run({ input, env, exec }) {
 }
 
 if (isMain(import.meta.url)) {
-  runAsHook(run);
+  runAsHook(run, { timeout: SWEEP_CTX_TIMEOUT_MS });
 }

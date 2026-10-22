@@ -26,13 +26,12 @@
  */
 
 import { join } from "node:path";
-import { applyPatch } from "diff";
 import { parseDocument, serializeDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { getChecksumContent } from "./parser.js";
 import { VersionManager } from "./versioning.js";
 import { withVaultLock } from "./vault-lock.js";
-import { readSuggestion } from "./suggestions.js";
+import { readSuggestion, applyStagedEdit } from "./suggestions.js";
 import {
   requireCzar,
   requireDocOwner,
@@ -43,13 +42,16 @@ import {
 } from "./errors.js";
 import type {
   ContextNode,
+  DocumentHistory,
   GovernanceTier,
   HashChainEvent,
   HashChainEventType,
   RbacHook,
   VersionEntry,
 } from "./types.js";
-import type { NestStorage } from "./storage.js";
+import { assertWritableDocumentPath, type NestStorage } from "./storage.js";
+import { settlePdfForCommit } from "./pdf-nodes.js";
+import { assertStructurePublish, enforcedStructure, scaffoldFirstPublish } from "./structure-store.js";
 
 /** Inputs common to every governance action. */
 interface BaseInput {
@@ -106,20 +108,22 @@ async function approveSuggestionImpl(
   const approved = await loadApprovedBase(input.storage, input.documentId);
   await assertNotStale(approved.content, sug.meta.target_hash, input.suggestionId);
 
-  const patched = applyPatch(approved.content, sug.patch);
-  if (typeof patched !== "string" || patched === "") {
+  const patched = applyStagedEdit(approved.content, sug);
+  if (patched === null) {
     throw new IntegrityError(
-      `Failed to apply suggestion "${input.suggestionId}" to current approved content`,
+      `Suggestion "${input.suggestionId}" no longer applies to the current version — the document changed since it was staged, or the patch is damaged; stage it again`,
       "content_hash_mismatch",
     );
   }
-
+  // commitNewVersion judges it against the structure rules in force now
+  // (§11.1.1), for what the edit newly breaks against the approved base.
   const { versionEntry } = await commitNewVersion({
     storage: input.storage,
     documentId: input.documentId,
     newRawContent: patched,
     actor: input.actor,
     note: input.comment,
+    knownHistory: approved.history,
   });
 
   const archivedAt = await input.storage.archiveSuggestion(
@@ -259,9 +263,13 @@ async function rollbackDocumentImpl(
   });
 
   const vm = new VersionManager(input.storage);
+  // One history read, shared by the reconstruct and the commit below. Plain
+  // read, as the reconstruct always did: a corrupt history fails the rollback.
+  const history = await input.storage.readHistory(input.documentId);
   const targetContent = await vm.reconstructVersion(
     input.documentId,
     input.targetVersion,
+    history ?? undefined,
   );
 
   const { versionEntry } = await commitNewVersion({
@@ -269,6 +277,8 @@ async function rollbackDocumentImpl(
     documentId: input.documentId,
     newRawContent: targetContent,
     actor: input.actor,
+    knownHistory: history,
+    restoring: true,
     note: input.reason
       ? `rollback to v${input.targetVersion}: ${input.reason}`
       : `rollback to v${input.targetVersion}`,
@@ -359,7 +369,7 @@ async function gateForTier(
 async function loadApprovedBase(
   storage: NestStorage,
   documentId: string,
-): Promise<{ version: number; content: string }> {
+): Promise<{ version: number; content: string; history: DocumentHistory }> {
   // The approved base is the EXACT current chain head — last keyframe plus
   // any diffs applied forward. `readLatestApprovedKeyframe` alone would
   // skip non-keyframe entries and let stale suggestions slip through.
@@ -371,8 +381,10 @@ async function loadApprovedBase(
   const content = await new VersionManager(storage).reconstructVersion(
     documentId,
     latest.version,
+    history,
   );
-  return { version: latest.version, content };
+  // Returned so the commit reuses this read instead of reading it again.
+  return { version: latest.version, content, history };
 }
 
 async function assertNotStale(
@@ -395,18 +407,39 @@ interface CommitInput {
   newRawContent: string;
   actor: string;
   note?: string;
+  /** True for a rollback — see `settlePdfForCommit`. */
+  restoring?: boolean;
+  /**
+   * History the caller already read under this lock; omit to read it here.
+   * `null` means the document has no history — not "unknown".
+   */
+  knownHistory?: DocumentHistory | null;
 }
 
 async function commitNewVersion(
   input: CommitInput,
 ): Promise<{ versionEntry: VersionEntry; serialized: string }> {
+  // Every caller (suggestion approval, rollback, czar direct edit) seals and
+  // writes a version, so the id guard and the structure rules (§11.1.1) are
+  // applied here, before anything is written.
+  await assertWritableDocumentPath(input.storage.root, input.documentId);
   const filePath = join(input.storage.root, `${input.documentId}.md`);
   const parsed = parseDocument(filePath, input.newRawContent, input.documentId);
 
+  // Judged before historyOrRepair: a refused write quarantines nothing.
+  const rules = await enforcedStructure(input.storage);
+  const first = rules ? await assertStructurePublish(input.storage, rules, parsed, input.knownHistory) : false;
+
   const versionManager = new VersionManager(input.storage);
+  // Read once, shared by the numbering and the append below.
+  const knownHistory =
+    input.knownHistory !== undefined
+      ? input.knownHistory
+      : (await versionManager.historyOrRepair(input.documentId)).history;
   const newVersion = await versionManager.nextVersion(
     input.documentId,
     parsed.frontmatter.version ?? 0,
+    knownHistory,
   );
   const updatedAt = new Date().toISOString();
   const node: ContextNode = {
@@ -417,6 +450,12 @@ async function commitNewVersion(
       updated_at: updatedAt,
     },
   };
+
+  // A pdf node's text and binary move together: refuse an edit that would
+  // split them, and bring the sidecar in line with the version being sealed.
+  await settlePdfForCommit(input.storage, input.documentId, node, {
+    restoring: input.restoring ?? false,
+  });
 
   // Recompute body checksum on the body-as-it-will-be-serialized so the
   // checksum stored in frontmatter matches what later drift detection
@@ -431,12 +470,16 @@ async function commitNewVersion(
   const versionEntry = await versionManager.createVersion(finalNode, input.actor, {
     note: input.note,
     publishedAt: updatedAt,
+    knownHistory,
   });
 
   // Write the live canonical file last so a mid-flight crash leaves the
   // chain consistent (history wrote first, live file matches the chain
   // head only after this succeeds).
   await input.storage.writeDocument(input.documentId, serialized);
+  // A czar direct edit may create the document: its new folders get their
+  // required contents, as any first publish's do.
+  if (rules && first) await scaffoldFirstPublish(input.storage, rules, [input.documentId]);
 
   return { versionEntry, serialized };
 }

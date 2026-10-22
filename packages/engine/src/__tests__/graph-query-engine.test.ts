@@ -90,6 +90,17 @@ describe("GraphQueryEngine — graph mode", () => {
     expect(result.documents.map((d) => d.id)).not.toContain("nodes/onboarding");
   });
 
+  it("a search URI matches body text, not just title and tags", async () => {
+    await addDoc("nodes/api", { title: "API", body: "All endpoints require Bearer authentication." });
+    await addDoc("nodes/draft", { title: "Draft", body: "authentication draft", publish: false });
+    await reindex();
+
+    const result = await new GraphQueryEngine(storage).query("contextnest://search/authentication");
+
+    expect(result.mode).toBe("graph");
+    expect(result.documents.map((d) => d.id)).toEqual(["nodes/api"]);
+  });
+
   it("traverses reference edges to reachable neighbors", async () => {
     // api links to helper → helper should be pulled in via 1-hop traversal
     await addDoc("nodes/api", {
@@ -107,6 +118,31 @@ describe("GraphQueryEngine — graph mode", () => {
     expect(found).toContain("nodes/api");
     expect(found).toContain("nodes/helper");
     expect(result.nodesTraversed).toBeGreaterThanOrEqual(2);
+  });
+
+  it("returns the same documents in the same order on every run", async () => {
+    for (let i = 0; i < 12; i++) {
+      await addDoc(`nodes/n${String(i).padStart(2, "0")}`, {
+        tags: ["set"],
+        body: "x".repeat(200 * ((i * 7) % 5 + 1)),
+      });
+    }
+    await reindex();
+
+    const engine = new GraphQueryEngine(storage);
+    const first = (await engine.query("#set", { hops: 0 })).documents.map((d) => d.id);
+    expect(first).toHaveLength(12);
+    for (let run = 0; run < 10; run++) {
+      const again = (await engine.query("#set", { hops: 0 })).documents.map((d) => d.id);
+      expect(again).toEqual(first);
+    }
+  });
+
+  it("readDocuments returns documents in the requested order", async () => {
+    const ids = ["nodes/c", "nodes/a", "nodes/b"];
+    for (const id of ids) await addDoc(id, { body: "y".repeat(id === "nodes/c" ? 5000 : 10) });
+    const map = await storage.readDocuments([...ids, "nodes/missing"]);
+    expect([...map.keys()]).toEqual(ids);
   });
 
   it("separates source nodes from regular documents", async () => {

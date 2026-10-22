@@ -1,0 +1,19 @@
+{
+  "name": "contextnest",
+  "version": "1.0.0",
+  "description": "Native Antigravity plugin for ContextNest: vault-aware retrieval, automatic capture, structure rule enforcement, and MCP tools via ctx CLI.",
+  "author": {
+    "name": "PromptOwl",
+    "email": "support@promptowl.ai"
+  },
+  "repository": "https://github.com/promptowl/contextnest",
+  "license": "AGPL-3.0",
+  "keywords": [
+    "contextnest",
+    "memory",
+    "rag",
+    "governance",
+    "antigravity",
+    "promptowl"
+  ]
+}

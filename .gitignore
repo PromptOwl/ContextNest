@@ -8,6 +8,8 @@ local_vault
 fixtures/*
 # Keep the committed test vault tracked (it backs the engine test suite).
 !fixtures/minimal-vault/
+# Tiny PDFs for the `pdf` node type's CLI / MCP regression suites.
+!fixtures/pdf/
 .claude/agent-memory/*
 # Per-checkout Context Nest plugin overrides — personal, never shared.
 .claude/contextnest.local.json

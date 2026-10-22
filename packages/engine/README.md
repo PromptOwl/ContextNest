@@ -83,7 +83,7 @@ console.log(report.valid ? "Integrity OK" : `Tampering: ${report.errors}`);
 
 ## Graph Traversal
 
-The engine evaluates selectors against document metadata (no bodies loaded), then traverses relationship edges via BFS for N hops, loading bodies only for reached nodes. `[[wikilinks]]` in document bodies (`[[Title]]`, `[[Title|alias]]`, `[[nodes/id]]`) are resolved at index time into `reference` edges alongside `contextnest://` links, so a wiki-style vault traverses the same way. Unlike `contextnest://` links, which become edges whether or not the target resolves, a wikilink only produces an edge when it matches a **published** document — a `[[Title]]` pointing at a draft counts as unresolved until that document is published.
+The engine evaluates selectors against document metadata (no bodies loaded), then traverses relationship edges via BFS for N hops, loading bodies only for reached nodes. `[[wikilinks]]` in document bodies (`[[Title]]`, `[[Title|alias]]`, `[[nodes/id]]`) are resolved at index time into `reference` edges alongside `contextnest://` links, so a wiki-style vault traverses the same way. Both link forms only produce an edge when they resolve to a **published** document — a `[[Title]]` or `contextnest://nodes/…` pointing at a draft, a missing node, or a tag/folder/search URI counts as unresolved (`ctx index` reports the counts) until it does. The one exception is a cross-namespace `contextnest://` link, which names a node in another nest and keeps its full URI as the edge target.
 
 - `depends_on` edges and edges to hub nodes are free (always traversed)
 - `reference` edges cost 1 hop
@@ -110,7 +110,8 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `filterDocuments` | The one type / status / tag filter, for surfaces that filter a list they already hold |
 | `setVaultDescription` | Set or clear a registry alias's description |
 | `parseStewards` / `serializeStewards` | Canonical `stewards.yaml` marshalling (format only) |
-| `traverseWikiGraph` | `[[wikilink]]` seed resolution and hop traversal |
+| `traverseWikiGraph` | Body-link seed resolution and hop traversal — follows `[[wikilinks]]` and `contextnest://` links (pinned `@N` / `#anchor` forms included) alike |
+| `extractLinkedIds` | Every node a body links to, both link forms, resolved to ids |
 
 Errors all carry a `code`: `InvalidSelectorError`, `CorruptHistoryError`,
 `VersionArtifactExistsError`, and the rest are exported from the package root.

@@ -7,16 +7,24 @@
 export type {
   NodeType,
   Status,
+  ForgetReasonCode,
   Transport,
   FederationMode,
   GovernanceTier,
   SuggestionSource,
+  ReviewMode,
   HashChainEventType,
   SourceMeta,
+  PdfMeta,
+  ViewMeta,
+  ViewBlock,
+  ViewRenderMode,
+  ViewAudience,
   SkillInput,
   SkillMeta,
   Frontmatter,
   ContextNode,
+  IntegrityFailure,
   PendingChange,
   SuggestionMeta,
   HashChainEvent,
@@ -71,6 +79,9 @@ export {
   RejectedDocumentError,
   CorruptHistoryError,
   VersionArtifactExistsError,
+  ForgottenDocumentError,
+  ForgottenVersionError,
+  FrontmatterShapeError,
   /** @deprecated retained for back-compat; never thrown post-1.2.0. */
   SupersededDocumentError,
 } from "./errors.js";
@@ -90,6 +101,7 @@ export {
   quarantineSuggestion,
   listSuggestions,
   readSuggestion,
+  applyStagedEdit,
 } from "./suggestions.js";
 export type {
   StageSuggestionInput,
@@ -146,13 +158,20 @@ export {
   hashChainEventSchema,
   NODE_TYPES,
   STATUSES,
+  WRITABLE_STATUSES,
+  FORGET_REASON_CODES,
   STATUS_ALIASES,
   TRANSPORTS,
   sourceMetaSchema,
+  pdfMetaSchema,
   GOVERNANCE_TIERS,
   SUGGESTION_SOURCES,
+  REVIEW_MODES,
   HASH_CHAIN_EVENT_TYPES,
   TAG_PATTERN,
+  TITLE_MAX_LENGTH,
+  TAG_RULE,
+  describeInvalidTag,
   CHECKSUM_PATTERN,
   ZONE_ID_PATTERN,
   CLIENT_METADATA_RESERVED_KEYS,
@@ -179,6 +198,7 @@ export {
   isApproved,
   isPublished,
   isRejected,
+  isForgotten,
   isRetrievable,
   /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
   isSuperseded,
@@ -198,6 +218,7 @@ export type { SyntaxConfig } from "./config.js";
 // tests, but is not part of the public API surface.
 export {
   ALIAS_PATTERN,
+  ACCOUNT_NAME_PATTERN,
   getRegistryDir,
   getRegistryPath,
   readRegistry,
@@ -241,13 +262,29 @@ export {
 export type { RemoteNestConnection } from "./remote-nest.js";
 
 // Storage
-export { NestStorage, UNSTAGED_DRIFT_SENTINEL, normalizeDocumentId, normalizeFolder } from "./storage.js";
+export {
+  NestStorage,
+  UNSTAGED_DRIFT_SENTINEL,
+  normalizeDocumentId,
+  normalizeFolder,
+  assertWritableDocumentId,
+  assertNotMachineryPath,
+  assertErasableDocumentId,
+  assertResolvesOutsideMachinery,
+  assertWritableDocumentPath,
+  machineryAliasSegment,
+  assertFitsFileSystem,
+} from "./storage.js";
 export type {
   LayoutMode,
   ReadDocumentOptions,
   CheckpointChainState,
   FolderEntry,
+  NestStorageOptions,
 } from "./storage.js";
+
+// Encrypted vaults (opt-in; default vaults stay plain Markdown)
+export * from "./encryption/index.js";
 
 // Document filtering — shared by context_list and by surfaces that filter a
 // document list they already hold.
@@ -258,8 +295,46 @@ export type { DocumentFilters } from "./filters.js";
 export { parseUri, canonicalizeUri, serializeUri, extractPath } from "./uri.js";
 
 // Resolver
-export { Resolver } from "./resolver.js";
-export type { ResolverOptions } from "./resolver.js";
+export { Resolver, forgottenView, DEFAULT_FIELD_BOOSTS, LEGACY_FIELD_BOOSTS } from "./resolver.js";
+export type { ResolverOptions, FieldBoosts } from "./resolver.js";
+
+// Retrieval modes (semantic / hybrid search, embedding index)
+export {
+  SEARCH_MODES,
+  parseSearchConfig,
+  searchConfigSchema,
+  type SearchMode,
+  type SearchConfig,
+  type EmbeddingsConfig,
+  type RerankConfig,
+} from "./semantic/config.js";
+export {
+  registerEmbeddingProvider,
+  registerReranker,
+  createEmbeddingProvider,
+  createReranker,
+  type EmbeddingProvider,
+  type Reranker,
+  type EmbedKind,
+} from "./semantic/providers.js";
+export { createBedrockEmbeddingProvider, createBedrockReranker, type BedrockInvoke } from "./semantic/bedrock.js";
+export { splitPassages, DEFAULT_PASSAGE_CHARS } from "./semantic/passages.js";
+export { EmbeddingStore, EMBEDDINGS_DIR, embeddingText, contentHash } from "./semantic/embedding-store.js";
+export {
+  rrfFuse,
+  exactSeeds,
+  semanticSearch,
+  rerankHits,
+  selectPassages,
+  DEFAULT_RERANK_TOP_N,
+  type RerankUnit,
+  type RerankOptions,
+  buildEmbeddings,
+  RRF_K,
+  DEFAULT_FUSION_WEIGHTS,
+  type RankedHit,
+  type HitScores,
+} from "./semantic/hybrid.js";
 
 // Inline extraction
 export {
@@ -290,6 +365,9 @@ export {
   buildWikiTitleIndex,
   resolveWikiSeeds,
   resolveWikiTarget,
+  resolveContextLink,
+  contextLinkTarget,
+  extractLinkedIds,
   traverseWikiGraph,
 } from "./wiki-graph.js";
 export type { WikiDocLike, WikiTitleIndex, WikiTraversalResult } from "./wiki-graph.js";
@@ -303,7 +381,7 @@ export {
 export type { StewardRole, StewardEntry, StewardsConfig } from "./stewards.js";
 
 // Packs
-export { PackLoader } from "./packs.js";
+export { PackLoader, invalidPackSelectors } from "./packs.js";
 
 // Versioning
 export { VersionManager } from "./versioning.js";
@@ -312,6 +390,7 @@ export { VersionManager } from "./versioning.js";
 export {
   normalizeForHash,
   sha256,
+  sha256Bytes,
   computeContentHash,
   computeChainHash,
   computeCheckpointHash,
@@ -320,6 +399,8 @@ export {
   verifyCheckpointChain,
   detectDrift,
   verifyRemoteDelta,
+  INTEGRITY_WARNING,
+  withIntegrityWarning,
 } from "./integrity.js";
 export type {
   DriftReport,
@@ -357,6 +438,30 @@ export type {
   BulkPublishResult,
 } from "./publish.js";
 
+// Forget protocol (§6.3) — erasure that keeps verification intact
+export {
+  forgetDocument,
+  forgetLog,
+  deleteDocumentWithTombstone,
+  assertNotForgotten,
+  applyImportedTombstones,
+} from "./forget.js";
+export type {
+  ForgetOptions,
+  ForgetResult,
+  DeleteOptions,
+  DeleteResult,
+} from "./forget.js";
+export {
+  FORGET_EVENT_TYPE,
+  MIN_FORGETTABLE_BODY_LENGTH,
+  buildTombstoneIndex,
+  importVerdict,
+  isPathForgotten,
+  forgettableBodyHash,
+} from "./tombstones.js";
+export type { TombstoneIndex, TombstoneRecord } from "./tombstones.js";
+
 // Source graph
 export {
   buildDependencyGraph,
@@ -375,7 +480,7 @@ export type { InjectorOptions } from "./injection.js";
 
 // Graph traversal
 export { GraphTraverser } from "./graph-traverser.js";
-export { GraphQueryEngine } from "./graph-query-engine.js";
+export { GraphQueryEngine, annotateIntegrity } from "./graph-query-engine.js";
 export type { GraphQueryOptions } from "./graph-query-engine.js";
 export { evaluateFromIndex } from "./selector/index-evaluator.js";
 export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
@@ -383,6 +488,7 @@ export type { IndexEvaluatorOptions } from "./selector/index-evaluator.js";
 // Agent config generation
 export { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 export {
+  slugify,
   slugifyImportPath,
   isVersionArtifactPath,
   sanitizeImportedFrontmatter,
@@ -419,3 +525,123 @@ export type {
   InstallManifest,
 } from "./skills.js";
 export { withVaultLock, VaultLockTimeoutError, LOCK_DIRNAME } from "./vault-lock.js";
+
+// Human review gate — see review.ts
+export {
+  REVIEW_HOLD_NOTE_PREFIX,
+  REVIEW_OFF_COMMAND,
+  readReviewMode,
+  setReviewMode,
+  isReviewHold,
+  listReviewHolds,
+  currentReviewProposal,
+  stageReviewHold,
+  listPendingReview,
+  approveReview,
+  rejectReview,
+  reviewHeldMessage,
+} from "./review.js";
+export type {
+  ReviewHold,
+  PendingReviewItem,
+  ReviewDecisionOptions,
+  ApproveReviewResult,
+  RejectReviewResult,
+} from "./review.js";
+
+// Structure rules (§11.1) — see structure.ts / structure-store.ts
+export {
+  compileStructure,
+  checkDocument,
+  checkUpdate,
+  structureView,
+  checkFolder,
+  checkDeleteDocument,
+  checkDeleteFolder,
+  scaffoldPlan,
+  auditStructure,
+  resolveFolder,
+  describeStructure,
+  enforceStructure,
+  documentFolders,
+  MAX_MATCHED_NAME,
+  comparableSegment,
+} from "./structure.js";
+export type {
+  StructureConfig,
+  StructureDoc,
+  Violation,
+  ViolationCode,
+  CompiledStructure,
+  CompiledRule,
+  FolderRuleView,
+  ResolvedFolderRule,
+  StructureView,
+} from "./structure.js";
+export {
+  setStructure,
+  enforcedStructure,
+  missingFolders,
+  scaffoldFolders,
+  assertStructureUpdate,
+  assertStructureDelete,
+  scaffoldFirstPublish,
+  assertStructurePublish,
+  structurePublishViolations,
+  sealedHead,
+  structureReport,
+  isEnforced,
+} from "./structure-store.js";
+
+// PDF nodes (§1.11) — extraction, the verified binary reader, and the sidecar path.
+export {
+  extractPdf,
+  isPdf,
+  pdfExtractorVersion,
+  PDF_IMPORTER_VERSION,
+  PDF_EXTRACTOR,
+  UNPDF_VERSION,
+  DEFAULT_PDF_MAX_BYTES,
+} from "./importers/pdf.js";
+export type { PdfExtraction } from "./importers/pdf.js";
+export { readPdfBinary, readPdfMeta, pdfSidecarPath } from "./pdf-nodes.js";
+
+// View nodes (§1.12)
+export {
+  viewMetaSchema,
+  isVaultRef,
+  VIEW_BLOCK_KINDS,
+  VIEW_RENDER_MODES,
+  VIEW_AUDIENCES,
+  VIEW_LAYOUTS,
+  VIEW_LIST_FIELDS,
+} from "./view-schema.js";
+export { resolveView, viewFingerprint, DEFAULT_VIEW_LIST_LIMIT } from "./view-nodes.js";
+export type {
+  ResolveViewOptions,
+  ResolvedView,
+  ResolvedViewBlock,
+  ResolvedMdBlock,
+  ResolvedListBlock,
+  ResolvedListItem,
+  ResolvedCalloutBlock,
+  ServerResolvedBlock,
+  ViewBlockUnavailableReason,
+} from "./view-nodes.js";
+export type { ReadPdfBinaryOptions } from "./pdf-nodes.js";
+
+// ─── Importers ───────────────────────────────────────────────────────────────
+export {
+  jatsToDocument,
+  linkCitations,
+  buildCitationIndex,
+  splitJatsArticles,
+  JATS_IMPORTER_VERSION,
+} from "./importers/jats.js";
+export type {
+  JatsImportOptions,
+  JatsImportResult,
+  JatsPaperMeta,
+  JatsRef,
+  CitationIndex,
+} from "./importers/jats.js";

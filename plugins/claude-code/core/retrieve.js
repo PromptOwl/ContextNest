@@ -70,6 +70,35 @@ function promptText(input) {
   return String(input?.prompt ?? input?.user_prompt ?? "").trim();
 }
 
+/**
+ * Filler and workflow words that name no subject. A prompt made only of these
+ * ("commit and push", "open the PR", "yes go ahead") is an instruction about
+ * the session, and searching it only injects whatever happens to match "push".
+ */
+const NON_TOPIC_WORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "these", "those", "its", "it's", "you", "your",
+  "now", "then", "also", "again", "just", "please", "thanks", "thank", "okay", "yes", "yeah",
+  "let", "let's", "lets", "can", "could", "would", "should", "will", "want", "need", "make",
+  "sure", "all", "any", "some", "more", "next", "step", "steps", "here", "there", "what", "which",
+  "commit", "commits", "push", "pull", "merge", "rebase", "open", "create", "run", "rerun",
+  "start", "continue", "proceed", "done", "ahead", "check", "fix", "fixes", "do", "did", "go",
+  "work", "working", "move", "same", "them", "they", "our", "how", "why",
+]);
+
+/**
+ * True when the prompt names at least one subject worth searching for. Any
+ * script counts (a non-ASCII word always does — the word list is English);
+ * an ASCII word needs 3+ letters, so a lone "CI?" is skipped — the price of
+ * not treating "PR" and "OK" as subjects.
+ */
+export function hasTopic(text) {
+  return text
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}'._-]+/u)
+    .map((w) => w.replace(/^['._-]+|['._-]+$/g, ""))
+    .some((w) => (/[^\x00-\x7f]/.test(w) || w.length >= 3) && !NON_TOPIC_WORDS.has(w));
+}
+
 /** search one vault target → [{id,title,type,vault}] */
 function searchVault(exec, query, alias) {
   const hits = ctxJson(exec, withVault(["search", query, "--json"], alias), []);
@@ -78,25 +107,54 @@ function searchVault(exec, query, alias) {
     id: h.id,
     title: h.title,
     type: h.type,
-    vault: alias || null,
+    // A server-level alias searches every nest; each hit names the
+    // `<server>/<nest>` it lives in, which is what it must be cited and edited as.
+    vault: h.vault || alias || null,
   }));
 }
 
-/** Fan search across the resolved vault targets, capped to MAX_HITS total. */
+/**
+ * Fan search across the resolved vault targets, capped to MAX_HITS total.
+ *
+ * The MAX_HITS slots are handed out round-robin across the targets (first
+ * hit of each, then second hit of each, …) and the survivors are emitted
+ * grouped in target order, so the primary vault (cwd/default) still leads
+ * the block but a secondary vault with a long hit list can no longer fill
+ * every slot before the next target is even searched. Previously the first
+ * target's hits were taken until the cap was reached, which on an unranked
+ * or stopword-heavy search meant one demo vault's alphabetical head crowded
+ * out every other vault on every prompt.
+ */
 function searchAll(exec, config, query) {
   const targets = vaultTargets(config, exec);
-  const out = [];
+  const perTarget = [];
   const seen = new Set();
   for (const alias of targets) {
+    const hits = [];
     for (const hit of searchVault(exec, query, alias)) {
-      const key = `${alias || ""}::${hit.id}`;
+      const key = `${hit.vault || ""}::${hit.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push(hit);
-      if (out.length >= MAX_HITS * targets.length) break;
+      hits.push(hit);
+      if (hits.length >= MAX_HITS) break;
     }
+    perTarget.push(hits);
   }
-  return out.slice(0, MAX_HITS);
+
+  const kept = perTarget.map(() => []);
+  let total = 0;
+  for (let round = 0; total < MAX_HITS; round++) {
+    let progressed = false;
+    for (let t = 0; t < perTarget.length && total < MAX_HITS; t++) {
+      const hit = perTarget[t][round];
+      if (!hit) continue;
+      kept[t].push(hit);
+      total++;
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  return kept.flat();
 }
 
 /** Format the cheap-search injection block, or null when there are no hits. */
@@ -207,13 +265,15 @@ export function run({ input, env, exec, ledgerIo = {} }) {
   const ladder = correctionIntent(query) ? CHANGE_LADDER : null;
   const join = (block) => [queued, block, ladder].filter(Boolean).join("\n\n");
 
+  // No subject to look up: hand over only what is parked or the sweep rule.
+  if (!query || !hasTopic(query)) {
+    persist();
+    const block = join(null);
+    return block ? wrap(block) : null;
+  }
   if (mode === "agent") {
     persist();
     return wrap(join(AGENT_DIRECTIVE));
-  }
-  if (!query) {
-    persist();
-    return queued ? wrap(queued) : null;
   }
 
   const hits = searchAll(exec, config, query);

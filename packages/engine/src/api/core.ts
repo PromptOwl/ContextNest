@@ -17,15 +17,29 @@ import { SELECTOR_GRAMMAR } from "../selector/grammar.js";
 import {
   NODE_TYPES,
   STATUSES,
-  TAG_PATTERN,
+  WRITABLE_STATUSES,
+  FORGET_REASON_CODES,
   frontmatterSchema,
+  pdfMetaSchema,
   sourceMetaSchema,
+  tagSchema as tag,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
+import { viewMetaSchema } from "../view-schema.js";
+import { SEARCH_MODES } from "../semantic/config.js";
 import { clientField, clientMetadataSchema } from "./client.js";
 import type { OperationDescriptor } from "./types.js";
 
-const tag = z.string().regex(TAG_PATTERN);
+/**
+ * Present on a served node ONLY when it failed integrity verification (live
+ * body vs its checksum, or its own version chain). The node is still served;
+ * `warning` is the line an agent must heed before repeating any value from it.
+ */
+const integrityVerdict = z.object({
+  status: z.literal("failed"),
+  checks: z.array(z.string()),
+  warning: z.string(),
+});
 
 /** A node as returned in list/query summaries (body optional/trimmed). */
 const nodeSummary = z.object({
@@ -43,12 +57,18 @@ const nodeSummary = z.object({
   // Source nodes carry their `source` block so agents can hydrate them
   // (spec §1.9, §5). Present only for type:"source".
   source: z.record(z.unknown()).optional(),
+  // PDF nodes carry their `pdf` block (spec §1.11) so a listing can show the
+  // page count / scan warning and link the binary without a second read.
+  // Present only for type:"pdf".
+  pdf: pdfMetaSchema.optional(),
+  integrity: integrityVerdict.optional(),
 });
 
 /** A fully-loaded document. */
 const documentPayload = z.object({
   id: z.string(),
   frontmatter: frontmatterSchema,
+  integrity: integrityVerdict.optional(),
   body: z.string(),
   /** Exact stored bytes, frontmatter block included. Only with `include_raw`. */
   raw: z.string().optional(),
@@ -91,21 +111,81 @@ const searchOp: OperationDescriptor = {
   name: "context_search",
   namespace: "core",
   description:
-    "Full-text keyword search across node content, titles, tags, and metadata.",
+    "Search published nodes (content, titles, tags, metadata), best match first. `mode`: lexical " +
+    "(stemmed BM25 keyword search — the default), semantic (embedding similarity; finds paraphrases), or " +
+    "hybrid (reciprocal-rank fusion of both, exact title/#tag matches pinned first). semantic/hybrid need " +
+    "`search.embeddings` in the vault config and an index built with context_embed. `rerank` re-scores the " +
+    "top hits with the configured reranker.",
   input: z.object({
     query: z.string().min(1).describe("Search terms"),
     limit: z.number().int().positive().optional().describe("Max results"),
+    mode: z
+      .enum(SEARCH_MODES)
+      .optional()
+      .describe("lexical | semantic | hybrid. Omitted: the vault's search.mode once an index exists, else lexical"),
+    rerank: z.boolean().optional().describe("Re-score the top hits with the configured search.rerank model"),
     ...clientField,
   }),
   output: z.object({
     // Best hit first: documents matching every query term, then partial
     // matches, each tier by descending BM25 `score`.
-    results: z.array(nodeSummary.extend({ score: z.number().optional() })),
-    // Matches before `limit` was applied, so a caller can say "N more".
+    results: z.array(
+      nodeSummary.extend({
+        score: z.number().optional(),
+        // Per-signal scores behind `score`: lexical = BM25, semantic = cosine,
+        // rrf = fused, rerank = reranker relevance. Only those that applied.
+        scores: z
+          .object({
+            lexical: z.number().optional(),
+            semantic: z.number().optional(),
+            rrf: z.number().optional(),
+            rerank: z.number().optional(),
+          })
+          .optional(),
+        // Passage rerank only: the best-matching ~300-token window of the node.
+        passage: z.string().optional(),
+      }),
+    ),
+    /** The mode that actually ran (a configured default falls back to lexical until an index exists). */
+    mode: z.enum(SEARCH_MODES).optional(),
+    /** semantic/hybrid: published nodes with no current vector (new/changed since the last context_embed). */
+    embeddings_stale: z.number().int().nonnegative().optional(),
+    // Every match before `limit` was applied, so a capped page never reads
+    // as the whole answer and a caller can say "N more". Same name as the
+    // hosted REST and MCP search responses.
+    count: z.number().int().nonnegative(),
+    // Deprecated alias of `count`, kept for clients of engine <= 2.9.x.
     total: z.number().int().optional(),
   }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["search"],
+};
+
+// ─── context_embed ───────────────────────────────────────────────────────────
+
+const embedOp: OperationDescriptor = {
+  name: "context_embed",
+  namespace: "core",
+  description:
+    "Build or refresh the vault's embedding index for semantic/hybrid context_search. Embeds PUBLISHED " +
+    "nodes only (drafts and superseded versions never), keyed by node id + version + content hash, so only " +
+    "new or changed nodes are re-embedded and unpublished ones are pruned. Uses the `search.embeddings` " +
+    "provider in .context/config.yaml; the index lives in .context/embeddings/ (git-ignored, rebuildable).",
+  input: z.object({
+    rebuild: z.boolean().optional().describe("Discard the index and re-embed every published node"),
+    ...clientField,
+  }),
+  output: z.object({
+    provider: z.string(),
+    model: z.string(),
+    path: z.string().describe("Vault-relative index location"),
+    total: z.number().int().describe("Vectors in the index after this run"),
+    embedded: z.number().int().describe("Nodes sent to the provider this run"),
+    reused: z.number().int().describe("Nodes whose vector was still current"),
+    pruned: z.number().int().describe("Vectors dropped: node no longer published or gone"),
+    dimensions: z.number().int(),
+  }),
+  errors: ["VALIDATION_FAILED", "CONFIG_ERROR"],
 };
 
 // ─── context_query ───────────────────────────────────────────────────────────
@@ -346,7 +426,12 @@ const createOp: OperationDescriptor = {
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z
       .string()
@@ -368,12 +453,18 @@ const createOp: OperationDescriptor = {
       .describe(
         "Publish on create (default true). Pass false to leave the node a draft — governed surfaces use this when a write must clear review before becoming retrievable.",
       ),
+    review: z
+      .boolean()
+      .optional()
+      .describe(
+        "Hold the new node for human review: it is written with status pending_review and is not retrievable until approved (context_publish / `ctx review approve`). Ignored when publish is explicitly true. Write surfaces set this from the vault's `review` setting.",
+      ),
     note: z
       .string()
       .optional()
       .describe("Version-history note recorded against the publish (audit trail)."),
     status: z
-      .enum(STATUSES)
+      .enum(WRITABLE_STATUSES)
       .optional()
       .describe(
         "Initial lifecycle status (default draft). Only meaningful with publish:false — publishing sets `published` regardless.",
@@ -400,23 +491,37 @@ const createOp: OperationDescriptor = {
       .describe(
         'Source block (required for type:source): how an agent fetches the live data this node stands for.',
       ),
+    // Like `source`, the `view` block is required by one type and forbidden on
+    // the rest, so it travels as its own field rather than inside `metadata`.
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required for type:view): the layout of blocks this view composes — md/list/summary/html/table/kpi/chart/callout/metric/data. Refs and bindings must be vault references, never URLs (§1.12).",
+      ),
     ...clientField,
   }),
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
-    status: z.enum(STATUSES).describe("Resulting status — draft when publish:false"),
+    status: z.enum(STATUSES).describe("Resulting status — draft when publish:false, pending_review when held for review"),
     checkpoint: z
       .number()
       .int()
       .nullable()
       .describe("Checkpoint sealing the publish, or null when created as a draft"),
+    held_for_review: z
+      .boolean()
+      .optional()
+      .describe("True when the write was held for human review instead of published"),
   }),
   errors: [
     "VALIDATION_FAILED",
     "INVALID_DOCUMENT_ID",
     "DOCUMENT_ALREADY_EXISTS",
+    "FORGOTTEN_DOCUMENT",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
+    "PENDING_CONFIRMATION",
   ],
   aliases: ["create_document"],
 };
@@ -454,10 +559,10 @@ const updateOp: OperationDescriptor = {
         "Frontmatter metadata to merge into frontmatter.metadata. A null value clears that key.",
       ),
     status: z
-      .enum(STATUSES)
+      .enum(WRITABLE_STATUSES)
       .optional()
       .describe(
-        "New lifecycle status. Canonical values only — normalize aliases with `normalizeStatus` before calling.",
+        "New lifecycle status. Canonical values only — normalize aliases with `normalizeStatus` before calling. Not `forgotten`: that is set only by context_forget, which erases the content.",
       ),
     note: z
       .string()
@@ -468,6 +573,12 @@ const updateOp: OperationDescriptor = {
       .optional()
       .describe(
         "Publish the edit (default true). Defaults to FALSE when `status` names a non-published lifecycle value — those are metadata transitions, not content releases. An explicit value always wins.",
+      ),
+    review: z
+      .boolean()
+      .optional()
+      .describe(
+        "Hold the edit for human review instead of publishing it. An edit to a PUBLISHED node is staged under _suggestions/ (the published version keeps serving; a later held edit builds on it and supersedes it); any other node is written in place with status pending_review. Approve with `ctx review approve` or the context_review tool. Ignored when publish is explicitly true. Write surfaces set this from the vault's `review` setting.",
       ),
     version: z
       .number()
@@ -485,13 +596,20 @@ const updateOp: OperationDescriptor = {
       .enum(NODE_TYPES)
       .optional()
       .describe(
-        "New node type. Converting to or from source/skill needs that type's block in the same call — `source` for a source node, `trigger` for a skill node.",
+        "New node type. Converting to or from source/skill/view needs that type's block in the same call — `source` for a source node, `trigger` for a skill node, `view` for a view node. Nothing converts to or from `pdf`: pdf nodes come only from context_import_pdf.",
       ),
     source: sourceMetaSchema
       .strict()
       .optional()
       .describe(
         "Replacement source block, for a node that is (or is becoming) type:source. Replaces the block wholesale.",
+      ),
+    // Like `source`, the `view` block is required by one type and forbidden on
+    // the rest, so it travels as its own field rather than inside `metadata`.
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "Replacement view block, for a node that is (or is becoming) type:view. Replaces the block wholesale.",
       ),
     trigger: z
       .string()
@@ -509,18 +627,30 @@ const updateOp: OperationDescriptor = {
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
-    status: z.enum(STATUSES).describe("Resulting status — `published` unless the edit stayed a draft"),
+    status: z
+      .enum(STATUSES)
+      .describe("Resulting status — `published` unless the edit stayed a draft; `pending_review` when held for review"),
     checkpoint: z
       .number()
       .int()
       .nullable()
       .describe("Checkpoint sealing the publish, or null when the edit did not publish"),
+    held_for_review: z
+      .boolean()
+      .optional()
+      .describe("True when the edit was held for human review instead of published"),
+    suggestion_id: z
+      .string()
+      .optional()
+      .describe("The staged hold's id, when an edit to a published node was held for review"),
   }),
   errors: [
     "VALIDATION_FAILED",
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "REJECTED_DOCUMENT",
+    "FORGOTTEN_DOCUMENT",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["update_document"],
@@ -553,6 +683,7 @@ const publishOp: OperationDescriptor = {
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
     "REJECTED_DOCUMENT",
+    "FORGOTTEN_DOCUMENT",
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["publish_document"],
@@ -563,18 +694,41 @@ const publishOp: OperationDescriptor = {
 const deleteOp: OperationDescriptor = {
   name: "context_delete",
   namespace: "core",
-  description: "Delete a node and its version history from the vault.",
-  input: nodeSelector,
+  description:
+    "Delete a node and its version history from the vault. Records who deleted it, when and why in the forget audit log (hashes only, never content); the path stays reusable. Pass `purge: true` to delete without that record. To erase content while keeping the audit trail verifiable, use context_forget instead.",
+  input: z.object({
+    ...nodeSelectorShape,
+    reason_code: z
+      .enum(FORGET_REASON_CODES)
+      .optional()
+      .describe("Reason recorded in the audit log (default user_request). A closed code, never free text."),
+    requested_by: z
+      .string()
+      .optional()
+      .describe("Who asked for the deletion (an identity, recorded in the audit log)."),
+    purge: z
+      .boolean()
+      .optional()
+      .describe(
+        "Delete WITHOUT an audit record (default false).",
+      ),
+    ...clientField,
+  }),
   output: z.object({
     id: z.string(),
     title: z.string().describe("Title of the deleted node, read before removal"),
     deleted: z.literal(true),
+    tombstoned: z
+      .boolean()
+      .optional()
+      .describe("True when the deletion was recorded in the audit log; false for a purge"),
   }),
   errors: [
     "VALIDATION_FAILED",
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
     "INVALID_URI",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["delete_document"],
@@ -611,6 +765,17 @@ const versionEntryOut = z.object({
     .describe(
       "Caller metadata the write carried — agent, session_id, custom keys. Absent for versions written before the caller sent any.",
     ),
+  tombstone: z
+    .boolean()
+    .optional()
+    .describe("True when this version was forgotten: its content is erased, its hashes kept (§6.3)"),
+  forgotten_at: z.string().optional(),
+  forgotten_by: z.string().optional(),
+  reason_code: z.enum(FORGET_REASON_CODES).optional(),
+  forget_stub: z
+    .boolean()
+    .optional()
+    .describe("True for the empty-stub version a node-level forget sealed"),
 });
 
 const versionsOp: OperationDescriptor = {
@@ -666,11 +831,14 @@ const reconstructOp: OperationDescriptor = {
   output: z.object({
     id: z.string(),
     version: z.number().int(),
+    /** Present only when the document's version chain fails verification. */
+    integrity: integrityVerdict.optional(),
     content: z.string(),
   }),
   errors: [
     "VALIDATION_FAILED",
     "VERSION_NOT_FOUND",
+    "VERSION_FORGOTTEN",
     "RECONSTRUCTION_FAILED",
     "DOCUMENT_NOT_FOUND",
     "INVALID_DOCUMENT_ID",
@@ -689,6 +857,12 @@ const verifyError = z.object({
     "checkpoint_hash_mismatch",
     "body_drift",
     "unreadable_history",
+    "unreadable_document",
+    "version_unreconstructable",
+    "sidecar_drift",
+    "sidecar_missing",
+    "forgotten_content_present",
+    "unrecorded_tombstone",
   ]),
   document: z.string().optional(),
   version: z.number().int().optional(),
@@ -700,11 +874,91 @@ const verifyError = z.object({
 const verifyOp: OperationDescriptor = {
   name: "context_verify",
   namespace: "core",
-  description: "Verify every document and checkpoint hash chain in the vault.",
+  description:
+    "Verify every document and checkpoint hash chain in the vault, rebuild every recorded document version (one that cannot be rebuilt is reported as `version_unreconstructable`), and re-hash every pdf node's binary against the sha256 its frontmatter records.",
   input: z.object({ ...clientField }),
-  output: z.object({ valid: z.boolean(), errors: z.array(verifyError) }),
+  output: z.object({
+    valid: z.boolean(),
+    errors: z.array(verifyError),
+    tombstoned: z
+      .array(z.object({ document: z.string(), version: z.number().int() }))
+      .optional()
+      .describe("Versions verified hash-only because they were forgotten (§6.3.2). Not errors."),
+  }),
   errors: ["VALIDATION_FAILED"],
   aliases: ["verify_integrity"],
+};
+
+// ─── context_forget ──────────────────────────────────────────────────────────
+
+const forgetOp: OperationDescriptor = {
+  name: "context_forget",
+  namespace: "core",
+  description:
+    "Forget a node (right to be forgotten, spec §6.3). Erases the content of every version from history while keeping its hashes, so `context_verify` still passes, and replaces the node with an empty `status: forgotten` stub that every URI for the path — floating or pinned — resolves to. Records an audit event (who, when, reason code, which versions — never the content) and refuses any later attempt to republish or re-import the forgotten content. Irreversible.",
+  input: z.object({
+    ...nodeSelectorShape,
+    reason_code: z
+      .enum(FORGET_REASON_CODES)
+      .describe("Why (closed set, §6.3.1) — never free text: the reason for forgetting is not stored in the nest"),
+    requested_by: z
+      .string()
+      .optional()
+      .describe("Who asked for it — data subject, steward, regulator (an identity, not a reason)"),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    versions: z.array(z.number().int()).describe("Version numbers whose content was erased"),
+    stub_version: z
+      .number()
+      .int()
+      .describe("The version the empty `status: forgotten` stub was sealed as"),
+    checkpoint: z.number().int().describe("The checkpoint the forget cut"),
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "FORGOTTEN_DOCUMENT",
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
+
+// ─── context_forget_log ──────────────────────────────────────────────────────
+
+const forgetLogOp: OperationDescriptor = {
+  name: "context_forget_log",
+  namespace: "core",
+  description:
+    "The forget audit trail (spec §6.3): every recorded forget and delete — who, when, which reason code, which versions — optionally for one node. Never carries forgotten content.",
+  input: z.object({
+    id: z.string().optional().describe("Only events for this node id"),
+    ...clientField,
+  }),
+  output: z.object({
+    events: z.array(
+      z.object({
+        event_id: z.string(),
+        document_id: z.string(),
+        scope: z.enum(["node", "versions"]),
+        mode: z.enum(["forget", "delete"]),
+        versions: z.array(z.number().int()),
+        reason_code: z.enum(FORGET_REASON_CODES),
+        forgotten_by: z.string(),
+        forgotten_at: z.string(),
+        requested_by: z.string().optional(),
+        stub_version: z.number().int().optional(),
+        checkpoint: z.number().int().optional(),
+        erased_hashes: z
+          .number()
+          .int()
+          .describe("How many content hashes the record holds for anti-resurrection"),
+      }),
+    ),
+  }),
+  errors: ["VALIDATION_FAILED", "INVALID_DOCUMENT_ID"],
 };
 
 // ─── context_init ────────────────────────────────────────────────────────────
@@ -838,7 +1092,12 @@ const importDoc = z
       .describe(
         "One-line summary stored in frontmatter. Indexed for retrieval alongside title and tags, so a node without one is markedly harder to find.",
       ),
-    type: z.enum(NODE_TYPES).optional().describe("Node type (default: document)"),
+    type: z
+      .enum(NODE_TYPES)
+      .optional()
+      .describe(
+        "Node type (default: document). Not `pdf`: a pdf node is created only by context_import_pdf, from the PDF's bytes.",
+      ),
     tags: z.array(tag).optional().describe("Tags"),
     folder: z.string().optional().describe('Folder path under nodes/; segments are slugified'),
     metadata: z.record(z.unknown()).optional().describe("Extra frontmatter metadata"),
@@ -847,6 +1106,13 @@ const importDoc = z
       .optional()
       .describe(
         "Source block (required for type:source): how an agent fetches the live data this node stands for.",
+      ),
+    // Like `source`, the `view` block is required by one type and forbidden on
+    // the rest, so it travels as its own field rather than inside `metadata`.
+    view: viewMetaSchema
+      .optional()
+      .describe(
+        "View block (required for type:view): the layout of blocks this view composes (§1.12).",
       ),
     trigger: z.string().optional().describe("Skill trigger (required for type:skill)"),
     tools_required: z.array(z.string()).optional().describe("Tools a skill needs to run"),
@@ -880,7 +1146,7 @@ const importOp: OperationDescriptor = {
   name: "context_import",
   namespace: "core",
   description:
-    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest.",
+    "Bulk-publish many nodes in one pass (folder/batch import). Supply `documents` to create new nodes from title+content, `ids` for nodes already written into the vault, `files` to write an existing vault's files in, and/or `discover` to let the engine find and publish everything already in the vault. Files the import did not author are repaired only as far as they must be to validate — paths slugified, a missing title derived, an unknown `type` coerced, an invalid tag dropped — and every repair comes back in `warnings`. Publishing modes share ONE checkpoint and ONE index regeneration for the whole batch; failures are reported per-document, never aborting the rest. A `.versions/chain_events.yaml` in `files` re-applies its forget records here: grant import of it only to callers who may also forget.",
   // Every input is optional and validated in the executor rather than through
   // a refined union: `.refine()` produces a ZodEffects, which degrades to a
   // useless JSON Schema through zod-to-json-schema — and MCP publishes
@@ -930,6 +1196,12 @@ const importOp: OperationDescriptor = {
       .describe(
         "With `discover`: stamped as `author` on every imported document. The importing user, not the vault's own `author:` — which names someone who need not exist on this host.",
       ),
+    note: z
+      .string()
+      .optional()
+      .describe(
+        "Version-history note recorded against every document this call publishes (audit trail), e.g. the reviewer's note on a bulk approval.",
+      ),
     ...clientField,
   }),
   output: z.object({
@@ -972,9 +1244,91 @@ const importOp: OperationDescriptor = {
       )
       .optional(),
   }),
-  errors: ["VALIDATION_FAILED", "VAULT_LOCK_TIMEOUT"],
+  errors: ["VALIDATION_FAILED", "CONFIG_ERROR", "VAULT_LOCK_TIMEOUT"],
 };
 
+
+// ─── context_import_pdf ──────────────────────────────────────────────────────
+
+/**
+ * Import a PDF as a `type: pdf` node (spec §1.11): the binary is stored as a
+ * sidecar beside the node, bound by SHA-256 in the `pdf:` block, and the body
+ * is the text extracted from it. The ONLY way a pdf node comes to exist — the
+ * block records bytes, and no other op carries any.
+ */
+const importPdfOp: OperationDescriptor = {
+  name: "context_import_pdf",
+  namespace: "core",
+  description:
+    "Import a PDF as a `type: pdf` node: the PDF is stored beside the node as a binary sidecar bound by SHA-256, and the node body is its extracted text (one `<!-- page N -->` marker per page; empty for a scanned PDF with no text layer, flagged `text_layer: false`). Pass `id` of an existing pdf node to add a new version — the previous binary is kept in version history; identical bytes are a no-op. The extracted text is read-only: to change it, import a new PDF.",
+  input: z.object({
+    bytes_base64: z.string().min(1).describe("The PDF file, base64-encoded"),
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Node id. An existing pdf node gets a new version; a free id creates the node there. Default: derived from the title under nodes/ (+ folder).",
+      ),
+    title: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe(
+        "Node title. Default: the PDF's own /Title, else the filename, else \"Untitled PDF\". A new version keeps the existing title unless one is given.",
+      ),
+    filename: z
+      .string()
+      .optional()
+      .describe("Original file name — used for the title when neither `title` nor the PDF's metadata gives one. Never read from disk."),
+    folder: z
+      .string()
+      .optional()
+      .describe('Folder path under nodes/ (e.g. "gtm/decks"); segments are slugified. Ignored when `id` is given.'),
+    tags: z.array(tag).optional().describe("Tags (replace the existing ones on a new version)"),
+    description: z.string().optional().describe("One-line summary stored in frontmatter"),
+    publish: z
+      .boolean()
+      .optional()
+      .describe(
+        "Publish the import (default true). Pass false to leave it a draft — governed surfaces use this when a write must clear review first.",
+      ),
+    note: z
+      .string()
+      .optional()
+      .describe("Version-history note recorded against the publish (audit trail)."),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    version: z.number().int().min(1),
+    created: z.boolean().describe("True when this call created the node, false for a new version (or no-op)"),
+    unchanged: z
+      .boolean()
+      .describe("True when the bytes matched the node's current PDF, so nothing was written"),
+    status: z.enum(STATUSES),
+    checkpoint: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Checkpoint sealing the publish, or null for a draft / no-op"),
+    pdf: pdfMetaSchema.describe("The node's pdf block — sidecar path, sha256, size, pages, extractor"),
+    text_layer: z
+      .boolean()
+      .describe("False for a scanned PDF: no text was extracted and the body is empty"),
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "INVALID_DOCUMENT_ID",
+    "DOCUMENT_ALREADY_EXISTS",
+    "REJECTED_DOCUMENT",
+    "FORGOTTEN_DOCUMENT",
+    // The publish refuses a sidecar that does not hash to pdf.sha256.
+    "INTEGRITY_ERROR",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
 
 // ─── context_skill / context_skill_install ───────────────────────────────────
 
@@ -1004,6 +1358,9 @@ const skillOp: OperationDescriptor = {
   output: z.object({
     name: z.string().describe("Slugified skill / rule name"),
     description: z.string().describe("The harness's local matcher text, from `skill.trigger`"),
+    integrity: integrityVerdict
+      .optional()
+      .describe("Present only when the skill node failed integrity verification — do not run it unreviewed."),
     content: z.string().describe("Complete file content, harness frontmatter included"),
     relative_path: z.string().describe("Path relative to `base`"),
     base: z.enum(["project_root", "home"]),
@@ -1056,6 +1413,9 @@ const skillInstallOp: OperationDescriptor = {
     ),
     post_install: z.string().describe("What the user must do for the harness to pick it up"),
     notes: z.string(),
+    integrity: integrityVerdict
+      .optional()
+      .describe("Present only when the skill node failed integrity verification — do not install it unreviewed."),
     served_version: z
       .number()
       .int()
@@ -1077,6 +1437,75 @@ const skillInstallOp: OperationDescriptor = {
   errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "REJECTED_DOCUMENT"],
 };
 
+// ─── context_structure ───────────────────────────────────────────────────────
+
+/** One folder rule as `context_structure` reports it. */
+const folderRuleView = z.object({
+  pattern: z.string().describe('Folder path pattern, e.g. "clients/{client}/meetings"; "/" is the vault root'),
+  description: z.string().optional(),
+  types: z.array(z.string()).optional().describe("Node types allowed directly in the folder; absent = any, [] = none"),
+  folder_name: z.string().optional().describe("Format of the trailing {placeholder} folder name: token pattern or /regex/"),
+  file_name: z.string().optional().describe('Format of file names in the folder: token pattern ("{date}-{slug}") or /regex/'),
+  template: z.string().optional().describe("Template new files in the folder start from"),
+  required: z.boolean().describe("This fixed-name folder is created with its parent and cannot be deleted alone"),
+  files: z
+    .record(z.object({ template: z.string().optional(), type: z.string().optional() }))
+    .describe("Files every matching folder must contain (leaf name → template/type)"),
+});
+
+const structureOp: OperationDescriptor = {
+  name: "context_structure",
+  namespace: "core",
+  description:
+    "Read this nest's structure rules: which folders may exist, which node types and file-name formats each " +
+    "folder allows, the template its files start from, and the sections and files that are required. Call it " +
+    "before creating or moving a document in a nest with rules; writes that break an enforced rule are refused. " +
+    "Pass `folder` to get the one rule governing that folder (with its template body); `report: true` lists " +
+    "existing content that breaks the rules. File names come from titles (lowercased, words joined by \"-\").",
+  input: z.object({
+    folder: z
+      .string()
+      .optional()
+      .describe('Folder to resolve the governing rule for, e.g. "clients/acme-042/meetings" (a leading "nodes/" is optional)'),
+    report: z.boolean().optional().describe("Also list every existing document and folder that breaks a rule"),
+    ...clientField,
+  }),
+  output: z.object({
+    enforce: z.boolean().describe("true: writes that break a rule are refused; false: rules are report-only"),
+    closed: z.boolean().describe("true: only declared folders (and their ancestors) may exist and hold documents"),
+    folders: z.array(folderRuleView),
+    templates: z.record(z.object({ body: z.string(), required_sections: z.array(z.string()) })),
+    resolved: folderRuleView
+      .extend({
+        template_body: z.string().optional(),
+        required_sections: z.array(z.string()).optional(),
+      })
+      .nullable()
+      .optional()
+      .describe("With `folder`: the governing rule, or null when no rule governs it"),
+    violations: z
+      .array(
+        z.object({
+          code: z.string(),
+          path: z.string(),
+          rule: z.string().optional(),
+          message: z.string(),
+        }),
+      )
+      .optional()
+      .describe("With `report`: what breaks the rules today (grandfathered content stays editable)"),
+    warnings: z
+      .array(z.string())
+      .optional()
+      .describe("Rules that compile but are probably mistakes, e.g. a template name not defined under templates"),
+    error: z
+      .string()
+      .optional()
+      .describe("Present when the rules in config.yaml do not compile: why. Writes are refused only if the rules are enforced"),
+  }),
+  errors: ["CONFIG_ERROR", "VALIDATION_FAILED"],
+};
+
 /** All `core` namespace operations, in catalog order. */
 export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   getOp,
@@ -1085,6 +1514,7 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   listOp,
   foldersOp,
   searchOp,
+  embedOp,
   createOp,
   updateOp,
   publishOp,
@@ -1092,10 +1522,14 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   versionsOp,
   reconstructOp,
   verifyOp,
+  forgetOp,
+  forgetLogOp,
   initOp,
   packsOp,
   nestsOp,
   importOp,
+  importPdfOp,
   skillOp,
   skillInstallOp,
+  structureOp,
 ];

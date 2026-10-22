@@ -87,6 +87,16 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx vault describe <alias> [description]` — Set or clear a registry description; omit the text to remove it
 - `ctx vault default <alias>` / `ctx vault remove <alias>` / `ctx vault which`
 
+### Hosted nests
+- `ctx login <server>` — Sign in once in the browser; the CLI mints its own API key and keeps it in your OS keyring (or the encrypted file store — never plaintext). `--key-stdin` saves an existing `cnst_…` key instead (hidden prompt on a terminal; a server without browser login falls back to it)
+- `ctx login <server> --as <alias> [--set-default]` — Sign in and register the server as a vault in one step: `ctx vault list` then shows every nest as `<alias>/<nest>`. With `--nest <id>` the alias points at that nest
+- `ctx vault add <alias> --url <server>/mcp` — Register the server; with a saved login no `--bearer-env` is needed. Then `ctx --vault <alias> query …`
+- `ctx push --server <server> --nest <id>` — Uses the saved key when `--key` / `CONTEXTNEST_API_KEY` are absent
+- `ctx login --list [server]` — Show the servers and nests you're logged into (never prints keys)
+- `ctx login <server> --nest <id> --key-stdin` — Save a key for one nest only; it wins over the server-wide key for that nest. Hosted (`https://nest.promptowl.ai`), self-hosted and nest-scoped keys all live side by side, so you never log out to switch. A nest key also works through a server alias as `--vault <alias>/<nest>`, with or without a server-wide key
+- `ctx login <server> --account <name>` — Sign in to the same server as a second account (say, a client's). Point an alias at it with `ctx vault add <alias> --url <server>/mcp --account <name>` (or `ctx login … --account <name> --as <alias>`); `--list` and `ctx logout --account <name>` take it too
+- `ctx logout <server|alias> [--nest <id>] [--account <name>] | --all` — Forget a server's keys (with its nest-scoped keys), one nest's key, or everything; `--all` also resets an unreadable store. Revoke keys on the server in the web UI
+
 ### Document Management
 - `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)
 - `ctx add <path> --type skill` — Create a skill node with trigger, inputs, and guard rails
@@ -96,7 +106,12 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
 - `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
 - `ctx update <path>` — Update a document
-- `ctx delete <path>` — Delete a document
+- `ctx update <path> --assignee <email> --due <YYYY-MM-DD> --priority <urgent|high|medium|low> --parent <id>` — Remote (Community) nest only: set task fields; the nest checks the assignee is on its roster. `""` or `none` clears a field
+- `ctx list --assignee <email|none> --priority <p|none> --due-before <YYYY-MM-DD>` — Remote nest only: filter tasks
+- `ctx task log <path> --note "…" [--status working|done|blocked] [--claim] [--agent <name>]` — Remote nest only: record what you did on a task. Attributed to you, your API key and the agent (`--agent` or `$CONTEXTNEST_AGENT`), and shown in the task's activity. `--claim` assigns it to you if it is unassigned
+- `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
+- `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
+- `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
 - `ctx publish <path>` — Publish (bump version, create checkpoint)
 - `ctx publish --all` — Publish every unpublished document in one batch, with a live counter. Seals one checkpoint and regenerates the index once, instead of once per document
 - `ctx validate [path]` — Validate against the spec
@@ -115,7 +130,8 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx history <path>` — Show version history
 - `ctx history <path> --diff` — Include each version's unified diff from the one before
 - `ctx reconstruct <path> <version>` — Reconstruct a specific version. A version the history does not contain is now refused rather than answered with a neighbouring version's content
-- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it)
+- `ctx verify` — Verify all hash chains (reports a `history.yaml` it cannot read instead of skipping it; forgotten versions verify hash-only)
+- `ctx forget-log [path]` — The forget audit trail (never the forgotten content)
 
 ### File Safety
 
@@ -163,7 +179,11 @@ link and waits for the decision, exiting `0` once the push is applied and
 non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
 submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
 defaults to the server's window, else 15 minutes). Ungated nests apply
-immediately, exactly as before.
+immediately, exactly as before. A push that runs straight through lists any
+document it skipped (already exists — never overwritten) or failed, and exits
+non-zero if one failed. On such a nest, `ctx add` against the remote vault is
+held the same way: it prints the nest's message and exits `0`, and the document
+does not exist until a reviewer confirms it.
 
 ### Caller attribution
 
@@ -318,6 +338,91 @@ Query context from cloud-hosted packs without downloading source files:
 ctx query @promptowl/executive-ai-strategy
 ```
 
+## Recipes (`ctx pull`)
+
+A recipe is a node in a remote nest (slug `recipe-<id>`) whose body holds one fenced block that opens with ```` ```yaml recipe ````. It names the remote nodes to copy and where they land, the skills to bring in, the template files to write at the vault root, and the pack to generate. Because the recipe is a node, it is stewarded and versioned like everything it describes.
+
+```bash
+ctx pull <remote-alias> --recipe org-essentials --dry-run   # show the plan, write nothing
+ctx pull <remote-alias> --recipe org-essentials             # pull
+ctx pull <remote-alias> --recipe org-essentials --update    # take newer upstream versions
+```
+
+- Every pulled document lands as a **draft** with `derived_from: contextnest://<nest>/<id>` and `metadata.pulled_from` recording the upstream version. Review it, then `ctx publish`.
+- A later pull skips what is current, reports newer upstream versions (applied only with `--update`), and **never overwrites** a document or file it did not pull, nor a pulled one you have since edited or published.
+- Skills land as `type: skill`. Install one with `ctx skill install <path> --mode loader --write`.
+- Pulls write into a **local vault** for now; use `ctx push` to send the result to a hosted nest.
+
+```yaml recipe
+id: org-essentials
+includes:
+  - from: nodes/org/spine/the-accountability-method   # remote node id
+    to: nodes/methodologies/accountability-method      # local document id
+    tags: [prime-document]                             # optional, added to the source's tags
+skills:
+  - from: nodes/org/skills/distill-capture             # lands at nodes/skills/<slug> unless `to` is set
+files:
+  - from: nodes/org/templates/stewards-example         # first ```yaml block in the node; `to` must be .yaml/.yml, outside nodes/, packs/ and dot-folders
+    to: stewards.example.yaml
+pack:
+  id: org-essentials
+  include: [nodes/methodologies/accountability-method]
+  agent_instructions: Load these first.
+```
+
+### Kinds (`kind:` in a recipe, `ctx kind apply`)
+
+A recipe can also carry a `kind:` section: the server-side half of a package. A pull never sends it anywhere. It validates the section and writes it to `nodes/kinds/<recipe-id>`, a draft with the same lineage as every other pulled document (`derived_from` points at the recipe node), so the kind is reviewed, published and versioned like the documents it ships with. `ctx kind apply` is the separate, explicit step that sends it to a hosted nest.
+
+```yaml recipe
+id: seam                       # must be a plain name when the recipe carries a kind
+includes: [...]
+kind:
+  plugins:                     # PUT /nests/:id/plugins/:name (FEATURE_PLUGINS)
+    - name: github
+      mode: summary            # raw | summary
+      settings:                # plain values only; secret-looking keys or values are refused
+        repos: [org/repo]
+  edge_types:                  # POST /nests/:id/edge-types, upsert by name (FEATURE_WORKFLOW_PLANE)
+    - name: escalates-when
+      description: Escalate the source to the target when the condition holds.   # required by the server
+      is_flow: true
+      condition_schema: { params: [CAC], mode_default: structured }
+  edges:                       # POST /nests/:id/edges (FEATURE_WORKFLOW_PLANE)
+    - from: nodes/playbooks/triage   # node ids as they exist in the target nest
+      to: nodes/agents/escalate
+      type: escalates-when           # declared above, or a stock type: next, on-success, on-failure, depends-on, owned-by
+      condition: { mode: structured, term: CAC, op: ">", value: 500 }   # or { mode: nl|open, text: "..." }
+  schedules:                   # POST /nests/:id/schedules (FEATURE_WORKFLOW_PLANE); one per agent
+    - agent: nodes/agents/escalate   # an agent or skill node
+      every_minutes: 60              # 5 to 10080
+  stewards:                    # POST /nests/:id/stewards
+    - scope: document          # document | tag | nest
+      target: nodes/playbooks/triage   # a document id, or a tag; none for nest
+      role: reviewer           # editor | reviewer | viewer
+      principal: "@seam-owner" # always a placeholder; the person is chosen at apply time
+  runner:
+    handlers: [llm-judge]      # runner handlers the kind expects; informational
+```
+
+Unknown fields anywhere in `kind:` are refused (a structured condition takes only `term`, `op` and `value`), as is any plugin setting or condition value that looks like a secret. Stock edge types are used as they are, never redeclared in `edge_types`. Secrets are set on the server, never in a recipe.
+
+```bash
+ctx kind apply seam --server https://nest.example.com --nest <id> --steward @seam-owner=lead@example.com        # plan only
+ctx kind apply seam --server https://nest.example.com --nest <id> --steward @seam-owner=lead@example.com --yes  # send it
+```
+
+- **Dry run by default.** Without `--yes`, only GETs are sent: they check the key and the nest, and find out which planes are on.
+- **Published kinds only.** `--yes` refuses a kind that is still a draft — review and `ctx publish` it first, or pass `--allow-draft` to apply an unreviewed one deliberately (stewards switch governance on).
+  "Published" means published under the vault's normal rules; it implies a review only when the vault has its review gate on.
+- **Re-runs are safe.** Anything the server already has (a 409) is reported as `exists`; an edge whose edge type failed in the same run is `skipped`, not sent. `--steward` emails are lowercased.
+- Authentication works as it does for `ctx push`: `--key`, `CONTEXTNEST_API_KEY`, or the key saved by `ctx login`; https (or localhost) only, and redirects are refused.
+- A plane the server has switched off answers 404. Its entries are skipped with a warning that names the flag (`FEATURE_WORKFLOW_PLANE`, `FEATURE_PLUGINS`). A plugin the server has not loaded is skipped too.
+- Plugins are configured but **never enabled**. Enable one on the server once its secrets are connected.
+- A schedule that already exists for an agent is left as it is. An edge or steward that already exists (409) is reported as present.
+- Stewards whose placeholder is not mapped with `--steward @placeholder=email` are not applied. Assigning a steward turns governance on for the nest.
+- Server ids come from the title and folder that `ctx push` sent. Edges and schedules name node ids **as they exist in the target nest**, and the server rejects ids it does not have.
+
 ## AI Agent Integration
 
 Running `ctx index` auto-generates config files so AI tools discover your vault:
@@ -334,7 +439,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **38 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
+For direct AI agent access via the Model Context Protocol — **41 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -353,7 +458,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 38 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 41 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 

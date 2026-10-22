@@ -43,6 +43,7 @@ describe("plugin manifest", () => {
       "capture_mode",
       "ctx_command",
       "retrieval_mode",
+      "unclear_nest",
       "vault",
     ]);
     for (const k of keys) {

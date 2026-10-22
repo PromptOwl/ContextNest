@@ -46,6 +46,8 @@ function initVault(cwd: string) {
     [distPath, "init", "--name", "status-vault", "--layout", "structured"],
     { cwd, env: ENV, stdio: "ignore" },
   );
+  // New vaults hold writes for review; this suite seeds published docs.
+  execFileSync("node", [distPath, "config", "set", "review", "off"], { cwd, env: ENV, stdio: "ignore" });
 }
 
 describe("ctx — status alias normalization", () => {

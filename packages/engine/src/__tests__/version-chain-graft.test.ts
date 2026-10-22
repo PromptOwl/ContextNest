@@ -19,6 +19,7 @@ import { NestStorage } from "../storage.js";
 import { serializeDocument } from "../parser.js";
 import { VersionManager } from "../versioning.js";
 import { publishDocument } from "../publish.js";
+import { computeChainHash, computeContentHash } from "../integrity.js";
 import type { ContextNode } from "../types.js";
 
 const DOC_ID = "nodes/demo";
@@ -277,5 +278,91 @@ describe("version chain integrity", () => {
 
     await expect(versions.repairLatestVersion(DOC_ID)).resolves.toBe(false);
     expect(await storage.readHistory(DOC_ID)).toEqual(before);
+  });
+
+  /**
+   * Damage v2 the way an overwriting import does: its change log no longer
+   * applies to v1, but every stored fingerprint is rewritten to agree with the
+   * bytes on disk — so no hash check can see it, only an actual rebuild.
+   */
+  async function damageOlderVersion(): Promise<void> {
+    const patch = (await versions.getDiff(DOC_ID, 2))!;
+    const tampered = patch.replace("body line 1", "text that is not in v1");
+    await storage.writeDiff(DOC_ID, 2, tampered, { overwrite: true });
+
+    const history = (await storage.readHistory(DOC_ID))!;
+    let prev: string | null = null;
+    for (const entry of history.versions) {
+      if (entry.version === 2) entry.content_hash = computeContentHash(tampered);
+      entry.chain_hash = computeChainHash(
+        prev,
+        entry.content_hash,
+        entry.version,
+        entry.edited_by,
+        entry.edited_at,
+      );
+      prev = entry.chain_hash;
+    }
+    await storage.writeHistory(DOC_ID, history);
+  }
+
+  it("verify reports a version that no longer rebuilds even when every hash agrees", async () => {
+    await buildChain(3);
+    expect((await storage.verifyVaultIntegrity()).valid).toBe(true);
+
+    await damageOlderVersion();
+
+    const report = await storage.verifyVaultIntegrity();
+    expect(report.valid).toBe(false);
+    const rebuilds = report.errors.filter((e) => e.type === "version_unreconstructable");
+    // v2's diff is broken, and v3 replays through it — both named, per version.
+    expect(rebuilds.map((e) => ({ document: e.document, version: e.version }))).toEqual([
+      { document: DOC_ID, version: 2 },
+      { document: DOC_ID, version: 3 },
+    ]);
+    // The point of the scenario: no hash check catches this damage.
+    expect(report.errors.filter((e) => e.type !== "version_unreconstructable")).toEqual([]);
+  });
+
+  it("repairVersions reports unreadable versions and the newest readable one, read-only when the latest rebuilds", async () => {
+    await buildChain(12); // keyframes at 1 and 11 — the chain re-anchors past the damage
+    await damageOlderVersion();
+
+    const before = await storage.readHistory(DOC_ID);
+    const report = await versions.repairVersions(DOC_ID);
+    expect(report).toEqual({
+      repaired: false,
+      unreadable: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+      newestReadable: 12,
+    });
+    // Nothing rewritten: the latest version already rebuilds.
+    expect(await storage.readHistory(DOC_ID)).toEqual(before);
+    // Idempotent: a second run reports the same.
+    await expect(versions.repairVersions(DOC_ID)).resolves.toEqual(report);
+  });
+
+  it("repairVersions re-anchors an unreadable latest version and reports what stayed broken", async () => {
+    await buildChain(3);
+    await damageOlderVersion();
+
+    const report = await versions.repairVersions(DOC_ID);
+    expect(report.repaired).toBe(true);
+    expect(report.newestReadable).toBe(3);
+    // v2's bytes are genuinely gone; no repair invents them.
+    expect(report.unreadable).toEqual([2]);
+
+    // Repair never adds or renumbers a version (acceptance: version count
+    // never increases).
+    const history = (await storage.readHistory(DOC_ID))!;
+    expect(history.versions.map((e) => e.version)).toEqual([1, 2, 3]);
+    await expect(versions.reconstructVersion(DOC_ID, 3)).resolves.toContain(
+      "body line 3",
+    );
+
+    // Second run: nothing left to repair, same readability report.
+    await expect(versions.repairVersions(DOC_ID)).resolves.toEqual({
+      ...report,
+      repaired: false,
+    });
   });
 });
