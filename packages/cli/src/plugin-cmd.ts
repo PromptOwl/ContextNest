@@ -3,14 +3,16 @@
  *
  *   ctx plugin add <package|path>      validate + record a plugin
  *   ctx plugin list [--json]           what's installed, settings (secrets masked)
- *   ctx plugin set <name> k=v …        settings; `x-secret` keys are stored too, but an
- *                                      env var CONTEXTNEST_PLUGIN_<NAME>_<KEY> always wins
+ *   ctx plugin set <name> k=v …        settings; `x-secret` keys go to the secure credential
+ *                                      store (never plugins.yaml); an env var
+ *                                      CONTEXTNEST_PLUGIN_<NAME>_<KEY> always wins
  *   ctx plugin remove <name> --yes     forget the plugin (nodes stay)
  *   ctx plugin pull <name>             run pull() → upsert nodes; cursor advances on a clean run
  *   ctx plugin search <text>           federated: vault hits (governed) + live plugin hits
  *   ctx plugin promote <name> <id>     fetchOne() → upsert
  *
- * State lives in `.context/plugins.yaml`. The engine stores nothing itself —
+ * State lives in `.context/plugins.yaml` (secrets excepted — see
+ * plugin-secrets.ts). The engine stores nothing itself —
  * settings are passed per call — so this file is the CLI's whole contribution:
  * an operator-owned record of which plugins run here, with what, since when.
  */
@@ -26,6 +28,7 @@ import { NestStorage } from "@promptowl/contextnest-engine";
 import { createPluginHost, loadPlugins, trimSlashes, type Distiller } from "@promptowl/contextnest-engine/plugins";
 import { secretKeys, type NestPlugin } from "@promptowl/contextnest-plugin-sdk";
 import { confirmOrExit } from "./safety.js";
+import { PluginSecretStore, pluginEnvKey, resolvePluginSettings, splitSecretSettings } from "./plugin-secrets.js";
 
 interface PluginEntry {
   package: string;
@@ -33,6 +36,8 @@ interface PluginEntry {
    *  can mask them even when the module no longer loads. */
   secrets?: string[];
   settings?: Record<string, unknown>;
+  /** Names (never values) of the secrets held in the secure store. */
+  stored_secrets?: string[];
   cursor?: unknown;
   mode?: "raw" | "summary";
   folder?: string;
@@ -109,15 +114,39 @@ async function loadAll(root: string, file: PluginsFile): Promise<{ plugins: Nest
   return { plugins, errors };
 }
 
-/** Stored settings with env overrides applied: CONTEXTNEST_PLUGIN_<NAME>_<KEY>. */
-function resolveSettings(plugin: NestPlugin, entry: PluginEntry): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...(entry.settings ?? {}) };
-  const prefix = `CONTEXTNEST_PLUGIN_${plugin.manifest.name.toUpperCase().replace(/-/g, "_")}_`;
-  for (const key of Object.keys(plugin.manifest.settings.properties ?? {})) {
-    const env = process.env[`${prefix}${key.toUpperCase()}`];
-    if (env !== undefined && env !== "") out[key] = env;
+const secrets = new PluginSecretStore();
+
+/** Plain settings < secure-store secrets < env (CONTEXTNEST_PLUGIN_<NAME>_<KEY>). */
+async function resolveSettings(root: string, plugin: NestPlugin, entry: PluginEntry): Promise<Record<string, unknown>> {
+  const name = plugin.manifest.name;
+  const stored = entry.stored_secrets?.length ? await secrets.load(root, name) : {};
+  return resolvePluginSettings(name, Object.keys(plugin.manifest.settings.properties ?? {}), entry.settings ?? {}, stored);
+}
+
+/**
+ * Move plaintext secrets an older ctx wrote into plugins.yaml to the secure
+ * store. Returns true when the entry changed (caller writes the file). With no
+ * secure store they stay where they are — still read, with a warning.
+ */
+async function migrateLegacySecrets(root: string, plugin: NestPlugin, entry: PluginEntry): Promise<boolean> {
+  const isSecret = secretNamesFor(plugin, entry);
+  const { plain, secret } = splitSecretSettings(entry.settings ?? {}, isSecret);
+  if (Object.keys(secret).length === 0) return false;
+  const name = plugin.manifest.name;
+  if (!(await secrets.available())) {
+    console.error(
+      chalk.yellow(
+        `! ${name}: ${Object.keys(secret).join(", ")} still stored in plaintext in ${FILE}; no secure store to move ${Object.keys(secret).length === 1 ? "it" : "them"} to. ` +
+          `Use ${Object.keys(secret).map((k) => pluginEnvKey(name, k)).join(", ")} instead.`,
+      ),
+    );
+    return false;
   }
-  return out;
+  const where = await secrets.save(root, name, secret);
+  entry.settings = plain;
+  entry.stored_secrets = [...new Set([...(entry.stored_secrets ?? []), ...Object.keys(secret)])].sort();
+  console.error(chalk.dim(`  moved ${Object.keys(secret).join(", ")} for ${name} from ${FILE} to ${where}`));
+  return true;
 }
 
 /**
@@ -213,9 +242,9 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       console.log(`${chalk.green("✓")} ${chalk.bold(name)} v${plugin.manifest.version} — ${plugin.manifest.description}`);
       console.log(chalk.dim(`  faces: ${plugin.manifest.capabilities.join(", ")}`));
       const req = ((plugin.manifest.settings as { required?: string[] }).required ?? []).join(", ");
-      const secrets = secretKeys(plugin.manifest);
+      const secretNames = secretKeys(plugin.manifest);
       console.log(chalk.dim(`  configure: ctx plugin set ${name} ${req ? req.split(", ").map((k) => `${k}=…`).join(" ") : "key=value"}`));
-      if (secrets.length) console.log(chalk.dim(`  secrets (${secrets.join(", ")}) may also come from CONTEXTNEST_PLUGIN_${name.toUpperCase().replace(/-/g, "_")}_<KEY>`));
+      if (secretNames.length) console.log(chalk.dim(`  secrets (${secretNames.join(", ")}) are kept in the secure credential store; ${secretNames.map((k) => pluginEnvKey(name, k)).join(", ")} override${secretNames.length === 1 ? "s" : ""} them`));
     });
 
   cmd
@@ -229,7 +258,8 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const rows = Object.entries(file.plugins).map(([name, entry]) => {
         const p = plugins.find((x) => x.manifest.name === name);
         const isSecret = secretNamesFor(p, entry);
-        const settings = Object.fromEntries(Object.entries(entry.settings ?? {}).map(([k, v]) => [k, isSecret(k) ? mask(v) : v]));
+        const settings: Record<string, unknown> = Object.fromEntries(Object.entries(entry.settings ?? {}).map(([k, v]) => [k, isSecret(k) ? mask(v) : v]));
+        for (const k of entry.stored_secrets ?? []) settings[k] = "•••• (secure store)";
         return { name, package: entry.package, version: p?.manifest.version, capabilities: p?.manifest.capabilities, mode: entry.mode ?? "raw", folder: entry.folder, settings, cursor: entry.cursor, last_run_at: entry.last_run_at, last_status: entry.last_status, error: errors.find((e) => e.startsWith(`${name}:`)) };
       });
       if (opts.json) {
@@ -260,16 +290,29 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       if (!entry) throw new Error(`No plugin "${name}" — add it first: ctx plugin add <package>`);
       const plugin = await loadOne(root, entry.package);
       const kv = parseKv(pairs, plugin.manifest.settings as { properties?: Record<string, { type?: string }> });
-      const next = { ...(entry.settings ?? {}), ...kv };
-      if (plugin.validateSettings) await plugin.validateSettings(resolveSettings(plugin, { ...entry, settings: next }));
-      entry.settings = next;
+      const isSecret = secretNamesFor(plugin, entry);
+      const { plain, secret } = splitSecretSettings(kv, isSecret);
+      const nextPlain = { ...(entry.settings ?? {}), ...plain };
+      const stored = entry.stored_secrets?.length ? await secrets.load(root, name) : {};
+      if (plugin.validateSettings) {
+        const keys = Object.keys(plugin.manifest.settings.properties ?? {});
+        await plugin.validateSettings(resolvePluginSettings(name, keys, nextPlain, { ...stored, ...secret }));
+      }
+      // Secrets first: if there is no secure store this throws before anything is written.
+      if (Object.keys(secret).length) {
+        const where = await secrets.save(root, name, secret);
+        entry.stored_secrets = [...new Set([...(entry.stored_secrets ?? []), ...Object.keys(secret)])].sort();
+        console.log(chalk.dim(`  ${Object.keys(secret).join(", ")} → ${where}`));
+      }
+      entry.settings = nextPlain;
+      await migrateLegacySecrets(root, plugin, entry);
       if (opts.mode) {
         if (opts.mode !== "raw" && opts.mode !== "summary") throw new Error("--mode must be raw or summary");
         entry.mode = opts.mode;
       }
       if (opts.folder !== undefined) entry.folder = opts.folder;
-      writeFile(root, file);
       entry.secrets = secretKeys(plugin.manifest);
+      writeFile(root, file);
       console.log(`${chalk.green("✓")} ${name}: ${Object.keys(kv).join(", ") || "options"} saved`);
     });
 
@@ -283,6 +326,11 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       await confirmOrExit(`Remove plugin "${name}" from this vault? Its settings and cursor are forgotten; nodes stay.`, { destructive: true });
       delete file.plugins[name];
       writeFile(root, file);
+      try {
+        await secrets.clear(root, name);
+      } catch (e) {
+        console.error(chalk.yellow(`! ${name}: could not clear its stored secrets: ${(e as Error).message}`));
+      }
       console.log(`${chalk.green("✓")} removed ${name}`);
     });
 
@@ -299,12 +347,13 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const entry = file.plugins[name];
       if (!entry) throw new Error(`No plugin "${name}" — add it first: ctx plugin add <package>`);
       const plugin = await loadOne(root, entry.package);
+      if (await migrateLegacySecrets(root, plugin, entry)) writeFile(root, file);
       const host = createPluginHost({ plugins: [plugin], distill: distillerFromEnv(), log: (l, m) => l !== "debug" && console.error(chalk.dim(`[${l}] ${m}`)) });
       const api = createEngineApi({ extensions: [host.extension] });
       const mode = (opts.mode ?? entry.mode ?? "raw") as "raw" | "summary";
       const input: Record<string, unknown> = {
         plugin: name,
-        settings: resolveSettings(plugin, entry),
+        settings: await resolveSettings(root, plugin, entry),
         cursor: opts.reset ? undefined : entry.cursor,
         mode,
         target: { folder: await targetFolder(root, opts.folder ?? entry.folder, name) },
@@ -338,9 +387,11 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const { plugins, errors } = await loadAll(root, file);
       const host = createPluginHost({ plugins });
       const api = createEngineApi({ extensions: [host.extension] });
-      const targets = plugins
-        .filter((p) => p.search && (!opts.plugin || p.manifest.name === opts.plugin))
-        .map((p) => ({ plugin: p.manifest.name, settings: resolveSettings(p, file.plugins[p.manifest.name]) }));
+      const targets = await Promise.all(
+        plugins
+          .filter((p) => p.search && (!opts.plugin || p.manifest.name === opts.plugin))
+          .map(async (p) => ({ plugin: p.manifest.name, settings: await resolveSettings(root, p, file.plugins[p.manifest.name]) })),
+      );
       const result = await api.run<{ nest: Array<{ id: string; title: string; score?: number }>; live: Array<{ plugin: string; hits: Array<{ title: string; snippet: string; externalId: string; url?: string }> }>; errors: Array<{ plugin: string; error: string }> }>(
         "context_search_federated",
         { text, limit: Number(opts.limit), include_nest: opts.nest, plugins: targets, ...(deps.client() ? { client: deps.client() } : {}) },
@@ -373,11 +424,12 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const entry = file.plugins[name];
       if (!entry) throw new Error(`No plugin "${name}"`);
       const plugin = await loadOne(root, entry.package);
+      if (await migrateLegacySecrets(root, plugin, entry)) writeFile(root, file);
       const host = createPluginHost({ plugins: [plugin], distill: distillerFromEnv() });
       const api = createEngineApi({ extensions: [host.extension] });
       const result = await api.run<{ id: string; outcome: string }>(
         "context_promote",
-        { plugin: name, settings: resolveSettings(plugin, entry), externalId, mode: opts.mode ?? entry.mode ?? "raw", target: { folder: await targetFolder(root, entry.folder, name) }, ...(deps.client() ? { client: deps.client() } : {}) },
+        { plugin: name, settings: await resolveSettings(root, plugin, entry), externalId, mode: opts.mode ?? entry.mode ?? "raw", target: { folder: await targetFolder(root, entry.folder, name) }, ...(deps.client() ? { client: deps.client() } : {}) },
         deps.opContext(root),
       );
       if (opts.json) console.log(JSON.stringify(result, null, 2));

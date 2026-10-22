@@ -20,6 +20,10 @@ Community and the MCP/REST bindings get the same ops. Plugins get a wrapped
 and per-run budget.
 
 `ctx plugin add|list|set|remove|pull|search|promote` runs the same plugins
-against a local vault. State lives in `.context/plugins.yaml`; secrets may also
-come from `CONTEXTNEST_PLUGIN_<NAME>_<KEY>`; summary mode uses
-`CONTEXTNEST_DISTILL_URL` when set.
+against a local vault. Plain settings and cursors live in `.context/plugins.yaml`;
+`x-secret` settings go to the secure credential store from `ctx login` (OS
+keyring, else the encrypted file store) and never to that file, with
+`CONTEXTNEST_PLUGIN_<NAME>_<KEY>` as the override and the fallback when no
+secure store exists. Plaintext secrets an older build left in `plugins.yaml`
+are migrated on the next write. Summary mode uses `CONTEXTNEST_DISTILL_URL`
+when set.

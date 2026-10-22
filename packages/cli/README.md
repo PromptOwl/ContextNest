@@ -243,8 +243,12 @@ ctx plugin promote slack 1726000000.000100   # land one live hit through the nor
 ctx plugin list --json
 ```
 
-Settings live in `.context/plugins.yaml` (mode 600). A secret setting may also be supplied as
-`CONTEXTNEST_PLUGIN_<NAME>_<KEY>`, which always wins. `--mode summary` needs an LLM: point
+Plain settings live in `.context/plugins.yaml` (mode 600). Settings the plugin marks `x-secret` go to
+the same secure credential store as `ctx login` — the OS keyring, else the AES-256-GCM file store when
+`CONTEXTNEST_CREDENTIALS_KEY` is set — and never to `plugins.yaml`. With neither available, `ctx plugin
+set` refuses to store a secret and names the env var to use instead: `CONTEXTNEST_PLUGIN_<NAME>_<KEY>`,
+which always wins over a stored value. A plaintext secret left in `plugins.yaml` by an older `ctx` is
+moved to the secure store on the next `set`, `pull` or `promote`; `remove` forgets stored secrets too. `--mode summary` needs an LLM: point
 `CONTEXTNEST_DISTILL_URL` at an endpoint accepting `POST {body, kind, instructions}`; without one,
 summary requests land raw with a warning — never dropped. The cursor advances only after a clean run,
 so failures and local-edit conflicts are retried next time.
