@@ -77,6 +77,11 @@ jobs:
           persist-credentials: false
           path: contextnest
 
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
       - name: Test the transform and the guard
         working-directory: contextnest
         run: node --test scripts/spec-sync/transform-spec.test.mjs scripts/spec-sync/guard-spec.test.mjs
@@ -236,6 +241,11 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
 
       - name: Compare the published files
         env:

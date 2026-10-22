@@ -70,6 +70,13 @@ test("(a) the spec's own example languages pass", () => {
   }
 });
 
+test("(a) inline ```ts``` is not a fence and does not hide the real fences after it", () => {
+  const r = failing(inject("Write ```ts``` inline.\n\n```\nok\n```\n\n```ts\nx\n```\n"));
+  assert.ok(r.includes("code-fence"));
+  const blocks = fencedBlocks(inject("Write ```ts``` inline.\n"));
+  assert.ok(!blocks.some((b) => b.lang === "ts``"));
+});
+
 test("(a) raw HTML <pre> / <script> blocks fail", () => {
   assert.ok(failing(inject("<pre>\nconst x = 1;\n</pre>\n")).includes("code-fence"));
   assert.ok(failing(inject("<script>alert(1)</script>")).includes("code-fence"));
@@ -109,6 +116,14 @@ test("(b) a real 6-line engine function pasted into the spec fails (even in an u
   // Re-indented and with blank lines and braces interleaved: still caught.
   const mangled = text.split("\n").map((l) => "    " + l.trim() + "\n\n}").join("\n");
   assert.ok(failing(inject(mangled)).includes("engine-copy"));
+});
+
+test("(b) engine code disguised as a bullet list, quote or comments still fails", () => {
+  const { text } = realEngineFunction();
+  for (const prefix of ["* ", "- ", "> ", "1. ", "// "]) {
+    const dressed = text.split("\n").map((l) => prefix + l.trim()).join("\n");
+    assert.ok(failing(inject(dressed)).includes("engine-copy"), `prefix ${JSON.stringify(prefix)}`);
+  }
 });
 
 test(`(b) fewer than ${SHINGLE} copied lines do not trip engine-copy`, () => {

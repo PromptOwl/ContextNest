@@ -90,10 +90,25 @@ export function isTrivial(norm) {
   return false;
 }
 
-function significant(text) {
+/**
+ * Spec-side only: peel markdown/comment prefixes (`* `, `- `, `> `, `1. `,
+ * `// `, `# `) so code dressed up as a bullet list, quote or comment is still
+ * compared. Code-side comment lines stay trivial, so prose never matches them.
+ */
+export function stripSpecPrefixes(norm) {
+  let prev;
+  do {
+    prev = norm;
+    norm = norm.replace(/^(?:[*+>-]|\d+[.)]|\/\/+|\/\*+|#+)\s*/, "");
+  } while (norm !== prev);
+  return norm;
+}
+
+function significant(text, { spec = false } = {}) {
   const out = [];
   text.split(/\r\n|\n|\r/).forEach((raw, i) => {
-    const n = normalizeLine(raw);
+    let n = normalizeLine(raw);
+    if (spec) n = stripSpecPrefixes(n);
     if (!isTrivial(n)) out.push({ n, line: i + 1 });
   });
   return out;
@@ -161,6 +176,9 @@ export function fencedBlocks(text) {
     const m = l.match(/^\s*(`{3,}|~{3,})(.*)$/);
     if (!m) return;
     if (!open) {
+      // CommonMark: a backtick fence's info string cannot contain a backtick
+      // (```ts``` is inline code, not a fence).
+      if (m[1][0] === "`" && m[2].includes("`")) return;
       const info = m[2].trim();
       const lang = info.split(/\s+/)[0].replace(/^\{?\.?/, "").replace(/[},].*$/, "").toLowerCase();
       open = { fence: m[1], line: i + 1, lang };
@@ -201,7 +219,7 @@ export function guardSpec(text, { codeRoot, shingles } = {}) {
   if (shingles.size === 0) {
     copy.findings.push("no engine source found to compare against (wrong --code-root?) — failing closed");
   }
-  const sig = significant(text);
+  const sig = significant(text, { spec: true });
   let lastHit = -Infinity;
   for (let i = 0; i + SHINGLE <= sig.length; i++) {
     const key = sig.slice(i, i + SHINGLE).map((s) => s.n).join("\n");
