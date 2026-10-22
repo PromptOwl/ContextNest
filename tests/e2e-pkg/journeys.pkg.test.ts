@@ -1941,6 +1941,395 @@ const J9: Journey = {
   ],
 };
 
+/**
+ * A lexical search hit with its score breakdown, as `search --json` returns it:
+ * a total `score` plus a per-signal `scores` object (in lexical mode, only
+ * `scores.lexical`, equal to the total).
+ */
+type ScoredHit = {
+  id: string;
+  title: string;
+  score: number;
+  scores: { lexical?: number };
+};
+/**
+ * Hit ids in RESULT order — deliberately NOT sorted (unlike `searchIds`),
+ * because ranking order is exactly what J10-03/J10-04 assert.
+ */
+const searchOrder = (data: unknown) => (data as ScoredHit[]).map((h) => h.id);
+
+/**
+ * J10 — "I search for a word and the right node comes back, ranked."
+ *
+ * The everyday read path: no embeddings, no network — just the default lexical
+ * (stemmed keyword) search every user hits on day one. It proves the end-to-end
+ * experience survives a real install: a body word finds its node, a different
+ * word form still matches (stemming), the most relevant node ranks first, a
+ * title hit outranks a passing body mention, `--json` exposes the per-signal
+ * score behind the ranking, and `--limit` / no-match behave cleanly.
+ *
+ * Review is OFF (like J2/J3) so each `add` publishes immediately and is
+ * searchable — a held node is invisible to search (that contract is J7's).
+ *
+ * The node set is purpose-built:
+ *   - deployment-guide — "deployment" in title AND body, plus unique word "downtime".
+ *   - rollback-notes   — "deployment" in the body only, a single passing mention.
+ *   - caching-overview — "caching" in the TITLE only (body has no "caching").
+ *   - misc-perf        — "caching" in the BODY only, a single passing mention.
+ * The deployment pair drives the "relevant first" ranking; the caching pair is
+ * the clean title-only-vs-body-only discriminator (neither side wins on body
+ * frequency), so J10-04 genuinely measures the title contribution.
+ */
+const J10: Journey = {
+  id: "J10",
+  title: "Find the right node with lexical search (everyday reader)",
+  cases: [
+    {
+      id: "J10-01",
+      title: "A search for a word in a node's body returns that node",
+      actions: [
+        { args: ["init", "--name", "handbook"], stdout: ["Initialized"] },
+        // Review OFF: each add lands published and searchable (a held node is
+        // invisible to search — that's J7's contract, not this journey's).
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/deployment-guide",
+            "--type", "document",
+            "--title", "Deployment guide",
+            "--tags", "#ops",
+            "--body", "We deploy the service by running the deploy script. Deployment happens nightly without downtime.",
+            "-y",
+          ],
+          files: [{ path: "nodes/deployment-guide.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/rollback-notes",
+            "--type", "document",
+            "--title", "Rollback notes",
+            "--tags", "#ops",
+            "--body", "If a release goes wrong, roll back quickly. This also has a passing mention of deployment.",
+            "-y",
+          ],
+          files: [{ path: "nodes/rollback-notes.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/caching-overview",
+            "--type", "document",
+            "--title", "Caching strategy",
+            "--tags", "#perf",
+            "--body", "General notes about system performance and latency budgets.",
+            "-y",
+          ],
+          files: [{ path: "nodes/caching-overview.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/misc-perf",
+            "--type", "document",
+            "--title", "Performance notes",
+            "--tags", "#perf",
+            "--body", "A few teams mention caching once here, in passing, among many other topics and details.",
+            "-y",
+          ],
+          files: [{ path: "nodes/misc-perf.md", exists: true }],
+        },
+        // "downtime" appears in exactly one node's body — searching it returns that node.
+        {
+          args: ["search", "downtime", "--json"],
+          json: (data) =>
+            expect(searchOrder(data)).toEqual(["nodes/deployment-guide"]),
+        },
+      ],
+    },
+    {
+      id: "J10-02",
+      title: "Searching a different word form still finds the node (stemming)",
+      actions: [
+        // "deploying" is written in no node; it stems to "deploy", which the
+        // guide's body carries ("deploy"/"deploy script") — so a stemmed keyword
+        // match, not a literal one, is what surfaces it.
+        {
+          args: ["search", "deploying", "--json"],
+          json: (data) =>
+            expect(searchOrder(data)).toEqual(["nodes/deployment-guide"]),
+        },
+      ],
+    },
+    {
+      id: "J10-03",
+      title: "The most relevant node ranks first when several match",
+      actions: [
+        // Both ops nodes contain "deployment"; the guide (title + body) is more
+        // relevant than the rollback node (one passing body mention), so it leads.
+        {
+          args: ["search", "deployment", "--json"],
+          json: (data) => {
+            const order = searchOrder(data);
+            expect(order).toHaveLength(2);
+            expect(order[0]).toBe("nodes/deployment-guide");
+            expect(order).toContain("nodes/rollback-notes");
+          },
+        },
+      ],
+    },
+    {
+      id: "J10-04",
+      title:
+        "A node whose title contains the term outranks one that only mentions it in passing",
+      actions: [
+        // Clean discriminator: "caching" is in caching-overview's TITLE only and
+        // in misc-perf's BODY only (a single mention) — neither wins on body
+        // frequency, so the title-bearing node leading proves the title boost.
+        {
+          args: ["search", "caching", "--json"],
+          json: (data) => {
+            const hits = data as ScoredHit[];
+            expect(hits.map((h) => h.id)).toEqual([
+              "nodes/caching-overview",
+              "nodes/misc-perf",
+            ]);
+            expect(hits[0].score).toBeGreaterThan(hits[1].score);
+          },
+        },
+      ],
+    },
+    {
+      id: "J10-05",
+      title: "`--json` exposes each hit's relevance score and per-signal breakdown",
+      actions: [
+        {
+          args: ["search", "deployment", "--json"],
+          json: (data) => {
+            const hits = data as ScoredHit[];
+            expect(hits.length).toBeGreaterThan(0);
+            for (const h of hits) {
+              expect(typeof h.score).toBe("number");
+              // Lexical mode surfaces a single per-signal score, equal to the total.
+              expect(typeof h.scores.lexical).toBe("number");
+              expect(h.scores.lexical).toBe(h.score);
+            }
+            // Results are ordered by descending score.
+            const scores = hits.map((h) => h.score);
+            expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+          },
+        },
+      ],
+    },
+    {
+      id: "J10-06",
+      title:
+        "`--limit` caps how many hits come back; a term with no match returns an empty result cleanly",
+      actions: [
+        // "deployment" matches two nodes; --limit 1 returns only the top one.
+        {
+          args: ["search", "deployment", "--limit", "1", "--json"],
+          json: (data) =>
+            expect(searchOrder(data)).toEqual(["nodes/deployment-guide"]),
+        },
+        // A term in no node is not an error — a clean empty result.
+        { args: ["search", "nonexistentxyz"], stdout: ["No results found."] },
+        {
+          args: ["search", "nonexistentxyz", "--json"],
+          json: (data) => expect(data).toEqual([]),
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J11 — "An agent edited a node's file behind my back; I review the change."
+ * The steward side of governance (distinct from J7's review gate, which holds
+ * *new* CLI/agent writes): `ctx drift` catches edits made straight to a node's
+ * file on disk — bypassing the CLI, so its stored checksum no longer matches —
+ * and routes them through a decision. Detection and staging never touch the
+ * canonical node or its hash chain; only an approval writes a new version.
+ */
+type DriftError = { type: string; document: string };
+const driftedDocs = (data: unknown) =>
+  (data as { drifted: DriftError[] }).drifted.map((d) => d.document);
+
+type SuggestionMeta = { suggestion_id: string; source: string };
+const suggestionList = (data: unknown) =>
+  data as { count: number; suggestions: SuggestionMeta[] };
+
+// The body a teammate hand-edits on disk, outside the CLI.
+const POLICY_BEFORE = "Access requires MFA.";
+const POLICY_AFTER = "Access requires MFA and a hardware key.";
+const editPolicyBodyOnDisk = (vault: string) => {
+  const p = join(vault, "nodes", "policy.md");
+  writeFileSync(p, readFileSync(p, "utf-8").replace(POLICY_BEFORE, POLICY_AFTER));
+};
+
+// A suggestion id is minted at `stage` time (timestamp-based), so later
+// approve/reject steps read it from here via the harness's function-form args.
+// Anchored to the "Staged suggestion" line (not a bare `s_` token anywhere in
+// the output) and throws on no match — so a wording change fails loudly right
+// here, instead of letting an empty or stale id silently drive the wrong
+// command downstream. A successful capture overwrites the previous id, so the
+// J11-05 re-stage can't reuse J11-03's.
+let j11Sid = "";
+const captureSid = (r: RunResult) => {
+  const m = r.stdout.match(/Staged suggestion (s_\S+)/);
+  if (!m) throw new Error(`J11: no suggestion id in drift-stage output:\n${r.stdout}`);
+  j11Sid = m[1];
+};
+
+const J11: Journey = {
+  id: "J11",
+  title: "Review an out-of-band correction to a node (drift steward)",
+  cases: [
+    {
+      id: "J11-01",
+      title: "A steward's published vault starts with no drift",
+      actions: [
+        { args: ["init", "--name", "governed handbook"], stdout: ["Initialized"] },
+        // Review OFF so the node lands published with a stored checksum — the
+        // baseline `drift` compares the file on disk against.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/policy",
+            "--type", "document",
+            "--title", "Security policy",
+            "--tags", "#policy",
+            "--body", POLICY_BEFORE,
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/policy.md", exists: true, contains: POLICY_BEFORE }],
+        },
+        { args: ["drift", "scan"], stdout: ["No drift detected."] },
+        {
+          args: ["drift", "scan", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect(driftedDocs(data)).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J11-02",
+      title: "An edit made outside the CLI is caught as drift",
+      actions: [
+        // The teammate's hand-edit lands on disk before the scan runs.
+        {
+          mutate: editPolicyBodyOnDisk,
+          args: ["drift", "scan"],
+          status: 1,
+          // Assert the words, not the ✗ glyph (Windows stdout decode).
+          stdout: ["1 drifted document(s)", "nodes/policy"],
+        },
+        {
+          args: ["drift", "scan", "--json"],
+          status: 1, // scan exits non-zero when it finds drift, JSON still on stdout
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(false);
+            expect(driftedDocs(data)).toEqual(["nodes/policy"]);
+            expect((data as { drifted: DriftError[] }).drifted[0].type).toBe("body_drift");
+          },
+        },
+      ],
+    },
+    {
+      id: "J11-03",
+      title: "Staging the edit records a suggestion without changing the node",
+      actions: [
+        // Stage proceeds without -y (non-destructive); it writes a suggestion,
+        // not the canonical node. Capture the minted id for J11-04/05.
+        {
+          args: ["drift", "stage", "nodes/policy"],
+          stdout: ["Staged suggestion", "out-of-band-edit", "standard"],
+          capture: captureSid,
+        },
+        {
+          args: ["drift", "list", "nodes/policy"],
+          stdout: ["1 suggestion(s) for nodes/policy"],
+        },
+        {
+          args: ["drift", "list", "nodes/policy", "--json"],
+          json: (data) => {
+            const l = suggestionList(data);
+            expect(l.count).toBe(1);
+            expect(l.suggestions[0].source).toBe("out-of-band-edit");
+            expect(l.suggestions[0].suggestion_id).toMatch(/^s_/);
+          },
+        },
+        // The node itself is untouched: still one version, chain still intact.
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
+        },
+        { args: ["verify"], stdout: ["All integrity checks passed"] },
+      ],
+    },
+    {
+      id: "J11-04",
+      title: "Rejecting a suggestion archives it and keeps the approved node",
+      actions: [
+        {
+          args: () => [
+            "drift", "reject", "nodes/policy", j11Sid,
+            "--reason", "superseded by SSO rollout",
+          ],
+          stdout: ["Rejected", "superseded by SSO rollout"],
+        },
+        // The suggestion is gone and no new version was created.
+        {
+          args: ["drift", "list", "nodes/policy", "--json"],
+          json: (data) => expect(suggestionList(data).count).toBe(0),
+        },
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
+        },
+        // Honest subtlety: reject is a decision, not a revert — the file on disk
+        // still carries the drifted bytes, so scan still flags it.
+        { args: ["drift", "scan"], status: 1, stdout: ["1 drifted document(s)"] },
+      ],
+    },
+    {
+      id: "J11-05",
+      title: "Staging and approving the edit makes it a new version",
+      actions: [
+        // Re-stage the still-present drift; capture the new id.
+        {
+          args: ["drift", "stage", "nodes/policy"],
+          stdout: ["Staged suggestion"],
+          capture: captureSid,
+        },
+        // Approve is the one guarded write — it refuses without confirmation.
+        {
+          args: () => ["drift", "approve", "nodes/policy", j11Sid],
+          status: 1,
+          stderr: ["Refusing without confirmation", "Non-interactive session"],
+        },
+        // The refused approve wrote nothing — the node is still its first version.
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
+        },
+        {
+          args: () => ["drift", "approve", "nodes/policy", j11Sid, "-y"],
+          stdout: ["Approved", "new version: v2"],
+        },
+        // The edit is now the node's content, as a clean second version.
+        { args: ["drift", "scan"], stdout: ["No drift detected."] },
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1, 2]),
+        },
+        { args: ["verify"], stdout: ["All integrity checks passed"] },
+        { args: ["read", "nodes/policy", "--raw"], stdout: [POLICY_AFTER] },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -1976,5 +2365,12 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J9 — build a knowledge base from PDFs", () => {
     runJourney({ installDir: INSTALL, scratch }, J9);
+  });
+
+  it("J10 — find the right node with lexical search", () => {
+    runJourney({ installDir: INSTALL, scratch }, J10);
+  });
+  it("J11 — review an out-of-band correction to a node (drift steward)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J11);
   });
 });

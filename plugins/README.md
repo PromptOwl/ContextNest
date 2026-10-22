@@ -1,8 +1,6 @@
 # Context Nest agent plugins
 
-Plugins that make coding agents **vault-aware** (auto-retrieve relevant context) and
-**self-maintaining** (auto-capture new knowledge), all by driving the existing
-[`ctx`](../packages/cli) CLI.
+Plugins that make coding agents **vault-aware** (auto-retrieve relevant context) and **self-maintaining** (auto-capture new knowledge), all by driving the existing [`ctx`](../packages/cli) CLI.
 
 ```text
 plugins/
@@ -15,10 +13,7 @@ plugins/
 
 ## How the pieces fit
 
-`plugins/shared/core/*.js` is pure (stdin/env in, hook-output JSON out, shelling to
-`ctx`) and imports no agent-specific API. Each agent plugin **vendors** a copy of that
-core via the sync script, because installed Claude plugins can't read files outside
-their own directory:
+`plugins/shared/core/*.js` is pure (stdin/env in, hook-output JSON out, shelling to `ctx`) and imports no agent-specific API. Each agent plugin **vendors** a copy of that core via the sync script, because installed Claude plugins can't read files outside their own directory:
 
 ```bash
 pnpm plugins:sync     # vendor shared/core + fill agent/skill prompt bodies

@@ -661,10 +661,18 @@ async function runOnDocument<T>(
   }
 }
 
+/**
+ * A body as `update --body-file` takes it back: writes store `\n<body>\n`, so
+ * drop that one leading and trailing newline or every round trip adds two.
+ */
+export function bodyOnly(body: string): string {
+  return body.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+}
+
 export async function remoteRead(
   target: RemoteTarget,
   path: string,
-  opts: { raw?: boolean; html?: boolean },
+  opts: { raw?: boolean; html?: boolean; body?: boolean },
 ): Promise<void> {
   if (opts.html) {
     throw new ContextNestError(
@@ -686,6 +694,10 @@ export async function remoteRead(
       // sweep-check reads every candidate this way, so it found nothing on a
       // remote nest. Rebuild the file from what did come back.
       console.log(doc.raw ?? serializeDocument({ id: doc.id, frontmatter: doc.frontmatter, body: doc.body } as ContextNode));
+      return;
+    }
+    if (opts.body) {
+      console.log(bodyOnly(doc.body));
       return;
     }
     const fm = doc.frontmatter;
