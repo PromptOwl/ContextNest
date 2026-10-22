@@ -1,5 +1,12 @@
 # @promptowl/contextnest-cli
 
+## 3.4.0
+
+### Minor Changes
+
+- c050c1d: `ctx add` and `ctx update` take `--body-file <file>` (or `-` for stdin), so a body with newlines, quotes or `$` needs no shell escaping; `ctx read --body` prints the body alone, ready to edit and pass back. `ctx update` now refuses to replace a body with an empty one unless `--force` — the signature of a failed read-modify-write that used to wipe the document.
+- 0414023: Add `ctx setup`: pick the vault options on a web page (https://nest.promptowl.ai/setup, or `CONTEXTNEST_SETUP_URL`), then `ctx init` runs with them. `ctx init` also takes `--tools <ids|none>` to choose the agent config files without a prompt.
+
 ## 3.3.0
 
 ### Minor Changes
