@@ -8,7 +8,8 @@
 // make sure no AGPL code, licence header, import, or internal detail rides
 // along into the Apache-2.0 repo:
 //
-//   code-fence     (a) fenced code blocks tagged with a programming language
+//   code-fence     (a) fenced code blocks tagged with anything but the
+//                      allowlisted example languages (yaml, markdown, bash, …)
 //   engine-copy    (b) >= 5 consecutive non-trivial lines that also appear in
 //                      packages/*/src/** or packages/*/bin/** (normalized-line
 //                      shingles; trivial = short, brace-only or comment-only)
@@ -30,9 +31,12 @@ import { readFileSync, readdirSync, statSync, writeFileSync, existsSync } from "
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const CODE_FENCE_LANGS = new Set([
-  "ts", "typescript", "tsx", "js", "javascript", "jsx", "mjs", "cjs",
-  "rust", "rs", "python", "py", "go", "java", "c", "cpp", "c++", "csharp", "cs",
+// Fence info strings the spec may use. Anything else — ts, js, py, rust, go,
+// ruby, php, … — fails: an allowlist, so a language nobody thought of is
+// caught too.
+export const ALLOWED_FENCE_LANGS = new Set([
+  "", "yaml", "yml", "markdown", "md", "bash", "sh", "shell", "console",
+  "json", "text", "txt", "plaintext", "diff",
 ]);
 
 // Lines allowed to carry a licence marker. Exact whole-line matches only: if
@@ -141,7 +145,9 @@ export function fencedBlocks(text) {
   const blocks = [];
   let open = null;
   lines.forEach((l, i) => {
-    const m = l.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    // Any indentation, not CommonMark's 0-3 spaces: a fence nested in a list
+    // item is still a code block, and this guard fails closed.
+    const m = l.match(/^\s*(`{3,}|~{3,})(.*)$/);
     if (!m) return;
     if (!open) {
       const info = m[2].trim();
@@ -162,7 +168,7 @@ export function fencedBlocks(text) {
 export function guardSpec(text, { codeRoot, shingles } = {}) {
   const lines = text.split(/\r\n|\n|\r/);
   const checks = [
-    { id: "code-fence", label: "(a) no language-tagged code blocks", findings: [] },
+    { id: "code-fence", label: "(a) code blocks are only unlabeled/yaml/markdown/bash/json/text/diff", findings: [] },
     { id: "engine-copy", label: `(b) no ${SHINGLE}+ line runs copied from packages/*/src or bin`, findings: [] },
     { id: "licence-marker", label: "(c) no SPDX / AGPL / GNU Affero / Copyright (c) outside the allowlisted lines", findings: [] },
     { id: "code-import", label: "(d) no @promptowl/contextnest-* imports, relative imports or require(", findings: [] },
@@ -171,7 +177,7 @@ export function guardSpec(text, { codeRoot, shingles } = {}) {
   const [fence, copy, licence, imports, leak] = checks;
 
   for (const b of fencedBlocks(text)) {
-    if (CODE_FENCE_LANGS.has(b.lang)) fence.findings.push(`line ${b.line}: \`\`\`${b.lang} block`);
+    if (!ALLOWED_FENCE_LANGS.has(b.lang)) fence.findings.push(`line ${b.line}: \`\`\`${b.lang} block`);
   }
 
   if (!shingles) {

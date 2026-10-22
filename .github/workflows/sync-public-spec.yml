@@ -118,6 +118,9 @@ jobs:
           ref: main
           token: ${{ secrets.SPEC_SYNC_TOKEN }}
           path: spec-repo
+          # Don't leave the token in spec-repo/.git/config; the push below
+          # passes it for that one command only.
+          persist-credentials: false
 
       - name: Open or update the sync PR
         working-directory: spec-repo
@@ -171,7 +174,12 @@ jobs:
             echo "::error title=Path allowlist violated::The sync commit touches: $touched"
             exit 1
           fi
-          git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
+          # Force: the branch always holds exactly one sync commit on top of
+          # main. Commits a reviewer pushes to it are replaced on the next sync.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
 
           body="$RUNNER_TEMP/pr-body.md"
           {

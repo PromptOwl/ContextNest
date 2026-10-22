@@ -23,7 +23,11 @@ const failing = (text) => {
 };
 
 // Inject a sample just after the Abstract heading, as real prose would sit.
-const inject = (sample) => PUBLIC.replace("## Abstract\n", `## Abstract\n\n${sample}\n`);
+const inject = (sample) => {
+  const out = PUBLIC.replace(/## Abstract\r?\n/, (m) => `${m}\n${sample}\n`);
+  assert.notEqual(out, PUBLIC, "injection point not found");
+  return out;
+};
 
 test("current spec, after the transform, passes every check", () => {
   const r = guardSpec(PUBLIC, { shingles });
@@ -48,11 +52,21 @@ test("guard compares against real engine source", () => {
   assert.ok(shingles.size > 1000);
 });
 
-for (const lang of ["ts", "typescript", "tsx", "js", "javascript", "mjs", "cjs", "rust", "rs", "python", "py", "go", "java", "c", "cpp", "csharp"]) {
+for (const lang of ["ts", "typescript", "tsx", "js", "javascript", "mjs", "cjs", "rust", "rs", "python", "py", "go", "java", "c", "cpp", "csharp", "ruby", "php", "kotlin", "swift", "node"]) {
   test(`(a) a \`\`\`${lang} block fails`, () => {
     assert.ok(failing(inject("```" + lang + "\nx\n```\n")).includes("code-fence"));
   });
 }
+
+test("(a) a fence nested in a list item (indented 4+ spaces) is caught", () => {
+  assert.ok(failing(inject("- step one\n\n    ```ts\n    x\n    ```\n")).includes("code-fence"));
+});
+
+test("(a) the spec's own example languages pass", () => {
+  for (const lang of ["", "yaml", "markdown", "bash", "json", "text"]) {
+    assert.ok(!failing(inject("```" + lang + "\nkey: value\n```\n")).includes("code-fence"), lang);
+  }
+});
 
 test("(a) tilde fences and {.lang} info strings are caught too", () => {
   assert.ok(failing(inject("~~~ Python\nx\n~~~\n")).includes("code-fence"));

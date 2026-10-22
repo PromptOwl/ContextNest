@@ -21,7 +21,9 @@ the public copy cannot quietly fall a version behind.
      matches, it exits green with "no changes" (and closes a stale sync PR if
      one is open);
    - otherwise commits on the fixed branch `sync/contextnest-spec`,
-     force-pushes it, and opens the PR — or edits the open one. Title:
+     force-pushes it (the branch is always one sync commit on top of `main`;
+     anything a reviewer pushes to it is replaced by the next sync — make
+     fixes in ContextNest instead), and opens the PR — or edits the open one. Title:
      `Sync spec from ContextNest@<sha> (spec v<version>)`.
    - It never merges. A person reviews and merges the PR, then tags
      `v<version>` on context-nest-spec if the version changed (the PR body says
@@ -47,9 +49,10 @@ enforces that, fail-closed:
   its own `LICENSE`.
 - **Licence & leak guard** (`scripts/spec-sync/guard-spec.mjs`), run before any
   push and again by the drift job. It fails on:
-  - (a) fenced code blocks tagged with a programming language (`ts`, `js`,
-    `mjs`, `py`, `rust`, `go`, `java`, `c`, `cpp`, `csharp`, …). The spec's
-    `yaml`, `markdown`, `bash` and unlabeled example blocks are allowed;
+  - (a) fenced code blocks with any info string outside an allowlist
+    (unlabeled, `yaml`/`yml`, `markdown`/`md`, `bash`/`sh`/`shell`/`console`,
+    `json`, `text`/`txt`/`plaintext`, `diff`) — so `ts`, `js`, `py`, `rust`,
+    `go`, `ruby`, … all fail, at any indentation (list-nested fences too);
   - (b) any run of 5 or more non-trivial lines (≥ 20 characters, not
     brace-only, not comment-only) that also appears in `packages/*/src/**` or
     `packages/*/bin/**` — normalized-line shingles, so re-indenting or
@@ -67,7 +70,8 @@ If the guard flags a legitimate spec change (say, a new row in the §15 table),
 update the allowlist in `guard-spec.mjs` and its tests in the same PR, so the
 change gets a reviewer.
 
-Run the tests locally:
+CI (`ci.yml`, job "Spec sync scripts") runs these tests on every PR, on
+Linux and Windows. Run them locally:
 
 ```bash
 node --test scripts/spec-sync/transform-spec.test.mjs scripts/spec-sync/guard-spec.test.mjs
@@ -93,7 +97,9 @@ approval for fine-grained tokens, an org owner approves it under Organization
 settings → Personal access tokens.
 
 The sync PRs are authored by the token's owner, so use a bot or service
-account if you have one. If the secret is missing, the sync job fails at its
+account if you have one. Create the secret **before** this workflow reaches
+`main`: until it exists, every push to `main` that touches the spec fails red
+at the first step. If the secret is missing, the sync job fails at its
 first step with a message naming it.
 
 ### Rotating it
