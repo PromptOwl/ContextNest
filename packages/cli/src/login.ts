@@ -4,7 +4,7 @@
  * share. I/O is injected so every branch is unit-tested (login.test.ts).
  *
  * Device flow, the same one the web UI's "Sign in with PromptOwl" drives:
- *   POST /auth/device → poll GET /auth/device/poll → POST /auth/promptowl
+ *   POST /auth/device → poll POST /auth/device/poll → POST /auth/promptowl
  *   (session cookie) → POST /auth/keys (mint a key labelled for this machine).
  * Accounts hold several keys, so this never replaces one already in use.
  */
@@ -104,9 +104,22 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
 
   const intervalMs = Math.max(1, start.interval ?? DEFAULT_POLL_INTERVAL_S) * 1000;
   const deadline = now() + (start.expiresIn ?? start.expires_in ?? DEFAULT_EXPIRES_S) * 1000;
-  const pollPath =
-    `/auth/device/poll?code=${encodeURIComponent(start.deviceCode)}` +
-    `&client_secret=${encodeURIComponent(start.clientSecret)}`;
+  const pollBody = { code: start.deviceCode, client_secret: start.clientSecret };
+  // Secret in the POST body so access logs never record it. A server older than
+  // POST /auth/device/poll answers 404/405; fall back to the deprecated GET.
+  let pollGet = false;
+  const pollOnce = async (): Promise<Response> => {
+    if (!pollGet) {
+      const res = await send("/auth/device/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pollBody),
+      });
+      if (res.status !== 404 && res.status !== 405) return res;
+      pollGet = true;
+    }
+    return send(`/auth/device/poll?${new URLSearchParams(pollBody)}`);
+  };
 
   let poToken: string | null = null;
   let failures = 0;
@@ -116,7 +129,7 @@ export async function deviceLogin(serverUrl: string, io: DeviceLoginIO = {}): Pr
     try {
       let res: Response;
       try {
-        res = await send(pollPath);
+        res = await pollOnce();
       } catch (err) {
         throw new TransientError((err as Error).message);
       }
