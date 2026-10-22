@@ -31,7 +31,9 @@ the public copy cannot quietly fall a version behind.
 3. The **drift** job runs every Monday (and on demand). It transforms
    ContextNest `main` and compares it with context-nest-spec `main`. Any
    difference fails the run red, with the diff in the job summary — so drift is
-   visible even when a sync PR sits unmerged.
+   visible even when a sync PR sits unmerged. It stays red every Monday until
+   that PR is merged; a failed scheduled run notifies through GitHub's normal
+   Actions notifications (whoever last edited the cron, plus watchers).
 
 Every run writes a job summary: source commit, spec version, lines +/−, the PR
 link or "no changes", and the guard results.
@@ -53,10 +55,12 @@ enforces that, fail-closed:
     (unlabeled, `yaml`/`yml`, `markdown`/`md`, `bash`/`sh`/`shell`/`console`,
     `json`, `text`/`txt`/`plaintext`, `diff`) — so `ts`, `js`, `py`, `rust`,
     `go`, `ruby`, … all fail, at any indentation (list-nested fences too);
+    raw HTML `<pre>` / `<script>` blocks fail as well;
   - (b) any run of 5 or more non-trivial lines (≥ 20 characters, not
-    brace-only, not comment-only) that also appears in `packages/*/src/**` or
-    `packages/*/bin/**` — normalized-line shingles, so re-indenting or
-    interleaving blank lines does not hide a copy;
+    brace-only, not comment-only) that also appears in `packages/*/src/**`,
+    `packages/*/bin/**`, or a code file under `plugins/` or `scripts/` —
+    normalized-line shingles, so re-indenting or interleaving blank lines does
+    not hide a copy;
   - (c) `SPDX-License-Identifier`, `AGPL`, `GNU Affero` or `Copyright (c)` on
     any line except the exact allowlisted ones (the licence line and the §15
     components table, in `LICENCE_LINE_ALLOWLIST`);
@@ -65,6 +69,10 @@ enforces that, fail-closed:
   - internal details: home-directory paths, internal or private IPs,
     `localhost:` URLs, email addresses outside `example.com/.org/.net`, the
     internal Slack workspace, and `cnst_` keys.
+
+Known limit: a 4-space-indented code block (no fence) is not detected by (a);
+check (b) still catches it when it is copied code of 5+ significant lines, and
+the sync PR is always reviewed by a person before merge.
 
 If the guard flags a legitimate spec change (say, a new row in the §15 table),
 update the allowlist in `guard-spec.mjs` and its tests in the same PR, so the
@@ -79,7 +87,9 @@ node --test scripts/spec-sync/transform-spec.test.mjs scripts/spec-sync/guard-sp
 
 ## The secret: `SPEC_SYNC_TOKEN`
 
-A repository secret on PromptOwl/ContextNest. The workflow's own
+An **environment secret** on PromptOwl/ContextNest, in the environment
+`spec-sync`, which only `main` can deploy to. That way a workflow edited on
+another branch and run by hand cannot read the token. The workflow's own
 `GITHUB_TOKEN` stays read-only (`permissions: contents: read`); this token is
 the only thing that can write, and only to context-nest-spec.
 
@@ -91,8 +101,15 @@ Create it as a **fine-grained personal access token**:
   and write** (Metadata: Read is added automatically). Nothing else.
 - Expiration: 90 days or less is a good default; one year at most.
 
-Then add it at ContextNest → Settings → Secrets and variables → Actions → New
-repository secret, name `SPEC_SYNC_TOKEN`. If the organization requires
+Then, in ContextNest → Settings → Environments:
+
+1. **New environment** `spec-sync`.
+2. Deployment branches and tags → **Selected branches and tags** → add `main`.
+3. Environment secrets → **Add secret**, name `SPEC_SYNC_TOKEN`, value the
+   token.
+
+Do not add it as a repository secret: that would make it readable from any
+branch. If the organization requires
 approval for fine-grained tokens, an org owner approves it under Organization
 settings → Personal access tokens.
 
@@ -105,7 +122,8 @@ first step with a message naming it.
 ### Rotating it
 
 1. Create a new token with the same settings.
-2. Replace the value of `SPEC_SYNC_TOKEN` (same name, new value).
+2. Replace the value of `SPEC_SYNC_TOKEN` in the `spec-sync` environment
+   (same name, new value).
 3. Actions → **Sync public spec** → Run workflow, branch `main`, mode `sync`.
    It should go green with "no changes" or an updated PR link.
 4. Revoke the old token.

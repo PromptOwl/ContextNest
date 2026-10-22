@@ -45,6 +45,9 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SPEC_SYNC_TOKEN lives in this environment, whose deployment branches are
+    # limited to main: a workflow edited on another branch cannot read it.
+    environment: spec-sync
     # Serialize syncs: a second push waits for the first instead of racing it
     # on the same branch/PR.
     concurrency:
@@ -57,7 +60,7 @@ jobs:
           SPEC_SYNC_TOKEN: ${{ secrets.SPEC_SYNC_TOKEN }}
         run: |
           if [ -z "$SPEC_SYNC_TOKEN" ]; then
-            echo "::error title=SPEC_SYNC_TOKEN is not set::Create the repository secret SPEC_SYNC_TOKEN (fine-grained token for PromptOwl/context-nest-spec only: Contents read/write + Pull requests read/write). See docs/spec-sync.md."
+            echo "::error title=SPEC_SYNC_TOKEN is not set::Create the secret SPEC_SYNC_TOKEN in the spec-sync environment (fine-grained token for PromptOwl/context-nest-spec only: Contents read/write + Pull requests read/write). See docs/spec-sync.md."
             {
               echo "## Sync public spec"
               echo ""
@@ -90,6 +93,11 @@ jobs:
           sha=$(git rev-parse HEAD)
           guard=0
           node scripts/spec-sync/guard-spec.mjs "$out/$SPEC_FILE" --code-root . --report "$out/guard.md" || guard=$?
+          # Never trust a bare exit 0: the guard must have written its report.
+          if [ ! -s "$out/$SPEC_FILE" ] || [ ! -s "$out/guard.md" ]; then
+            echo "::error title=Guard did not run::No transformed spec or guard report was produced."
+            exit 1
+          fi
           {
             echo "## Sync public spec"
             echo ""
@@ -247,6 +255,8 @@ jobs:
           guard_src=0; guard_pub=0
           node scripts/spec-sync/guard-spec.mjs "$out/expected.md" --code-root . --report "$out/guard-src.md" || guard_src=$?
           node scripts/spec-sync/guard-spec.mjs "$out/published.md" --code-root . --report "$out/guard-pub.md" || guard_pub=$?
+          [ -s "$out/guard-src.md" ] || guard_src=1
+          [ -s "$out/guard-pub.md" ] || guard_pub=1
 
           diff -u --label "context-nest-spec@main" --label "ContextNest@${sha:0:7} (transformed)" \
             "$out/published.md" "$out/expected.md" > "$out/spec.diff" || true

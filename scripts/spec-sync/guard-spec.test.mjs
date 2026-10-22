@@ -5,7 +5,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { transformSpec } from "./transform-spec.mjs";
@@ -66,6 +68,18 @@ test("(a) the spec's own example languages pass", () => {
   for (const lang of ["", "yaml", "markdown", "bash", "json", "text"]) {
     assert.ok(!failing(inject("```" + lang + "\nkey: value\n```\n")).includes("code-fence"), lang);
   }
+});
+
+test("(a) raw HTML <pre> / <script> blocks fail", () => {
+  assert.ok(failing(inject("<pre>\nconst x = 1;\n</pre>\n")).includes("code-fence"));
+  assert.ok(failing(inject("<script>alert(1)</script>")).includes("code-fence"));
+});
+
+test("plugin and script code is compared too, but not this guard's own folder", () => {
+  const files = codeFiles(ROOT).map((f) => relative(ROOT, f));
+  assert.ok(files.some((f) => f.startsWith("plugins")));
+  assert.ok(files.some((f) => f.startsWith(join("scripts", "sync-plugins"))));
+  assert.ok(!files.some((f) => f.startsWith(join("scripts", "spec-sync"))));
 });
 
 test("(a) tilde fences and {.lang} info strings are caught too", () => {
@@ -146,4 +160,27 @@ for (const sample of [
 
 test("example.com / example.org emails are allowed", () => {
   assert.deepEqual(failing(inject("Contact jane@example.com or ops@docs.example.org.")), []);
+});
+
+test("the CLI runs (and reports) when invoked through a symlink", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "guard-"));
+  const link = join(dir, "guard-link.mjs");
+  try {
+    symlinkSync(fileURLToPath(new URL("./guard-spec.mjs", import.meta.url)), link);
+  } catch {
+    t.skip("symlinks not permitted here");
+    return;
+  }
+  const spec = join(dir, "spec.md");
+  writeFileSync(spec, "# Spec\n\nCopyright (c) 2026 X\n");
+  let code = 0;
+  let out = "";
+  try {
+    out = execFileSync(process.execPath, [link, spec, "--code-root", ROOT], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (err) {
+    code = err.status;
+    out = err.stdout;
+  }
+  assert.equal(code, 1, "guard must fail, not exit 0 silently");
+  assert.match(out, /\| FAIL \|/);
 });

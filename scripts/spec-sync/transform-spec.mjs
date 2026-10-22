@@ -14,7 +14,7 @@
 //
 // No dependencies: plain Node ESM.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 export const SOURCE_LICENSE_LINE =
@@ -68,7 +68,18 @@ function main(argv) {
   writeFileSync(argv[1], transformSpec(readFileSync(argv[0], "utf8")));
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// Compare real paths: a symlinked checkout or a differently-cased Windows path
+// must still run main(), never exit 0 having checked nothing.
+function isMain() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
   try {
     main(process.argv.slice(2));
   } catch (err) {

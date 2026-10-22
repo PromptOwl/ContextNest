@@ -11,7 +11,8 @@
 //   code-fence     (a) fenced code blocks tagged with anything but the
 //                      allowlisted example languages (yaml, markdown, bash, …)
 //   engine-copy    (b) >= 5 consecutive non-trivial lines that also appear in
-//                      packages/*/src/** or packages/*/bin/** (normalized-line
+//                      packages/*/src/** or packages/*/bin/**, or in code files
+//                      under plugins/ and scripts/ (normalized-line
 //                      shingles; trivial = short, brace-only or comment-only)
 //   licence-marker (c) SPDX / AGPL / GNU Affero / Copyright (c), except the
 //                      exact allowlisted lines below
@@ -27,7 +28,7 @@
 //
 // No dependencies: plain Node ESM.
 
-import { readFileSync, readdirSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -121,6 +122,16 @@ export function codeFiles(codeRoot) {
       }
     }
   }
+  // The rest of the repo's code: plugins and scripts (code files only — their
+  // markdown prompts legitimately quote the spec). This guard's own folder is
+  // skipped: its tests hold injected samples by design.
+  const CODE_EXT = /\.(?:[cm]?[jt]sx?|sh)$/;
+  const self = join(codeRoot, "scripts", "spec-sync");
+  for (const base of ["plugins", "scripts"]) {
+    const d = join(codeRoot, base);
+    if (!existsSync(d)) continue;
+    for (const f of walk(d)) if (CODE_EXT.test(f) && !f.startsWith(self)) files.push(f);
+  }
   return files;
 }
 
@@ -169,13 +180,16 @@ export function guardSpec(text, { codeRoot, shingles } = {}) {
   const lines = text.split(/\r\n|\n|\r/);
   const checks = [
     { id: "code-fence", label: "(a) code blocks are only unlabeled/yaml/markdown/bash/json/text/diff", findings: [] },
-    { id: "engine-copy", label: `(b) no ${SHINGLE}+ line runs copied from packages/*/src or bin`, findings: [] },
+    { id: "engine-copy", label: `(b) no ${SHINGLE}+ line runs copied from packages/*/src+bin, plugins/, scripts/`, findings: [] },
     { id: "licence-marker", label: "(c) no SPDX / AGPL / GNU Affero / Copyright (c) outside the allowlisted lines", findings: [] },
     { id: "code-import", label: "(d) no @promptowl/contextnest-* imports, relative imports or require(", findings: [] },
     { id: "internal-leak", label: "no home paths, internal/private IPs, localhost URLs, real emails, internal Slack, cnst_ keys", findings: [] },
   ];
   const [fence, copy, licence, imports, leak] = checks;
 
+  lines.forEach((l, i) => {
+    if (/<(?:pre|script)\b/i.test(l)) fence.findings.push(`line ${i + 1}: raw HTML <pre>/<script> block`);
+  });
   for (const b of fencedBlocks(text)) {
     if (!ALLOWED_FENCE_LANGS.has(b.lang)) fence.findings.push(`line ${b.line}: \`\`\`${b.lang} block`);
   }
@@ -241,7 +255,18 @@ function main(argv) {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// Compare real paths: a symlinked checkout or a differently-cased Windows path
+// must still run main(), never exit 0 having checked nothing.
+function isMain() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
   try {
     main(process.argv.slice(2));
   } catch (err) {
