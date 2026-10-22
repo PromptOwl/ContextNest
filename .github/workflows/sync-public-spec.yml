@@ -1,0 +1,290 @@
+# Keeps the public spec repo (PromptOwl/context-nest-spec, Apache-2.0) in
+# step with CONTEXT_NEST_SPEC.md on this repo's `main`. See docs/spec-sync.md.
+#
+#   sync  — on push to main (or manual run): transform the spec, run the
+#           licence & leak guard, and open/update ONE PR on context-nest-spec
+#           from branch sync/contextnest-spec. Never merges.
+#   drift — weekly (or manual run): fail red if ContextNest main, after the
+#           transform, differs from context-nest-spec main.
+#
+# Security: workflow token is read-only. The only cross-repo write uses the
+# SPEC_SYNC_TOKEN secret, scoped to context-nest-spec alone. No
+# pull_request_target; no event text is interpolated into shell — values
+# reach `run:` through env vars.
+
+name: Sync public spec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - CONTEXT_NEST_SPEC.md
+      - LICENSE-SPEC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sync = open/update the PR on context-nest-spec; drift = compare the two published files"
+        type: choice
+        options: [sync, drift]
+        default: sync
+  schedule:
+    # Mondays 09:17 UTC
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  SPEC_REPO: PromptOwl/context-nest-spec
+  SPEC_FILE: CONTEXT_NEST_SPEC.md
+  SYNC_BRANCH: sync/contextnest-spec
+
+jobs:
+  sync:
+    name: Sync spec to context-nest-spec
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Serialize syncs: a second push waits for the first instead of racing it
+    # on the same branch/PR.
+    concurrency:
+      group: sync-public-spec
+      cancel-in-progress: false
+
+    steps:
+      - name: Require SPEC_SYNC_TOKEN
+        env:
+          SPEC_SYNC_TOKEN: ${{ secrets.SPEC_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SPEC_SYNC_TOKEN" ]; then
+            echo "::error title=SPEC_SYNC_TOKEN is not set::Create the repository secret SPEC_SYNC_TOKEN (fine-grained token for PromptOwl/context-nest-spec only: Contents read/write + Pull requests read/write). See docs/spec-sync.md."
+            {
+              echo "## Sync public spec"
+              echo ""
+              echo "**Failed:** secret \`SPEC_SYNC_TOKEN\` is not set. See \`docs/spec-sync.md\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Checkout ContextNest
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # A push syncs the commit that was pushed; a manual run syncs main.
+          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
+          persist-credentials: false
+          path: contextnest
+
+      - name: Test the transform and the guard
+        working-directory: contextnest
+        run: node --test scripts/spec-sync/transform-spec.test.mjs scripts/spec-sync/guard-spec.test.mjs
+
+      - name: Transform the spec and run the licence & leak guard
+        id: prep
+        working-directory: contextnest
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/public"
+          mkdir -p "$out"
+          node scripts/spec-sync/transform-spec.mjs "$SPEC_FILE" "$out/$SPEC_FILE"
+          version=$(node scripts/spec-sync/transform-spec.mjs --version "$SPEC_FILE")
+          sha=$(git rev-parse HEAD)
+          guard=0
+          node scripts/spec-sync/guard-spec.mjs "$out/$SPEC_FILE" --code-root . --report "$out/guard.md" || guard=$?
+          {
+            echo "## Sync public spec"
+            echo ""
+            echo "- Source: [\`PromptOwl/ContextNest@${sha:0:7}\`](https://github.com/PromptOwl/ContextNest/commit/$sha)"
+            echo "- Spec version: \`$version\`"
+            echo ""
+            echo "### Licence & leak guard"
+            echo ""
+            cat "$out/guard.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$guard" -ne 0 ]; then
+            echo "::error title=Licence & leak guard failed::Nothing was pushed. See the job summary for findings."
+            exit 1
+          fi
+          {
+            echo "public_spec=$out/$SPEC_FILE"
+            echo "guard_report=$out/guard.md"
+            echo "version=$version"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout context-nest-spec
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SPEC_REPO }}
+          ref: main
+          token: ${{ secrets.SPEC_SYNC_TOKEN }}
+          path: spec-repo
+
+      - name: Open or update the sync PR
+        working-directory: spec-repo
+        env:
+          GH_TOKEN: ${{ secrets.SPEC_SYNC_TOKEN }}
+          PUBLIC_SPEC: ${{ steps.prep.outputs.public_spec }}
+          GUARD_REPORT: ${{ steps.prep.outputs.guard_report }}
+          VERSION: ${{ steps.prep.outputs.version }}
+          SOURCE_SHA: ${{ steps.prep.outputs.sha }}
+        run: |
+          set -euo pipefail
+          short=${SOURCE_SHA:0:7}
+          source_url="https://github.com/PromptOwl/ContextNest/commit/$SOURCE_SHA"
+          old_version=$(node ../contextnest/scripts/spec-sync/transform-spec.mjs --version "$SPEC_FILE" 2>/dev/null || echo "none")
+          existing=$(gh pr list --repo "$SPEC_REPO" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          cp "$PUBLIC_SPEC" "$SPEC_FILE"
+
+          # Path allowlist: the sync writes exactly one file, nothing else.
+          status=$(git status --porcelain --untracked-files=all)
+          if [ -z "$status" ]; then
+            echo "context-nest-spec main already matches ContextNest@$short."
+            if [ -n "$existing" ]; then
+              gh pr close "$existing" --repo "$SPEC_REPO" --delete-branch \
+                --comment "Closing: \`main\` already matches ContextNest@$short ($source_url)."
+              closed="(closed obsolete sync PR #$existing)"
+            fi
+            {
+              echo "- Diff: no changes ${closed:-}"
+              echo "- PR: no changes"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$status" != " M $SPEC_FILE" ] && [ "$status" != "?? $SPEC_FILE" ]; then
+            echo "::error title=Path allowlist violated::Only $SPEC_FILE may change in $SPEC_REPO. git status:"
+            echo "$status"
+            exit 1
+          fi
+
+          read -r added removed _ < <(git diff --numstat -- "$SPEC_FILE" || true)
+          if [ -z "${added:-}" ]; then added=$(wc -l < "$SPEC_FILE"); removed=0; fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$SYNC_BRANCH"
+          git add -- "$SPEC_FILE"
+          title="Sync spec from ContextNest@$short (spec v$VERSION)"
+          git commit -q -m "$title" -m "Source: $source_url"
+          touched=$(git diff-tree --no-commit-id --name-only -r HEAD)
+          if [ "$touched" != "$SPEC_FILE" ]; then
+            echo "::error title=Path allowlist violated::The sync commit touches: $touched"
+            exit 1
+          fi
+          git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
+
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            echo "Automated sync of \`$SPEC_FILE\` from PromptOwl/ContextNest \`main\`."
+            echo ""
+            echo "- Source commit: [\`ContextNest@$short\`]($source_url)"
+            echo "- Spec version: \`$VERSION\` (main here: \`$old_version\`)"
+            echo "- Diff: +$added / -$removed lines"
+            echo ""
+            echo "The only rewrite is the licence line (this repo's \`LICENSE\` is Apache-2.0 and links back to the AGPL-3.0 reference implementation). This repo keeps its own \`LICENSE\`; the sync never touches any other file."
+            echo ""
+            if [ "$VERSION" != "$old_version" ]; then
+              echo "**After merge:** the spec version changed ($old_version -> $VERSION). Tag the merge commit \`v$VERSION\` and publish a release."
+            else
+              echo "After merge: the spec version is unchanged (\`$VERSION\`), so no new tag is needed."
+            fi
+            echo ""
+            echo "## Licence & leak guard: passed"
+            echo ""
+            cat "$GUARD_REPORT"
+            echo ""
+            echo "This PR is never merged automatically. Review it, then merge by hand."
+          } > "$body"
+
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "$SPEC_REPO" --title "$title" --body-file "$body"
+            pr_url=$(gh pr view "$existing" --repo "$SPEC_REPO" --json url --jq .url)
+          else
+            pr_url=$(gh pr create --repo "$SPEC_REPO" --base main --head "$SYNC_BRANCH" --title "$title" --body-file "$body")
+          fi
+          echo "Sync PR: $pr_url"
+          {
+            echo "- Diff: +$added / -$removed lines"
+            echo "- PR: $pr_url"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  drift:
+    name: Drift check (ContextNest main vs context-nest-spec main)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'drift')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout ContextNest main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Compare the published files
+        env:
+          # Read-only: context-nest-spec is public.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/drift"
+          mkdir -p "$out"
+          node scripts/spec-sync/transform-spec.mjs "$SPEC_FILE" "$out/expected.md"
+          gh api -H "Accept: application/vnd.github.raw" "repos/$SPEC_REPO/contents/$SPEC_FILE?ref=main" > "$out/published.md"
+          sha=$(git rev-parse HEAD)
+          version=$(node scripts/spec-sync/transform-spec.mjs --version "$SPEC_FILE")
+          published_version=$(node scripts/spec-sync/transform-spec.mjs --version "$out/published.md" 2>/dev/null || echo "unknown")
+          fail=0
+
+          guard_src=0; guard_pub=0
+          node scripts/spec-sync/guard-spec.mjs "$out/expected.md" --code-root . --report "$out/guard-src.md" || guard_src=$?
+          node scripts/spec-sync/guard-spec.mjs "$out/published.md" --code-root . --report "$out/guard-pub.md" || guard_pub=$?
+
+          diff -u --label "context-nest-spec@main" --label "ContextNest@${sha:0:7} (transformed)" \
+            "$out/published.md" "$out/expected.md" > "$out/spec.diff" || true
+          added=0; removed=0
+          if [ -s "$out/spec.diff" ]; then
+            read -r added removed _ < <(git diff --no-index --numstat "$out/published.md" "$out/expected.md" || true)
+          fi
+          open_pr=$(gh pr list --repo "$SPEC_REPO" --head "$SYNC_BRANCH" --state open --json url --jq '.[0].url // empty')
+
+          {
+            echo "## Spec drift check"
+            echo ""
+            echo "- ContextNest main: [\`${sha:0:7}\`](https://github.com/PromptOwl/ContextNest/commit/$sha), spec \`v$version\`"
+            echo "- context-nest-spec main: spec \`v$published_version\`"
+            echo "- Open sync PR: ${open_pr:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -s "$out/spec.diff" ]; then
+            fail=1
+            echo "::error title=Spec drift::context-nest-spec main differs from ContextNest main (+$added / -$removed lines). Merge the sync PR or run this workflow with mode=sync."
+            {
+              echo "- **Result: DRIFT** (+$added / -$removed lines)"
+              echo ""
+              echo "<details><summary>Diff (first 200 lines)</summary>"
+              echo ""
+              echo '```diff'
+              head -n 200 "$out/spec.diff"
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Result: in sync**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo ""
+            echo "### Licence & leak guard — ContextNest main (transformed)"
+            echo ""
+            cat "$out/guard-src.md"
+            echo ""
+            echo "### Licence & leak guard — context-nest-spec main"
+            echo ""
+            cat "$out/guard-pub.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$guard_src" -ne 0 ] || [ "$guard_pub" -ne 0 ]; then
+            fail=1
+            echo "::error title=Licence & leak guard failed::See the job summary for findings."
+          fi
+          exit "$fail"
