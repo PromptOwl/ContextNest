@@ -17,6 +17,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/core/retrieve.js\"",
+            "timeout": 20,
             "statusMessage": "Searching Context Nest vault..."
           }
         ]

@@ -88,7 +88,7 @@ Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate
 
 Each `core/*.js` module exports a **pure** `run({ input, env, exec })` returning the hook-output object (or `null` to do nothing), plus a thin IO shell guarded by `isMain(import.meta.url)`. Tests call `run()` with a fake `exec` — no subprocess. Zero runtime deps, plain Node ESM.
 
-Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `CAPTURE_MODE` (`off`/`propose`/`auto`, default `propose`), `UNCLEAR_NEST` (`ask`/`default`, default `ask` — what capture does when no nest clearly fits a new note), `VAULT` (pinned alias; may be `<server>/<nest>`), `CTX_COMMAND` (default `ctx`). `AUTO_CAPTURE` is deprecated but still read (`true`→`propose`, `false`→`off`); an explicit `CAPTURE_MODE` wins at any layer.
+Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (so non-Claude agents can feed the same values): `RETRIEVAL_MODE` (`off`/`search`/`query`/`agent`, default `search`), `CAPTURE_MODE` (`off`/`explicit`/`propose`/`auto`, default `explicit` — only user asks, corrections and update sweeps gate; `propose` adds the ambient review), `UNCLEAR_NEST` (`ask`/`default`, default `ask` — what capture does when no nest clearly fits a new note), `VAULT` (pinned alias; may be `<server>/<nest>`), `CTX_COMMAND` (default `ctx`). `AUTO_CAPTURE` is deprecated but still read (`true`→`propose`, `false`→`off`); an explicit `CAPTURE_MODE` wins at any layer.
 
 **Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
 
@@ -109,6 +109,13 @@ Hooks: `SessionStart` → vault overview injection (plus a compact blueprint of 
 **URI scheme**: `contextnest://path`, `@N` (pinned to checkpoint N), `#section`.
 
 **Version model**: keyframe + diff (keyframe every 10 versions by default), SHA-256 hash-chained for both document versions and nest checkpoints.
+
+## Pull requests
+
+Every PR — human- or AI-authored — must have both of these, or the Claude review marks it 🔴 blocking (full rules in `REVIEW.md`):
+
+1. **ClickUp ticket** referenced in the title, body or branch name (`CU-<id>`, `[CU-<id>]`, `#<id>`, or an `app.clickup.com/t/<id>` link). If you don't know the ticket, ask — don't open the PR without it.
+2. **Steps to test** section in the body: numbered steps a tester can follow from the user's perspective — where to go or what to run, what to do, what they should see. "Unit tests pass" is not test steps. Use `N/A — no user-facing change` plus a reason only for docs/CI/chore PRs.
 
 ## Releasing
 

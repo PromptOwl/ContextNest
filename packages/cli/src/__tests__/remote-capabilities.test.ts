@@ -54,6 +54,7 @@ vi.mock("@promptowl/contextnest-engine", async (importOriginal) => {
             throw new ContextNestError(`Tool ${op} not found`, "INTERNAL");
           }
           if (replies[op] instanceof Error) throw replies[op];
+          if (typeof replies[op] === "function") return (replies[op] as (i: typeof input) => unknown)(input);
           if (op === "nest_index" && token && nestsByToken[token]) return nestsByToken[token];
           return replies[op];
         },
@@ -294,6 +295,115 @@ describe("remoteUpdate / remoteMove", () => {
     expect(calls).toEqual([{ op: "context_move", input: { id: "nodes/a", folder: "archive" } }]);
     expect(plain()).toContain("nodes/a → nodes/archive/a");
     expect(closed).toBe(opened);
+  });
+});
+
+describe("existing-document ids on a remote nest (CU-wdqcq046wd)", () => {
+  const doc = { id: "my-node", frontmatter: { title: "My Node" }, body: "Flat body", raw: "raw bytes" };
+
+  it("sends a bare id as typed, so a flat-layout nest finds its root-level node", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: doc };
+    await remoteRead(target, "my-node.md", { raw: true });
+    expect(calls).toEqual([{ op: "context_get", input: { id: "my-node", include_raw: true } }]);
+  });
+
+  it("reduces a contextnest:// URI to its path", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: doc };
+    await remoteRead(target, "contextnest://my-node", { raw: true });
+    expect(calls[0].input.id).toBe("my-node");
+  });
+
+  it("retries a bare id under nodes/ once on a nest that does not resolve it itself", async () => {
+    advertised = new Set(["context_delete"]);
+    replies = {
+      context_delete: (input: { id: string }) => {
+        if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+        return { id: "nodes/a", deleted: true };
+      },
+    };
+    configureSafety({ yes: true }); // delete is destructive: no prompt in tests
+    await remoteDelete(target, "a");
+    expect(calls.map((c) => c.input.id)).toEqual(["a", "nodes/a"]);
+    expect(plain()).toContain("Deleted nodes/a");
+  });
+
+  it("retries with the op's other fields intact (update)", async () => {
+    advertised = new Set(["context_update"]);
+    replies = {
+      context_update: (input: { id: string }) => {
+        if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+        return { id: "nodes/a", version: 2, status: "published" };
+      },
+    };
+    await remoteUpdate(target, "a", { tags: "keep" });
+    expect(calls.map((c) => c.input)).toEqual([
+      { id: "a", tags: ["#keep"] },
+      { id: "nodes/a", tags: ["#keep"] },
+    ]);
+  });
+
+  /** A nest that only knows `nodes/a`, the way an engine before #183 answers a bare id. */
+  const onlyNodesA = (reply: unknown) => (input: { id: string }) => {
+    if (input.id !== "nodes/a") throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+    return reply;
+  };
+
+  it("retries publish, move and the submit-for-review lookup the same way", async () => {
+    advertised = new Set(["context_publish", "context_move"]);
+    replies = {
+      context_publish: onlyNodesA({ id: "nodes/a", version: 2, checkpoint: 3 }),
+      context_move: onlyNodesA({ id: "nodes/x/a", previous_id: "nodes/a" }),
+    };
+    await remotePublish(target, "a");
+    await remoteMove(target, "a", "x");
+    expect(calls.map((c) => c.input)).toEqual([
+      { id: "a" },
+      { id: "nodes/a" },
+      { id: "a", folder: "x" },
+      { id: "nodes/a", folder: "x" },
+    ]);
+
+    calls = [];
+    advertised = new Set(["context_get", "context_submit_review"]);
+    replies = {
+      context_get: onlyNodesA({ id: "nodes/a", frontmatter: { title: "A" }, body: "" }),
+      context_submit_review: { submitted: true },
+    };
+    await remotePublish(target, "a");
+    expect(calls.map((c) => [c.op, c.input])).toEqual([
+      ["context_get", { id: "a" }],
+      ["context_get", { id: "nodes/a" }],
+      ["context_submit_review", { title: "A" }],
+    ]);
+  });
+
+  it("missing under nodes/ too: reports the id the user typed, not the retried one", async () => {
+    advertised = new Set(["context_get"]);
+    replies = {
+      context_get: (input: { id: string }) => {
+        throw new ContextNestError(`Document not found: ${input.id}`, "DOCUMENT_NOT_FOUND");
+      },
+    };
+    await expect(remoteRead(target, "ghost", {})).rejects.toThrow("Document not found: ghost");
+    expect(calls.map((c) => c.input.id)).toEqual(["ghost", "nodes/ghost"]);
+  });
+
+  it("refuses a URI pinned to a checkpoint instead of acting on the live document", async () => {
+    advertised = new Set(["context_get"]);
+    const err = await remoteRead(target, "contextnest://my-node@3", {}).catch((e) => e);
+    expect((err as ContextNestError).code).toBe("VALIDATION_FAILED");
+    expect(calls).toEqual([]);
+  });
+
+  it("does not retry an id that already names a folder, nor on any other error", async () => {
+    advertised = new Set(["context_get"]);
+    replies = { context_get: new ContextNestError("Document not found: x/a", "DOCUMENT_NOT_FOUND") };
+    await expect(remoteRead(target, "x/a", {})).rejects.toThrow(/not found/);
+    replies = { context_get: new ContextNestError("boom", "INTERNAL") };
+    await expect(remoteRead(target, "a", {})).rejects.toThrow(/boom/);
+    expect(calls.map((c) => c.input.id)).toEqual(["x/a", "a"]);
   });
 });
 

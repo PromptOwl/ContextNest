@@ -2,6 +2,7 @@
  * contextnest-cli — Command-line tool for Context Nest vault operations.
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import pathMod from "node:path";
@@ -89,6 +90,7 @@ import {
   remoteSearch,
   remoteEmbed,
   remoteRead,
+  bodyOnly,
   remoteVerify,
   remoteHistory,
   remoteAdd,
@@ -119,6 +121,7 @@ import {
   printSearchResults,
   type SearchHitView,
   titleFromId,
+  documentId,
   parseTagsOption,
   printStructure,
   type StructureOutput,
@@ -138,6 +141,7 @@ import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
 import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
+import { choicesToCommand, setupBaseUrl, waitForChoices } from "./setup.js";
 import { telemetryConsent } from "./telemetry/index.js";
 import { loadCloudToken } from "./credentials.js";
 import {
@@ -263,6 +267,7 @@ const HELP_GROUPS: { title: string; commands: [name: string, blurb: string][] }[
   {
     title: "Set up a vault",
     commands: [
+      ["setup", "Pick vault options and agent connect steps on a web page, then create a local vault or connect a cloud nest"],
       ["init", "Create a new vault here (try --starter for a ready-made template)"],
       ["vault", "Manage named vaults so you can switch with --vault <alias>"],
       ["welcome", "Open the vault's welcome page in your browser"],
@@ -704,6 +709,22 @@ function opContext(
     actor,
     onProgress,
   };
+}
+
+/**
+ * The document an irreversible command will act on, as the engine resolves
+ * it, so the confirm prompt names the file at risk: a bare `foo` can be the
+ * vault-root `foo.md` or `nodes/foo.md`. context_versions resolves without
+ * parsing a document that has history, so this refuses nothing the command
+ * itself would not.
+ */
+async function resolvedDocumentId(storage: NestStorage, path: string): Promise<string> {
+  const { id } = await cliApi().run<{ id: string }>(
+    "context_versions",
+    { id: documentId(path) },
+    opContext(storage, "cli@contextnest.local"),
+  );
+  return id;
 }
 
 // Interactively prompt the user to pick a starter recipe using an arrow-key
@@ -1251,6 +1272,10 @@ program
   // --list-starters (it did: `personal` was missing for a release).
   .option("-s, --starter <recipe>", `Starter recipe: ${listStarters().map((s) => s.id).join(", ")}`)
   .option("--list-starters", "List available starter recipes")
+  .option(
+    "--tools <ids>",
+    "With --starter: agent config files to write, comma-separated (claude, cursor, windsurf, copilot, gemini) or none",
+  )
   .option("--set-default", "Make the new vault the registry default")
   .option(
     "--register",
@@ -1435,7 +1460,16 @@ program
       // so re-check the TTY independently here.
       let agentTools: string[] | undefined;
       const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
-      if (isTty) {
+      if (typeof opts.tools === "string") {
+        const known = detectAgentTools(root).map((t) => t.id);
+        const picked: string[] = opts.tools === "none" ? [] : opts.tools.split(",").map((t: string) => t.trim()).filter(Boolean);
+        const unknown = picked.filter((t) => !known.includes(t));
+        if (unknown.length) {
+          console.log(chalk.red(`Unknown tool: ${unknown.join(", ")}. Known: ${known.join(", ")}, none`));
+          process.exit(1);
+        }
+        agentTools = picked;
+      } else if (isTty) {
         agentTools = await promptToolSelection(detectAgentTools(root));
         if (agentTools.length === 0) {
           console.log(chalk.dim("  No tools selected — no agent config files will be written."));
@@ -1461,6 +1495,7 @@ program
   .option("--html", "Render as styled HTML and open in browser")
   .option("--out <file>", "Save HTML to file instead of opening in browser (requires --html)")
   .option("--raw", "Output raw file content (frontmatter + body)")
+  .option("--body", "Output the body only — what `update --body-file` takes back")
   .action(async (path, opts) => {
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
@@ -1468,7 +1503,7 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    const id = documentId(path);
     // allow_rejected: `ctx read` has always shown a retired document — reading
     // one is not republishing it, and refusing would hide it from the person
     // deciding whether to revive it.
@@ -1497,6 +1532,12 @@ program
       // script piping --raw still sees it without corrupting the payload.
       if (got.integrity) console.error(chalk.red(got.integrity.warning));
       console.log(doc.rawContent);
+      return;
+    }
+
+    if (opts.body) {
+      if (got.integrity) console.error(chalk.red(got.integrity.warning));
+      console.log(bodyOnly(doc.body));
       return;
     }
 
@@ -1696,6 +1737,20 @@ skillCmd
 
 // ─── ctx add ───────────────────────────────────────────────────────────────────
 
+/**
+ * `--body-file <path|->`: read the body from a file or stdin into `opts.body`,
+ * so agents can pass newlines, quotes and `$` without shell escaping (an
+ * escaped `\n` inside a quoted `--body` lands in the vault as a literal `\n`).
+ */
+function readBodyFile(opts: { body?: string; bodyFile?: string }): void {
+  if (opts.bodyFile === undefined) return;
+  if (opts.body !== undefined) {
+    throw new ContextNestError("Pass --body or --body-file, not both.", "VALIDATION_FAILED");
+  }
+  // One trailing newline is what a heredoc or an editor adds; --body has none.
+  opts.body = fs.readFileSync(opts.bodyFile === "-" ? 0 : opts.bodyFile, "utf-8").replace(/\r?\n$/, "");
+}
+
 program
   .command("add <path>")
   .description("Create a new document with frontmatter template")
@@ -1703,9 +1758,11 @@ program
   .option("--title <title>", "Document title")
   .option("--tags <tags>", "Tags (comma- or space-separated)")
   .option("--body <body>", "Markdown body content")
+  .option("--body-file <file>", "Read the body from a file, or - for stdin (no shell escaping)")
   .option("--trigger <trigger>", "Skill trigger description (for --type skill)")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .action(async (path, opts) => {
+    readBodyFile(opts);
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteAdd(remote, path, opts);
@@ -2064,7 +2121,7 @@ program
       process.exit(1);
     }
 
-    await confirmOrExit(`Publish ${normalizeDocumentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
+    await confirmOrExit(`Publish ${documentId(path)} — cuts a new version and seals a checkpoint. Continue?`);
 
     const result = await cliApi().run<{
       id: string;
@@ -2074,7 +2131,7 @@ program
     }>(
       "context_publish",
       {
-        id: normalizeDocumentId(path),
+        id: documentId(path),
         ...(opts.message ? { note: opts.message } : {}),
       },
       opContext(storage, opts.author),
@@ -2145,7 +2202,7 @@ program
       return;
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    const id = documentId(path);
     const history = await cliApi().run<{
       id: string;
       keyframe_interval: number;
@@ -2212,7 +2269,7 @@ program
       integrity?: IntegrityFailure;
     }>(
       "context_reconstruct",
-      { id: normalizeDocumentId(path), version: parseInt(version, 10) },
+      { id: documentId(path), version: parseInt(version, 10) },
       opContext(storage, "cli@contextnest.local"),
     );
     // stderr, like `read --raw`: stdout stays the reconstructed bytes.
@@ -2786,12 +2843,22 @@ program
   .option("--tags <tags>", 'New tags (comma- or space-separated, replaces existing; --tags "" removes them all)')
   .option("--status <status>", "New status (draft|pending_review|approved|published|rejected; aliases accepted)")
   .option("--body <body>", "New markdown body content")
+  .option("--body-file <file>", "Read the new body from a file, or - for stdin (no shell escaping)")
   .option("--publish", "Publish now even when the vault's review gate is on (review: on holds the write)")
   .option("--assignee <email>", 'Remote nest: assign to someone on its roster ("" or none unassigns)')
   .option("--due <date>", 'Remote nest: due date YYYY-MM-DD ("" or none clears)')
   .option("--priority <p>", 'Remote nest: urgent|high|medium|low ("" or none clears)')
   .option("--parent <id>", 'Remote nest: parent node id, making this a sub-item ("" or none clears)')
   .action(async (path, opts) => {
+    readBodyFile(opts);
+    // An empty body is what a failed read-modify-write looks like (a strip
+    // that matched nothing), and it would replace the whole document.
+    if (opts.body !== undefined && opts.body.trim() === "" && !isForce()) {
+      throw new ContextNestError(
+        "Refusing to replace the body with an empty one — pass --force if you mean to clear it.",
+        "VALIDATION_FAILED",
+      );
+    }
     const remote = remoteTarget(selectedVaultAlias);
     if (remote) {
       await remoteUpdate(remote, path, opts);
@@ -2808,7 +2875,7 @@ program
     const status = opts.status !== undefined ? normalizeStatus(opts.status) : undefined;
 
     await confirmOrExit(
-      `Rewrite ${normalizeDocumentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
+      `Rewrite ${documentId(path)} in ${realRootPath() ?? storage.root}? The previous content stays recoverable from version history.`,
     );
 
     // The gate only concerns writes that would publish: a lifecycle transition
@@ -2827,7 +2894,7 @@ program
     }>(
       "context_update",
       {
-        id: normalizeDocumentId(path),
+        id: documentId(path),
         ...(opts.title !== undefined ? { title: opts.title } : {}),
         // A held write settles its own status (pending_review, or a staged
         // edit); an explicit `published` would contradict the hold.
@@ -2915,15 +2982,16 @@ program
       return;
     }
     const storage = getStorage();
+    const id = await resolvedDocumentId(storage, path);
     await confirmOrExit(
-      `Delete ${normalizeDocumentId(path)} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
+      `Delete ${id} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
         (opts.purge ? " --purge leaves no audit record." : ""),
       { destructive: true },
     );
     const result = await cliApi().run<{ id: string; title: string; tombstoned?: boolean }>(
       "context_delete",
       {
-        id: normalizeDocumentId(path),
+        id,
         reason_code: opts.reason,
         ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
         ...(opts.purge ? { purge: true } : {}),
@@ -2978,7 +3046,7 @@ Example:
       throw new ContextNestError(`ctx forget works against a local vault only for now.`, "NOT_IMPLEMENTED");
     }
     const storage = getStorage();
-    const id = normalizeDocumentId(path);
+    const id = await resolvedDocumentId(storage, path);
     await confirmOrExit(
       `Forget ${id}? Its content is erased from history for good (hashes are kept, so verify still passes). This cannot be undone.`,
       { destructive: true },
@@ -3032,7 +3100,7 @@ program
       }>;
     }>(
       "context_forget_log",
-      path ? { id: normalizeDocumentId(path) } : {},
+      path ? { id: documentId(path) } : {},
       opContext(storage, "cli@contextnest.local"),
     );
     if (opts.json) {
@@ -3542,6 +3610,46 @@ enrichCmd
   });
 
 // ─── ctx welcome ──────────────────────────────────────────────────────────────
+
+// ─── ctx setup ─────────────────────────────────────────────────────────────────
+
+program
+  .command("setup")
+  .description("Pick vault options on a web page, then create the vault here (ctx init) or sign in to a cloud nest (ctx login)")
+  .option("--no-open", "Print the page URL instead of opening a browser")
+  .addHelpText(
+    "after",
+    "\nThe page is https://nest.promptowl.ai/setup by default. Set CONTEXTNEST_SETUP_URL to use another server.",
+  )
+  .action(async (opts: { open: boolean }) => {
+    const base = setupBaseUrl();
+    const tools = detectAgentTools(process.cwd());
+    const choices = await waitForChoices(
+      base,
+      (url) => {
+        console.log(chalk.bold("\n  Choose your vault options in the browser:"));
+        console.log(`  ${chalk.cyan(url)}\n`);
+        console.log(chalk.dim("  Waiting for the page (Ctrl+C to cancel)…"));
+        if (opts.open) openUrlInBrowser(url);
+      },
+      { detected: tools.filter((t) => t.detected).map((t) => t.id) },
+    );
+    const { command, args } = choicesToCommand(
+      choices,
+      listStarters().map((s) => s.id),
+      tools.map((t) => t.id),
+    );
+    console.log(chalk.green("\n  Received. Running:"), chalk.cyan(`ctx ${command} ${args.join(" ")}`));
+    // A child process, not a re-parse: init's and login's prompts, exits and
+    // registry hooks all assume they own the process.
+    const child = spawnSync(process.execPath, [...process.execArgv, process.argv[1]!, command, ...args], {
+      stdio: "inherit",
+    });
+    if (child.status === 0) {
+      console.log(chalk.dim(`\n  Next: connect your agent — the steps are on the page (${base}/setup?done=1).`));
+    }
+    process.exitCode = child.status ?? 1;
+  });
 
 program
   .command("welcome")

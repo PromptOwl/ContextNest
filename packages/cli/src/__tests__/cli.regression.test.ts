@@ -26,7 +26,7 @@ import {
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -432,6 +432,87 @@ describe("[regression] ctx read", () => {
   });
 });
 
+describe("[regression] ctx read/history/update in an Obsidian (flat) vault", () => {
+  beforeEach(() => {
+    execFileSync("node", [distPath, "init", "--name", "regression-vault", "--layout", "obsidian"], {
+      cwd: tmp,
+      env: ENV,
+      stdio: "ignore",
+    });
+    reviewOff(tmp);
+    writeFileSync(join(tmp, "my-node.md"), "---\ntitle: My Node\n---\n\nFlat body\n", "utf-8");
+    runCtx(tmp, ["index"]);
+  });
+
+  it("opens a root-level node by id, file name and URI — never re-rooted under nodes/", () => {
+    // Regression (CU-wdqcq046wd): read prefixed every bare id with nodes/, so
+    // every node in a flat vault was DOCUMENT_NOT_FOUND: nodes/<id>.
+    for (const ref of ["my-node", "my-node.md", "contextnest://my-node"]) {
+      const out = runCtx(tmp, ["read", ref]);
+      expect(out).toMatch(/My Node/);
+      expect(out).toMatch(/Flat body/);
+    }
+  });
+
+  it("history and update reach the same root-level node", () => {
+    runCtx(tmp, ["update", "my-node", "--body", "Edited body"]);
+    expect(readFileSync(join(tmp, "my-node.md"), "utf-8")).toMatch(/Edited body/);
+    expect(existsSync(join(tmp, "nodes"))).toBe(false);
+    expect(runCtx(tmp, ["history", "my-node"])).toMatch(/my-node/);
+  });
+
+  it("delete removes the root-level node it names", () => {
+    runCtx(tmp, ["delete", "my-node", "--yes"]);
+    expect(existsSync(join(tmp, "my-node.md"))).toBe(false);
+  });
+
+  it("forget erases the root-level node it names, and the prompt names it", () => {
+    runCtx(tmp, ["publish", "my-node", "--yes"]);
+    expect(runCtx(tmp, ["forget", "my-node", "--reason", "user_request", "--yes"])).toMatch(/Forgot my-node/);
+  });
+
+  it("publish reaches the root-level node", () => {
+    expect(runCtx(tmp, ["publish", "my-node", "--yes"])).toMatch(/Published my-node/);
+  });
+
+  it("an id that climbs out of the vault is still refused, and nothing outside is touched", () => {
+    // normalizeDocumentId was not the traversal guard: the engine refuses it.
+    const outside = join(tmp, "..", `cn-outside-${process.pid}.md`);
+    writeFileSync(outside, "---\ntitle: Outside\n---\n\nkeep\n", "utf-8");
+    try {
+      const res = runCtxResult(tmp, ["delete", `../${basename(outside, ".md")}`, "--yes"]);
+      expect(res.status).not.toBe(0);
+      expect(existsSync(outside)).toBe(true);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+});
+
+describe("[regression] bare id in a structured vault holding both <id>.md and nodes/<id>.md", () => {
+  beforeEach(() => initVault(tmp));
+
+  it("resolves to the root-level document, as MCP context_* clients already do", () => {
+    runCtx(tmp, ["add", "nodes/twin", "--title", "Nested Twin", "--body", "nested"]);
+    writeFileSync(join(tmp, "twin.md"), "---\ntitle: Root Twin\n---\n\nroot\n", "utf-8");
+    runCtx(tmp, ["index"]);
+    expect(runCtx(tmp, ["read", "twin"])).toMatch(/Root Twin/);
+    expect(runCtx(tmp, ["read", "nodes/twin"])).toMatch(/Nested Twin/);
+  });
+
+  it("delete names the file it resolved before removing it, and leaves the other", () => {
+    runCtx(tmp, ["add", "nodes/twin", "--title", "Nested Twin", "--body", "nested"]);
+    writeFileSync(join(tmp, "twin.md"), "---\ntitle: Root Twin\n---\n\nroot\n", "utf-8");
+    runCtx(tmp, ["index"]);
+    // Resolved before the prompt: the id it names is the one deleted.
+    const res = runCtxResult(tmp, ["delete", "twin", "--yes"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Deleted twin \(Root Twin\)/);
+    expect(existsSync(join(tmp, "twin.md"))).toBe(false);
+    expect(existsSync(join(tmp, "nodes", "twin.md"))).toBe(true);
+  });
+});
+
 // ─── list ────────────────────────────────────────────────────────────────────
 
 describe("[regression] ctx list", () => {
@@ -755,6 +836,34 @@ describe("[regression] ctx update", () => {
 
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
     expect(onDisk).toMatch(/Revised body/);
+  });
+
+  it("--body-file - takes the body from stdin, and read --body round-trips it unchanged", () => {
+    const body = 'Line with "quotes", $HOME and `ticks`\r\n\nSecond paragraph';
+    const pipe = (args: string[], input?: string) =>
+      execFileSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    pipe(["update", "nodes/mutable", "--body-file", "-"], `${body}\n`);
+    const first = pipe(["read", "nodes/mutable", "--body"]);
+    expect(first).toContain('"quotes", $HOME and `ticks`');
+    expect(first).toContain("Second paragraph");
+    // Two read → update cycles must not grow or alter the body.
+    pipe(["update", "nodes/mutable", "--body-file", "-"], first);
+    pipe(["update", "nodes/mutable", "--body-file", "-"], pipe(["read", "nodes/mutable", "--body"]));
+    expect(pipe(["read", "nodes/mutable", "--body"])).toBe(first);
+  });
+
+  it("refuses an empty body unless --force, and --body with --body-file", () => {
+    const run = (args: string[], input?: string) =>
+      spawnSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    for (const r of [
+      run(["update", "nodes/mutable", "--body", ""]),
+      run(["update", "nodes/mutable", "--body-file", "-"], "\n"),
+    ]) {
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/empty one/);
+    }
+    expect(run(["update", "nodes/mutable", "--body", "x", "--body-file", "-"], "y").stderr).toMatch(/not both/);
+    expect(run(["update", "nodes/mutable", "--body", "", "--force"]).status).toBe(0);
   });
 
   it("a title change is persisted to the frontmatter", () => {

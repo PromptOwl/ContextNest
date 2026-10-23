@@ -1,0 +1,585 @@
+/**
+ * Context Nest plugin — shared core helpers.
+ *
+ * Agent-agnostic. Nothing here imports a Claude-specific API; every module in
+ * this directory only reads stdin JSON + environment variables and shells out
+ * to the `ctx` CLI. That keeps the same files reusable byte-for-byte by future
+ * Codex / Gemini adapters.
+ *
+ * SINGLE SOURCE OF TRUTH: this file lives at plugins/shared/core/ and is
+ * vendored into each agent plugin's core/ directory by scripts/sync-plugins.mjs.
+ * Edit it here, then run `pnpm plugins:sync`.
+ */
+
+import { execFileSync } from "node:child_process";
+import { readFileSync, realpathSync } from "node:fs";
+import { homedir as osHomedir, tmpdir as osTmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
+
+/** Windows needs shell-based spawning for npm's .cmd shims — see makeExec. */
+const WIN32 = process.platform === "win32";
+
+/**
+ * Quote one argv entry for cmd.exe, which passes the command line through
+ * verbatim. Backslash runs before a quote (and before the closing quote) are
+ * doubled, per the Windows argv parsing rules.
+ * ponytail: `%VAR%` inside a quoted arg still expands; no cmd.exe escape for it.
+ */
+export function winQuote(s) {
+  const str = String(s);
+  if (str !== "" && !/[\s"^&|<>()%!]/.test(str)) return str;
+  return `"${str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+}
+
+/** Default per-call `ctx` timeout for hooks, in ms (0 disables). See makeExec. */
+export const CTX_TIMEOUT_MS = 8000;
+/** Default cap on how many registered vaults the cheap tiers fan out across. */
+export const MAX_FANOUT_VAULTS = 5;
+/** Default cap on how many retrieval hits we inject. */
+export const MAX_HITS = 6;
+/**
+ * Explicit `--limit` for whole-vault `ctx list` scans. A remote nest pages
+ * `list` at 50 by default, which silently truncated the id→tag map the query
+ * tier builds and the straggler sweep; local vaults return everything anyway.
+ */
+export const MAX_LIST_SCAN = 1000;
+
+/** Project-level settings override, relative to the project root. */
+export const PROJECT_SETTINGS_FILE = join(".claude", "contextnest.local.json");
+/** User-level settings override, relative to the home directory. */
+export const USER_SETTINGS_FILE = join(".contextnest", "plugin-settings.json");
+
+/**
+ * The only accepted retrieval_mode values. Anything else (a typo, a stale
+ * value, `SEARCH` in the wrong case) is treated as if the key were absent, so
+ * it can never silently degrade to the wrong tier. Shared so the command and
+ * tests validate against the same source of truth.
+ */
+export const VALID_RETRIEVAL_MODES = ["off", "search", "query", "agent"];
+
+/**
+ * The only accepted capture_mode values, in ascending order of autonomy:
+ *   off      — never gate the stop; the vault is only written via an explicit
+ *              `/contextnest:capture` or a direct instruction.
+ *   explicit — gate only on what the user did: an ask to remember, a
+ *              correction, a `ctx update` (sweep check). No ambient review, so
+ *              no background agent run nobody asked for. Like propose, an ask
+ *              is proposed in one line, not written. The default.
+ *   propose  — also gate ambiently, but the agent stays read-only: it walks
+ *              the capture ladder and proposes in one line. Nothing is
+ *              written until the user says yes.
+ *   auto     — write unattended, still behind the ladder and the cooldown.
+ * Same validation contract as VALID_RETRIEVAL_MODES: anything else is treated
+ * as if the key were absent, so a typo can never silently raise autonomy.
+ */
+export const VALID_CAPTURE_MODES = ["off", "explicit", "propose", "auto"];
+
+/**
+ * What capture does when no nest's description clearly fits a new node:
+ * `ask` the user (default — a wrong guess can land in a partner's nest), or
+ * write to the `default` vault (the pin, else the registry default).
+ */
+export const VALID_UNCLEAR_NEST = ["ask", "default"];
+
+/** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
+export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
+export const FALSY_VALUES = ["false", "0", "no", "off"];
+
+/**
+ * Valid shape for a pinned vault alias — mirrors the engine's ALIAS_PATTERN
+ * (packages/engine/src/registry.ts), the single source of truth for what ctx
+ * accepts. Plugins can't import the engine (they run as standalone vendored
+ * JS), so the rule is duplicated here. An empty string is handled separately:
+ * it is the deliberate "unpin" value, not a malformed alias. Note this only
+ * validates *shape*; whether the alias is actually registered is checked by
+ * the /contextnest:config command, which can consult the registry.
+ */
+// An optional `/<nest>` suffix addresses one nest behind a server-level
+// remote (`ctx vault list` shows those as `<server>/<nest>` rows).
+export const ALIAS_PATTERN = /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)?$/;
+
+/**
+ * Read a settings override file. Missing or malformed files are silently
+ * ignored (hooks must never break a session), as is anything that isn't a
+ * plain JSON object.
+ */
+function readSettingsFile(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read plugin configuration.
+ *
+ * Claude Code collects userConfig answers once at enable time and exports
+ * them as CLAUDE_PLUGIN_OPTION_<KEY> — they cannot be changed afterwards from
+ * within a session. Settings override files exist so users CAN change them
+ * later (via /contextnest:config or by editing the file); a key present in a
+ * file therefore beats the frozen env value. Precedence, highest first:
+ *
+ *   1. <project>/.claude/contextnest.local.json
+ *   2. ~/.contextnest/plugin-settings.json
+ *   3. CLAUDE_PLUGIN_OPTION_* env (enable-time answers)
+ *   4. CONTEXTNEST_* env (generic fallbacks for Codex/Gemini adapters)
+ *   5. defaults
+ *
+ * File keys mirror the manifest: retrieval_mode, auto_capture, vault,
+ * ctx_command. An explicit "" in a file is honoured (e.g. vault:"" unpins).
+ *
+ * @param {Record<string, string | undefined>} env
+ * @param {{ cwd?: string, homedir?: string }} [opts] injection points for tests
+ */
+export function getConfig(env = process.env, opts = {}) {
+  const cwd = opts.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
+  const home = opts.homedir || osHomedir();
+  const fileLayers = [
+    readSettingsFile(join(cwd, PROJECT_SETTINGS_FILE)),
+    readSettingsFile(join(home, USER_SETTINGS_FILE)),
+  ];
+
+  // Resolve one setting across the layers. `envKeys` is scanned after the
+  // files. `opts.normalize` transforms a raw value before it is validated and
+  // returned; `opts.accept` rejects invalid values — a rejected value is
+  // skipped as if that layer never set the key, so resolution falls through to
+  // the next layer (and ultimately the default). File layers honour an empty
+  // string (e.g. vault:"" unpins); env layers treat "" as absent, as before.
+  const pick = (fileKey, envKeys = [], opts = {}) => {
+    const finalize = (raw) => {
+      const v = opts.normalize ? opts.normalize(String(raw)) : String(raw);
+      return opts.accept && !opts.accept(v) ? undefined : v;
+    };
+    for (const layer of fileLayers) {
+      const raw = layer[fileKey];
+      if (raw !== undefined && raw !== null) {
+        const v = finalize(raw);
+        if (v !== undefined) return v;
+      }
+    }
+    for (const k of envKeys) {
+      const raw = env[k];
+      if (raw !== undefined && raw !== "") {
+        const v = finalize(raw);
+        if (v !== undefined) return v;
+      }
+    }
+    return undefined;
+  };
+
+  // Accept only recognized boolean spellings; a garbage value ("banana", "2")
+  // is skipped per layer so it can neither be mistaken for a boolean nor mask
+  // a valid lower-precedence value. JSON booleans arrive as "true"/"false".
+  const rawAuto = pick(
+    "auto_capture",
+    ["CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE", "CONTEXTNEST_AUTO_CAPTURE"],
+    {
+      normalize: (s) => s.trim().toLowerCase(),
+      accept: (s) => TRUTHY_VALUES.includes(s) || FALSY_VALUES.includes(s),
+    },
+  );
+
+  // capture_mode supersedes the auto_capture boolean. Resolved independently so
+  // an explicit mode set at ANY layer beats a legacy boolean at a HIGHER one:
+  // someone who has picked a mode has said more than someone who ticked a box,
+  // and the legacy key's only two states can't express "propose".
+  const rawCaptureMode = pick(
+    "capture_mode",
+    ["CLAUDE_PLUGIN_OPTION_CAPTURE_MODE", "CONTEXTNEST_CAPTURE_MODE"],
+    {
+      normalize: (s) => s.trim().toLowerCase(),
+      accept: (s) => VALID_CAPTURE_MODES.includes(s),
+    },
+  );
+
+  // Accept the unpin sentinel "" or a shape-valid alias (`<alias>` or
+  // `<server>/<nest>`); a malformed one ("my vault", "a/b/c", "..") is skipped so it can't reach ctx as a bad
+  // --vault arg. Registry membership is verified by the config command.
+  const rawVault = pick(
+    "vault",
+    ["CLAUDE_PLUGIN_OPTION_VAULT", "CONTEXTNEST_VAULT_ALIAS"],
+    {
+      normalize: (s) => s.trim(),
+      accept: (s) => s === "" || ALIAS_PATTERN.test(s),
+    },
+  );
+
+  return {
+    // Invalid values are skipped per layer (see pick), so this only ever
+    // yields a known mode or the "search" default — never a bogus string.
+    retrievalMode:
+      pick(
+        "retrieval_mode",
+        ["CLAUDE_PLUGIN_OPTION_RETRIEVAL_MODE", "CONTEXTNEST_RETRIEVAL_MODE"],
+        {
+          normalize: (s) => s.trim().toLowerCase(),
+          accept: (s) => VALID_RETRIEVAL_MODES.includes(s),
+        },
+      ) || "search",
+    // Default ON. Only a recognized falsy value disables it.
+    autoCapture: rawAuto === undefined ? true : TRUTHY_VALUES.includes(rawAuto),
+    // Effective capture behaviour. An explicit capture_mode wins; otherwise the
+    // legacy boolean maps onto the two modes it could express (true was never
+    // "write without asking" as a *choice*, it was just "on", so it lands on
+    // the safer of the two). Absent both → explicit: an ambient review is a
+    // background agent run (~25k tokens), so nobody gets one unasked — while
+    // asks, corrections and the sweep check still work.
+    captureMode:
+      rawCaptureMode ??
+      (rawAuto === undefined ? "explicit" : TRUTHY_VALUES.includes(rawAuto) ? "propose" : "off"),
+    unclearNest:
+      pick(
+        "unclear_nest",
+        ["CLAUDE_PLUGIN_OPTION_UNCLEAR_NEST", "CONTEXTNEST_UNCLEAR_NEST"],
+        {
+          normalize: (s) => s.trim().toLowerCase(),
+          accept: (s) => VALID_UNCLEAR_NEST.includes(s),
+        },
+      ) || "ask",
+    // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
+    // collides with the env var the ctx CLI itself consumes for resolution.
+    vault: rawVault === undefined ? "" : rawVault,
+    // Command used to invoke ctx. Trimmed; a blank value is skipped so it
+    // falls back to the "ctx" default (which itself npx-falls-back on ENOENT).
+    // Internal whitespace is allowed — execFileSync runs the whole string as
+    // argv[0], so a path containing spaces is legitimate.
+    ctxCommand:
+      pick(
+        "ctx_command",
+        ["CLAUDE_PLUGIN_OPTION_CTX_COMMAND", "CONTEXTNEST_CTX_COMMAND"],
+        { normalize: (s) => s.trim(), accept: (s) => s.length > 0 },
+      ) || "ctx",
+  };
+}
+
+/**
+ * Build the default synchronous `ctx` runner. Tries the configured command,
+ * and on ENOENT (no global install) transparently falls back to npx.
+ *
+ * The returned function has the injectable shape the run() handlers expect:
+ *   exec(args: string[]) => { status, stdout, stderr }
+ *
+ * Every call is capped at `CONTEXTNEST_CTX_TIMEOUT_MS` (default 8s). A hook
+ * runs on the user's prompt, so a hung `ctx` (remote fan-out, keyring, npx
+ * download) must cost one timeout, not one per call: after the first, the
+ * rest of this process's calls fail fast as if ctx were unavailable.
+ *
+ * `opts.timeout` raises the default for a hook that may legitimately run long
+ * (the sweep check); the env override still wins.
+ *
+ * @param {ReturnType<typeof getConfig>} config
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeout?: number }} [opts]
+ */
+export function makeExec(config, opts = {}) {
+  const cwd = opts.cwd || process.cwd();
+  const env = opts.env || process.env;
+  const timeout = envInt(env, "CONTEXTNEST_CTX_TIMEOUT_MS", opts.timeout ?? CTX_TIMEOUT_MS);
+  let timedOut = false;
+
+  const attempt = (cmd, args) => {
+    if (timedOut) return { status: 1, stdout: "", stderr: "", code: "ETIMEDOUT" };
+    try {
+      const stdout = execFileSync(
+        WIN32 ? winQuote(cmd) : cmd,
+        WIN32 ? args.map(winQuote) : args,
+        {
+          cwd,
+          env,
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "pipe"],
+          maxBuffer: 16 * 1024 * 1024,
+          // npm installs ctx/npx as .cmd shims on Windows, and Node refuses to
+          // execFile those without a shell (CVE-2024-27980) — it throws EINVAL,
+          // not ENOENT, so the npx fallback never fires either. Run through the
+          // shell there; cmd.exe does no quoting of its own, hence winQuote.
+          shell: WIN32,
+          ...(timeout > 0 ? { timeout } : {}),
+        },
+      );
+      return { status: 0, stdout, stderr: "" };
+    } catch (err) {
+      if (err.code === "ETIMEDOUT") timedOut = true;
+      return {
+        status: typeof err.status === "number" ? err.status : 1,
+        stdout: err.stdout ? String(err.stdout) : "",
+        stderr: err.stderr ? String(err.stderr) : "",
+        code: err.code,
+      };
+    }
+  };
+
+  return (args) => {
+    const res = attempt(config.ctxCommand, args);
+    // EINVAL: shell-less .cmd refusal on older Node. ENOENT: no global install.
+    if (res.code === "ENOENT" || res.code === "EINVAL") {
+      return attempt("npx", ["-y", "@promptowl/contextnest-cli", ...args]);
+    }
+    return res;
+  };
+}
+
+/** Non-negative integer env override, or `fallback` when unset/invalid. */
+export function envInt(env, name, fallback) {
+  const raw = parseInt(env?.[name] || "", 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
+/** Parse JSON without throwing. Returns `fallback` on any failure. */
+export function safeJson(str, fallback = null) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Run a ctx subcommand expecting JSON on stdout. Returns the parsed value, or
+ * `fallback` when ctx failed or emitted non-JSON.
+ *
+ * @param {(args: string[]) => {status:number, stdout:string}} exec
+ * @param {string[]} args
+ */
+export function ctxJson(exec, args, fallback = null) {
+  const res = exec(args);
+  if (!res || res.status !== 0) return fallback;
+  return safeJson(res.stdout, fallback);
+}
+
+/**
+ * Append `--vault <alias>` when a vault is explicitly given. ctx accepts the
+ * global flag before or after the subcommand, so appending is safe.
+ */
+export function withVault(args, alias) {
+  return alias ? [...args, "--vault", alias] : args;
+}
+
+/**
+ * List registered vaults from the central registry.
+ * @returns {{alias:string, path:string, description?:string, isDefault?:boolean, exists?:boolean}[]}
+ */
+export function listVaults(exec) {
+  const vaults = ctxJson(exec, ["vault", "list", "--json"], []);
+  return Array.isArray(vaults) ? vaults : [];
+}
+
+/** Registry rows to SEARCH: everything but the `<server>/<nest>` rows its server row covers. */
+export function searchableVaults(vaults) {
+  return vaults.filter((v) => !v.parent);
+}
+
+/**
+ * True when `alias` names a vault that is registered AND present on disk.
+ * `getConfig` only checks the alias *shape*; this is the registry check.
+ * Takes the already-fetched `listVaults` result so callers that need the list
+ * anyway (vaultTargets, session-start) share this predicate instead of each
+ * re-running `vault list` — and instead of each inlining the same `.some(...)`.
+ *
+ * @param {string} alias
+ * @param {{alias: string, exists?: boolean}[]} vaults from listVaults()
+ */
+export function isVaultRegistered(alias, vaults) {
+  if (!alias) return false;
+  return vaults.some((v) => v.alias === alias && v.exists !== false);
+}
+
+/** Best-effort canonical form of a path: realpath when it exists, else resolved. */
+function canonical(p) {
+  const abs = resolve(String(p));
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/**
+ * True when two paths name the same directory. Compared in both their given
+ * and realpath'd forms, so a symlinked temp dir (macOS `/var` → `/private/var`)
+ * or a path that doesn't exist yet still matches its twin.
+ */
+export function samePath(a, b) {
+  if (!a || !b) return false;
+  const forms = (p) => new Set([resolve(String(p)), canonical(p)]);
+  const fa = forms(a);
+  for (const f of forms(b)) if (fa.has(f)) return true;
+  return false;
+}
+
+/**
+ * True when `path` is `root` or lives under it. Both the given and the
+ * realpath'd forms of each side are compared (see samePath), so a symlinked
+ * temp dir still matches. Note: `path.relative` does not case-fold; on Windows
+ * the realpath step normalizes to on-disk casing when the path exists, and a
+ * not-yet-existing path is compared as given.
+ */
+function isUnder(path, root) {
+  const inside = (p, r) => {
+    const rel = relative(r, p);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+  for (const r of [resolve(String(root)), canonical(root)]) {
+    for (const p of [resolve(String(path)), canonical(path)]) {
+      if (inside(p, r)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a vault path lives under the OS temp directory. Agents create
+ * scratch vaults there (and `ctx init` registers them), and nobody wants a
+ * throwaway's nodes injected into every prompt of a real session.
+ * `tmp` is injectable for tests; defaults to os.tmpdir().
+ */
+export function isTmpVaultPath(path, tmp = osTmpdir()) {
+  if (!path || !tmp) return false;
+  return isUnder(path, tmp);
+}
+
+/**
+ * The vault ctx resolves from the working directory alone, via
+ * `ctx vault which --json` (exec already runs in the hook's cwd). Only a
+ * `source: "local"` resolution counts — i.e. a `.context/config.yaml` found by
+ * walking up from cwd. A registry default, an env override, or the bare-cwd
+ * fallback is NOT a cwd vault. Returns `{ path, alias }` where `alias` is the
+ * registered alias for that same path when there is one (else null), or null
+ * when the cwd is not inside a vault (or ctx is too old to know `--json`).
+ *
+ * @param {(args:string[]) => any} exec
+ * @param {{alias:string, path?:string, exists?:boolean}[]} vaults from listVaults()
+ */
+export function cwdVault(exec, vaults = []) {
+  const which = ctxJson(exec, ["vault", "which", "--json"], null);
+  if (!which || typeof which !== "object" || Array.isArray(which)) return null;
+  if (which.kind !== "local" || which.source !== "local" || !which.path) return null;
+  const match = vaults.find((v) => v.exists !== false && v.path && samePath(v.path, which.path));
+  return { path: which.path, alias: match ? match.alias : null };
+}
+
+/**
+ * Decide which vault aliases the cheap (non-agent) tiers should search.
+ *
+ *  - Pinned alias, registered → just that alias.
+ *  - Pinned alias, NOT registered (stale/removed pin) → ignore the pin and
+ *    behave as unpinned, rather than passing ctx a bad --vault that resolves to
+ *    nothing. session-start surfaces a warning so this isn't silent.
+ *  - Unpinned → the vault in the working directory FIRST, then the registry
+ *    DEFAULT (`ctx vault default`), then the remaining registered vaults in
+ *    registry order, capped at MAX_FANOUT_VAULTS in total.
+ *      · The cwd vault is targeted as `null` (no --vault, ctx resolves it
+ *        locally) and its hits are cited without an alias prefix. When that
+ *        same directory is also registered it is targeted by its alias
+ *        instead — once, still first — so a hit keeps a citable `alias:id`
+ *        and is never listed twice.
+ *      · The default vault is the one the user chose to stand for "my
+ *        vault" when nothing more specific applies, so it is always a
+ *        target, wherever it sits in the registry. Before this it competed
+ *        for the MAX_FANOUT_VAULTS slots in plain registry order and lost to
+ *        whichever demo vaults happened to be registered earlier — the real
+ *        brain was never searched while its demos filled every prompt.
+ *      · Registry entries whose path is missing (`exists: false`) or lives
+ *        under os.tmpdir() (scratch vaults agents create) are skipped. A cwd
+ *        vault, the default vault, or a pin is a deliberate choice and is
+ *        exempt from the tmp filter; a default missing on disk is still
+ *        skipped.
+ *  - Unpinned + nothing eligible + no cwd vault → a single null target, i.e.
+ *    let ctx resolve the local/default vault with no --vault flag.
+ *
+ * @param {ReturnType<typeof getConfig>} config
+ * @param {(args:string[]) => any} exec
+ * @returns {(string|null)[]} list of alias targets (null = ctx default resolution)
+ */
+export function vaultTargets(config, exec) {
+  const listed = listVaults(exec).filter((v) => v.exists !== false);
+  if (isVaultRegistered(config.vault, listed)) return [config.vault];
+  // `<server>/<nest>` rows are for choosing a nest to WRITE to. Searching the
+  // server row already spans every one of its nests in one call (each hit
+  // names its nest), so fanning out over them too would search twice — and
+  // blow MAX_FANOUT_VAULTS on a server with dozens of partner nests.
+  const present = searchableVaults(listed);
+
+  const local = cwdVault(exec, present);
+  const targets = [];
+  const taken = new Set();
+  const take = (alias) => {
+    if (taken.has(alias)) return;
+    taken.add(alias);
+    targets.push(alias);
+  };
+  if (local) take(local.alias);
+  const preferred = present.find((v) => v.isDefault === true);
+  if (preferred) take(preferred.alias);
+  for (const v of present) {
+    if (targets.length >= MAX_FANOUT_VAULTS) break;
+    if (taken.has(v.alias)) continue;
+    if (isTmpVaultPath(v.path)) continue;
+    take(v.alias);
+  }
+  return targets.length === 0 ? [null] : targets;
+}
+
+/** Collapse internal whitespace and trim, for compact single-line context. */
+export function squish(text, max = 200) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  return s.length > max ? s.slice(0, max - 1).trimEnd() + "…" : s;
+}
+
+/**
+ * Read all of stdin as a string (used by the IO shells). Resolves to "" if
+ * stdin is closed/empty so a hook firing with no payload never hangs.
+ */
+export function readStdin(stream = process.stdin) {
+  return new Promise((resolve) => {
+    let data = "";
+    let settled = false;
+    const done = () => {
+      if (!settled) {
+        settled = true;
+        resolve(data);
+      }
+    };
+    if (stream.isTTY) return resolve("");
+    stream.setEncoding("utf-8");
+    stream.on("data", (c) => (data += c));
+    stream.on("end", done);
+    stream.on("error", done);
+    stream.on("close", done);
+  });
+}
+
+/**
+ * The standard IO shell for a hook handler: read+parse stdin, invoke run() with
+ * a default exec, print any returned object as JSON, and ALWAYS exit 0. Hooks
+ * must never break a session, so every error path is swallowed (to stderr only).
+ *
+ * @param {(ctx:{input:any, env:NodeJS.ProcessEnv, exec:Function}) => any|Promise<any>} run
+ * @param {{ timeout?: number }} [opts] per-call ctx timeout for this hook (see makeExec)
+ */
+export async function runAsHook(run, opts = {}) {
+  try {
+    const raw = await readStdin();
+    const input = raw ? safeJson(raw, {}) : {};
+    const env = process.env;
+    const config = getConfig(env);
+    const exec = makeExec(config, { cwd: input.cwd || process.cwd(), env, timeout: opts.timeout });
+    const out = await run({ input, env, exec });
+    if (out) process.stdout.write(JSON.stringify(out));
+  } catch (err) {
+    process.stderr.write(`[contextnest] hook error: ${err?.message || err}\n`);
+  }
+  process.exit(0);
+}
+
+/** True when this module file is the process entry point (ESM main check). */
+export function isMain(importMetaUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return importMetaUrl === new URL(`file://${entry}`).href;
+  } catch {
+    return false;
+  }
+}

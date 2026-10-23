@@ -56,6 +56,7 @@ import {
   assertNotMachineryPath,
   assertResolvesOutsideMachinery,
   NON_DOCUMENT_BASENAMES,
+  isUnreadableDocumentError,
 } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
@@ -260,8 +261,15 @@ async function givenId(ctx: OperationContext, id: string): Promise<string> {
   const file = `${id}.md`.toLowerCase();
   const scaffold = file === "context.md" || [...NON_DOCUMENT_BASENAMES].some((b) => b.toLowerCase() === file);
   if (!scaffold && (await readIfExists(ctx, id).catch(() => null))) return id;
+  // One that is there but will not read (its own YAML, frontmatter or
+  // encryption) is still the one named: the op reports why, rather than a
+  // not-found for the bare id. A vault-level failure still throws here.
   const rooted = `nodes/${id}`;
-  return (await readIfExists(ctx, rooted)) ? rooted : id;
+  const found = await readIfExists(ctx, rooted).catch((err) => {
+    if (isUnreadableDocumentError(err)) return true;
+    throw err;
+  });
+  return found ? rooted : id;
 }
 
 /**
@@ -1442,10 +1450,25 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
     // what makes re-running the same batch idempotent instead of duplicating.
     // A path the guard refuses (`../`) reads as absent here and fails at its
     // own write below, so it is reported per file rather than sinking the batch.
+    // One listing per folder, not one stat per file (a round trip each on a
+    // network mount); case-folded, so a name a case-insensitive disk holds is taken.
+    const listings = new Map<string, Promise<Set<string>>>();
+    const isTaken = async (p: string): Promise<boolean> => {
+      const cut = p.lastIndexOf("/");
+      const dir = p.slice(0, Math.max(cut, 0));
+      let names = listings.get(dir);
+      if (!names) {
+        names = ctx.storage
+          .vaultEntryNames(dir)
+          .then((n) => new Set(n.map(comparableSegment)), () => new Set<string>());
+        listings.set(dir, names);
+      }
+      return (await names).has(comparableSegment(p.slice(cut + 1)));
+    };
     const plan = (
       await planImportPaths(
         incoming.map((f) => String(f.path ?? "")),
-        input.overwrite ? async () => false : (p) => ctx.storage.hasVaultFile(p),
+        input.overwrite ? async () => false : isTaken,
       )
     ).map((planned, i) => ({ ...planned, content: incoming[i].content ?? "" }));
     // Every verdict for the whole batch BEFORE anything lands (import-verdicts.ts).
@@ -1606,6 +1629,9 @@ const importDocs: OperationExecutor = async (ctx, input: any) => {
       // their folders' INDEX.md can change. Other modes write files too.
       indexOnlyBatchFolders:
         !!input.ids?.length && !input.documents?.length && !input.files?.length && !input.discover,
+      // An import's version is a one-off: a keyframe skips rebuilding the
+      // previous one to diff against. Ids-only (bulk approval) keeps diffs.
+      keyframe: !!input.discover || !!input.files?.length,
       // The importer's metadata rides along with the publish write instead of
       // costing its own pass. Title falls back to the filename; the author is
       // the importing user, since the source's own `author:` names someone who

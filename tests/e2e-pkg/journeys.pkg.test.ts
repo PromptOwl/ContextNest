@@ -43,6 +43,7 @@ import {
   packCli,
   freshInstall,
   runJourney,
+  repoRoot,
   type Journey,
   type RunResult,
 } from "./journey-harness.js";
@@ -1750,6 +1751,585 @@ const J8: Journey = {
   ],
 };
 
+/**
+ * J9 — "I build a knowledge base out of PDFs."
+ * A researcher drops report PDFs into the vault and relies on them like any
+ * other node: the text is pulled out so it is searchable, the original file
+ * stays attached byte-for-byte, a newer edition versions the node while the
+ * previous file is archived, a corrupted attachment is caught by verify, the
+ * extracted text can't be hand-edited, and a scanned PDF imports with a warning.
+ *
+ * Review gate OFF (like J2/J3/J5/J6/J8): each import should land as a published
+ * version, not wait behind the gate — the story is about PDFs, not review.
+ *
+ * Cases accumulate in one vault and run top to bottom; J9-03 searches for the
+ * v1 phrase BEFORE J9-04 re-imports a v2 whose body no longer contains it, so
+ * the cases must not be reordered. Fixtures are the committed PDFs under
+ * fixtures/pdf/ (report.pdf → "Revenue grew 12 percent.", report-v2.pdf → "14
+ * percent.", scanned.pdf → no text layer); paths are absolute so the installed
+ * bin (cwd = vault) resolves them.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const PDF_FIXTURE = (name: string) => join(repoRoot, "fixtures", "pdf", name);
+const PDF_V1 = PDF_FIXTURE("report.pdf"); // "Revenue grew 12 percent."
+const PDF_V2 = PDF_FIXTURE("report-v2.pdf"); // "Revenue grew 14 percent."
+const PDF_SCANNED = PDF_FIXTURE("scanned.pdf"); // image-only, no text layer
+// The import derives this id from the PDF title ("Quarterly Report") + --folder.
+const PDF_NODE = "nodes/reports/quarterly-report";
+const PDF_SIDECAR = "nodes/reports/quarterly-report.pdf";
+// Where a re-import archives the superseded binary (one .pdf per prior version).
+const PDF_ARCHIVE = "nodes/reports/.versions/quarterly-report";
+
+/** The sidecar on disk must be the source PDF, byte-for-byte. */
+const sidecarEquals = (vault: string, fixture: string) =>
+  readFileSync(join(vault, PDF_SIDECAR)).equals(readFileSync(fixture));
+
+const J9: Journey = {
+  id: "J9",
+  title: "Build a knowledge base from PDFs (researcher)",
+  cases: [
+    {
+      id: "J9-01",
+      title: "Import a text PDF; it becomes a node with the text pulled out, and the vault still verifies clean",
+      actions: [
+        { args: ["init", "--name", "pdf-kb", "--layout", "structured"] },
+        // Land imports as published versions, not held behind the review gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: ["import", "pdf", PDF_V1, "--folder", "reports", "--tags", "finance"],
+          // The import line a user reads: id, version, page count, published.
+          stdout: ["Imported", PDF_NODE, "2 pages", "published"],
+          // The node is a type: pdf node carrying the extracted text and its tag,
+          // and the original binary landed beside it.
+          files: [
+            { path: `${PDF_NODE}.md`, contains: "type: pdf" },
+            { path: `${PDF_NODE}.md`, contains: "Revenue grew 12 percent." },
+            { path: `${PDF_NODE}.md`, contains: "#finance" },
+            { path: PDF_SIDECAR, exists: true },
+          ],
+        },
+        // The whole vault re-checks clean, including the PDF node's sidecar hash.
+        { args: ["verify"], stdout: [PDF_NODE, "All integrity checks passed"] },
+      ],
+    },
+    {
+      id: "J9-02",
+      title: "The original PDF stays attached to the node, byte-for-byte",
+      actions: [
+        {
+          args: ["read", PDF_NODE, "--raw"],
+          stdout: ["type: pdf", "Revenue grew 12 percent."],
+          // The attachment is the untouched source file, not a re-encoding.
+          check: (vault) =>
+            expect(sidecarEquals(vault, PDF_V1), "attached PDF differs from the imported source").toBe(true),
+        },
+      ],
+    },
+    {
+      id: "J9-03",
+      title: "A search for a phrase that only appears inside the PDF finds the node",
+      actions: [
+        // "Revenue grew 12 percent." is nowhere but inside the PDF's text layer.
+        {
+          args: ["search", "Revenue grew 12 percent", "--json"],
+          json: (data) => expect(searchIds(data)).toEqual([PDF_NODE]),
+        },
+      ],
+    },
+    {
+      id: "J9-04",
+      title: "Importing a newer edition versions the node (new text) and keeps the previous file archived",
+      actions: [
+        {
+          args: ["import", "pdf", PDF_V2, "--id", PDF_NODE],
+          stdout: ["Updated", PDF_NODE, "v2", "published"],
+          files: [{ path: `${PDF_NODE}.md`, contains: "Revenue grew 14 percent." }],
+          // The live attachment is now the new edition; the old one is archived
+          // under the node's version history, byte-for-byte, not overwritten.
+          check: (vault) => {
+            expect(sidecarEquals(vault, PDF_V2), "live sidecar should be the new edition").toBe(true);
+            const archived = readdirSync(join(vault, PDF_ARCHIVE)).filter((f) => f.endsWith(".pdf"));
+            expect(archived.length, "a superseded PDF should be archived").toBe(1);
+            expect(
+              readFileSync(join(vault, PDF_ARCHIVE, archived[0])).equals(readFileSync(PDF_V1)),
+              "the archived PDF should be the original v1 file",
+            ).toBe(true);
+          },
+        },
+        // The node now reads as the new edition; the old figure is gone from it.
+        {
+          args: ["read", PDF_NODE, "--raw"],
+          stdout: ["Revenue grew 14 percent."],
+          stdoutNot: ["Revenue grew 12 percent."],
+        },
+      ],
+    },
+    {
+      id: "J9-05",
+      title: "A swapped or corrupted attachment is caught by verify",
+      actions: [
+        {
+          // Overwrite the attached PDF with unrelated bytes (a tamper/swap).
+          mutate: (vault) => writeFileSync(join(vault, PDF_SIDECAR), readFileSync(PDF_SCANNED)),
+          args: ["verify", "--json"],
+          status: 1,
+          json: (data) => {
+            const d = data as { valid: boolean; errors: Array<{ type: string; document: string }> };
+            expect(d.valid).toBe(false);
+            expect(
+              d.errors.some((e) => e.type === "sidecar_drift" && e.document === PDF_NODE),
+              "verify should report sidecar_drift for the tampered PDF node",
+            ).toBe(true);
+          },
+        },
+        {
+          // Put the correct file back (the node is at v2) — the vault recovers.
+          mutate: (vault) => writeFileSync(join(vault, PDF_SIDECAR), readFileSync(PDF_V2)),
+          args: ["verify"],
+          stdout: ["All integrity checks passed"],
+        },
+      ],
+    },
+    {
+      id: "J9-06",
+      title: "The pulled-out text can't be hand-edited, but the node's title and tags still can",
+      actions: [
+        {
+          // The binary is the source of truth, so a --body edit is refused…
+          args: ["update", PDF_NODE, "--body", "hand edited text"],
+          status: 1,
+          stderr: ["is a PDF node", "cannot be edited directly"],
+          // …before any write: the extracted text on disk is untouched.
+          files: [{ path: `${PDF_NODE}.md`, contains: "Revenue grew 14 percent." }],
+        },
+        {
+          // …while a metadata edit still goes through (the refusal is body-only).
+          args: ["update", PDF_NODE, "--title", "Q4 Earnings"],
+          stdout: ["Updated and published", PDF_NODE],
+          files: [{ path: `${PDF_NODE}.md`, contains: "title: Q4 Earnings" }],
+        },
+      ],
+    },
+    {
+      id: "J9-07",
+      title: "A scanned (image-only) PDF imports but warns there is no text to search",
+      actions: [
+        {
+          args: ["import", "pdf", PDF_SCANNED, "--id", "nodes/scan"],
+          // It still imports and stores the file, but says the body is empty —
+          // nothing to search. (Assert the words, not the ⚠ glyph: Windows
+          // stdout can mangle it.)
+          stdout: ["Imported", "nodes/scan", "no text layer"],
+          files: [
+            { path: "nodes/scan.md", contains: "text_layer: false" },
+            { path: "nodes/scan.pdf", exists: true },
+          ],
+        },
+        // There really is nothing to search: a text PDF's body carries page
+        // markers (J9-01's node has "<!-- page 1 -->"); this scanned node's body
+        // is empty, so no such marker and none of the report's words appear.
+        {
+          args: ["read", "nodes/scan", "--raw"],
+          stdout: ["type: pdf"],
+          stdoutNot: ["<!-- page 1 -->", "Revenue grew"],
+        },
+        // The whole vault — the versioned report plus the scanned PDF — is healthy.
+        { args: ["verify"], stdout: ["All integrity checks passed"] },
+      ],
+    },
+  ],
+};
+
+/**
+ * A lexical search hit with its score breakdown, as `search --json` returns it:
+ * a total `score` plus a per-signal `scores` object (in lexical mode, only
+ * `scores.lexical`, equal to the total).
+ */
+type ScoredHit = {
+  id: string;
+  title: string;
+  score: number;
+  scores: { lexical?: number };
+};
+/**
+ * Hit ids in RESULT order — deliberately NOT sorted (unlike `searchIds`),
+ * because ranking order is exactly what J10-03/J10-04 assert.
+ */
+const searchOrder = (data: unknown) => (data as ScoredHit[]).map((h) => h.id);
+
+/**
+ * J10 — "I search for a word and the right node comes back, ranked."
+ *
+ * The everyday read path: no embeddings, no network — just the default lexical
+ * (stemmed keyword) search every user hits on day one. It proves the end-to-end
+ * experience survives a real install: a body word finds its node, a different
+ * word form still matches (stemming), the most relevant node ranks first, a
+ * title hit outranks a passing body mention, `--json` exposes the per-signal
+ * score behind the ranking, and `--limit` / no-match behave cleanly.
+ *
+ * Review is OFF (like J2/J3) so each `add` publishes immediately and is
+ * searchable — a held node is invisible to search (that contract is J7's).
+ *
+ * The node set is purpose-built:
+ *   - deployment-guide — "deployment" in title AND body, plus unique word "downtime".
+ *   - rollback-notes   — "deployment" in the body only, a single passing mention.
+ *   - caching-overview — "caching" in the TITLE only (body has no "caching").
+ *   - misc-perf        — "caching" in the BODY only, a single passing mention.
+ * The deployment pair drives the "relevant first" ranking; the caching pair is
+ * the clean title-only-vs-body-only discriminator (neither side wins on body
+ * frequency), so J10-04 genuinely measures the title contribution.
+ */
+const J10: Journey = {
+  id: "J10",
+  title: "Find the right node with lexical search (everyday reader)",
+  cases: [
+    {
+      id: "J10-01",
+      title: "A search for a word in a node's body returns that node",
+      actions: [
+        { args: ["init", "--name", "handbook"], stdout: ["Initialized"] },
+        // Review OFF: each add lands published and searchable (a held node is
+        // invisible to search — that's J7's contract, not this journey's).
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/deployment-guide",
+            "--type", "document",
+            "--title", "Deployment guide",
+            "--tags", "#ops",
+            "--body", "We deploy the service by running the deploy script. Deployment happens nightly without downtime.",
+            "-y",
+          ],
+          files: [{ path: "nodes/deployment-guide.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/rollback-notes",
+            "--type", "document",
+            "--title", "Rollback notes",
+            "--tags", "#ops",
+            "--body", "If a release goes wrong, roll back quickly. This also has a passing mention of deployment.",
+            "-y",
+          ],
+          files: [{ path: "nodes/rollback-notes.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/caching-overview",
+            "--type", "document",
+            "--title", "Caching strategy",
+            "--tags", "#perf",
+            "--body", "General notes about system performance and latency budgets.",
+            "-y",
+          ],
+          files: [{ path: "nodes/caching-overview.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/misc-perf",
+            "--type", "document",
+            "--title", "Performance notes",
+            "--tags", "#perf",
+            "--body", "A few teams mention caching once here, in passing, among many other topics and details.",
+            "-y",
+          ],
+          files: [{ path: "nodes/misc-perf.md", exists: true }],
+        },
+        // "downtime" appears in exactly one node's body — searching it returns that node.
+        {
+          args: ["search", "downtime", "--json"],
+          json: (data) =>
+            expect(searchOrder(data)).toEqual(["nodes/deployment-guide"]),
+        },
+      ],
+    },
+    {
+      id: "J10-02",
+      title: "Searching a different word form still finds the node (stemming)",
+      actions: [
+        // "deploying" is written in no node; it stems to "deploy", which the
+        // guide's body carries ("deploy"/"deploy script") — so a stemmed keyword
+        // match, not a literal one, is what surfaces it.
+        {
+          args: ["search", "deploying", "--json"],
+          json: (data) =>
+            expect(searchOrder(data)).toEqual(["nodes/deployment-guide"]),
+        },
+      ],
+    },
+    {
+      id: "J10-03",
+      title: "The most relevant node ranks first when several match",
+      actions: [
+        // Both ops nodes contain "deployment"; the guide (title + body) is more
+        // relevant than the rollback node (one passing body mention), so it leads.
+        {
+          args: ["search", "deployment", "--json"],
+          json: (data) => {
+            const order = searchOrder(data);
+            expect(order).toHaveLength(2);
+            expect(order[0]).toBe("nodes/deployment-guide");
+            expect(order).toContain("nodes/rollback-notes");
+          },
+        },
+      ],
+    },
+    {
+      id: "J10-04",
+      title:
+        "A node whose title contains the term outranks one that only mentions it in passing",
+      actions: [
+        // Clean discriminator: "caching" is in caching-overview's TITLE only and
+        // in misc-perf's BODY only (a single mention) — neither wins on body
+        // frequency, so the title-bearing node leading proves the title boost.
+        {
+          args: ["search", "caching", "--json"],
+          json: (data) => {
+            const hits = data as ScoredHit[];
+            expect(hits.map((h) => h.id)).toEqual([
+              "nodes/caching-overview",
+              "nodes/misc-perf",
+            ]);
+            expect(hits[0].score).toBeGreaterThan(hits[1].score);
+          },
+        },
+      ],
+    },
+    {
+      id: "J10-05",
+      title: "`--json` exposes each hit's relevance score and per-signal breakdown",
+      actions: [
+        {
+          args: ["search", "deployment", "--json"],
+          json: (data) => {
+            const hits = data as ScoredHit[];
+            expect(hits.length).toBeGreaterThan(0);
+            for (const h of hits) {
+              expect(typeof h.score).toBe("number");
+              // Lexical mode surfaces a single per-signal score, equal to the total.
+              expect(typeof h.scores.lexical).toBe("number");
+              expect(h.scores.lexical).toBe(h.score);
+            }
+            // Results are ordered by descending score.
+            const scores = hits.map((h) => h.score);
+            expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+          },
+        },
+      ],
+    },
+    {
+      id: "J10-06",
+      title:
+        "`--limit` caps how many hits come back; a term with no match returns an empty result cleanly",
+      actions: [
+        // "deployment" matches two nodes; --limit 1 returns only the top one.
+        {
+          args: ["search", "deployment", "--limit", "1", "--json"],
+          json: (data) =>
+            expect(searchOrder(data)).toEqual(["nodes/deployment-guide"]),
+        },
+        // A term in no node is not an error — a clean empty result.
+        { args: ["search", "nonexistentxyz"], stdout: ["No results found."] },
+        {
+          args: ["search", "nonexistentxyz", "--json"],
+          json: (data) => expect(data).toEqual([]),
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J11 — "An agent edited a node's file behind my back; I review the change."
+ * The steward side of governance (distinct from J7's review gate, which holds
+ * *new* CLI/agent writes): `ctx drift` catches edits made straight to a node's
+ * file on disk — bypassing the CLI, so its stored checksum no longer matches —
+ * and routes them through a decision. Detection and staging never touch the
+ * canonical node or its hash chain; only an approval writes a new version.
+ */
+type DriftError = { type: string; document: string };
+const driftedDocs = (data: unknown) =>
+  (data as { drifted: DriftError[] }).drifted.map((d) => d.document);
+
+type SuggestionMeta = { suggestion_id: string; source: string };
+const suggestionList = (data: unknown) =>
+  data as { count: number; suggestions: SuggestionMeta[] };
+
+// The body a teammate hand-edits on disk, outside the CLI.
+const POLICY_BEFORE = "Access requires MFA.";
+const POLICY_AFTER = "Access requires MFA and a hardware key.";
+const editPolicyBodyOnDisk = (vault: string) => {
+  const p = join(vault, "nodes", "policy.md");
+  writeFileSync(p, readFileSync(p, "utf-8").replace(POLICY_BEFORE, POLICY_AFTER));
+};
+
+// A suggestion id is minted at `stage` time (timestamp-based), so later
+// approve/reject steps read it from here via the harness's function-form args.
+// Anchored to the "Staged suggestion" line (not a bare `s_` token anywhere in
+// the output) and throws on no match — so a wording change fails loudly right
+// here, instead of letting an empty or stale id silently drive the wrong
+// command downstream. A successful capture overwrites the previous id, so the
+// J11-05 re-stage can't reuse J11-03's.
+let j11Sid = "";
+const captureSid = (r: RunResult) => {
+  const m = r.stdout.match(/Staged suggestion (s_\S+)/);
+  if (!m) throw new Error(`J11: no suggestion id in drift-stage output:\n${r.stdout}`);
+  j11Sid = m[1];
+};
+
+const J11: Journey = {
+  id: "J11",
+  title: "Review an out-of-band correction to a node (drift steward)",
+  cases: [
+    {
+      id: "J11-01",
+      title: "A steward's published vault starts with no drift",
+      actions: [
+        { args: ["init", "--name", "governed handbook"], stdout: ["Initialized"] },
+        // Review OFF so the node lands published with a stored checksum — the
+        // baseline `drift` compares the file on disk against.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/policy",
+            "--type", "document",
+            "--title", "Security policy",
+            "--tags", "#policy",
+            "--body", POLICY_BEFORE,
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/policy.md", exists: true, contains: POLICY_BEFORE }],
+        },
+        { args: ["drift", "scan"], stdout: ["No drift detected."] },
+        {
+          args: ["drift", "scan", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect(driftedDocs(data)).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J11-02",
+      title: "An edit made outside the CLI is caught as drift",
+      actions: [
+        // The teammate's hand-edit lands on disk before the scan runs.
+        {
+          mutate: editPolicyBodyOnDisk,
+          args: ["drift", "scan"],
+          status: 1,
+          // Assert the words, not the ✗ glyph (Windows stdout decode).
+          stdout: ["1 drifted document(s)", "nodes/policy"],
+        },
+        {
+          args: ["drift", "scan", "--json"],
+          status: 1, // scan exits non-zero when it finds drift, JSON still on stdout
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(false);
+            expect(driftedDocs(data)).toEqual(["nodes/policy"]);
+            expect((data as { drifted: DriftError[] }).drifted[0].type).toBe("body_drift");
+          },
+        },
+      ],
+    },
+    {
+      id: "J11-03",
+      title: "Staging the edit records a suggestion without changing the node",
+      actions: [
+        // Stage proceeds without -y (non-destructive); it writes a suggestion,
+        // not the canonical node. Capture the minted id for J11-04/05.
+        {
+          args: ["drift", "stage", "nodes/policy"],
+          stdout: ["Staged suggestion", "out-of-band-edit", "standard"],
+          capture: captureSid,
+        },
+        {
+          args: ["drift", "list", "nodes/policy"],
+          stdout: ["1 suggestion(s) for nodes/policy"],
+        },
+        {
+          args: ["drift", "list", "nodes/policy", "--json"],
+          json: (data) => {
+            const l = suggestionList(data);
+            expect(l.count).toBe(1);
+            expect(l.suggestions[0].source).toBe("out-of-band-edit");
+            expect(l.suggestions[0].suggestion_id).toMatch(/^s_/);
+          },
+        },
+        // The node itself is untouched: still one version, chain still intact.
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
+        },
+        { args: ["verify"], stdout: ["All integrity checks passed"] },
+      ],
+    },
+    {
+      id: "J11-04",
+      title: "Rejecting a suggestion archives it and keeps the approved node",
+      actions: [
+        {
+          args: () => [
+            "drift", "reject", "nodes/policy", j11Sid,
+            "--reason", "superseded by SSO rollout",
+          ],
+          stdout: ["Rejected", "superseded by SSO rollout"],
+        },
+        // The suggestion is gone and no new version was created.
+        {
+          args: ["drift", "list", "nodes/policy", "--json"],
+          json: (data) => expect(suggestionList(data).count).toBe(0),
+        },
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
+        },
+        // Honest subtlety: reject is a decision, not a revert — the file on disk
+        // still carries the drifted bytes, so scan still flags it.
+        { args: ["drift", "scan"], status: 1, stdout: ["1 drifted document(s)"] },
+      ],
+    },
+    {
+      id: "J11-05",
+      title: "Staging and approving the edit makes it a new version",
+      actions: [
+        // Re-stage the still-present drift; capture the new id.
+        {
+          args: ["drift", "stage", "nodes/policy"],
+          stdout: ["Staged suggestion"],
+          capture: captureSid,
+        },
+        // Approve is the one guarded write — it refuses without confirmation.
+        {
+          args: () => ["drift", "approve", "nodes/policy", j11Sid],
+          status: 1,
+          stderr: ["Refusing without confirmation", "Non-interactive session"],
+        },
+        // The refused approve wrote nothing — the node is still its first version.
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1]),
+        },
+        {
+          args: () => ["drift", "approve", "nodes/policy", j11Sid, "-y"],
+          stdout: ["Approved", "new version: v2"],
+        },
+        // The edit is now the node's content, as a clean second version.
+        { args: ["drift", "scan"], stdout: ["No drift detected."] },
+        {
+          args: ["history", "nodes/policy", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1, 2]),
+        },
+        { args: ["verify"], stdout: ["All integrity checks passed"] },
+        { args: ["read", "nodes/policy", "--raw"], stdout: [POLICY_AFTER] },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -1781,5 +2361,16 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J8 — keep a vault encrypted at rest", () => {
     runJourney({ installDir: INSTALL, scratch }, J8);
+  });
+
+  it("J9 — build a knowledge base from PDFs", () => {
+    runJourney({ installDir: INSTALL, scratch }, J9);
+  });
+
+  it("J10 — find the right node with lexical search", () => {
+    runJourney({ installDir: INSTALL, scratch }, J10);
+  });
+  it("J11 — review an out-of-band correction to a node (drift steward)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J11);
   });
 });
