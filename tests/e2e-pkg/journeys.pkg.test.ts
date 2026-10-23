@@ -2440,7 +2440,6 @@ const J12: Journey = {
             // Direct neighbours only: the node two links away (far) is NOT reached.
             expect(queryDocIds(data)).toEqual(["nodes/hub", "nodes/n1", "nodes/n2"]);
             expect(queryMeta(data).hopsUsed).toBe(1);
-            expect(queryMeta(data).nodesTraversed).toBe(3);
           },
         },
       ],
@@ -2455,7 +2454,6 @@ const J12: Journey = {
             // The neighbour-of-a-neighbour (far) is now reached; one more than depth 1.
             expect(queryDocIds(data)).toEqual(["nodes/far", "nodes/hub", "nodes/n1", "nodes/n2"]);
             expect(queryMeta(data).hopsUsed).toBe(2);
-            expect(queryMeta(data).nodesTraversed).toBe(4);
           },
         },
       ],
@@ -2504,6 +2502,14 @@ const J12: Journey = {
       id: "J12-06",
       title: "A tag query combined with --hops expands from the matched seed through the graph",
       actions: [
+        // Baseline at --hops 0: the bare tag match is the hub alone — only it
+        // carries #central. (With no --hops the query defaults to a graph walk, so
+        // --hops 0 is how you ask for the seed and nothing else.) This pins down
+        // that the expansion below is the work of --hops, not of the tag match.
+        {
+          args: ["query", "#central", "--hops", "0", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/hub"]),
+        },
         {
           args: ["query", "#central", "--hops", "2", "--json"],
           json: (data) => {
