@@ -102,6 +102,28 @@ jobs:
             DEPENDENCIES.md
             dependency-graph.json
 
+  spec-sync-scripts:
+    name: Spec sync scripts (transform + licence guard)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Plain node:test, no install needed. Same suites the sync workflow runs
+      # before it publishes, so a regression shows up here first.
+      - name: Test
+        run: node --test scripts/spec-sync/transform-spec.test.mjs scripts/spec-sync/guard-spec.test.mjs
+
   docker:
     name: Docker image (MCP server)
     runs-on: ubuntu-latest
