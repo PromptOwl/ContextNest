@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 const pkg = createRequire(import.meta.url)("./package.json") as { version: string };
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/api/index.ts"],
+  entry: ["src/index.ts", "src/api/index.ts", "src/plugins/index.ts"],
   format: ["esm"],
   dts: true,
   clean: true,

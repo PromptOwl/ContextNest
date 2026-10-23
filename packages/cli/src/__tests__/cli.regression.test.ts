@@ -2180,6 +2180,7 @@ describe("[regression] file safety — command coverage", () => {
     "init", "add", "update", "delete", "forget", "publish", "index", "welcome",
     "checkpoint rebuild", "drift stage", "drift approve", "drift reject",
     "vault add", "vault describe", "vault remove", "vault default", "vault prune",
+    "plugin add", "plugin set", "plugin remove", "plugin pull", "plugin promote",
     "import pdf",
     "import jats", "import pubmed", "enrich pubtator",
   ];
