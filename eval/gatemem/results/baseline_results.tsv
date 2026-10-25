@@ -1,0 +1,5 @@
+mode	domain	U	A	F	MGS	n
+long_context	medical	0.8095	0.0833	0.0113	73.4	579
+long_context	office	0.5974	0.3509	0.0450	37.0	547
+long_context	education	0.7556	0.1167	0.1000	60.1	540
+long_context	household	0.6902	0.1522	0.0870	53.4	552
