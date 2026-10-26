@@ -167,7 +167,8 @@ wire; in-process callers supply it, wire transports leave it undefined.
 connectors written against an Apache-2.0 SDK that bring outside sources into a vault (raw or summarized) and
 answer queries live. The host owns everything a plugin must not: node upserts keyed on
 `metadata.provenance` (`plugin` + `externalId`), the never-overwrite-a-human-edit rule, the wrapped `fetch`
-(no loopback/private hosts, timeouts, per-run budget) and the `distill` port. It registers the `sync`
+(no loopback/private hosts, timeouts, per-run budget — a guard for honest plugins, not a sandbox: a plugin
+runs in-process, so the host decides which plugins to trust) and the `distill` port. It registers the `sync`
 namespace of the operation catalog as an `EngineExtension`.
 
 ```ts

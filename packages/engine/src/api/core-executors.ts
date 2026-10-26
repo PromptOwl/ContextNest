@@ -2131,6 +2131,13 @@ const locked =
   (ctx, input) =>
     withVaultLock(ctx.storage.root, () => Promise.resolve(executor(ctx, input)));
 
+/**
+ * `create` / `update` WITHOUT the vault lock, for an engine-internal caller
+ * that already holds it around a read-check-write (the plugin host's
+ * never-overwrite-a-human-edit rule). Not re-exported from the package.
+ */
+export const UNLOCKED_WRITE_EXECUTORS = Object.freeze({ context_create: create, context_update: update });
+
 /** name → executor for the built-in `core` namespace. */
 export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Object.freeze({
   context_query: query,

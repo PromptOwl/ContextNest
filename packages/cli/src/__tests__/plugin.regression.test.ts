@@ -145,7 +145,9 @@ describe("[regression] ctx plugin", () => {
     expect(yaml).not.toMatch(/token: /);
   });
 
-  it("with no secure store, set refuses to write a secret in plaintext and names the env var; the env var alone still works", () => {
+  // Windows always has Credential Manager, so this env still has a secure store
+  // there (and the test would write a real credential).
+  it.skipIf(process.platform === "win32")("with no secure store, set refuses to write a secret in plaintext and names the env var; the env var alone still works", () => {
     ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
     const r = run(tmp, ["plugin", "set", "memo", "prefix=Memo", "token=sekrit"], NO_STORE_ENV);
     expect(r.status).not.toBe(0);
@@ -205,6 +207,46 @@ describe("[regression] ctx plugin", () => {
     ok(tmp, ["plugin", "remove", "memo", "--yes"]);
     expect(ok(tmp, ["plugin", "list"])).not.toMatch(/memo/);
     expect(ok(tmp, ["read", r.results[0].id])).toMatch(/first memo/);
+  });
+
+  it("a plugin recorded in a vault but never added on this machine is not imported — a cloned vault cannot run its own code (#108 review)", () => {
+    const marker = join(tmp, "ran.txt");
+    writeFileSync(join(tmp, "plugins", "evil.mjs"), `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "x"); export default {};`);
+    writeFileSync(join(tmp, ".context", "plugins.yaml"), "version: 1\nplugins:\n  evil:\n    package: ./plugins/evil.mjs\n");
+    const listed = run(tmp, ["plugin", "list", "--json"]);
+    expect(listed.status).toBe(0);
+    expect(listed.stdout).toMatch(/not trusted on this machine/);
+    run(tmp, ["plugin", "search", "x", "--json"]);
+    run(tmp, ["plugin", "pull", "evil", "--json"]);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("a plugin file changed since add is refused until it is added again (#108 review)", () => {
+    ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
+    ok(tmp, ["plugin", "set", "memo", "prefix=Memo", "token=sekrit"]);
+    writeFileSync(pluginFile, PLUGIN_SRC + "\n// edited\n");
+    const r = run(tmp, ["plugin", "pull", "memo", "--json"]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr + r.stdout).toMatch(/changed since it was added/);
+    ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
+    expect(JSON.parse(ok(tmp, ["plugin", "pull", "memo", "--json"])).created).toBe(1);
+  });
+
+  it("a pull that fails before it starts is recorded, so list does not show a stale status (#108 review)", () => {
+    writeFileSync(join(tmp, "plugins", "strict.mjs"), PLUGIN_SRC.replace('name: "memo"', 'name: "strict"').replace("pull(ctx, cursor) {", "validateSettings(s) { if (!s.prefix) throw new Error('prefix required'); },\n  pull(ctx, cursor) {"));
+    ok(tmp, ["plugin", "add", "./plugins/strict.mjs"]);
+    const r = run(tmp, ["plugin", "pull", "strict", "--json"]);
+    expect(r.status).not.toBe(0);
+    const row = JSON.parse(ok(tmp, ["plugin", "list", "--json"])).plugins[0];
+    expect(row).toMatchObject({ name: "strict", last_status: "error" });
+  });
+
+  it("refuses a plain-http distill endpoint off localhost — item bodies and the token would travel in clear (#108 review)", () => {
+    ok(tmp, ["plugin", "add", "./plugins/memo.mjs"]);
+    ok(tmp, ["plugin", "set", "memo", "prefix=Memo", "token=sekrit"]);
+    const r = run(tmp, ["plugin", "pull", "memo", "--json"], { ...ENV, CONTEXTNEST_DISTILL_URL: "http://distill.example/api" });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr + r.stdout).toMatch(/must be https/);
   });
 
   it.each(["plugin add", "plugin set", "plugin remove", "plugin pull", "plugin promote", "plugin list", "plugin search"])("`ctx %s --help` exists", (name) => {

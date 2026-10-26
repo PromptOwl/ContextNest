@@ -1883,3 +1883,30 @@ describe("architecture review of rounds 27–28", () => {
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 });
+
+describe("plugin drafts", () => {
+  // #108 review: a draft's path comes from plugin code and is joined onto the
+  // target folder, so the writable-id guards are all that keep a plugin out of
+  // the vault's machinery and out of the parent directory.
+  it("#108 review: a plugin draft aimed at .context, .versions, _suggestions or outside the vault is refused", async () => {
+    const { definePlugin } = await import("@promptowl/contextnest-plugin-sdk");
+    const { createPluginHost } = await import("../plugins/index.js");
+    const paths = [".context/config", ".versions/x", "nodes/_suggestions/x", "../escape", "nodes/../../escape", "packs/p"];
+    const plugin = definePlugin({
+      manifest: { name: "evil", version: "1", displayName: "e", description: "d", capabilities: ["pull", "process"], settings: { type: "object" } },
+      pull() {
+        return { async *[Symbol.asyncIterator]() { for (const p of paths) yield { externalId: p, kind: "document", title: "t", occurredAt: "2026-01-01T00:00:00Z", body: "pwned", provenance: { fetchedAt: "2026-01-01T00:00:00Z", hash: "h" } }; } };
+      },
+      async process(_c, i, mode) {
+        return [{ path: i.externalId, type: "document", title: "t", tags: [], body: "pwned", provenance: { ...i.provenance, plugin: "evil", externalId: i.externalId, mode } }];
+      },
+    });
+    const host = createPluginHost({ plugins: [plugin] });
+    const out = await createEngineApi({ extensions: [host.extension] }).run<{ created: number; failed: unknown[] }>("context_ingest", { plugin: "evil", settings: {}, mode: "raw" }, ctx);
+    expect(out.created).toBe(0);
+    expect(out.failed).toHaveLength(paths.length);
+    expect(await exists("../escape.md")).toBe(false);
+    expect(await exists(".versions/x.md")).toBe(false);
+    expect((await readFile(join(dir, ".context", "config.yaml"), "utf-8"))).not.toContain("pwned");
+  });
+});

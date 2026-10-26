@@ -32,7 +32,8 @@ import {
 import { ContextNestError } from "../errors.js";
 import type { EngineExtension } from "../api/extension.js";
 import type { OperationContext } from "../api/context.js";
-import { CORE_EXECUTORS } from "../api/core-executors.js";
+import { CORE_EXECUTORS, UNLOCKED_WRITE_EXECUTORS } from "../api/core-executors.js";
+import { withVaultLock } from "../vault-lock.js";
 import { createSafeFetch, type SafeFetchOptions } from "./safe-fetch.js";
 import { defaultProcess, defaultFolder } from "./mapper.js";
 import { SYNC_OPERATIONS } from "./ops.js";
@@ -229,8 +230,15 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
     };
   }
 
-  /** The engine's own write path. Returns the outcome; never throws for a conflict. */
-  const engineWrite: DraftWriter = async (ctx, plugin, d, target) => {
+  /**
+   * The engine's own write path. Returns the outcome; never throws for a conflict.
+   * Read, human-edit check and write run under ONE vault lock: a human edit
+   * landing between the check and the write would otherwise be overwritten,
+   * and two concurrent pulls could both see "absent" and race on create.
+   */
+  const engineWrite: DraftWriter = (ctx, plugin, d, target) => withVaultLock(ctx.storage.root, () => engineWriteLocked(ctx, plugin, d, target));
+
+  const engineWriteLocked: DraftWriter = async (ctx, plugin, d, target) => {
     const id = joinPath(target.folder, d.path);
     const author = authorFor(plugin.manifest.name);
     const actorCtx: OperationContext = { ...ctx, actor: author };
@@ -258,7 +266,7 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
         editHash({ title: existing.frontmatter.title, tags: existing.frontmatter.tags, body: existing.body }) !== prev.bodyHash;
       if (humanEdited) return { id, outcome: "conflict" };
       if (prev.hash === d.provenance.hash && prev.mode === d.provenance.mode) return { id, outcome: "unchanged" };
-      await CORE_EXECUTORS.context_update(actorCtx, {
+      await UNLOCKED_WRITE_EXECUTORS.context_update(actorCtx, {
         id,
         title: d.title,
         content: d.body,
@@ -270,7 +278,7 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
       });
       return { id, outcome: "updated" };
     }
-    await CORE_EXECUTORS.context_create(actorCtx, {
+    await UNLOCKED_WRITE_EXECUTORS.context_create(actorCtx, {
       id,
       title: d.title,
       content: d.body,

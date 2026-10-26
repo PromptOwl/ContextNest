@@ -170,6 +170,32 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
     expect(doc.body).toContain("Human note.");
   });
 
+  it("a human edit racing a plugin update is not lost — read, check and write share one vault lock (#108 review)", async () => {
+    const first = await run(fakePlugin([item()]));
+    const id = first.results[0].id;
+    const realRead = ctx.storage.readDocument.bind(ctx.storage);
+    let human: Promise<unknown> | undefined;
+    // Land a human edit in the window between the host's read and its write.
+    ctx.storage.readDocument = (async (docId: string) => {
+      const doc = await realRead(docId);
+      if (docId === id && !human) {
+        human = createEngineApi().run("context_update", { id, append: "\n\nHuman note." }, ctx);
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      return doc;
+    }) as typeof ctx.storage.readDocument;
+    try {
+      const out = await run(fakePlugin([item({ body: "upstream changed", provenance: { ...item().provenance, hash: "h9" } })]));
+      await human;
+      expect(out.updated).toBe(1);
+    } finally {
+      ctx.storage.readDocument = realRead;
+    }
+    const doc = await ctx.storage.readDocument(id);
+    expect(doc.body).toContain("upstream changed");
+    expect(doc.body).toContain("Human note."); // queued behind the lock, applied on top — not overwritten
+  });
+
   it("a title-only or tags-only human edit also counts as a human edit (review finding #1)", async () => {
     const first = await run(fakePlugin([item()]));
     const id = first.results[0].id;
@@ -332,6 +358,43 @@ describe("createSafeFetch redirects", () => {
     const res = await f("https://api.example/a", { headers: { Authorization: "Bearer s3cret", Cookie: "sid=1", "X-Trace": "t" } });
     expect(res.status).toBe(200);
     expect(seen.map((s) => s.auth)).toEqual(["Bearer s3cret", "Bearer s3cret", null]);
+  });
+
+  it("stops after 5 redirects", async () => {
+    const { createSafeFetch } = await import("../plugins/safe-fetch.js");
+    const fetchFn = async () => new Response(null, { status: 302, headers: { location: "https://api.example/next" } });
+    const f = createSafeFetch({ fetchFn: fetchFn as any, lookupFn: async () => [{ address: "93.184.216.34" }] });
+    await expect(f("https://api.example/a")).rejects.toThrow(/more than 5 redirects/);
+  });
+});
+
+describe("createSafeFetch signals and bodies (#108 review)", () => {
+  const lookupFn = async () => [{ address: "93.184.216.34" }];
+
+  it("an already-aborted signal, on init or on a Request, sends nothing", async () => {
+    const { createSafeFetch } = await import("../plugins/safe-fetch.js");
+    const fetchFn = vi.fn(async () => new Response("ok"));
+    const f = createSafeFetch({ fetchFn: fetchFn as any, lookupFn });
+    const ac = new AbortController();
+    ac.abort(new Error("stop"));
+    await expect(f("https://api.example/a", { signal: ac.signal })).rejects.toThrow(/stop/);
+    await expect(f(new Request("https://api.example/a", { signal: ac.signal }))).rejects.toThrow();
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("a Request's body is resent on a 307; a streamed body is refused, not resent empty", async () => {
+    const { createSafeFetch } = await import("../plugins/safe-fetch.js");
+    const bodies: Array<string | null> = [];
+    const fetchFn = async (input: any, init: any) => {
+      bodies.push(init.body instanceof ArrayBuffer ? new TextDecoder().decode(init.body) : init.body ? "(stream)" : null);
+      return String(input) === "https://api.example/a" ? new Response(null, { status: 307, headers: { location: "https://api.example/b" } }) : new Response("ok");
+    };
+    const f = createSafeFetch({ fetchFn: fetchFn as any, lookupFn });
+    const res = await f(new Request("https://api.example/a", { method: "POST", body: "payload" }));
+    expect(res.status).toBe(200);
+    expect(bodies).toEqual(["payload", "payload"]);
+    const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("x")); c.close(); } });
+    await expect(f("https://api.example/a", { method: "POST", body: stream, duplex: "half" } as any)).rejects.toThrow(/streamed body/);
   });
 });
 

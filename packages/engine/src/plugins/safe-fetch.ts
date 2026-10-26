@@ -7,10 +7,14 @@
  * Every call carries a timeout, and a per-run budget caps how many calls one
  * ingest may make.
  *
- * Honest scope: the check resolves the name and then lets `fetch` resolve it
- * again, so a DNS answer that flips between the two lookups (rebinding) is
- * not caught. Pinning the socket to the checked address needs an undici
- * dispatcher, which the engine deliberately does not depend on.
+ * Honest scope: this guards honest plugins against SSRF mistakes; it is not a
+ * sandbox. A plugin runs in-process and can reach the network without
+ * `ctx.fetch` — trusting a plugin to load is the security boundary (the CLI
+ * records that trust per machine at `ctx plugin add`). The check also resolves
+ * the name and then lets `fetch` resolve it again, so a DNS answer that flips
+ * between the two lookups (rebinding) is not caught. Pinning the socket to the
+ * checked address needs an undici dispatcher, which the engine deliberately
+ * does not depend on.
  */
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
@@ -127,8 +131,14 @@ export function createSafeFetch(opts: SafeFetchOptions = {}): typeof fetch {
 
   const safeFetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     let url = new URL(input instanceof Request ? input.url : String(input));
-    const baseInit: RequestInit = input instanceof Request ? { method: input.method, headers: input.headers, body: input.body as BodyInit, ...init } : { ...init };
+    // A Request's body is a one-shot stream: buffer it so a 307/308 hop can resend it.
+    const baseInit: RequestInit =
+      input instanceof Request
+        ? { method: input.method, headers: input.headers, signal: input.signal, ...(input.body ? { body: await input.arrayBuffer() } : {}), ...init }
+        : { ...init };
+    const outer = baseInit.signal ?? undefined;
     for (let hop = 0; ; hop++) {
+      outer?.throwIfAborted();
       if (used >= budget) throw new Error(`fetch refused: per-run budget of ${budget} calls exhausted`);
       used++;
       if (url.protocol !== "https:" && !(opts.allowInsecure && url.protocol === "http:")) {
@@ -137,7 +147,6 @@ export function createSafeFetch(opts: SafeFetchOptions = {}): typeof fetch {
       await assertPublicHost(url.hostname, lookupFn);
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(new Error(`fetch timed out after ${timeoutMs}ms`)), timeoutMs);
-      const outer = init?.signal;
       const onAbort = () => ac.abort(outer?.reason);
       outer?.addEventListener("abort", onAbort, { once: true });
       try {
@@ -145,6 +154,9 @@ export function createSafeFetch(opts: SafeFetchOptions = {}): typeof fetch {
         const location = res.headers.get("location");
         if ([301, 302, 303, 307, 308].includes(res.status) && location) {
           if (hop >= MAX_REDIRECTS) throw new Error(`fetch refused: more than ${MAX_REDIRECTS} redirects`);
+          if ((res.status === 307 || res.status === 308) && baseInit.body instanceof ReadableStream) {
+            throw new Error(`fetch refused: cannot resend a streamed body across a ${res.status} redirect`);
+          }
           const next = new URL(location, url);
           // A cross-origin hop never carries the plugin's credentials along.
           if (next.origin !== url.origin) baseInit.headers = withoutCredentials(baseInit.headers);

@@ -18,13 +18,14 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import yaml from "js-yaml";
 import type { Command } from "commander";
 import chalk from "./color.js";
 import { createEngineApi, type OperationContext } from "@promptowl/contextnest-engine/api";
-import { NestStorage } from "@promptowl/contextnest-engine";
+import { NestStorage, getRegistryDir } from "@promptowl/contextnest-engine";
 import { createPluginHost, loadPlugins, trimSlashes, type Distiller } from "@promptowl/contextnest-engine/plugins";
 import { secretKeys, type NestPlugin } from "@promptowl/contextnest-plugin-sdk";
 import { confirmOrExit } from "./safety.js";
@@ -56,7 +57,6 @@ export interface PluginCmdDeps {
 }
 
 const FILE = path.join(".context", "plugins.yaml");
-const mask = (v: unknown) => (typeof v === "string" && v.length > 4 ? `••••${v.slice(-4)}` : "••••");
 
 function readFile(root: string): PluginsFile {
   const p = path.join(root, FILE);
@@ -93,10 +93,76 @@ function resolveSpec(root: string, spec: string): string {
   return spec; // let import() try the global resolution and report
 }
 
-async function loadOne(root: string, spec: string): Promise<NestPlugin> {
+/**
+ * Per-machine plugin trust. `.context/plugins.yaml` lives in the vault, so a
+ * cloned or shared vault could name its own `./evil.mjs`; importing that on a
+ * plain `ctx plugin list` would run it. `add` is the operator's explicit trust
+ * decision: it records the resolved module and a hash of its file OUTSIDE the
+ * vault, and every other command imports only a module that still matches.
+ */
+interface TrustEntry {
+  href: string;
+  sha256: string | null;
+}
+const trustPath = () => path.join(getRegistryDir(), "plugin-trust.json");
+function trustKey(root: string, name: string): string {
+  let real = root;
+  try {
+    real = fs.realpathSync(root);
+  } catch {
+    /* keep as given */
+  }
+  return `${real}#${name}`;
+}
+function readTrust(): Record<string, TrustEntry> {
+  try {
+    return JSON.parse(fs.readFileSync(trustPath(), "utf-8")) as Record<string, TrustEntry>;
+  } catch {
+    return {};
+  }
+}
+function writeTrust(map: Record<string, TrustEntry>): void {
+  fs.mkdirSync(path.dirname(trustPath()), { recursive: true });
+  fs.writeFileSync(trustPath(), JSON.stringify(map, null, 2), { mode: 0o600 });
+}
+// ponytail: hashes the entry file only, not what it imports; a package upgrade
+// or edit of the entry still forces a re-add. Hash the package tree if needed.
+function fingerprint(href: string): TrustEntry {
+  if (!href.startsWith("file:")) return { href, sha256: null };
+  return { href, sha256: createHash("sha256").update(fs.readFileSync(fileURLToPath(href))).digest("hex") };
+}
+
+async function importSpec(root: string, spec: string): Promise<NestPlugin> {
   const { plugins, errors } = await loadPlugins([spec], (s) => import(resolveSpec(root, s)));
   if (errors.length) throw new Error(`${spec}: ${errors[0].error}`);
   return plugins[0];
+}
+
+/** `add` only: import a module the operator just named; the caller records the trust once it keeps the entry. */
+async function loadForAdd(root: string, spec: string): Promise<{ plugin: NestPlugin; trust: TrustEntry }> {
+  const trust = fingerprint(resolveSpec(root, spec));
+  return { plugin: await importSpec(root, spec), trust };
+}
+function setTrust(root: string, name: string, entry: TrustEntry | undefined): void {
+  const map = readTrust();
+  if (entry) map[trustKey(root, name)] = entry;
+  else delete map[trustKey(root, name)];
+  writeTrust(map);
+}
+
+/** Every other command: import only what `add` trusted, unchanged since. */
+async function loadOne(root: string, name: string, spec: string): Promise<NestPlugin> {
+  const trusted = readTrust()[trustKey(root, name)];
+  let fp: TrustEntry | null = null;
+  try {
+    fp = fingerprint(resolveSpec(root, spec));
+  } catch {
+    /* missing file: reported as untrusted below */
+  }
+  if (!trusted || !fp || trusted.href !== fp.href || trusted.sha256 !== fp.sha256) {
+    throw new Error(`not trusted on this machine, or changed since it was added. Review ${spec}, then run: ctx plugin add ${spec}`);
+  }
+  return importSpec(root, spec);
 }
 
 async function loadAll(root: string, file: PluginsFile): Promise<{ plugins: NestPlugin[]; errors: string[] }> {
@@ -104,7 +170,7 @@ async function loadAll(root: string, file: PluginsFile): Promise<{ plugins: Nest
   const errors: string[] = [];
   for (const [name, entry] of Object.entries(file.plugins)) {
     try {
-      const p = await loadOne(root, entry.package);
+      const p = await loadOne(root, name, entry.package);
       if (p.manifest.name !== name) throw new Error(`package now reports name "${p.manifest.name}", recorded as "${name}"`);
       plugins.push(p);
     } catch (e) {
@@ -120,6 +186,11 @@ const secrets = new PluginSecretStore();
 async function resolveSettings(root: string, plugin: NestPlugin, entry: PluginEntry): Promise<Record<string, unknown>> {
   const name = plugin.manifest.name;
   const stored = entry.stored_secrets?.length ? await secrets.load(root, name) : {};
+  const missing = (entry.stored_secrets ?? []).filter((k) => !(k in stored) && !process.env[pluginEnvKey(name, k)]);
+  if (missing.length) {
+    // Secrets are keyed on the vault's real path: a moved/renamed vault, or another machine, finds none.
+    console.error(chalk.yellow(`! ${name}: ${missing.join(", ")} not found in the secure store (vault moved or renamed?). Set ${missing.length === 1 ? "it" : "them"} again: ctx plugin set ${name} ${missing.map((k) => `${k}=…`).join(" ")}`));
+  }
   return resolvePluginSettings(name, Object.keys(plugin.manifest.settings.properties ?? {}), entry.settings ?? {}, stored);
 }
 
@@ -157,6 +228,11 @@ async function migrateLegacySecrets(root: string, plugin: NestPlugin, entry: Plu
 function distillerFromEnv(): Distiller | undefined {
   const url = process.env.CONTEXTNEST_DISTILL_URL;
   if (!url) return undefined;
+  // Item bodies and the bearer token go here: https, or plain http to loopback only.
+  const u = new URL(url);
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname))) {
+    throw new Error(`CONTEXTNEST_DISTILL_URL must be https (or http on localhost), got ${u.protocol}//${u.host}`);
+  }
   const token = process.env.CONTEXTNEST_DISTILL_TOKEN;
   return async (input) => {
     const res = await fetch(url, {
@@ -231,7 +307,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
     .description("Validate a plugin package (name or path) and record it for this vault")
     .action(async (spec: string) => {
       const root = deps.getVaultRoot();
-      const plugin = await loadOne(root, spec);
+      const { plugin, trust } = await loadForAdd(root, spec);
       const file = readFile(root);
       const name = plugin.manifest.name;
       if (file.plugins[name] && file.plugins[name].package !== spec) {
@@ -239,6 +315,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       }
       file.plugins[name] = { ...(file.plugins[name] ?? {}), package: spec, secrets: secretKeys(plugin.manifest) };
       writeFile(root, file);
+      setTrust(root, name, trust);
       console.log(`${chalk.green("✓")} ${chalk.bold(name)} v${plugin.manifest.version} — ${plugin.manifest.description}`);
       console.log(chalk.dim(`  faces: ${plugin.manifest.capabilities.join(", ")}`));
       const req = ((plugin.manifest.settings as { required?: string[] }).required ?? []).join(", ");
@@ -258,7 +335,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const rows = Object.entries(file.plugins).map(([name, entry]) => {
         const p = plugins.find((x) => x.manifest.name === name);
         const isSecret = secretNamesFor(p, entry);
-        const settings: Record<string, unknown> = Object.fromEntries(Object.entries(entry.settings ?? {}).map(([k, v]) => [k, isSecret(k) ? mask(v) : v]));
+        const settings: Record<string, unknown> = Object.fromEntries(Object.entries(entry.settings ?? {}).map(([k, v]) => [k, isSecret(k) ? "••••" : v]));
         for (const k of entry.stored_secrets ?? []) settings[k] = "•••• (secure store)";
         return { name, package: entry.package, version: p?.manifest.version, capabilities: p?.manifest.capabilities, mode: entry.mode ?? "raw", folder: entry.folder, settings, cursor: entry.cursor, last_run_at: entry.last_run_at, last_status: entry.last_status, error: errors.find((e) => e.startsWith(`${name}:`)) };
       });
@@ -288,7 +365,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const file = readFile(root);
       const entry = file.plugins[name];
       if (!entry) throw new Error(`No plugin "${name}" — add it first: ctx plugin add <package>`);
-      const plugin = await loadOne(root, entry.package);
+      const plugin = await loadOne(root, name, entry.package);
       const kv = parseKv(pairs, plugin.manifest.settings as { properties?: Record<string, { type?: string }> });
       const isSecret = secretNamesFor(plugin, entry);
       const { plain, secret } = splitSecretSettings(kv, isSecret);
@@ -326,6 +403,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       await confirmOrExit(`Remove plugin "${name}" from this vault? Its settings and cursor are forgotten; nodes stay.`, { destructive: true });
       delete file.plugins[name];
       writeFile(root, file);
+      setTrust(root, name, undefined);
       try {
         await secrets.clear(root, name);
       } catch (e) {
@@ -346,7 +424,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const file = readFile(root);
       const entry = file.plugins[name];
       if (!entry) throw new Error(`No plugin "${name}" — add it first: ctx plugin add <package>`);
-      const plugin = await loadOne(root, entry.package);
+      const plugin = await loadOne(root, name, entry.package);
       if (await migrateLegacySecrets(root, plugin, entry)) writeFile(root, file);
       const host = createPluginHost({ plugins: [plugin], distill: distillerFromEnv(), log: (l, m) => l !== "debug" && console.error(chalk.dim(`[${l}] ${m}`)) });
       const api = createEngineApi({ extensions: [host.extension] });
@@ -359,7 +437,17 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
         target: { folder: await targetFolder(root, opts.folder ?? entry.folder, name) },
         ...(deps.client() ? { client: deps.client() } : {}),
       };
-      const result = await api.run<{ created: number; updated: number; unchanged: number; conflicts: Array<{ externalId: string; id: string }>; failed: Array<{ externalId: string; error: string }>; clean: boolean; nextCursor?: unknown; results: unknown[] }>("context_ingest", input, deps.opContext(root));
+      type IngestOut = { created: number; updated: number; unchanged: number; conflicts: Array<{ externalId: string; id: string }>; failed: Array<{ externalId: string; error: string }>; clean: boolean; nextCursor?: unknown; results: unknown[] };
+      let result: IngestOut;
+      try {
+        result = await api.run<IngestOut>("context_ingest", input, deps.opContext(root));
+      } catch (e) {
+        // A run that never started (bad settings, unknown face) is still a run: don't leave `list` showing a stale "clean".
+        entry.last_run_at = new Date().toISOString();
+        entry.last_status = "error";
+        writeFile(root, file);
+        throw e;
+      }
       if (result.clean && result.nextCursor !== undefined) entry.cursor = result.nextCursor;
       entry.last_run_at = new Date().toISOString();
       entry.last_status = result.clean ? "clean" : result.failed.length ? "failed" : "conflicts";
@@ -423,7 +511,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
       const file = readFile(root);
       const entry = file.plugins[name];
       if (!entry) throw new Error(`No plugin "${name}"`);
-      const plugin = await loadOne(root, entry.package);
+      const plugin = await loadOne(root, name, entry.package);
       if (await migrateLegacySecrets(root, plugin, entry)) writeFile(root, file);
       const host = createPluginHost({ plugins: [plugin], distill: distillerFromEnv() });
       const api = createEngineApi({ extensions: [host.extension] });
