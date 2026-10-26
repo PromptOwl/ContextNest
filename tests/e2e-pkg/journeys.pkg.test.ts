@@ -2532,9 +2532,14 @@ const validateReport = (data: unknown) => data as ValidateReport;
 
 // Rewrite a node's frontmatter `type:` on disk, outside the CLI — the health
 // story's "I hand-edited a node into an invalid state" (and the later fix).
+// Guard first: a plain-string replace is a silent no-op if the seed format
+// drifts, so assert the line is present — a changed fixture then fails right
+// here, clearly, instead of surfacing as a confusing validate mismatch later.
 const setNodeTypeOnDisk = (vault: string, id: string, from: string, to: string) => {
   const p = join(vault, `${id}.md`);
-  writeFileSync(p, readFileSync(p, "utf-8").replace(`type: ${from}`, `type: ${to}`));
+  const src = readFileSync(p, "utf-8");
+  expect(src, `${id}.md should contain "type: ${from}" to rewrite`).toContain(`type: ${from}`);
+  writeFileSync(p, src.replace(`type: ${from}`, `type: ${to}`));
 };
 
 // A node dropped straight onto disk, never seen by the CLI — so the generated
@@ -2578,8 +2583,13 @@ const writeLegacyStatusNode = (vault: string) => {
     ].join("\n"),
   );
 };
-const indexFileHasNode = (vault: string, file: string) =>
-  readFileSync(join(vault, file), "utf-8").includes(GAMMA_ID);
+// The node ids recorded as `- id:` entries in the generated context.yaml index
+// (only the `documents:` list uses that key) — stricter than a blind substring,
+// which would also match the id inside a title, a relationship, or a comment.
+const contextYamlDocIds = (vault: string) =>
+  [...readFileSync(join(vault, "context.yaml"), "utf-8").matchAll(/^\s*-\s*id:\s*(\S+)/gm)].map(
+    (m) => m[1],
+  );
 
 /**
  * J13 — "I check my vault's health and fix what's flagged."
@@ -2732,8 +2742,15 @@ const J13: Journey = {
           // the out-of-band node. (Asserted after the command, so it reflects the
           // regenerated files — not whatever was there before.)
           check: (v) => {
-            expect(indexFileHasNode(v, "context.yaml"), "context.yaml missing the new node").toBe(true);
-            expect(indexFileHasNode(v, "nodes/INDEX.md"), "INDEX.md missing the new node").toBe(true);
+            // context.yaml: the node is a real entry in the documents list.
+            expect(contextYamlDocIds(v), "context.yaml documents missing the new node").toContain(
+              GAMMA_ID,
+            );
+            // INDEX.md: the node is linked by its canonical URI in the generated table.
+            expect(
+              readFileSync(join(v, "nodes", "INDEX.md"), "utf-8"),
+              "INDEX.md missing the new node",
+            ).toContain(`contextnest://${GAMMA_ID}`);
           },
         },
       ],
