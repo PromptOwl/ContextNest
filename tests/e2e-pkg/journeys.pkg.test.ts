@@ -2523,6 +2523,260 @@ const J12: Journey = {
   ],
 };
 
+/** The shape `ctx validate --json` returns. */
+type ValidateReport = {
+  valid: boolean;
+  errors: Array<{ path: string; errors: Array<{ rule: number; field: string }> }>;
+};
+const validateReport = (data: unknown) => data as ValidateReport;
+
+// Rewrite a node's frontmatter `type:` on disk, outside the CLI — the health
+// story's "I hand-edited a node into an invalid state" (and the later fix).
+// Guard first: a plain-string replace is a silent no-op if the seed format
+// drifts, so assert the line is present — a changed fixture then fails right
+// here, clearly, instead of surfacing as a confusing validate mismatch later.
+const setNodeTypeOnDisk = (vault: string, id: string, from: string, to: string) => {
+  const p = join(vault, `${id}.md`);
+  const src = readFileSync(p, "utf-8");
+  expect(src, `${id}.md should contain "type: ${from}" to rewrite`).toContain(`type: ${from}`);
+  writeFileSync(p, src.replace(`type: ${from}`, `type: ${to}`));
+};
+
+// A node dropped straight onto disk, never seen by the CLI — so the generated
+// index (context.yaml, nodes/INDEX.md) is stale until `ctx index` rebuilds it.
+const GAMMA_ID = "nodes/gamma";
+const writeUnindexedNode = (vault: string) => {
+  writeFileSync(
+    join(vault, "nodes", "gamma.md"),
+    [
+      "---",
+      "title: Gamma",
+      "type: document",
+      "tags:",
+      "  - '#ops'",
+      "status: published",
+      "version: 1",
+      "---",
+      "",
+      "Gamma body mentions kangaroo.",
+      "",
+    ].join("\n"),
+  );
+};
+// A node written with a legacy status label (`archived`, a synonym the engine
+// maps to the canonical `rejected`) — `ctx index` canonicalizes it on disk.
+const writeLegacyStatusNode = (vault: string) => {
+  writeFileSync(
+    join(vault, "nodes", "legacy.md"),
+    [
+      "---",
+      "title: Legacy Status Node",
+      "type: document",
+      "tags:",
+      "  - '#ops'",
+      "status: archived",
+      "version: 1",
+      "---",
+      "",
+      "Legacy body.",
+      "",
+    ].join("\n"),
+  );
+};
+// The node ids recorded as `- id:` entries in the generated context.yaml index
+// (only the `documents:` list uses that key) — stricter than a blind substring,
+// which would also match the id inside a title, a relationship, or a comment.
+const contextYamlDocIds = (vault: string) =>
+  [...readFileSync(join(vault, "context.yaml"), "utf-8").matchAll(/^\s*-\s*id:\s*(\S+)/gm)].map(
+    (m) => m[1],
+  );
+
+/**
+ * J13 — "I check my vault's health and fix what's flagged."
+ * The maintainer's periodic checkup. A well-formed vault passes `ctx validate`
+ * and `ctx doctor` clean. A node hand-edited into a spec violation is caught by
+ * `validate` (named, with its rule) and goes green once fixed. Then `ctx index`
+ * rebuilds the generated index (context.yaml + INDEX.md) so a node that landed
+ * on disk out-of-band is recorded, and a legacy status label is canonicalized.
+ *
+ * The review gate is turned OFF (like J2): this journey is about validation and
+ * index health, so the seed nodes should land published without a gate between.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J13: Journey = {
+  id: "J13",
+  title: "Keep the vault healthy — validate, index regen & doctor (maintainer)",
+  cases: [
+    {
+      id: "J13-01",
+      title: "A well-formed vault passes its checkup with every document conforming to the spec",
+      actions: [
+        { args: ["init", "--name", "health-check"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/alpha",
+            "--type", "document",
+            "--title", "Alpha",
+            "--tags", "#ops",
+            "--body", "Alpha body. See [[beta]].",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/alpha.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/beta",
+            "--type", "document",
+            "--title", "Beta",
+            "--tags", "#ops",
+            "--body", "Beta body.",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/beta.md", exists: true }],
+        },
+        // Human report: every node ticked, overall pass.
+        {
+          args: ["validate"],
+          stdout: ["✓ nodes/alpha", "✓ nodes/beta", "documents and 0 packs valid"],
+        },
+        // Machine report: clean.
+        {
+          args: ["validate", "--json"],
+          json: (data) => {
+            const r = validateReport(data);
+            expect(r.valid).toBe(true);
+            expect(r.errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-02",
+      title: "The environment checkup reports the versions, registry and current folder with no problems",
+      actions: [
+        {
+          args: ["doctor"],
+          stdout: ["CLI", "Engine", "Registry", "Current dir"],
+        },
+        {
+          args: ["doctor", "--json"],
+          json: (data) => {
+            const d = data as {
+              cli: { version: string };
+              engine: { version: string };
+              cwd: { in_vault: boolean };
+              registry: { missing: number };
+            };
+            expect(typeof d.cli.version).toBe("string");
+            expect(typeof d.engine.version).toBe("string");
+            // doctor ran from inside the vault, and nothing in the registry is missing.
+            expect(d.cwd.in_vault).toBe(true);
+            expect(d.registry.missing).toBe(0);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-03",
+      title: "A node hand-edited into a spec violation is flagged with the exact rule it breaks",
+      actions: [
+        // Break beta: mark it a source node but leave out the required source block.
+        {
+          mutate: (v) => setNodeTypeOnDisk(v, "nodes/beta", "document", "source"),
+          args: ["validate"],
+          status: 1,
+          stdout: [
+            "✗ nodes/beta",
+            "Rule 9: Source block is required when type is 'source'",
+            "Validation failed with errors",
+          ],
+          // alpha is untouched and still passes — only beta is flagged.
+          stdoutNot: ["✗ nodes/alpha"],
+        },
+        // Machine report names the document, the rule number and the field.
+        {
+          args: ["validate", "--json"],
+          status: 1,
+          json: (data) => {
+            const r = validateReport(data);
+            expect(r.valid).toBe(false);
+            const beta = r.errors.find((e) => e.path === "nodes/beta");
+            expect(beta, "expected a nodes/beta error entry").toBeDefined();
+            expect(beta!.errors.some((e) => e.rule === 9 && e.field === "source")).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-04",
+      title: "Fixing the node clears the flag and validation comes back clean",
+      actions: [
+        {
+          mutate: (v) => setNodeTypeOnDisk(v, "nodes/beta", "source", "document"),
+          args: ["validate"],
+          stdout: ["✓ nodes/beta", "documents and 0 packs valid"],
+          stdoutNot: ["✗ nodes/beta", "Validation failed"],
+        },
+        {
+          args: ["validate", "--json"],
+          json: (data) => expect(validateReport(data).valid).toBe(true),
+        },
+      ],
+    },
+    {
+      id: "J13-05",
+      title: "Regenerating the index records a node that landed on disk out-of-band",
+      actions: [
+        // Drop a node straight onto disk — the generated index is now stale.
+        {
+          mutate: writeUnindexedNode,
+          args: ["index"],
+          stdout: ["Generated context.yaml", "Generated nodes/INDEX.md"],
+          // The "N file(s) changed" action log is on stderr (the file-safety channel).
+          stderr: ["file(s) changed"],
+          // Proof the index was actually rebuilt: both generated files now carry
+          // the out-of-band node. (Asserted after the command, so it reflects the
+          // regenerated files — not whatever was there before.)
+          check: (v) => {
+            // context.yaml: the node is a real entry in the documents list.
+            expect(contextYamlDocIds(v), "context.yaml documents missing the new node").toContain(
+              GAMMA_ID,
+            );
+            // INDEX.md: the node is linked by its canonical URI in the generated table.
+            expect(
+              readFileSync(join(v, "nodes", "INDEX.md"), "utf-8"),
+              "INDEX.md missing the new node",
+            ).toContain(`contextnest://${GAMMA_ID}`);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-06",
+      title: "A node written with a legacy status label is canonicalized on disk",
+      actions: [
+        {
+          mutate: writeLegacyStatusNode,
+          args: ["index"],
+          stdout: ["Generated context.yaml"],
+          stderr: ["file(s) changed"],
+          // The legacy `archived` label is rewritten to the canonical `rejected`
+          // on disk — the index pass tidies status aliases in place.
+          check: (v) => {
+            const md = readFileSync(join(v, "nodes", "legacy.md"), "utf-8");
+            expect(md).toContain("status: rejected");
+            expect(md).not.toContain("status: archived");
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -2568,5 +2822,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J12 — explore the knowledge graph", () => {
     runJourney({ installDir: INSTALL, scratch }, J12);
+  });
+  it("J13 — keep the vault healthy (validate, index regen & doctor)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J13);
   });
 });
