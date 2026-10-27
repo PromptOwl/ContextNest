@@ -115,6 +115,31 @@ describe("manifest", () => {
     expect(actual).toEqual(expected);
   });
 
+  it("keeps frontmatter JSON cannot hold (!!binary, .inf, .nan, -0) through the manifest", async () => {
+    await storage.writeDocument(
+      "nodes/a/exotic",
+      doc("title: Exotic\ntype: source\nstatus: published\nversion: 1\ndescription: !!binary aGVsbG8=\nsource:\n  transport: mcp\n  server: s\n  tools: [t]\n  cache_ttl: .inf\nmetadata:\n  edge_priority: -0.0", "x"), // YAML `-0` is the integer 0; `-0.0` is negative zero
+    );
+    const docs = await storage.discoverDocuments({ includeRetired: true });
+    const manifest = buildManifest(docs, { checkpoint: 0, indexGeneratedAt: "t" });
+    await storage.writeManifest(manifest);
+    const back = (await storage.readManifest())!.documents["nodes/a/exotic"].frontmatter;
+    expect(back).toEqual(manifest.documents["nodes/a/exotic"].frontmatter);
+    expect(back.description).toBeInstanceOf(Uint8Array);
+    expect(back.source?.cache_ttl).toBe(Infinity);
+    expect(Object.is(back.metadata?.edge_priority, -0)).toBe(true);
+  });
+
+  it("a crawl rebuild leaves pending ids marked after it began", async () => {
+    await storage.regenerateIndex(); // manifest exists
+    const crawl = await storage.discoverDocuments({ includeRetired: true }); // an unlocked caller's crawl…
+    await storage.writeDocument("nodes/b/racer", doc("title: Racer\ntype: document\nstatus: published\nversion: 1", "x")); // …a write lands…
+    await storage.regenerateIndex({ docs: crawl }); // …and the rebuild finishes
+    await storage.writeDocument("nodes/c/later", doc("title: Later\ntype: document\nstatus: published\nversion: 1", "x"));
+    await storage.regenerateIndex({ changedIds: ["nodes/c/later"] });
+    expect((await storage.readContextYaml())?.documents.map((d) => d.id)).toContain("nodes/b/racer");
+  });
+
   it("goes stale when the vault's layout changes: the crawl lists other folders", async () => {
     const flat = await mkdtemp(join(tmpdir(), "cn-manifest-flat-"));
     try {

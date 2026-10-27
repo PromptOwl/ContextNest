@@ -1270,15 +1270,20 @@ export class NestStorage {
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
     let folders: Map<string, ContextNode[]>;
+    // The pending ids the manifest written below covers.
+    let covered: number;
     if (manifest) {
       // Every folder re-read is one a crawl would list, so all their INDEX.md files are due.
-      folders = await this.refreshManifest(manifest, opts.changedIds!);
+      ({ folders, pendingBytes: covered } = await this.refreshManifest(manifest, opts.changedIds!));
       const published = manifestDocuments(manifest).filter((d) => d.frontmatter.status === "published");
       contextYaml = generateContextYaml(published, config, latestCheckpoint, { linksOf: manifestLinks(manifest) });
       manifest.checkpoint = head;
       manifest.index_generated_at = contextYaml.generated_at;
       await this.writeManifest(manifest);
     } else {
+      // Read before our own crawl, so it covers them. A crawl handed in was
+      // taken earlier, by the caller: it vouches for no pending id.
+      covered = opts.docs ? 0 : (await this.readPending()).bytes;
       const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
       const published = docs.filter((d) => d.frontmatter.status === "published");
       contextYaml = generateContextYaml(published, config, latestCheckpoint);
@@ -1294,7 +1299,7 @@ export class NestStorage {
     }
     // Only once the manifest that covers them is on disk: a crash before this
     // leaves them pending, and the next update re-reads them.
-    await this.clearPendingIds();
+    await this.dropPending(covered);
     await this.writeContextYaml(contextYaml);
 
     // Distinct folders write distinct INDEX.md files, so the writes are
@@ -2296,8 +2301,9 @@ export class NestStorage {
     manifest: Manifest,
     ids: Iterable<string>,
     onUnreadable?: (id: string, reason: string) => void,
-  ): Promise<Map<string, ContextNode[]>> {
-    const spelled = new Set([...ids, ...(await this.readPendingIds())].map(folderOfId));
+  ): Promise<{ folders: Map<string, ContextNode[]>; pendingBytes: number }> {
+    const pending = await this.readPending();
+    const spelled = new Set([...ids, ...pending.ids].map(folderOfId));
     const folders = new Set<string>();
     for (const folder of spelled) {
       folders.add(folder && (await resolveIdCasing(folder, (relDir) =>
@@ -2314,15 +2320,30 @@ export class NestStorage {
       for (const doc of docs) manifest.documents[doc.id] = manifestEntry(doc);
       if (docs.length) read.set(folder, docs);
     }
-    return read;
+    return { folders: read, pendingBytes: pending.bytes };
   }
 
-  /** Whether the full crawl reads this folder's own files (its layout patterns, no dot segment). */
+  /**
+   * Whether the full crawl reads this folder's own files: its layout's
+   * patterns, no dot segment — and no symlink or junction on the way, which
+   * the crawl never descends. Read through one, a folder could be sealed
+   * history under another name (`VERSIO~1`), and its INDEX.md would be
+   * written into it.
+   */
   private async folderInLayout(folder: string): Promise<boolean> {
     if (folder.split("/").some((s) => s.startsWith("."))) return false;
-    if ((await this.detectLayout()) !== "structured") return true;
-    const top = folder.split("/")[0];
-    return folder === "" || top === "nodes" || top === "sources";
+    if ((await this.detectLayout()) === "structured") {
+      const top = folder.split("/")[0];
+      if (folder !== "" && top !== "nodes" && top !== "sources") return false;
+    }
+    if (folder === "") return true;
+    const [base, real] = await Promise.all([
+      realpath(this.root).catch(() => null),
+      realpath(join(this.root, ...folder.split("/"))).catch(() => null),
+    ]);
+    // Gone: nothing to list, and its stale entries are dropped by the caller.
+    if (!real) return true;
+    return !!base && relative(base, real).split(sep).join("/") === folder;
   }
 
   private pendingPath(): string {
@@ -2341,13 +2362,24 @@ export class NestStorage {
     });
   }
 
-  private async readPendingIds(): Promise<string[]> {
-    const raw = await readFile(this.pendingPath(), "utf-8").catch(() => "");
-    return raw.split("\n").filter(Boolean);
+  /** The pending ids, and how many bytes of the list they took — what a later {@link dropPending} may remove. */
+  private async readPending(): Promise<{ ids: string[]; bytes: number }> {
+    const raw = await readFile(this.pendingPath()).catch(() => Buffer.alloc(0));
+    return { ids: raw.toString("utf-8").split("\n").filter(Boolean), bytes: raw.length };
   }
 
-  private async clearPendingIds(): Promise<void> {
-    await unlink(this.pendingPath()).catch(() => {});
+  /**
+   * Remove the first `bytes` of the pending list: the ids a manifest now on
+   * disk covers. Never the whole file — an id appended after they were read
+   * (a write racing an unlocked rebuild) is not covered, and must stay.
+   */
+  private async dropPending(bytes: number): Promise<void> {
+    if (bytes === 0) return;
+    const raw = await readFile(this.pendingPath()).catch(() => null);
+    if (!raw) return;
+    const rest = raw.subarray(bytes);
+    if (rest.length === 0) await unlink(this.pendingPath()).catch(() => {});
+    else await writeFile(this.pendingPath(), rest);
   }
 
   /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */

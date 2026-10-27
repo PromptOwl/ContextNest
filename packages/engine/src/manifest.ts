@@ -106,18 +106,24 @@ export function manifestLinks(manifest: Manifest): (doc: { id: string }) => Mani
 }
 
 /**
- * JSON, keeping Dates: YAML frontmatter can hold a timestamp (`title:
- * 2024-01-01`), which plain JSON would hand back as a string, and the index
- * would print it differently from a crawl.
+ * A frontmatter value plain JSON cannot hold, with where it sat: a YAML
+ * timestamp (`title: 2024-01-01`), `!!binary`, `.inf`/`.nan`, `-0`. JSON would
+ * hand each back as something else and the index would print it differently
+ * from a crawl.
+ */
+type Typed = [path: string[], kind: "date" | "binary" | "number", text: string];
+
+/**
+ * JSON with the values above kept beside each entry (`typed`) — never as a
+ * marker inside the value, which authored frontmatter could spell too
+ * (`description: {$date: x}`).
  */
 export function serializeManifest(manifest: Manifest): string {
-  // Where each Date sat, beside the entry — never a marker inside the value,
-  // which authored frontmatter could spell too (`description: {$date: x}`).
-  const documents: Record<string, ManifestEntry & { dates?: string[][] }> = {};
+  const documents: Record<string, unknown> = {};
   for (const [id, entry] of Object.entries(manifest.documents)) {
-    const dates: string[][] = [];
-    findDates(entry.frontmatter, [], dates);
-    documents[id] = dates.length ? { ...entry, dates } : entry;
+    const typed: Typed[] = [];
+    const frontmatter = jsonSafe(entry.frontmatter, [], typed);
+    documents[id] = typed.length ? { ...entry, frontmatter, typed } : entry;
   }
   return JSON.stringify({ ...manifest, documents });
 }
@@ -125,22 +131,40 @@ export function serializeManifest(manifest: Manifest): string {
 export function parseManifest(text: string): Manifest | null {
   // Not a JSON.parse reviver: it runs for every value, links included, and
   // made the read several times slower.
-  const manifest = JSON.parse(text) as { documents?: Record<string, ManifestEntry & { dates?: string[][] }> } | null;
+  const manifest = JSON.parse(text) as { documents?: Record<string, ManifestEntry & { typed?: Typed[] }> } | null;
   for (const entry of Object.values(manifest?.documents ?? {})) {
-    for (const path of entry.dates ?? []) {
+    for (const [path, kind, text] of entry.typed ?? []) {
       const parent = path.slice(0, -1).reduce<any>((at, key) => at?.[key], entry.frontmatter);
-      if (parent && typeof parent[path.at(-1)!] === "string") parent[path.at(-1)!] = new Date(parent[path.at(-1)!]);
+      if (!parent || typeof parent !== "object") continue;
+      parent[path.at(-1)!] =
+        kind === "date" ? new Date(text) : kind === "binary" ? new Uint8Array(Buffer.from(text, "base64")) : Number(text);
     }
-    delete entry.dates;
+    delete entry.typed;
   }
   return manifest as Manifest | null;
 }
 
-function findDates(value: unknown, path: string[], out: string[][]): void {
-  if (value instanceof Date) out.push(path);
-  else if (value && typeof value === "object") {
-    for (const [key, child] of Object.entries(value)) findDates(child, [...path, key], out);
+/** A copy JSON round-trips exactly; what it cannot hold goes to `out` and leaves `null` in place. */
+function jsonSafe(value: unknown, path: string[], out: Typed[]): unknown {
+  if (value instanceof Date) {
+    out.push([path, "date", Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString()]);
+    return null;
   }
+  if (value instanceof Uint8Array) {
+    out.push([path, "binary", Buffer.from(value).toString("base64")]);
+    return null;
+  }
+  if (typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0))) {
+    out.push([path, "number", Object.is(value, -0) ? "-0" : String(value)]);
+    return null;
+  }
+  if (Array.isArray(value)) return value.map((v, i) => jsonSafe(v, [...path, String(i)], out));
+  if (value && typeof value === "object") {
+    const copy: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) copy[key] = jsonSafe(child, [...path, key], out);
+    return copy;
+  }
+  return value;
 }
 
 /**
