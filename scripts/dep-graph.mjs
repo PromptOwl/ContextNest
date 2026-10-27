@@ -56,6 +56,8 @@ const BUNDLED = {
  */
 const RATIONALE = {
   "@promptowl/contextnest-engine": "The engine itself — vault storage, selectors, versioning, integrity.",
+  "@promptowl/contextnest-plugin-sdk":
+    "The Nest Plugin contract (manifest + item schemas) the plugin host validates against. Apache-2.0 on purpose: plugins import it, never the AGPL engine.",
   "@modelcontextprotocol/sdk": "The Model Context Protocol server implementation the MCP package exists to serve.",
   chalk: "Terminal colour. Optional — see the minimal install profile below.",
   commander: "Command, argument and help parsing for `ctx`.",

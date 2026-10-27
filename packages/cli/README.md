@@ -229,6 +229,43 @@ normal output.
 CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 ```
 
+### Plugins
+
+Connect outside sources — GitHub, Gong, Slack, Teams, email, your own tools — through
+[Nest Plugins](https://github.com/PromptOwl/CommunityNestSDK) (Apache-2.0 SDK; plugins may be any licence).
+
+```bash
+ctx plugin add @promptowl/contextnest-plugin-github-markdown
+ctx plugin set github-markdown repo=PromptOwl/ContextNest folder=vendor/contextnest
+ctx plugin pull github-markdown              # upserts changed files; keeps nodes you edited
+ctx plugin search "onboarding"               # vault hits (governed) + live plugin hits
+ctx plugin promote slack 1726000000.000100   # land one live hit through the normal path
+ctx plugin list --json
+```
+
+A plugin is code that runs in-process, so `add` is a trust decision made per machine: it records the
+module and a hash of its file in `~/.contextnest/plugin-trust.json`, outside the vault. Every other
+command loads only a plugin added on this machine and unchanged since; anything else — a vault you
+cloned, a plugin file or package that changed — is refused until you review it and run `ctx plugin add`
+again.
+
+Plain settings live in `.context/plugins.yaml` (mode 600). Settings the plugin marks `x-secret` go to
+the same secure credential store as `ctx login` — the OS keyring, else the AES-256-GCM file store when
+`CONTEXTNEST_CREDENTIALS_KEY` is set — and never to `plugins.yaml`. With neither available, `ctx plugin
+set` refuses to store a secret and names the env var to use instead: `CONTEXTNEST_PLUGIN_<NAME>_<KEY>`,
+which always wins over a stored value. A plaintext secret left in `plugins.yaml` by an older `ctx` is
+moved to the secure store on the next `set`, `pull` or `promote`; `remove` forgets stored secrets too. `--mode summary` needs an LLM: point
+`CONTEXTNEST_DISTILL_URL` at an endpoint accepting `POST {body, kind, instructions}` (https, or http on
+localhost only); without one,
+summary requests land raw with a warning — never dropped. The cursor advances only after a clean run,
+so failures and local-edit conflicts are retried next time.
+
+"Nodes you edited" means title, tags or body: a plugin never overwrites those. A status change alone
+(say, holding a plugin-written node as `draft`) is not an edit — the next upstream change re-lands the
+node published. Hold with a one-word edit to the body, or run a governed host (Community), which routes
+plugin writes through review. Secret settings are listed masked; the names to mask are recorded in
+`plugins.yaml` at `add` time so masking holds even if the plugin package later fails to load.
+
 ### Packs & Checkpoints
 - `ctx pack list` — List context packs
 - `ctx pack show <id>` — Show pack details

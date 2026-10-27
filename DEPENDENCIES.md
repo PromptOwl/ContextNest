@@ -9,7 +9,7 @@ Every package that lands in your `node_modules` when you install a Context Nest 
 | Package | Runtime packages | Max depth | With `--omit=optional` |
 | --- | --- | --- | --- |
 | `@promptowl/contextnest-cli` | 2 | 1 | 1 |
-| `@promptowl/contextnest-engine` | 106 | 11 | 106 |
+| `@promptowl/contextnest-engine` | 107 | 11 | 107 |
 | `@promptowl/contextnest-mcp-server` | 0 | 0 | 0 |
 
 Counts are unique packages in the resolved production tree, including the monorepo's own packages. Depth is measured from the package you install.
@@ -48,12 +48,13 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 107 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 108 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
 | `@promptowl/contextnest-engine` | 3.2.0 | AGPL-3.0 |
 | `@modelcontextprotocol/sdk` | 1.31.0 | MIT |
+| `@promptowl/contextnest-plugin-sdk` | 0.1.0 | Apache-2.0 |
 | `diff` | 9.0.0 | BSD-3-Clause |
 | `fast-xml-parser` | 5.11.2 | MIT |
 | `js-yaml` | 4.3.2 | MIT |
@@ -167,6 +168,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | Package | Version | Licence | Required | Why |
 | --- | --- | --- | --- | --- |
 | `@modelcontextprotocol/sdk` | 1.31.0 | MIT | yes | The Model Context Protocol server implementation the MCP package exists to serve. |
+| `@promptowl/contextnest-plugin-sdk` | 0.1.0 | Apache-2.0 | yes | The Nest Plugin contract (manifest + item schemas) the plugin host validates against. Apache-2.0 on purpose: plugins import it, never the AGPL engine. |
 | `diff` | 9.0.0 | BSD-3-Clause | yes | Unified diffs for the keyframe+diff version model and drift suggestions. |
 | `fast-xml-parser` | 5.11.2 | MIT | yes | Order-preserving XML parse for the JATS importer (PubMed Central / publisher articles). Pinned to the v4 line: one long-established transitive (strnum) rather than v5's freshly split package set. |
 | `js-yaml` | 4.3.2 | MIT | yes | Reads and writes YAML frontmatter, `context.yaml`, packs and history files. |
@@ -295,7 +297,7 @@ None. Every dependency is top-level.
 
 ### Bundled into `dist/` at build time
 
-Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 107 package(s):
+Not installed into your `node_modules` — compiled into the published bundle, with unused code removed. 108 package(s):
 
 | Package | Version | Licence |
 | --- | --- | --- |
@@ -303,6 +305,7 @@ Not installed into your `node_modules` — compiled into the published bundle, w
 | `@promptowl/contextnest-engine` | 3.2.0 | AGPL-3.0 |
 | `zod` | 3.25.76 | MIT |
 | `@hono/node-server` | 1.19.14 | MIT |
+| `@promptowl/contextnest-plugin-sdk` | 0.1.0 | Apache-2.0 |
 | `ajv` | 8.18.0 | MIT |
 | `ajv-formats` | 3.0.1 | MIT |
 | `content-type` | 1.0.5 | MIT |
