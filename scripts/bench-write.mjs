@@ -53,7 +53,7 @@ for (const n of sizes.length ? sizes : [200, 1000, 3000]) {
       const t0 = performance.now();
       const res = await publishDocument(storage, id, { editedBy: "bench" });
       const t1 = performance.now();
-      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs, written: [res.node] });
+      await storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
       publishMs += t1 - t0;
       indexMs += performance.now() - t1;
     }

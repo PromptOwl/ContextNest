@@ -1165,6 +1165,21 @@ describe("[regression] ctx index", () => {
     expect(existsSync(join(tmp, "nodes", "INDEX.md"))).toBe(true);
   });
 
+  // Writes keep context.yaml current from a manifest instead of a crawl, so a
+  // file added by hand reaches the index through `ctx index` — and must stay
+  // there through later writes, which carry the manifest the reindex wrote.
+  it("reconciles a hand-added document and keeps it through later writes", () => {
+    writeFileSync(
+      join(tmp, "nodes", "by-hand.md"),
+      "---\ntitle: By Hand\ntype: document\nstatus: published\nversion: 1\n---\n\nAdded outside ctx.\n",
+      "utf-8",
+    );
+    runCtx(tmp, ["index"]);
+    expect(existsSync(join(tmp, ".context", "manifest", "manifest.json"))).toBe(true);
+    runCtx(tmp, ["update", "nodes/indexed", "--body", "Edited"]);
+    expect(readFileSync(join(tmp, "context.yaml"), "utf-8")).toContain("nodes/by-hand");
+  });
+
   // Parity with MCP read_index: assert the *content* of the generated index,
   // not just file existence. Catches regressions where index gen silently
   // drops published docs.

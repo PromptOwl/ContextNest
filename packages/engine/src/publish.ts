@@ -170,7 +170,6 @@ export async function publishDocument(
     docId,
     new Map([[docId, versionEntry]]),
     (docs) => (vaultDocs = docs),
-    { written: [node] },
   );
 
   return {

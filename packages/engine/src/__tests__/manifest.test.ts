@@ -89,8 +89,49 @@ describe("manifest", () => {
       indexGeneratedAt: "2026-10-27T00:00:00.000Z",
     });
     await storage.writeManifest(manifest);
-    expect(await storage.readManifest()).toEqual(manifest);
+    expect(await storage.readManifest()).toEqual({ ...manifest, layout: "structured" });
     expect(await readFile(join(root, MANIFEST_DIR, ".gitignore"), "utf-8")).toBe("*\n");
+  });
+
+  it("keeps a YAML timestamp in frontmatter a Date through the JSON file", async () => {
+    await storage.writeDocument("nodes/dated", doc("title: 2024-01-01\ntype: document\nstatus: published\nversion: 1", "x"));
+    const docs = await storage.discoverDocuments({ includeRetired: true });
+    expect(docs.find((d) => d.id === "nodes/dated")?.frontmatter.title).toBeInstanceOf(Date);
+    await storage.writeManifest(buildManifest(docs, { checkpoint: 0, indexGeneratedAt: "t" }));
+    expect((await storage.readManifest())?.documents["nodes/dated"].frontmatter.title).toBeInstanceOf(Date);
+  });
+
+  it("treats authored `$date` mappings as plain data: no crash, same index as a crawl", async () => {
+    await storage.regenerateIndex(); // a manifest exists from here on
+    await storage.writeDocument("nodes/a/bomb", doc("title: Bomb\ntype: document\nstatus: published\nversion: 1\ndescription:\n  $date: nope", "x"));
+    await storage.writeDocument("nodes/a/shaped", doc("title: Shaped\ntype: document\nstatus: published\nversion: 1\ndescription:\n  $date: '2024-01-01T00:00:00.000Z'", "x"));
+    for (let i = 0; i < 3; i++) {
+      await storage.writeDocument(`nodes/a/w${i}`, doc(`title: W${i}\ntype: document\nstatus: published\nversion: 1`, "x"));
+      await storage.regenerateIndex({ changedIds: [`nodes/a/w${i}`] });
+    }
+    const published = (await storage.discoverDocuments()).filter((d) => d.frontmatter.status === "published");
+    const { generated_at: _e, checkpoint_at: _ec, ...expected } = generateContextYaml(published, await storage.readConfig(), await storage.readLatestCheckpoint());
+    const { generated_at: _a, checkpoint_at: _ac, ...actual } = (await storage.readContextYaml())!;
+    expect(actual).toEqual(expected);
+  });
+
+  it("goes stale when the vault's layout changes: the crawl lists other folders", async () => {
+    const flat = await mkdtemp(join(tmpdir(), "cn-manifest-flat-"));
+    try {
+      const s = new NestStorage(flat);
+      await s.init("Flat", "obsidian");
+      await s.writeDocument("notes/x", doc("title: X\ntype: document\nstatus: published\nversion: 1", "x"));
+      await s.regenerateIndex();
+      expect((await s.readContextYaml())?.documents.map((d) => d.id)).toEqual(["notes/x"]);
+      // The first nodes/ document makes the vault structured: notes/ drops out of the crawl.
+      await s.writeDocument("nodes/a", doc("title: A\ntype: document\nstatus: published\nversion: 1", "x"));
+      await s.regenerateIndex({ changedIds: ["nodes/a"] });
+      expect((await s.readContextYaml())?.documents.map((d) => d.id)).toEqual(
+        (await s.discoverDocuments()).filter((d) => d.frontmatter.status === "published").map((d) => d.id),
+      );
+    } finally {
+      await rm(flat, { recursive: true, force: true });
+    }
   });
 
   it("reads a missing, corrupt or foreign-format manifest as none", async () => {

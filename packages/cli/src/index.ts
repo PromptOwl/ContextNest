@@ -31,6 +31,8 @@ import {
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
+  buildManifest,
+  withVaultLock,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -2471,80 +2473,89 @@ program
   .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
   .action(async () => {
     const storage = getStorage();
-    // Per-folder INDEX.md must list retired docs too so stewards can find
-    // them; context.yaml gets filtered to published-only below. Matches
-    // storage.regenerateIndex().
-    const docs = await storage.discoverDocuments({ includeRetired: true });
-
     await confirmOrExit(
       `Regenerate context.yaml and INDEX.md in ${realRootPath() ?? storage.root}? Documents whose status is written in a legacy form are rewritten in place.`,
     );
 
-    // Status-canonicalization pass: rewrite any doc whose on-disk status
-    // differs from its parsed (normalized) status. Only `ctx index` does
-    // this — per-mutation calls to regenerateIndex stay cheap. After this
-    // pass disk values are guaranteed canonical until something else edits
-    // them out-of-band.
-    let normalized = 0;
-    for (const doc of docs) {
-      const onDisk = await storage.readDocument(doc.id);
-      const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
-      const canonical = doc.frontmatter.status;
-      if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
-        // Round-trip through serializeDocument — which itself normalizes —
-        // and write back. This rewrites any aliased value to canonical.
-        await storage.writeDocument(doc.id, serializeDocument(doc));
-        normalized++;
+    // Crawl through write under the vault lock: a write landing in between would
+    // be missing from the manifest this writes, which later writes trust.
+    await withVaultLock(storage.root, async () => {
+      // Per-folder INDEX.md must list retired docs too so stewards can find
+      // them; context.yaml gets filtered to published-only below. Matches
+      // storage.regenerateIndex().
+      const docs = await storage.discoverDocuments({ includeRetired: true });
+
+      // Status-canonicalization pass: rewrite any doc whose on-disk status
+      // differs from its parsed (normalized) status. Only `ctx index` does
+      // this — per-mutation calls to regenerateIndex stay cheap. After this
+      // pass disk values are guaranteed canonical until something else edits
+      // them out-of-band.
+      let normalized = 0;
+      for (const doc of docs) {
+        const onDisk = await storage.readDocument(doc.id);
+        const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
+        const canonical = doc.frontmatter.status;
+        if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
+          // Round-trip through serializeDocument — which itself normalizes —
+          // and write back. This rewrites any aliased value to canonical.
+          await storage.writeDocument(doc.id, serializeDocument(doc));
+          normalized++;
+        }
       }
-    }
-    if (normalized > 0) {
-      console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
-    }
+      if (normalized > 0) {
+        console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
+      }
 
-    const config = await storage.readConfig();
-    // Head only — same reason storage.regenerateIndex() takes it this way: the
-    // chain grows by one entry per published doc per checkpoint, and only its
-    // newest entry reaches context.yaml.
-    const latestCheckpoint = await storage.readLatestCheckpoint();
-    const published = docs.filter((d) => d.frontmatter.status === "published");
+      const config = await storage.readConfig();
+      // Head only — same reason storage.regenerateIndex() takes it this way: the
+      // chain grows by one entry per published doc per checkpoint, and only its
+      // newest entry reaches context.yaml.
+      const latestCheckpoint = await storage.readLatestCheckpoint();
+      const published = docs.filter((d) => d.frontmatter.status === "published");
 
-    // Generate context.yaml
-    const { contextYaml, stats } = generateContextYamlWithStats(
-      published,
-      config,
-      latestCheckpoint,
-    );
-    await storage.writeContextYaml(contextYaml);
-    console.log(chalk.green("Generated context.yaml"));
-    // Where the graph came from. A vault authored with [[wikilinks]] used to
-    // index with zero edges and --hops silently did nothing; the unresolved
-    // count is the hint that a link's title does not match any published doc.
-    console.log(
-      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
-        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
-        (stats.unresolvedContextLinks
-          ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
-            (stats.unresolvedContextLinks === 1 ? "" : "s")
-          : "") +
-        ")",
-    );
+      // Generate context.yaml
+      const { contextYaml, stats } = generateContextYamlWithStats(
+        published,
+        config,
+        latestCheckpoint,
+      );
+      await storage.writeContextYaml(contextYaml);
+      // The reindex is the reconcile for edits made outside the engine; a
+      // manifest from the same crawl spares the next write its own.
+      await storage.writeManifest(
+        buildManifest(docs, { checkpoint: latestCheckpoint?.checkpoint ?? 0, indexGeneratedAt: contextYaml.generated_at }),
+      );
+      console.log(chalk.green("Generated context.yaml"));
+      // Where the graph came from. A vault authored with [[wikilinks]] used to
+      // index with zero edges and --hops silently did nothing; the unresolved
+      // count is the hint that a link's title does not match any published doc.
+      console.log(
+        `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+          `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
+          (stats.unresolvedContextLinks
+            ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
+              (stats.unresolvedContextLinks === 1 ? "" : "s")
+            : "") +
+          ")",
+      );
 
-    // Generate INDEX.md for each folder
-    const folders = new Map<string, ContextNode[]>();
-    for (const doc of docs) {
-      const parts = doc.id.split("/");
-      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-      if (!folders.has(folder)) folders.set(folder, []);
-      folders.get(folder)!.push(doc);
-    }
+      // Generate INDEX.md for each folder
+      const folders = new Map<string, ContextNode[]>();
+      for (const doc of docs) {
+        const parts = doc.id.split("/");
+        const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+        if (!folders.has(folder)) folders.set(folder, []);
+        folders.get(folder)!.push(doc);
+      }
 
-    for (const [folder, folderDocs] of folders) {
-      if (folder === ".") continue;
-      const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-      const indexMd = generateIndexMd(folder, title, folderDocs);
-      await storage.writeIndexMd(folder, indexMd);
-      console.log(chalk.green(`Generated ${folder}/INDEX.md`));
-    }
+      for (const [folder, folderDocs] of folders) {
+        if (folder === ".") continue;
+        const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+        const indexMd = generateIndexMd(folder, title, folderDocs);
+        await storage.writeIndexMd(folder, indexMd);
+        console.log(chalk.green(`Generated ${folder}/INDEX.md`));
+      }
+    });
   });
 
 // ─── Cloud query helper ──────────────────────────────────────────────────────
@@ -4321,7 +4332,9 @@ drift
       comment: opts.comment,
     });
 
-    await storage.regenerateIndex({ changedIds: [id] });
+    // Under the vault lock, as every other index update: approveSuggestion has
+    // released its own, and an overlapping update would lose a manifest entry.
+    await withVaultLock(storage.root, () => storage.regenerateIndex({ changedIds: [id] }));
 
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));

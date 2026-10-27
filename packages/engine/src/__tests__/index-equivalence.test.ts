@@ -8,6 +8,7 @@ import { VersionManager } from "../versioning.js";
 import { generateContextYaml } from "../index-generator.js";
 import { generateIndexMd } from "../index-md-generator.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
+import { serializeDocument } from "../parser.js";
 
 /**
  * Whatever a write does to keep the index and the checkpoint current, the
@@ -121,12 +122,16 @@ describe("index and checkpoint equal a full rebuild after any write sequence", (
     const next = rng(seed);
     const pick = <T>(xs: T[]): T => xs[Math.floor(next() * xs.length)];
     let created = 0;
+    /** A write that skips its index update (crash, unpublished import) happened; the next write that lands must converge. */
+    let stale = false;
 
     for (let i = 0; i < steps; i++) {
       const docs = await ctx.storage.discoverDocuments({ includeRetired: true });
       const ids = docs.map((d) => d.id);
       const live = docs.filter((d) => d.frontmatter.status !== "forgotten").map((d) => d.id);
-      const op = !live.length || next() < 0.3 ? "create" : pick(["edit", "retitle", "unpublish", "reject", "publish", "delete", "forget"]);
+      const op = !live.length || next() < 0.3
+        ? "create"
+        : pick(["edit", "retitle", "unpublish", "reject", "publish", "delete", "forget", "recase", "import", "crash"]);
       const id = live.length ? pick(live) : "";
       const before = await ctx.storage.readLatestCheckpointNumber();
       const step = `seed ${seed} step ${i}: ${op} ${id}`;
@@ -136,12 +141,40 @@ describe("index and checkpoint equal a full rebuild after any write sequence", (
           case "create":
             await api.run("context_create", {
               title: pick(TITLES),
-              id: `nodes/${pick(FOLDERS)}/doc-${created++}`,
+              // Also ids the crawl never lists: outside nodes/ and sources/, and
+              // a basename it excludes. Writable, so their writes must not index them.
+              id: pick([...FOLDERS.map((f) => `nodes/${f}/doc-${created}`), `other/doc-${created}`, "nodes/a/README"]),
               content: body(next, ids),
               tags: [`#t${Math.floor(next() * 3)}`],
               publish: next() < 0.8,
             }, ctx);
+            created++;
             break;
+          case "recase":
+            // The same file under another spelling: resolves on a
+            // case-insensitive filesystem, not found on a case-sensitive one.
+            await api.run("context_update", { id: id.toUpperCase().replace(/^NODES\//, "nodes/"), content: body(next, ids) }, ctx);
+            break;
+          case "import":
+            // Files mode writes without publishing — and without an index
+            // update of its own until something else writes.
+            await api.run("context_import", {
+              files: [{
+                path: `nodes/b/imp-${created++}.md`,
+                content: `---\ntitle: ${pick(TITLES)}\ntype: document\nstatus: published\nversion: 1\n---\n\n${body(next, ids)}\n`,
+              }],
+              publish: false,
+            }, ctx);
+            break;
+          case "crash": {
+            // A write killed before its index update: the next write must still converge.
+            const node = await ctx.storage.readDocument(id);
+            node.frontmatter.status = node.frontmatter.status === "published" ? "draft" : "published";
+            await ctx.storage.writeDocument(id, serializeDocument(node));
+            landed.add(op);
+            stale = true;
+            continue;
+          }
           case "edit":
             await api.run("context_update", { id, content: body(next, ids) }, ctx);
             break;
@@ -165,10 +198,15 @@ describe("index and checkpoint equal a full rebuild after any write sequence", (
             break;
         }
         landed.add(op);
+        // An unpublished files import has never updated the index (before the
+        // manifest either): stale, like a crash, until the next write lands.
+        stale = op === "import";
       } catch {
         // Refusals (publishing a rejected doc, a forgotten path) are part of
-        // the sequence: whatever a refused write left behind must still match.
+        // the sequence: whatever a refused write left behind must still match
+        // — but a refusal updates nothing, so a stale index stays stale.
       }
+      if (stale) continue;
 
       await expectIndexMatchesCrawl(step);
       if ((await ctx.storage.readLatestCheckpointNumber()) > before) await expectSealMatchesCrawl(step);
@@ -186,10 +224,11 @@ describe("index and checkpoint equal a full rebuild after any write sequence", (
     }, 60_000);
   }
 
-  // Refusals are swallowed above, so make sure the seeds exercise every op.
+  // Refusals are swallowed above, so make sure the seeds exercise every op
+  // (`recase` only lands on a case-insensitive filesystem).
   it("the seeds landed every kind of write at least once", () => {
-    expect([...landed].sort()).toEqual(
-      ["create", "delete", "edit", "forget", "publish", "reject", "retitle", "unpublish"],
-    );
+    expect([...landed]).toEqual(expect.arrayContaining(
+      ["create", "crash", "delete", "edit", "forget", "import", "publish", "reject", "retitle", "unpublish"],
+    ));
   });
 });

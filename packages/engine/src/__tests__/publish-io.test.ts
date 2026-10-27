@@ -84,9 +84,12 @@ describe("publish I/O: one history read per document, same results", () => {
     // The index rebuild reuses the checkpoint the publish just sealed.
     expect(readHead).not.toHaveBeenCalled();
     // No vault crawl: the checkpoint and context.yaml come from the manifest,
-    // and the only read is the published doc's own folder, for its INDEX.md.
-    expect(crawl).toHaveBeenCalledTimes(1);
-    expect(crawl.mock.calls[0][0]).toMatchObject({ folder: "nodes/alpha", recursive: false });
+    // which the seal and the index update each refresh by reading the
+    // published doc's own folder (as the crawl would list it) — nothing else.
+    expect(crawl.mock.calls.map(([o]) => o)).toEqual([
+      expect.objectContaining({ folder: "nodes/alpha", recursive: false }),
+      expect.objectContaining({ folder: "nodes/alpha", recursive: false }),
+    ]);
     vi.restoreAllMocks();
 
     const doc = await storage.readDocument("nodes/alpha/doc");

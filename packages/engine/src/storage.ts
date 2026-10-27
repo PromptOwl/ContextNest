@@ -5,6 +5,7 @@
 
 import {
   access,
+  appendFile,
   readFile,
   writeFile,
   mkdir,
@@ -45,6 +46,8 @@ import {
   manifestDocuments,
   manifestEntry,
   manifestLinks,
+  parseManifest,
+  serializeManifest,
   type Manifest,
 } from "./manifest.js";
 import {
@@ -446,6 +449,12 @@ export const SENSITIVE_FILE_GLOBS = [
   "**/*.pdf",
   "context.yaml",
 ];
+
+/** A document id's folder, as discoverDocuments' `folder` takes it ("" at the root). */
+function folderOfId(id: string): string {
+  const slash = id.lastIndexOf("/");
+  return slash < 0 ? "" : id.slice(0, slash);
+}
 
 /**
  * Run a write; only if its directory is missing, create it and write once more.
@@ -1238,8 +1247,6 @@ export class NestStorage {
       changedIds?: string[];
       latestCheckpoint?: Checkpoint;
       docs?: ContextNode[];
-      /** Changed documents the caller holds parsed, as written: not re-read. */
-      written?: ContextNode[];
     } = {},
   ): Promise<void> {
     const config = await this.readConfig();
@@ -1252,12 +1259,6 @@ export class NestStorage {
     const head = latestCheckpoint?.checkpoint ?? 0;
     const packs = await this.readPacks();
 
-    const folderOf = (id: string) => {
-      const parts = id.split("/");
-      return parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-    };
-    const scope = opts.changedIds ? new Set(opts.changedIds.map(folderOf)) : null;
-
     // A caller that just sealed hands the head over; the manifest it found
     // was written against the head before.
     const manifest =
@@ -1268,22 +1269,12 @@ export class NestStorage {
     let contextYaml: ContextYaml;
     // Per-folder INDEX.md must list retired docs too so stewards can find
     // them; context.yaml gets filtered to published only below.
-    const folders = new Map<string, ContextNode[]>();
+    let folders: Map<string, ContextNode[]>;
     if (manifest) {
-      const written = new Map(opts.written?.map((d) => [d.id, d]));
-      for (const id of new Set(opts.changedIds)) {
-        // Gone or unreadable: a crawl would not list it either.
-        const node = written.get(id) ?? (await this.readDocument(id).catch(() => null));
-        if (node) manifest.documents[id] = manifestEntry(node);
-        else delete manifest.documents[id];
-      }
+      // Every folder re-read is one a crawl would list, so all their INDEX.md files are due.
+      folders = await this.refreshManifest(manifest, opts.changedIds!);
       const published = manifestDocuments(manifest).filter((d) => d.frontmatter.status === "published");
       contextYaml = generateContextYaml(published, config, latestCheckpoint, { linksOf: manifestLinks(manifest) });
-      for (const folder of scope!) {
-        if (folder === ".") continue;
-        const folderDocs = await this.discoverDocuments({ includeRetired: true, folder, recursive: false });
-        if (folderDocs.length) folders.set(folder, folderDocs);
-      }
       manifest.checkpoint = head;
       manifest.index_generated_at = contextYaml.generated_at;
       await this.writeManifest(manifest);
@@ -1291,19 +1282,25 @@ export class NestStorage {
       const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
       const published = docs.filter((d) => d.frontmatter.status === "published");
       contextYaml = generateContextYaml(published, config, latestCheckpoint);
+      const scope = opts.changedIds ? new Set(opts.changedIds.map(folderOfId)) : null;
+      folders = new Map();
       for (const doc of docs) {
-        const folder = folderOf(doc.id);
+        const folder = folderOfId(doc.id);
+        if (scope && !scope.has(folder)) continue;
         if (!folders.has(folder)) folders.set(folder, []);
         folders.get(folder)!.push(doc);
       }
       await this.writeManifest(buildManifest(docs, { checkpoint: head, indexGeneratedAt: contextYaml.generated_at }));
     }
+    // Only once the manifest that covers them is on disk: a crash before this
+    // leaves them pending, and the next update re-reads them.
+    await this.clearPendingIds();
     await this.writeContextYaml(contextYaml);
 
     // Distinct folders write distinct INDEX.md files, so the writes are
     // independent — batch them (an imported vault can carry hundreds).
     await mapInBatches(
-      [...folders].filter(([folder]) => folder !== "." && (!scope || scope.has(folder))),
+      [...folders].filter(([folder]) => folder !== ""),
       async ([folder, folderDocs]) => {
         const title = folder
           .split("/")
@@ -1811,6 +1808,7 @@ export class NestStorage {
     await assertResolvesOutsideMachinery(this.root, id);
     const filePath = join(this.root, `${id}.md`);
     const onDisk = await this.sealText(id, "doc", content);
+    await this.markPending(id);
     try {
       await writeInDir(dirname(filePath), () =>
         writeFile(filePath, onDisk, {
@@ -1868,6 +1866,8 @@ export class NestStorage {
         }
       }
     }
+    const rel = relPath.replace(/\\/g, "/");
+    if (rel.endsWith(".md")) await this.markPending(rel.slice(0, -3));
     await writeFile(filePath, onDisk, typeof onDisk === "string" ? "utf-8" : undefined);
   }
 
@@ -2125,6 +2125,7 @@ export class NestStorage {
       // Missing or unparseable: the unlink below reports the former, and an
       // unparseable file declares no sidecar.
     }
+    await this.markPending(id);
     try {
       await unlink(filePath);
     } catch (err: unknown) {
@@ -2244,7 +2245,7 @@ export class NestStorage {
   async readManifest(): Promise<Manifest | null> {
     try {
       const raw = await readFile(join(this.root, MANIFEST_DIR, MANIFEST_FILE), "utf-8");
-      const data = JSON.parse(await this.openText(raw, "index", "manifest")) as Manifest | null;
+      const data = parseManifest(await this.openText(raw, "index", "manifest"));
       return data?.format === MANIFEST_FORMAT && data.documents && typeof data.documents === "object" ? data : null;
     } catch {
       return null;
@@ -2260,6 +2261,7 @@ export class NestStorage {
   async currentManifest(heads: number[]): Promise<Manifest | null> {
     const manifest = await this.readManifest();
     if (!manifest || !heads.includes(manifest.checkpoint)) return null;
+    if (manifest.layout !== (await this.detectLayout())) return null;
     return (await this.readIndexGeneratedAt()) === manifest.index_generated_at ? manifest : null;
   }
 
@@ -2279,10 +2281,79 @@ export class NestStorage {
     }
   }
 
+  /**
+   * Bring `manifest` up to date for `ids`, and for every id written since the
+   * last index update (the pending list), by re-reading their FOLDERS the way
+   * the crawl reads them: on-disk spelling of every id, the layout's patterns,
+   * the same exclusions. A per-id read would key a case-variant id twice and
+   * index files the crawl never lists. Returns each folder's documents (for
+   * its INDEX.md); `onUnreadable` hears what the crawl would have skipped.
+   *
+   * ponytail: a folder deleted outright under a case-variant spelling keeps
+   * its stale keys until `ctx index`; resolve the parent's spelling if seen.
+   */
+  async refreshManifest(
+    manifest: Manifest,
+    ids: Iterable<string>,
+    onUnreadable?: (id: string, reason: string) => void,
+  ): Promise<Map<string, ContextNode[]>> {
+    const spelled = new Set([...ids, ...(await this.readPendingIds())].map(folderOfId));
+    const folders = new Set<string>();
+    for (const folder of spelled) {
+      folders.add(folder && (await resolveIdCasing(folder, (relDir) =>
+        readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root), "")));
+    }
+    const read = new Map<string, ContextNode[]>();
+    for (const folder of folders) {
+      const docs = (await this.folderInLayout(folder))
+        ? await this.discoverDocuments({ includeRetired: true, folder, recursive: false, onUnreadable })
+        : [];
+      for (const id of Object.keys(manifest.documents)) {
+        if (folderOfId(id) === folder) delete manifest.documents[id];
+      }
+      for (const doc of docs) manifest.documents[doc.id] = manifestEntry(doc);
+      if (docs.length) read.set(folder, docs);
+    }
+    return read;
+  }
+
+  /** Whether the full crawl reads this folder's own files (its layout patterns, no dot segment). */
+  private async folderInLayout(folder: string): Promise<boolean> {
+    if (folder.split("/").some((s) => s.startsWith("."))) return false;
+    if ((await this.detectLayout()) !== "structured") return true;
+    const top = folder.split("/")[0];
+    return folder === "" || top === "nodes" || top === "sources";
+  }
+
+  private pendingPath(): string {
+    return join(this.root, MANIFEST_DIR, "pending");
+  }
+
+  /**
+   * Note, BEFORE a document file changes, that the manifest's entry for it may
+   * be wrong until an index update re-reads it. A write that never reaches one
+   * (a crash, an import that publishes nothing) is caught by the next. With no
+   * manifest directory there is no manifest to go stale.
+   */
+  private async markPending(id: string): Promise<void> {
+    await appendFile(this.pendingPath(), `${id}\n`).catch((err: NodeJS.ErrnoException) => {
+      if (err.code !== "ENOENT") throw err;
+    });
+  }
+
+  private async readPendingIds(): Promise<string[]> {
+    const raw = await readFile(this.pendingPath(), "utf-8").catch(() => "");
+    return raw.split("\n").filter(Boolean);
+  }
+
+  private async clearPendingIds(): Promise<void> {
+    await unlink(this.pendingPath()).catch(() => {});
+  }
+
   /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */
   async writeManifest(manifest: Manifest): Promise<void> {
     const dir = join(this.root, MANIFEST_DIR);
-    const content = await this.sealText("", "index", JSON.stringify(manifest));
+    const content = await this.sealText("", "index", serializeManifest({ ...manifest, layout: await this.detectLayout() }));
     const write = () => this.writeFileDurable(join(dir, MANIFEST_FILE), content);
     // The directory is made (with its .gitignore) only when missing: an
     // up-front mkdir is a round trip per write on a network mount.

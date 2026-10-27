@@ -471,6 +471,7 @@ export {
 
 // Index generation
 export { generateContextYaml, generateContextYamlWithStats } from "./index-generator.js";
+export { buildManifest, type Manifest } from "./manifest.js";
 export type { GenerateContextYamlOptions } from "./index-generator.js";
 export { generateIndexMd } from "./index-md-generator.js";
 

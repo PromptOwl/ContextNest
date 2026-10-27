@@ -47,6 +47,12 @@ export interface Manifest {
   checkpoint: number;
   /** `generated_at` of the context.yaml written alongside it. */
   index_generated_at: string;
+  /**
+   * The vault's layout when written (storage sets it). It decides which
+   * folders the crawl lists, vault-wide: a flip (the first `nodes/` document
+   * in a flat vault) makes the whole manifest stale, not one folder.
+   */
+  layout?: string;
   documents: Record<string, ManifestEntry>;
 }
 
@@ -97,6 +103,44 @@ export function manifestDocuments(manifest: Manifest): ContextNode[] {
 
 export function manifestLinks(manifest: Manifest): (doc: { id: string }) => ManifestLinks {
   return (doc) => manifest.documents[doc.id]?.links ?? { context: [], wiki: [] };
+}
+
+/**
+ * JSON, keeping Dates: YAML frontmatter can hold a timestamp (`title:
+ * 2024-01-01`), which plain JSON would hand back as a string, and the index
+ * would print it differently from a crawl.
+ */
+export function serializeManifest(manifest: Manifest): string {
+  // Where each Date sat, beside the entry — never a marker inside the value,
+  // which authored frontmatter could spell too (`description: {$date: x}`).
+  const documents: Record<string, ManifestEntry & { dates?: string[][] }> = {};
+  for (const [id, entry] of Object.entries(manifest.documents)) {
+    const dates: string[][] = [];
+    findDates(entry.frontmatter, [], dates);
+    documents[id] = dates.length ? { ...entry, dates } : entry;
+  }
+  return JSON.stringify({ ...manifest, documents });
+}
+
+export function parseManifest(text: string): Manifest | null {
+  // Not a JSON.parse reviver: it runs for every value, links included, and
+  // made the read several times slower.
+  const manifest = JSON.parse(text) as { documents?: Record<string, ManifestEntry & { dates?: string[][] }> } | null;
+  for (const entry of Object.values(manifest?.documents ?? {})) {
+    for (const path of entry.dates ?? []) {
+      const parent = path.slice(0, -1).reduce<any>((at, key) => at?.[key], entry.frontmatter);
+      if (parent && typeof parent[path.at(-1)!] === "string") parent[path.at(-1)!] = new Date(parent[path.at(-1)!]);
+    }
+    delete entry.dates;
+  }
+  return manifest as Manifest | null;
+}
+
+function findDates(value: unknown, path: string[], out: string[][]): void {
+  if (value instanceof Date) out.push(path);
+  else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) findDates(child, [...path, key], out);
+  }
 }
 
 /**

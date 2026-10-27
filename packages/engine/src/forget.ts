@@ -554,7 +554,9 @@ export async function applyImportedTombstones(
   }
   // One checkpoint for every forget this import re-applied, not one each.
   if (applied.length > 0) {
-    await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","), undefined, undefined, { changed: applied });
+    // A crawl, not the manifest: an import re-applies forgets in bulk, and its
+    // other files (written alongside) are not in `applied`.
+    await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","), undefined, undefined, { crawl: true });
   }
   return { applied, refused };
 }

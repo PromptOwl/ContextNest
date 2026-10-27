@@ -22,8 +22,8 @@ type SealHistory = {
   versions: ReadonlyArray<Pick<VersionEntry, "version" | "chain_hash">>;
 };
 import { computeCheckpointHash, computeChainHash } from "./integrity.js";
-import { NestStorage, isUnreadableDocumentError, type CheckpointChainState } from "./storage.js";
-import { manifestDocuments, manifestEntry } from "./manifest.js";
+import { NestStorage, type CheckpointChainState } from "./storage.js";
+import { manifestDocuments } from "./manifest.js";
 import { mapInBatches } from "./concurrency.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
@@ -305,8 +305,6 @@ export class CheckpointManager {
     options: {
       /** Documents written since the manifest besides `justSealed` (a forget's stub). */
       changed?: string[];
-      /** Documents the caller just wrote, parsed: used instead of re-reading them. */
-      written?: ContextNode[];
       /** Crawl even with a current manifest: a bulk import re-reads most of the vault anyway. */
       crawl?: boolean;
     } = {},
@@ -324,16 +322,12 @@ export class CheckpointManager {
       const manifest = options.crawl ? null : await this.storage.currentManifest([head?.checkpoint ?? 0]);
       let publishedDocuments: ContextNode[];
       if (manifest) {
-        const written = new Map(options.written?.map((d) => [d.id, d]));
-        for (const id of new Set([...(justSealed?.keys() ?? []), ...(options.changed ?? [])])) {
-          try {
-            manifest.documents[id] = manifestEntry(written.get(id) ?? (await this.storage.readDocument(id)));
-          } catch (err) {
-            delete manifest.documents[id];
-            if (isUnreadableDocumentError(err)) unreadable.push(id);
-            else if ((err as { code?: string }).code !== "DOCUMENT_NOT_FOUND") throw err;
-          }
-        }
+        // In memory only: the index update after the seal writes it back.
+        await this.storage.refreshManifest(
+          manifest,
+          [...(justSealed?.keys() ?? []), ...(options.changed ?? [])],
+          (id) => unreadable.push(id),
+        );
         publishedDocuments = manifestDocuments(manifest).filter(isPublished);
       } else {
         const crawled = await this.storage.discoverDocuments({ includeRetired: true, onUnreadable: (id) => unreadable.push(id) });
