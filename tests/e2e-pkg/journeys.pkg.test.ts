@@ -2330,6 +2330,453 @@ const J11: Journey = {
   ],
 };
 
+/** The traversal metadata a `ctx query --json` payload carries alongside its documents. */
+type QueryMeta = { mode: string; hopsUsed: number; nodesTraversed: number; sourceNodes: unknown[] };
+const queryMeta = (data: unknown) => data as QueryMeta;
+
+/**
+ * J12 — "I explore the knowledge graph, not just one node at a time."
+ * The promise that makes a nest more than a flat pile of notes: pull a node AND
+ * everything it connects to, with the reach controlled by how many links out you
+ * follow. A hub node links to two neighbours; one neighbour links onward to a
+ * third; a separate island node links to nothing. The user queries the hub at
+ * depth 1 (direct neighbours only), widens to depth 2 (reaches the node two
+ * links away), confirms the unconnected island never shows up no matter how deep
+ * the walk goes, and sees the same expansion when the seed comes from a tag.
+ *
+ * Edges are authored the ordinary way — `[[Title]]` wikilinks in a node's body,
+ * which the index turns into `reference` edges (CU-wdqcq01c60) — so the fixture
+ * graph is built purely by writing bodies, no edge command needed. Traversal is
+ * undirected: the hub reaches a node its body links to, in one hop.
+ *
+ * The review gate is left ON (the default, like J1): each node is HELD on add
+ * and `publish --all` promotes the whole set, so the graph is a set of genuinely
+ * published nodes the traversal walks.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J12: Journey = {
+  id: "J12",
+  title: "Explore the knowledge graph (follow links, control the reach)",
+  cases: [
+    {
+      id: "J12-01",
+      title:
+        "I build a connected vault — a hub linked to two neighbours, one of which links onward to a third, plus one unconnected island node",
+      actions: [
+        { args: ["init", "--name", "graph-vault"], stdout: ["Initialized"] },
+        {
+          args: [
+            "add", "nodes/hub",
+            "--type", "document",
+            "--title", "Hub",
+            "--tags", "#central",
+            "--body", "The hub links to [[Neighbor One]] and [[Neighbor Two]].",
+            "-y",
+          ],
+          stdout: ["Held for review", "nodes/hub"],
+          files: [{ path: "nodes/hub.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/n1",
+            "--type", "document",
+            "--title", "Neighbor One",
+            "--body", "Neighbor one links onward to [[Far Node]].",
+            "-y",
+          ],
+          stdout: ["Held for review"],
+        },
+        {
+          args: [
+            "add", "nodes/n2",
+            "--type", "document",
+            "--title", "Neighbor Two",
+            "--body", "A direct neighbour of the hub.",
+            "-y",
+          ],
+          stdout: ["Held for review"],
+        },
+        {
+          args: [
+            "add", "nodes/far",
+            "--type", "document",
+            "--title", "Far Node",
+            "--body", "Two links away from the hub.",
+            "-y",
+          ],
+          stdout: ["Held for review"],
+        },
+        {
+          args: [
+            "add", "nodes/island",
+            "--type", "document",
+            "--title", "Island",
+            "--body", "Unconnected to anything.",
+            "-y",
+          ],
+          stdout: ["Held for review"],
+        },
+        // Promote the whole set past the gate — the graph is published knowledge.
+        { args: ["publish", "--all", "-y"], stdout: ["Published 5 document(s)"] },
+        // All five are published nodes, the island included (so its later absence
+        // from a traversal is about connectivity, not about being unpublished).
+        {
+          args: ["list", "--json"],
+          json: (data) => {
+            for (const id of ["nodes/hub", "nodes/n1", "nodes/n2", "nodes/far", "nodes/island"])
+              expect(statusOf(data, id)).toBe("published");
+          },
+        },
+      ],
+    },
+    {
+      id: "J12-02",
+      title: "I ask for the hub at depth 1 and get it plus its direct neighbours — and no further",
+      actions: [
+        {
+          args: ["query", "nodes/hub", "--hops", "1", "--json"],
+          json: (data) => {
+            // Direct neighbours only: the node two links away (far) is NOT reached.
+            expect(queryDocIds(data)).toEqual(["nodes/hub", "nodes/n1", "nodes/n2"]);
+            expect(queryMeta(data).hopsUsed).toBe(1);
+          },
+        },
+      ],
+    },
+    {
+      id: "J12-03",
+      title: "I widen the search to depth 2 and it now also pulls the node two links away",
+      actions: [
+        {
+          args: ["query", "nodes/hub", "--hops", "2", "--json"],
+          json: (data) => {
+            // The neighbour-of-a-neighbour (far) is now reached; one more than depth 1.
+            expect(queryDocIds(data)).toEqual(["nodes/far", "nodes/hub", "nodes/n1", "nodes/n2"]);
+            expect(queryMeta(data).hopsUsed).toBe(2);
+          },
+        },
+      ],
+    },
+    {
+      id: "J12-04",
+      title: "The unconnected island never appears in a traversal from the hub",
+      actions: [
+        // Even at a depth deeper than the graph's longest path, the island stays out.
+        {
+          args: ["query", "nodes/hub", "--hops", "3", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual(["nodes/far", "nodes/hub", "nodes/n1", "nodes/n2"]),
+        },
+        // And the island is a real, reachable-by-id node — it simply expands to
+        // nothing, because it links to nothing: connectivity, not existence, decides.
+        {
+          args: ["query", "nodes/island", "--hops", "2", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/island"]),
+        },
+      ],
+    },
+    {
+      id: "J12-05",
+      title: "The traversal result is complete and correct in --json — the expected nodes with their content, and nothing extra",
+      actions: [
+        {
+          args: ["query", "nodes/hub", "--hops", "2", "--json"],
+          json: (data) => {
+            const docs = queryDocs(data);
+            const meta = queryMeta(data);
+            expect(meta.mode).toBe("graph");
+            // Nothing extra: no stray source nodes, and the reported count matches
+            // the documents actually returned.
+            expect(meta.sourceNodes).toEqual([]);
+            expect(meta.nodesTraversed).toBe(docs.length);
+            // Complete: every reached node carries its loaded body, and the hub's
+            // body is the content the user wrote, wikilink intact.
+            expect(docs.every((d) => d.body.trim().length > 0)).toBe(true);
+            expect(docs.find((d) => d.id === "nodes/hub")?.body).toContain("[[Neighbor One]]");
+          },
+        },
+      ],
+    },
+    {
+      id: "J12-06",
+      title: "A tag query combined with --hops expands from the matched seed through the graph",
+      actions: [
+        // Baseline at --hops 0: the bare tag match is the hub alone — only it
+        // carries #central. (With no --hops the query defaults to a graph walk, so
+        // --hops 0 is how you ask for the seed and nothing else.) This pins down
+        // that the expansion below is the work of --hops, not of the tag match.
+        {
+          args: ["query", "#central", "--hops", "0", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/hub"]),
+        },
+        {
+          args: ["query", "#central", "--hops", "2", "--json"],
+          json: (data) => {
+            // Only the hub carries #central, but --hops walks out from that seed to
+            // its whole two-hop neighbourhood — more than the bare tag match.
+            expect(queryDocIds(data)).toEqual(["nodes/far", "nodes/hub", "nodes/n1", "nodes/n2"]);
+          },
+        },
+      ],
+    },
+  ],
+};
+
+/** The shape `ctx validate --json` returns. */
+type ValidateReport = {
+  valid: boolean;
+  errors: Array<{ path: string; errors: Array<{ rule: number; field: string }> }>;
+};
+const validateReport = (data: unknown) => data as ValidateReport;
+
+// Rewrite a node's frontmatter `type:` on disk, outside the CLI — the health
+// story's "I hand-edited a node into an invalid state" (and the later fix).
+// Guard first: a plain-string replace is a silent no-op if the seed format
+// drifts, so assert the line is present — a changed fixture then fails right
+// here, clearly, instead of surfacing as a confusing validate mismatch later.
+const setNodeTypeOnDisk = (vault: string, id: string, from: string, to: string) => {
+  const p = join(vault, `${id}.md`);
+  const src = readFileSync(p, "utf-8");
+  expect(src, `${id}.md should contain "type: ${from}" to rewrite`).toContain(`type: ${from}`);
+  writeFileSync(p, src.replace(`type: ${from}`, `type: ${to}`));
+};
+
+// A node dropped straight onto disk, never seen by the CLI — so the generated
+// index (context.yaml, nodes/INDEX.md) is stale until `ctx index` rebuilds it.
+const GAMMA_ID = "nodes/gamma";
+const writeUnindexedNode = (vault: string) => {
+  writeFileSync(
+    join(vault, "nodes", "gamma.md"),
+    [
+      "---",
+      "title: Gamma",
+      "type: document",
+      "tags:",
+      "  - '#ops'",
+      "status: published",
+      "version: 1",
+      "---",
+      "",
+      "Gamma body mentions kangaroo.",
+      "",
+    ].join("\n"),
+  );
+};
+// A node written with a legacy status label (`archived`, a synonym the engine
+// maps to the canonical `rejected`) — `ctx index` canonicalizes it on disk.
+const writeLegacyStatusNode = (vault: string) => {
+  writeFileSync(
+    join(vault, "nodes", "legacy.md"),
+    [
+      "---",
+      "title: Legacy Status Node",
+      "type: document",
+      "tags:",
+      "  - '#ops'",
+      "status: archived",
+      "version: 1",
+      "---",
+      "",
+      "Legacy body.",
+      "",
+    ].join("\n"),
+  );
+};
+// The node ids recorded as `- id:` entries in the generated context.yaml index
+// (only the `documents:` list uses that key) — stricter than a blind substring,
+// which would also match the id inside a title, a relationship, or a comment.
+const contextYamlDocIds = (vault: string) =>
+  [...readFileSync(join(vault, "context.yaml"), "utf-8").matchAll(/^\s*-\s*id:\s*(\S+)/gm)].map(
+    (m) => m[1],
+  );
+
+/**
+ * J13 — "I check my vault's health and fix what's flagged."
+ * The maintainer's periodic checkup. A well-formed vault passes `ctx validate`
+ * and `ctx doctor` clean. A node hand-edited into a spec violation is caught by
+ * `validate` (named, with its rule) and goes green once fixed. Then `ctx index`
+ * rebuilds the generated index (context.yaml + INDEX.md) so a node that landed
+ * on disk out-of-band is recorded, and a legacy status label is canonicalized.
+ *
+ * The review gate is turned OFF (like J2): this journey is about validation and
+ * index health, so the seed nodes should land published without a gate between.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J13: Journey = {
+  id: "J13",
+  title: "Keep the vault healthy — validate, index regen & doctor (maintainer)",
+  cases: [
+    {
+      id: "J13-01",
+      title: "A well-formed vault passes its checkup with every document conforming to the spec",
+      actions: [
+        { args: ["init", "--name", "health-check"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/alpha",
+            "--type", "document",
+            "--title", "Alpha",
+            "--tags", "#ops",
+            "--body", "Alpha body. See [[beta]].",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/alpha.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/beta",
+            "--type", "document",
+            "--title", "Beta",
+            "--tags", "#ops",
+            "--body", "Beta body.",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/beta.md", exists: true }],
+        },
+        // Human report: every node ticked, overall pass.
+        {
+          args: ["validate"],
+          stdout: ["✓ nodes/alpha", "✓ nodes/beta", "documents and 0 packs valid"],
+        },
+        // Machine report: clean.
+        {
+          args: ["validate", "--json"],
+          json: (data) => {
+            const r = validateReport(data);
+            expect(r.valid).toBe(true);
+            expect(r.errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-02",
+      title: "The environment checkup reports the versions, registry and current folder with no problems",
+      actions: [
+        {
+          args: ["doctor"],
+          stdout: ["CLI", "Engine", "Registry", "Current dir"],
+        },
+        {
+          args: ["doctor", "--json"],
+          json: (data) => {
+            const d = data as {
+              cli: { version: string };
+              engine: { version: string };
+              cwd: { in_vault: boolean };
+              registry: { missing: number };
+            };
+            expect(typeof d.cli.version).toBe("string");
+            expect(typeof d.engine.version).toBe("string");
+            // doctor ran from inside the vault, and nothing in the registry is missing.
+            expect(d.cwd.in_vault).toBe(true);
+            expect(d.registry.missing).toBe(0);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-03",
+      title: "A node hand-edited into a spec violation is flagged with the exact rule it breaks",
+      actions: [
+        // Break beta: mark it a source node but leave out the required source block.
+        {
+          mutate: (v) => setNodeTypeOnDisk(v, "nodes/beta", "document", "source"),
+          args: ["validate"],
+          status: 1,
+          stdout: [
+            "✗ nodes/beta",
+            "Rule 9: Source block is required when type is 'source'",
+            "Validation failed with errors",
+          ],
+          // alpha is untouched and still passes — only beta is flagged.
+          stdoutNot: ["✗ nodes/alpha"],
+        },
+        // Machine report names the document, the rule number and the field.
+        {
+          args: ["validate", "--json"],
+          status: 1,
+          json: (data) => {
+            const r = validateReport(data);
+            expect(r.valid).toBe(false);
+            const beta = r.errors.find((e) => e.path === "nodes/beta");
+            expect(beta, "expected a nodes/beta error entry").toBeDefined();
+            expect(beta!.errors.some((e) => e.rule === 9 && e.field === "source")).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-04",
+      title: "Fixing the node clears the flag and validation comes back clean",
+      actions: [
+        {
+          mutate: (v) => setNodeTypeOnDisk(v, "nodes/beta", "source", "document"),
+          args: ["validate"],
+          stdout: ["✓ nodes/beta", "documents and 0 packs valid"],
+          stdoutNot: ["✗ nodes/beta", "Validation failed"],
+        },
+        {
+          args: ["validate", "--json"],
+          json: (data) => expect(validateReport(data).valid).toBe(true),
+        },
+      ],
+    },
+    {
+      id: "J13-05",
+      title: "Regenerating the index records a node that landed on disk out-of-band",
+      actions: [
+        // Drop a node straight onto disk — the generated index is now stale.
+        {
+          mutate: writeUnindexedNode,
+          args: ["index"],
+          stdout: ["Generated context.yaml", "Generated nodes/INDEX.md"],
+          // The "N file(s) changed" action log is on stderr (the file-safety channel).
+          stderr: ["file(s) changed"],
+          // Proof the index was actually rebuilt: both generated files now carry
+          // the out-of-band node. (Asserted after the command, so it reflects the
+          // regenerated files — not whatever was there before.)
+          check: (v) => {
+            // context.yaml: the node is a real entry in the documents list.
+            expect(contextYamlDocIds(v), "context.yaml documents missing the new node").toContain(
+              GAMMA_ID,
+            );
+            // INDEX.md: the node is linked by its canonical URI in the generated table.
+            expect(
+              readFileSync(join(v, "nodes", "INDEX.md"), "utf-8"),
+              "INDEX.md missing the new node",
+            ).toContain(`contextnest://${GAMMA_ID}`);
+          },
+        },
+      ],
+    },
+    {
+      id: "J13-06",
+      title: "A node written with a legacy status label is canonicalized on disk",
+      actions: [
+        {
+          mutate: writeLegacyStatusNode,
+          args: ["index"],
+          stdout: ["Generated context.yaml"],
+          stderr: ["file(s) changed"],
+          // The legacy `archived` label is rewritten to the canonical `rejected`
+          // on disk — the index pass tidies status aliases in place.
+          check: (v) => {
+            const md = readFileSync(join(v, "nodes", "legacy.md"), "utf-8");
+            expect(md).toContain("status: rejected");
+            expect(md).not.toContain("status: archived");
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -2372,5 +2819,11 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J11 — review an out-of-band correction to a node (drift steward)", () => {
     runJourney({ installDir: INSTALL, scratch }, J11);
+  });
+  it("J12 — explore the knowledge graph", () => {
+    runJourney({ installDir: INSTALL, scratch }, J12);
+  });
+  it("J13 — keep the vault healthy (validate, index regen & doctor)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J13);
   });
 });
