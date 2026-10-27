@@ -238,6 +238,8 @@ CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 ### Index & Agent Configs
 - `ctx index` — Regenerate context.yaml, INDEX.md, and agent config files (CLAUDE.md, GEMINI.md, .cursorrules, .windsurfrules, .github/copilot-instructions.md)
 
+Writes made through `ctx` (or the MCP server) keep `context.yaml` and the checkpoints current without reading the whole vault: the engine tracks each document's index entry in `.context/manifest/` (a git-ignored cache, rebuilt from the vault whenever it is missing or out of date) and re-reads only the folders a write touched. **Files you add or edit outside `ctx`** — in an editor, by `git pull`, by a sync tool — are not seen until you run `ctx index`, which re-reads the whole vault. Until then they are missing from `context.yaml`, and a status changed by hand (say `published` → `draft`) is still sealed as it was by later checkpoints; `ctx verify` does not flag that. Run `ctx index` after any such change.
+
 ## Upgrading to 2.0
 
 Your vault files are untouched — no migration to run. Behaviour that changes:

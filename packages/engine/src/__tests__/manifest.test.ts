@@ -159,6 +159,27 @@ describe("manifest", () => {
     }
   });
 
+  it("a tampered manifest only ever costs a crawl: hostile ids and bad shapes are refused whole", async () => {
+    await publishDocument(storage, "nodes/other", { editedBy: "t" });
+    await storage.regenerateIndex();
+    const good = (await storage.readManifest())!;
+    const entry = good.documents["nodes/other"];
+    const file = join(root, MANIFEST_DIR, MANIFEST_FILE);
+    for (const id of ["../outside/x", "/etc/x", "C:/x", "nodes/../../x", "nodes/.versions/x", "nodes\\x", "nodes//x", "nodes/node_modules/x"]) {
+      await writeFile(file, JSON.stringify({ ...good, documents: { ...good.documents, [id]: entry } }));
+      expect(await storage.readManifest(), id).toBeNull();
+    }
+    for (const bad of [{ frontmatter: "x", links: entry.links }, { frontmatter: entry.frontmatter, links: { context: "x", wiki: [] } }, null]) {
+      await writeFile(file, JSON.stringify({ ...good, documents: { ...good.documents, "nodes/bad": bad } }));
+      expect(await storage.readManifest()).toBeNull();
+    }
+    // Planted for real: the next publish crawls instead, and never seals the hostile id.
+    await writeFile(file, JSON.stringify({ ...good, documents: { ...good.documents, "../outside/x": { ...entry, frontmatter: { ...entry.frontmatter, status: "published" } } } }));
+    const res = await publishDocument(storage, "nodes/skill", { editedBy: "t" });
+    expect(Object.keys(res.checkpoint.document_versions)).not.toContain("../outside/x");
+    expect(res.vaultDocs).toBeDefined(); // the seal fell back to the crawl
+  });
+
   it("reads a missing, corrupt or foreign-format manifest as none", async () => {
     expect(await storage.readManifest()).toBeNull();
     await storage.writeManifest(buildManifest([], { checkpoint: 0, indexGeneratedAt: "t" }));

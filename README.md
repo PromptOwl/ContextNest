@@ -679,7 +679,7 @@ full stack trace back.
 
 | Command | Description |
 |---|---|
-| `ctx index` | Regenerate context.yaml and INDEX.md files |
+| `ctx index` | Regenerate context.yaml and INDEX.md files from the whole vault — run it after adding or editing files outside `ctx` (editor, `git pull`); writes through `ctx` keep the index current on their own |
 | `ctx pack list` | List all context packs |
 | `ctx pack show <id>` | Show pack details |
 | `ctx checkpoint list` | List checkpoints |

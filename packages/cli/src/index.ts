@@ -2471,6 +2471,16 @@ program
 program
   .command("index")
   .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
+  .addHelpText(
+    "after",
+    `
+Writes through ctx (and the MCP server) keep context.yaml and the checkpoints
+current on their own, from a cache in .context/manifest/ — they re-read only the
+folders they touch. Files added or edited OUTSIDE ctx (an editor, git pull, a
+sync tool) are seen only after this command re-reads the whole vault: until
+then they are missing from context.yaml, and a status changed by hand is still
+sealed as it was. Run it after any such change.`,
+  )
   .action(async () => {
     const storage = getStorage();
     await confirmOrExit(

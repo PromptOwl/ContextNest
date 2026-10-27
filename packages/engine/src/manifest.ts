@@ -132,6 +132,12 @@ export function parseManifest(text: string): Manifest | null {
   // Not a JSON.parse reviver: it runs for every value, links included, and
   // made the read several times slower.
   const manifest = JSON.parse(text) as { documents?: Record<string, ManifestEntry & { typed?: Typed[] }> } | null;
+  // The manifest feeds the seal and every id is joined onto the vault root,
+  // so a hand-made or tampered one is refused WHOLE — never trimmed — and the
+  // caller crawls: only ids a crawl could have produced, only well-formed entries.
+  for (const [id, entry] of Object.entries(manifest?.documents ?? {})) {
+    if (!crawlableId(id) || !wellFormed(entry)) return null;
+  }
   for (const entry of Object.values(manifest?.documents ?? {})) {
     for (const [path, kind, text] of entry.typed ?? []) {
       const parent = path.slice(0, -1).reduce<any>((at, key) => at?.[key], entry.frontmatter);
@@ -142,6 +148,34 @@ export function parseManifest(text: string): Manifest | null {
     delete entry.typed;
   }
   return manifest as Manifest | null;
+}
+
+/**
+ * An id the crawl could list: relative, "/"-separated, no empty, `.`, `..` or
+ * dot-led segment (the crawl never enters one), no machinery segment, no
+ * backslash or control character. Looser than the id rules for a NEW
+ * document on purpose — a file already on disk may carry any other name.
+ */
+function crawlableId(id: string): boolean {
+  if (!id || id.includes("\\") || /[\u0000-\u001f\u007f]/.test(id) || /^[a-zA-Z]:/.test(id)) return false;
+  return id
+    .split("/")
+    .every((seg) => seg !== "" && !seg.startsWith(".") && seg !== "node_modules" && seg !== "_suggestions");
+}
+
+function wellFormed(entry: unknown): boolean {
+  const e = entry as Partial<ManifestEntry> | null;
+  return (
+    !!e &&
+    typeof e === "object" &&
+    !!e.frontmatter &&
+    typeof e.frontmatter === "object" &&
+    !Array.isArray(e.frontmatter) &&
+    Array.isArray(e.links?.context) &&
+    Array.isArray(e.links?.wiki) &&
+    e.links.context.every((l) => typeof l === "string") &&
+    e.links.wiki.every((l) => typeof l === "string")
+  );
 }
 
 /** A copy JSON round-trips exactly; what it cannot hold goes to `out` and leaves `null` in place. */
