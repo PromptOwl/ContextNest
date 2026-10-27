@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -100,6 +100,51 @@ describe("manifest", () => {
     expect(await storage.readManifest()).toBeNull();
     await writeFile(file, "format: 99\ncheckpoint: 1\nindex_generated_at: t\ndocuments: {}\n");
     expect(await storage.readManifest()).toBeNull();
+  });
+
+  describe("regenerateIndex with changedIds", () => {
+    const fullCrawls = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.filter(([opts]) => (opts as { folder?: string } | undefined)?.folder === undefined).length;
+
+    it("reads only the changed documents and their folder once a manifest exists", async () => {
+      await storage.regenerateIndex(); // first: crawls, writes the manifest
+      const crawl = vi.spyOn(storage, "discoverDocuments");
+      await storage.writeDocument("nodes/a/new", doc("title: New\ntype: document\nstatus: published\nversion: 1", "[[Other]]"));
+      await storage.regenerateIndex({ changedIds: ["nodes/a/new"] });
+
+      expect(fullCrawls(crawl)).toBe(0);
+      expect(crawl.mock.calls.map(([o]) => (o as { folder?: string }).folder)).toEqual(["nodes/a"]);
+      const index = await storage.readContextYaml();
+      expect(index?.documents.map((d) => d.id)).toContain("nodes/a/new");
+      expect(index?.relationships).toContainEqual({ from: "nodes/a/new", to: "nodes/other", type: "reference" });
+    });
+
+    it("crawls when another writer rewrote context.yaml behind the manifest", async () => {
+      await storage.regenerateIndex();
+      const index = (await storage.readContextYaml())!;
+      await storage.writeContextYaml({ ...index, generated_at: "2000-01-01T00:00:00.000Z" });
+      const crawl = vi.spyOn(storage, "discoverDocuments");
+      await storage.regenerateIndex({ changedIds: ["nodes/other"] });
+      expect(fullCrawls(crawl)).toBe(1);
+    });
+
+    it("crawls when the head moved past the checkpoint the manifest was written at", async () => {
+      await storage.regenerateIndex();
+      const manifest = (await storage.readManifest())!;
+      await storage.writeManifest({ ...manifest, checkpoint: manifest.checkpoint + 5 });
+      const crawl = vi.spyOn(storage, "discoverDocuments");
+      await storage.regenerateIndex({ changedIds: ["nodes/other"] });
+      expect(fullCrawls(crawl)).toBe(1);
+    });
+  });
+
+  it("is dropped when a vault is encrypted, never left in plaintext", async () => {
+    await storage.writeDocument("nodes/secret", doc("title: Secret\ntype: document\nstatus: published\nversion: 1", "[[SECRET-LINK-TOKEN-55]]"));
+    await storage.regenerateIndex();
+    expect(await storage.readManifest()).not.toBeNull();
+    setDefaultVaultKeyStore(new MemoryKeyStore());
+    await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
+    await expect(readFile(join(root, MANIFEST_DIR, "manifest.yaml"), "utf-8")).rejects.toThrow();
   });
 
   it("is sealed in an encrypted vault: no link text on disk", async () => {

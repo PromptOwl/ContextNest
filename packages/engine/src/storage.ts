@@ -37,7 +37,15 @@ import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
 import { resolveIdCasing } from "./id-casing.js";
-import { MANIFEST_DIR, MANIFEST_FORMAT, type Manifest } from "./manifest.js";
+import {
+  MANIFEST_DIR,
+  MANIFEST_FORMAT,
+  buildManifest,
+  manifestDocuments,
+  manifestEntry,
+  manifestLinks,
+  type Manifest,
+} from "./manifest.js";
 import {
   buildTombstoneIndex,
   carriesForgottenBody,
@@ -1217,13 +1225,16 @@ export class NestStorage {
    * `latestCheckpoint` is the head the caller just sealed, saving its re-read.
    * `docs` is a crawl (includeRetired) the caller took after its last document
    * write — the checkpoint's — saving a second full crawl.
+   *
+   * With `changedIds` and no `docs`, the vault is not crawled: the manifest
+   * (manifest.ts) is brought up to date for just those ids and context.yaml is
+   * built from it, and each changed folder's INDEX.md from a read of that
+   * folder alone. A missing or stale manifest falls back to the crawl, and
+   * every crawl rewrites the manifest from what it read.
    */
   async regenerateIndex(
     opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint; docs?: ContextNode[] } = {},
   ): Promise<void> {
-    // Per-folder INDEX.md must list retired docs too so stewards can find
-    // them; context.yaml gets filtered to published only below.
-    const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
     const config = await this.readConfig();
     // Only the LATEST checkpoint reaches context.yaml, so this must not load the
     // whole chain: regenerateIndex runs after every single write, and
@@ -1231,23 +1242,55 @@ export class NestStorage {
     // Parsing it here is what made writes time out on a mature vault while reads
     // — which never come through this path — stayed instant.
     const latestCheckpoint = opts.latestCheckpoint ?? (await this.readLatestCheckpoint());
-    const published = docs.filter((d) => d.frontmatter.status === "published");
+    const head = latestCheckpoint?.checkpoint ?? 0;
     const packs = await this.readPacks();
-
-    const contextYaml = generateContextYaml(published, config, latestCheckpoint);
-    await this.writeContextYaml(contextYaml);
 
     const folderOf = (id: string) => {
       const parts = id.split("/");
       return parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
     };
-    const folders = new Map<string, ContextNode[]>();
-    for (const doc of docs) {
-      const folder = folderOf(doc.id);
-      if (!folders.has(folder)) folders.set(folder, []);
-      folders.get(folder)!.push(doc);
-    }
     const scope = opts.changedIds ? new Set(opts.changedIds.map(folderOf)) : null;
+
+    // A caller that just sealed hands the head over; the manifest it found
+    // was written against the head before.
+    const manifest =
+      opts.changedIds && !opts.docs
+        ? await this.currentManifest(opts.latestCheckpoint ? [head, head - 1] : [head])
+        : null;
+
+    let contextYaml: ContextYaml;
+    // Per-folder INDEX.md must list retired docs too so stewards can find
+    // them; context.yaml gets filtered to published only below.
+    const folders = new Map<string, ContextNode[]>();
+    if (manifest) {
+      for (const id of new Set(opts.changedIds)) {
+        // Gone or unreadable: a crawl would not list it either.
+        const node = await this.readDocument(id).catch(() => null);
+        if (node) manifest.documents[id] = manifestEntry(node);
+        else delete manifest.documents[id];
+      }
+      const published = manifestDocuments(manifest).filter((d) => d.frontmatter.status === "published");
+      contextYaml = generateContextYaml(published, config, latestCheckpoint, { linksOf: manifestLinks(manifest) });
+      for (const folder of scope!) {
+        if (folder === ".") continue;
+        const folderDocs = await this.discoverDocuments({ includeRetired: true, folder, recursive: false });
+        if (folderDocs.length) folders.set(folder, folderDocs);
+      }
+      manifest.checkpoint = head;
+      manifest.index_generated_at = contextYaml.generated_at;
+      await this.writeManifest(manifest);
+    } else {
+      const docs = opts.docs ?? (await this.discoverDocuments({ includeRetired: true }));
+      const published = docs.filter((d) => d.frontmatter.status === "published");
+      contextYaml = generateContextYaml(published, config, latestCheckpoint);
+      for (const doc of docs) {
+        const folder = folderOf(doc.id);
+        if (!folders.has(folder)) folders.set(folder, []);
+        folders.get(folder)!.push(doc);
+      }
+      await this.writeManifest(buildManifest(docs, { checkpoint: head, indexGeneratedAt: contextYaml.generated_at }));
+    }
+    await this.writeContextYaml(contextYaml);
 
     // Distinct folders write distinct INDEX.md files, so the writes are
     // independent — batch them (an imported vault can carry hundreds).
@@ -2200,13 +2243,37 @@ export class NestStorage {
     }
   }
 
+  /**
+   * The manifest, only if it still describes the vault: written against one
+   * of `heads` (checkpoint numbers) and alongside the context.yaml on disk. A
+   * writer that does not keep the manifest (an older engine, a restore) moves
+   * one or the other, and the caller crawls instead.
+   *
+   * ponytail: parses all of context.yaml for its generated_at; read just the
+   * header if that shows up in a profile.
+   */
+  async currentManifest(heads: number[]): Promise<Manifest | null> {
+    const manifest = await this.readManifest();
+    if (!manifest || !heads.includes(manifest.checkpoint)) return null;
+    const index = await this.readContextYaml().catch(() => null);
+    return index?.generated_at === manifest.index_generated_at ? manifest : null;
+  }
+
   /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */
   async writeManifest(manifest: Manifest): Promise<void> {
     const dir = join(this.root, MANIFEST_DIR);
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, ".gitignore"), "*\n");
-    const content = yaml.dump(manifest, { lineWidth: -1, noRefs: true, sortKeys: false });
-    await this.writeFileDurable(join(dir, "manifest.yaml"), await this.sealText("", "index", content));
+    const content = await this.sealText("", "index", yaml.dump(manifest, { lineWidth: -1, noRefs: true, sortKeys: false }));
+    const write = () => this.writeFileDurable(join(dir, "manifest.yaml"), content);
+    // The directory is made (with its .gitignore) only when missing: an
+    // up-front mkdir is a round trip per write on a network mount.
+    try {
+      await write();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".gitignore"), "*\n");
+      await write();
+    }
   }
 
   /**

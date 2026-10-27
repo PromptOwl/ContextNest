@@ -782,7 +782,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // review before it becomes retrievable. Still regenerate the index so the
   // draft is discoverable to the surfaces that list drafts.
   if (!publish) {
-    await ctx.storage.regenerateIndex();
+    await ctx.storage.regenerateIndex({ changedIds: [node.id] });
     return {
       id: node.id,
       version: node.frontmatter.version ?? 1,
@@ -971,7 +971,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   }
   await ctx.storage.writeDocument(id, serializeDocument(node));
   if (!publish) {
-    await ctx.storage.regenerateIndex();
+    await ctx.storage.regenerateIndex({ changedIds: [id] });
     return {
       id,
       version: frontmatter.version ?? 1,
@@ -1019,7 +1019,7 @@ const del: OperationExecutor = async (ctx, input: any) => {
     ...(input.purge ? { purge: true } : {}),
   });
   await purgeEmbeddings(ctx.storage.root, [id]);
-  await ctx.storage.regenerateIndex();
+  await ctx.storage.regenerateIndex({ changedIds: [id] });
   return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
 };
 
@@ -1032,7 +1032,7 @@ const forget: OperationExecutor = async (ctx, input: any) => {
     ...(input.client ? { client: input.client } : {}),
   });
   await purgeEmbeddings(ctx.storage.root, [id]);
-  await ctx.storage.regenerateIndex();
+  await ctx.storage.regenerateIndex({ changedIds: [id] });
   return {
     id: result.id,
     versions: result.versions,
@@ -2040,7 +2040,7 @@ async function importPdfLocked(
     wroteNode = true;
     if (rules && created) await scaffoldFolders(ctx.storage, rules, created);
     if (!publish) {
-      await ctx.storage.regenerateIndex();
+      await ctx.storage.regenerateIndex({ changedIds: [id] });
       return {
         id,
         version: frontmatter.version ?? 1,
