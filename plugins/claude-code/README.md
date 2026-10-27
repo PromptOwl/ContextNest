@@ -107,7 +107,7 @@ The ladders are domain-free — the capture agent calibrates what counts as dura
 | Hook | `SessionStart` | Inject vault overview (or a warning if `ctx` is missing) |
 | Hook | `UserPromptSubmit` | Effort-toggled retrieval injection, and dispatches any parked job |
 | Hook | `Stop` | Decides and parks; never blocks. Fires on explicit intent, a correction, or past the cooldown |
-| Hook | `PostToolUse` (Bash) | After a `ctx update`: diffs against the prior version and names every node, in every nest, still carrying the removed value |
+| Hook | `PostToolUse` (Bash, async) | After a `ctx update`: diffs against the prior version and names every node, in every nest, still carrying the removed value. Runs in the background — the turn is not held while it searches; its findings reach Claude on the next turn |
 | Agent | `contextnest-retriever` | Digest mode for questions; scout mode returns an occurrence map for writes |
 | Agent | `contextnest-capture` | Walks the capture ladder; proposes (or, in `auto`, writes) the minimum |
 | Agent | `contextnest-curator` | Fixes its assigned scope (nest, or node slice) exhaustively; fanned out in parallel |
