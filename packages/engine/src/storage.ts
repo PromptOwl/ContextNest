@@ -37,6 +37,7 @@ import { generateIndexMd } from "./index-md-generator.js";
 import { generateAgentConfigs, mergeAgentConfig } from "./agent-configs.js";
 import { mapInBatches } from "./concurrency.js";
 import { resolveIdCasing } from "./id-casing.js";
+import { MANIFEST_DIR, MANIFEST_FORMAT, type Manifest } from "./manifest.js";
 import {
   buildTombstoneIndex,
   carriesForgottenBody,
@@ -2183,6 +2184,29 @@ export class NestStorage {
       sortKeys: false,
     });
     await writeFile(join(this.root, "context.yaml"), await this.sealText("", "index", content), "utf-8");
+  }
+
+  /**
+   * Read the vault manifest (manifest.ts). A cache: missing, unreadable, or
+   * written in another format all read as `null`, and the caller crawls.
+   */
+  async readManifest(): Promise<Manifest | null> {
+    try {
+      const raw = await readFile(join(this.root, MANIFEST_DIR, "manifest.yaml"), "utf-8");
+      const data = yaml.load(await this.openText(raw, "index", "manifest")) as Manifest | null;
+      return data?.format === MANIFEST_FORMAT && data.documents && typeof data.documents === "object" ? data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */
+  async writeManifest(manifest: Manifest): Promise<void> {
+    const dir = join(this.root, MANIFEST_DIR);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, ".gitignore"), "*\n");
+    const content = yaml.dump(manifest, { lineWidth: -1, noRefs: true, sortKeys: false });
+    await this.writeFileDurable(join(dir, "manifest.yaml"), await this.sealText("", "index", content));
   }
 
   /**
