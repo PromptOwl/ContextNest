@@ -320,10 +320,10 @@ export interface BuildDoctorReportOptions {
 }
 
 /** Saved logins against the registry; reads the plain logins file, never the secure store on the hot path. */
-async function inspectLogins(): Promise<DoctorReport["logins"]> {
+async function inspectLogins(fileOnly: boolean): Promise<DoctorReport["logins"]> {
   try {
     const remotes = readRegistry().remotes;
-    return (await loggedInServers()).map((l) => {
+    return (await loggedInServers({ fileOnly })).map((l) => {
       const aliases = aliasesFor(remotes, l);
       return {
         url: l.url,
@@ -356,7 +356,7 @@ export async function buildDoctorReport(opts: BuildDoctorReportOptions): Promise
     registry,
     cwd,
     plugin: readClaudePluginVersion(claudePluginManifestPath(env)),
-    logins: await inspectLogins(),
+    logins: await inspectLogins(isDoctorOffline(env)),
     privacy: {
       telemetry: cwd.vault_path !== null && telemetryConsent(cwd.vault_path, env),
       credentials: await new CredentialStore({ env })

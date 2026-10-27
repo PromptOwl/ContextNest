@@ -351,9 +351,10 @@ function readLogins(opts: CredentialStoreOptions): LoginServerRef[] | null {
  * ctx that predates it (no file, marker not "none") opens the store, once,
  * and writes the file so the next call is free.
  */
-export async function loggedInServers(opts: CredentialStoreOptions = {}): Promise<LoginServerRef[]> {
+export async function loggedInServers(opts: CredentialStoreOptions & { fileOnly?: boolean } = {}): Promise<LoginServerRef[]> {
   const cached = readLogins(opts);
   if (cached) return cached;
+  if (opts.fileOnly) return [];
   if (nothingSaved(opts)) return [];
   try {
     return serversOf(await readSavedMap({ ...opts, fresh: true }));
