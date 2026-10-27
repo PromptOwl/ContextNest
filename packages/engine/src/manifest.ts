@@ -21,6 +21,12 @@ import { extractContextLinks, extractWikiLinks } from "./wiki-graph.js";
 export const MANIFEST_DIR = ".context/manifest";
 /** JSON, not YAML: nobody reads it but the engine, and it is parsed on every write. */
 export const MANIFEST_FILE = "manifest.json";
+/**
+ * Largest manifest read (an untrusted file, parsed whole). ~300 bytes an entry,
+ * so this is far beyond any real vault; a bigger file is not read — the
+ * caller crawls, which is always correct.
+ */
+export const MANIFEST_MAX_BYTES = 64 * 1024 * 1024;
 export const MANIFEST_FORMAT = 1;
 
 /** The frontmatter fields context.yaml and the checkpoint read. */
@@ -138,7 +144,9 @@ export function serializeManifestEntry(entry: ManifestEntry): string {
 export function parseManifest(text: string): Manifest | null {
   // Not a JSON.parse reviver: it runs for every value, links included, and
   // made the read several times slower.
-  const manifest = JSON.parse(text) as { documents?: Record<string, ManifestEntry & { typed?: Typed[] }> } | null;
+  const parsed: unknown = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const manifest = parsed as { documents?: Record<string, ManifestEntry & { typed?: Typed[] }> };
   // The manifest feeds the seal and every id is joined onto the vault root,
   // so a hand-made or tampered one is refused WHOLE — never trimmed — and the
   // caller crawls: only ids a crawl could have produced, only well-formed entries.

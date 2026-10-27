@@ -42,6 +42,7 @@ import {
   MANIFEST_DIR,
   MANIFEST_FILE,
   MANIFEST_FORMAT,
+  MANIFEST_MAX_BYTES,
   buildManifest,
   manifestDocuments,
   manifestEntry,
@@ -2278,7 +2279,10 @@ export class NestStorage {
    */
   async readManifest(): Promise<Manifest | null> {
     try {
-      const raw = await readFile(join(this.root, MANIFEST_DIR, MANIFEST_FILE), "utf-8");
+      const path = join(this.root, MANIFEST_DIR, MANIFEST_FILE);
+      // Untrusted and parsed whole: a file past the cap is not read at all.
+      if ((await stat(path)).size > MANIFEST_MAX_BYTES) return null;
+      const raw = await readFile(path, "utf-8");
       const data = parseManifest(await this.openText(raw, "index", "manifest"));
       return data?.format === MANIFEST_FORMAT && data.documents && typeof data.documents === "object" ? data : null;
     } catch {
@@ -2291,6 +2295,12 @@ export class NestStorage {
    * of `heads` (checkpoint numbers) and alongside the context.yaml on disk. A
    * writer that does not keep the manifest (an older engine, a restore) moves
    * one or the other, and the caller crawls instead.
+   *
+   * This guards against OTHER WRITERS, not tampering: `generated_at` is a
+   * timestamp read from one line of context.yaml, so a hand edit that keeps
+   * that line passes. Tampering with the manifest itself is caught by
+   * parseManifest (it can only cost a crawl); documents edited by hand are
+   * what `verify` reports as `stale_index`.
    */
   async currentManifest(heads: number[]): Promise<Manifest | null> {
     const manifest = await this.readManifest();

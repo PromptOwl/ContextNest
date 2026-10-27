@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NestStorage } from "../storage.js";
 import { generateContextYaml } from "../index-generator.js";
 import { publishDocument } from "../publish.js";
-import { buildManifest, manifestDocuments, manifestLinks, MANIFEST_DIR, MANIFEST_FILE } from "../manifest.js";
+import { buildManifest, manifestDocuments, manifestLinks, parseManifest, MANIFEST_DIR, MANIFEST_FILE, MANIFEST_MAX_BYTES } from "../manifest.js";
 import { MemoryKeyStore, setDefaultVaultKeyStore } from "../encryption/key-store.js";
 import { encryptVault } from "../encryption/migrate.js";
 
@@ -250,6 +250,18 @@ describe("manifest", () => {
     await writeFile(file, "{\"documents\": [unclosed");
     expect(await storage.readManifest()).toBeNull();
     await writeFile(file, JSON.stringify({ format: 99, checkpoint: 1, index_generated_at: "t", documents: {} }));
+    expect(await storage.readManifest()).toBeNull();
+    // JSON that is not an object never reaches a cast.
+    for (const value of ["5", "[]", "null", "\"x\""]) {
+      expect(parseManifest(value), value).toBeNull();
+    }
+  });
+
+  it("does not read a manifest past the size cap: the caller crawls", async () => {
+    await storage.writeManifest(buildManifest(await storage.discoverDocuments({ includeRetired: true }), { checkpoint: 0, indexGeneratedAt: "t" }));
+    expect(await storage.readManifest()).not.toBeNull();
+    // Sparse: grows the file past the cap without writing 64 MB.
+    await truncate(join(root, MANIFEST_DIR, MANIFEST_FILE), MANIFEST_MAX_BYTES + 1);
     expect(await storage.readManifest()).toBeNull();
   });
 
