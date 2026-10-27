@@ -3869,7 +3869,8 @@ program
       if (!opts.keyStdin) {
         // The name the server shows for this key (what you'd revoke). Asked on a
         // terminal only; Enter keeps the default, and scripts always get it.
-        const defaultName = `ctx CLI (${hostname()})`;
+        // Capped: a long machine name (CI runners, corporate laptops) must not make the default invalid.
+        const defaultName = `ctx CLI (${hostname().slice(0, 60 - "ctx CLI ()".length)})`;
         let keyName = defaultName;
         while (process.stdin.isTTY) {
           keyName = await promptText("Name for the API key this login creates", defaultName);
