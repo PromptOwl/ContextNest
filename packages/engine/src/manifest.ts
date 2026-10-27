@@ -128,6 +128,13 @@ export function serializeManifest(manifest: Manifest): string {
   return JSON.stringify({ ...manifest, documents });
 }
 
+/** One entry as the manifest file holds it: equal strings, equal entries. */
+export function serializeManifestEntry(entry: ManifestEntry): string {
+  const typed: Typed[] = [];
+  const frontmatter = jsonSafe(entry.frontmatter, [], typed);
+  return JSON.stringify({ frontmatter, links: entry.links, typed });
+}
+
 export function parseManifest(text: string): Manifest | null {
   // Not a JSON.parse reviver: it runs for every value, links included, and
   // made the read several times slower.

@@ -2443,6 +2443,11 @@ program
       }
     }
 
+    // Files changed outside ctx: writes do not see them until `ctx index`, so
+    // context.yaml and later checkpoints still hold the old state. A warning —
+    // a hand edit is not tampering — never an error.
+    const staleIndex = lock ? [] : await storage.staleIndexIds(liveDocs);
+
     if (opts.json) {
       console.log(
         JSON.stringify(
@@ -2450,12 +2455,21 @@ program
             valid: totalErrors === 0,
             errors: allReportErrors,
             ...(tombstoned.length > 0 ? { tombstoned } : {}),
+            ...(staleIndex.length > 0 ? { stale_index: staleIndex } : {}),
           },
           null,
           2,
         ),
       );
     } else {
+      if (staleIndex.length > 0) {
+        console.log(
+          chalk.yellow(
+            `\n⚠ ${staleIndex.length} document(s) changed outside ctx are not in the index or checkpoints yet — run \`ctx index\`:`,
+          ),
+        );
+        for (const id of staleIndex) console.log(chalk.yellow(`  ${id}`));
+      }
       console.log(
         totalErrors === 0
           ? chalk.green("\nAll integrity checks passed")

@@ -224,6 +224,25 @@ describe("manifest", () => {
     expect(await storage.readManifest()).not.toBeNull();
   });
 
+  it("verify names documents changed outside the engine, until ctx index reconciles them", async () => {
+    await publishDocument(storage, "nodes/other", { editedBy: "t" });
+    await storage.regenerateIndex();
+    expect((await storage.verifyVaultIntegrity()).stale_index).toBeUndefined();
+
+    // By hand: a status flip, a new file, a deleted one — none through the engine.
+    const flipped = (await readFile(join(root, "nodes", "other.md"), "utf-8")).replace("status: published", "status: draft");
+    await writeFile(join(root, "nodes", "other.md"), flipped);
+    await writeFile(join(root, "nodes", "by-hand.md"), doc("title: By Hand\ntype: document\nstatus: published\nversion: 1", "x"));
+    await rm(join(root, "nodes", "skill.md"));
+
+    const report = await storage.verifyVaultIntegrity();
+    expect(report.stale_index).toEqual(["nodes/by-hand", "nodes/other", "nodes/skill"]);
+    expect(report.valid).toBe(true); // a warning: hand edits are not tampering
+
+    await storage.regenerateIndex(); // what `ctx index` does
+    expect((await storage.verifyVaultIntegrity()).stale_index).toBeUndefined();
+  });
+
   it("reads a missing, corrupt or foreign-format manifest as none", async () => {
     expect(await storage.readManifest()).toBeNull();
     await storage.writeManifest(buildManifest([], { checkpoint: 0, indexGeneratedAt: "t" }));

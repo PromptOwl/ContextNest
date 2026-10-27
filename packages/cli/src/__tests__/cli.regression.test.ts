@@ -1174,7 +1174,13 @@ describe("[regression] ctx index", () => {
       "---\ntitle: By Hand\ntype: document\nstatus: published\nversion: 1\n---\n\nAdded outside ctx.\n",
       "utf-8",
     );
+    // verify names it (a warning, still a pass) until the reindex picks it up.
+    const before = JSON.parse(runCtx(tmp, ["verify", "--json"]));
+    expect(before.valid).toBe(true);
+    expect(before.stale_index).toEqual(["nodes/by-hand"]);
+    expect(runCtx(tmp, ["verify"])).toMatch(/changed outside ctx[\s\S]*nodes\/by-hand/);
     runCtx(tmp, ["index"]);
+    expect(JSON.parse(runCtx(tmp, ["verify", "--json"])).stale_index).toBeUndefined();
     expect(existsSync(join(tmp, ".context", "manifest", "manifest.json"))).toBe(true);
     runCtx(tmp, ["update", "nodes/indexed", "--body", "Edited"]);
     expect(readFileSync(join(tmp, "context.yaml"), "utf-8")).toContain("nodes/by-hand");

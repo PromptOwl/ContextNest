@@ -48,6 +48,7 @@ import {
   manifestLinks,
   parseManifest,
   serializeManifest,
+  serializeManifestEntry,
   type Manifest,
 } from "./manifest.js";
 import {
@@ -1430,11 +1431,39 @@ export class NestStorage {
       }
     }
 
+    const stale = await this.staleIndexIds(liveDocs);
     return {
       valid: errors.length === 0,
       errors,
       ...(tombstoned.length > 0 ? { tombstoned } : {}),
+      ...(stale.length > 0 ? { stale_index: stale } : {}),
     };
+  }
+
+  /**
+   * Documents the current manifest describes differently from disk — what
+   * edits outside the engine left for `ctx index` (see
+   * VerificationReport.stale_index). `docs` is a crawl (includeRetired) the
+   * caller already took. Empty when no manifest is current.
+   */
+  async staleIndexIds(docs?: ContextNode[]): Promise<string[]> {
+    const manifest = await this.currentManifest([await this.readLatestCheckpointNumber()]);
+    if (!manifest) return [];
+    const onDisk = buildManifest(docs ?? (await this.discoverDocuments({ includeRetired: true })), {
+      checkpoint: 0,
+      indexGeneratedAt: "",
+    }).documents;
+    const same = (id: string) =>
+      !!manifest.documents[id] &&
+      !!onDisk[id] &&
+      serializeManifestEntry(manifest.documents[id]) === serializeManifestEntry(onDisk[id]);
+    // An engine write that has not reached an index update yet (a rollback,
+    // a czar edit, an unpublished import) is pending: the next write re-reads
+    // its whole folder, so nothing there waits on `ctx index`.
+    const pendingFolders = new Set((await this.readPending()).ids.map((id) => folderOfId(id).toLowerCase()));
+    return [...new Set([...Object.keys(manifest.documents), ...Object.keys(onDisk)])]
+      .filter((id) => !same(id) && !pendingFolders.has(folderOfId(id).toLowerCase()))
+      .sort();
   }
 
   /**
