@@ -2777,6 +2777,203 @@ const J13: Journey = {
   ],
 };
 
+/**
+ * J14 — "I work across more than one vault."
+ *
+ * The consultant's workflow: a separate vault per client, switched between and
+ * kept isolated. Register two local vaults under friendly aliases, confirm the
+ * registry shows both and which is the default, switch the default, then prove
+ * that a query scoped to one vault by `--vault <alias>` only ever returns that
+ * vault's own nodes — never the other's.
+ *
+ * Both vaults deliberately share the same tag (#client) and the same kind of
+ * node id, so a naive un-scoped query WOULD surface both — the vault scoping is
+ * the thing under test, not just that the data happens to differ.
+ *
+ * The journey's own vault dir is used only as a NEUTRAL working directory and is
+ * never initialized: with no local .context to walk up to, `vault which`
+ * resolves through the registry default, so switching the default actually
+ * changes what it reports. The two real vaults (A and B) live in their own temp
+ * dirs, created on first use and cleaned up by the suite's afterAll, and every
+ * command targets them explicitly — by alias, or (for `init`) by pointing
+ * CONTEXTNEST_VAULT_PATH at the vault root.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+let _j14A: string | undefined;
+let _j14B: string | undefined;
+const j14VaultA = () => {
+  if (!_j14A) {
+    _j14A = mkdtempSync(join(tmpdir(), "cn-journey-j14-A-"));
+    scratch.push(_j14A); // cleaned by the suite's afterAll
+  }
+  return _j14A;
+};
+const j14VaultB = () => {
+  if (!_j14B) {
+    _j14B = mkdtempSync(join(tmpdir(), "cn-journey-j14-B-"));
+    scratch.push(_j14B);
+  }
+  return _j14B;
+};
+/** The id/isDefault rows `ctx vault list --json` returns. */
+type VaultRow = { alias: string; isDefault: boolean };
+const vaultRow = (data: unknown, alias: string) =>
+  (data as VaultRow[]).find((r) => r.alias === alias);
+
+const J14: Journey = {
+  id: "J14",
+  title: "Work across more than one vault (consultant — a vault per client)",
+  cases: [
+    {
+      id: "J14-01",
+      title: "Register two separate local vaults under two aliases; vault list shows both",
+      actions: [
+        // Scaffold vault A in its own temp dir. The cwd stays the neutral
+        // journey dir; `init` writes wherever CONTEXTNEST_VAULT_PATH points.
+        {
+          args: ["init", "--name", "Client Alpha"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j14VaultA() }),
+          stdout: ["Initialized"],
+          check: () =>
+            expect(
+              existsSync(join(j14VaultA(), ".context", "config.yaml")),
+              "vault A was not initialized",
+            ).toBe(true),
+        },
+        // Scaffold vault B likewise.
+        {
+          args: ["init", "--name", "Client Beta"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j14VaultB() }),
+          stdout: ["Initialized"],
+          check: () =>
+            expect(
+              existsSync(join(j14VaultB(), ".context", "config.yaml")),
+              "vault B was not initialized",
+            ).toBe(true),
+        },
+        // Register both under friendly aliases (alpha becomes the default).
+        { args: () => ["vault", "add", "alpha", j14VaultA(), "--set-default"] },
+        { args: () => ["vault", "add", "beta", j14VaultB()] },
+        // The registry now lists both aliases.
+        {
+          args: ["vault", "list", "--json"],
+          json: (d) => {
+            expect(vaultRow(d, "alpha"), "alpha not registered").toBeDefined();
+            expect(vaultRow(d, "beta"), "beta not registered").toBeDefined();
+          },
+        },
+      ],
+    },
+    {
+      id: "J14-02",
+      title: "vault list clearly marks which vault is the default",
+      actions: [
+        {
+          args: ["vault", "list", "--json"],
+          json: (d) => {
+            // alpha was registered with --set-default in J14-01.
+            expect(vaultRow(d, "alpha")?.isDefault, "alpha should be the default").toBe(true);
+            expect(vaultRow(d, "beta")?.isDefault, "beta should not be the default").toBe(false);
+          },
+        },
+        // The human listing marks the default with a leading "*".
+        { args: ["vault", "list"], stdout: ["* alpha"] },
+      ],
+    },
+    {
+      id: "J14-03",
+      title: "Switch the default to the other vault; vault which confirms the active vault changed",
+      actions: [
+        // Before the switch, the ambient default (no --vault, neutral cwd) is alpha.
+        {
+          args: ["vault", "which", "--json"],
+          json: (d) => {
+            expect((d as { alias?: string }).alias, "default should start as alpha").toBe("alpha");
+            expect((d as { source?: string }).source).toBe("default");
+          },
+        },
+        {
+          args: ["vault", "default", "beta"],
+          stdout: ['Default vault is now "beta"'],
+        },
+        // After the switch, the ambient default is now beta.
+        {
+          args: ["vault", "which", "--json"],
+          json: (d) => {
+            expect((d as { alias?: string }).alias, "default should now be beta").toBe("beta");
+            expect((d as { source?: string }).source).toBe("default");
+          },
+        },
+      ],
+    },
+    {
+      id: "J14-04",
+      title: "Query a vault by its alias and get back only that vault's nodes",
+      actions: [
+        // Put one node in each vault — same tag, same kind of id — so vault
+        // scope is the only thing that can tell them apart. --publish bypasses
+        // the review gate so the nodes are immediately queryable.
+        {
+          args: [
+            "add", "nodes/alpha-roadmap", "--vault", "alpha",
+            "--type", "document", "--title", "Alpha Roadmap", "--tags", "client", "--publish",
+          ],
+          stdout: ["Created and published nodes/alpha-roadmap"],
+        },
+        {
+          args: [
+            "add", "nodes/beta-roadmap", "--vault", "beta",
+            "--type", "document", "--title", "Beta Roadmap", "--tags", "client", "--publish",
+          ],
+          stdout: ["Created and published nodes/beta-roadmap"],
+        },
+        // Listing alpha returns exactly alpha's node.
+        {
+          args: ["list", "--vault", "alpha", "--json"],
+          json: (d) => {
+            const ids = (d as Array<{ id: string }>).map((r) => r.id);
+            expect(ids).toEqual(["nodes/alpha-roadmap"]);
+          },
+        },
+        // Querying alpha's (shared) tag returns only alpha's node.
+        {
+          args: ["query", "#client", "--vault", "alpha", "--json"],
+          stdoutNot: ["beta-roadmap", "Beta Roadmap"],
+          json: (d) => expect(queryDocIds(d)).toEqual(["nodes/alpha-roadmap"]),
+        },
+      ],
+    },
+    {
+      id: "J14-05",
+      title: "No cross-vault leak: a node in one vault never appears when querying the other",
+      actions: [
+        // The mirror of J14-04: beta's scope returns only beta's node...
+        {
+          args: ["list", "--vault", "beta", "--json"],
+          json: (d) => {
+            const ids = (d as Array<{ id: string }>).map((r) => r.id);
+            expect(ids).toEqual(["nodes/beta-roadmap"]);
+          },
+        },
+        {
+          args: ["query", "#client", "--vault", "beta", "--json"],
+          stdoutNot: ["alpha-roadmap", "Alpha Roadmap"],
+          json: (d) => expect(queryDocIds(d)).toEqual(["nodes/beta-roadmap"]),
+        },
+        // ...and full-text search is scoped too: a word unique to beta's node
+        // ("Beta" — absent from alpha's "Alpha Roadmap") finds nothing when the
+        // search is scoped to alpha.
+        {
+          args: ["search", "Beta", "--vault", "alpha"],
+          stdout: ["No results found."],
+          stdoutNot: ["beta-roadmap", "alpha-roadmap"],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -2825,5 +3022,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J13 — keep the vault healthy (validate, index regen & doctor)", () => {
     runJourney({ installDir: INSTALL, scratch }, J13);
+  });
+  it("J14 — work across more than one vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J14);
   });
 });
