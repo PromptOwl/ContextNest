@@ -2877,8 +2877,10 @@ const J14: Journey = {
             expect(vaultRow(d, "beta")?.isDefault, "beta should not be the default").toBe(false);
           },
         },
-        // The human listing marks the default with a leading "*".
-        { args: ["vault", "list"], stdout: ["* alpha"] },
+        // The human listing marks the default with a leading "*" (matched
+        // tolerant of spacing so a cosmetic format tweak doesn't false-fail;
+        // the robust what-check is the isDefault field asserted above).
+        { args: ["vault", "list"], stdout: [/\*\s+alpha\b/] },
       ],
     },
     {
@@ -2961,9 +2963,17 @@ const J14: Journey = {
           stdoutNot: ["alpha-roadmap", "Alpha Roadmap"],
           json: (d) => expect(queryDocIds(d)).toEqual(["nodes/beta-roadmap"]),
         },
-        // ...and full-text search is scoped too: a word unique to beta's node
-        // ("Beta" — absent from alpha's "Alpha Roadmap") finds nothing when the
-        // search is scoped to alpha.
+        // Positive control: the SAME single-word search DOES find beta's node
+        // when scoped to beta — so the empty result in alpha below is produced
+        // by vault scoping, not by a dead index or a query that matches nothing
+        // anywhere.
+        {
+          args: ["search", "Beta", "--vault", "beta"],
+          stdout: ["nodes/beta-roadmap"],
+        },
+        // ...and full-text search is scoped too: the same "Beta" (unique to
+        // beta's node, absent from alpha's "Alpha Roadmap") finds nothing when
+        // the search is scoped to alpha.
         {
           args: ["search", "Beta", "--vault", "alpha"],
           stdout: ["No results found."],
