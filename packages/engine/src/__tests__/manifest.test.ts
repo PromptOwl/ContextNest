@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NestStorage } from "../storage.js";
 import { generateContextYaml } from "../index-generator.js";
-import { buildManifest, manifestDocuments, manifestLinks, MANIFEST_DIR } from "../manifest.js";
+import { publishDocument } from "../publish.js";
+import { buildManifest, manifestDocuments, manifestLinks, MANIFEST_DIR, MANIFEST_FILE } from "../manifest.js";
 import { MemoryKeyStore, setDefaultVaultKeyStore } from "../encryption/key-store.js";
 import { encryptVault } from "../encryption/migrate.js";
 
@@ -95,10 +96,10 @@ describe("manifest", () => {
   it("reads a missing, corrupt or foreign-format manifest as none", async () => {
     expect(await storage.readManifest()).toBeNull();
     await storage.writeManifest(buildManifest([], { checkpoint: 0, indexGeneratedAt: "t" }));
-    const file = join(root, MANIFEST_DIR, "manifest.yaml");
-    await writeFile(file, "documents: [unclosed");
+    const file = join(root, MANIFEST_DIR, MANIFEST_FILE);
+    await writeFile(file, "{\"documents\": [unclosed");
     expect(await storage.readManifest()).toBeNull();
-    await writeFile(file, "format: 99\ncheckpoint: 1\nindex_generated_at: t\ndocuments: {}\n");
+    await writeFile(file, JSON.stringify({ format: 99, checkpoint: 1, index_generated_at: "t", documents: {} }));
     expect(await storage.readManifest()).toBeNull();
   });
 
@@ -117,6 +118,22 @@ describe("manifest", () => {
       const index = await storage.readContextYaml();
       expect(index?.documents.map((d) => d.id)).toContain("nodes/a/new");
       expect(index?.relationships).toContainEqual({ from: "nodes/a/new", to: "nodes/other", type: "reference" });
+    });
+
+    it("a publish seals and reindexes without crawling once a manifest exists", async () => {
+      await publishDocument(storage, "nodes/other", { editedBy: "t" }); // no manifest yet: crawls
+      await storage.regenerateIndex();
+      const crawl = vi.spyOn(storage, "discoverDocuments");
+
+      await storage.writeDocument("nodes/draft", doc("title: Draft Doc\ntype: document\nstatus: draft", "[[Other]] again"));
+      const res = await publishDocument(storage, "nodes/draft", { editedBy: "t" });
+      await storage.regenerateIndex({ changedIds: ["nodes/draft"], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
+
+      expect(fullCrawls(crawl)).toBe(0);
+      expect(res.vaultDocs).toBeUndefined();
+      expect(res.checkpoint.document_versions["nodes/draft"]).toBe(res.versionEntry.version);
+      expect((await storage.readContextYaml())?.checkpoint).toBe(res.checkpoint.checkpoint);
+      expect((await storage.verifyVaultIntegrity()).errors).toEqual([]);
     });
 
     it("crawls when another writer rewrote context.yaml behind the manifest", async () => {
@@ -144,7 +161,7 @@ describe("manifest", () => {
     expect(await storage.readManifest()).not.toBeNull();
     setDefaultVaultKeyStore(new MemoryKeyStore());
     await encryptVault(storage, { scrypt: { N: 2 ** 10, r: 8, p: 1 } });
-    await expect(readFile(join(root, MANIFEST_DIR, "manifest.yaml"), "utf-8")).rejects.toThrow();
+    await expect(readFile(join(root, MANIFEST_DIR, MANIFEST_FILE), "utf-8")).rejects.toThrow();
   });
 
   it("is sealed in an encrypted vault: no link text on disk", async () => {
@@ -159,7 +176,7 @@ describe("manifest", () => {
       indexGeneratedAt: "t",
     });
     await storage.writeManifest(manifest);
-    expect(await readFile(join(root, MANIFEST_DIR, "manifest.yaml"), "utf-8")).not.toContain("SECRET-LINK-TOKEN-55");
+    expect(await readFile(join(root, MANIFEST_DIR, MANIFEST_FILE), "utf-8")).not.toContain("SECRET-LINK-TOKEN-55");
     expect((await new NestStorage(root).readManifest())?.documents["nodes/secret"].links.wiki).toEqual([
       "SECRET-LINK-TOKEN-55",
     ]);

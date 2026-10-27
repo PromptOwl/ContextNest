@@ -245,7 +245,7 @@ async function forgetNode(
   // A replay skips it: `applyImportedTombstones` cuts one for the whole batch.
   const checkpoint = options.replay
     ? null
-    : await new CheckpointManager(storage).createCheckpointFromVault(docId);
+    : await new CheckpointManager(storage).createCheckpointFromVault(docId, undefined, undefined, { changed: [docId] });
 
   const event = options.replay
     ? null
@@ -554,7 +554,7 @@ export async function applyImportedTombstones(
   }
   // One checkpoint for every forget this import re-applied, not one each.
   if (applied.length > 0) {
-    await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","));
+    await new CheckpointManager(storage).createCheckpointFromVault(applied.join(","), undefined, undefined, { changed: applied });
   }
   return { applied, refused };
 }

@@ -39,6 +39,7 @@ import { mapInBatches } from "./concurrency.js";
 import { resolveIdCasing } from "./id-casing.js";
 import {
   MANIFEST_DIR,
+  MANIFEST_FILE,
   MANIFEST_FORMAT,
   buildManifest,
   manifestDocuments,
@@ -1233,7 +1234,13 @@ export class NestStorage {
    * every crawl rewrites the manifest from what it read.
    */
   async regenerateIndex(
-    opts: { changedIds?: string[]; latestCheckpoint?: Checkpoint; docs?: ContextNode[] } = {},
+    opts: {
+      changedIds?: string[];
+      latestCheckpoint?: Checkpoint;
+      docs?: ContextNode[];
+      /** Changed documents the caller holds parsed, as written: not re-read. */
+      written?: ContextNode[];
+    } = {},
   ): Promise<void> {
     const config = await this.readConfig();
     // Only the LATEST checkpoint reaches context.yaml, so this must not load the
@@ -1263,9 +1270,10 @@ export class NestStorage {
     // them; context.yaml gets filtered to published only below.
     const folders = new Map<string, ContextNode[]>();
     if (manifest) {
+      const written = new Map(opts.written?.map((d) => [d.id, d]));
       for (const id of new Set(opts.changedIds)) {
         // Gone or unreadable: a crawl would not list it either.
-        const node = await this.readDocument(id).catch(() => null);
+        const node = written.get(id) ?? (await this.readDocument(id).catch(() => null));
         if (node) manifest.documents[id] = manifestEntry(node);
         else delete manifest.documents[id];
       }
@@ -2235,8 +2243,8 @@ export class NestStorage {
    */
   async readManifest(): Promise<Manifest | null> {
     try {
-      const raw = await readFile(join(this.root, MANIFEST_DIR, "manifest.yaml"), "utf-8");
-      const data = yaml.load(await this.openText(raw, "index", "manifest")) as Manifest | null;
+      const raw = await readFile(join(this.root, MANIFEST_DIR, MANIFEST_FILE), "utf-8");
+      const data = JSON.parse(await this.openText(raw, "index", "manifest")) as Manifest | null;
       return data?.format === MANIFEST_FORMAT && data.documents && typeof data.documents === "object" ? data : null;
     } catch {
       return null;
@@ -2248,22 +2256,34 @@ export class NestStorage {
    * of `heads` (checkpoint numbers) and alongside the context.yaml on disk. A
    * writer that does not keep the manifest (an older engine, a restore) moves
    * one or the other, and the caller crawls instead.
-   *
-   * ponytail: parses all of context.yaml for its generated_at; read just the
-   * header if that shows up in a profile.
    */
   async currentManifest(heads: number[]): Promise<Manifest | null> {
     const manifest = await this.readManifest();
     if (!manifest || !heads.includes(manifest.checkpoint)) return null;
-    const index = await this.readContextYaml().catch(() => null);
-    return index?.generated_at === manifest.index_generated_at ? manifest : null;
+    return (await this.readIndexGeneratedAt()) === manifest.index_generated_at ? manifest : null;
+  }
+
+  /**
+   * context.yaml's `generated_at`, from its own line: parsing the whole index
+   * (it lists every document and edge) to compare one stamp cost more than the
+   * write it guards. Anything unreadable is `null`.
+   */
+  private async readIndexGeneratedAt(): Promise<string | null> {
+    try {
+      const raw = await readFile(join(this.root, "context.yaml"), "utf-8");
+      const line = (await this.openText(raw, "index", "context.yaml")).match(/^generated_at:.*$/m)?.[0];
+      const value = line ? (yaml.load(line) as { generated_at?: unknown } | null)?.generated_at : undefined;
+      return typeof value === "string" ? value : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */
   async writeManifest(manifest: Manifest): Promise<void> {
     const dir = join(this.root, MANIFEST_DIR);
-    const content = await this.sealText("", "index", yaml.dump(manifest, { lineWidth: -1, noRefs: true, sortKeys: false }));
-    const write = () => this.writeFileDurable(join(dir, "manifest.yaml"), content);
+    const content = await this.sealText("", "index", JSON.stringify(manifest));
+    const write = () => this.writeFileDurable(join(dir, MANIFEST_FILE), content);
     // The directory is made (with its .gitignore) only when missing: an
     // up-front mkdir is a round trip per write on a network mount.
     try {

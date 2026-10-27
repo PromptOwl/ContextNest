@@ -83,8 +83,10 @@ describe("publish I/O: one history read per document, same results", () => {
     expect(countFor(readDocument, "nodes/alpha/doc")).toBe(1);
     // The index rebuild reuses the checkpoint the publish just sealed.
     expect(readHead).not.toHaveBeenCalled();
-    // One vault crawl, shared by the checkpoint and the index rebuild.
+    // No vault crawl: the checkpoint and context.yaml come from the manifest,
+    // and the only read is the published doc's own folder, for its INDEX.md.
     expect(crawl).toHaveBeenCalledTimes(1);
+    expect(crawl.mock.calls[0][0]).toMatchObject({ folder: "nodes/alpha", recursive: false });
     vi.restoreAllMocks();
 
     const doc = await storage.readDocument("nodes/alpha/doc");

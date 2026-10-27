@@ -19,6 +19,8 @@ import type { ContextNode, Frontmatter } from "./types.js";
 import { extractContextLinks, extractWikiLinks } from "./wiki-graph.js";
 
 export const MANIFEST_DIR = ".context/manifest";
+/** JSON, not YAML: nobody reads it but the engine, and it is parsed on every write. */
+export const MANIFEST_FILE = "manifest.json";
 export const MANIFEST_FORMAT = 1;
 
 /** The frontmatter fields context.yaml and the checkpoint read. */
