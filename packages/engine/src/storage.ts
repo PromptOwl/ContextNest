@@ -2304,10 +2304,27 @@ export class NestStorage {
   ): Promise<{ folders: Map<string, ContextNode[]>; pendingBytes: number }> {
     const pending = await this.readPending();
     const spelled = new Set([...ids, ...pending.ids].map(folderOfId));
+    // Each folder as the crawl knows it: where it really is under the vault
+    // root. An 8.3 short name, a case variant or a link to an in-layout folder
+    // names the real folder (which is re-read); a link into `.versions` or out
+    // of the vault names no crawlable folder (nothing is read or written
+    // through it). A folder that is gone keeps its spelling, case-resolved as
+    // far as its parents exist, so its stale entries are dropped.
+    const realRoot = await realpath(this.root).catch(() => this.root);
     const folders = new Set<string>();
     for (const folder of spelled) {
-      folders.add(folder && (await resolveIdCasing(folder, (relDir) =>
-        readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root), "")));
+      if (!folder) {
+        folders.add("");
+        continue;
+      }
+      const real = await realpath(join(this.root, ...folder.split("/"))).catch(() => null);
+      if (real) {
+        const rel = relative(realRoot, real);
+        if (rel && !rel.startsWith("..") && !isAbsolute(rel)) folders.add(rel.split(sep).join("/"));
+        continue;
+      }
+      folders.add(await resolveIdCasing(folder, (relDir) =>
+        readdir(relDir ? join(this.root, ...relDir.split("/")) : this.root), ""));
     }
     const read = new Map<string, ContextNode[]>();
     for (const folder of folders) {
@@ -2325,25 +2342,15 @@ export class NestStorage {
 
   /**
    * Whether the full crawl reads this folder's own files: its layout's
-   * patterns, no dot segment — and no symlink or junction on the way, which
-   * the crawl never descends. Read through one, a folder could be sealed
-   * history under another name (`VERSIO~1`), and its INDEX.md would be
-   * written into it.
+   * patterns, no dot or `node_modules` segment. Judged on the REAL folder
+   * (refreshManifest resolves links and short names first), so `VERSIO~1`
+   * pointing at sealed history is judged as `.versions`.
    */
   private async folderInLayout(folder: string): Promise<boolean> {
-    if (folder.split("/").some((s) => s.startsWith("."))) return false;
-    if ((await this.detectLayout()) === "structured") {
-      const top = folder.split("/")[0];
-      if (folder !== "" && top !== "nodes" && top !== "sources") return false;
-    }
-    if (folder === "") return true;
-    const [base, real] = await Promise.all([
-      realpath(this.root).catch(() => null),
-      realpath(join(this.root, ...folder.split("/"))).catch(() => null),
-    ]);
-    // Gone: nothing to list, and its stale entries are dropped by the caller.
-    if (!real) return true;
-    return !!base && relative(base, real).split(sep).join("/") === folder;
+    if (folder.split("/").some((s) => s.startsWith(".") || s === "node_modules")) return false;
+    if ((await this.detectLayout()) !== "structured") return true;
+    const top = folder.split("/")[0];
+    return folder === "" || top === "nodes" || top === "sources";
   }
 
   private pendingPath(): string {

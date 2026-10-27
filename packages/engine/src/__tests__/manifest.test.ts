@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NestStorage } from "../storage.js";
@@ -165,7 +165,7 @@ describe("manifest", () => {
     const good = (await storage.readManifest())!;
     const entry = good.documents["nodes/other"];
     const file = join(root, MANIFEST_DIR, MANIFEST_FILE);
-    for (const id of ["../outside/x", "/etc/x", "C:/x", "nodes/../../x", "nodes/.versions/x", "nodes\\x", "nodes//x", "nodes/node_modules/x"]) {
+    for (const id of ["../outside/x", "/etc/x", "nodes/../../x", "nodes/.versions/x", "nodes\\x", "nodes//x", "nodes/node_modules/x"]) {
       await writeFile(file, JSON.stringify({ ...good, documents: { ...good.documents, [id]: entry } }));
       expect(await storage.readManifest(), id).toBeNull();
     }
@@ -178,6 +178,50 @@ describe("manifest", () => {
     const res = await publishDocument(storage, "nodes/skill", { editedBy: "t" });
     expect(Object.keys(res.checkpoint.document_versions)).not.toContain("../outside/x");
     expect(res.vaultDocs).toBeDefined(); // the seal fell back to the crawl
+  });
+
+  it("an authored __proto__ key stays the entry's own: nothing global changes", async () => {
+    await storage.writeDocument(
+      "nodes/a/src",
+      doc("title: Src\ntype: source\nstatus: published\nversion: 1\nsource:\n  transport: mcp\n  server: s\n  tools: [t]\n  __proto__: {polluted: 2024-06-06}", "x"),
+    );
+    await storage.regenerateIndex();
+    const manifest = await storage.readManifest();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    const source = manifest!.documents["nodes/a/src"].frontmatter.source as unknown as Record<string, unknown>;
+    expect(Object.hasOwn(source, "__proto__")).toBe(true);
+  });
+
+  it("a typed path through a prototype key refuses the manifest", async () => {
+    await storage.regenerateIndex();
+    const good = (await storage.readManifest())!;
+    const file = join(root, MANIFEST_DIR, MANIFEST_FILE);
+    for (const path of [["constructor", "prototype", "x"], ["__proto__", "x"], "title", [1]]) {
+      const entry = { ...good.documents["nodes/other"], typed: [[path, "date", "2024-01-01T00:00:00.000Z"]] };
+      await writeFile(file, JSON.stringify({ ...good, documents: { ...good.documents, "nodes/other": entry } }));
+      expect(await storage.readManifest(), JSON.stringify(path)).toBeNull();
+      expect(({} as Record<string, unknown>).x).toBeUndefined();
+    }
+  });
+
+  it("a write through a link to an in-layout folder indexes the real folder", async () => {
+    const { symlink } = await import("node:fs/promises");
+    await storage.writeDocument("nodes/real/x", doc("title: RX\ntype: document\nstatus: published\nversion: 1", "x"));
+    await storage.regenerateIndex();
+    await symlink(join(root, "nodes", "real"), join(root, "nodes", "lnk"), process.platform === "win32" ? "junction" : "dir");
+    await storage.writeDocument("nodes/lnk/y", doc("title: RY\ntype: document\nstatus: published\nversion: 1", "x"));
+    await storage.regenerateIndex({ changedIds: ["nodes/lnk/y"] });
+    const ids = (await storage.readContextYaml())?.documents.map((d) => d.id);
+    expect(ids).toContain("nodes/real/y");
+    expect(ids).not.toContain("nodes/lnk/y");
+  });
+
+  it("keeps a manifest whose ids sit under a legacy _suggestions folder (the crawl lists them)", async () => {
+    await mkdir(join(root, "nodes", "a", "_suggestions"), { recursive: true });
+    await writeFile(join(root, "nodes", "a", "_suggestions", "legacy.md"), doc("title: Legacy\ntype: document\nstatus: published\nversion: 1", "x"));
+    await storage.regenerateIndex();
+    expect((await storage.discoverDocuments()).map((d) => d.id)).toContain("nodes/a/_suggestions/legacy");
+    expect(await storage.readManifest()).not.toBeNull();
   });
 
   it("reads a missing, corrupt or foreign-format manifest as none", async () => {

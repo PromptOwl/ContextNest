@@ -140,10 +140,9 @@ export function parseManifest(text: string): Manifest | null {
   }
   for (const entry of Object.values(manifest?.documents ?? {})) {
     for (const [path, kind, text] of entry.typed ?? []) {
-      const parent = path.slice(0, -1).reduce<any>((at, key) => at?.[key], entry.frontmatter);
-      if (!parent || typeof parent !== "object") continue;
-      parent[path.at(-1)!] =
+      const value =
         kind === "date" ? new Date(text) : kind === "binary" ? new Uint8Array(Buffer.from(text, "base64")) : Number(text);
+      if (!restoreOwn(entry.frontmatter, path, value)) return null;
     }
     delete entry.typed;
   }
@@ -151,16 +150,54 @@ export function parseManifest(text: string): Manifest | null {
 }
 
 /**
+ * Put `value` back where serializeManifest took it out, stepping through OWN
+ * keys only: an authored `__proto__` key is the entry's own (js-yaml and
+ * JSON.parse keep it so), while a path that would reach a prototype —
+ * `constructor.prototype`, a `__proto__` the entry does not own — refuses
+ * the manifest instead of writing global state.
+ */
+function restoreOwn(frontmatter: object, path: string[], value: unknown): boolean {
+  let at: unknown = frontmatter;
+  for (const key of path.slice(0, -1)) {
+    if (!at || typeof at !== "object" || !Object.hasOwn(at, key)) return false;
+    at = (at as Record<string, unknown>)[key];
+  }
+  const last = path.at(-1)!;
+  // serializeManifest left `null` in this very place, so it is an own key.
+  if (!at || typeof at !== "object" || !Object.hasOwn(at, last)) return false;
+  Object.defineProperty(at, last, { value, writable: true, enumerable: true, configurable: true });
+  return true;
+}
+
+const TYPED_KINDS = new Set(["date", "binary", "number"]);
+
+function wellTyped(typed: unknown): boolean {
+  return (
+    typed === undefined ||
+    (Array.isArray(typed) &&
+      typed.every(
+        (t) =>
+          Array.isArray(t) &&
+          t.length === 3 &&
+          Array.isArray(t[0]) &&
+          t[0].length > 0 &&
+          t[0].every((k: unknown) => typeof k === "string") &&
+          TYPED_KINDS.has(t[1]) &&
+          typeof t[2] === "string",
+      ))
+  );
+}
+
+/**
  * An id the crawl could list: relative, "/"-separated, no empty, `.`, `..` or
- * dot-led segment (the crawl never enters one), no machinery segment, no
- * backslash or control character. Looser than the id rules for a NEW
- * document on purpose — a file already on disk may carry any other name.
+ * dot-led segment (the crawl never enters one), no `node_modules` (never
+ * walked), no backslash (a separator on Windows, so `a\..\..\x` would
+ * escape) or control character. Looser than the id rules for a NEW document
+ * on purpose — a file already on disk may carry any other name.
  */
 function crawlableId(id: string): boolean {
-  if (!id || id.includes("\\") || /[\u0000-\u001f\u007f]/.test(id) || /^[a-zA-Z]:/.test(id)) return false;
-  return id
-    .split("/")
-    .every((seg) => seg !== "" && !seg.startsWith(".") && seg !== "node_modules" && seg !== "_suggestions");
+  if (!id || id.includes("\\") || /[\u0000-\u001f\u007f]/.test(id)) return false;
+  return id.split("/").every((seg) => seg !== "" && !seg.startsWith(".") && seg !== "node_modules");
 }
 
 function wellFormed(entry: unknown): boolean {
@@ -174,7 +211,8 @@ function wellFormed(entry: unknown): boolean {
     Array.isArray(e.links?.context) &&
     Array.isArray(e.links?.wiki) &&
     e.links.context.every((l) => typeof l === "string") &&
-    e.links.wiki.every((l) => typeof l === "string")
+    e.links.wiki.every((l) => typeof l === "string") &&
+    wellTyped((e as { typed?: unknown }).typed)
   );
 }
 
@@ -195,7 +233,11 @@ function jsonSafe(value: unknown, path: string[], out: Typed[]): unknown {
   if (Array.isArray(value)) return value.map((v, i) => jsonSafe(v, [...path, String(i)], out));
   if (value && typeof value === "object") {
     const copy: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value)) copy[key] = jsonSafe(child, [...path, key], out);
+    // defineProperty, not `copy[key] =`: an authored `__proto__` key would
+    // otherwise set the copy's prototype and vanish from the JSON.
+    for (const [key, child] of Object.entries(value)) {
+      Object.defineProperty(copy, key, { value: jsonSafe(child, [...path, key], out), writable: true, enumerable: true, configurable: true });
+    }
     return copy;
   }
   return value;
