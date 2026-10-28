@@ -810,6 +810,22 @@ describe("session-start", () => {
     expect(ctx).toContain("pinned");
   });
 
+  it("says so when the user is logged in to a server with no registered vault, and not when one covers it", () => {
+    const vaults = ["vault list", [{ alias: "work", exists: true }]] as [string, unknown];
+    const open = fakeExec([vaults, ["login --list --json", [{ url: "https://nest.example.com", account: null, usedBy: [] }]]]);
+    const ctx = additional(startSession({ input: {}, env: {}, exec: open }))!;
+    expect(ctx).toContain("logged in to https://nest.example.com");
+    expect(ctx).toContain("no vault registered");
+    expect(ctx).toContain("ctx vault add <alias> --url https://nest.example.com/mcp");
+
+    const covered = fakeExec([vaults, ["login --list --json", [{ url: "https://nest.example.com", usedBy: ["po"] }]]]);
+    expect(additional(startSession({ input: {}, env: {}, exec: covered }))!).not.toContain("logged in to");
+    // An older ctx that doesn't know --json fails the call: nothing is said.
+    const old = (args: string[]) =>
+      args.includes("login") ? { status: 1, stdout: "", stderr: "unknown option" } : fakeExec([vaults])(args);
+    expect(additional(startSession({ input: {}, env: {}, exec: old }))!).not.toContain("logged in to");
+  });
+
   it("warns when the pinned vault is not registered (stale pin)", () => {
     const ex = fakeExec([
       ["vault list", [{ alias: "work", exists: true }, { alias: "home", exists: true }]],
