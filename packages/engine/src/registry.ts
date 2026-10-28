@@ -186,6 +186,10 @@ const vaultRegistrySchema = z
     // strip unknown top-level keys) keep working against a registry that has
     // them — extending `vaults` entries would fail their whole-registry parse.
     remotes: z.record(z.string().regex(ALIAS_PATTERN), remoteNestSpecSchema).optional(),
+    // First-run onboarding markers (bare `ctx`). Top-level for the same reason
+    // as `remotes`: older CLIs strip unknown top-level keys instead of failing.
+    onboarded_at: z.string().optional(),
+    skipped_at: z.string().optional(),
   })
   .superRefine((reg, rc) => {
     // One alias namespace across both maps: --vault/CONTEXTNEST_VAULT/default
@@ -234,6 +238,12 @@ export function readRegistry(): VaultRegistry {
     throw new ConfigError(`Invalid vault registry (${path}): ${messages.join("; ")}`);
   }
   return result.data as VaultRegistry;
+}
+
+/** Record that first-run onboarding finished (`onboarded`) or was skipped. Never re-onboards afterwards. */
+export function markOnboarding(kind: "onboarded" | "skipped", now: Date = new Date()): void {
+  const reg = readRegistry();
+  writeRegistry({ ...reg, [kind === "onboarded" ? "onboarded_at" : "skipped_at"]: now.toISOString() });
 }
 
 export function writeRegistry(registry: VaultRegistry): void {
