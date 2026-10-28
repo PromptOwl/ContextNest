@@ -43,6 +43,7 @@ import {
   MANIFEST_FILE,
   MANIFEST_FORMAT,
   MANIFEST_MAX_BYTES,
+  manifestEnabled,
   buildManifest,
   manifestDocuments,
   manifestEntry,
@@ -2303,6 +2304,7 @@ export class NestStorage {
    * what `verify` reports as `stale_index`.
    */
   async currentManifest(heads: number[]): Promise<Manifest | null> {
+    if (!manifestEnabled()) return null; // POC switch (manifest.ts)
     const manifest = await this.readManifest();
     if (!manifest || !heads.includes(manifest.checkpoint)) return null;
     if (manifest.layout !== (await this.detectLayout())) return null;
@@ -2403,6 +2405,7 @@ export class NestStorage {
    * manifest directory there is no manifest to go stale.
    */
   private async markPending(id: string): Promise<void> {
+    if (!manifestEnabled()) return;
     await appendFile(this.pendingPath(), `${id}\n`).catch((err: NodeJS.ErrnoException) => {
       if (err.code !== "ENOENT") throw err;
     });
@@ -2430,6 +2433,7 @@ export class NestStorage {
 
   /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */
   async writeManifest(manifest: Manifest): Promise<void> {
+    if (!manifestEnabled()) return; // POC switch (manifest.ts): off writes nothing
     const dir = join(this.root, MANIFEST_DIR);
     const content = await this.sealText("", "index", serializeManifest({ ...manifest, layout: await this.detectLayout() }));
     const write = () => this.writeFileDurable(join(dir, MANIFEST_FILE), content);

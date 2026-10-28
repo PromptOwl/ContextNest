@@ -18,6 +18,17 @@
 import type { ContextNode, Frontmatter } from "./types.js";
 import { extractContextLinks, extractWikiLinks } from "./wiki-graph.js";
 
+/**
+ * POC switch: the manifest is OFF unless `CONTEXTNEST_MANIFEST` is on
+ * (`on`/`1`/`true`/`yes`). Off, the engine behaves as before it existed —
+ * every write crawls, no manifest or pending file is written, `verify`
+ * reports no `stale_index` — so it can ship, and be switched on per host to
+ * measure, without changing anything for anyone else.
+ */
+export function manifestEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|on|yes)$/i.test((env.CONTEXTNEST_MANIFEST ?? "").trim());
+}
+
 export const MANIFEST_DIR = ".context/manifest";
 /** JSON, not YAML: nobody reads it but the engine, and it is parsed on every write. */
 export const MANIFEST_FILE = "manifest.json";

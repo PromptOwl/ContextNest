@@ -9,6 +9,10 @@ import { generateContextYaml } from "../index-generator.js";
 import { generateIndexMd } from "../index-md-generator.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import { serializeDocument } from "../parser.js";
+import { useManifest } from "./fixtures/manifest-on.js";
+
+// The manifest is a POC behind CONTEXTNEST_MANIFEST (off by default): on here.
+useManifest();
 
 /**
  * Whatever a write does to keep the index and the checkpoint current, the

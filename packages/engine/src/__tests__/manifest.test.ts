@@ -8,6 +8,10 @@ import { publishDocument } from "../publish.js";
 import { buildManifest, manifestDocuments, manifestLinks, parseManifest, MANIFEST_DIR, MANIFEST_FILE, MANIFEST_MAX_BYTES } from "../manifest.js";
 import { MemoryKeyStore, setDefaultVaultKeyStore } from "../encryption/key-store.js";
 import { encryptVault } from "../encryption/migrate.js";
+import { useManifest } from "./fixtures/manifest-on.js";
+
+// The manifest is a POC behind CONTEXTNEST_MANIFEST (off by default): on here.
+useManifest();
 
 /**
  * The manifest stands in for a crawl of the vault when a write rebuilds
@@ -53,6 +57,27 @@ describe("manifest", () => {
   afterEach(async () => {
     setDefaultVaultKeyStore(null);
     await rm(root, { recursive: true, force: true });
+  });
+
+  it("is off unless CONTEXTNEST_MANIFEST is on: no manifest files, every write crawls", async () => {
+    const previous = process.env.CONTEXTNEST_MANIFEST;
+    delete process.env.CONTEXTNEST_MANIFEST;
+    try {
+      await publishDocument(storage, "nodes/other", { editedBy: "t" });
+      await storage.regenerateIndex();
+      const crawl = vi.spyOn(storage, "discoverDocuments");
+      await storage.writeDocument("nodes/draft", doc("title: Draft Doc\ntype: document\nstatus: draft", "x"));
+      const res = await publishDocument(storage, "nodes/draft", { editedBy: "t" });
+      await storage.regenerateIndex({ changedIds: ["nodes/draft"], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
+      // The seal crawled and handed its crawl to the index, as before the manifest.
+      expect(res.vaultDocs).toBeDefined();
+      expect(crawl.mock.calls.filter(([o]) => (o as { folder?: string } | undefined)?.folder === undefined)).toHaveLength(1);
+      await expect(readFile(join(root, MANIFEST_DIR, MANIFEST_FILE))).rejects.toThrow();
+      await expect(readFile(join(root, MANIFEST_DIR, "pending"))).rejects.toThrow();
+      expect((await storage.verifyVaultIntegrity()).stale_index).toBeUndefined();
+    } finally {
+      process.env.CONTEXTNEST_MANIFEST = previous;
+    }
   });
 
   it("generates the same context.yaml as the documents it was built from", async () => {

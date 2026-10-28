@@ -51,6 +51,9 @@ const ENV = {
   // nothing being supplied. Empty is falsy in buildCallClient.
   CONTEXTNEST_AGENT: "",
   CONTEXTNEST_SESSION_ID: "",
+  // The manifest is a POC switch (off by default); the tests that need it
+  // turn it on themselves.
+  CONTEXTNEST_MANIFEST: "",
 } as NodeJS.ProcessEnv;
 
 /** Run the CLI and return stdout. Throws on a non-zero exit. */
@@ -1168,22 +1171,41 @@ describe("[regression] ctx index", () => {
   // Writes keep context.yaml current from a manifest instead of a crawl, so a
   // file added by hand reaches the index through `ctx index` — and must stay
   // there through later writes, which carry the manifest the reindex wrote.
-  it("reconciles a hand-added document and keeps it through later writes", () => {
+  it("with the manifest on: reconciles a hand-added document and keeps it through later writes", () => {
+    ENV.CONTEXTNEST_MANIFEST = "on";
+    try {
+      runCtx(tmp, ["index"]); // builds the manifest
+      expect(existsSync(join(tmp, ".context", "manifest", "manifest.json"))).toBe(true);
+      writeFileSync(
+        join(tmp, "nodes", "by-hand.md"),
+        "---\ntitle: By Hand\ntype: document\nstatus: published\nversion: 1\n---\n\nAdded outside ctx.\n",
+        "utf-8",
+      );
+      // verify names it (a warning, still a pass) until the reindex picks it up.
+      const before = JSON.parse(runCtx(tmp, ["verify", "--json"]));
+      expect(before.valid).toBe(true);
+      expect(before.stale_index).toEqual(["nodes/by-hand"]);
+      expect(runCtx(tmp, ["verify"])).toMatch(/changed outside ctx[\s\S]*nodes\/by-hand/);
+      runCtx(tmp, ["index"]);
+      expect(JSON.parse(runCtx(tmp, ["verify", "--json"])).stale_index).toBeUndefined();
+      runCtx(tmp, ["update", "nodes/indexed", "--body", "Edited"]);
+      expect(readFileSync(join(tmp, "context.yaml"), "utf-8")).toContain("nodes/by-hand");
+    } finally {
+      ENV.CONTEXTNEST_MANIFEST = "";
+    }
+  });
+
+  it("with the manifest off (the default): no manifest files, and a hand-added file still reaches the index on the next write", () => {
+    runCtx(tmp, ["index"]);
     writeFileSync(
       join(tmp, "nodes", "by-hand.md"),
       "---\ntitle: By Hand\ntype: document\nstatus: published\nversion: 1\n---\n\nAdded outside ctx.\n",
       "utf-8",
     );
-    // verify names it (a warning, still a pass) until the reindex picks it up.
-    const before = JSON.parse(runCtx(tmp, ["verify", "--json"]));
-    expect(before.valid).toBe(true);
-    expect(before.stale_index).toEqual(["nodes/by-hand"]);
-    expect(runCtx(tmp, ["verify"])).toMatch(/changed outside ctx[\s\S]*nodes\/by-hand/);
-    runCtx(tmp, ["index"]);
-    expect(JSON.parse(runCtx(tmp, ["verify", "--json"])).stale_index).toBeUndefined();
-    expect(existsSync(join(tmp, ".context", "manifest", "manifest.json"))).toBe(true);
     runCtx(tmp, ["update", "nodes/indexed", "--body", "Edited"]);
     expect(readFileSync(join(tmp, "context.yaml"), "utf-8")).toContain("nodes/by-hand");
+    expect(existsSync(join(tmp, ".context", "manifest"))).toBe(false);
+    expect(JSON.parse(runCtx(tmp, ["verify", "--json"])).stale_index).toBeUndefined();
   });
 
   // Parity with MCP read_index: assert the *content* of the generated index,

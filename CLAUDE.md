@@ -114,7 +114,7 @@ Hooks: `SessionStart` → vault overview injection (plus a compact blueprint of 
 
 Every PR — human- or AI-authored — must have both of these, or the Claude review marks it 🔴 blocking (full rules in `REVIEW.md`):
 
-1. **Task** — a vault task link as the body's first line (`Task: https://nest.promptowl.ai/nest/<nest-id>?doc=nodes/projects/<stage>/<task-slug>`; tasks live in the `po-engineering-ops` nest), or a ClickUp ticket in the title, body or branch name (`CU-<id>`, `[CU-<id>]`, `#<id>`, or an `app.clickup.com/t/<id>` link). If you don't know the task, ask — don't open the PR without it.
+1. **ClickUp ticket** referenced in the title, body or branch name (`CU-<id>`, `[CU-<id>]`, `#<id>`, or an `app.clickup.com/t/<id>` link). If you don't know the ticket, ask — don't open the PR without it.
 2. **Steps to test** section in the body: numbered steps a tester can follow from the user's perspective — where to go or what to run, what to do, what they should see. "Unit tests pass" is not test steps. Use `N/A — no user-facing change` plus a reason only for docs/CI/chore PRs.
 
 ## Releasing

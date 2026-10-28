@@ -17,6 +17,10 @@ import { approveSuggestion, rollbackDocument } from "../approval.js";
 import { approveReview, listReviewHolds } from "../review.js";
 import { stageSuggestion } from "../suggestions.js";
 import type { RbacHook } from "../types.js";
+import { useManifest } from "./fixtures/manifest-on.js";
+
+// The manifest is a POC behind CONTEXTNEST_MANIFEST (off by default): on here.
+useManifest();
 
 const ALLOW_ALL: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
 

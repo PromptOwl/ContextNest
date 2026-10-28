@@ -38,6 +38,7 @@ import {
 } from "../index.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import { textPdf, textPdfV2, toBase64 } from "./fixtures/pdf-fixtures.js";
+import { useManifest } from "./fixtures/manifest-on.js";
 
 const SUMMARY: StructureConfig = {
   structure: { enforce: true },
@@ -1888,6 +1889,7 @@ describe("architecture review of rounds 27–28", () => {
 // QA attacks on the manifest (manifest.ts, storage.refreshManifest) that need a
 // real filesystem; the rest live in manifest.test.ts and index-equivalence.test.ts.
 describe("manifest: the index without a crawl", () => {
+  useManifest();
   let root: string;
   let storage: NestStorage;
   const published = (title: string) => `---\ntitle: ${title}\ntype: document\nstatus: published\nversion: 1\n---\n\nx\n`;

@@ -6,7 +6,9 @@
  *   pnpm bench:write 1000 10000   # chosen sizes
  *
  * Runs against the BUILT engine (packages/engine/dist), so build first —
- * `pnpm bench:write` does. Prints one JSON line per size:
+ * `pnpm bench:write` does. Each size runs twice — manifest off (the default,
+ * every write crawls) and on (`CONTEXTNEST_MANIFEST=on`) — one JSON line each:
+ *   manifest    off | on
  *   publishMs   publishDocument (version + checkpoint seal), mean of 5 updates
  *   indexMs     regenerateIndex after it, mean of the same 5
  *   crawlMs     one full discoverDocuments, for scale
@@ -26,7 +28,8 @@ const { NestStorage, publishDocuments, publishDocument } = await import(
 const UPDATES = 5;
 const sizes = process.argv.slice(2).map(Number).filter((n) => n > 0);
 
-for (const n of sizes.length ? sizes : [200, 1000, 3000]) {
+for (const n of sizes.length ? sizes : [200, 1000, 3000]) for (const manifest of ["off", "on"]) {
+  process.env.CONTEXTNEST_MANIFEST = manifest;
   const dir = await mkdtemp(join(tmpdir(), "cn-bench-write-"));
   try {
     const storage = new NestStorage(dir);
@@ -65,6 +68,7 @@ for (const n of sizes.length ? sizes : [200, 1000, 3000]) {
 
     console.log(JSON.stringify({
       docs: n,
+      manifest,
       publishMs: Math.round(publishMs / UPDATES),
       indexMs: Math.round(indexMs / UPDATES),
       crawlMs: Math.round(crawlMs),
