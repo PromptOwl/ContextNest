@@ -38,7 +38,7 @@ import {
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, isAbsolute } from "node:path";
 import {
   packCli,
   freshInstall,
@@ -2984,6 +2984,173 @@ const J14: Journey = {
   ],
 };
 
+// J15 exports a node to a file OUTSIDE the vault — a share you hand to someone
+// who doesn't run Context Nest. The destination is a module-level temp dir (NOT
+// the vault), created once and cleaned by the suite's afterAll; the export path
+// is a function-form arg so it resolves at run time.
+let _j15Out = "";
+const j15OutDir = () => {
+  if (!_j15Out) {
+    _j15Out = mkdtempSync(join(tmpdir(), "cn-journey-j15-out-"));
+    scratch.push(_j15Out); // cleaned by the suite's afterAll
+  }
+  return _j15Out;
+};
+// A distinct destination per case: `--out` refuses to overwrite an existing
+// file non-interactively, so each export that re-runs the command writes its own
+// file (a user exporting the node to share in more than one place).
+const j15Export = (name: string) => join(j15OutDir(), name);
+
+/** The *.html files inside the vault tree, vault-relative, forward-slashed. */
+const vaultHtml = (root: string): string[] => {
+  const out: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".html"))
+        out.push(p.slice(root.length + 1).replace(/\\/g, "/"));
+    }
+  };
+  walk(root);
+  return out.sort();
+};
+
+/**
+ * J15 — "I want to share one node with someone who doesn't use Context Nest."
+ * Export a published node to a standalone, styled HTML file via
+ * `read <id> --html --out <file>`, and prove the file is self-contained,
+ * carries the node's content, renders the markdown, lands outside the vault,
+ * and that the HTML-only `--out` guard can't silently litter a file.
+ *
+ * Review gate is OFF so the single `add` publishes directly — this journey is
+ * about export, not the review workflow (that is J7). Case ids + titles are the
+ * ticket's verbatim lines.
+ */
+const J15: Journey = {
+  id: "J15",
+  title: "Share a node outside the vault (HTML export)",
+  cases: [
+    {
+      id: "J15-01",
+      title: "I export a published node to an HTML file at a path I choose",
+      actions: [
+        { args: ["init", "--name", "share-demo"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/handoff",
+            "--type", "document",
+            "--title", "Project Handoff",
+            "--tags", "#share",
+            "--body",
+            "# Project Handoff\n\nStatus is **green**. See [[nodes/plan]] for the plan.\n\n- item one\n- item two",
+          ],
+          stdout: ["Created and published", "nodes/handoff"],
+        },
+        // The export: `--html --out` writes a styled HTML file to the path I name.
+        // "Written to <path>" (stdout) is the confirmation a user relies on.
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("share.html")],
+          stdout: ["Written to"],
+          check: () =>
+            expect(existsSync(j15Export("share.html")), "export file should be created").toBe(true),
+        },
+      ],
+    },
+    // J15-02..05 reuse the nodes/handoff node that J15-01 created — these cases
+    // share one vault and run in order (per the file header), so a case is not
+    // runnable on its own; vitest's -t selects whole journeys, not single cases.
+    {
+      id: "J15-02",
+      title: "The exported file is real HTML carrying the node's title and body",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("with-content.html")],
+          stdout: ["Written to"],
+          check: () => {
+            const html = readFileSync(j15Export("with-content.html"), "utf-8");
+            // A standalone HTML document a browser opens on its own...
+            expect(html).toContain("<!DOCTYPE html>");
+            expect(html).toMatch(/<html\b/);
+            expect(html).toContain("<body>");
+            // ...carrying the node's title and its body text, readable without the vault.
+            expect(html).toContain("Project Handoff");
+            expect(html).toContain("green");
+            expect(html).toContain("item one");
+          },
+        },
+      ],
+    },
+    {
+      id: "J15-03",
+      title: "The export lands outside the vault and nothing inside the vault changes",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("outside.html")],
+          stdout: ["Written to"],
+          check: (vaultDir) => {
+            // The export is a plain file OUTSIDE the vault directory. Compare via
+            // path.relative (not a raw string prefix, which false-positives on
+            // sibling dirs sharing a prefix and is unreliable under Windows 8.3
+            // names / drive-letter casing): a path outside vaultDir yields a
+            // relative that escapes with ".." or is absolute (different drive).
+            const rel = relative(vaultDir, j15Export("outside.html"));
+            expect(
+              rel.startsWith("..") || isAbsolute(rel),
+              `export must land outside the vault directory (relative: ${rel})`,
+            ).toBe(true);
+            // ...and the export writes nothing into the vault: the only .html in
+            // the vault tree is the init-time welcome page — no export leaked in.
+            expect(vaultHtml(vaultDir)).toEqual([".context/welcome.html"]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J15-04",
+      title: "Asking to save without --html writes no file (export is HTML-only)",
+      actions: [
+        // `--out` requires `--html`; without it the CLI just prints the node the
+        // normal way and writes no file — a fat-finger can't silently litter one.
+        {
+          args: () => ["read", "nodes/handoff", "--out", j15Export("guard.html")],
+          stdout: ["Project Handoff", "Status is"],
+          stdoutNot: ["Written to", "<!DOCTYPE html>"],
+          check: () =>
+            expect(
+              existsSync(j15Export("guard.html")),
+              "no file should be written without --html",
+            ).toBe(false),
+        },
+      ],
+    },
+    {
+      id: "J15-05",
+      title: "Markdown in the body renders as HTML, not raw markdown",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("rendered.html")],
+          stdout: ["Written to"],
+          check: () => {
+            const html = readFileSync(j15Export("rendered.html"), "utf-8");
+            // Markdown is rendered to real HTML elements...
+            // Match tags by name only (\b), so adding attributes to a tag in a
+            // future renderer change doesn't break the test.
+            expect(html).toMatch(/<h1\b/); // "# Project Handoff"
+            expect(html).toMatch(/<strong\b/); // "**green**"
+            expect(html).toMatch(/<li\b/); // "- item one / - item two"
+            expect(html).toContain('class="wikilink"'); // "[[nodes/plan]]"
+            // ...not dumped as the raw markdown source.
+            expect(html).not.toContain("**green**");
+            expect(html).not.toContain("[[nodes/plan]]");
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3035,5 +3202,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J14 — work across more than one vault", () => {
     runJourney({ installDir: INSTALL, scratch }, J14);
+  });
+  it("J15 — share a node outside the vault (HTML export)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J15);
   });
 });
