@@ -136,6 +136,7 @@ const remoteNestSpecSchema = z
       url: z.string().min(1),
       auth: remoteAuthSchema.optional(),
       account: z.string().regex(ACCOUNT_NAME_PATTERN, "account must be 1-64 of A-Z a-z 0-9 . _ @ + -").optional(),
+      scope: z.enum(["server", "nest"]).optional(),
       description: z.string().optional(),
       timeout_ms: z.number().int().positive().optional(),
     }),
@@ -430,6 +431,33 @@ export function removeVault(alias: string): RemoveVaultResult {
   return { registry, wasDefault };
 }
 
+export interface RenameVaultResult {
+  registry: VaultRegistry;
+  wasDefault: boolean;
+}
+
+/** Rename an alias (local vault or remote), keeping its entry and the default pointer. */
+export function renameVault(from: string, to: string): RenameVaultResult {
+  assertSafeAlias(from);
+  assertSafeAlias(to);
+  const registry = readRegistry();
+  const kind = registry.vaults[from] ? "vaults" : registry.remotes?.[from] ? "remotes" : null;
+  if (!kind) throw new ConfigError(`No vault registered under alias "${from}".`);
+  if (from === to) throw new ConfigError(`"${from}" is already named that.`);
+  if (registry.vaults[to] || registry.remotes?.[to]) {
+    throw new ConfigError(`Alias "${to}" already exists. Pick another name or remove it first.`);
+  }
+  const table = (kind === "vaults" ? registry.vaults : registry.remotes) as Record<string, unknown>;
+  // Rebuilt in order so the registry file keeps its layout.
+  const renamed = Object.fromEntries(Object.entries(table).map(([k, v]) => [k === from ? to : k, v]));
+  if (kind === "vaults") registry.vaults = renamed as typeof registry.vaults;
+  else registry.remotes = renamed as NonNullable<typeof registry.remotes>;
+  const wasDefault = registry.default === from;
+  if (wasDefault) registry.default = to;
+  writeRegistry(registry);
+  return { registry, wasDefault };
+}
+
 export interface PrunedVault {
   alias: string;
   path: string;
@@ -510,6 +538,10 @@ export interface VaultListEntry {
   /** Remote entries only. */
   transport?: RemoteNestSpec["transport"];
   url?: string;
+  /** Remote http entries: server (many nests) or a single nest, when the registry says. */
+  scope?: "server" | "nest";
+  /** Remote http entries: the `ctx login --account` the alias signs in as. */
+  account?: string;
   command?: string;
   args?: string[];
   /** Registry description, else (local only) the vault config's own `description` or `name`. */
@@ -542,7 +574,11 @@ export function listVaults(): VaultListEntry[] {
       kind: "remote" as const,
       transport: spec.transport,
       ...(spec.transport === "http"
-        ? { url: spec.url }
+        ? {
+            url: spec.url,
+            ...(spec.scope ? { scope: spec.scope } : {}),
+            ...(spec.account ? { account: spec.account } : {}),
+          }
         : { command: spec.command, args: spec.args }),
       description: spec.description,
       isDefault: registry.default === alias,

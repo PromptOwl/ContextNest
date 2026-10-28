@@ -272,6 +272,7 @@ function loginStatePath(opts: CredentialStoreOptions): string {
 }
 
 function writeLoginState(map: ServerMap, opts: CredentialStoreOptions): void {
+  writeLogins(map, opts); // always: the marker can stay "saved" while the server list changes
   const file = loginStatePath(opts);
   const state = Object.keys(map.servers).length > 0 ? "saved" : "none";
   try {
@@ -284,6 +285,85 @@ function writeLoginState(map: ServerMap, opts: CredentialStoreOptions): void {
     fs.writeFileSync(file, state);
   } catch {
     // Only a cache: without it the next lookup reads the store.
+  }
+}
+
+// ─── Logged-in servers (non-secret) ─────────────────────────────────────────
+// `<registry>/logins.json` lists the servers a server-wide key is saved for
+// (URL and account only, never a key), so a command can tell "logged in but
+// not registered" without opening the secure store. Written with the marker.
+
+export interface LoginServerRef {
+  url: string;
+  account?: string;
+}
+
+function loginsPath(opts: CredentialStoreOptions): string {
+  return pathMod.join(opts.home ? pathMod.join(opts.home, ".contextnest") : getRegistryDir(), "logins.json");
+}
+
+function serversOf(map: ServerMap): LoginServerRef[] {
+  return Object.keys(map.servers)
+    .filter((k) => !isNestScope(k))
+    .map((k) => {
+      const { scope, account } = splitAccountKey(k);
+      return { url: scope, ...(account ? { account } : {}) };
+    });
+}
+
+function writeLogins(map: ServerMap, opts: CredentialStoreOptions): void {
+  const file = loginsPath(opts);
+  const tmp = `${file}.${process.pid}.tmp`;
+  const body = JSON.stringify({ version: 1, servers: serversOf(map) });
+  try {
+    if (fs.readFileSync(file, "utf-8") === body) return;
+  } catch {
+    // missing: write it
+  }
+  try {
+    fs.mkdirSync(pathMod.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmp, body, { mode: 0o600 }); // account names can be emails
+    fs.renameSync(tmp, file);
+  } catch {
+    // Only a cache: without it the next check reads the store once.
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // nothing to clean
+    }
+  }
+}
+
+function readLogins(opts: CredentialStoreOptions): LoginServerRef[] | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(loginsPath(opts), "utf-8")) as { servers?: unknown };
+    if (!Array.isArray(raw.servers)) return null;
+    return raw.servers.filter(
+      (s): s is LoginServerRef => !!s && typeof (s as LoginServerRef).url === "string",
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The servers a server-wide key is saved for. Reads the plain file; only a
+ * ctx that predates it (no file, marker not "none") opens the store, once,
+ * and writes the file so the next call is free.
+ */
+export async function loggedInServers(opts: CredentialStoreOptions & { fileOnly?: boolean } = {}): Promise<LoginServerRef[]> {
+  const cached = readLogins(opts);
+  if (cached) return cached;
+  if (opts.fileOnly) return [];
+  if (nothingSaved(opts)) return [];
+  try {
+    return serversOf(await readSavedMap({ ...opts, fresh: true }));
+  } catch {
+    // An unreadable store (locked keychain, wrong key) is reported by the commands that need a key,
+    // not by a hint. Remember "nothing known" so the next command doesn't open the store again;
+    // the next successful save or read rewrites the file.
+    writeLogins(emptyServerMap(), opts);
+    return [];
   }
 }
 

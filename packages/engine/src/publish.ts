@@ -46,11 +46,12 @@ export interface PublishResult {
   /** The checkpoint this publish sealed — hand it to regenerateIndex. */
   checkpoint: Checkpoint;
   /**
-   * The vault crawl the checkpoint took after the write — hand it to
-   * regenerateIndex as `docs`. Like `checkpoint`, only valid passed straight
-   * through under the same lock: any write in between makes it stale.
+   * The vault crawl the checkpoint took after the write, when it took one (no
+   * current manifest) — hand it to regenerateIndex as `docs`. Like
+   * `checkpoint`, only valid passed straight through under the same lock: any
+   * write in between makes it stale.
    */
-  vaultDocs: ContextNode[];
+  vaultDocs?: ContextNode[];
 }
 
 /**
@@ -164,7 +165,7 @@ export async function publishDocument(
   // publish cannot slip between two separate reads and leave a doc missing from
   // — or version-skewed within — the checkpoint this publish seals.
   const checkpointManager = new CheckpointManager(storage);
-  let vaultDocs: ContextNode[] = [];
+  let vaultDocs: ContextNode[] | undefined;
   const checkpoint = await checkpointManager.createCheckpointFromVault(
     docId,
     new Map([[docId, versionEntry]]),
@@ -431,6 +432,7 @@ export async function publishDocuments(
       `bulk-import (${published.length} docs)`,
       new Map(published.map((p) => [p.id, { version: p.version, chain_hash: p.chainHash }])),
       (docs) => (vaultDocs = docs),
+      { crawl: true },
     );
   }
 
