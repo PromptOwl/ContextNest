@@ -805,6 +805,15 @@ export interface VerificationReport {
     actual: string;
   }>;
   /**
+   * Documents whose file differs from what the index (the manifest writes
+   * keep current) holds: added, edited or deleted outside the engine. Writes
+   * do not see them, so `context.yaml` and later checkpoints keep the old
+   * state until `ctx index`. A warning, never an error — a hand edit is not
+   * tampering — and absent when the manifest is not current (the next write
+   * re-reads the vault anyway).
+   */
+  stale_index?: string[];
+  /**
    * Versions verified hash-only because the forget protocol erased their
    * content (§6.3.2). Not errors: the chain proves they existed, not what
    * they said. Present only when there are some.
