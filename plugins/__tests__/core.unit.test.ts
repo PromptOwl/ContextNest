@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { run as retrieve } from "../shared/core/retrieve.js";
+import { run as retrieve, hasTopic } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
 import {
   run as captureGate,
@@ -161,7 +161,7 @@ describe("getConfig", () => {
   it("defaults and Claude userConfig precedence", () => {
     expect(cfg({}).retrievalMode).toBe("search");
     expect(cfg({}).autoCapture).toBe(true);
-    expect(cfg({}).captureMode).toBe("propose");
+    expect(cfg({}).captureMode).toBe("explicit");
     expect(cfg({}).vault).toBe("");
     expect(cfg({}).ctxCommand).toBe("ctx");
 
@@ -230,8 +230,8 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
   });
 
   describe("capture_mode supersedes the legacy auto_capture boolean", () => {
-    it("defaults to propose, and the legacy boolean maps onto off/propose", () => {
-      expect(getConfig({}, tempSettings()).captureMode).toBe("propose");
+    it("defaults to explicit, and the legacy boolean maps onto off/propose", () => {
+      expect(getConfig({}, tempSettings()).captureMode).toBe("explicit");
       expect(getConfig(enableTimeEnv, tempSettings()).captureMode).toBe("propose");
       expect(
         getConfig({ CLAUDE_PLUGIN_OPTION_AUTO_CAPTURE: "false" }, tempSettings()).captureMode,
@@ -255,7 +255,7 @@ describe("getConfig settings override files (CU-wdqcpzw825)", () => {
     it("a bogus mode is skipped per layer and cannot mask a valid lower one", () => {
       const opts = tempSettings({ capture_mode: "aggressive" }, { capture_mode: "auto" });
       expect(getConfig({}, opts).captureMode).toBe("auto");
-      expect(getConfig({}, tempSettings({ capture_mode: "aggressive" })).captureMode).toBe("propose");
+      expect(getConfig({}, tempSettings({ capture_mode: "aggressive" })).captureMode).toBe("explicit");
     });
 
     it("normalizes whitespace and casing before validating", () => {
@@ -584,9 +584,51 @@ describe("retrieve", () => {
   });
 
   it("agent → injects a directive to invoke the retriever", () => {
-    const out = retrieve({ input: { prompt: "x" }, env: env("agent"), exec: fakeExec([]) });
+    const out = retrieve({ input: { prompt: "how does auth work" }, env: env("agent"), exec: fakeExec([]) });
     expect(additional(out)).toMatch(/contextnest-retriever/);
     expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
+  });
+
+  it("a prompt with no subject ('commit and push') searches nothing, in any mode", () => {
+    for (const mode of ["search", "query", "agent"]) {
+      const calls: string[][] = [];
+      const exec = (args: string[]) => (calls.push(args), { status: 0, stdout: "[]", stderr: "" });
+      for (const prompt of ["commit and push", "open the PR", "yes go ahead", "ok"]) {
+        expect(retrieve({ input: { prompt }, env: env(mode), exec })).toBeNull();
+      }
+      expect(calls).toEqual([]);
+    }
+    expect(hasTopic("how does auth work")).toBe(true);
+    expect(hasTopic("commit and push")).toBe(false);
+    // Trailing punctuation must not turn a filler word into a subject.
+    for (const p of ["commit and push.", "open the PR.", "yes.", "ok, go ahead!", "'push'"]) {
+      expect(hasTopic(p)).toBe(false);
+    }
+    // Any script counts as a subject — the filler list is English only.
+    for (const p of ["¿cómo funciona la autenticación?", "认证如何工作", "как работает авторизация"]) {
+      expect(hasTopic(p)).toBe(true);
+    }
+  });
+
+  it("a subjectless prompt still hands over a parked job and the correction rule", () => {
+    for (const mode of ["search", "agent"]) {
+      const io = fakeLedgerIo();
+      captureGate({
+        input: { transcript_path: "t", session_id: "s1" },
+        env: {},
+        readTranscript: tx([userLine("remember that we use pnpm")]),
+        ledgerIo: io,
+      });
+      const calls: string[][] = [];
+      const exec = (args: string[]) => (calls.push(args), { status: 0, stdout: "[]", stderr: "" });
+      const parked = retrieve({ input: { prompt: "commit and push.", session_id: "s1" }, env: env(mode), exec, ledgerIo: io });
+      expect(additional(parked)).toMatch(/contextnest-capture/);
+      expect(additional(parked)).not.toMatch(/contextnest-retriever/);
+      // "no, it's" is correction-shaped yet names no subject.
+      const ladder = retrieve({ input: { prompt: "no, it's", session_id: "s2" }, env: env(mode), exec, ledgerIo: io });
+      expect(additional(ladder)).toMatch(/find EVERY occurrence/);
+      expect(calls).toEqual([]);
+    }
   });
 
   it("search → injects top hits from ctx search (empty registry, default vault)", () => {
@@ -750,6 +792,8 @@ describe("session-start", () => {
   it("warns when ctx is unavailable", () => {
     const out = startSession({ input: {}, env: {}, exec: () => ({ status: 1, stdout: "", code: "ENOENT" }) });
     expect(additional(out)).toMatch(/not available/i);
+    expect(additional(out)).toContain("/contextnest:setup");
+    expect(additional(out)).toMatch(/uploads nothing/i);
   });
 
   it("lists registered vaults and marks pinned/default", () => {
@@ -764,6 +808,22 @@ describe("session-start", () => {
     expect(ctx).toContain("`work`");
     expect(ctx).toContain("default");
     expect(ctx).toContain("pinned");
+  });
+
+  it("says so when the user is logged in to a server with no registered vault, and not when one covers it", () => {
+    const vaults = ["vault list", [{ alias: "work", exists: true }]] as [string, unknown];
+    const open = fakeExec([vaults, ["login --list --json", [{ url: "https://nest.example.com", account: null, usedBy: [] }]]]);
+    const ctx = additional(startSession({ input: {}, env: {}, exec: open }))!;
+    expect(ctx).toContain("logged in to https://nest.example.com");
+    expect(ctx).toContain("no vault registered");
+    expect(ctx).toContain("ctx vault add <alias> --url https://nest.example.com/mcp");
+
+    const covered = fakeExec([vaults, ["login --list --json", [{ url: "https://nest.example.com", usedBy: ["po"] }]]]);
+    expect(additional(startSession({ input: {}, env: {}, exec: covered }))!).not.toContain("logged in to");
+    // An older ctx that doesn't know --json fails the call: nothing is said.
+    const old = (args: string[]) =>
+      args.includes("login") ? { status: 1, stdout: "", stderr: "unknown option" } : fakeExec([vaults])(args);
+    expect(additional(startSession({ input: {}, env: {}, exec: old }))!).not.toContain("logged in to");
   });
 
   it("warns when the pinned vault is not registered (stale pin)", () => {
@@ -789,6 +849,17 @@ describe("session-start", () => {
     expect(ctx).toMatch(/working-directory vault/i);
     expect(ctx).toContain("/proj/notes");
     expect(ctx).toMatch(/not registered/i);
+    expect(ctx).toMatch(/Query the vault/);
+  });
+
+  it("keeps the query nudge for a working-directory vault with nothing registered", () => {
+    const ex = fakeExec([
+      ["vault list", []],
+      ["vault which", { kind: "local", path: "/proj/notes", source: "local" }],
+    ]);
+    const ctx = additional(startSession({ input: { cwd: "/proj/notes" }, env: {}, exec: ex }))!;
+    expect(ctx).toMatch(/Query the vault/);
+    expect(ctx).not.toContain("/contextnest:setup");
   });
 
   it("names the alias when the working-directory vault is registered", () => {
@@ -813,6 +884,13 @@ describe("session-start", () => {
   it("notes local resolution when no vaults are registered", () => {
     const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) });
     expect(additional(out)).toMatch(/No vaults are registered/i);
+    expect(additional(out)).toContain("/contextnest:setup");
+    expect(additional(out)).not.toMatch(/Query the vault/);
+  });
+
+  it("does not offer setup once a vault is registered", () => {
+    const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", [{ alias: "work", exists: true }]]]) });
+    expect(additional(out)).not.toContain("/contextnest:setup");
   });
 });
 
@@ -1193,6 +1271,24 @@ describe("sweep-check", () => {
     expect(text).toMatch(/contextnest-curator/);
   });
 
+  it("run: the sweep check runs under explicit capture, and only off silences it", () => {
+    const sweep = (mode: string) =>
+      sweepCheck({
+        input: { tool_input: { command: "ctx update nodes/a --vault eng --body whatever" } },
+        env: { CONTEXTNEST_CAPTURE_MODE: mode },
+        exec: fakeExec([
+          ["vault list", [{ alias: "eng", exists: true }]],
+          ["read nodes/a --raw --vault eng", "---\nt: x\n---\nSessions live in Postgres."],
+          ["history nodes/a --json --vault eng", { versions: [{ version: 1 }, { version: 2 }] }],
+          ["reconstruct nodes/a 1 --vault eng", "---\nt: x\n---\nSessions live in Redis."],
+          [`search redis --json --limit ${MAX_LIST_SCAN} --vault eng`, [{ id: "nodes/b" }]],
+          ["read nodes/b --raw --vault eng", "---\nt: x\n---\nRedis everywhere."],
+        ]),
+      });
+    expect(sweep("explicit")?.hookSpecificOutput?.additionalContext).toContain('eng:nodes/b still contains "redis"');
+    expect(sweep("off")).toBeNull();
+  });
+
   it("run: a held update (review on) is not diffed — its last two versions are an older edit", () => {
     const routes: [string, unknown][] = [
       ["vault list", [{ alias: "eng", exists: true }]],
@@ -1448,6 +1544,17 @@ describe("capture-gate", () => {
     ).toMatch(/persist/);
   });
 
+  it("explicit mode (the default) never gates ambiently, but still gates an ask and a correction", () => {
+    const ambient = [userLine("go on"), '{"role":"assistant","content":[{"tool_use":1}]}'];
+    const stop = (lines: string[], env: Record<string, string>) =>
+      captureGate({ input: { transcript_path: "t", session_id: "s1" }, env, readTranscript: tx(lines, 50), ledgerIo: fakeLedgerIo() });
+    for (const env of [{}, { CONTEXTNEST_CAPTURE_MODE: "explicit" }, { CONTEXTNEST_CAPTURE_MODE: "explicit", CONTEXTNEST_CAPTURE_ALWAYS: "1" }]) {
+      expect(stop(ambient, env)).toBeNull();
+      expect(stop([userLine("remember that we deploy on Fridays")], env)?.systemMessage).toMatch(/capture/i);
+      expect(stop([userLine("actually it's Postgres not Redis")], env)?.systemMessage).toMatch(/sweep/i);
+    }
+  });
+
   it("an ambient gate stamps the cooldown, and the next one is suppressed", () => {
     const io = fakeLedgerIo();
     const lines = [userLine("go on"), '{"role":"assistant","content":[{"tool_use":1}]}'];
@@ -1456,7 +1563,7 @@ describe("capture-gate", () => {
     // Far enough past the default cooldown that the first ambient pass fires.
     const first = captureGate({
       input,
-      env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5" },
+      env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5", CONTEXTNEST_CAPTURE_MODE: "propose" },
       readTranscript: tx(lines, 20),
       ledgerIo: io,
     });
@@ -1467,7 +1574,7 @@ describe("capture-gate", () => {
     expect(
       captureGate({
         input,
-        env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5" },
+        env: { CONTEXTNEST_CAPTURE_MIN_TURNS: "5", CONTEXTNEST_CAPTURE_MODE: "propose" },
         readTranscript: tx(lines, 21),
         ledgerIo: io,
       }),
@@ -1494,7 +1601,7 @@ describe("capture-gate", () => {
     saveLedger("s1", { lastGatedTurn: 20, captured: [] }, io);
     const out = captureGate({
       input: { transcript_path: "t", session_id: "s1" },
-      env: { CONTEXTNEST_CAPTURE_ALWAYS: "1" },
+      env: { CONTEXTNEST_CAPTURE_ALWAYS: "1", CONTEXTNEST_CAPTURE_MODE: "propose" },
       readTranscript: tx([userLine("hi")], 21),
       ledgerIo: io,
     });
@@ -1616,6 +1723,14 @@ describe("makeExec", () => {
     const exec = makeExec({ ctxCommand: process.execPath });
     const res = exec(["-e", "process.exit(3)"]);
     expect(res.status).toBe(3);
+  });
+
+  it("caps a hung call, then fails the rest fast instead of waiting again", () => {
+    const exec = makeExec({ ctxCommand: process.execPath }, { env: { ...process.env, CONTEXTNEST_CTX_TIMEOUT_MS: "300" } });
+    const started = Date.now();
+    expect(exec(["-e", "setTimeout(() => {}, 10000)"]).code).toBe("ETIMEDOUT");
+    expect(exec(["--version"]).code).toBe("ETIMEDOUT");
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 });
 

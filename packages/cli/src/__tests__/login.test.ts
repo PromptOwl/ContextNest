@@ -9,10 +9,10 @@ type Reply = { status?: number; body?: unknown; headers?: Record<string, string 
 
 /** A scripted fetch: each path pops its next reply; every request is recorded. */
 function scriptedFetch(script: Record<string, Reply[]>) {
-  const calls: { path: string; init: RequestInit }[] = [];
+  const calls: { path: string; url: string; init: RequestInit }[] = [];
   const impl = async (url: string | URL | Request, init: RequestInit = {}) => {
     const path = new URL(String(url)).pathname;
-    calls.push({ path, init });
+    calls.push({ path, url: String(url), init });
     const next = script[path]?.shift();
     if (!next) throw new Error(`unexpected request ${path}`);
     if (next instanceof Error) throw next;
@@ -57,6 +57,38 @@ describe("deviceLogin", () => {
     expect(JSON.parse(String(mint.init.body))).toEqual({ label: "ctx CLI (box)" });
     // No hop may follow a redirect: every request is sent with redirect: "manual".
     expect(f.calls.every((c) => c.init.redirect === "manual")).toBe(true);
+  });
+
+  it("polls with the device secret in a POST body, never in the URL", async () => {
+    const f = scriptedFetch({
+      "/auth/device": [START],
+      "/auth/device/poll": [PENDING, APPROVED],
+      "/auth/promptowl": [EXCHANGE],
+      "/auth/keys": [MINT],
+    });
+    await deviceLogin(SERVER, io(f));
+    const polls = f.calls.filter((c) => c.path === "/auth/device/poll");
+    expect(polls).toHaveLength(2);
+    for (const p of polls) {
+      expect(p.init.method).toBe("POST");
+      expect(p.url).toBe(`${SERVER}/auth/device/poll`);
+      expect(JSON.parse(String(p.init.body))).toEqual({ code: "dc", client_secret: "cs" });
+    }
+  });
+
+  it("falls back to the GET poll once on a server without POST /auth/device/poll", async () => {
+    const f = scriptedFetch({
+      "/auth/device": [START],
+      "/auth/device/poll": [{ status: 404 }, PENDING, APPROVED],
+      "/auth/promptowl": [EXCHANGE],
+      "/auth/keys": [MINT],
+    });
+    const res = await deviceLogin(SERVER, io(f));
+    expect(res.token).toBe("cnst_minted");
+    const polls = f.calls.filter((c) => c.path === "/auth/device/poll");
+    // One POST, then GET for the rest of the login — no POST retried every tick.
+    expect(polls.map((p) => p.init.method ?? "GET")).toEqual(["POST", "GET", "GET"]);
+    expect(polls[1].url).toBe(`${SERVER}/auth/device/poll?code=dc&client_secret=cs`);
   });
 
   it("refuses a redirect instead of carrying the session cookie to another host", async () => {
@@ -270,7 +302,7 @@ describe("connectTarget", () => {
       throw new ContextNestError("rejected — Check that CONTEXTNEST_LOGIN_TOKEN is exported", "REMOTE_AUTH_FAILED");
     });
     await expect(connectTarget({ alias: "h", spec: http }, async () => "cnst_old", reject as never)).rejects.toThrow(
-      /ctx login <server>` again/,
+      /ctx login https:\/\/nest\.example\.com` again/,
     );
   });
 
@@ -304,7 +336,7 @@ describe("connectTarget", () => {
     // Nothing saved and the server wants a key: point at ctx login.
     await expect(connectTarget({ alias: "h", spec: http }, async () => null, reject as never)).rejects.toMatchObject({
       code: "REMOTE_AUTH_FAILED",
-      message: expect.stringMatching(/ctx login <server>.*--vault h\/<nest>/),
+      message: expect.stringMatching(/ctx login https:\/\/nest\.example\.com.*--vault h\/<nest>/),
     });
     // A single-nest endpoint has no /<nest> to name.
     const one: RemoteNestSpec = { transport: "http", url: `${SERVER}/nests/abc/mcp` };

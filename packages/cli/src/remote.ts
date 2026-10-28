@@ -25,9 +25,13 @@ import {
   readRegistry,
 } from "@promptowl/contextnest-engine";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import readline from "node:readline";
 import pathMod from "node:path";
 import type { ContextNode, RemoteNestConnection, RemoteNestSpec, VaultListEntry } from "@promptowl/contextnest-engine";
 import { confirmOrExit, isDryRun } from "./safety.js";
+import { loginCommandFor, nestIdOf, serverOrigin } from "./login-registry.js";
+import { loggedInServers } from "./server-credentials.js";
 import { parseRecipeManifest, manifestSources } from "./pull.js";
 import type { FetchedRecipe, SourceNode } from "./pull.js";
 import {
@@ -174,6 +178,13 @@ export async function serverNests(
       // A failed probe only short-circuits the next probes, not a caller that
       // already holds a live connection (that is proof the server is back).
       if (cached.failed && !conn && !opts.retry && age < NEST_PROBE_BACKOFF_MS) {
+        // Remember WHY it failed: a rejected key must not turn into "not answering" on the next listing.
+        if (cached.reason === "REMOTE_AUTH_FAILED") {
+          throw new ContextNestError(
+            `Remote "${baseAlias}" rejected the key less than ${NEST_PROBE_BACKOFF_MS / 1000}s ago — sign in again.`,
+            "REMOTE_AUTH_FAILED",
+          );
+        }
         throw new ContextNestError(
           `Remote "${baseAlias}" was unreachable less than ${NEST_PROBE_BACKOFF_MS / 1000}s ago — not retrying yet.`,
           "REMOTE_UNREACHABLE",
@@ -191,7 +202,13 @@ export async function serverNests(
     nests = conn ? await fetchNests(conn) : await nestsOverSavedKeys(baseAlias, spec, fetchNests);
   } catch (err) {
     // Keep the last good list: a listing can still show it while the server is down.
-    if (!conn) write({ failed: true, ...(cached?.nests ? { nests: cached.nests } : {}) });
+    if (!conn) {
+      write({
+        failed: true,
+        ...(err instanceof ContextNestError ? { reason: err.code } : {}),
+        ...(cached?.nests ? { nests: cached.nests } : {}),
+      });
+    }
     throw err;
   }
   write({ nests });
@@ -237,7 +254,7 @@ async function nestsOverSavedKeys(
   return [...byId.values()];
 }
 
-type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean };
+type NestCache = { at: number; url: string; nests?: IndexedNest[] | null; failed?: boolean; reason?: string };
 
 /** The cached probe for this alias and URL; undefined when there is none or it is unreadable. */
 function readNestCache(baseAlias: string, url: string): NestCache | undefined {
@@ -365,19 +382,19 @@ async function connectWithLogin(
           } catch (e) {
             storeError = e as Error;
           }
-          if (token) return connectWithToken(target.alias, spec, token, connect);
+          if (token) return connectWithToken(target.alias, spec, token, connect, nestId);
         }
         if (storeError) throw new ContextNestError(storeError.message, "CONFIG_ERROR");
         // A key saved for one nest signs in only as `<alias>/<nest>`, never for the whole server.
         const serverAlias = !nestId && !/\/nests\/[^/]+\/mcp\/?$/.test(spec.url);
-        let message = `${err.message} Or sign in once: \`ctx login <server>\`.`;
+        let message = `${err.message} Or sign in once: \`${loginCommandFor(spec, nestId)}\`.`;
         if (serverAlias) message += ` A key saved for one nest works as --vault ${target.alias}/<nest>.`;
         throw new ContextNestError(message, err.code);
       }
       throw err;
     }
   }
-  return connectWithToken(target.alias, spec, token, connect);
+  return connectWithToken(target.alias, spec, token, connect, nestId);
 }
 
 /** Connect to an HTTP remote with a saved `ctx login` key. */
@@ -386,6 +403,7 @@ async function connectWithToken(
   spec: Extract<RemoteNestSpec, { transport: "http" }>,
   token: string,
   connect: typeof connectRemoteNest,
+  nestId?: string,
 ): Promise<RemoteNestConnection> {
   try {
     // The engine reads bearers from env-var references only, so hand it the key
@@ -399,7 +417,7 @@ async function connectWithToken(
     // The engine's message would point at our internal env var; point at the fix instead.
     if (err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED") {
       throw new ContextNestError(
-        `Remote nest "${alias}" rejected the key saved by \`ctx login\` — run \`ctx login <server>\` again.`,
+        `Remote nest "${alias}" rejected the key saved by \`ctx login\` — run \`${loginCommandFor(spec, nestId)}\` again.`,
         "REMOTE_AUTH_FAILED",
       );
     }
@@ -411,12 +429,60 @@ async function connectWithToken(
  * Connect, run, and always close — the standard remote command wrapper.
  * With a `<server>/<nest>` target, every call carries that nest's id.
  */
+/**
+ * A person at a terminal whose saved key was rejected can sign in right there.
+ * The connection is refused before anything runs, so retrying once is safe for
+ * reads and writes alike. Pipes, --json, CI and nest-scoped keys (which are
+ * pasted, not browsed) never prompt: they get the exact command in the error.
+ */
+function canReauthHere(spec: RemoteNestSpec): spec is Extract<RemoteNestSpec, { transport: "http" }> {
+  return (
+    spec.transport === "http" &&
+    !nestIdOf(spec.url) &&
+    Boolean(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY) &&
+    !process.argv.includes("--json") &&
+    !isDryRun() && // a dry run must not mint a key or write the credential store
+    !process.env.CI
+  );
+}
+
+async function askYesNo(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await new Promise<string>((resolve) => rl.question(`${question} [Y/n] `, resolve));
+    return answer.trim() === "" || /^y/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** Run `open` (resolve the nest, connect); a rejected key at a terminal gets one chance to sign in again. */
+async function reauthOnce<T>(target: RemoteTarget, open: () => Promise<T>): Promise<T> {
+  try {
+    return await open();
+  } catch (err) {
+    const spec = target.spec;
+    if (!(err instanceof ContextNestError) || err.code !== "REMOTE_AUTH_FAILED" || !canReauthHere(spec)) throw err;
+    const origin = serverOrigin(spec.url);
+    const hadKey = (await loggedInServers()).some((l) => l.url === origin && l.account === spec.account);
+    console.error(chalk.yellow(hadKey ? `The key saved for ${origin} was rejected.` : `You're not signed in to ${origin}.`));
+    if (!(await askYesNo("Sign in now?"))) throw err;
+    // By alias: it carries the URL and account, and tells login the vault is registered already.
+    const alias = target.alias.split("/")[0];
+    const login = spawnSync(process.execPath, [...process.execArgv, process.argv[1], "login", alias], { stdio: "inherit" });
+    if (login.status !== 0) throw err;
+    return await open();
+  }
+}
+
 async function withRemote<T>(
   target: RemoteTarget,
   fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
 ): Promise<T> {
-  const nestId = target.nest ? await resolveTargetNest(target) : undefined;
-  const conn = await connectTarget(target, undefined, undefined, nestId);
+  const { nestId, conn } = await reauthOnce(target, async () => {
+    const id = target.nest ? await resolveTargetNest(target) : undefined;
+    return { nestId: id, conn: await connectTarget(target, undefined, undefined, id) };
+  });
   try {
     if (!nestId) return await fn(conn);
     return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) }, nestId);
@@ -661,10 +727,18 @@ async function runOnDocument<T>(
   }
 }
 
+/**
+ * A body as `update --body-file` takes it back: writes store `\n<body>\n`, so
+ * drop that one leading and trailing newline or every round trip adds two.
+ */
+export function bodyOnly(body: string): string {
+  return body.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+}
+
 export async function remoteRead(
   target: RemoteTarget,
   path: string,
-  opts: { raw?: boolean; html?: boolean },
+  opts: { raw?: boolean; html?: boolean; body?: boolean },
 ): Promise<void> {
   if (opts.html) {
     throw new ContextNestError(
@@ -686,6 +760,10 @@ export async function remoteRead(
       // sweep-check reads every candidate this way, so it found nothing on a
       // remote nest. Rebuild the file from what did come back.
       console.log(doc.raw ?? serializeDocument({ id: doc.id, frontmatter: doc.frontmatter, body: doc.body } as ContextNode));
+      return;
+    }
+    if (opts.body) {
+      console.log(bodyOnly(doc.body));
       return;
     }
     const fm = doc.frontmatter;
@@ -1235,6 +1313,8 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
     vaults.map(async (v): Promise<{ nests: IndexedNest[] | null; note?: string }> => {
       const spec = registry.remotes?.[v.alias];
       if (v.kind !== "remote" || spec?.transport !== "http") return { nests: null };
+      // The registry says this is one nest: nothing to list, nothing to probe.
+      if (spec.scope === "nest") return { nests: null };
       try {
         // An unreachable server costs one probe timeout, then is skipped for
         // NEST_PROBE_BACKOFF_MS (serverNests remembers the failure).
@@ -1249,8 +1329,8 @@ export async function expandServerVaults(vaults: VaultListEntry[]): Promise<Vaul
         const stale = readNestCache(v.alias, nestCacheUrl(spec))?.nests ?? null;
         const why =
           err instanceof ContextNestError && err.code === "REMOTE_AUTH_FAILED"
-            ? "server refused the key — `ctx login <server>`"
-            : "server didn't answer";
+            ? `key rejected — ${loginCommandFor(spec)}`
+            : "server not answering";
         return { nests: stale, note: `${why}; ${stale ? "nest list may be out of date" : "nests not listed — try again shortly"}` };
       }
     }),
