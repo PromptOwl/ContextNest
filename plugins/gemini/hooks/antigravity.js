@@ -21,7 +21,7 @@ import { getConfig, isMain, makeExec, readStdin, safeJson } from "../core/lib.js
 import { clearPending, loadLedger, parkJob } from "../core/ledger.js";
 import { run as sessionStart } from "../core/session-start.js";
 import { run as retrieve } from "../core/retrieve.js";
-import { run as sweepCheck } from "../core/sweep-check.js";
+import { run as sweepCheck, SWEEP_CTX_TIMEOUT_MS } from "../core/sweep-check.js";
 import { run as captureGate } from "../core/capture-gate.js";
 
 // ponytail: the transcript record schema is undocumented; `USER_INPUT` +
@@ -159,7 +159,8 @@ if (isMain(import.meta.url)) {
       const raw = await readStdin();
       const input = raw ? safeJson(raw, {}) : {};
       const env = process.env;
-      const exec = makeExec(getConfig(env), { cwd: input.workspacePaths?.[0] || process.cwd(), env });
+      const timeout = event === "PostToolUse" ? SWEEP_CTX_TIMEOUT_MS : undefined;
+      const exec = makeExec(getConfig(env), { cwd: input.workspacePaths?.[0] || process.cwd(), env, timeout });
       out = run(event, { input, env, exec });
     } catch (err) {
       process.stderr.write(`[contextnest] antigravity ${event} hook error: ${err?.message || err}\n`);

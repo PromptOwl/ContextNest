@@ -20,6 +20,15 @@ import {
 } from "./lib.js";
 
 /**
+ * The one next step for a user with nothing connected. Says what connecting
+ * does NOT do, because "register a nest" read as "upload my vault".
+ */
+const SETUP_HINT =
+  "If the user's Context Nest MCP tools are not connected either, offer the guided setup " +
+  "(Claude Code: `/contextnest:setup`) — it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
+  "Connecting uploads nothing: local files stay on this machine unless the user runs `ctx push`.";
+
+/**
  * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function}} ctx
  * @returns {object|null}
  */
@@ -29,10 +38,11 @@ export function run({ env, exec }) {
   // Probe availability + registry in one call.
   const probe = exec(["vault", "list", "--json"]);
   if (!probe || probe.status !== 0) {
+    // No ctx and no npx (no Node, or a locked-down machine): the cloud MCP
+    // path needs neither, so point there instead of at an install.
     return wrap(
       "Context Nest CLI (`ctx`) is not available, so vault auto-retrieval and " +
-        "capture are disabled this session. Install it with " +
-        "`npm i -g @promptowl/contextnest-cli` to enable them.",
+        `capture hooks are disabled this session. ${SETUP_HINT}`,
     );
   }
 
@@ -79,7 +89,7 @@ export function run({ env, exec }) {
     lines.push(
       local
         ? "No vaults are registered; `ctx` resolves the working-directory vault above."
-        : "No vaults are registered; `ctx` will resolve a local `.context` vault from the working directory if present.",
+        : `No vaults are registered, so no nest is connected yet. ${SETUP_HINT}`,
     );
   } else {
     lines.push("Registered vaults:");
@@ -99,15 +109,37 @@ export function run({ env, exec }) {
     }
   }
 
+  // A server the user signed in to but never registered has nests that are invisible here.
+  // Said as a fact for the model to relay; the model is not asked to run anything.
+  const hintsOff = env.CONTEXTNEST_NO_HINTS && env.CONTEXTNEST_NO_HINTS !== "0";
+  const logins = hintsOff ? [] : ctxJson(exec, ["login", "--list", "--json"], []);
+  if (Array.isArray(logins)) {
+    for (const l of logins) {
+      if (!l || typeof l.url !== "string" || (Array.isArray(l.usedBy) && l.usedBy.length > 0)) continue;
+      // The file is the user's, but it ends up in model context: accept only what ctx itself would write.
+      if (!/^https?:\/\/[^\s`]+$/.test(l.url)) continue;
+      if (l.account != null && !/^[A-Za-z0-9._@+-]{1,64}$/.test(String(l.account))) continue;
+      const url = squish(l.url.replace(/`/g, "'"), 120);
+      lines.push(
+        `The user is logged in to ${url}${l.account ? ` (account ${squish(String(l.account).replace(/`/g, "'"), 40)})` : ""} ` +
+          "but has no vault registered for it, so its nests are not listed above. If they ask about it, tell them to run " +
+          `\`ctx vault add <alias> --url ${url}/mcp\` themselves.`,
+      );
+    }
+  }
+
   // The vault captures land in: the pinned one, else the working-directory
   // one. Only that vault's structure rules are shown — fanning out over every
   // registered vault would cost one `ctx` call each on every session start.
   const target = config.vault && pinnedIsRegistered ? { alias: config.vault } : local;
   if (target) lines.push(...structureLines(exec, withVault(["structure", "--json"], target.alias)));
 
-  lines.push(
-    "Query the vault before answering domain questions (`ctx query`/`/contextnest:recall`); cite nodes as `vault:id`.",
-  );
+  // Nothing connected: the setup hint is the whole message.
+  if (vaults.length > 0 || local) {
+    lines.push(
+      "Query the vault before answering domain questions (`ctx query`/`/contextnest:recall`); cite nodes as `vault:id`.",
+    );
+  }
 
   return wrap(lines.join("\n"));
 }

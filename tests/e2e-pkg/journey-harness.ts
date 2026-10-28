@@ -177,8 +177,14 @@ export interface Action {
    * vault to change out from under the CLI between commands.
    */
   mutate?: (vaultDir: string) => void;
-  /** The ctx args to run (e.g. ["add", "nodes/x", "-y"]). */
-  args: string[];
+  /**
+   * The ctx args to run (e.g. ["add", "nodes/x", "-y"]). A function form is
+   * evaluated at run time (after this action's `mutate`), with the journey's
+   * isolated vault root — for args that depend on run-time state an earlier step
+   * produced, such as a suggestion id minted by `drift stage` and stashed by a
+   * `capture` hook. Static args stay a plain array.
+   */
+  args: string[] | ((vaultDir: string) => string[]);
   /** Expected exit status (default 0). */
   status?: number;
   /** Every matcher must appear in stdout. */
@@ -266,9 +272,10 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
   for (const c of journey.cases) {
     for (const a of c.actions) {
       if (a.mutate) a.mutate(vault);
+      const argv = typeof a.args === "function" ? a.args(vault) : a.args;
       const extraEnv = { ...journey.env, ...(a.env ? a.env(vault) : undefined) };
-      const r = runInstalled(ctx.installDir, vault, a.args, cfg, extraEnv);
-      const at = `${c.id} — ${c.title} [ctx ${a.args.join(" ")}]`;
+      const r = runInstalled(ctx.installDir, vault, argv, cfg, extraEnv);
+      const at = `${c.id} — ${c.title} [ctx ${argv.join(" ")}]`;
       expect(r.status, `${at} — exit ${r.status}: ${r.stderr || r.stdout}`).toBe(
         a.status ?? 0,
       );

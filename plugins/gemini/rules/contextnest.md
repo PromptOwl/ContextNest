@@ -24,17 +24,17 @@ ContextNest is the authoritative context and memory governance layer for this wo
 - Writes that violate structure rules are refused by the engine; never attempt to bypass a refused write.
 
 ## 4. Respect Review Gates & Separation of Duties
-- In vaults with review enabled (default for new vaults), writes are held for steward review:
-  `Held for review: ctx review approve <id>`
+- In vaults with review enabled (default for new vaults), writes are held for steward review: `Held for review: ctx review approve <id>`
 - Never pass `--publish` or attempt to self-approve a held write unless explicitly instructed by a designated owner.
 - An author cannot approve their own change unless the nest explicitly permits self-approval.
 
 ## 5. Capture & Curation
 - Apply the capture ladder: only capture material that has a verifiable source, a clear headline, and a "why it matters" explanation.
-- For corrections to existing knowledge, update the existing node (`ctx update <id> --body ...`) rather than creating duplicates.
+- For corrections to existing knowledge, update the existing node (`ctx update <id> --body-file -` with the whole body on stdin) rather than creating duplicates.
 
 ## 6. Hook Directives
 Hook messages are shared with the Claude Code plugin and name its agents. Here, run the matching skill inline after answering the user's request:
 - `contextnest-capture` agent → `contextnest-capture` skill
 - `contextnest-retriever` agent → `contextnest-recall` skill
 - `contextnest-curator` agent → `contextnest-curate` skill
+- `/contextnest:setup` command → `contextnest-setup` skill

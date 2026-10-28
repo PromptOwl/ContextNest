@@ -1,5 +1,23 @@
 # @promptowl/contextnest-cli
 
+## 3.4.0
+
+### Minor Changes
+
+- c050c1d: `ctx add` and `ctx update` take `--body-file <file>` (or `-` for stdin), so a body with newlines, quotes or `$` needs no shell escaping; `ctx read --body` prints the body alone, ready to edit and pass back. `ctx update` now refuses to replace a body with an empty one unless `--force` — the signature of a failed read-modify-write that used to wipe the document.
+- 0414023: Add `ctx setup`: pick the vault options on a web page (https://nest.promptowl.ai/setup, or `CONTEXTNEST_SETUP_URL`), then `ctx init` runs with them. `ctx init` also takes `--tools <ids|none>` to choose the agent config files without a prompt.
+- 1950fba: **`ctx login <server>` now registers the server, so its nests are usable straight away.**
+
+  - A server-wide login adds a remote to your vaults, marked `scope: server` in `~/.contextnest/config.yaml`. It holds no key (the alias borrows the one in the secure store) and never takes your default vault unless it is your first entry. Its nests show as `<alias>/<nest>` in `ctx vault list`; address one with `--vault <alias>/<nest>`, or read across all of them with `--vault <alias>`. The alias comes from the host (`nest.promptowl.ai` → `promptowl`) or `--as`; `--no-register` keeps the old key-only behaviour; a `--nest` login registers nothing.
+  - **Already logged in?** A person at a terminal now sees one line on stderr on every command, until the server is registered (`ctx vault add <alias> --url <server>/mcp`) or hints are off (`ctx hints off`, or `CONTEXTNEST_NO_HINTS=1`). Agents, CI, pipes and `--json` never see it. `ctx doctor` and `ctx login --list [--json]` show which login each alias uses, and the Claude Code plugin mentions an unregistered login at session start.
+  - **Re-authenticating:** auth errors now carry the exact command (`ctx login https://… [--account x]`) instead of `<server>`. `ctx login <alias>` signs in again for a registered alias. At a terminal, a rejected key offers to sign in on the spot and then runs the command you asked for.
+  - New: `ctx vault rename <old> <new>`; `vault list` shows `[server]` / `[nest]`, and a rejected key reads "key rejected" while an unreachable server reads "not answering". The registry's optional `scope` (`nest`, or `server` as written by login) is ignored by older versions, so mixed installs keep working.
+  - Migration: if you logged in before this release, run the `ctx vault add …` command the hint prints. (Don't re-run `ctx login`: it mints a second key on the server.) A registry rewritten by an older ctx drops `scope`; those remotes are then probed as before.
+
+### Patch Changes
+
+- 2501365: `ctx login` now sends the device-login secret in the body of `POST /auth/device/poll` instead of in the URL, so server and proxy access logs can't record it. Against an older Community server without that endpoint (404/405), it falls back to the old GET poll, so login keeps working.
+
 ## 3.3.0
 
 ### Minor Changes

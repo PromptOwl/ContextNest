@@ -639,10 +639,10 @@ describe("<server>/<nest> targets", () => {
       Date.now = now;
     }
     expect(rows).toMatchObject([
-      { alias: "cn", description: expect.stringMatching(/All 2 nest.*didn't answer; nest list may be out of date/) },
+      { alias: "cn", description: expect.stringMatching(/All 2 nest.*not answering; nest list may be out of date/) },
       { alias: "cn/strategy" },
       { alias: "cn/chameleon-collective" },
-      { alias: "cold", description: expect.stringMatching(/didn't answer; nests not listed/) },
+      { alias: "cold", description: expect.stringMatching(/not answering; nests not listed/) },
     ]);
   });
 
