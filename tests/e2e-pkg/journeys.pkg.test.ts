@@ -38,7 +38,7 @@ import {
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, isAbsolute } from "node:path";
 import {
   packCli,
   freshInstall,
@@ -3058,6 +3058,9 @@ const J15: Journey = {
         },
       ],
     },
+    // J15-02..05 reuse the nodes/handoff node that J15-01 created — these cases
+    // share one vault and run in order (per the file header), so a case is not
+    // runnable on its own; vitest's -t selects whole journeys, not single cases.
     {
       id: "J15-02",
       title: "The exported file is real HTML carrying the node's title and body",
@@ -3087,11 +3090,16 @@ const J15: Journey = {
           args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("outside.html")],
           stdout: ["Written to"],
           check: (vaultDir) => {
-            // The export is a plain file OUTSIDE the vault directory...
+            // The export is a plain file OUTSIDE the vault directory. Compare via
+            // path.relative (not a raw string prefix, which false-positives on
+            // sibling dirs sharing a prefix and is unreliable under Windows 8.3
+            // names / drive-letter casing): a path outside vaultDir yields a
+            // relative that escapes with ".." or is absolute (different drive).
+            const rel = relative(vaultDir, j15Export("outside.html"));
             expect(
-              j15Export("outside.html").startsWith(vaultDir),
-              "export must land outside the vault directory",
-            ).toBe(false);
+              rel.startsWith("..") || isAbsolute(rel),
+              `export must land outside the vault directory (relative: ${rel})`,
+            ).toBe(true);
             // ...and the export writes nothing into the vault: the only .html in
             // the vault tree is the init-time welcome page — no export leaked in.
             expect(vaultHtml(vaultDir)).toEqual([".context/welcome.html"]);
@@ -3127,9 +3135,11 @@ const J15: Journey = {
           check: () => {
             const html = readFileSync(j15Export("rendered.html"), "utf-8");
             // Markdown is rendered to real HTML elements...
+            // Match tags by name only (\b), so adding attributes to a tag in a
+            // future renderer change doesn't break the test.
             expect(html).toMatch(/<h1\b/); // "# Project Handoff"
-            expect(html).toContain("<strong>"); // "**green**"
-            expect(html).toContain("<li>"); // "- item one / - item two"
+            expect(html).toMatch(/<strong\b/); // "**green**"
+            expect(html).toMatch(/<li\b/); // "- item one / - item two"
             expect(html).toContain('class="wikilink"'); // "[[nodes/plan]]"
             // ...not dumped as the raw markdown source.
             expect(html).not.toContain("**green**");
