@@ -3,7 +3,7 @@
 Status: proposed (reviewed by a newcomer-persona agent, findings folded in, see section 8)
 Task: CU-wdqcq067m5 (https://app.clickup.com/t/wdqcq067m5)
 Depends on: PR #228 (`feat(cli,engine): first-run onboarding for bare ctx`, CU-wdqcq067kw)
-Touches: `plugins/claude-code/commands/setup.md`, `plugins/shared/core/{session-start,lib}.js`, `plugins/gemini/skills/contextnest-setup/SKILL.md`, `packages/cli/src/first-run.ts` (copy only), plugin README/CHANGELOG, tests
+Touches: `plugins/claude-code/{package.json,package-lock.json,bin/}` (new), `plugins/claude-code/commands/setup.md`, `plugins/shared/core/{session-start,lib}.js`, `plugins/gemini/skills/contextnest-setup/SKILL.md`, `packages/cli/src/first-run.ts` (copy only), plugin README/CHANGELOG, tests
 
 ## 1. Problem
 
@@ -35,6 +35,16 @@ isn't one. An agent that follows the new README ("run `ctx`") gets help text and
 "Run `ctx` in a terminal to get set up.", and passes that on to the user instead
 of running the plugin's setup.
 
+Two more gaps:
+
+- **Installing the plugin doesn't install the CLI.** The hooks fall back to
+  `npx -y @promptowl/contextnest-cli`, which is slow. On a first session the
+  `npx` download probably runs past the 8 s hook limit, so the overview says
+  "CLI not available". This is unverified.
+- **Nothing tells the user to run setup.** The no-vault hint goes into Claude's
+  context only, so a user who never types `/contextnest:setup` may never learn
+  it exists.
+
 ## 2. Goal
 
 There are two ways in, and they should behave as one setup. Whether the user
@@ -43,8 +53,9 @@ words and end up with the same notes in the same place. Once either way is
 finished, the other one stays quiet.
 
 The persona test: a developer who has never heard of vaults, nests, or `ctx`
-should be done in under two minutes. They answer one question and approve one
-install, and they never see a word they have to look up.
+should be done in under two minutes. They are told to run setup without having
+to know about it, answer one question, install nothing by hand, and never see a
+word they have to look up.
 
 ## 3. Approach
 
@@ -67,6 +78,48 @@ choice. Each place says where the notes go: "this computer", or the hostname.
 
 ## 4. Changes
 
+### 4.0 The CLI comes with the plugin
+
+Claude Code installs a plugin's npm dependencies by itself, both when the plugin
+is installed and when it updates. It does this when the plugin folder has a
+`package.json` and a lockfile. It runs the install with scripts disabled and a
+60 s limit, using the user's npm or Bun. See
+https://code.claude.com/docs/en/plugins/loading.md#node-js-package-dependencies.
+
+The published CLI is a good fit. 3.4.0 depends on `commander` plus an optional
+`chalk`, has no install scripts, and is 4.3 MB unpacked. A scripts-disabled
+`npm ci` of it took about 1 s and 4.6 MB, and the installed `ctx --version` ran.
+
+1. **`plugins/claude-code/package.json`.** Add
+   `"dependencies": { "@promptowl/contextnest-cli": "<exact version>" }` and
+   commit a `package-lock.json`. `plugins/` is not in the pnpm workspace, so an
+   npm lockfile there clashes with nothing.
+2. **`plugins/shared/core/lib.js` (`makeExec`).** Change the fallback order to:
+   the configured or global `ctx`, then the bundled
+   `node <plugin>/node_modules/@promptowl/contextnest-cli/dist/index.js`, then
+   `npx`. Resolve the bundled path from `import.meta.url`. If it isn't there,
+   which is the case for Gemini and for `--plugin-dir` dev sessions, fall
+   through to `npx`.
+3. **`plugins/claude-code/bin/ctx`.** Add a two-line launcher for the bundled
+   CLI. Files in a plugin's `bin/` are on the Bash tool's `PATH` while the
+   plugin is enabled, so Claude can type plain `ctx` with nothing installed. A
+   user's own `ctx` still wins, because plugin `bin/` comes after the user's
+   `PATH`. Also add `bin/ctx.cmd` if Windows needs it: the docs don't say how
+   extensionless `bin/` files work on Windows.
+4. **`/contextnest:setup` stops asking to install the CLI.** At the end it offers,
+   once and optionally: "Want `ctx` in your own terminal too? `npm i -g
+   @promptowl/contextnest-cli`". That install is the only thing that puts `ctx`
+   on the user's shell `PATH`.
+5. **Release.** Bump the pin and lockfile after each CLI publish. It can't be
+   done in the changesets version PR, because the lockfile needs the published
+   tarball's integrity hash. `plugins:check` fails if the lockfile and the pin
+   disagree.
+
+Rejected:
+- Committing the built CLI (4.3 MB) into the plugin.
+- The docs' SessionStart `npm install` into `${CLAUDE_PLUGIN_DATA}`. It is POSIX
+  shell only, and it isn't needed now that the automatic install exists.
+
 ### 4.1 `/contextnest:setup` (`plugins/claude-code/commands/setup.md`)
 
 1. **One question:** "Where should Claude keep its notes?"
@@ -75,9 +128,10 @@ choice. Each place says where the notes go: "this computer", or the hostname.
    - **Both.**
    - **Not now.**
 
-   This is always the recommended answer, as it is in the CLI. With no `ctx`,
-   ask once: "I need to install the Context Nest tool (npm, no admin rights). OK?"
-   Offer the online path only if that install isn't possible (no Node or npm).
+   This is always the recommended answer, as it is in the CLI. The CLI comes
+   with the plugin (4.0). If even the bundled copy is missing, for example
+   because the automatic install failed, offer to install it with npm, and fall
+   back to the online MCP path only if that isn't possible.
 2. **No usage or scope questions.** Apply **Light** (`search` / `explicit`) for
    all projects, and say at the end how to change it (`/contextnest:config`).
    The no-CLI cloud path uses `claude mcp add --scope user`.
@@ -99,7 +153,9 @@ choice. Each place says where the notes go: "this computer", or the hostname.
    notes without `--set-default`, the same order the CLI uses. If the online half
    fails, keep the local notes and say how to retry.
 7. **Not now:** write `"setup": "declined"` to `~/.contextnest/plugin-settings.json`
-   (section 4.2), say "OK. Run /contextnest:setup any time.", and stop.
+   (section 4.2), say "OK. Run /contextnest:setup any time.", and stop. Every
+   path that finishes writes `"setup": "done"`. That includes "already set up"
+   and the online-MCP-only path, which leaves no `ctx` vault for the hook to see.
 8. **Finish with a first real note, not a search.** A fresh developer vault holds
    only placeholder pages, so searching it "proves" nothing. `init --starter`
    already prints the starter's first-note prompt for the agent. Follow it: one
@@ -117,7 +173,7 @@ choice. Each place says where the notes go: "this computer", or the hostname.
     - `ctx --version`, `ctx vault list`, `ctx login --list`
     - `ctx init`, `ctx login`, `ctx vault add`
 
-    The npm install still asks, since that is the one step the user should consent to.
+    The optional global `npm i -g` still asks, because it changes the user's machine outside the plugin.
 11. **Rename the frontmatter** to match: the `description` and `argument-hint`
     (`[local|online|both] [server-url]`; `cloud` stays accepted as an alias for
     `online`).
@@ -129,6 +185,25 @@ Unchanged:
 
 ### 4.2 Session overview (`plugins/shared/core/session-start.js`, `lib.js`)
 
+- **Tell the user to run setup if they haven't.** The hint below reaches only
+  Claude. The user also needs to see it.
+  - When there is no registered vault, no working-directory vault, and no
+    `setup` key, the SessionStart hook also returns a `systemMessage`, which the
+    docs describe as a message shown to the user: "Context Nest isn't set up
+    yet. Run /contextnest:setup to give Claude a notes folder. It takes about a
+    minute."
+  - It fires only when the hook input has `source: "startup"`, not on resume,
+    clear or compact. So the user sees it once per new session, before they
+    type anything, and never in the middle of a task.
+  - It stops once setup writes `done` or `declined` (4.1 item 7), or once a vault
+    exists, including one made by bare `ctx` in a terminal.
+  - Users who set up 0.7.0 over MCP only have no vault and no key, so they see
+    it once per session until they re-run setup. Setup then answers "already
+    set up" and writes `done`.
+  - To verify: the docs list the events that drop `systemMessage` (Setup,
+    InstructionsLoaded, Notification), and SessionStart is not among them. Check
+    it in a real session before relying on it. `initialUserMessage` can't start
+    setup by itself, because it works only in `-p` mode.
 - Rewrite `SETUP_HINT`:
   - Mention setup once per session, in one line, and never in the middle of the user's task.
   - If the user asks to set up, run `/contextnest:setup` yourself, and recommend this computer.
@@ -160,7 +235,9 @@ still open; otherwise make it the first commit of this ticket.
 
 ### 4.5 Docs and release
 
-- `plugins/claude-code/README.md` Setup section: running `ctx` in a terminal and `/contextnest:setup` are the same setup and end up in the same place, with one question.
+- `plugins/claude-code/README.md`:
+  - Setup section: running `ctx` in a terminal and `/contextnest:setup` are the same setup and end up in the same place, with one question.
+  - Requirements section: the CLI comes with the plugin. `npm i -g` is needed only for `ctx` in your own terminal.
 - Bump the plugin from `0.7.0` to `0.8.0` and add a CHANGELOG entry. Add a CLI changeset if 4.4 doesn't ride in PR #228.
 
 ### 4.6 Tests
@@ -169,6 +246,9 @@ still open; otherwise make it the first commit of this ticket.
   - the no-vault overview contains the new hint and never suggests bare `ctx`
   - `setup: "declined"` gives the one quiet line
   - a terminal `skipped_at` alone still offers setup
+  - `systemMessage` appears only on `startup` with nothing set up, and never after `done`, `declined`, or once a vault exists
+- `plugins/__tests__/io-shell.test.ts`: when `ctx` gives ENOENT, `makeExec` tries the bundled CLI before `npx`.
+- `plugins:check`: the plugin's pinned CLI version matches its lockfile.
 - A new drift test (section 3).
 - `packages/cli/src/__tests__/first-run.test.ts`: updated strings.
 - No new tests are needed for `init`, `login` or `vault add`, because they already have tests.
@@ -182,6 +262,14 @@ still open; otherwise make it the first commit of this ticket.
 
 ## 6. Risks
 
+- The automatic dependency install is documented for marketplace installs, which
+  copy the plugin into a cache. `--plugin-dir` dev sessions load in place, so
+  they probably skip it (inferred) and fall back to `npx` or a manual `npm ci`.
+  The install also needs npm or Bun on the user's `PATH`. The hooks already need
+  Node, so in practice this adds nothing.
+- If the user's own global `ctx` is older than the bundled one, it still wins.
+  This is today's behaviour, and setup's version check still applies.
+
 - The model has to read the sign-in link from a background `ctx login`. If the link line changes, setup silently waits. The drift test should also match the "Approve the login in your browser" line in `index.ts`.
 - `allowed-tools` pre-approves `ctx init`, `ctx login` and `ctx vault add` only while the command runs. Never add `ctx delete`, `ctx forget` or a bare `ctx:*` wildcard.
 - The starter's first-note prompt is written to make the agent act at once. Setup must keep its own rule above it: ask first, and write one note only after the user agrees.
@@ -189,14 +277,16 @@ still open; otherwise make it the first commit of this ticket.
 ## 7. Steps to test
 
 1. Use a clean profile: run `export CONTEXTNEST_CONFIG_DIR=$(mktemp -d)` with an empty `HOME`, install the plugin, and start Claude Code in any code repo.
-2. Run `/contextnest:setup` and accept the recommendation. You should see one question, then one install prompt if `ctx` is missing. Then `~/ContextNest/main` is created, Claude asks what to capture first, and the reply ends with three short lines.
-3. In a terminal, run `ctx`. You should see plain help with no setup menu, and exit code 0.
-4. Reset. Run `ctx` in a terminal first and press Enter twice; the wording should match step 2. Then run `/contextnest:setup`. You should see "Claude is already using your notes (~/ContextNest/main)" and no second vault.
-5. Reset. Run `/contextnest:setup` and choose **Online**. The approval link should appear in the chat, and after you approve, the nests are listed.
-6. Repeat step 5 while already signed in. No browser should open, and the nests connect straight away. Run it once more: you should see "already connected", and nothing is added twice.
-7. Choose **Both**. Your local notes should be the default, with the online nests beside them.
-8. Choose **Not now**, then start a new session. Claude should not offer setup again unless you ask.
-9. With no vault, type "set up context nest for me". Claude should run the setup itself and recommend this computer. It should never tell you to open a terminal.
+2. Before typing anything, you should see "Context Nest isn't set up yet. Run /contextnest:setup…". Ask Claude to run `ctx --version`; it should work with no global install.
+3. Run `/contextnest:setup` and accept the recommendation. You should see one question and no install prompt. Then `~/ContextNest/main` is created, Claude asks what to capture first, and the reply ends with three short lines. Start a new session: there should be no setup message.
+4. Install the CLI globally (`npm i -g @promptowl/contextnest-cli`), then run `ctx` in a terminal. You should see plain help with no setup menu, and exit code 0.
+5. Reset. Run `ctx` in a terminal first and press Enter twice; the wording should match step 3. Then start Claude Code. You should see no setup message. Run `/contextnest:setup`: you should see "Claude is already using your notes (~/ContextNest/main)" and no second vault.
+6. Reset. Run `/contextnest:setup` and choose **Online**. The approval link should appear in the chat, and after you approve, the nests are listed.
+7. Repeat step 6 while already signed in. No browser should open, and the nests connect straight away. Run it once more: you should see "already connected", and nothing is added twice.
+8. Choose **Both**. Your local notes should be the default, with the online nests beside them.
+9. Choose **Not now**, then start a new session. You should see no setup message, and Claude should not offer setup unless you ask.
+10. With no vault, type "set up context nest for me". Claude should run the setup itself and recommend this computer. It should never tell you to open a terminal.
+11. Resume a session (`claude --resume`) with nothing set up. The setup message should not repeat.
 
 ## 8. Persona review (summary)
 
@@ -206,7 +296,7 @@ first draft. Verdict: **ship, with changes**. Every change below is in section 4
 
 - Always recommend this computer. The draft recommended the hosted server whenever `ctx` was missing, which sent a newcomer to an account sign-in.
 - Use "notes" instead of vault, nest, template, alias, pin and default, in both the terminal and the plugin.
-- Cut the usage and scope questions, leaving one question and one install approval.
+- Cut the usage and scope questions, leaving one question. (The install approval it left has since gone too, because the CLI now comes with the plugin, 4.0.)
 - Don't "prove it works" by searching placeholder template pages. Write a first real note instead.
 - Don't register an already-connected server twice, and reword the "already set up" screen.
 - Remember "Not now" across sessions. Don't treat a terminal Skip as a permanent no.
