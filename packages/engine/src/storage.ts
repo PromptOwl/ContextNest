@@ -576,6 +576,14 @@ export interface NestStorageOptions {
    * key store. Ignored for a plain vault.
    */
   encryption?: VaultCryptoOptions;
+  /**
+   * Keep the agent config files (CLAUDE.md, GEMINI.md, .cursorrules, …) in
+   * step with the index on every regeneration. Default true. A host that
+   * serves the vault and never hands those files to a coding agent (a hosted
+   * server) turns it off: they embed the document list, so each write would
+   * otherwise rewrite five files nobody reads.
+   */
+  agentConfigs?: boolean;
 }
 
 /**
@@ -1319,6 +1327,7 @@ export class NestStorage {
       },
     );
 
+    if (this.options.agentConfigs === false) return;
     const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
     const agentConfigs = generateAgentConfigs({
       config,
@@ -1327,22 +1336,26 @@ export class NestStorage {
       hasMcpServer,
     });
 
-    for (const file of agentConfigs) {
-      const filePath = join(this.root, file.path);
+    // Distinct files: written side by side, so a network mount pays one
+    // round trip for all of them, not one per file.
+    await Promise.all(
+      agentConfigs.map(async (file) => {
+        const filePath = join(this.root, file.path);
 
-      let existing: string | null = null;
-      try {
-        existing = await readFile(filePath, "utf-8");
-      } catch {
-        // file does not exist yet
-      }
+        let existing: string | null = null;
+        try {
+          existing = await readFile(filePath, "utf-8");
+        } catch {
+          // file does not exist yet
+        }
 
-      const merged = mergeAgentConfig(existing, file.content);
-      // Usually unchanged between writes — skip the rewrite.
-      if (merged !== existing) {
-        await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
-      }
-    }
+        const merged = mergeAgentConfig(existing, file.content);
+        // Usually unchanged between writes — skip the rewrite.
+        if (merged !== existing) {
+          await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
+        }
+      }),
+    );
   }
 
   /**
