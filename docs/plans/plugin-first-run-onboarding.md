@@ -206,6 +206,27 @@ Unchanged:
     InstructionsLoaded, Notification), and SessionStart is not among them. Check
     it in a real session before relying on it. `initialUserMessage` can't start
     setup by itself, because it works only in `-p` mode.
+- **Warn when the user's own `ctx` is older than the plugin's.** The plugin
+  always runs the user's global `ctx` first (4.0), so an old one silently
+  costs features. For example, `login` arrived in 3.2.0, and `structure
+  --json` returns an error on older CLIs.
+  - Only on `source: "startup"`, SessionStart runs one extra `exec(["--version"])`.
+    It goes through the same fallback, so it reports whichever CLI the hooks
+    actually use. It costs one CLI start, about 0.2–0.4 s, once per new
+    session.
+  - The IO shell reads the CLI pin from the plugin's `package.json` and passes
+    it to `run()`. Gemini has no pin, so it skips the check.
+  - If the reported `x.y.z` is lower than the pin, return a `systemMessage`:
+    "Your `ctx` is 3.1.0; this plugin expects 3.4.0 or newer. Update it with
+    `npm i -g @promptowl/contextnest-cli@latest`."
+  - When the bundled or `npx` CLI answered, the version is equal or newer, so
+    there's no message.
+  - Unparseable output, a failed call, or `CONTEXTNEST_NO_HINTS` all mean no
+    message.
+  - It joins the setup message in one `systemMessage` if both apply.
+  - Not chosen: preferring the bundled CLI over an older global one. That
+    would need a version check in every hook process (one per prompt), or a
+    cached decision.
 - Rewrite `SETUP_HINT`:
   - Mention setup once per session, in one line, and never in the middle of the user's task.
   - If the user asks to set up, run `/contextnest:setup` yourself, and recommend this computer.
@@ -248,7 +269,8 @@ still open; otherwise make it the first commit of this ticket.
   - the no-vault overview contains the new hint and never suggests bare `ctx`
   - `setup: "declined"` gives the one quiet line
   - a terminal `skipped_at` alone still offers setup
-  - `systemMessage` appears only on `startup` with nothing set up, and never after `done`, `declined`, or once a vault exists
+  - `systemMessage` appears only on `startup` with nothing set up, and never after `done`, `declined`, or once a vault exists, or with `CONTEXTNEST_VAULT_PATH` set
+  - Outdated `ctx`: a fake `--version` of `3.1.0` against pin `3.4.0` gives the update line; equal, newer, unparseable, failed, no pin, or a non-startup `source` gives none; both messages join into one
 - `plugins/__tests__/io-shell.test.ts`: when `ctx` gives ENOENT, `makeExec` tries the bundled CLI before `npx`.
 - `plugins:check`: the plugin's pinned CLI version matches its lockfile.
 - A new drift test (section 3).
@@ -270,7 +292,8 @@ still open; otherwise make it the first commit of this ticket.
   The install also needs npm or Bun on the user's `PATH`. The hooks already need
   Node, so in practice this adds nothing.
 - If the user's own global `ctx` is older than the bundled one, it still wins.
-  This is today's behaviour, and setup's version check still applies.
+  The user is told once per session how to update it (4.2), but until they do,
+  the hooks run with the older CLI's features.
 
 - The model has to read the sign-in link from a background `ctx login`. If the link line changes, setup silently waits. The drift test should also match the "Approve the login in your browser" line in `index.ts`.
 - `allowed-tools` pre-approves `ctx init`, `ctx login` and `ctx vault add` only while the command runs. Never add `ctx delete`, `ctx forget` or a bare `ctx:*` wildcard.
@@ -290,6 +313,7 @@ still open; otherwise make it the first commit of this ticket.
 10. With no vault, type "set up context nest for me". Claude should run the setup itself and recommend this computer. It should never tell you to open a terminal.
 11. Resume a session (`claude --resume`) with nothing set up. The setup message should not repeat.
 12. An existing user: a global `ctx` with a registered vault (or only `CONTEXTNEST_VAULT_PATH` set), then install the plugin. You should see no setup message, `which ctx` in Claude's Bash should show the global one, and the overview should list your existing vaults.
+13. Same as step 12, but with an older global CLI (`npm i -g @promptowl/contextnest-cli@3.1.0`). At session start you should see "Your `ctx` is 3.1.0; this plugin expects 3.4.0 or newer…". Update it and start a new session; the line should be gone.
 
 ## 8. Persona review (summary)
 
