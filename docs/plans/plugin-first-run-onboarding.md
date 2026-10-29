@@ -113,7 +113,9 @@ The published CLI is a good fit. 3.4.0 depends on `commander` plus an optional
 5. **Release.** Bump the pin and lockfile after each CLI publish. It can't be
    done in the changesets version PR, because the lockfile needs the published
    tarball's integrity hash. `plugins:check` fails if the lockfile and the pin
-   disagree.
+   disagree. The step is written into the Releasing section of `CLAUDE.md`:
+   set the pin, refresh the lockfile, and bump the plugin version, because
+   installed plugins only re-fetch dependencies on a new plugin version.
 
 Rejected:
 - Committing the built CLI (4.3 MB) into the plugin.

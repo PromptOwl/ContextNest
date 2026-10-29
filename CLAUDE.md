@@ -121,6 +121,14 @@ Every PR — human- or AI-authored — must have both of these, or the Claude re
 
 Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together. `CONTEXT_NEST_SPEC.md` is the one exception in the repo: Apache-2.0, per `LICENSE-SPEC`.
 
+**After a release that publishes the CLI, update the Claude Code plugin's pin.** `plugins/claude-code/package.json` pins `@promptowl/contextnest-cli` to an exact version, and Claude Code installs it with the plugin. Do these steps, then commit them together:
+
+1. Set the pin to the new version.
+2. Run `npm install --package-lock-only --ignore-scripts` in `plugins/claude-code/` to refresh `package-lock.json`.
+3. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
+
+This can't go in the changesets version PR, because the lockfile needs the published tarball's integrity hash. `pnpm plugins:check` fails when the pin and the lockfile disagree. The pin is added by CU-wdqcq067m5; until that lands there is nothing to bump.
+
 ## Specification
 
 `CONTEXT_NEST_SPEC.md` is normative — §1 document format, §2 selectors, §3 packs, §4 URI scheme, §5 `context.yaml`, §6–8 versions/checkpoints/integrity, §9 injection & tracing, §10 INDEX.md, §13 validation rules.
