@@ -260,6 +260,13 @@ export function getConfig(env = process.env, opts = {}) {
           accept: (s) => VALID_UNCLEAR_NEST.includes(s),
         },
       ) || "ask",
+    // What /contextnest:setup recorded: "done", or "declined" for Not now. Read
+    // from the settings files only; it stops the session-start setup message.
+    setup:
+      pick("setup", [], {
+        normalize: (s) => s.trim().toLowerCase(),
+        accept: (s) => s === "done" || s === "declined",
+      }) || "",
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,
