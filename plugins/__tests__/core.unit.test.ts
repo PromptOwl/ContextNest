@@ -6,6 +6,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { run as retrieve, hasTopic } from "../shared/core/retrieve.js";
 import { run as sessionStart } from "../shared/core/session-start.js";
@@ -50,6 +51,7 @@ import {
   VALID_CAPTURE_MODES,
   VALID_RETRIEVAL_MODES,
   makeExec,
+  bundledCliPin,
   winQuote,
   MAX_FANOUT_VAULTS,
   MAX_HITS,
@@ -1731,6 +1733,34 @@ describe("makeExec", () => {
     expect(exec(["-e", "setTimeout(() => {}, 10000)"]).code).toBe("ETIMEDOUT");
     expect(exec(["--version"]).code).toBe("ETIMEDOUT");
     expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  // No global ctx: the CLI installed with the plugin answers before npx is tried.
+  it("falls back to the bundled CLI when the configured command is missing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cn-bundled-"));
+    const cli = join(dir, "index.js");
+    writeFileSync(cli, 'console.log("bundled " + process.argv.slice(2).join(" "))');
+    const exec = makeExec({ ctxCommand: "contextnest-no-such-command" }, { bundledCli: cli });
+    const res = exec(["vault", "list"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe("bundled vault list");
+  });
+
+  it("bundledCliPin reads an exact pin and ignores ranges or a missing file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cn-pin-"));
+    const pkg = (deps: object) => {
+      const p = join(dir, `${Math.random()}.json`);
+      writeFileSync(p, JSON.stringify({ dependencies: deps }));
+      return pathToFileURL(p);
+    };
+    expect(bundledCliPin(pkg({ "@promptowl/contextnest-cli": "3.4.0" }))).toBe("3.4.0");
+    expect(bundledCliPin(pkg({ "@promptowl/contextnest-cli": "^3.4.0" }))).toBeNull();
+    expect(bundledCliPin(pkg({}))).toBeNull();
+    expect(bundledCliPin(pathToFileURL(join(dir, "missing.json")))).toBeNull();
+  });
+
+  it("the Claude Code plugin pins the CLI exactly (Claude Code installs it with the plugin)", () => {
+    expect(bundledCliPin(new URL("../claude-code/package.json", import.meta.url))).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });
 

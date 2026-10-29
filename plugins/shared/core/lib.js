@@ -12,9 +12,10 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir as osHomedir, tmpdir as osTmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Windows needs shell-based spawning for npm's .cmd shims — see makeExec. */
 const WIN32 = process.platform === "win32";
@@ -29,6 +30,27 @@ export function winQuote(s) {
   const str = String(s);
   if (str !== "" && !/[\s"^&|<>()%!]/.test(str)) return str;
   return `"${str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+}
+
+/** The CLI's npm package; also the plugin's pinned dependency. */
+export const CLI_PACKAGE = "@promptowl/contextnest-cli";
+
+/**
+ * The CLI Claude Code installs with the plugin (its package.json pins it), at
+ * `<plugin>/node_modules`. Absent for Gemini and `--plugin-dir` dev runs.
+ */
+export const BUNDLED_CLI = fileURLToPath(
+  new URL(`../node_modules/${CLI_PACKAGE}/dist/index.js`, import.meta.url),
+);
+
+/** The exact CLI version this plugin pins in its package.json, or null (Gemini, shared/). */
+export function bundledCliPin(pkgUrl = new URL("../package.json", import.meta.url)) {
+  try {
+    const pin = JSON.parse(readFileSync(pkgUrl, "utf-8")).dependencies?.[CLI_PACKAGE];
+    return typeof pin === "string" && /^\d+\.\d+\.\d+$/.test(pin) ? pin : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Default per-call `ctx` timeout for hooks, in ms (0 disables). See makeExec. */
@@ -255,8 +277,9 @@ export function getConfig(env = process.env, opts = {}) {
 }
 
 /**
- * Build the default synchronous `ctx` runner. Tries the configured command,
- * and on ENOENT (no global install) transparently falls back to npx.
+ * Build the default synchronous `ctx` runner. Tries the configured command
+ * (the user's own `ctx`, so hooks match their terminal); when it isn't
+ * installed, the CLI bundled with the plugin; failing that, npx.
  *
  * The returned function has the injectable shape the run() handlers expect:
  *   exec(args: string[]) => { status, stdout, stderr }
@@ -270,11 +293,12 @@ export function getConfig(env = process.env, opts = {}) {
  * (the sweep check); the env override still wins.
  *
  * @param {ReturnType<typeof getConfig>} config
- * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeout?: number }} [opts]
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeout?: number, bundledCli?: string }} [opts]
  */
 export function makeExec(config, opts = {}) {
   const cwd = opts.cwd || process.cwd();
   const env = opts.env || process.env;
+  const bundledCli = opts.bundledCli ?? BUNDLED_CLI;
   const timeout = envInt(env, "CONTEXTNEST_CTX_TIMEOUT_MS", opts.timeout ?? CTX_TIMEOUT_MS);
   let timedOut = false;
 
@@ -313,8 +337,10 @@ export function makeExec(config, opts = {}) {
   return (args) => {
     const res = attempt(config.ctxCommand, args);
     // EINVAL: shell-less .cmd refusal on older Node. ENOENT: no global install.
-    if (res.code === "ENOENT" || res.code === "EINVAL") {
-      return attempt("npx", ["-y", "@promptowl/contextnest-cli", ...args]);
+    // 9009: cmd.exe's "not recognized", which is what the Windows shell spawn reports instead.
+    if (res.code === "ENOENT" || res.code === "EINVAL" || (WIN32 && res.status === 9009)) {
+      if (existsSync(bundledCli)) return attempt(process.execPath, [bundledCli, ...args]);
+      return attempt("npx", ["-y", CLI_PACKAGE, ...args]);
     }
     return res;
   };
