@@ -187,7 +187,9 @@ Unchanged:
 
 - **Tell the user to run setup if they haven't.** The hint below reaches only
   Claude. The user also needs to see it.
-  - When there is no registered vault, no working-directory vault, and no
+  - When there is no registered vault, no working-directory vault, no
+    `CONTEXTNEST_VAULT` or `CONTEXTNEST_VAULT_PATH` (the same "existing user"
+    test as the CLI's `shouldOnboard`; `cwdVault` ignores an env-var vault), and no
     `setup` key, the SessionStart hook also returns a `systemMessage`, which the
     docs describe as a message shown to the user: "Context Nest isn't set up
     yet. Run /contextnest:setup to give Claude a notes folder. It takes about a
@@ -287,6 +289,7 @@ still open; otherwise make it the first commit of this ticket.
 9. Choose **Not now**, then start a new session. You should see no setup message, and Claude should not offer setup unless you ask.
 10. With no vault, type "set up context nest for me". Claude should run the setup itself and recommend this computer. It should never tell you to open a terminal.
 11. Resume a session (`claude --resume`) with nothing set up. The setup message should not repeat.
+12. An existing user: a global `ctx` with a registered vault (or only `CONTEXTNEST_VAULT_PATH` set), then install the plugin. You should see no setup message, `which ctx` in Claude's Bash should show the global one, and the overview should list your existing vaults.
 
 ## 8. Persona review (summary)
 
