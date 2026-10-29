@@ -9,6 +9,7 @@ import { generateContextYaml } from "../index-generator.js";
 import { generateIndexMd } from "../index-md-generator.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import { serializeDocument } from "../parser.js";
+import { buildManifest } from "../manifest.js";
 import { useManifest } from "./fixtures/manifest-on.js";
 
 // The manifest is a POC behind CONTEXTNEST_MANIFEST (off by default): on here.
@@ -46,14 +47,26 @@ function rng(seed: number): () => number {
 const stamp = /\d{4}-\d{2}-\d{2}(T[\d:.]+Z)?/g;
 const normalize = (text: string) => text.replace(stamp, "<ts>");
 
-describe("index and checkpoint equal a full rebuild after any write sequence", () => {
+// "host": the manifest comes from the host (NestStorageOptions.manifest), as
+// the hosted server serves it from its database. The stand-in here is always
+// exact — a fresh crawl — so what is under test is how the engine consumes it.
+describe.each(["file", "host"] as const)("index and checkpoint equal a full rebuild after any write sequence (%s manifest)", (mode) => {
   let root: string;
   let ctx: OperationContext;
   const api = createEngineApi();
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "cn-index-eq-"));
-    const storage = new NestStorage(root);
+    const storage: NestStorage =
+      mode === "host"
+        ? new NestStorage(root, {
+            manifest: async () =>
+              buildManifest(await storage.discoverDocuments({ includeRetired: true }), {
+                checkpoint: 0,
+                indexGeneratedAt: "",
+              }).documents,
+          })
+        : new NestStorage(root);
     await storage.init("Equivalence Vault");
     ctx = {
       storage,
