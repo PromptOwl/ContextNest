@@ -1,6 +1,6 @@
 # Plan: the coding plugin uses the new `ctx` first-run onboarding
 
-Status: proposed (reviewed by a newcomer-persona agent, findings folded in, see section 8)
+Status: implemented on `claude/peaceful-ride-ycvqw1` (reviewed by a newcomer-persona agent, see section 8)
 Task: CU-wdqcq067m5 (https://app.clickup.com/t/wdqcq067m5)
 Depends on: PR #228 (`feat(cli,engine): first-run onboarding for bare ctx`, CU-wdqcq067kw)
 Touches: `plugins/claude-code/{package.json,package-lock.json,bin/}` (new), `plugins/claude-code/commands/setup.md`, `plugins/shared/core/{session-start,lib}.js`, `plugins/gemini/skills/contextnest-setup/SKILL.md`, `packages/cli/src/first-run.ts` (copy only), plugin README/CHANGELOG, tests

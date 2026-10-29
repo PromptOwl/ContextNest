@@ -12,25 +12,35 @@ Everything runs through the existing [`ctx`](../../packages/cli) CLI internally 
 
 ## Setup
 
-After installing the plugin, run:
+Until you set it up, each new session starts with a reminder. Run:
 
 ```text
 /contextnest:setup
 ```
 
-It checks what is already connected, then asks three things on one screen: where your notes live (PromptOwl cloud, your company's server, or only on this computer), how much the assistant does on its own (**Light**, recommended: matching notes are looked up per prompt, nothing saved unasked · **On demand**: nothing runs in the background, cheapest · **Hands-free**: also proposes notes worth keeping, the most tokens), and whether that applies to all projects or this one. It then connects through the `ctx` CLI if you have it, or by browser sign-in if you don't (nothing to install, no admin rights). Re-running it never replaces an existing setup.
+It asks one question: **where should Claude keep its notes?**
+- **On this computer** (recommended): a private folder, `~/ContextNest/main`, pre-filled for a software project.
+- **Online** at nest.promptowl.ai, or your company's server: notes your team can share.
+- **Both**.
+- **Not now**: the reminder stops.
 
-Connecting uploads nothing. A local vault stays on your machine unless you run `ctx push`; only notes written to a hosted nest live on that server.
+It then writes your first real note with you. Re-running it never replaces an existing setup.
+
+Typing `ctx` in a terminal runs the same setup, with the same question and the same folder, so it doesn't matter which one you start with. By default Claude checks your notes on each prompt and saves only when you ask or correct something. Change that with `/contextnest:config`.
+
+Nothing leaves your computer unless you choose to put your notes online.
 
 ## Requirements
 
-The hooks run on Node ≥ 20; on a machine without Node they fail on every event, so use the nest's MCP server on its own there. The auto-retrieval and capture hooks need the Context Nest CLI (the cloud path works without it, through the nest's MCP tools, and setup turns those hooks off). Either install it globally:
+Node ≥ 20. The hooks run on it, and on a machine without Node they fail on every event, so use the nest's MCP server on its own there.
+
+The Context Nest CLI comes with the plugin: Claude Code installs it along with the plugin, and Claude can run `ctx` straight away. If you also want `ctx` in your own terminal, install it globally:
 
 ```bash
 npm i -g @promptowl/contextnest-cli
 ```
 
-…or leave it — the plugin falls back to `npx -y @promptowl/contextnest-cli` (slower cold start). Node ≥ 20 is required.
+Your own install takes precedence over the bundled copy. If it is older than the version this plugin ships, a new session tells you how to update it.
 
 ## Install
 
@@ -104,7 +114,7 @@ The ladders are domain-free — the capture agent calibrates what counts as dura
 
 | Type | Name | Role |
 | --- | --- | --- |
-| Hook | `SessionStart` | Inject vault overview (or a warning if `ctx` is missing) |
+| Hook | `SessionStart` | Inject vault overview; on a new session, tell you to run setup if nothing is set up, or to update an outdated `ctx` |
 | Hook | `UserPromptSubmit` | Effort-toggled retrieval injection, and dispatches any parked job |
 | Hook | `Stop` | Decides and parks; never blocks. Fires on explicit intent, a correction, or past the cooldown |
 | Hook | `PostToolUse` (Bash) | After a `ctx update`: diffs against the prior version and names every node, in every nest, still carrying the removed value |
@@ -114,6 +124,8 @@ The ladders are domain-free — the capture agent calibrates what counts as dura
 | Skill | `/contextnest:recall <topic>` | Manual deep retrieval |
 | Command | `/contextnest:config` | View/change plugin settings after enable |
 | Command | `/contextnest:capture` | Capture on purpose, even when `capture_mode` is `off` |
+| Command | `/contextnest:setup` | One-question setup: notes on this computer, online, or both |
+| Executable | `bin/ctx` | The bundled CLI, on Claude's `PATH` while the plugin is enabled |
 
 ## Local development
 
