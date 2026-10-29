@@ -674,7 +674,12 @@ const publishOp: OperationDescriptor = {
   output: z.object({
     id: z.string(),
     version: z.number().int().min(1),
-    checkpoint: z.number().int().min(1),
+    checkpoint: z
+      .number()
+      .int()
+      .min(1)
+      .nullable()
+      .describe("The checkpoint this publish sealed; null when the host seals later (deferred)"),
     chain_hash: z.string().describe("Hash chaining this version to the one before it"),
   }),
   errors: [
