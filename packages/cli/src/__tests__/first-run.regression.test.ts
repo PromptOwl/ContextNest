@@ -35,7 +35,7 @@ describe("bare `ctx` (built CLI)", () => {
   it("first run without a terminal: help on stdout, exit 0, hint on stderr, nothing recorded", () => {
     const r = bare();
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/No vault yet/);
+    expect(r.stdout).toMatch(/No notes yet/);
     expect(r.stdout).toMatch(/USAGE/);
     expect(r.stderr).toMatch(/terminal to get set up/);
     expect(() => readFileSync(join(cfg, "config.yaml"), "utf-8")).toThrow();
@@ -45,16 +45,16 @@ describe("bare `ctx` (built CLI)", () => {
     writeFileSync(join(cfg, "config.yaml"), `version: 1\nvaults:\n  main:\n    path: ${cfg}\n`);
     const r = bare();
     expect(r.status).toBe(0);
-    expect(r.stdout).not.toMatch(/No vault yet/);
+    expect(r.stdout).not.toMatch(/No notes yet/);
     expect(r.stdout).toMatch(/USAGE/);
     expect(readFileSync(join(cfg, "config.yaml"), "utf-8")).toMatch(/onboarded_at/);
   });
 
-  it("onboarded then all vaults removed: help with the no-vault line, no re-onboarding", () => {
+  it("onboarded then all vaults removed: help with the no-notes line, no re-onboarding", () => {
     writeFileSync(join(cfg, "config.yaml"), "version: 1\nvaults: {}\nonboarded_at: '2026-01-01T00:00:00.000Z'\n");
     const r = bare();
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/No vault yet/);
+    expect(r.stdout).toMatch(/No notes yet/);
     expect(r.stderr).toBe("");
   });
 });

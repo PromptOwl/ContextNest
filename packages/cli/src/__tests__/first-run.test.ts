@@ -102,7 +102,9 @@ describe("runOnboarding", () => {
     expect(await runOnboarding(deps)).toBe("skipped");
     expect(calls).toEqual([]);
     expect(marks).toEqual(["skipped"]);
-    expect(lines.join("\n")).toMatch(/ctx init[\s\S]*ctx login[\s\S]*ctx vault add/);
+    expect(lines.join("\n")).toMatch(/ctx init[\s\S]*ctx login/);
+    // A first-timer has nothing to register yet.
+    expect(lines.join("\n")).not.toMatch(/vault add/);
   });
   it("remote: logs in to the default server and registers it", async () => {
     const { deps, calls, marks } = makeDeps(["2"]);
@@ -120,6 +122,15 @@ describe("runOnboarding", () => {
     const { deps, calls } = makeDeps([]);
     await runOnboarding(deps);
     expect(calls.map((c) => c[0])).toContain("list");
+  });
+  it("points Claude Code users at the plugin, others at the agent config init wrote", async () => {
+    const claude = makeDeps([]);
+    await runOnboarding(claude.deps);
+    expect(claude.lines.join("\n")).toMatch(/Context Nest plugin[\s\S]*\/plugin install contextnest/);
+    const other = makeDeps([], { detectedTools: () => ["cursor"] });
+    await runOnboarding(other.deps);
+    expect(other.lines.join("\n")).not.toMatch(/plugin install/);
+    expect(other.lines.join("\n")).toMatch(/agent config/);
   });
   it("both: a failed remote half keeps the local vault and still marks onboarded", async () => {
     const { deps, marks, lines } = makeDeps(["3"], {
