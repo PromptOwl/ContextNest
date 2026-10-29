@@ -40,10 +40,10 @@ export const MANIFEST_FILE = "manifest.json";
 export const MANIFEST_MAX_BYTES = 64 * 1024 * 1024;
 export const MANIFEST_FORMAT = 1;
 
-/** The frontmatter fields context.yaml and the checkpoint read. */
+/** The frontmatter fields context.yaml, the checkpoint and INDEX.md read. */
 export type ManifestFrontmatter = Pick<
   Frontmatter,
-  "title" | "description" | "type" | "tags" | "status" | "version" | "source" | "skill"
+  "title" | "description" | "type" | "tags" | "status" | "version" | "source" | "skill" | "updated_at"
 > & { metadata?: { edge_priority: number } };
 
 export interface ManifestLinks {
@@ -73,7 +73,7 @@ export interface Manifest {
   documents: Record<string, ManifestEntry>;
 }
 
-const FIELDS = ["title", "description", "type", "tags", "status", "version", "source", "skill"] as const;
+const FIELDS = ["title", "description", "type", "tags", "status", "version", "source", "skill", "updated_at"] as const;
 
 export function manifestEntry(doc: ContextNode): ManifestEntry {
   const frontmatter: Record<string, unknown> = {};
