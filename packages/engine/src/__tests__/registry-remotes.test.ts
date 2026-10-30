@@ -24,6 +24,7 @@ import {
   resolveNest,
   resolveVaultPath,
   describeRemoteEndpoint,
+  markOnboarding,
 } from "../registry.js";
 import { ConfigError } from "../errors.js";
 import type { RemoteNestSpec } from "../types.js";
@@ -444,6 +445,20 @@ describe("registry remotes", () => {
   });
 
   // ── describeRemoteEndpoint ────────────────────────────────────────────────
+
+  it("markOnboarding records its marker and keeps vaults, remotes and the default", () => {
+    addVault("localone", makeVault(join(tmp, "v")));
+    addRemote("team", HTTP_SPEC);
+    setDefaultVault("team");
+    markOnboarding("onboarded", new Date("2026-01-01T00:00:00Z"));
+    markOnboarding("skipped", new Date("2026-02-01T00:00:00Z"));
+    const reg = readRegistry();
+    expect(reg.onboarded_at).toBe("2026-01-01T00:00:00.000Z");
+    expect(reg.skipped_at).toBe("2026-02-01T00:00:00.000Z");
+    expect(Object.keys(reg.vaults)).toEqual(["localone"]);
+    expect(reg.remotes?.team).toEqual(HTTP_SPEC);
+    expect(reg.default).toBe("team");
+  });
 
   it("describeRemoteEndpoint renders http urls and stdio command lines", () => {
     expect(describeRemoteEndpoint(HTTP_SPEC)).toBe("https://nest.example.com/mcp");

@@ -119,13 +119,14 @@ export async function runOnboarding(deps: OnboardingDeps): Promise<OnboardingRes
   }
 
   let registered = 0;
-  if (wantLocal) {
-    if (await setupLocal(deps)) registered++;
-    else if (!wantRemote) return "failed";
-  }
+  // Agent tools `init` wrote config for; null when there is no local vault.
+  const localTools = wantLocal ? await setupLocal(deps) : null;
+  if (localTools) registered++;
+  else if (wantLocal && !wantRemote) return "failed";
   if (wantRemote) {
     if (wantLocal) log("\nNow the team server.");
-    if (await setupRemote(deps, !wantLocal)) registered++;
+    // The server is the default unless a local vault already took that role.
+    if (await setupRemote(deps, !localTools)) registered++;
   }
   if (registered === 0) {
     log("\nNothing was set up. Run `ctx` again to retry, or:");
@@ -147,12 +148,13 @@ export async function runOnboarding(deps: OnboardingDeps): Promise<OnboardingRes
     log("  (couldn't list it just now; try `ctx list`)");
   }
   log("\nNext: `ctx search <word>` to find things, `ctx add` to save a note.");
-  if (wantLocal) log("Your agent is ready: `ctx init` wrote CLAUDE.md / agent config into the vault.");
+  if (localTools?.length) log("Your agent is ready: `ctx init` wrote CLAUDE.md / agent config into the vault.");
   log("See all commands any time with `ctx --help`.");
   return "onboarded";
 }
 
-async function setupLocal(deps: OnboardingDeps): Promise<boolean> {
+/** Returns the agent tools `init` wrote config for, or null when no vault was created. */
+async function setupLocal(deps: OnboardingDeps): Promise<string[] | null> {
   const { log } = deps;
   let alias = DEFAULT_ALIAS;
   let starter = DEFAULT_STARTER;
@@ -163,7 +165,7 @@ async function setupLocal(deps: OnboardingDeps): Promise<boolean> {
   ).trim().toLowerCase();
   if (answer.startsWith("n")) {
     log("Skipped the local vault.");
-    return false;
+    return null;
   }
   if (answer.startsWith("c")) {
     starter = (await deps.ask("Starter (developer, personal, executive, analyst, team, sales)", starter)).trim();
@@ -172,7 +174,7 @@ async function setupLocal(deps: OnboardingDeps): Promise<boolean> {
   }
   if (deps.exists(deps.joinPath(dir, ".context", "config.yaml"))) {
     log(`A vault already exists at ${dir}. Register it with: ctx vault add ${alias} ${dir}`);
-    return false;
+    return null;
   }
   const tools = deps.detectedTools();
   log(`  Running: ctx init --starter ${starter} (in ${dir})`);
@@ -183,9 +185,9 @@ async function setupLocal(deps: OnboardingDeps): Promise<boolean> {
     );
   } catch (err) {
     log(`Couldn't create the vault: ${(err as Error).message}`);
-    return false;
+    return null;
   }
-  return true;
+  return tools;
 }
 
 async function setupRemote(deps: OnboardingDeps, setDefault: boolean): Promise<boolean> {
@@ -205,7 +207,8 @@ async function setupRemote(deps: OnboardingDeps, setDefault: boolean): Promise<b
       log("\nYour browser will open for a quick approval.");
     }
     log(`  Running: ctx login ${DEFAULT_SERVER} --as ${alias}`);
-    await deps.run(["login", DEFAULT_SERVER, "--as", alias, ...def]);
+    // --yes: choosing the server option already confirmed registering it.
+    await deps.run(["--yes", "login", DEFAULT_SERVER, "--as", alias, ...def]);
   } catch (err) {
     log(`Sign-in didn't finish: ${(err as Error).message}`);
     log("Nothing was changed on your account. Retry any time with:");
