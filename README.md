@@ -614,6 +614,10 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx vault prune` | Unregister local aliases whose vault no longer exists on disk; clears the default if it was one of them (remotes untouched; `--dry-run` previews, `--yes` for scripts) |
 | `ctx vault default <alias>` | Set the default vault |
 | `ctx vault which [--json]` | Show the resolved vault and the reason |
+| `ctx vault rename <old> <new>` | Rename an alias (local or remote); the default follows it |
+| `ctx login <server> [--as <alias>]` | Sign in once in the browser (key kept in the OS keyring) and register the server, so its nests show as `<alias>/<nest>`. The alias comes from the host (`nest.promptowl.ai` → `promptowl`) unless `--as`; `--no-register` only saves the key; `ctx login <alias>` signs in again. See [login and servers](docs/login-and-servers.md) |
+| `ctx setup` | Pick vault options on a web page (`CONTEXTNEST_SETUP_URL` for another server), then run `ctx init` or `ctx login` with them |
+| `ctx hints on\|off` | Turn the one-line hints on or off (`CONTEXTNEST_NO_HINTS=1` for one run) |
 | `ctx vault encrypt` | Encrypt the vault's content at rest in place (AES-256-GCM). Prints a one-time recovery passphrase; rerun to resume an interrupted run. See [encrypted vaults](docs/encrypted-vaults.md) |
 | `ctx vault decrypt` | Decrypt an encrypted vault back to plain Markdown |
 | `ctx doctor [--json]` | Report CLI / engine / latest-npm versions, registry health (missing aliases, missing default), whether cwd is inside a vault, and the installed Claude Code plugin version. Always exits 0; `CONTEXTNEST_DOCTOR_OFFLINE=1` skips the npm lookup |
@@ -626,10 +630,12 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx info` | Open an existing vault — its instructions, configuration and contents (`--nodes`, `--json`) |
 | `ctx add <path>` | Create a new document (publishes, or holds it for review when the vault's [review gate](#review-gate-on-by-default) is on; `--publish` to bypass; refuses a path that already holds a document) |
 | `ctx add <path> --type skill` | Create a skill node with trigger, inputs, and guard rails |
-| `ctx update <path>` | Update a document's title, tags, or body (publishes, or holds the edit for review when the gate is on; `--publish` to bypass) |
+| `ctx update <path>` | Update a document's title, tags, or body (publishes, or holds the edit for review when the gate is on; `--publish` to bypass). Refuses to replace a body with an empty one unless `--force` |
+| `ctx add` / `ctx update <path> --body-file <file\|->` | Read the body from a file or stdin: no shell escaping for newlines, quotes or `$` |
 | `ctx delete <path>` | Delete a document and its version history, recorded in `ctx forget-log` (`--reason`, `--requested-by`; `--purge` for no record) |
 | `ctx forget <path> --reason <code>` | Forget a document (right to be forgotten, spec §6.3): erase every version's content, keep the hashes so `ctx verify` still passes; leaves an empty `status: forgotten` stub. `--reason` is `user_request`, `legal`, `retention_expiry` or `error` |
-| `ctx read <path>` | Read and display a document in the terminal |
+| `ctx read <path>` | Read and display a document in the terminal (a bare id also finds a node at the root of an Obsidian-layout vault) |
+| `ctx read <path> --body` | Print the body alone, ready to edit and pass back with `--body-file` |
 | `ctx read <path> --html` | Render a document as styled HTML and open in browser |
 | `ctx skill <path>` | Render a `type: skill` node for an agent harness and print it |
 | `ctx skill install <path>` | Install a vault skill into Claude Code / Cursor / Codex (`--write` to actually write) |
@@ -647,7 +653,8 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx query <selector> --include-drafts` | Include drafts (default: published only) |
 | `ctx query @org/pack` | Query from a cloud-hosted pack via [PromptOwl](https://promptowl.ai) |
 | `ctx list` | List all documents (filter with `--type`, `--status`, `--tag`; cap with `--limit`) |
-| `ctx search <query>` | Full-text search across vault documents (`--limit` to cap) |
+| `ctx search <query>` | Full-text search across vault documents (`--limit` to cap; `--mode lexical\|semantic\|hybrid`, `--rerank`) |
+| `ctx embed` | Build the embedding index semantic/hybrid search needs, from published documents (`--rebuild` to start over). See [retrieval modes](docs/retrieval-modes.md) |
 | `ctx resolve <selector>` | Execute a selector query (low-level) |
 
 
@@ -756,7 +763,7 @@ shrink the batch, and the drops are listed as skipped.
 
 ## MCP Server
 
-The MCP server exposes vault operations as 41 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 44 tools for AI agents over stdio transport.
 
 ### Running the server
 

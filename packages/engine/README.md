@@ -73,7 +73,7 @@ console.log(report.valid ? "Integrity OK" : `Tampering: ${report.errors}`);
 - **Graph Traversal** — Hop-based BFS over `context.yaml` as a lightweight graph index, with priority-weighted edges
 - **Skill Nodes** — First-class `type: skill` nodes with trigger, inputs, tools_required, output_format, and guard_rails
 - **Versioning** — Hash-chained version history with keyframe + diff reconstruction; each non-keyframe version's change log is a standalone `v{N}.diff` unified diff beside the keyframes
-- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of 19 operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own. As of 2.0 the `core` namespace is complete and every surface actually runs on it
+- **Operation Catalog** — `@promptowl/contextnest-engine/api`: one canonical, schema-described set of 24 operations (`context_get`, `context_query`, `context_create`, …) that CLI, MCP, and REST surfaces bind to instead of hand-rolling their own. As of 2.0 the `core` namespace is complete and every surface actually runs on it
 - **Integrity** — SHA-256 content hashes, chain hashes, and checkpoint verification down to the byte
 - **URI Resolution** — Resolve `contextnest://` URIs to documents, tags, folders, or search results
 - **Storage** — Read/write documents, version histories, checkpoints, and config from the vault file system; discovery is folder-scoped, and `listFolders` returns the vault's shape from directory entries without parsing a document
@@ -107,6 +107,9 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `evaluateFromIndex` | Evaluate selectors against the lightweight index (no bodies) |
 | `publishDocument` | Publish a document (bump version, checkpoint) |
 | `publishDocuments` | Bulk publish — one checkpoint and one index pass for the whole batch, with an `onProgress(done, total)` sink |
+| `sealWrites` / `writePublishedVersion` | Seal deferred writes in one checkpoint and one index update; publish a version without its checkpoint (see [Host Options](#host-options)) |
+| `manifestEntry` / `ManifestEntry` | One document's index inputs, for a host that keeps the vault manifest itself |
+| `markOnboarding` | Record `onboarded_at` / `skipped_at` in the registry (what bare `ctx` writes after first-run setup) |
 | `filterDocuments` | The one type / status / tag filter, for surfaces that filter a list they already hold |
 | `setVaultDescription` | Set or clear a registry alias's description |
 | `parseStewards` / `serializeStewards` | Canonical `stewards.yaml` marshalling (format only) |
@@ -247,6 +250,33 @@ idempotent. `parser.explicitStatus(node)` exposes the same distinction the
 importer relies on: the status the author actually wrote, or `null` where
 `parseDocument` would have defaulted to `draft`.
 
+## Host Options
+
+For a host that serves a vault (the hosted Community server). The CLI and MCP
+server set none of these, so local vaults behave as before.
+
+- `new NestStorage(root, { agentConfigs: false })`: index regeneration stops
+  rewriting `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules` and
+  `.github/copilot-instructions.md`. Default `true`. Either way the files are
+  now written in parallel.
+- `new NestStorage(root, { manifest })`: `manifest()` returns every
+  document's `manifestEntry` from a record the host updates with each write
+  (`null` falls back to the crawl). The index update and checkpoint then take
+  the vault's documents from it: no vault crawl, no folder re-reads, no
+  manifest file on disk. The host owns its freshness: a document it misses is
+  not indexed or sealed until `ctx index` crawls.
+- `OperationContext.deferSeal: true`: `context_create`, `context_update`,
+  `context_publish`, `context_delete` and `context_import_pdf` stop at the
+  document and its version entry, and a publish answers `checkpoint: null`.
+  The host then calls `sealWrites(storage, { changed, published, triggeredBy })`
+  to seal every published document in one checkpoint and update the index
+  once, under the vault lock.
+- `CONTEXTNEST_MANIFEST=on` (experimental, off by default): the engine keeps
+  its own manifest in `.context/manifest/`, so a write reads only the changed
+  folder instead of crawling the vault, and `context_verify` warns
+  (`stale_index`) about documents changed outside the engine. Off, no manifest
+  files are written.
+
 ## Upgrading to 2.0
 
 Vault files are unchanged. The API breaks in five places:
@@ -287,7 +317,7 @@ The engine is the library layer. Most users reach it through one of these:
 | Surface | What it is |
 |---|---|
 | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) | The `ctx` command — `ctx init`, `ctx query`, `ctx verify` |
-| [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server exposing 35 vault tools to Claude, Cursor, Gemini, and Copilot |
+| [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) | MCP server exposing 44 vault tools to Claude, Cursor, Gemini, and Copilot |
 | [Claude integration](https://github.com/PromptOwl/ContextNest#mcp-server) | Drop-in MCP config for Claude Code and Claude Desktop |
 
 ## Links
