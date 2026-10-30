@@ -52,6 +52,7 @@ import {
   serializeManifest,
   serializeManifestEntry,
   type Manifest,
+  type ManifestEntry,
 } from "./manifest.js";
 import {
   buildTombstoneIndex,
@@ -576,6 +577,26 @@ export interface NestStorageOptions {
    * key store. Ignored for a plain vault.
    */
   encryption?: VaultCryptoOptions;
+  /**
+   * Every document's manifest entry (`manifestEntry`), from a record the host
+   * keeps itself and updates in the same step as each document write (the
+   * hosted server: its database). `null` when the host cannot vouch for it.
+   *
+   * When set, the index update and the checkpoint take the vault's documents
+   * from it: no crawl, no folder re-reads, no manifest file or pending list on
+   * disk. The host owns its freshness — an entry it misses is a document the
+   * index and the next checkpoint do not see until `ctx index` crawls.
+   */
+  manifest?: () => Promise<Record<string, ManifestEntry> | null>;
+
+  /**  
+   * Keep the agent config files (CLAUDE.md, GEMINI.md, .cursorrules, …) in
+   * step with the index on every regeneration. Default true. A host that
+   * serves the vault and never hands those files to a coding agent (a hosted
+   * server) turns it off: they embed the document list, so each write would
+   * otherwise rewrite five files nobody reads.
+   */
+  agentConfigs?: boolean;
 }
 
 /**
@@ -1319,6 +1340,7 @@ export class NestStorage {
       },
     );
 
+    if (this.options.agentConfigs === false) return;
     const hasMcpServer = !!(config?.servers && Object.keys(config.servers).length > 0);
     const agentConfigs = generateAgentConfigs({
       config,
@@ -1327,22 +1349,26 @@ export class NestStorage {
       hasMcpServer,
     });
 
-    for (const file of agentConfigs) {
-      const filePath = join(this.root, file.path);
+    // Distinct files: written side by side, so a network mount pays one
+    // round trip for all of them, not one per file.
+    await Promise.all(
+      agentConfigs.map(async (file) => {
+        const filePath = join(this.root, file.path);
 
-      let existing: string | null = null;
-      try {
-        existing = await readFile(filePath, "utf-8");
-      } catch {
-        // file does not exist yet
-      }
+        let existing: string | null = null;
+        try {
+          existing = await readFile(filePath, "utf-8");
+        } catch {
+          // file does not exist yet
+        }
 
-      const merged = mergeAgentConfig(existing, file.content);
-      // Usually unchanged between writes — skip the rewrite.
-      if (merged !== existing) {
-        await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
-      }
-    }
+        const merged = mergeAgentConfig(existing, file.content);
+        // Usually unchanged between writes — skip the rewrite.
+        if (merged !== existing) {
+          await writeInDir(dirname(filePath), () => writeFile(filePath, merged, "utf-8"));
+        }
+      }),
+    );
   }
 
   /**
@@ -2304,6 +2330,13 @@ export class NestStorage {
    * what `verify` reports as `stale_index`.
    */
   async currentManifest(heads: number[]): Promise<Manifest | null> {
+    if (this.options.manifest) {
+      // The host's record is current by contract: no stamps to compare.
+      const documents = await this.options.manifest();
+      return documents
+        ? { format: MANIFEST_FORMAT, checkpoint: heads[0] ?? 0, index_generated_at: "", documents }
+        : null;
+    }
     if (!manifestEnabled()) return null; // POC switch (manifest.ts)
     const manifest = await this.readManifest();
     if (!manifest || !heads.includes(manifest.checkpoint)) return null;
@@ -2344,6 +2377,19 @@ export class NestStorage {
     onUnreadable?: (id: string, reason: string) => void,
   ): Promise<{ folders: Map<string, ContextNode[]>; pendingBytes: number }> {
     const pending = await this.readPending();
+    if (this.options.manifest) {
+      // The host's record already holds these writes: each changed folder's
+      // documents come from it, not from a read of the folder.
+      const wanted = new Set([...ids, ...pending.ids].map(folderOfId));
+      const read = new Map<string, ContextNode[]>();
+      for (const doc of manifestDocuments(manifest)) {
+        const folder = folderOfId(doc.id);
+        if (!wanted.has(folder)) continue;
+        if (!read.has(folder)) read.set(folder, []);
+        read.get(folder)!.push(doc);
+      }
+      return { folders: read, pendingBytes: pending.bytes };
+    }
     const spelled = new Set([...ids, ...pending.ids].map(folderOfId));
     // Each folder as the crawl knows it: where it really is under the vault
     // root. An 8.3 short name, a case variant or a link to an in-layout folder
@@ -2394,6 +2440,17 @@ export class NestStorage {
     return folder === "" || top === "nodes" || top === "sources";
   }
 
+  /**
+   * The pending list when the host keeps the manifest: the host's record has
+   * every write, but a write that skipped its index update (a crash, an
+   * unpublished import) still owes its folder an INDEX.md rewrite. In memory —
+   * a file would cost a round trip per write on a network mount.
+   *
+   * ponytail: lost on restart, so that folder's INDEX.md stays stale until its
+   * next write or `ctx index`; persist it if hosts start serving INDEX.md.
+   */
+  private readonly hostPending: string[] = [];
+
   private pendingPath(): string {
     return join(this.root, MANIFEST_DIR, "pending");
   }
@@ -2405,6 +2462,10 @@ export class NestStorage {
    * manifest directory there is no manifest to go stale.
    */
   private async markPending(id: string): Promise<void> {
+    if (this.options.manifest) {
+      this.hostPending.push(id);
+      return;
+    }
     if (!manifestEnabled()) return;
     await appendFile(this.pendingPath(), `${id}\n`).catch((err: NodeJS.ErrnoException) => {
       if (err.code !== "ENOENT") throw err;
@@ -2413,6 +2474,8 @@ export class NestStorage {
 
   /** The pending ids, and how many bytes of the list they took — what a later {@link dropPending} may remove. */
   private async readPending(): Promise<{ ids: string[]; bytes: number }> {
+    // With a host manifest each entry counts as one "byte".
+    if (this.options.manifest) return { ids: [...this.hostPending], bytes: this.hostPending.length };
     const raw = await readFile(this.pendingPath()).catch(() => Buffer.alloc(0));
     return { ids: raw.toString("utf-8").split("\n").filter(Boolean), bytes: raw.length };
   }
@@ -2424,6 +2487,10 @@ export class NestStorage {
    */
   private async dropPending(bytes: number): Promise<void> {
     if (bytes === 0) return;
+    if (this.options.manifest) {
+      this.hostPending.splice(0, bytes);
+      return;
+    }
     const raw = await readFile(this.pendingPath()).catch(() => null);
     if (!raw) return;
     const rest = raw.subarray(bytes);
@@ -2433,7 +2500,8 @@ export class NestStorage {
 
   /** Write the vault manifest atomically, sealed like context.yaml, in a directory git ignores. */
   async writeManifest(manifest: Manifest): Promise<void> {
-    if (!manifestEnabled()) return; // POC switch (manifest.ts): off writes nothing
+    // The host keeps its own record; the POC switch (manifest.ts) off writes nothing.
+    if (this.options.manifest || !manifestEnabled()) return;
     const dir = join(this.root, MANIFEST_DIR);
     const content = await this.sealText("", "index", serializeManifest({ ...manifest, layout: await this.detectLayout() }));
     const write = () => this.writeFileDurable(join(dir, MANIFEST_FILE), content);

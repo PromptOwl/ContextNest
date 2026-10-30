@@ -3151,6 +3151,185 @@ const J15: Journey = {
   ],
 };
 
+/**
+ * J16 — "I organize my work on a task board."
+ * The vault doubles as a personal task board. Work items are `task` nodes;
+ * their board column is just a tag (`#todo` / `#doing` / `#done`) alongside a
+ * shared project tag. The user pulls up a single column, the whole board, and a
+ * finished-only view by combining `type:task` with a column tag — then moves an
+ * item across columns by retagging it. The dedicated `ctx task` command is
+ * remote-only (it logs work against a remote nest); this is the fully-local
+ * board that works offline against a plain vault, driven entirely through
+ * `ctx add --tags` / `ctx update --tags` — no frontmatter hand-edits.
+ *
+ * The review gate is OFF (like J2/J10/J14): a board is about browsing what's
+ * there, so each item should land visible immediately rather than wait behind a
+ * gate. Membership is asserted with `--json` (`queryDocIds`, sorted) because the
+ * set of ids returned is the contract here, not the human wording.
+ *
+ * Cases share one vault and run top-to-bottom — a case is not runnable alone,
+ * and the retag in J16-06 depends on the board built in J16-02/J16-04. Case ids
+ * + titles are the ticket's verbatim lines.
+ */
+const J16: Journey = {
+  id: "J16",
+  title: "Organize work on a task board (solo maker)",
+  cases: [
+    {
+      id: "J16-01",
+      title: "Starting a fresh board: an empty vault is ready and asking for tasks returns nothing",
+      actions: [
+        {
+          args: ["init", "--name", "task-board"],
+          stdout: ["Initialized"],
+          files: [
+            { path: "CONTEXT.md", exists: true },
+            { path: ".context", exists: true },
+          ],
+        },
+        // A board is about browsing — writes should land visible, not wait behind the gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        // No task nodes yet, so the board is empty.
+        {
+          args: ["query", "type:task", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+      ],
+    },
+    {
+      id: "J16-02",
+      title: "I add several work items as task nodes, each tagged with its column and a shared project tag",
+      actions: [
+        {
+          args: [
+            "add", "nodes/ship-email",
+            "--type", "task",
+            "--title", "Ship the onboarding email",
+            "--tags", "project,todo",
+            "--body", "Draft and send the welcome email.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/ship-email"],
+          files: [{ path: "nodes/ship-email.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/fix-login",
+            "--type", "task",
+            "--title", "Fix the login bug",
+            "--tags", "project,doing",
+            "--body", "Add the missing null check.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/fix-login.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/release-notes",
+            "--type", "task",
+            "--title", "Write the release notes",
+            "--tags", "project,done",
+            "--body", "Summarize the v3 changes.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/release-notes.md", exists: true }],
+        },
+      ],
+    },
+    {
+      id: "J16-03",
+      title: 'Show my To-Do column: filtering by the todo tag returns only todo items',
+      actions: [
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/ship-email"]),
+        },
+      ],
+    },
+    {
+      id: "J16-04",
+      title: "Show everything on the board: filtering by node type task returns every work item and nothing else",
+      actions: [
+        // A non-task node in the same project — it must NOT show up on the board.
+        {
+          args: [
+            "add", "nodes/project-overview",
+            "--type", "document",
+            "--title", "Project overview",
+            "--tags", "project",
+            "--body", "Context for the project. Not a work item.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/project-overview.md", exists: true }],
+        },
+        // The board = every task node, and only task nodes.
+        {
+          args: ["query", "type:task", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual([
+              "nodes/fix-login",
+              "nodes/release-notes",
+              "nodes/ship-email",
+            ]),
+        },
+        // Discriminator: the document DOES exist and shares the project tag — it's
+        // excluded from the board by TYPE, not because it's missing or unpublished.
+        {
+          args: ["query", "#project", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual([
+              "nodes/fix-login",
+              "nodes/project-overview",
+              "nodes/release-notes",
+              "nodes/ship-email",
+            ]),
+        },
+      ],
+    },
+    {
+      id: "J16-05",
+      title: "Show the Done column: combining the task type with the done tag returns only finished items",
+      actions: [
+        {
+          args: ["query", "type:task #done", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/release-notes"]),
+        },
+      ],
+    },
+    {
+      id: "J16-06",
+      title: "I move an item across columns by retagging it, and it leaves the old column and appears in the new one",
+      actions: [
+        // Starting position: ship-email is the only card in To-Do.
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/ship-email"]),
+        },
+        // Move it todo → doing. `--tags` REPLACES the tag set, so #todo is dropped
+        // and #doing is added in one edit (the project tag is carried over).
+        {
+          args: ["update", "nodes/ship-email", "--tags", "project,doing"],
+          stdout: ["Updated and published", "Version: 2"],
+        },
+        // It's gone from To-Do...
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+        // ...and now sits in Doing alongside the card that was already there.
+        {
+          args: ["query", "type:task #doing", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual(["nodes/fix-login", "nodes/ship-email"]),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3205,5 +3384,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J15 — share a node outside the vault (HTML export)", () => {
     runJourney({ installDir: INSTALL, scratch }, J15);
+  });
+  it("J16 — organize work on a task board", () => {
+    runJourney({ installDir: INSTALL, scratch }, J16);
   });
 });
