@@ -147,8 +147,12 @@ describe("sweep-check hook registration", () => {
     expect(groups[0].matcher).toBe("Bash");
     const h = groups[0].hooks[0];
     expect(h.command).toContain("core/sweep-check.js");
-    // It shells out to ctx several times; an explicit ceiling keeps a slow
-    // vault from stalling the loop on every Bash call.
+    // It shells out to ctx several times across every nest (up to 45 s); run
+    // synchronously it held the turn after every `ctx update`. Async, the turn
+    // goes on and its findings reach the model on the next turn.
+    expect(h.async).toBe(true);
+    // Not enforced on an async hook today, but kept as the ceiling should the
+    // hook ever run synchronously again.
     expect(typeof h.timeout).toBe("number");
     expect(h.timeout).toBeGreaterThan(0);
   });
