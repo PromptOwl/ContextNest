@@ -222,6 +222,7 @@ export {
   getRegistryDir,
   getRegistryPath,
   readRegistry,
+  markOnboarding,
   isVaultRoot,
   isRefusedCwd,
   assertVaultRoot,
