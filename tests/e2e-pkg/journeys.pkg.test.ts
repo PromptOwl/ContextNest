@@ -3330,6 +3330,167 @@ const J16: Journey = {
   ],
 };
 
+/**
+ * J17 — "I onboard an AI agent to a new vault."
+ * `ctx init --starter <recipe> --tools <agents>` is how a fresh project becomes
+ * agent-aware: a starter scaffolds the vault AND `agent-configs.ts` writes the
+ * chosen agents' config files (`CLAUDE.md`, `.cursorrules`, `GEMINI.md`,
+ * `.windsurfrules`, `.github/copilot-instructions.md`). The user previews the
+ * recipes first (writes nothing), onboards one agent, checks the generated
+ * config is self-contained and actually works, onboards several agents at once,
+ * and confirms opting out (`--tools none`) builds the vault but leaves the
+ * project free of agent config.
+ *
+ * Each scenario onboards into its OWN fresh project dir (a plain init scaffolds
+ * into a directory). Like J14, those dirs are created once, memoized, pushed to
+ * `scratch` for the suite's afterAll, and targeted per action via
+ * `CONTEXTNEST_VAULT_PATH` (an absolute vault path wins over cwd in vault
+ * resolution). File assertions read those dirs directly in `check` — the
+ * harness's `files`/vault root is the journey's sandbox vault, which this
+ * journey never writes to.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const _j17dirs: Record<string, string> = {};
+const j17dir = (key: string) => {
+  if (!_j17dirs[key]) {
+    _j17dirs[key] = mkdtempSync(join(tmpdir(), `cn-journey-j17-${key}-`));
+    scratch.push(_j17dirs[key]); // cleaned by the suite's afterAll
+  }
+  return _j17dirs[key];
+};
+/** The agent config file each `--tools` id writes, relative to the project root. */
+const AGENT_CONFIGS = [
+  "CLAUDE.md",
+  ".cursorrules",
+  "GEMINI.md",
+  ".windsurfrules",
+  join(".github", "copilot-instructions.md"),
+];
+const J17: Journey = {
+  id: "J17",
+  title: "Onboard an AI agent to a new vault (developer)",
+  cases: [
+    {
+      id: "J17-01",
+      title: "Previewing the starter templates lists the recipes and writes nothing to disk",
+      actions: [
+        {
+          args: ["init", "--list-starters"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("list") }),
+          stdout: ["Available starter recipes:", "developer"],
+          // A pure preview: the target dir stays completely empty — no vault, no
+          // agent config, no context.yaml, nothing. Assert the whole dir is empty
+          // (not just a handful of named files) so any stray write is caught.
+          check: () => {
+            const d = j17dir("list");
+            expect(readdirSync(d), "list-starters must write nothing to disk").toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-02",
+      title: "Onboarding one agent scaffolds the vault and writes a CLAUDE.md",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer", "--tools", "claude", "--name", "onboard-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
+          stdout: ["Applied starter: Developer / Engineering", "Created 3 documents"],
+          check: () => {
+            const d = j17dir("claude");
+            // The vault was scaffolded...
+            expect(existsSync(join(d, "CONTEXT.md")), "vault CONTEXT.md").toBe(true);
+            expect(existsSync(join(d, "context.yaml")), "vault context.yaml").toBe(true);
+            // ...and the chosen agent's config file was written.
+            expect(existsSync(join(d, "CLAUDE.md")), "CLAUDE.md").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-03",
+      title: "The written CLAUDE.md is self-contained and correct: auto-generated marker plus how to run ctx query",
+      actions: [
+        {
+          // Reuses the vault J17-02 onboarded (same memoized `claude` dir) — this
+          // case must stay after J17-02; do not reorder.
+          // An agent following the generated config runs `ctx query` against the
+          // vault that was just created — and it answers with the starter nodes.
+          args: ["query", "type:document", "--json"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
+          json: (data) => {
+            // Precondition guard: a missing vault here means J17-02 didn't run
+            // first. Surface that directly instead of a bare "no docs" diff.
+            expect(
+              existsSync(join(j17dir("claude"), "CLAUDE.md")),
+              "J17-03 reuses the vault J17-02 onboarded — J17-02 must run first (do not reorder)",
+            ).toBe(true);
+            expect(queryDocIds(data)).toEqual([
+              "nodes/architecture/architecture-overview",
+              "nodes/onboarding/getting-started",
+              "nodes/standards/coding-conventions",
+            ]);
+          },
+          // The config is self-contained: it marks its own auto-generated block
+          // and teaches the agent the one command it needs — no external setup.
+          check: () => {
+            const claudeMd = readFileSync(join(j17dir("claude"), "CLAUDE.md"), "utf-8");
+            expect(claudeMd).toContain("do not edit this section");
+            expect(claudeMd).toContain("Context Nest vault");
+            expect(claudeMd).toContain("ctx query");
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-04",
+      title: "Onboarding several agents at once writes each one's config file",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer",
+            "--tools", "claude,cursor,gemini,windsurf,copilot", "--name", "multi-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("multi") }),
+          stdout: ["Applied starter: Developer / Engineering"],
+          // Every onboarded tool gets its config file — the positive mirror of
+          // J17-05's "all absent", so each AGENT_CONFIGS entry is covered both ways.
+          check: () => {
+            const d = j17dir("multi");
+            for (const f of AGENT_CONFIGS)
+              expect(existsSync(join(d, f)), `expected ${f} for its tool`).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-05",
+      title: "Opting out still builds the vault but writes no agent config files at all",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer", "--tools", "none", "--name", "none-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("none") }),
+          stdout: ["Applied starter: Developer / Engineering", "Created 3 documents"],
+          check: () => {
+            const d = j17dir("none");
+            // The vault is still built...
+            expect(existsSync(join(d, "CONTEXT.md")), "vault CONTEXT.md").toBe(true);
+            expect(existsSync(join(d, ".context")), "vault .context").toBe(true);
+            // ...but NOT a single agent config file was written.
+            for (const f of AGENT_CONFIGS)
+              expect(existsSync(join(d, f)), `--tools none must not write ${f}`).toBe(false);
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3387,5 +3548,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J16 — organize work on a task board", () => {
     runJourney({ installDir: INSTALL, scratch }, J16);
+  });
+  it("J17 — onboard an AI agent to a new vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J17);
   });
 });
