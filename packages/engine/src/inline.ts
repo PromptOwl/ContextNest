@@ -89,6 +89,8 @@ export interface RelationshipStats {
  */
 export function buildRelationshipsWithStats(
   documents: ContextNode[],
+  /** Link targets per document when bodies are not at hand (the manifest). */
+  linksOf: LinksOf = bodyLinks,
 ): { edges: RelationshipEdge[]; stats: RelationshipStats } {
   const edges: RelationshipEdge[] = [];
   const seen = new Set<string>();
@@ -111,9 +113,9 @@ export function buildRelationshipsWithStats(
   const index = buildWikiTitleIndex(documents);
 
   for (const doc of documents) {
+    const { context, wiki } = linksOf(doc);
     // Extract reference edges from inline links
-    const links = extractContextLinks(doc.body);
-    for (const link of links) {
+    for (const link of context) {
       // Path with anchor, checkpoint pin and trailing slash stripped; a
       // cross-namespace link keeps its full URI. Same helper the body-link
       // traversal in wiki-graph.ts uses, so both agree on the target.
@@ -130,7 +132,7 @@ export function buildRelationshipsWithStats(
     }
 
     // Extract reference edges from [[wikilinks]]
-    for (const target of extractWikiLinks(doc.body)) {
+    for (const target of wiki) {
       const to = resolveWikiTarget(target, index);
       if (to === null) {
         // `[[#section]]` is a self-anchor, not a dangling link.
@@ -154,6 +156,14 @@ export function buildRelationshipsWithStats(
   stats.edges = edges.length;
   return { edges, stats };
 }
+
+/** A document's raw link targets: `contextnest://` links and `[[wikilinks]]`. */
+export type LinksOf = (doc: ContextNode) => { context: string[]; wiki: string[] };
+
+const bodyLinks: LinksOf = (doc) => ({
+  context: extractContextLinks(doc.body),
+  wiki: extractWikiLinks(doc.body),
+});
 
 /**
  * Build a relationship edge list from all documents.

@@ -627,6 +627,10 @@ export interface VaultRegistry {
   vaults: Record<string, VaultRegistryEntry>;
   /** Registered remote nests, keyed by alias. Shares one alias namespace with `vaults`. */
   remotes?: Record<string, RemoteNestSpec>;
+  /** ISO time first-run onboarding finished (bare `ctx`). */
+  onboarded_at?: string;
+  /** ISO time first-run onboarding was skipped. */
+  skipped_at?: string;
 }
 
 /**
@@ -804,6 +808,15 @@ export interface VerificationReport {
     expected: string | null;
     actual: string;
   }>;
+  /**
+   * Documents whose file differs from what the index (the manifest writes
+   * keep current) holds: added, edited or deleted outside the engine. Writes
+   * do not see them, so `context.yaml` and later checkpoints keep the old
+   * state until `ctx index`. A warning, never an error — a hand edit is not
+   * tampering — and absent when the manifest is not current (the next write
+   * re-reads the vault anyway).
+   */
+  stale_index?: string[];
   /**
    * Versions verified hash-only because the forget protocol erased their
    * content (§6.3.2). Not errors: the chain proves they existed, not what

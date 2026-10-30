@@ -1,5 +1,21 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.13.0
+
+### Minor Changes
+
+- e206eda: **Faster index regeneration on network storage; hosts can skip the agent config files.**
+
+  - `regenerateIndex` writes the agent config files (`CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.github/copilot-instructions.md`) side by side instead of one after another. They embed the document list, so they change on almost every write; on a GCS-mounted vault that loop cost about 1.3 s per save.
+  - New `NestStorage` option `agentConfigs` (default `true`). A host that serves the vault and never hands those files to a coding agent (the hosted Community server) passes `false`, and each write stops rewriting them. The CLI and MCP server keep the default, so nothing changes for local vaults.
+
+- 578da7a: **Hosts can seal writes later, in a batch.** A new `OperationContext.deferSeal` makes `context_create`, `context_update`, `context_publish`, `context_delete` and `context_import_pdf` stop at the document and its version entry: no nest checkpoint and no index update on the request. A publish answers `checkpoint: null` (the `context_publish` output schema now allows it). The host then calls `sealWrites(storage, { changed, published, triggeredBy })`, which seals every published document in one checkpoint and updates the index once, under the vault lock. `writePublishedVersion` (a publish without its checkpoint) is exported too. Version chains are written on the request, so `verify` is clean before and after the seal. The CLI and MCP server never defer: nothing changes for them.
+- 78f2ab5: **Hosts can supply the vault manifest themselves.** New `NestStorage` option `manifest`: a function returning every document's `manifestEntry`, from a record the host updates with each document write (the hosted Community server will serve it from its database). With it, a write's index update and checkpoint take the vault's documents from that record: no vault crawl, no folder re-reads, and no manifest file or pending list on disk. It works without `CONTEXTNEST_MANIFEST`. Returning `null` falls back to the crawl. `manifestEntry` and `ManifestEntry` are now exported, and manifest entries carry `updated_at` so INDEX.md can be built from them. The CLI and MCP server do not set the option: nothing changes for local vaults.
+
+### Patch Changes
+
+- **`ctx index` and suggestion approval update the index under the vault lock.** `ctx index` now crawls and writes inside the vault lock, and the index update after `approve_suggestion` (MCP) / `ctx drift approve` takes the lock too, so a concurrent write can no longer slip in between. Also ships an experimental manifest-based write path (`.context/manifest/`, off unless `CONTEXTNEST_MANIFEST=on`): with it on, a write's index update and checkpoint read only the changed folder instead of crawling the vault, and `ctx verify` / `context_verify` warn (`stale_index`) about documents changed outside ctx. With it off, which is the default, nothing else changes and no manifest files are written.
+
 ## 2.12.0
 
 ### Minor Changes

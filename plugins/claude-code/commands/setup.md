@@ -1,68 +1,105 @@
 ---
-description: Connect Context Nest in one guided step — PromptOwl cloud, your company's server, or notes only on this computer — and choose how much it runs on its own. Safe to re-run; it never replaces an existing setup.
-argument-hint: "[cloud|local] [server-url]"
+description: Set up Context Nest in one question — notes on this computer, online at nest.promptowl.ai (or your company's server), or both. Safe to re-run; it never replaces an existing setup.
+argument-hint: "[local|online|both] [server-url]"
+allowed-tools: Bash(ctx --version), Bash(ctx vault list:*), Bash(ctx vault which:*), Bash(ctx login --list:*), Bash(ctx init:*), Bash(ctx login:*), Bash(ctx vault add:*), Bash(ctx list:*), Bash(ctx structure:*), Bash(mkdir -p:*)
 ---
 
 # Context Nest setup
 
-Walk the user from "plugin installed" to "nest connected and the agent knows how to use it". The user may know nothing about Context Nest — do the work, ask only the choices below, and never hand them a command to copy unless a step says so.
+Take the user from "plugin installed" to "Claude has a notes folder it uses". The user may never have heard of Context Nest. Do the work yourself, ask only what is below, and don't hand them commands to copy unless a step says so.
 
-Server: the URL in `$ARGUMENTS` if one was given, else the one chosen in Step 2 (`https://nest.promptowl.ai` for PromptOwl cloud). Call it `<server>` below. Accept it only if it is a plain `https://host[:port][/path]` URL (`http://` only for localhost/127.0.0.1) with no spaces, quotes or shell characters; otherwise say why and stop. Always pass it to commands in double quotes.
+**Words.** Say **notes** to the user. Keep "vault", "nest", "alias", "starter", "pin", "default" and "register" inside commands; never make them part of a question. Always say where the notes go: "this computer", or the server's hostname.
 
-Say this once, before connecting anything: **connecting uploads nothing.** Notes in a local vault stay on this machine unless the user runs `ctx push`; only what is written to a hosted nest lives on that server.
+**`ctx`.** The plugin ships the Context Nest CLI and puts `ctx` on your Bash `PATH`. A copy the user installed themselves comes first. Never run bare `ctx` (with no subcommand): that is the CLI's own guided setup, and it needs an interactive terminal.
+
+**Server.** A URL in `$ARGUMENTS` is the server; otherwise it is `https://nest.promptowl.ai`. Call it `<server>` below. Accept a URL only if it is a plain `https://host[:port][/path]` (`http://` only for localhost/127.0.0.1) with no spaces, quotes or shell characters; otherwise say why and stop. Always pass it in double quotes.
 
 ## Step 1 — see what is already set up
 
-Check all three, quietly:
+Check quietly:
 
-1. **MCP** — are tools from a Context Nest MCP server already available to you in this session (e.g. `nest_index`, `context_search`)?
-2. **CLI** — run `ctx --version`. Not found → `npx -y @promptowl/contextnest-cli --version`. Use whichever works as `<ctx>` from here on; neither → no CLI. A version below 3.2.0 has no `login` command: treat it as too old for Step 3b and offer `npm i -g @promptowl/contextnest-cli@latest`, or use `npx -y @promptowl/contextnest-cli@latest` as `<ctx>` instead.
-3. **Vaults** — with a CLI, run `<ctx> vault list --json`, and `<ctx> login --list` when the CLI has `login`.
+1. `ctx --version`. If it fails, the bundled CLI is missing too, for example because the plugin's automatic install failed. Offer `npm i -g @promptowl/contextnest-cli` (Node ≥ 20, no admin rights). If the user says no or it fails, go to **Step 3d**.
+2. `ctx vault list --json` and `ctx login --list --json`.
+3. Whether Context Nest MCP tools (e.g. `nest_index`, `context_search`) are already available to you in this session.
 
-An MCP server or claude.ai connector that already points at `<server>` but needs sign-in counts as the cloud path half done: `<server>` is that connector's server; ask Step 2 without its first question, then go to Step 3a item 2 for that server instead of adding another.
+**Already set up** means at least one registered vault, or the MCP tools are present. If so, and `$ARGUMENTS` names no path, say "Claude is already using your notes (`<where>`)." Name the folder, or the hostname for online notes. Then ask with `AskUserQuestion`:
 
-**Already connected** (MCP tools present, or at least one registered vault): if `$ARGUMENTS` names `cloud` or `local`, treat it as **Connect another nest** and go on without asking. Otherwise show a short summary (what is connected, which vault is default/pinned) and ask with `AskUserQuestion`: **Done** · **Connect another nest** (continue at Step 2) · **Pin a vault** (hand over to `/contextnest:config vault`). Never remove, replace, or re-default anything that already exists.
+- **Done**
+- **Add my team's notes** (or **Add notes on this computer** when only online notes exist) → the matching path in Step 3
+- **Change which notes Claude uses first** → hand over to `/contextnest:config vault`
 
-## Step 2 — three choices, one question screen
+Write `"setup": "done"` (see **Record the outcome**). Never remove, replace or re-default anything that exists.
 
-Ask all three in a single `AskUserQuestion` call; leave out any question `$ARGUMENTS` already answers (a URL answers the first). With no usable CLI and no plan to install one, also leave out the second — its settings drive hooks that need `ctx` (Step 3d writes them off).
+## Step 2 — one question
 
-1. **Where do your notes live?** — **PromptOwl cloud (recommended)** → `https://nest.promptowl.ai` · **Only on this computer** → a private local vault, nothing connects to a server. A company server is typed into "Other" as its URL.
-2. **How should the assistant use them?** — show the cost in each label:
-   - **Light (recommended)** — looks up matching notes on each prompt (no extra AI call, a few hundred tokens only when something matches); notes are saved only when you ask or correct something. → `retrieval_mode: search`, `capture_mode: explicit`.
-   - **On demand — cheapest** — nothing runs in the background; you ask, or use `/contextnest:recall` and `/contextnest:capture`. → `off` / `off`.
-   - **Hands-free** — also reviews finished turns and proposes notes worth keeping (each review is a background agent run, roughly 25k tokens). → `search` / `propose`.
-3. **Apply to** — **All projects (recommended)** · **This project only**. This scopes the plugin settings and the MCP entry; a `ctx` sign-in or new local vault is still registered for the whole user account — say so when it applies.
+Skip this when `$ARGUMENTS` says `local`, `online` (or `cloud`) or `both`. A URL alone means online. Otherwise ask with one `AskUserQuestion`:
 
-Then pick the path: **Only on this computer** → Step 3c. A server and a CLI of 3.2.0 or later → Step 3b. A server and no usable CLI → Step 3a. `cloud` or `local` in `$ARGUMENTS` forces 3a or 3b.
+**Where should Claude keep its notes?**
+- **On this computer (recommended)** — private, works offline. Creates `~/ContextNest/main`.
+- **Online at nest.promptowl.ai** — needs an account; your team can share the notes. (A company server: type its URL in "Other".)
+- **Both** — on this computer, plus your team's online notes.
+- **Not now**
 
-## Step 3a — cloud (MCP + browser sign-in)
+Always recommend this computer, the same default as the CLI's own setup. Before connecting anything, say once: "Nothing leaves this computer unless you choose to put it online."
 
-1. Tell the user it adds a `contextnest` entry to their MCP config, then run `claude mcp add --transport http --scope <scope> contextnest "<server>/mcp"` — `<scope>` is `user` for all projects, `local` for this project only. If a server named `contextnest` already exists, ask before using another name — never remove the existing one.
-2. Tell the user, in one short message: run `/mcp`, pick **contextnest** (or the existing server/connector found in Step 1), choose **Authenticate**, and approve in the browser. If `contextnest` does not show in `/mcp`, restart Claude Code first.
-3. Stop here and wait. Once they say it worked, go to Step 3d. If `/mcp` offers no **Authenticate** or the sign-in fails, the server has browser sign-in turned off — remove the `contextnest` entry you added (`claude mcp remove contextnest --scope <scope>`) and offer the local CLI path instead.
-4. The sign-in may grant read access only. If a write is later refused for a missing scope, say so plainly and offer the local CLI path for writing.
+There are no other questions. Claude checks the notes on each prompt and saves only when the user asks or corrects something (the plugin's default). Say at the end how to change that.
 
-## Step 3b — local CLI
+## Step 3a — on this computer
 
-1. No CLI at all → offer `npm i -g @promptowl/contextnest-cli` (needs Node ≥ 20; installs to the user's npm prefix, no admin rights). If it fails, offer the cloud path instead of debugging the machine.
-2. Sign in and register the server as one alias covering every nest: `<ctx> login "<server>" --as promptowl` — add `--set-default` only when `vault list` showed no default. If `promptowl` is taken, pick another alias; never pass `--force`. The command opens the browser and waits for approval: run it with a long timeout (10 min) and tell the user to approve the page that opened. On a server without browser login it asks for a pasted key — tell the user to create one in the server's web UI (Connect) and run `! <ctx> login "<server>" --as promptowl --key-stdin` themselves, so the key never passes through you.
-3. Confirm with `<ctx> vault list --json`: each nest shows as `promptowl/<nest>`.
-4. More than one nest → ask with `AskUserQuestion` whether to pin one (each nest as an option, labelled with its description, plus **Don't pin — choose per question**). Pinning writes `vault` the way `/contextnest:config` does. Then go to Step 3d.
+These are the same folder, name and template as the CLI's own setup (`ctx` in a terminal), so both end up in the same place.
 
-## Step 3c — only on this computer
+1. If `~/ContextNest/main/.context/config.yaml` exists, those notes already exist. Add them instead of creating anything: `ctx vault add main ~/ContextNest/main` (add `--set-default` only when `vault list` showed no default). Go to Step 4.
+2. If `~/ContextNest/.context/config.yaml` exists, `~/ContextNest` is itself a vault. An older setup made `~/contextnest`, which is the same folder on macOS and Windows. Don't create notes inside it. Ask for another folder.
+3. If the alias `main` is taken by another folder, ask for another name.
+4. Run `mkdir -p ~/ContextNest/main`, then in that folder:
+   `ctx init --starter developer --name main --tools claude --vault main`
+   Add `--set-default` only when `vault list` showed no default.
+5. If the user asked for a different template, name or folder (in "Other"), use theirs. Templates: `ctx init --list-starters`.
 
-Needs the CLI (install as in Step 3b item 1; if that fails, say a local vault needs it and offer PromptOwl cloud). Create `~/contextnest` (or another folder the user names; if it already exists and is not empty, ask for another — never `init` over an existing vault), and inside it run `<ctx> init --name "My notes"` — add `--set-default` only when `vault list` showed no default — and use the alias it printed as `<alias>` from here on. Nothing leaves the machine. If the second question was skipped, apply **Light** in Step 3d. Then go to Step 3d.
+## Step 3b — online
 
-## Step 3d — apply the usage choice
+1. If `ctx vault list --json` already has a vault whose URL is on `<server>`, say "You're already connected to `<host>` (N nests)." and go to Step 4. Never add the same server twice.
+2. The alias is `promptowl` for `https://nest.promptowl.ai`. For any other server, leave `--as` out and `ctx` names it after the host. If `promptowl` is taken, pick another. Never pass `--force`. Add `--set-default` only when no vault is the default and this is not **Both**.
+3. **Already signed in.** If `ctx login --list --json` lists `<server>`, run `ctx vault add <alias> --url "<server>/mcp"` with no browser. Then check that `ctx vault list --json` shows `<alias>/<nest>` rows. If it shows none, the saved sign-in has expired: run `ctx login "<server>" --no-register` (item 4) to renew it, then check again.
+4. **Sign in.** Run `ctx login "<server>" --as <alias>` **in the background** (`run_in_background`). The user can't see Bash output while it waits for approval.
+   - Over SSH, or on Linux with neither `DISPLAY` nor `WAYLAND_DISPLAY`, prefix it with `CONTEXTNEST_NO_BROWSER=1`.
+   - Read its output until the line `Approve the login in your browser:` and the URL after it, and a `Code:` line if there is one. Post both in the chat: "Approve the sign-in here: <url> (code …)".
+   - Wait for the command to finish.
+   - A server without browser sign-in asks for a pasted key instead. Tell the user to create one on the server's Connect page and run `! ctx login "<server>" --as <alias> --key-stdin` themselves, so the key never passes through you.
+5. If sign-in fails, say nothing was changed on their account and how to retry. With **Both**, keep the local notes.
 
-Write the Step 2 choice as `retrieval_mode` and `capture_mode`, the way `/contextnest:config` does (its Step 3 merge rules; `--global` for all projects). With no CLI on this machine, write `off` / `off` whatever was chosen and say why: the hooks need `ctx`, so you use the nest's MCP tools directly instead. On the cloud path with a CLI present, say plainly that the hooks cover only the vaults `ctx` knows; this nest is reached through its MCP tools. Then go to Step 4.
+## Step 3c — both
 
-## Step 4 — learn the nest, then prove it works
+Step 3a first; its notes become the default. Then Step 3b without `--set-default`.
 
-Do not write usage rules from memory — the nest is the source of truth, and it changes without a plugin release.
+## Step 3d — no CLI at all (fallback)
 
-- MCP: call `nest_index`, then `context_overview`. Read any guide or onboarding node they surface and follow it.
-- CLI: `<ctx> --vault <alias> list --limit 20` and `<ctx> --vault <alias> structure --json`, where `<alias>` is the vault just connected (`promptowl`, or the alias `ctx init` printed).
+Only when Step 1 found no working `ctx` and the user declined the npm install. Tell them it adds a `contextnest` entry to their MCP config. Then:
 
-Then show the user it works with one real read: search for something the nest is about and cite one hit. Finish with three lines at most — what is connected, what the agent now does on its own (per the usage choice), and how to change it (`/contextnest:config`). Ask before writing a test note; never write one unasked.
+1. Run `claude mcp add --transport http --scope user contextnest "<server>/mcp"`. If a server named `contextnest` exists, ask before using another name, and never remove the existing one.
+2. Tell the user to run `/mcp`, pick **contextnest**, choose **Authenticate**, and approve in the browser. If it doesn't show, restart Claude Code first.
+3. Wait for them to say it worked. If there is no **Authenticate** option, remove only the entry you added (`claude mcp remove contextnest --scope user`) and say a local setup needs Node.
+4. The hooks need `ctx`, so say plainly that Claude reaches these notes only through the MCP tools.
+
+## Not now
+
+Write `"setup": "declined"` and say "OK — run /contextnest:setup any time." Stop.
+
+## Record the outcome
+
+Merge the `setup` key into `~/.contextnest/plugin-settings.json`: read it, keep every other key, create the folder if needed, and write pretty JSON. The values are `"done"` (set up, or already set up) and `"declined"` (Not now). This is what stops the "isn't set up yet" message at session start.
+
+## Step 4 — first note, then three lines
+
+Write `"setup": "done"`.
+
+- **New local notes.** `ctx init --starter` printed a brief addressed to you about a first note. Follow it, but ask first: one question about what to capture first, then exactly one real note, written only after the user agrees. Don't read the brief out to them. Don't search the new folder to "prove it works": it holds only template pages. New notes folders hold Claude's writes for the user's OK, so `ctx` prints `Held for review: ctx review approve <id>`. Tell the user in one line that the note is waiting for them and how to approve it. Never approve it yourself.
+- **Online notes.** Run `ctx --vault <alias> list --limit 20` and `ctx --vault <alias> structure --json`. Name the nests you found in one line each.
+
+Then close in at most three lines:
+
+1. Where the notes are (the folder or hostname).
+2. What Claude now does on its own: checks the notes on each prompt, and saves when you say "remember…" or correct it.
+3. How to change that: `/contextnest:config`.
+
+If `command -v ctx` points inside the plugin's own folder, the user has no `ctx` of their own. Offer once: "Want `ctx` in your own terminal too? `npm i -g @promptowl/contextnest-cli`". Never write a test note unasked.

@@ -31,6 +31,8 @@ import {
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
+  buildManifest,
+  withVaultLock,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -55,6 +57,7 @@ import {
   setVaultDescription,
   listVaults,
   readRegistry,
+  markOnboarding,
   findLocalVault,
   getRegistryPath,
   getRegistryDir,
@@ -140,6 +143,7 @@ import type {
 import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
+import { NO_VAULT_LINE, isBareInvocation, isHeadless, runOnboarding, shouldOnboard } from "./first-run.js";
 import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
 import { choicesToCommand, setupBaseUrl, waitForChoices } from "./setup.js";
 import { telemetryConsent } from "./telemetry/index.js";
@@ -2487,6 +2491,11 @@ program
       }
     }
 
+    // Files changed outside ctx: writes do not see them until `ctx index`, so
+    // context.yaml and later checkpoints still hold the old state. A warning —
+    // a hand edit is not tampering — never an error.
+    const staleIndex = lock ? [] : await storage.staleIndexIds(liveDocs);
+
     if (opts.json) {
       console.log(
         JSON.stringify(
@@ -2494,12 +2503,21 @@ program
             valid: totalErrors === 0,
             errors: allReportErrors,
             ...(tombstoned.length > 0 ? { tombstoned } : {}),
+            ...(staleIndex.length > 0 ? { stale_index: staleIndex } : {}),
           },
           null,
           2,
         ),
       );
     } else {
+      if (staleIndex.length > 0) {
+        console.log(
+          chalk.yellow(
+            `\n⚠ ${staleIndex.length} document(s) changed outside ctx are not in the index or checkpoints yet — run \`ctx index\`:`,
+          ),
+        );
+        for (const id of staleIndex) console.log(chalk.yellow(`  ${id}`));
+      }
       console.log(
         totalErrors === 0
           ? chalk.green("\nAll integrity checks passed")
@@ -2517,80 +2535,89 @@ program
   .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
   .action(async () => {
     const storage = getStorage();
-    // Per-folder INDEX.md must list retired docs too so stewards can find
-    // them; context.yaml gets filtered to published-only below. Matches
-    // storage.regenerateIndex().
-    const docs = await storage.discoverDocuments({ includeRetired: true });
-
     await confirmOrExit(
       `Regenerate context.yaml and INDEX.md in ${realRootPath() ?? storage.root}? Documents whose status is written in a legacy form are rewritten in place.`,
     );
 
-    // Status-canonicalization pass: rewrite any doc whose on-disk status
-    // differs from its parsed (normalized) status. Only `ctx index` does
-    // this — per-mutation calls to regenerateIndex stay cheap. After this
-    // pass disk values are guaranteed canonical until something else edits
-    // them out-of-band.
-    let normalized = 0;
-    for (const doc of docs) {
-      const onDisk = await storage.readDocument(doc.id);
-      const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
-      const canonical = doc.frontmatter.status;
-      if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
-        // Round-trip through serializeDocument — which itself normalizes —
-        // and write back. This rewrites any aliased value to canonical.
-        await storage.writeDocument(doc.id, serializeDocument(doc));
-        normalized++;
+    // Crawl through write under the vault lock: a write landing in between would
+    // be missing from the manifest this writes, which later writes trust.
+    await withVaultLock(storage.root, async () => {
+      // Per-folder INDEX.md must list retired docs too so stewards can find
+      // them; context.yaml gets filtered to published-only below. Matches
+      // storage.regenerateIndex().
+      const docs = await storage.discoverDocuments({ includeRetired: true });
+
+      // Status-canonicalization pass: rewrite any doc whose on-disk status
+      // differs from its parsed (normalized) status. Only `ctx index` does
+      // this — per-mutation calls to regenerateIndex stay cheap. After this
+      // pass disk values are guaranteed canonical until something else edits
+      // them out-of-band.
+      let normalized = 0;
+      for (const doc of docs) {
+        const onDisk = await storage.readDocument(doc.id);
+        const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
+        const canonical = doc.frontmatter.status;
+        if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
+          // Round-trip through serializeDocument — which itself normalizes —
+          // and write back. This rewrites any aliased value to canonical.
+          await storage.writeDocument(doc.id, serializeDocument(doc));
+          normalized++;
+        }
       }
-    }
-    if (normalized > 0) {
-      console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
-    }
+      if (normalized > 0) {
+        console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
+      }
 
-    const config = await storage.readConfig();
-    // Head only — same reason storage.regenerateIndex() takes it this way: the
-    // chain grows by one entry per published doc per checkpoint, and only its
-    // newest entry reaches context.yaml.
-    const latestCheckpoint = await storage.readLatestCheckpoint();
-    const published = docs.filter((d) => d.frontmatter.status === "published");
+      const config = await storage.readConfig();
+      // Head only — same reason storage.regenerateIndex() takes it this way: the
+      // chain grows by one entry per published doc per checkpoint, and only its
+      // newest entry reaches context.yaml.
+      const latestCheckpoint = await storage.readLatestCheckpoint();
+      const published = docs.filter((d) => d.frontmatter.status === "published");
 
-    // Generate context.yaml
-    const { contextYaml, stats } = generateContextYamlWithStats(
-      published,
-      config,
-      latestCheckpoint,
-    );
-    await storage.writeContextYaml(contextYaml);
-    console.log(chalk.green("Generated context.yaml"));
-    // Where the graph came from. A vault authored with [[wikilinks]] used to
-    // index with zero edges and --hops silently did nothing; the unresolved
-    // count is the hint that a link's title does not match any published doc.
-    console.log(
-      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
-        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
-        (stats.unresolvedContextLinks
-          ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
-            (stats.unresolvedContextLinks === 1 ? "" : "s")
-          : "") +
-        ")",
-    );
+      // Generate context.yaml
+      const { contextYaml, stats } = generateContextYamlWithStats(
+        published,
+        config,
+        latestCheckpoint,
+      );
+      await storage.writeContextYaml(contextYaml);
+      // The reindex is the reconcile for edits made outside the engine; a
+      // manifest from the same crawl spares the next write its own.
+      await storage.writeManifest(
+        buildManifest(docs, { checkpoint: latestCheckpoint?.checkpoint ?? 0, indexGeneratedAt: contextYaml.generated_at }),
+      );
+      console.log(chalk.green("Generated context.yaml"));
+      // Where the graph came from. A vault authored with [[wikilinks]] used to
+      // index with zero edges and --hops silently did nothing; the unresolved
+      // count is the hint that a link's title does not match any published doc.
+      console.log(
+        `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+          `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
+          (stats.unresolvedContextLinks
+            ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
+              (stats.unresolvedContextLinks === 1 ? "" : "s")
+            : "") +
+          ")",
+      );
 
-    // Generate INDEX.md for each folder
-    const folders = new Map<string, ContextNode[]>();
-    for (const doc of docs) {
-      const parts = doc.id.split("/");
-      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-      if (!folders.has(folder)) folders.set(folder, []);
-      folders.get(folder)!.push(doc);
-    }
+      // Generate INDEX.md for each folder
+      const folders = new Map<string, ContextNode[]>();
+      for (const doc of docs) {
+        const parts = doc.id.split("/");
+        const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+        if (!folders.has(folder)) folders.set(folder, []);
+        folders.get(folder)!.push(doc);
+      }
 
-    for (const [folder, folderDocs] of folders) {
-      if (folder === ".") continue;
-      const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-      const indexMd = generateIndexMd(folder, title, folderDocs);
-      await storage.writeIndexMd(folder, indexMd);
-      console.log(chalk.green(`Generated ${folder}/INDEX.md`));
-    }
+      for (const [folder, folderDocs] of folders) {
+        if (folder === ".") continue;
+        const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+        const indexMd = generateIndexMd(folder, title, folderDocs);
+        await storage.writeIndexMd(folder, indexMd);
+        console.log(chalk.green(`Generated ${folder}/INDEX.md`));
+      }
+    });
   });
 
 // ─── Cloud query helper ──────────────────────────────────────────────────────
@@ -4448,7 +4475,9 @@ drift
       comment: opts.comment,
     });
 
-    await storage.regenerateIndex({ changedIds: [id] });
+    // Under the vault lock, as every other index update: approveSuggestion has
+    // released its own, and an overlapping update would lose a manifest entry.
+    await withVaultLock(storage.root, () => storage.regenerateIndex({ changedIds: [id] }));
 
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
@@ -5360,8 +5389,76 @@ program
     console.log("");
   });
 
+// Bare `ctx`: first-run onboarding, otherwise the help list (stdout, exit 0).
+async function bareCtx(): Promise<void> {
+  const registry = readRegistry();
+  let vaultResolves = false;
+  try {
+    vaultResolves = Boolean(findLocalVault(process.cwd()));
+  } catch {
+    /* an unreadable local config is not a reason to onboard */
+  }
+  const decision = shouldOnboard({
+    argv: process.argv,
+    env: process.env,
+    tty: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    registry,
+    vaultResolves,
+  });
+  if (decision.action === "onboard") {
+    const startCwd = process.cwd();
+    const realExit = process.exit;
+    // No local browser (SSH, no display): print the approval link instead of opening one.
+    if (isHeadless(process.env)) process.env.CONTEXTNEST_NO_BROWSER = "1";
+    const result = await runOnboarding({
+      signedIn: async (server) => normalizeServerUrl(server) in (await loadServerMap()).servers,
+      env: process.env,
+      home: homedir(),
+      ask: (q, d) => promptText(q, d),
+      log: (l) => console.log(l),
+      exists: (p) => fs.existsSync(p),
+      joinPath: (...parts) => pathMod.join(...parts),
+      markOnboarding,
+      detectedTools: () => detectAgentTools(startCwd).filter((t) => t.detected).map((t) => t.id),
+      run: async (args, cwd) => {
+        // The commands call process.exit(1) on failure; turn that into a throw
+        // so one failed step cannot kill the whole flow.
+        process.exit = ((code?: number) => {
+          throw new Error(`command failed (exit ${code ?? 1})`);
+        }) as typeof process.exit;
+        try {
+          if (cwd) {
+            fs.mkdirSync(cwd, { recursive: true });
+            process.chdir(cwd);
+          }
+          await program.parseAsync(args, { from: "user" });
+        } finally {
+          process.exit = realExit;
+          if (cwd) process.chdir(startCwd);
+          // commander keeps option values between parses; don't leak ours.
+          for (const k of ["yes", "vault"]) program.setOptionValue(k, undefined);
+        }
+      },
+    });
+    if (result === "failed") process.exitCode = 1;
+    return;
+  }
+  if (decision.markOnboarded) {
+    try {
+      markOnboarding("onboarded");
+    } catch {
+      /* best effort; never block help */
+    }
+  }
+  const noVault =
+    Object.keys(registry.vaults).length === 0 && Object.keys(registry.remotes ?? {}).length === 0 && !vaultResolves;
+  if (noVault) console.log(chalk.yellow(NO_VAULT_LINE) + "\n");
+  program.outputHelp();
+  if (decision.hint) console.error(chalk.dim(decision.hint));
+}
+
 // Parse and run
-program.parseAsync().catch((err: unknown) => {
+(isBareInvocation(process.argv) ? bareCtx() : program.parseAsync()).catch((err: unknown) => {
   // No error path prints a raw stack trace: engine errors render with their
   // code, everything else (YAML syntax errors, fs failures, genuine bugs) as a
   // plain one-liner. Set CONTEXTNEST_DEBUG=1 to get the full stack back.
