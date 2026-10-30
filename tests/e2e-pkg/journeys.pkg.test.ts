@@ -3379,11 +3379,12 @@ const J17: Journey = {
           args: ["init", "--list-starters"],
           env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("list") }),
           stdout: ["Available starter recipes:", "developer"],
-          // A pure preview: the target dir stays empty — no vault, no agent config.
+          // A pure preview: the target dir stays completely empty — no vault, no
+          // agent config, no context.yaml, nothing. Assert the whole dir is empty
+          // (not just a handful of named files) so any stray write is caught.
           check: () => {
             const d = j17dir("list");
-            for (const f of ["CLAUDE.md", "CONTEXT.md", ".context"])
-              expect(existsSync(join(d, f)), `list-starters must not write ${f}`).toBe(false);
+            expect(readdirSync(d), "list-starters must write nothing to disk").toEqual([]);
           },
         },
       ],
@@ -3420,12 +3421,19 @@ const J17: Journey = {
           // vault that was just created — and it answers with the starter nodes.
           args: ["query", "type:document", "--json"],
           env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
-          json: (data) =>
+          json: (data) => {
+            // Precondition guard: a missing vault here means J17-02 didn't run
+            // first. Surface that directly instead of a bare "no docs" diff.
+            expect(
+              existsSync(join(j17dir("claude"), "CLAUDE.md")),
+              "J17-03 reuses the vault J17-02 onboarded — J17-02 must run first (do not reorder)",
+            ).toBe(true);
             expect(queryDocIds(data)).toEqual([
               "nodes/architecture/architecture-overview",
               "nodes/onboarding/getting-started",
               "nodes/standards/coding-conventions",
-            ]),
+            ]);
+          },
           // The config is self-contained: it marks its own auto-generated block
           // and teaches the agent the one command it needs — no external setup.
           check: () => {
@@ -3443,13 +3451,16 @@ const J17: Journey = {
       actions: [
         {
           args: [
-            "init", "--starter", "developer", "--tools", "claude,cursor,gemini", "--name", "multi-demo",
+            "init", "--starter", "developer",
+            "--tools", "claude,cursor,gemini,windsurf,copilot", "--name", "multi-demo",
           ],
           env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("multi") }),
           stdout: ["Applied starter: Developer / Engineering"],
+          // Every onboarded tool gets its config file — the positive mirror of
+          // J17-05's "all absent", so each AGENT_CONFIGS entry is covered both ways.
           check: () => {
             const d = j17dir("multi");
-            for (const f of ["CLAUDE.md", ".cursorrules", "GEMINI.md"])
+            for (const f of AGENT_CONFIGS)
               expect(existsSync(join(d, f)), `expected ${f} for its tool`).toBe(true);
           },
         },
