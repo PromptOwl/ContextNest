@@ -4,9 +4,7 @@
 
 **by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
 
-[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-mcp-server.svg)](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
+[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-mcp-server.svg)](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0) [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
 MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **44 tools** over stdio transport: 24 canonical `context_*` tools, 9 vault, review and drift tools, and 11 deprecated aliases.
 
@@ -33,11 +31,7 @@ Or install globally:
 npm install -g @promptowl/contextnest-mcp-server
 ```
 
-**Zero dependencies, no install scripts.** Everything the server needs is compiled into the
-published bundle, so the install pulls one package and executes none of our code. A stdio server
-never touches the SDK's express, hono, ajv or jose transports, and they are no longer shipped. Every
-bundled package is listed with its version and licence in
-[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
+**Zero dependencies, no install scripts.** Everything the server needs is compiled into the published bundle, so the install pulls one package and executes none of our code. A stdio server never touches the SDK's express, hono, ajv or jose transports, and they are no longer shipped. Every bundled package is listed with its version and licence in [DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
 
 ## Usage
 
@@ -74,9 +68,7 @@ gemini mcp add contextnest -- contextnest-mcp /path/to/your/vault
 contextnest-mcp /path/to/your/vault
 ```
 
-The positional argument may also be a **registered alias** (see the CLI's
-`ctx vault add`), in which case the path is looked up in the central registry
-(`~/.contextnest/config.yaml`):
+The positional argument may also be a **registered alias** (see the CLI's `ctx vault add`), in which case the path is looked up in the central registry (`~/.contextnest/config.yaml`):
 
 ```bash
 contextnest-mcp work
@@ -91,18 +83,13 @@ CONTEXTNEST_VAULT_PATH=/path/to/vault contextnest-mcp
 CONTEXTNEST_VAULT=work contextnest-mcp
 ```
 
-The vault is resolved with this precedence: `CONTEXTNEST_VAULT` (alias) →
-`CONTEXTNEST_VAULT_PATH` (path) → positional argument (alias or path) → a vault
-found above the current directory → the registry's default alias → the current
-directory.
+The vault is resolved with this precedence: `CONTEXTNEST_VAULT` (alias) → `CONTEXTNEST_VAULT_PATH` (path) → positional argument (alias or path) → a vault found above the current directory → the registry's default alias → the current directory.
 
 ## Tools
 
 ### Canonical tools (`context_*`)
 
-Name, description and input schema for each of these come from the engine's
-operation catalog, so this surface cannot drift from the CLI or the cloud. Prefer
-them over the legacy tools below.
+Name, description and input schema for each of these come from the engine's operation catalog, so this surface cannot drift from the CLI or the cloud. Prefer them over the legacy tools below.
 
 | Tool | Description |
 |------|-------------|
@@ -133,8 +120,7 @@ them over the legacy tools below.
 
 #### `client` — attributing a call
 
-Every tool above takes an optional `client` object naming the calling agent and
-its session, plus any custom scalar keys:
+Every tool above takes an optional `client` object naming the calling agent and its session, plus any custom scalar keys:
 
 ```jsonc
 context_create({
@@ -144,19 +130,11 @@ context_create({
 })
 ```
 
-A write that publishes records it on the version-history entry it seals, so
-`context_versions` can answer *which agent wrote v7, in which session*; a graph
-read stamps it on the access traces it emits.
+A write that publishes records it on the version-history entry it seals, so `context_versions` can answer *which agent wrote v7, in which session*; a graph read stamps it on the access traces it emits.
 
-**Every field is optional** — `client` itself, and `agent`/`session_id` within
-it. Send none, one, or all.
+**Every field is optional** — `client` itself, and `agent`/`session_id` within it. Send none, one, or all.
 
-**You usually do not need to send it.** The server fills both fields from what
-the connection already tells it: `agent` from the `clientInfo.name` in your
-`initialize` handshake, and `session_id` from a per-process id — over stdio one
-server process is one client connection, so every call sharing that id really
-did come from one session. Anything you send wins, merged **per key**: supply
-just `agent` and you keep it while still getting a session id.
+**You usually do not need to send it.** The server fills both fields from what the connection already tells it: `agent` from the `clientInfo.name` in your `initialize` handshake, and `session_id` from a per-process id — over stdio one server process is one client connection, so every call sharing that id really did come from one session. Anything you send wins, merged **per key**: supply just `agent` and you keep it while still getting a session id.
 
 | Env var | Effect |
 |---------|--------|
@@ -164,19 +142,9 @@ just `agent` and you keep it while still getting a session id.
 | `CONTEXTNEST_AGENT` | Overrides the `agent` the handshake reports |
 | `CONTEXTNEST_SESSION_ID` | Overrides the per-process session id |
 
-Precedence per key: **caller > env > connection.** With attribution off and no
-caller value, the `client` key is left off the record entirely rather than
-written as `{}` — "not attributed" and "attributed to nobody" are different
-claims, and history should only make the first. The opt-out matters because
-what gets derived lands in an append-only history: an operator who does not
-want their client's name recorded in a vault needs to say so before the first
-write, not scrub it after.
+Precedence per key: **caller > env > connection.** With attribution off and no caller value, the `client` key is left off the record entirely rather than written as `{}` — "not attributed" and "attributed to nobody" are different claims, and history should only make the first. The opt-out matters because what gets derived lands in an append-only history: an operator who does not want their client's name recorded in a vault needs to say so before the first write, not scrub it after.
 
-It is a label, never an identity claim — `clientInfo.name` is your self-report,
-the server authenticates neither, and it never authorizes from either — and it
-is not an input to any hash chain. Note that `client` describes the CALL;
-`metadata` on `context_create` / `context_update` is frontmatter and describes
-the DOCUMENT. See spec §9.4.
+It is a label, never an identity claim — `clientInfo.name` is your self-report, the server authenticates neither, and it never authorizes from either — and it is not an input to any hash chain. Note that `client` describes the CALL; `metadata` on `context_create` / `context_update` is frontmatter and describes the DOCUMENT. See spec §9.4.
 
 ### Vault tools
 
@@ -186,12 +154,11 @@ the DOCUMENT. See spec §9.4.
 | `read_index` | Return the context.yaml graph index |
 | `read_pack` | Resolve and return a context pack |
 | `list_checkpoints` | List recent checkpoints |
-| `context_review` | Review gate: `list` held writes, `approve` / `reject` one (`id`), turn the gate `off` / `on` |
+| `context_review` | Controls the review gate. It can `list` held writes, `approve` or `reject` one by `id`, and turn the gate `off` or `on`. |
 
 ### Deprecated tools
 
-Registered and behaving exactly as before, so existing clients keep working. They
-will be removed in a future major.
+Registered and behaving exactly as before, so existing clients keep working. They will be removed in a future major.
 
 | Deprecated | Use instead |
 |------|-------------|
@@ -249,35 +216,17 @@ context_create({ type: "skill", trigger: "..." })           → create a new ski
 
 ## Upgrading to 2.0
 
-Nothing in your MCP client config changes. The old tools are all still
-registered. Four things do change:
+Nothing in your MCP client config changes. The old tools are all still registered. Four things do change:
 
-**`context_overview` is removed.** It returned counts and a node list.
-`context_init` now returns everything it did *plus* the vault's `CONTEXT.md`
-instructions, its configuration and its path — so opening a vault is one call
-instead of two. `vault_info` is an alias for `context_init` now, which is what
-that name always promised. Node lists are opt-in behind `include_nodes`.
+**`context_overview` is removed.** It returned counts and a node list. `context_init` now returns everything it did *plus* the vault's `CONTEXT.md` instructions, its configuration and its path — so opening a vault is one call instead of two. `vault_info` is an alias for `context_init` now, which is what that name always promised. Node lists are opt-in behind `include_nodes`.
 
-**Document ids are taken exactly as stored.** A bare slug is no longer re-rooted
-under `nodes/`. If you were passing `api-design` to `read_document` and relying on
-it finding `nodes/api-design`, pass the full id to `context_get`. This is what
-makes flat-layout vaults work at all — every id from one used to resolve to a
-document that does not exist. A trailing `.md` and leading slashes are still
-stripped.
+**Document ids are taken exactly as stored.** A bare slug is no longer re-rooted under `nodes/`. If you were passing `api-design` to `read_document` and relying on it finding `nodes/api-design`, pass the full id to `context_get`. This is what makes flat-layout vaults work at all — every id from one used to resolve to a document that does not exist. A trailing `.md` and leading slashes are still stripped.
 
-**`context_import` output changed:** `created` → `published`, and `checkpoint` is
-added. `failed` entries carry `id` (for the `ids` path) or `title` (for the
-`documents` path), not `title` unconditionally.
+**`context_import` output changed:** `created` → `published`, and `checkpoint` is added. `failed` entries carry `id` (for the `ids` path) or `title` (for the `documents` path), not `title` unconditionally.
 
-**`context_update` semantics:** `title` now sets a *new* title rather than
-selecting the node to update — select by `id`. `tags` replaces the tag set rather
-than merging into it; send the merged set if you want the old behaviour. A `null`
-metadata value clears that key.
+**`context_update` semantics:** `title` now sets a *new* title rather than selecting the node to update — select by `id`. `tags` replaces the tag set rather than merging into it; send the merged set if you want the old behaviour. A `null` metadata value clears that key.
 
-Two long-standing filter bugs are fixed in `context_list`, which may return
-results where it previously returned nothing: `status: "rejected"` could never
-match, and `type: "document"` skipped every document that omitted the optional
-`type` field. Tags now match with or without a leading `#` and regardless of case.
+Two long-standing filter bugs are fixed in `context_list`, which may return results where it previously returned nothing: `status: "rejected"` could never match, and `type: "document"` skipped every document that omitted the optional `type` field. Tags now match with or without a leading `#` and regardless of case.
 
 ## Ecosystem
 

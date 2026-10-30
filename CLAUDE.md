@@ -72,7 +72,7 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-43 tools over stdio, in three groups:
+44 tools over stdio, in three groups:
 
 - **Catalog-driven** (24, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_embed`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`, `context_forget`, `context_forget_log`, `context_structure`. **Add new tools here, not by hand.**
 - **Hand-written, still current** (9): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`, `context_review` (review gate — hand-written on purpose so hosted catalog bindings cannot toggle it).
