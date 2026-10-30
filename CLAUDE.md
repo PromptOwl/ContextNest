@@ -92,7 +92,7 @@ Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (
 
 **Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
 
-Hooks: `SessionStart` → vault overview injection (plus a compact blueprint of the pinned/working-directory vault's structure rules via `ctx structure --json`), `UserPromptSubmit` → retrieval **and dispatch of any parked job**, `Stop` → capture gate, `PostToolUse` (Bash) → sweep-check: after a `ctx update`, diff against the prior version and report every node in every registered nest still carrying the removed value (two channels: exact entity-tag lookup via `ctx list --tag` — agents tag nodes with the concrete values they assert and retag on edit — plus confirmed full-text search for untagged prose). The sweep-check keys on the write, not the phrasing — `correctionIntent()` misses declarative updates entirely, which is why it exists. Concurrent same-vault writes are serialized by a per-vault `mkdir` lock in the engine's mutating executors (`packages/engine/src/vault-lock.ts`); without it, parallel writers silently corrupt the checkpoint chain.
+Hooks: `SessionStart` → vault overview injection (plus a compact blueprint of the pinned/working-directory vault's structure rules via `ctx structure --json`), `UserPromptSubmit` → retrieval **and dispatch of any parked job**, `Stop` → capture gate, `PostToolUse` (Bash, registered `async` so it never holds the turn — its report reaches the model on the next turn) → sweep-check: after a `ctx update`, diff against the prior version and report every node in every registered nest still carrying the removed value (two channels: exact entity-tag lookup via `ctx list --tag` — agents tag nodes with the concrete values they assert and retag on edit — plus confirmed full-text search for untagged prose). The sweep-check keys on the write, not the phrasing — `correctionIntent()` misses declarative updates entirely, which is why it exists. Concurrent same-vault writes are serialized by a per-vault `mkdir` lock in the engine's mutating executors (`packages/engine/src/vault-lock.ts`); without it, parallel writers silently corrupt the checkpoint chain.
 
 **The Stop hook never blocks.** It used to return `decision: "block"`, which held the turn open while a subagent ran. It now parks `{kind, reason, turn}` in the session ledger and returns only a `systemMessage`; the next `UserPromptSubmit` drains the queue and hands the directive over as `additionalContext` (the field the model acts on — Stop's own `additionalContext` is transcript metadata it does not act on). `contextnest-capture` and `contextnest-curator` are `background: true` so the dispatched work overlaps the user's next request. Note `saveLedger` writes an explicit key projection: a new ledger field must be added to the `EMPTY` sentinel, the `loadLedger` projection **and** the `saveLedger` stringify, or it is dropped silently.
 
@@ -114,12 +114,20 @@ Hooks: `SessionStart` → vault overview injection (plus a compact blueprint of 
 
 Every PR — human- or AI-authored — must have both of these, or the Claude review marks it 🔴 blocking (full rules in `REVIEW.md`):
 
-1. **ClickUp ticket** referenced in the title, body or branch name (`CU-<id>`, `[CU-<id>]`, `#<id>`, or an `app.clickup.com/t/<id>` link). If you don't know the ticket, ask — don't open the PR without it.
+1. **Task** — a vault task link as the body's first line (`Task: https://nest.promptowl.ai/nest/<nest-id>?doc=nodes/projects/<stage>/<task-slug>`; tasks live in the `po-engineering-ops` nest), or a ClickUp ticket in the title, body or branch name (`CU-<id>`, `[CU-<id>]`, `#<id>`, or an `app.clickup.com/t/<id>` link). If you don't know the task, ask — don't open the PR without it.
 2. **Steps to test** section in the body: numbered steps a tester can follow from the user's perspective — where to go or what to run, what to do, what they should see. "Unit tests pass" is not test steps. Use `N/A — no user-facing change` plus a reason only for docs/CI/chore PRs.
 
 ## Releasing
 
 Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together. `CONTEXT_NEST_SPEC.md` is the one exception in the repo: Apache-2.0, per `LICENSE-SPEC`.
+
+**After a release that publishes the CLI, update the Claude Code plugin's pin.** `plugins/claude-code/package.json` pins `@promptowl/contextnest-cli` to an exact version, and Claude Code installs it with the plugin. Do these steps, then commit them together:
+
+1. Set the pin to the new version.
+2. Run `npm install --package-lock-only --ignore-scripts` in `plugins/claude-code/` to refresh `package-lock.json`.
+3. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
+
+This can't go in the changesets version PR, because the lockfile needs the published tarball's integrity hash. `pnpm plugins:check` fails when the pin and the lockfile disagree. The pin is added by CU-wdqcq067m5; until that lands there is nothing to bump.
 
 ## Specification
 

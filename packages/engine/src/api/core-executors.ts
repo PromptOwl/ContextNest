@@ -60,7 +60,7 @@ import {
 } from "../storage.js";
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
-import { publishDocument, publishDocuments } from "../publish.js";
+import { publishDocument, publishDocuments, writePublishedVersion } from "../publish.js";
 import { VersionManager } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import {
@@ -321,25 +321,39 @@ const vaultError = (ctx: OperationContext, err: unknown) =>
     .split(ctx.storage.root.replace(/\\/g, "/"))
     .join(".");
 
-/** Publish via publishDocument, then regenerate context.yaml (matches OSS). */
+/**
+ * Publish via publishDocument, then regenerate context.yaml (matches OSS).
+ * Under `ctx.deferSeal` only the version is written: no checkpoint, no index
+ * update, `checkpoint: null` — the host seals later (sealWrites).
+ */
 async function publishAndIndex(
   ctx: OperationContext,
   id: string,
   note?: string,
   client?: ClientMetadata,
-): Promise<{ version: number; checkpoint: number }> {
-  const res = await publishDocument(ctx.storage, id, {
+): Promise<{ version: number; checkpoint: number | null; chain_hash: string }> {
+  const options = {
     editedBy: ctx.actor ?? "engine",
     ...(note ? { note } : {}),
     ...(client ? { client } : {}),
     ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
-  });
+  };
+  if (ctx.deferSeal) {
+    const { versionEntry } = await writePublishedVersion(ctx.storage, id, options);
+    return { version: versionEntry.version, checkpoint: null, chain_hash: versionEntry.chain_hash };
+  }
+  const res = await publishDocument(ctx.storage, id, options);
   // publishDocument does NOT touch context.yaml; graph-mode reads (the default
   // context_query) seed from it, so a stale index would hide the write. OSS
   // mcp-server/CLI both regenerate here. One doc changed, so only its folder's
   // INDEX.md needs rewriting.
   await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: res.checkpoint, docs: res.vaultDocs });
-  return { version: res.versionEntry.version, checkpoint: res.checkpointNumber };
+  return { version: res.versionEntry.version, checkpoint: res.checkpointNumber, chain_hash: res.versionEntry.chain_hash };
+}
+
+/** The index update after a write that seals nothing (a draft, a delete) — the host's to do under `deferSeal`. */
+async function indexAfterWrite(ctx: OperationContext, id: string): Promise<void> {
+  if (!ctx.deferSeal) await ctx.storage.regenerateIndex({ changedIds: [id] });
 }
 
 const query: OperationExecutor = async (ctx, input: any) => {
@@ -782,7 +796,7 @@ const create: OperationExecutor = async (ctx, input: any) => {
   // review before it becomes retrievable. Still regenerate the index so the
   // draft is discoverable to the surfaces that list drafts.
   if (!publish) {
-    await ctx.storage.regenerateIndex();
+    await indexAfterWrite(ctx, node.id);
     return {
       id: node.id,
       version: node.frontmatter.version ?? 1,
@@ -971,7 +985,7 @@ const update: OperationExecutor = async (ctx, input: any) => {
   }
   await ctx.storage.writeDocument(id, serializeDocument(node));
   if (!publish) {
-    await ctx.storage.regenerateIndex();
+    await indexAfterWrite(ctx, id);
     return {
       id,
       version: frontmatter.version ?? 1,
@@ -987,21 +1001,10 @@ const update: OperationExecutor = async (ctx, input: any) => {
 const publish: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   // publishDocument guards rejected docs, judges the structure rules (§11.1.1)
-  // and seals a checkpoint; regenerate the index so graph-mode reads see the
-  // freshly-published node (same as create/update).
-  const result = await publishDocument(ctx.storage, id, {
-    editedBy: ctx.actor ?? "engine",
-    ...(input.note ? { note: input.note } : {}),
-    ...(input.client ? { client: input.client } : {}),
-    ...(ctx.structure === "skip" ? { structure: "skip" as const } : {}),
-  });
-  await ctx.storage.regenerateIndex({ changedIds: [id], latestCheckpoint: result.checkpoint, docs: result.vaultDocs });
-  return {
-    id,
-    version: result.versionEntry.version,
-    checkpoint: result.checkpointNumber,
-    chain_hash: result.versionEntry.chain_hash,
-  };
+  // and seals a checkpoint; the index is regenerated so graph-mode reads see
+  // the freshly-published node (same as create/update).
+  const result = await publishAndIndex(ctx, id, input.note, input.client);
+  return { id, version: result.version, checkpoint: result.checkpoint, chain_hash: result.chain_hash };
 };
 
 const del: OperationExecutor = async (ctx, input: any) => {
@@ -1019,7 +1022,7 @@ const del: OperationExecutor = async (ctx, input: any) => {
     ...(input.purge ? { purge: true } : {}),
   });
   await purgeEmbeddings(ctx.storage.root, [id]);
-  await ctx.storage.regenerateIndex();
+  await indexAfterWrite(ctx, id);
   return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
 };
 
@@ -1032,7 +1035,9 @@ const forget: OperationExecutor = async (ctx, input: any) => {
     ...(input.client ? { client: input.client } : {}),
   });
   await purgeEmbeddings(ctx.storage.root, [id]);
-  await ctx.storage.regenerateIndex();
+  // The forget just sealed a checkpoint: hand its head over, as a publish does.
+  const head = await ctx.storage.readLatestCheckpoint();
+  await ctx.storage.regenerateIndex({ changedIds: [id], ...(head ? { latestCheckpoint: head } : {}) });
   return {
     id: result.id,
     versions: result.versions,
@@ -2040,7 +2045,7 @@ async function importPdfLocked(
     wroteNode = true;
     if (rules && created) await scaffoldFolders(ctx.storage, rules, created);
     if (!publish) {
-      await ctx.storage.regenerateIndex();
+      await indexAfterWrite(ctx, id);
       return {
         id,
         version: frontmatter.version ?? 1,
