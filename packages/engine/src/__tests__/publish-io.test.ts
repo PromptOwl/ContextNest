@@ -17,6 +17,10 @@ import { approveSuggestion, rollbackDocument } from "../approval.js";
 import { approveReview, listReviewHolds } from "../review.js";
 import { stageSuggestion } from "../suggestions.js";
 import type { RbacHook } from "../types.js";
+import { useManifest } from "./fixtures/manifest-on.js";
+
+// The manifest is a POC behind CONTEXTNEST_MANIFEST (off by default): on here.
+useManifest();
 
 const ALLOW_ALL: RbacHook = { isCzar: () => true, canIngest: () => true, isDocOwner: () => true };
 
@@ -83,8 +87,13 @@ describe("publish I/O: one history read per document, same results", () => {
     expect(countFor(readDocument, "nodes/alpha/doc")).toBe(1);
     // The index rebuild reuses the checkpoint the publish just sealed.
     expect(readHead).not.toHaveBeenCalled();
-    // One vault crawl, shared by the checkpoint and the index rebuild.
-    expect(crawl).toHaveBeenCalledTimes(1);
+    // No vault crawl: the checkpoint and context.yaml come from the manifest,
+    // which the seal and the index update each refresh by reading the
+    // published doc's own folder (as the crawl would list it) — nothing else.
+    expect(crawl.mock.calls.map(([o]) => o)).toEqual([
+      expect.objectContaining({ folder: "nodes/alpha", recursive: false }),
+      expect.objectContaining({ folder: "nodes/alpha", recursive: false }),
+    ]);
     vi.restoreAllMocks();
 
     const doc = await storage.readDocument("nodes/alpha/doc");

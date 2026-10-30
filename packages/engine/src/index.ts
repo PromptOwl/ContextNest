@@ -229,6 +229,7 @@ export {
   addVault,
   addRemote,
   removeVault,
+  renameVault,
   pruneVaults,
   setDefaultVault,
   setVaultDescription,
@@ -241,6 +242,7 @@ export type {
   AddVaultOptions,
   AddRemoteOptions,
   RemoveVaultResult,
+  RenameVaultResult,
   PrunedVault,
   PruneVaultsResult,
   VaultListEntry,
@@ -430,7 +432,7 @@ export type {
 } from "./hygienist.js";
 
 // Publish
-export { publishDocument, publishDocuments } from "./publish.js";
+export { publishDocument, publishDocuments, writePublishedVersion, sealWrites } from "./publish.js";
 export type {
   PublishOptions,
   PublishResult,
@@ -471,6 +473,7 @@ export {
 
 // Index generation
 export { generateContextYaml, generateContextYamlWithStats } from "./index-generator.js";
+export { buildManifest, manifestEntry, type Manifest, type ManifestEntry } from "./manifest.js";
 export type { GenerateContextYamlOptions } from "./index-generator.js";
 export { generateIndexMd } from "./index-md-generator.js";
 

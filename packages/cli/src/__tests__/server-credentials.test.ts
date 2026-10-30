@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { KeyringBackend } from "../keyring.js";
@@ -13,6 +13,7 @@ import {
   isNestScope,
   keysUnderServer,
   loadServerMap,
+  loggedInServers,
   nestScopeUrl,
   normalizeServerUrl,
   parseServerMap,
@@ -245,5 +246,85 @@ describe("server map (secure store)", () => {
     await expect(loadServerMap(opts)).rejects.toThrow(/unreadable.*logout --all/);
     await expect(savedTokenFor(A, opts)).rejects.toThrow(/^Saved `ctx login` keys are unreadable/);
     expect(keyring.items.get(SERVERS_ACCOUNT)).toBe("{corrupt");
+  });
+});
+
+describe("logged-in servers (plain file, no keys)", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "cn-logins-"));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  const countingKeyring = () => {
+    const ring = memoryKeyring();
+    const stats = { reads: 0 };
+    return { ring: { ...ring, get: async (a: string) => (stats.reads++, ring.get(a)) }, items: ring.items, stats };
+  };
+  const loginsFile = () => join(home, ".contextnest", "logins.json");
+
+  it("lists server-wide logins (with accounts), never nest keys, and never writes a key", async () => {
+    const { ring } = countingKeyring();
+    const opts = { home, env: {}, keyring: ring };
+    let map = upsertServer(emptyServerMap(), A, { token: "cnst_secret_one" });
+    map = upsertServer(map, A, { token: "cnst_secret_two" }, "work");
+    map = upsertServer(map, nestScopeUrl(B, "n1"), { token: "cnst_secret_three" });
+    await saveServerMap(map, opts);
+    expect(await loggedInServers(opts)).toEqual([{ url: A }, { url: A, account: "work" }]);
+    expect(readFileSync(loginsFile(), "utf-8")).not.toContain("cnst_");
+    if (process.platform !== "win32") expect(statSync(loginsFile()).mode & 0o077).toBe(0); // owner-only
+  });
+
+  it("follows a second login even when the marker stays 'saved'", async () => {
+    const opts = { home, env: {}, keyring: memoryKeyring() };
+    await saveServerMap(upsertServer(emptyServerMap(), A, { token: "t" }), opts);
+    await saveServerMap(upsertServer(upsertServer(emptyServerMap(), A, { token: "t" }), B, { token: "t" }), opts);
+    expect((await loggedInServers(opts)).map((s) => s.url)).toEqual([A, B]);
+    await saveServerMap(emptyServerMap(), opts);
+    expect(await loggedInServers(opts)).toEqual([]);
+  });
+
+  it("an upgraded user (key saved, no logins file) costs one store read, then none", async () => {
+    const { ring, items, stats } = countingKeyring();
+    items.set(SERVERS_ACCOUNT, JSON.stringify(upsertServer(emptyServerMap(), A, { token: "old" })));
+    const opts = { home, env: {}, keyring: ring };
+    expect(await loggedInServers(opts)).toEqual([{ url: A }]);
+    expect(stats.reads).toBe(1);
+    for (let i = 0; i < 5; i++) expect(await loggedInServers(opts)).toEqual([{ url: A }]);
+    expect(stats.reads).toBe(1);
+  });
+
+  it("nothing saved: the marker answers and the store is never opened", async () => {
+    const { ring, stats } = countingKeyring();
+    const opts = { home, env: {}, keyring: ring };
+    await saveServerMap(emptyServerMap(), opts);
+    stats.reads = 0;
+    expect(await loggedInServers(opts)).toEqual([]);
+    expect(stats.reads).toBe(0);
+  });
+
+  it("an unreadable store is tried once, remembered, and does not throw", async () => {
+    const { ring, items, stats } = countingKeyring();
+    items.set(SERVERS_ACCOUNT, "{corrupt");
+    const opts = { home, env: {}, keyring: ring };
+    expect(await loggedInServers(opts)).toEqual([]);
+    const after = stats.reads;
+    expect(after).toBeGreaterThan(0);
+    for (let i = 0; i < 5; i++) expect(await loggedInServers(opts)).toEqual([]);
+    expect(stats.reads).toBe(after); // every later command skips the store
+    // A good save repairs it.
+    items.delete(SERVERS_ACCOUNT);
+    await saveServerMap(upsertServer(emptyServerMap(), A, { token: "t" }), opts);
+    expect(await loggedInServers(opts)).toEqual([{ url: A }]);
+  });
+
+  it("a corrupt logins file falls back to the store once", async () => {
+    const { ring, items } = countingKeyring();
+    items.set(SERVERS_ACCOUNT, JSON.stringify(upsertServer(emptyServerMap(), A, { token: "t" })));
+    const opts = { home, env: {}, keyring: ring };
+    await loggedInServers(opts);
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(loginsFile(), "{not json");
+    expect(await loggedInServers(opts)).toEqual([{ url: A }]);
+    expect(JSON.parse(readFileSync(loginsFile(), "utf-8")).servers).toEqual([{ url: A }]);
   });
 });

@@ -11,7 +11,7 @@ import type {
   NestConfig,
   Checkpoint,
 } from "./types.js";
-import { buildRelationshipsWithStats, type RelationshipStats } from "./inline.js";
+import { buildRelationshipsWithStats, type LinksOf, type RelationshipStats } from "./inline.js";
 import { stripTagPrefix } from "./parser.js";
 
 /** Minimum inbound references before a document can be a hub (edges into hubs are free). */
@@ -20,6 +20,8 @@ export const HUB_MIN_DEGREE = 3;
 export interface GenerateContextYamlOptions {
   namespace?: string;
   federation?: "none" | "federated" | "scoped";
+  /** Link targets per document, for documents passed without bodies (the manifest). */
+  linksOf?: LinksOf;
 }
 
 /**
@@ -97,7 +99,7 @@ export function generateContextYamlWithStats(
   });
 
   // Build relationships edge list, applying explicit edge priorities from frontmatter
-  const { edges: relationships, stats } = buildRelationshipsWithStats(publishedDocuments);
+  const { edges: relationships, stats } = buildRelationshipsWithStats(publishedDocuments, options.linksOf);
 
   // Apply explicit edge_priority from document metadata
   const priorityByDocId = new Map<string, number>();

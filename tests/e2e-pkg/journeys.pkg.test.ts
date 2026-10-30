@@ -38,7 +38,7 @@ import {
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, isAbsolute } from "node:path";
 import {
   packCli,
   freshInstall,
@@ -2984,6 +2984,352 @@ const J14: Journey = {
   ],
 };
 
+// J15 exports a node to a file OUTSIDE the vault — a share you hand to someone
+// who doesn't run Context Nest. The destination is a module-level temp dir (NOT
+// the vault), created once and cleaned by the suite's afterAll; the export path
+// is a function-form arg so it resolves at run time.
+let _j15Out = "";
+const j15OutDir = () => {
+  if (!_j15Out) {
+    _j15Out = mkdtempSync(join(tmpdir(), "cn-journey-j15-out-"));
+    scratch.push(_j15Out); // cleaned by the suite's afterAll
+  }
+  return _j15Out;
+};
+// A distinct destination per case: `--out` refuses to overwrite an existing
+// file non-interactively, so each export that re-runs the command writes its own
+// file (a user exporting the node to share in more than one place).
+const j15Export = (name: string) => join(j15OutDir(), name);
+
+/** The *.html files inside the vault tree, vault-relative, forward-slashed. */
+const vaultHtml = (root: string): string[] => {
+  const out: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".html"))
+        out.push(p.slice(root.length + 1).replace(/\\/g, "/"));
+    }
+  };
+  walk(root);
+  return out.sort();
+};
+
+/**
+ * J15 — "I want to share one node with someone who doesn't use Context Nest."
+ * Export a published node to a standalone, styled HTML file via
+ * `read <id> --html --out <file>`, and prove the file is self-contained,
+ * carries the node's content, renders the markdown, lands outside the vault,
+ * and that the HTML-only `--out` guard can't silently litter a file.
+ *
+ * Review gate is OFF so the single `add` publishes directly — this journey is
+ * about export, not the review workflow (that is J7). Case ids + titles are the
+ * ticket's verbatim lines.
+ */
+const J15: Journey = {
+  id: "J15",
+  title: "Share a node outside the vault (HTML export)",
+  cases: [
+    {
+      id: "J15-01",
+      title: "I export a published node to an HTML file at a path I choose",
+      actions: [
+        { args: ["init", "--name", "share-demo"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/handoff",
+            "--type", "document",
+            "--title", "Project Handoff",
+            "--tags", "#share",
+            "--body",
+            "# Project Handoff\n\nStatus is **green**. See [[nodes/plan]] for the plan.\n\n- item one\n- item two",
+          ],
+          stdout: ["Created and published", "nodes/handoff"],
+        },
+        // The export: `--html --out` writes a styled HTML file to the path I name.
+        // "Written to <path>" (stdout) is the confirmation a user relies on.
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("share.html")],
+          stdout: ["Written to"],
+          check: () =>
+            expect(existsSync(j15Export("share.html")), "export file should be created").toBe(true),
+        },
+      ],
+    },
+    // J15-02..05 reuse the nodes/handoff node that J15-01 created — these cases
+    // share one vault and run in order (per the file header), so a case is not
+    // runnable on its own; vitest's -t selects whole journeys, not single cases.
+    {
+      id: "J15-02",
+      title: "The exported file is real HTML carrying the node's title and body",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("with-content.html")],
+          stdout: ["Written to"],
+          check: () => {
+            const html = readFileSync(j15Export("with-content.html"), "utf-8");
+            // A standalone HTML document a browser opens on its own...
+            expect(html).toContain("<!DOCTYPE html>");
+            expect(html).toMatch(/<html\b/);
+            expect(html).toContain("<body>");
+            // ...carrying the node's title and its body text, readable without the vault.
+            expect(html).toContain("Project Handoff");
+            expect(html).toContain("green");
+            expect(html).toContain("item one");
+          },
+        },
+      ],
+    },
+    {
+      id: "J15-03",
+      title: "The export lands outside the vault and nothing inside the vault changes",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("outside.html")],
+          stdout: ["Written to"],
+          check: (vaultDir) => {
+            // The export is a plain file OUTSIDE the vault directory. Compare via
+            // path.relative (not a raw string prefix, which false-positives on
+            // sibling dirs sharing a prefix and is unreliable under Windows 8.3
+            // names / drive-letter casing): a path outside vaultDir yields a
+            // relative that escapes with ".." or is absolute (different drive).
+            const rel = relative(vaultDir, j15Export("outside.html"));
+            expect(
+              rel.startsWith("..") || isAbsolute(rel),
+              `export must land outside the vault directory (relative: ${rel})`,
+            ).toBe(true);
+            // ...and the export writes nothing into the vault: the only .html in
+            // the vault tree is the init-time welcome page — no export leaked in.
+            expect(vaultHtml(vaultDir)).toEqual([".context/welcome.html"]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J15-04",
+      title: "Asking to save without --html writes no file (export is HTML-only)",
+      actions: [
+        // `--out` requires `--html`; without it the CLI just prints the node the
+        // normal way and writes no file — a fat-finger can't silently litter one.
+        {
+          args: () => ["read", "nodes/handoff", "--out", j15Export("guard.html")],
+          stdout: ["Project Handoff", "Status is"],
+          stdoutNot: ["Written to", "<!DOCTYPE html>"],
+          check: () =>
+            expect(
+              existsSync(j15Export("guard.html")),
+              "no file should be written without --html",
+            ).toBe(false),
+        },
+      ],
+    },
+    {
+      id: "J15-05",
+      title: "Markdown in the body renders as HTML, not raw markdown",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("rendered.html")],
+          stdout: ["Written to"],
+          check: () => {
+            const html = readFileSync(j15Export("rendered.html"), "utf-8");
+            // Markdown is rendered to real HTML elements...
+            // Match tags by name only (\b), so adding attributes to a tag in a
+            // future renderer change doesn't break the test.
+            expect(html).toMatch(/<h1\b/); // "# Project Handoff"
+            expect(html).toMatch(/<strong\b/); // "**green**"
+            expect(html).toMatch(/<li\b/); // "- item one / - item two"
+            expect(html).toContain('class="wikilink"'); // "[[nodes/plan]]"
+            // ...not dumped as the raw markdown source.
+            expect(html).not.toContain("**green**");
+            expect(html).not.toContain("[[nodes/plan]]");
+          },
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J16 — "I organize my work on a task board."
+ * The vault doubles as a personal task board. Work items are `task` nodes;
+ * their board column is just a tag (`#todo` / `#doing` / `#done`) alongside a
+ * shared project tag. The user pulls up a single column, the whole board, and a
+ * finished-only view by combining `type:task` with a column tag — then moves an
+ * item across columns by retagging it. The dedicated `ctx task` command is
+ * remote-only (it logs work against a remote nest); this is the fully-local
+ * board that works offline against a plain vault, driven entirely through
+ * `ctx add --tags` / `ctx update --tags` — no frontmatter hand-edits.
+ *
+ * The review gate is OFF (like J2/J10/J14): a board is about browsing what's
+ * there, so each item should land visible immediately rather than wait behind a
+ * gate. Membership is asserted with `--json` (`queryDocIds`, sorted) because the
+ * set of ids returned is the contract here, not the human wording.
+ *
+ * Cases share one vault and run top-to-bottom — a case is not runnable alone,
+ * and the retag in J16-06 depends on the board built in J16-02/J16-04. Case ids
+ * + titles are the ticket's verbatim lines.
+ */
+const J16: Journey = {
+  id: "J16",
+  title: "Organize work on a task board (solo maker)",
+  cases: [
+    {
+      id: "J16-01",
+      title: "Starting a fresh board: an empty vault is ready and asking for tasks returns nothing",
+      actions: [
+        {
+          args: ["init", "--name", "task-board"],
+          stdout: ["Initialized"],
+          files: [
+            { path: "CONTEXT.md", exists: true },
+            { path: ".context", exists: true },
+          ],
+        },
+        // A board is about browsing — writes should land visible, not wait behind the gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        // No task nodes yet, so the board is empty.
+        {
+          args: ["query", "type:task", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+      ],
+    },
+    {
+      id: "J16-02",
+      title: "I add several work items as task nodes, each tagged with its column and a shared project tag",
+      actions: [
+        {
+          args: [
+            "add", "nodes/ship-email",
+            "--type", "task",
+            "--title", "Ship the onboarding email",
+            "--tags", "project,todo",
+            "--body", "Draft and send the welcome email.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/ship-email"],
+          files: [{ path: "nodes/ship-email.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/fix-login",
+            "--type", "task",
+            "--title", "Fix the login bug",
+            "--tags", "project,doing",
+            "--body", "Add the missing null check.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/fix-login.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/release-notes",
+            "--type", "task",
+            "--title", "Write the release notes",
+            "--tags", "project,done",
+            "--body", "Summarize the v3 changes.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/release-notes.md", exists: true }],
+        },
+      ],
+    },
+    {
+      id: "J16-03",
+      title: 'Show my To-Do column: filtering by the todo tag returns only todo items',
+      actions: [
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/ship-email"]),
+        },
+      ],
+    },
+    {
+      id: "J16-04",
+      title: "Show everything on the board: filtering by node type task returns every work item and nothing else",
+      actions: [
+        // A non-task node in the same project — it must NOT show up on the board.
+        {
+          args: [
+            "add", "nodes/project-overview",
+            "--type", "document",
+            "--title", "Project overview",
+            "--tags", "project",
+            "--body", "Context for the project. Not a work item.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/project-overview.md", exists: true }],
+        },
+        // The board = every task node, and only task nodes.
+        {
+          args: ["query", "type:task", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual([
+              "nodes/fix-login",
+              "nodes/release-notes",
+              "nodes/ship-email",
+            ]),
+        },
+        // Discriminator: the document DOES exist and shares the project tag — it's
+        // excluded from the board by TYPE, not because it's missing or unpublished.
+        {
+          args: ["query", "#project", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual([
+              "nodes/fix-login",
+              "nodes/project-overview",
+              "nodes/release-notes",
+              "nodes/ship-email",
+            ]),
+        },
+      ],
+    },
+    {
+      id: "J16-05",
+      title: "Show the Done column: combining the task type with the done tag returns only finished items",
+      actions: [
+        {
+          args: ["query", "type:task #done", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/release-notes"]),
+        },
+      ],
+    },
+    {
+      id: "J16-06",
+      title: "I move an item across columns by retagging it, and it leaves the old column and appears in the new one",
+      actions: [
+        // Starting position: ship-email is the only card in To-Do.
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/ship-email"]),
+        },
+        // Move it todo → doing. `--tags` REPLACES the tag set, so #todo is dropped
+        // and #doing is added in one edit (the project tag is carried over).
+        {
+          args: ["update", "nodes/ship-email", "--tags", "project,doing"],
+          stdout: ["Updated and published", "Version: 2"],
+        },
+        // It's gone from To-Do...
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+        // ...and now sits in Doing alongside the card that was already there.
+        {
+          args: ["query", "type:task #doing", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual(["nodes/fix-login", "nodes/ship-email"]),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3035,5 +3381,11 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J14 — work across more than one vault", () => {
     runJourney({ installDir: INSTALL, scratch }, J14);
+  });
+  it("J15 — share a node outside the vault (HTML export)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J15);
+  });
+  it("J16 — organize work on a task board", () => {
+    runJourney({ installDir: INSTALL, scratch }, J16);
   });
 });

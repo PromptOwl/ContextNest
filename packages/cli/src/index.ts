@@ -31,6 +31,8 @@ import {
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
+  buildManifest,
+  withVaultLock,
   generateIndexMd,
   generateAgentConfigs,
   mergeAgentConfig,
@@ -49,6 +51,7 @@ import {
   addVault,
   addRemote,
   removeVault,
+  renameVault,
   pruneVaults,
   setDefaultVault,
   setVaultDescription,
@@ -153,6 +156,7 @@ import {
   keyForEndpoint,
   keysUnderServer,
   loadServerMap,
+  loggedInServers,
   nestScopeUrl,
   normalizeServerUrl,
   removeServer,
@@ -163,6 +167,19 @@ import {
   type ServerMap,
 } from "./server-credentials.js";
 import { NoBrowserLoginError, deviceLogin, parsePastedKey, resolvePushKey } from "./login.js";
+import {
+  aliasesFor,
+  coversServer,
+  deriveServerAlias,
+  loginHintLine,
+  loginTargetOfAlias,
+  mayShowLoginHint,
+  nestIdOf,
+  scopeForEndpoint,
+  serverOrigin,
+  unregisteredLogins,
+} from "./login-registry.js";
+import { hintsDisabled, setHintsEnabled } from "./hints.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
@@ -522,6 +539,7 @@ const VAULT_WRITE_COMMANDS = new Set([
 const REGISTRY_WRITE_COMMANDS = new Set([
   "vault add",
   "vault describe",
+  "vault rename",
   "vault remove",
   "vault default",
   "vault prune",
@@ -534,6 +552,35 @@ function commandPath(cmd: Command): string {
   return parts.join(" ");
 }
 
+/**
+ * A person at a terminal who logged in before `ctx login` registered servers has
+ * a key and no vault for it: say so, on every command, until they register it
+ * or run `ctx hints off`. stderr-on-a-TTY only, so agents, CI and pipes never see it.
+ */
+async function printLoginHint(command: string, json: boolean): Promise<void> {
+  try {
+    if (
+      !mayShowLoginHint({
+        stderrIsTTY: Boolean(process.stderr.isTTY),
+        json,
+        command,
+        env: process.env,
+        disabled: hintsDisabled(),
+      })
+    ) {
+      return;
+    }
+    const reg = readRegistry();
+    const open = unregisteredLogins(await loggedInServers(), reg.remotes);
+    for (const server of open) {
+      const alias = deriveServerAlias(server.url, (a) => Boolean(reg.vaults[a] || reg.remotes?.[a]));
+      console.error(chalk.yellow(loginHintLine(server, alias)));
+    }
+  } catch {
+    // A hint must never break the command it rides on.
+  }
+}
+
 program.hook("preAction", async (_thisCommand, actionCommand) => {
   const opts = actionCommand.optsWithGlobals();
   selectedVaultAlias = opts.vault as string | undefined;
@@ -541,6 +588,7 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
   configureSafety({ dryRun: opts.dryRun, yes: opts.yes, force: opts.force });
 
   const name = commandPath(actionCommand);
+  await printLoginHint(name, Boolean(opts.json));
 
   if (REGISTRY_WRITE_COMMANDS.has(name)) {
     // openRegistrySandbox redirects CONTEXTNEST_CONFIG_DIR under --dry-run and
@@ -2441,6 +2489,11 @@ program
       }
     }
 
+    // Files changed outside ctx: writes do not see them until `ctx index`, so
+    // context.yaml and later checkpoints still hold the old state. A warning —
+    // a hand edit is not tampering — never an error.
+    const staleIndex = lock ? [] : await storage.staleIndexIds(liveDocs);
+
     if (opts.json) {
       console.log(
         JSON.stringify(
@@ -2448,12 +2501,21 @@ program
             valid: totalErrors === 0,
             errors: allReportErrors,
             ...(tombstoned.length > 0 ? { tombstoned } : {}),
+            ...(staleIndex.length > 0 ? { stale_index: staleIndex } : {}),
           },
           null,
           2,
         ),
       );
     } else {
+      if (staleIndex.length > 0) {
+        console.log(
+          chalk.yellow(
+            `\n⚠ ${staleIndex.length} document(s) changed outside ctx are not in the index or checkpoints yet — run \`ctx index\`:`,
+          ),
+        );
+        for (const id of staleIndex) console.log(chalk.yellow(`  ${id}`));
+      }
       console.log(
         totalErrors === 0
           ? chalk.green("\nAll integrity checks passed")
@@ -2471,80 +2533,89 @@ program
   .description("Regenerate context.yaml and INDEX.md files; canonicalize status aliases on disk")
   .action(async () => {
     const storage = getStorage();
-    // Per-folder INDEX.md must list retired docs too so stewards can find
-    // them; context.yaml gets filtered to published-only below. Matches
-    // storage.regenerateIndex().
-    const docs = await storage.discoverDocuments({ includeRetired: true });
-
     await confirmOrExit(
       `Regenerate context.yaml and INDEX.md in ${realRootPath() ?? storage.root}? Documents whose status is written in a legacy form are rewritten in place.`,
     );
 
-    // Status-canonicalization pass: rewrite any doc whose on-disk status
-    // differs from its parsed (normalized) status. Only `ctx index` does
-    // this — per-mutation calls to regenerateIndex stay cheap. After this
-    // pass disk values are guaranteed canonical until something else edits
-    // them out-of-band.
-    let normalized = 0;
-    for (const doc of docs) {
-      const onDisk = await storage.readDocument(doc.id);
-      const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
-      const canonical = doc.frontmatter.status;
-      if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
-        // Round-trip through serializeDocument — which itself normalizes —
-        // and write back. This rewrites any aliased value to canonical.
-        await storage.writeDocument(doc.id, serializeDocument(doc));
-        normalized++;
+    // Crawl through write under the vault lock: a write landing in between would
+    // be missing from the manifest this writes, which later writes trust.
+    await withVaultLock(storage.root, async () => {
+      // Per-folder INDEX.md must list retired docs too so stewards can find
+      // them; context.yaml gets filtered to published-only below. Matches
+      // storage.regenerateIndex().
+      const docs = await storage.discoverDocuments({ includeRetired: true });
+
+      // Status-canonicalization pass: rewrite any doc whose on-disk status
+      // differs from its parsed (normalized) status. Only `ctx index` does
+      // this — per-mutation calls to regenerateIndex stay cheap. After this
+      // pass disk values are guaranteed canonical until something else edits
+      // them out-of-band.
+      let normalized = 0;
+      for (const doc of docs) {
+        const onDisk = await storage.readDocument(doc.id);
+        const rawStatus = onDisk.rawContent.match(/^status:\s*["']?([^"'\n]+)/m)?.[1]?.trim();
+        const canonical = doc.frontmatter.status;
+        if (rawStatus && canonical && rawStatus.toLowerCase() !== canonical) {
+          // Round-trip through serializeDocument — which itself normalizes —
+          // and write back. This rewrites any aliased value to canonical.
+          await storage.writeDocument(doc.id, serializeDocument(doc));
+          normalized++;
+        }
       }
-    }
-    if (normalized > 0) {
-      console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
-    }
+      if (normalized > 0) {
+        console.log(chalk.green(`Canonicalized status on ${normalized} document(s)`));
+      }
 
-    const config = await storage.readConfig();
-    // Head only — same reason storage.regenerateIndex() takes it this way: the
-    // chain grows by one entry per published doc per checkpoint, and only its
-    // newest entry reaches context.yaml.
-    const latestCheckpoint = await storage.readLatestCheckpoint();
-    const published = docs.filter((d) => d.frontmatter.status === "published");
+      const config = await storage.readConfig();
+      // Head only — same reason storage.regenerateIndex() takes it this way: the
+      // chain grows by one entry per published doc per checkpoint, and only its
+      // newest entry reaches context.yaml.
+      const latestCheckpoint = await storage.readLatestCheckpoint();
+      const published = docs.filter((d) => d.frontmatter.status === "published");
 
-    // Generate context.yaml
-    const { contextYaml, stats } = generateContextYamlWithStats(
-      published,
-      config,
-      latestCheckpoint,
-    );
-    await storage.writeContextYaml(contextYaml);
-    console.log(chalk.green("Generated context.yaml"));
-    // Where the graph came from. A vault authored with [[wikilinks]] used to
-    // index with zero edges and --hops silently did nothing; the unresolved
-    // count is the hint that a link's title does not match any published doc.
-    console.log(
-      `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
-        `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
-        (stats.unresolvedContextLinks
-          ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
-            (stats.unresolvedContextLinks === 1 ? "" : "s")
-          : "") +
-        ")",
-    );
+      // Generate context.yaml
+      const { contextYaml, stats } = generateContextYamlWithStats(
+        published,
+        config,
+        latestCheckpoint,
+      );
+      await storage.writeContextYaml(contextYaml);
+      // The reindex is the reconcile for edits made outside the engine; a
+      // manifest from the same crawl spares the next write its own.
+      await storage.writeManifest(
+        buildManifest(docs, { checkpoint: latestCheckpoint?.checkpoint ?? 0, indexGeneratedAt: contextYaml.generated_at }),
+      );
+      console.log(chalk.green("Generated context.yaml"));
+      // Where the graph came from. A vault authored with [[wikilinks]] used to
+      // index with zero edges and --hops silently did nothing; the unresolved
+      // count is the hint that a link's title does not match any published doc.
+      console.log(
+        `${stats.edges} relationship edge${stats.edges === 1 ? "" : "s"} ` +
+          `(${stats.fromWikilinks} from wikilinks, ${stats.unresolvedWikilinks} unresolved` +
+          (stats.unresolvedContextLinks
+            ? `, ${stats.unresolvedContextLinks} unresolved contextnest:// link` +
+              (stats.unresolvedContextLinks === 1 ? "" : "s")
+            : "") +
+          ")",
+      );
 
-    // Generate INDEX.md for each folder
-    const folders = new Map<string, ContextNode[]>();
-    for (const doc of docs) {
-      const parts = doc.id.split("/");
-      const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
-      if (!folders.has(folder)) folders.set(folder, []);
-      folders.get(folder)!.push(doc);
-    }
+      // Generate INDEX.md for each folder
+      const folders = new Map<string, ContextNode[]>();
+      for (const doc of docs) {
+        const parts = doc.id.split("/");
+        const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : ".";
+        if (!folders.has(folder)) folders.set(folder, []);
+        folders.get(folder)!.push(doc);
+      }
 
-    for (const [folder, folderDocs] of folders) {
-      if (folder === ".") continue;
-      const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-      const indexMd = generateIndexMd(folder, title, folderDocs);
-      await storage.writeIndexMd(folder, indexMd);
-      console.log(chalk.green(`Generated ${folder}/INDEX.md`));
-    }
+      for (const [folder, folderDocs] of folders) {
+        if (folder === ".") continue;
+        const title = folder.split("/").pop()!.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+        const indexMd = generateIndexMd(folder, title, folderDocs);
+        await storage.writeIndexMd(folder, indexMd);
+        console.log(chalk.green(`Generated ${folder}/INDEX.md`));
+      }
+    });
   });
 
 // ─── Cloud query helper ──────────────────────────────────────────────────────
@@ -3712,7 +3783,9 @@ program
   .option("--label <text>", "Label for this credential (default: your account email)")
   .option("--account <name>", "Save the key under a named account, to sign in to the same server as someone else too")
   .option("--list", "Show the servers and nests you're logged into (never prints keys)")
-  .option("--as <alias>", "Also register the server (all its nests), or the --nest, as a remote vault alias")
+  .option("--json", "With --list: print the servers (URL, account, which vault aliases use each) as JSON, without opening the key store")
+  .option("--as <alias>", "Register the server (all its nests), or the --nest, under this alias (default: derived from the host)")
+  .option("--no-register", "Only save the key; don't add the server to your vaults")
   .option("--set-default", "With --as: make that alias the default vault")
   .action(async (
     server: string | undefined,
@@ -3722,17 +3795,36 @@ program
       label?: string;
       account?: string;
       list?: boolean;
+      json?: boolean;
       as?: string;
+      register?: boolean;
       setDefault?: boolean;
     },
   ) => {
     try {
+      if (opts.json && !opts.list) throw new Error("--json goes with --list.");
+      if (opts.list && opts.json) {
+        // From the plain logins file: fast, and no key can appear in it.
+        const remotes = readRegistry().remotes;
+        const all = await loggedInServers();
+        const wanted = server ? all.filter((l) => l.url === normalizeServerUrl(server as string)) : all;
+        console.log(
+          JSON.stringify(
+            wanted.map((l) => ({ url: l.url, account: l.account ?? null, usedBy: aliasesFor(remotes, l) })),
+            null,
+            2,
+          ),
+        );
+        return;
+      }
       if (opts.list) {
         const map = await loadServerMap();
         const all = Object.keys(map.servers);
         // Every account's keys for the server.
-        const keys = (server
-          ? all.filter((k) => keysUnderServer(map, server, splitAccountKey(k).account).includes(k))
+        const listFor = server;
+        const registryRemotes = readRegistry().remotes;
+        const keys = (listFor
+          ? all.filter((k) => keysUnderServer(map, listFor, splitAccountKey(k).account).includes(k))
           : all
         ).sort();
         if (keys.length === 0) {
@@ -3742,13 +3834,26 @@ program
         for (const key of keys) {
           const cred = map.servers[key];
           const scope = isNestScope(key) ? chalk.dim("  (this nest only)") : map.default === key ? chalk.dim("  (default)") : "";
-          console.log(`${key}${scope}`);
+          const { scope: keyUrl, account: keyAccount } = splitAccountKey(key);
+          const usedBy = isNestScope(key) ? [] : aliasesFor(registryRemotes, { url: keyUrl, account: keyAccount });
+          const used = usedBy.length ? chalk.dim(`  used by: ${usedBy.join(", ")}`) : "";
+          console.log(`${key}${scope}${used}`);
           const meta = [cred.label, cred.updatedAt && `saved ${cred.updatedAt.slice(0, 10)}`].filter(Boolean).join(" · ");
           if (meta) console.log(chalk.dim(`  ${meta}`));
         }
         return;
       }
       if (!server) throw new Error("Name the <server> to log in to, or pass --list.");
+      let signedInByAlias = false;
+      // A registered alias stands for its server (and account): `ctx login promptowl` signs in again.
+      const ofAlias = loginTargetOfAlias(server, readRegistry().remotes);
+      if (ofAlias) {
+        server = ofAlias.server;
+        opts.account ??= ofAlias.account;
+        opts.nest ??= ofAlias.nest;
+        opts.register = false; // it is registered already
+        signedInByAlias = true;
+      }
       assertSafeEndpoint(server, "<server>");
       if (opts.nest && !opts.keyStdin) {
         throw new Error(
@@ -3762,6 +3867,7 @@ program
       const accountNote = opts.account ? ` (account "${opts.account}")` : "";
       const accountFlag = opts.account ? ` --account ${opts.account}` : "";
       if (opts.setDefault && !opts.as) throw new Error("--set-default goes with --as <alias>.");
+      if (opts.as && opts.register === false) throw new Error("--as names the vault to register; drop --no-register, or drop --as.");
       // Check the alias before signing in, not after a key has been minted.
       if (opts.as) {
         const reg = readRegistry();
@@ -3775,6 +3881,7 @@ program
         transport: "http",
         url: `${url}/mcp`,
         ...(opts.account ? { account: opts.account } : {}),
+        scope: opts.nest ? "nest" : "server",
       };
       if (opts.as) {
         await confirmOrExit(`Register remote "${opts.as}" → ${describeRemoteEndpoint(aliasSpec)} in ${registryPathForLog()}?`);
@@ -3787,7 +3894,8 @@ program
       if (!opts.keyStdin) {
         // The name the server shows for this key (what you'd revoke). Asked on a
         // terminal only; Enter keeps the default, and scripts always get it.
-        const defaultName = `ctx CLI (${hostname()})`;
+        // Capped: a long machine name (CI runners, corporate laptops) must not make the default invalid.
+        const defaultName = `ctx CLI (${hostname().slice(0, 60 - "ctx CLI ()".length)})`;
         let keyName = defaultName;
         while (process.stdin.isTTY) {
           keyName = await promptText("Name for the API key this login creates", defaultName);
@@ -3858,6 +3966,43 @@ program
         );
         return;
       }
+      // Server-wide login with no --as: register the server so every nest is usable now.
+      // The alias carries no key (it borrows the saved one) and never takes the default vault.
+      if (!opts.nest && opts.register !== false) {
+        const reg = readRegistry();
+        // A server-level remote only: one nest of this server registered earlier does not stand for it.
+        const already = Object.entries(reg.remotes ?? {}).find(([, r]) =>
+          coversServer(r, { url: serverUrl, account: opts.account }),
+        );
+        if (already) {
+          console.log(chalk.dim(`  "${already[0]}" already points at this server: ctx vault list`));
+          return;
+        }
+        const alias = deriveServerAlias(serverUrl, (a) => Boolean(reg.vaults[a] || reg.remotes?.[a]));
+        const spec: RemoteNestSpec = { ...aliasSpec, scope: "server" } as RemoteNestSpec;
+        try {
+          addRemote(alias, spec);
+        } catch (err) {
+          throw new Error(
+            `${(err as Error).message}\n  The key is saved; register it with: ctx vault add ${alias} --url ${aliasSpec.url}${accountFlag}`,
+          );
+        }
+        const added = readRegistry();
+        const isDefault = added.default === alias; // the registry's rule: the first entry becomes the default
+        console.log(chalk.green(`Registered "${chalk.bold(alias)}"${isDefault ? " (default)" : ""} → ${aliasSpec.url}`));
+        console.log(chalk.dim(`  The key stays in the secure store; config.yaml holds none.`));
+        console.log(chalk.dim(`  Your nests: ctx vault list   (each shows as ${alias}/<nest>)`));
+        console.log(
+          chalk.dim(
+            isDefault
+              ? `  Use one:    ctx --vault ${alias}/<nest> list   (without --vault, ctx reads across all of them)`
+              : `  Use one:    ctx --vault ${alias}/<nest> list   (without --vault, ctx still uses your default vault)`,
+          ),
+        );
+        console.log(chalk.dim(`  Undo:       ctx vault remove ${alias}`));
+        return;
+      }
+      if (signedInByAlias && !opts.nest) return; // already registered: nothing more to set up
       // A nest-scoped key reaches only its own nest, directly or as <alias>/<nest> behind a server alias.
       const next = opts.nest
         ? [
@@ -3934,6 +4079,13 @@ program
       for (const k of targets) map = removeServer(map, k);
       await saveServerMap(map);
       for (const [url, cred] of forgotten) printLoggedOut(url, cred);
+      // The registry entry stays: say so, or the user keeps a vault that can only answer "key rejected".
+      if (!opts.nest) {
+        const left = aliasesFor(readRegistry().remotes, { url: normalizeServerUrl(server), account });
+        for (const alias of left) {
+          console.log(chalk.dim(`  Vault "${alias}" is still registered (it will report a missing key). Remove it: ctx vault remove ${alias}`));
+        }
+      }
     } catch (err) {
       console.error(chalk.red((err as Error).message));
       process.exit(1);
@@ -4321,7 +4473,9 @@ drift
       comment: opts.comment,
     });
 
-    await storage.regenerateIndex({ changedIds: [id] });
+    // Under the vault lock, as every other index update: approveSuggestion has
+    // released its own, and an overlapping update would lose a manifest entry.
+    await withVaultLock(storage.root, () => storage.regenerateIndex({ changedIds: [id] }));
 
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
@@ -4808,7 +4962,8 @@ vaultCmd
       }
       if (v.kind === "remote") {
         const endpoint = v.url ?? [v.command, ...(v.args ?? [])].join(" ");
-        console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[remote:${v.transport}]`)}`);
+        const kindLabel = v.transport === "http" ? (v.scope ?? "remote") : `remote:${v.transport}`;
+        console.log(`${marker} ${chalk.cyan(v.alias)}  ${chalk.magenta(`[${kindLabel}]`)}`);
         if (v.description) console.log(`     ${chalk.dim(v.description)}`);
         console.log(`     ${chalk.dim(endpoint)}`);
         continue;
@@ -4834,6 +4989,44 @@ vaultCmd
     console.log(`\n  ${chalk.dim("* = default")}   ${chalk.dim("registry: " + registryPathForLog())}\n`);
   });
 
+program
+  .command("hints <state>")
+  .description("Turn ctx's one-line hints on or off (e.g. 'logged in but not registered'); CONTEXTNEST_NO_HINTS=1 silences one run")
+  .action((state: string) => {
+    if (state !== "on" && state !== "off") {
+      console.error(chalk.red('Say "ctx hints on" or "ctx hints off".'));
+      process.exit(1);
+    }
+    if (isDryRun()) {
+      console.error(chalk.bold.cyan(`Dry run — hints stay as they are.`));
+      return;
+    }
+    setHintsEnabled(state === "on");
+    console.log(state === "on" ? chalk.green("Hints on.") : chalk.yellow("Hints off. `ctx hints on` brings them back."));
+  });
+
+vaultCmd
+  .command("rename <old> <new>")
+  .description("Rename a vault alias (local or remote); the default pointer follows")
+  .action(async (oldAlias: string, newAlias: string) => {
+    try {
+      await confirmOrExit(`Rename "${oldAlias}" to "${newAlias}" in ${registryPathForLog()}?`);
+      const { wasDefault } = renameVault(oldAlias, newAlias);
+      // Move the nest-list cache with the alias; a stale one under the old name would be picked up by a later alias.
+      try {
+        const cacheDir = pathMod.join(getRegistryDir(), "cache");
+        fs.renameSync(pathMod.join(cacheDir, `nests-${oldAlias}.json`), pathMod.join(cacheDir, `nests-${newAlias}.json`));
+      } catch {
+        // no cache, or a read-only dir: it is only a cache
+      }
+      console.log(chalk.green(`Renamed "${oldAlias}" → "${chalk.bold(newAlias)}"${wasDefault ? " (default)" : ""}`));
+      console.log(chalk.dim(`  Nests behind it now show as ${newAlias}/<nest>; update any --vault ${oldAlias}/… you use.`));
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+  });
+
 vaultCmd
   .command("add <alias> [path]")
   .description("Register a vault path — or a remote nest via --url / --mcp-command — under an alias")
@@ -4843,6 +5036,7 @@ vaultCmd
   .option("--url <url>", "Register a REMOTE nest at this MCP endpoint (streamable HTTP)")
   .option("--bearer-env <var>", "Env var holding the bearer token for --url (stored as a reference, never the value)")
   .option("--account <name>", "With --url: sign in with the keys `ctx login --account <name>` saved")
+  .option("--server", "With --url: mark the endpoint as a server whose nests are listed as <alias>/<nest> (a /nests/<id>/mcp URL is marked a nest on its own)")
   .option("--mcp-command <cmd>", "Register a REMOTE nest served by this stdio MCP command")
   .option(
     "--mcp-arg <arg>",
@@ -4862,6 +5056,10 @@ vaultCmd
           console.log(chalk.red("A remote nest takes no path argument."));
           process.exit(1);
         }
+        if (opts.server && (!opts.url || scopeForEndpoint(opts.url) === "nest")) {
+          console.log(chalk.red("--server goes with a server --url, not a /nests/<id>/mcp endpoint or --mcp-command."));
+          process.exit(1);
+        }
         if (opts.account && (!opts.url || opts.bearerEnv)) {
           console.log(chalk.red("--account goes with --url and no --bearer-env (it picks a `ctx login` account)."));
           process.exit(1);
@@ -4872,6 +5070,7 @@ vaultCmd
               url: opts.url,
               ...(opts.bearerEnv ? { auth: { bearer_env: opts.bearerEnv } } : {}),
               ...(opts.account ? { account: opts.account } : {}),
+              ...(scopeForEndpoint(opts.url) ? { scope: scopeForEndpoint(opts.url) } : opts.server ? { scope: "server" } : {}),
               ...(opts.description ? { description: opts.description } : {}),
             }
           : {
@@ -5166,6 +5365,18 @@ program
     } else {
       row("Current dir", chalk.dim("not inside a vault"));
     }
+    if (report.logins.length === 0) {
+      row("Logins", chalk.dim("none (ctx login <server>)"));
+    }
+    const registered = readRegistry();
+    const taken = new Set([...Object.keys(registered.vaults), ...Object.keys(registered.remotes ?? {})]);
+    report.logins.forEach((l, i) => {
+      const who = `${l.url}${l.account ? ` (account ${l.account})` : ""}`;
+      const state = l.aliases.length
+        ? `${chalk.green("registered")} as ${l.aliases.map((a, n) => `${a} [${l.scopes[n]}]`).join(", ")}`
+        : `${chalk.yellow("not registered")} — ctx vault add ${deriveServerAlias(l.url, (a) => taken.has(a))} --url ${l.url}/mcp --server${l.account ? ` --account ${l.account}` : ""}`;
+      row(i === 0 ? "Logins" : "", `${who}  ${state}`);
+    });
     row(
       "Claude plugin",
       report.plugin.version
