@@ -19,8 +19,10 @@ Works the same for a solo dev's second brain, a team's living onboarding doc, or
 
 ```bash
 npm install -g @promptowl/contextnest-cli
-ctx init --starter developer
+ctx
 ```
+
+The first time you run `ctx` it walks you through setup: a local vault, a team server, or both. After that, `ctx` just shows the command list. Prefer to script it? `ctx init --starter developer` still works.
 
 Getting started is one question: *what are you trying to capture?* Point your agent at a codebase, a folder of docs, an old wiki, or just tell it what's in your head. It'll build the first usable version in ten minutes and get denser every time you come back.
 

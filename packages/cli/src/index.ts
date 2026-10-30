@@ -57,6 +57,7 @@ import {
   setVaultDescription,
   listVaults,
   readRegistry,
+  markOnboarding,
   findLocalVault,
   getRegistryPath,
   getRegistryDir,
@@ -142,6 +143,7 @@ import type {
 import { getStarter, listStarters } from "./starters/index.js";
 import { buildDoctorReport, defaultVaultStatus } from "./doctor.js";
 import { detectAgentTools, type AgentTool } from "./agent-tools.js";
+import { NO_VAULT_LINE, isBareInvocation, isHeadless, runOnboarding, shouldOnboard } from "./first-run.js";
 import { generateWelcomeHtml, openInBrowser, openUrlInBrowser } from "./welcome-html.js";
 import { choicesToCommand, setupBaseUrl, waitForChoices } from "./setup.js";
 import { telemetryConsent } from "./telemetry/index.js";
@@ -5387,8 +5389,76 @@ program
     console.log("");
   });
 
+// Bare `ctx`: first-run onboarding, otherwise the help list (stdout, exit 0).
+async function bareCtx(): Promise<void> {
+  const registry = readRegistry();
+  let vaultResolves = false;
+  try {
+    vaultResolves = Boolean(findLocalVault(process.cwd()));
+  } catch {
+    /* an unreadable local config is not a reason to onboard */
+  }
+  const decision = shouldOnboard({
+    argv: process.argv,
+    env: process.env,
+    tty: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    registry,
+    vaultResolves,
+  });
+  if (decision.action === "onboard") {
+    const startCwd = process.cwd();
+    const realExit = process.exit;
+    // No local browser (SSH, no display): print the approval link instead of opening one.
+    if (isHeadless(process.env)) process.env.CONTEXTNEST_NO_BROWSER = "1";
+    const result = await runOnboarding({
+      signedIn: async (server) => normalizeServerUrl(server) in (await loadServerMap()).servers,
+      env: process.env,
+      home: homedir(),
+      ask: (q, d) => promptText(q, d),
+      log: (l) => console.log(l),
+      exists: (p) => fs.existsSync(p),
+      joinPath: (...parts) => pathMod.join(...parts),
+      markOnboarding,
+      detectedTools: () => detectAgentTools(startCwd).filter((t) => t.detected).map((t) => t.id),
+      run: async (args, cwd) => {
+        // The commands call process.exit(1) on failure; turn that into a throw
+        // so one failed step cannot kill the whole flow.
+        process.exit = ((code?: number) => {
+          throw new Error(`command failed (exit ${code ?? 1})`);
+        }) as typeof process.exit;
+        try {
+          if (cwd) {
+            fs.mkdirSync(cwd, { recursive: true });
+            process.chdir(cwd);
+          }
+          await program.parseAsync(args, { from: "user" });
+        } finally {
+          process.exit = realExit;
+          if (cwd) process.chdir(startCwd);
+          // commander keeps option values between parses; don't leak ours.
+          for (const k of ["yes", "vault"]) program.setOptionValue(k, undefined);
+        }
+      },
+    });
+    if (result === "failed") process.exitCode = 1;
+    return;
+  }
+  if (decision.markOnboarded) {
+    try {
+      markOnboarding("onboarded");
+    } catch {
+      /* best effort; never block help */
+    }
+  }
+  const noVault =
+    Object.keys(registry.vaults).length === 0 && Object.keys(registry.remotes ?? {}).length === 0 && !vaultResolves;
+  if (noVault) console.log(chalk.yellow(NO_VAULT_LINE) + "\n");
+  program.outputHelp();
+  if (decision.hint) console.error(chalk.dim(decision.hint));
+}
+
 // Parse and run
-program.parseAsync().catch((err: unknown) => {
+(isBareInvocation(process.argv) ? bareCtx() : program.parseAsync()).catch((err: unknown) => {
   // No error path prints a raw stack trace: engine errors render with their
   // code, everything else (YAML syntax errors, fs failures, genuine bugs) as a
   // plain one-liner. Set CONTEXTNEST_DEBUG=1 to get the full stack back.

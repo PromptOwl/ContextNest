@@ -222,6 +222,7 @@ export {
   getRegistryDir,
   getRegistryPath,
   readRegistry,
+  markOnboarding,
   isVaultRoot,
   isRefusedCwd,
   assertVaultRoot,
@@ -432,7 +433,7 @@ export type {
 } from "./hygienist.js";
 
 // Publish
-export { publishDocument, publishDocuments } from "./publish.js";
+export { publishDocument, publishDocuments, writePublishedVersion, sealWrites } from "./publish.js";
 export type {
   PublishOptions,
   PublishResult,

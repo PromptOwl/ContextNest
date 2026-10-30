@@ -1,8 +1,11 @@
 {
   "name": "@promptowl/contextnest-claude-plugin",
-  "version": "0.5.1",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Claude Code plugin for Context Nest — vault-aware retrieval + automatic capture via the ctx CLI",
-  "license": "AGPL-3.0"
+  "license": "AGPL-3.0",
+  "dependencies": {
+    "@promptowl/contextnest-cli": "3.4.0"
+  }
 }

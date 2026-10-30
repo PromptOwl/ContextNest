@@ -6,9 +6,10 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { run as retrieve, hasTopic } from "../shared/core/retrieve.js";
-import { run as sessionStart } from "../shared/core/session-start.js";
+import { run as sessionStart, SETUP_NOTICE } from "../shared/core/session-start.js";
 import {
   run as captureGate,
   captureReason,
@@ -50,6 +51,7 @@ import {
   VALID_CAPTURE_MODES,
   VALID_RETRIEVAL_MODES,
   makeExec,
+  bundledCliPin,
   winQuote,
   MAX_FANOUT_VAULTS,
   MAX_HITS,
@@ -892,6 +894,83 @@ describe("session-start", () => {
     const out = startSession({ input: {}, env: {}, exec: fakeExec([["vault list", [{ alias: "work", exists: true }]]]) });
     expect(additional(out)).not.toContain("/contextnest:setup");
   });
+
+  it("tells Claude to run setup itself, never bare ctx or a terminal", () => {
+    const ctx = additional(startSession({ input: {}, env: {}, exec: fakeExec([["vault list", []]]) }))!;
+    expect(ctx).toMatch(/run the guided setup yourself/);
+    expect(ctx).toMatch(/Never run bare `ctx`/);
+    expect(ctx).toMatch(/never send the user to a terminal/);
+  });
+});
+
+describe("session-start — messages to the user", () => {
+  const STARTUP = { source: "startup" };
+  const none = fakeExec([["vault list", []]]);
+  /** Session start with project settings written to a fresh project dir. */
+  function withSettings(settings: object, args: Parameters<typeof sessionStart>[0]) {
+    const dir = mkdtempSync(join(tmpdir(), "cn-proj-"));
+    mkdirSync(join(dir, ".claude"), { recursive: true });
+    writeFileSync(join(dir, ".claude", "contextnest.local.json"), JSON.stringify(settings));
+    return sessionStart({ ...args, env: { ...args.env, CLAUDE_PROJECT_DIR: dir } });
+  }
+
+  it("tells the user to run setup on a fresh session with nothing set up", () => {
+    const out = startSession({ input: STARTUP, env: {}, exec: none, cliPin: null });
+    expect(out?.systemMessage).toBe(SETUP_NOTICE);
+  });
+
+  it("stays quiet on resume, clear and compact, and with hints off", () => {
+    for (const source of ["resume", "clear", "compact"]) {
+      expect(startSession({ input: { source }, env: {}, exec: none, cliPin: null })?.systemMessage).toBeUndefined();
+    }
+    const off = startSession({ input: STARTUP, env: { CONTEXTNEST_NO_HINTS: "1" }, exec: none, cliPin: null });
+    expect(off?.systemMessage).toBeUndefined();
+  });
+
+  it("never tells an existing user to set up: a vault, a working-directory vault, or one set in the environment", () => {
+    const registered = fakeExec([["vault list", [{ alias: "work", exists: true }]]]);
+    const local = fakeExec([["vault list", []], ["vault which", { kind: "local", path: "/p", source: "local" }]]);
+    expect(startSession({ input: STARTUP, env: {}, exec: registered, cliPin: null })?.systemMessage).toBeUndefined();
+    expect(startSession({ input: STARTUP, env: {}, exec: local, cliPin: null })?.systemMessage).toBeUndefined();
+    for (const key of ["CONTEXTNEST_VAULT", "CONTEXTNEST_VAULT_PATH"]) {
+      const out = startSession({ input: STARTUP, env: { [key]: "x" }, exec: none, cliPin: null });
+      expect(out?.systemMessage).toBeUndefined();
+      expect(additional(out)).toMatch(/uses the vault set by/);
+      expect(additional(out)).toMatch(/Query the vault/);
+    }
+  });
+
+  it("after Not now: no message, and Claude runs setup only if asked", () => {
+    const out = withSettings({ setup: "declined" }, { input: STARTUP, env: {}, exec: none, cliPin: null });
+    expect(out?.systemMessage).toBeUndefined();
+    expect(additional(out)).toMatch(/chose not to set up/);
+  });
+
+  it("after setup over MCP only (no ctx vault): no message", () => {
+    const out = withSettings({ setup: "done" }, { input: STARTUP, env: {}, exec: none, cliPin: null });
+    expect(out?.systemMessage).toBeUndefined();
+    expect(additional(out)).toMatch(/MCP tools/);
+  });
+
+  it("warns once when the ctx in use is older than the plugin's pin", () => {
+    const withVersion = (v: string) => fakeExec([["vault list", [{ alias: "w", exists: true }]], ["--version", v]]);
+    const out = startSession({ input: STARTUP, env: {}, exec: withVersion("3.1.0\n"), cliPin: "3.4.0" });
+    expect(out?.systemMessage).toMatch(/Your `ctx` is 3\.1\.0; this plugin expects 3\.4\.0 or newer/);
+    expect(out?.systemMessage).toContain("npm i -g @promptowl/contextnest-cli@latest");
+    for (const v of ["3.4.0", "3.10.0", "4.0.0", "not a version"]) {
+      expect(startSession({ input: STARTUP, env: {}, exec: withVersion(v), cliPin: "3.4.0" })?.systemMessage).toBeUndefined();
+    }
+    const failed = (args: string[]) => (args[0] === "--version" ? { status: 1, stdout: "" } : withVersion("")(args));
+    expect(startSession({ input: STARTUP, env: {}, exec: failed, cliPin: "3.4.0" })?.systemMessage).toBeUndefined();
+    expect(startSession({ input: { source: "resume" }, env: {}, exec: withVersion("3.1.0"), cliPin: "3.4.0" })?.systemMessage).toBeUndefined();
+  });
+
+  it("joins both messages into one", () => {
+    const ex = fakeExec([["vault list", []], ["--version", "3.1.0"]]);
+    const msg = startSession({ input: STARTUP, env: {}, exec: ex, cliPin: "3.4.0" })?.systemMessage;
+    expect(msg).toContain(SETUP_NOTICE);
+    expect(msg).toMatch(/Your `ctx` is 3\.1\.0/);
+  });
 });
 
 describe("session-start — structure rules", () => {
@@ -1731,6 +1810,34 @@ describe("makeExec", () => {
     expect(exec(["-e", "setTimeout(() => {}, 10000)"]).code).toBe("ETIMEDOUT");
     expect(exec(["--version"]).code).toBe("ETIMEDOUT");
     expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  // No global ctx: the CLI installed with the plugin answers before npx is tried.
+  it("falls back to the bundled CLI when the configured command is missing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cn-bundled-"));
+    const cli = join(dir, "index.js");
+    writeFileSync(cli, 'console.log("bundled " + process.argv.slice(2).join(" "))');
+    const exec = makeExec({ ctxCommand: "contextnest-no-such-command" }, { bundledCli: cli });
+    const res = exec(["vault", "list"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe("bundled vault list");
+  });
+
+  it("bundledCliPin reads an exact pin and ignores ranges or a missing file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cn-pin-"));
+    const pkg = (deps: object) => {
+      const p = join(dir, `${Math.random()}.json`);
+      writeFileSync(p, JSON.stringify({ dependencies: deps }));
+      return pathToFileURL(p);
+    };
+    expect(bundledCliPin(pkg({ "@promptowl/contextnest-cli": "3.4.0" }))).toBe("3.4.0");
+    expect(bundledCliPin(pkg({ "@promptowl/contextnest-cli": "^3.4.0" }))).toBeNull();
+    expect(bundledCliPin(pkg({}))).toBeNull();
+    expect(bundledCliPin(pathToFileURL(join(dir, "missing.json")))).toBeNull();
+  });
+
+  it("the Claude Code plugin pins the CLI exactly (Claude Code installs it with the plugin)", () => {
+    expect(bundledCliPin(new URL("../claude-code/package.json", import.meta.url))).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });
 

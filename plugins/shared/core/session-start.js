@@ -6,6 +6,9 @@
  * injects the registered vault aliases + descriptions, marks the pinned/default
  * one, names the vault found in the working directory (if any), and nudges the
  * model to use the vault before answering.
+ *
+ * On a fresh session it may also tell the USER (systemMessage) to run
+ * /contextnest:setup when nothing is set up, or to update an outdated `ctx`.
  */
 
 import {
@@ -13,6 +16,7 @@ import {
   ctxJson,
   cwdVault,
   isVaultRegistered,
+  bundledCliPin,
   squish,
   withVault,
   runAsHook,
@@ -20,20 +24,40 @@ import {
 } from "./lib.js";
 
 /**
- * The one next step for a user with nothing connected. Says what connecting
- * does NOT do, because "register a nest" read as "upload my vault".
+ * What Claude does about a user with nothing connected. Bare `ctx` is the
+ * CLI's own guided setup, but it needs an interactive terminal, which the
+ * Bash tool is not — so Claude runs the plugin's setup instead. Says what
+ * connecting does NOT do, because "register a nest" read as "upload my vault".
  */
 const SETUP_HINT =
-  "If the user's Context Nest MCP tools are not connected either, offer the guided setup " +
-  "(Claude Code: `/contextnest:setup`) — it signs in to a hosted nest (no install needed) or sets up the local `ctx` CLI. " +
-  "Connecting uploads nothing: local files stay on this machine unless the user runs `ctx push`.";
+  "If the user asks to set up Context Nest, run the guided setup yourself (Claude Code: `/contextnest:setup`) " +
+  "and recommend keeping the notes on this computer. Never run bare `ctx` to set up and never send the user to a terminal: " +
+  "that setup needs an interactive terminal. Mention setup at most once per session, in one line, never in the middle of their task. " +
+  "Connecting uploads nothing: local notes stay on this machine unless the user chooses to put them online.";
+
+/** Shown to the user (not just Claude) at the start of a session when nothing is set up. */
+export const SETUP_NOTICE =
+  "Context Nest isn't set up yet. Run /contextnest:setup to give Claude a notes folder (about a minute).";
+
+/** `x.y.z` → comparable number triple, or null. */
+const semver = (s) => {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(s ?? ""));
+  return m ? m.slice(1).map(Number) : null;
+};
+const older = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 
 /**
- * @param {{input:any, env:NodeJS.ProcessEnv, exec:Function}} ctx
+ * @param {{input?:any, env:NodeJS.ProcessEnv, exec:Function, cliPin?:string|null}} ctx
+ *   `cliPin`: the CLI version this plugin ships (its package.json); null skips the outdated check.
  * @returns {object|null}
  */
-export function run({ env, exec }) {
+export function run({ input, env, exec, cliPin = bundledCliPin() }) {
   const config = getConfig(env);
+  // Messages for the user. Only on a fresh session — resume, clear and compact
+  // would repeat them mid-work — and never when the user turned hints off.
+  const hintsOff = env.CONTEXTNEST_NO_HINTS && env.CONTEXTNEST_NO_HINTS !== "0";
+  const notify = input?.source === "startup" && !hintsOff;
+  const notices = [];
 
   // Probe availability + registry in one call.
   const probe = exec(["vault", "list", "--json"]);
@@ -85,12 +109,27 @@ export function run({ env, exec }) {
     lines.push(`Working-directory vault: \`${local.path}\` (${how}; ${rank}).`);
   }
 
+  // A vault named in the environment resolves without being registered; the
+  // CLI's own first-run check counts that user as set up, and so does this.
+  const envVault = Boolean(env.CONTEXTNEST_VAULT || env.CONTEXTNEST_VAULT_PATH);
   if (vaults.length === 0) {
-    lines.push(
-      local
-        ? "No vaults are registered; `ctx` resolves the working-directory vault above."
-        : `No vaults are registered, so no nest is connected yet. ${SETUP_HINT}`,
-    );
+    if (local) {
+      lines.push("No vaults are registered; `ctx` resolves the working-directory vault above.");
+    } else if (envVault) {
+      lines.push("No vaults are registered; `ctx` uses the vault set by CONTEXTNEST_VAULT / CONTEXTNEST_VAULT_PATH.");
+    } else if (config.setup === "declined") {
+      lines.push(
+        "No nest is connected: the user chose not to set up Context Nest for now. Run `/contextnest:setup` only if they ask.",
+      );
+    } else if (config.setup === "done") {
+      // Set up over MCP only: no ctx vault, the nest is reached through its tools.
+      lines.push(
+        "No vaults are registered with `ctx`. Use the Context Nest MCP tools if they are connected; if the user asks to connect a nest, run `/contextnest:setup`.",
+      );
+    } else {
+      lines.push(`No vaults are registered, so no nest is connected yet. ${SETUP_HINT}`);
+      if (notify) notices.push(SETUP_NOTICE);
+    }
   } else {
     lines.push("Registered vaults:");
     for (const v of vaults) {
@@ -111,7 +150,6 @@ export function run({ env, exec }) {
 
   // A server the user signed in to but never registered has nests that are invisible here.
   // Said as a fact for the model to relay; the model is not asked to run anything.
-  const hintsOff = env.CONTEXTNEST_NO_HINTS && env.CONTEXTNEST_NO_HINTS !== "0";
   const logins = hintsOff ? [] : ctxJson(exec, ["login", "--list", "--json"], []);
   if (Array.isArray(logins)) {
     for (const l of logins) {
@@ -135,13 +173,28 @@ export function run({ env, exec }) {
   if (target) lines.push(...structureLines(exec, withVault(["structure", "--json"], target.alias)));
 
   // Nothing connected: the setup hint is the whole message.
-  if (vaults.length > 0 || local) {
+  if (vaults.length > 0 || local || envVault) {
     lines.push(
       "Query the vault before answering domain questions (`ctx query`/`/contextnest:recall`); cite nodes as `vault:id`.",
     );
   }
 
-  return wrap(lines.join("\n"));
+  // The user's own global `ctx` wins over the copy shipped with the plugin, so
+  // an old one silently costs features. The call takes the same path the hooks
+  // do: the bundled or npx CLI answers with the pin or newer and says nothing.
+  if (notify && cliPin) {
+    const res = exec(["--version"]);
+    const have = res?.status === 0 ? semver(res.stdout) : null;
+    const want = semver(cliPin);
+    if (have && want && older(have, want) < 0) {
+      notices.push(
+        `Your \`ctx\` is ${have.join(".")}; this plugin expects ${cliPin} or newer. ` +
+          "Update it with: npm i -g @promptowl/contextnest-cli@latest",
+      );
+    }
+  }
+
+  return wrap(lines.join("\n"), notices);
 }
 
 /** Folder rules shown before eliding the rest to `ctx structure`. */
@@ -180,8 +233,10 @@ function structureLines(exec, args) {
   return lines;
 }
 
-function wrap(additionalContext) {
+/** `notices` go to the user as a systemMessage; the context goes to Claude. */
+function wrap(additionalContext, notices = []) {
   return {
+    ...(notices.length ? { systemMessage: notices.join("\n") } : {}),
     hookSpecificOutput: {
       hookEventName: "SessionStart",
       additionalContext,
