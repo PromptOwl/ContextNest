@@ -344,13 +344,26 @@ export function makeExec(config, opts = {}) {
   return (args) => {
     const res = attempt(config.ctxCommand, args);
     // EINVAL: shell-less .cmd refusal on older Node. ENOENT: no global install.
-    // 9009: cmd.exe's "not recognized", which is what the Windows shell spawn reports instead.
-    if (res.code === "ENOENT" || res.code === "EINVAL" || (WIN32 && res.status === 9009)) {
+    // 9009: cmd.exe's "not recognized", which is what the Windows shell spawn reports instead —
+    // though `cmd /c` often exits 1 for it, so on 1 ask `where` whether the command exists
+    // (never rerun a real ctx failure through the fallback).
+    if (res.code === "ENOENT" || res.code === "EINVAL" || (WIN32 && (res.status === 9009 || (res.status === 1 && !winCommandExists(config.ctxCommand))))) {
       if (existsSync(bundledCli)) return attempt(process.execPath, [bundledCli, ...args]);
       return attempt("npx", ["-y", CLI_PACKAGE, ...args]);
     }
     return res;
   };
+}
+
+/** Whether cmd.exe can find `cmd`: a path must exist, a bare name must be on PATH. */
+function winCommandExists(cmd) {
+  if (/[\\/]/.test(cmd)) return existsSync(cmd);
+  try {
+    execFileSync("where.exe", [cmd], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Non-negative integer env override, or `fallback` when unset/invalid. */

@@ -627,6 +627,10 @@ export interface VaultRegistry {
   vaults: Record<string, VaultRegistryEntry>;
   /** Registered remote nests, keyed by alias. Shares one alias namespace with `vaults`. */
   remotes?: Record<string, RemoteNestSpec>;
+  /** ISO time first-run onboarding finished (bare `ctx`). */
+  onboarded_at?: string;
+  /** ISO time first-run onboarding was skipped. */
+  skipped_at?: string;
 }
 
 /**

@@ -109,14 +109,14 @@ describe("runOnboarding", () => {
   it("remote: logs in to the default server and registers it", async () => {
     const { deps, calls, marks } = makeDeps(["2"]);
     expect(await runOnboarding(deps)).toBe("onboarded");
-    expect(calls[0]).toEqual(["login", DEFAULT_SERVER, "--as", "promptowl", "--set-default"]);
+    expect(calls[0]).toEqual(["--yes", "login", DEFAULT_SERVER, "--as", "promptowl", "--set-default"]);
     expect(marks).toEqual(["onboarded"]);
   });
   it("remote: already signed in skips login and just registers the server", async () => {
     const { deps, calls } = makeDeps(["2"], { signedIn: async () => true });
     expect(await runOnboarding(deps)).toBe("onboarded");
     expect(calls[0]).toEqual(["vault", "add", "promptowl", "--url", `${DEFAULT_SERVER}/mcp`, "--set-default"]);
-    expect(calls.some((c) => c[0] === "login")).toBe(false);
+    expect(calls.some((c) => c.includes("login"))).toBe(false);
   });
   it("finishes by listing the default vault", async () => {
     const { deps, calls } = makeDeps([]);
@@ -135,12 +135,43 @@ describe("runOnboarding", () => {
   it("both: a failed remote half keeps the local vault and still marks onboarded", async () => {
     const { deps, marks, lines } = makeDeps(["3"], {
       run: async (args) => {
-        if (args[0] === "login") throw new Error("denied");
+        if (args.includes("login")) throw new Error("denied");
       },
     });
     expect(await runOnboarding(deps)).toBe("onboarded");
     expect(marks).toEqual(["onboarded"]);
     expect(lines.join("\n")).toMatch(/Nothing was changed on your account/);
+  });
+  it("both: the server is the default only when the local half failed", async () => {
+    const ok = makeDeps(["3"]);
+    await runOnboarding(ok.deps);
+    expect(ok.calls.find((c) => c.includes("login"))).not.toContain("--set-default");
+
+    const localFails = makeDeps(["3"], {
+      run: async (args) => {
+        localFails.calls.push(args);
+        if (args.includes("init")) throw new Error("boom");
+      },
+    });
+    expect(await runOnboarding(localFails.deps)).toBe("onboarded");
+    expect(localFails.calls.find((c) => c.includes("login"))).toContain("--set-default");
+    expect(localFails.lines.join("\n")).not.toMatch(/Your agent is ready/);
+  });
+  it("claims agent config only when init wrote some", async () => {
+    const withTools = makeDeps([], { detectedTools: () => ["cursor"] });
+    await runOnboarding(withTools.deps);
+    expect(withTools.lines.join("\n")).toMatch(/Your agent is ready/);
+
+    const noTools = makeDeps([], { detectedTools: () => [] });
+    await runOnboarding(noTools.deps);
+    expect(noTools.calls[0]).toContain("none");
+    expect(noTools.lines.join("\n")).not.toMatch(/Your agent is ready/);
+  });
+  it("an unknown choice sets nothing up", async () => {
+    const { deps, calls, marks } = makeDeps(["7"]);
+    expect(await runOnboarding(deps)).toBe("failed");
+    expect(calls).toEqual([]);
+    expect(marks).toEqual([]);
   });
   it("remote-only failure marks nothing, so the next `ctx` retries", async () => {
     const { deps, marks } = makeDeps(["2"], {
@@ -163,9 +194,24 @@ describe("runOnboarding", () => {
     expect(calls).toEqual([]);
   });
   it("customize asks for starter, name and folder", async () => {
-    const { deps, calls } = makeDeps(["1", "c", "team", "work", "/x/work"]);
+    const cwds: (string | undefined)[] = [];
+    const { deps, calls } = makeDeps(["1", "c", "team", "work", "/x/work"], {
+      run: async (args, cwd) => {
+        calls.push(args);
+        cwds.push(cwd);
+      },
+    });
     await runOnboarding(deps);
-    expect(calls[0]).toContain("team");
-    expect(calls[0]).toContain("work");
+    expect(calls[0]).toEqual([
+      "--yes", "--vault", "work", "init", "--starter", "team", "--name", "work", "--set-default", "--tools", "claude",
+    ]);
+    expect(cwds[0]).toBe("/x/work");
+  });
+  it("customize still refuses a folder that already holds a vault", async () => {
+    const { deps, calls } = makeDeps(["1", "c", "team", "work", "/x/work"], {
+      exists: (p) => p === "/x/work/.context/config.yaml",
+    });
+    expect(await runOnboarding(deps)).toBe("failed");
+    expect(calls).toEqual([]);
   });
 });

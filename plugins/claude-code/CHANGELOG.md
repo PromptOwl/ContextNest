@@ -12,6 +12,13 @@ Setup matches the `ctx` first run, and the CLI comes with the plugin (CU-wdqcq06
 - **New sessions tell you what to do.** If nothing is set up, a message says to run `/contextnest:setup`, until you finish setup or choose Not now. If your own `ctx` is older than the bundled one, a message says how to update it. Neither repeats on resume, and `CONTEXTNEST_NO_HINTS` silences both.
 - Claude runs setup itself when asked. It never runs bare `ctx`, which needs a real terminal, and never sends you to one.
 
+## 0.7.1
+
+Writes no longer hold the turn, and capture stays quiet unless you ask.
+
+- **The sweep-check runs in the background.** After a `ctx update`, the search for nodes still carrying the removed value no longer pauses Claude Code (it could take up to 45 s). The report arrives on the next turn.
+- **New default capture mode: `explicit`.** Capture engages only when you ask to remember something or correct a fact, plus the post-update sweep-check. The ambient review of finished turns is now opt-in via `propose`. Setup's Light preset maps to `explicit`. Existing installs keep the value they chose.
+
 ## 0.7.0
 
 Guided onboarding: install the plugin, run `/contextnest:setup`, and it connects you — no copy-paste prompts.
