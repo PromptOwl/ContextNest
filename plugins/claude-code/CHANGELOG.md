@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+Writes no longer hold the turn, and capture stays quiet unless you ask.
+
+- **The sweep-check runs in the background.** After a `ctx update`, the search for nodes still carrying the removed value no longer pauses Claude Code (it could take up to 45 s). The report arrives on the next turn.
+- **New default capture mode: `explicit`.** Capture engages only when you ask to remember something or correct a fact, plus the post-update sweep-check. The ambient review of finished turns is now opt-in via `propose`. Setup's Light preset maps to `explicit`. Existing installs keep the value they chose.
+
 ## 0.7.0
 
 Guided onboarding: install the plugin, run `/contextnest:setup`, and it connects you — no copy-paste prompts.
