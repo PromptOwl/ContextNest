@@ -8,8 +8,9 @@
  */
 
 export const DEFAULT_SERVER = "https://nest.promptowl.ai";
-const DEFAULT_ALIAS = "main";
-const DEFAULT_STARTER = "developer";
+// The plugin's /contextnest:setup uses the same three; plugins/__tests__ guards the match.
+export const DEFAULT_ALIAS = "main";
+export const DEFAULT_STARTER = "developer";
 
 export interface OnboardingState {
   argv: string[];
@@ -56,27 +57,26 @@ export function plainTerminal(env: NodeJS.ProcessEnv): boolean {
 }
 
 export const NO_VAULT_LINE =
-  `No vault yet. Run \`ctx init\` (local) or \`ctx login ${DEFAULT_SERVER}\` (team server).`;
+  `No notes yet. \`ctx init\` makes a private notes folder on this computer; \`ctx login ${DEFAULT_SERVER}\` puts them online.`;
 
 export function bannerText(env: NodeJS.ProcessEnv): string {
   return [
     plainTerminal(env) ? "Welcome to Context Nest!" : "🪺 Welcome to Context Nest!",
     "",
-    "Give your AI agents a knowledge base they can query.",
+    "Give your AI tools notes they check before they answer.",
     "Enter accepts the default. Ctrl-C quits.",
     "",
-    "Where should your vault live?",
-    "  1) On this machine    local folder, works offline  (default)",
-    "  2) On a team server   sign in at nest.promptowl.ai",
+    "Where should your AI tools keep their notes?",
+    "  1) On this computer   private, works offline  (recommended)",
+    "  2) Online             nest.promptowl.ai, needs an account; your team can share",
     "  3) Both",
     "  4) Skip               just show me the commands",
   ].join("\n");
 }
 
 export const LATER_COMMANDS = [
-  "ctx init                 create a local vault",
-  `ctx login ${DEFAULT_SERVER}   sign in to a team server`,
-  "ctx vault add <alias>    register an existing vault or server",
+  "ctx init                 a private notes folder on this computer",
+  `ctx login ${DEFAULT_SERVER}   your notes online`,
 ];
 
 export interface OnboardingDeps {
@@ -124,7 +124,7 @@ export async function runOnboarding(deps: OnboardingDeps): Promise<OnboardingRes
   if (localTools) registered++;
   else if (wantLocal && !wantRemote) return "failed";
   if (wantRemote) {
-    if (wantLocal) log("\nNow the team server.");
+    if (wantLocal) log("\nNow the online notes.");
     // The server is the default unless a local vault already took that role.
     if (await setupRemote(deps, !localTools)) registered++;
   }
@@ -141,14 +141,22 @@ export async function runOnboarding(deps: OnboardingDeps): Promise<OnboardingRes
   } catch {
     /* the summary is a courtesy; setup already succeeded */
   }
-  log("\nHere's what's in your default vault:");
+  log("\nHere's what's in your notes:");
   try {
     await deps.run(["list"]);
   } catch {
     log("  (couldn't list it just now; try `ctx list`)");
   }
   log("\nNext: `ctx search <word>` to find things, `ctx add` to save a note.");
-  if (localTools?.length) log("Your agent is ready: `ctx init` wrote CLAUDE.md / agent config into the vault.");
+  if (deps.detectedTools().includes("claude")) {
+    // Claude Code runs in the user's repo, not in the notes folder, so the agent config
+    // `init` wrote there doesn't reach it; the plugin does.
+    log("Using Claude Code? Add the Context Nest plugin and it finds these notes by itself:");
+    log("  /plugin marketplace add promptowl/contextnest");
+    log("  /plugin install contextnest");
+  } else if (localTools?.length) {
+    log("Your agent is ready: `ctx init` wrote CLAUDE.md / agent config into the notes folder.");
+  }
   log("See all commands any time with `ctx --help`.");
   return "onboarded";
 }
@@ -161,19 +169,19 @@ async function setupLocal(deps: OnboardingDeps): Promise<string[] | null> {
   let dir = deps.joinPath(deps.home, "ContextNest", alias);
 
   const answer = (
-    await deps.ask(`\nCreate ${dir} with the ${starter} template? [Y/n/customize]`, "y")
+    await deps.ask(`\nCreate your notes in ${dir} (pre-filled pages for a software project)? [Y/n/customize]`, "y")
   ).trim().toLowerCase();
   if (answer.startsWith("n")) {
-    log("Skipped the local vault.");
+    log("Skipped the notes on this computer.");
     return null;
   }
   if (answer.startsWith("c")) {
-    starter = (await deps.ask("Starter (developer, personal, executive, analyst, team, sales)", starter)).trim();
-    alias = (await deps.ask("Vault name", alias)).trim() || alias;
+    starter = (await deps.ask("Template (developer, personal, executive, analyst, team, sales)", starter)).trim();
+    alias = (await deps.ask("Name", alias)).trim() || alias;
     dir = (await deps.ask("Folder", deps.joinPath(deps.home, "ContextNest", alias))).trim();
   }
   if (deps.exists(deps.joinPath(dir, ".context", "config.yaml"))) {
-    log(`A vault already exists at ${dir}. Register it with: ctx vault add ${alias} ${dir}`);
+    log(`Notes already exist at ${dir}. Add them with: ctx vault add ${alias} ${dir}`);
     return null;
   }
   const tools = deps.detectedTools();

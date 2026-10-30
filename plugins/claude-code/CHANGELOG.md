@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+Setup matches the `ctx` first run, and the CLI comes with the plugin (CU-wdqcq067m5).
+
+- **The CLI ships with the plugin.** `package.json` pins `@promptowl/contextnest-cli`, and Claude Code installs it along with the plugin. The hooks use your own `ctx` first, then the bundled copy, then `npx`. `bin/ctx` puts it on Claude's `PATH`. On Windows, a missing `ctx` now falls back too.
+- **`/contextnest:setup` asks one question: "Where should Claude keep its notes?"** The answers are this computer (recommended), online, both, or not now. The usage and scope questions are gone: Light is the default, and `/contextnest:config` changes it.
+  - **On this computer** creates `~/ContextNest/main` with the developer template, the same as `ctx` in a terminal, so either way ends up in the same place. It never creates a vault inside an old `~/contextnest`.
+  - **Online** reuses a saved sign-in, never adds a server twice, and posts the approval link in the chat.
+  - Setup ends with your first real note, not a search over template pages.
+- **New sessions tell you what to do.** If nothing is set up, a message says to run `/contextnest:setup`, until you finish setup or choose Not now. If your own `ctx` is older than the bundled one, a message says how to update it. Neither repeats on resume, and `CONTEXTNEST_NO_HINTS` silences both.
+- Claude runs setup itself when asked. It never runs bare `ctx`, which needs a real terminal, and never sends you to one.
+
 ## 0.7.1
 
 Writes no longer hold the turn, and capture stays quiet unless you ask.
