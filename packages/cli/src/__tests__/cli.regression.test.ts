@@ -51,6 +51,9 @@ const ENV = {
   // nothing being supplied. Empty is falsy in buildCallClient.
   CONTEXTNEST_AGENT: "",
   CONTEXTNEST_SESSION_ID: "",
+  // The manifest is a POC switch (off by default); the tests that need it
+  // turn it on themselves.
+  CONTEXTNEST_MANIFEST: "",
 } as NodeJS.ProcessEnv;
 
 /** Run the CLI and return stdout. Throws on a non-zero exit. */
@@ -838,6 +841,34 @@ describe("[regression] ctx update", () => {
     expect(onDisk).toMatch(/Revised body/);
   });
 
+  it("--body-file - takes the body from stdin, and read --body round-trips it unchanged", () => {
+    const body = 'Line with "quotes", $HOME and `ticks`\r\n\nSecond paragraph';
+    const pipe = (args: string[], input?: string) =>
+      execFileSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    pipe(["update", "nodes/mutable", "--body-file", "-"], `${body}\n`);
+    const first = pipe(["read", "nodes/mutable", "--body"]);
+    expect(first).toContain('"quotes", $HOME and `ticks`');
+    expect(first).toContain("Second paragraph");
+    // Two read → update cycles must not grow or alter the body.
+    pipe(["update", "nodes/mutable", "--body-file", "-"], first);
+    pipe(["update", "nodes/mutable", "--body-file", "-"], pipe(["read", "nodes/mutable", "--body"]));
+    expect(pipe(["read", "nodes/mutable", "--body"])).toBe(first);
+  });
+
+  it("refuses an empty body unless --force, and --body with --body-file", () => {
+    const run = (args: string[], input?: string) =>
+      spawnSync("node", [distPath, ...args], { cwd: tmp, env: ENV, encoding: "utf-8", input });
+    for (const r of [
+      run(["update", "nodes/mutable", "--body", ""]),
+      run(["update", "nodes/mutable", "--body-file", "-"], "\n"),
+    ]) {
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/empty one/);
+    }
+    expect(run(["update", "nodes/mutable", "--body", "x", "--body-file", "-"], "y").stderr).toMatch(/not both/);
+    expect(run(["update", "nodes/mutable", "--body", "", "--force"]).status).toBe(0);
+  });
+
   it("a title change is persisted to the frontmatter", () => {
     runCtx(tmp, ["update", "nodes/mutable", "--title", "Renamed"]);
     const onDisk = readFileSync(join(tmp, "nodes", "mutable.md"), "utf-8");
@@ -1135,6 +1166,46 @@ describe("[regression] ctx index", () => {
     expect(out).toMatch(/Generated context\.yaml/);
     expect(existsSync(join(tmp, "context.yaml"))).toBe(true);
     expect(existsSync(join(tmp, "nodes", "INDEX.md"))).toBe(true);
+  });
+
+  // Writes keep context.yaml current from a manifest instead of a crawl, so a
+  // file added by hand reaches the index through `ctx index` — and must stay
+  // there through later writes, which carry the manifest the reindex wrote.
+  it("with the manifest on: reconciles a hand-added document and keeps it through later writes", () => {
+    ENV.CONTEXTNEST_MANIFEST = "on";
+    try {
+      runCtx(tmp, ["index"]); // builds the manifest
+      expect(existsSync(join(tmp, ".context", "manifest", "manifest.json"))).toBe(true);
+      writeFileSync(
+        join(tmp, "nodes", "by-hand.md"),
+        "---\ntitle: By Hand\ntype: document\nstatus: published\nversion: 1\n---\n\nAdded outside ctx.\n",
+        "utf-8",
+      );
+      // verify names it (a warning, still a pass) until the reindex picks it up.
+      const before = JSON.parse(runCtx(tmp, ["verify", "--json"]));
+      expect(before.valid).toBe(true);
+      expect(before.stale_index).toEqual(["nodes/by-hand"]);
+      expect(runCtx(tmp, ["verify"])).toMatch(/changed outside ctx[\s\S]*nodes\/by-hand/);
+      runCtx(tmp, ["index"]);
+      expect(JSON.parse(runCtx(tmp, ["verify", "--json"])).stale_index).toBeUndefined();
+      runCtx(tmp, ["update", "nodes/indexed", "--body", "Edited"]);
+      expect(readFileSync(join(tmp, "context.yaml"), "utf-8")).toContain("nodes/by-hand");
+    } finally {
+      ENV.CONTEXTNEST_MANIFEST = "";
+    }
+  });
+
+  it("with the manifest off (the default): no manifest files, and a hand-added file still reaches the index on the next write", () => {
+    runCtx(tmp, ["index"]);
+    writeFileSync(
+      join(tmp, "nodes", "by-hand.md"),
+      "---\ntitle: By Hand\ntype: document\nstatus: published\nversion: 1\n---\n\nAdded outside ctx.\n",
+      "utf-8",
+    );
+    runCtx(tmp, ["update", "nodes/indexed", "--body", "Edited"]);
+    expect(readFileSync(join(tmp, "context.yaml"), "utf-8")).toContain("nodes/by-hand");
+    expect(existsSync(join(tmp, ".context", "manifest"))).toBe(false);
+    expect(JSON.parse(runCtx(tmp, ["verify", "--json"])).stale_index).toBeUndefined();
   });
 
   // Parity with MCP read_index: assert the *content* of the generated index,

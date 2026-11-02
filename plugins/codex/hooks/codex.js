@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { runAsHook } from "../core/lib.js";
 import { run as sessionStart } from "../core/session-start.js";
 import { run as retrieve } from "../core/retrieve.js";
-import { run as sweepCheck } from "../core/sweep-check.js";
+import { run as sweepCheck, SWEEP_CTX_TIMEOUT_MS } from "../core/sweep-check.js";
 import { run as captureGate, transcriptReader } from "../core/capture-gate.js";
 
 const RULES = join(dirname(fileURLToPath(import.meta.url)), "..", "rules", "contextnest.md");
@@ -93,5 +93,6 @@ export function run(event, { input, env, exec, ledgerIo = {} }) {
 
 /** IO shell: `node -e "import(...).then(m => m.main('Stop'))"`. */
 export function main(event) {
-  return runAsHook((ctx) => run(event, ctx));
+  // The sweep reads several nests, so it gets the same longer ctx budget as in Claude Code.
+  return runAsHook((ctx) => run(event, ctx), event === "PostToolUse" ? { timeout: SWEEP_CTX_TIMEOUT_MS } : {});
 }

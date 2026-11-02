@@ -1706,7 +1706,9 @@ tool(
       comment,
     });
 
-    await storage.regenerateIndex({ changedIds: [id] });
+    // approveSuggestion releases the lock it took; the index update after it
+    // must hold it too, or a concurrent write loses its manifest update.
+    await lockedHandler(() => storage.regenerateIndex({ changedIds: [id] }));
 
     return {
       content: [

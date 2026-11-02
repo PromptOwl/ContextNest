@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -227,5 +227,26 @@ describe("antigravity adapter", () => {
       expect(cmd).toMatch(/^node \.\/hooks\/antigravity\.js (SessionStart|PreInvocation|PostToolUse|Stop)$/);
     }
     expect(existsSync(join(pluginDir, "hooks", "antigravity.js"))).toBe(true);
+  });
+});
+
+describe("Gemini skills", () => {
+  // The rules' hook-directive table is how shared hook text ("/contextnest:setup",
+  // "contextnest-capture agent") reaches a Gemini skill; a typo there or in a
+  // skill's name would silently point users at nothing.
+  it("every skill's frontmatter name matches its folder, and every skill the rules map to exists", () => {
+    const skillsDir = join(pluginDir, "skills");
+    const names = readdirSync(skillsDir);
+    for (const dir of names) {
+      const text = readFileSync(join(skillsDir, dir, "SKILL.md"), "utf-8");
+      const front = text.split(/^---\s*$/m)[1] ?? "";
+      expect(front).toMatch(/^name: (\S+)\s*$/m);
+      expect(front.match(/^name: (\S+)\s*$/m)?.[1]).toBe(dir);
+      expect(front).toMatch(/^description: \S/m);
+    }
+    const rules = readFileSync(join(pluginDir, "rules", "contextnest.md"), "utf-8");
+    const mapped = [...rules.matchAll(/→ `([\w-]+)` skill/g)].map((m) => m[1]);
+    expect(mapped).toContain("contextnest-setup");
+    for (const skill of mapped) expect(names).toContain(skill);
   });
 });

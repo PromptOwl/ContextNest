@@ -413,7 +413,7 @@ export async function rejectReview(
     node.frontmatter.status = "rejected";
     node.frontmatter.updated_at = new Date().toISOString();
     await storage.writeDocument(id, serializeDocument(node));
-    await storage.regenerateIndex();
+    await storage.regenerateIndex({ changedIds: [id] });
     return { id, kind: "new" };
   });
 }

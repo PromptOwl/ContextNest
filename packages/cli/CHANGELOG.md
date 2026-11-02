@@ -1,5 +1,58 @@
 # @promptowl/contextnest-cli
 
+## 3.5.0
+
+### Minor Changes
+
+- e206eda: **Faster index regeneration on network storage; hosts can skip the agent config files.**
+
+  - `regenerateIndex` writes the agent config files (`CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.github/copilot-instructions.md`) side by side instead of one after another. They embed the document list, so they change on almost every write; on a GCS-mounted vault that loop cost about 1.3 s per save.
+  - New `NestStorage` option `agentConfigs` (default `true`). A host that serves the vault and never hands those files to a coding agent (the hosted Community server) passes `false`, and each write stops rewriting them. The CLI and MCP server keep the default, so nothing changes for local vaults.
+
+- 578da7a: **Hosts can seal writes later, in a batch.** A new `OperationContext.deferSeal` makes `context_create`, `context_update`, `context_publish`, `context_delete` and `context_import_pdf` stop at the document and its version entry: no nest checkpoint and no index update on the request. A publish answers `checkpoint: null` (the `context_publish` output schema now allows it). The host then calls `sealWrites(storage, { changed, published, triggeredBy })`, which seals every published document in one checkpoint and updates the index once, under the vault lock. `writePublishedVersion` (a publish without its checkpoint) is exported too. Version chains are written on the request, so `verify` is clean before and after the seal. The CLI and MCP server never defer: nothing changes for them.
+- 45c9934: **Bare `ctx` sets you up on first run.** The first time `ctx` is run with no arguments in a terminal and no vault exists, a guided setup creates a local vault (`ctx init --starter developer`, registered as `main`), signs in to a team server (`ctx login https://nest.promptowl.ai --as promptowl`), does both, or skips. It never prompts in CI or without a TTY, and existing users are never onboarded. After that, bare `ctx` prints the command list and **exits 0 (was 1)**, with a "No vault yet" line when there is no vault. The engine registry gains optional top-level `onboarded_at` / `skipped_at` markers and a new `markOnboarding()` export; older CLIs ignore the markers.
+- 78f2ab5: **Hosts can supply the vault manifest themselves.** New `NestStorage` option `manifest`: a function returning every document's `manifestEntry`, from a record the host updates with each document write (the hosted Community server will serve it from its database). With it, a write's index update and checkpoint take the vault's documents from that record: no vault crawl, no folder re-reads, and no manifest file or pending list on disk. It works without `CONTEXTNEST_MANIFEST`. Returning `null` falls back to the crawl. `manifestEntry` and `ManifestEntry` are now exported, and manifest entries carry `updated_at` so INDEX.md can be built from them. The CLI and MCP server do not set the option: nothing changes for local vaults.
+
+### Patch Changes
+
+- **`ctx index` and suggestion approval update the index under the vault lock.** `ctx index` now crawls and writes inside the vault lock, and the index update after `approve_suggestion` (MCP) / `ctx drift approve` takes the lock too, so a concurrent write can no longer slip in between. Also ships an experimental manifest-based write path (`.context/manifest/`, off unless `CONTEXTNEST_MANIFEST=on`): with it on, a write's index update and checkpoint read only the changed folder instead of crawling the vault, and `ctx verify` / `context_verify` warn (`stale_index`) about documents changed outside ctx. With it off, which is the default, nothing else changes and no manifest files are written.
+
+## 3.4.0
+
+### Minor Changes
+
+- c050c1d: `ctx add` and `ctx update` take `--body-file <file>` (or `-` for stdin), so a body with newlines, quotes or `$` needs no shell escaping; `ctx read --body` prints the body alone, ready to edit and pass back. `ctx update` now refuses to replace a body with an empty one unless `--force` — the signature of a failed read-modify-write that used to wipe the document.
+- 0414023: Add `ctx setup`: pick the vault options on a web page (https://nest.promptowl.ai/setup, or `CONTEXTNEST_SETUP_URL`), then `ctx init` runs with them. `ctx init` also takes `--tools <ids|none>` to choose the agent config files without a prompt.
+- 1950fba: **`ctx login <server>` now registers the server, so its nests are usable straight away.**
+
+  - A server-wide login adds a remote to your vaults, marked `scope: server` in `~/.contextnest/config.yaml`. It holds no key (the alias borrows the one in the secure store) and never takes your default vault unless it is your first entry. Its nests show as `<alias>/<nest>` in `ctx vault list`; address one with `--vault <alias>/<nest>`, or read across all of them with `--vault <alias>`. The alias comes from the host (`nest.promptowl.ai` → `promptowl`) or `--as`; `--no-register` keeps the old key-only behaviour; a `--nest` login registers nothing.
+  - **Already logged in?** A person at a terminal now sees one line on stderr on every command, until the server is registered (`ctx vault add <alias> --url <server>/mcp`) or hints are off (`ctx hints off`, or `CONTEXTNEST_NO_HINTS=1`). Agents, CI, pipes and `--json` never see it. `ctx doctor` and `ctx login --list [--json]` show which login each alias uses, and the Claude Code plugin mentions an unregistered login at session start.
+  - **Re-authenticating:** auth errors now carry the exact command (`ctx login https://… [--account x]`) instead of `<server>`. `ctx login <alias>` signs in again for a registered alias. At a terminal, a rejected key offers to sign in on the spot and then runs the command you asked for.
+  - New: `ctx vault rename <old> <new>`; `vault list` shows `[server]` / `[nest]`, and a rejected key reads "key rejected" while an unreachable server reads "not answering". The registry's optional `scope` (`nest`, or `server` as written by login) is ignored by older versions, so mixed installs keep working.
+  - Migration: if you logged in before this release, run the `ctx vault add …` command the hint prints. (Don't re-run `ctx login`: it mints a second key on the server.) A registry rewritten by an older ctx drops `scope`; those remotes are then probed as before.
+
+### Patch Changes
+
+- 2501365: `ctx login` now sends the device-login secret in the body of `POST /auth/device/poll` instead of in the URL, so server and proxy access logs can't record it. Against an older Community server without that endpoint (404/405), it falls back to the old GET poll, so login keeps working.
+
+## 3.3.0
+
+### Minor Changes
+
+- **Retrieval modes: stemmed lexical search, plus opt-in semantic and hybrid search over published versions.**
+
+  - Lexical search now applies English (Porter) stemming at index and query time, so `migrations` finds `migration`. Stopwords are still dropped.
+  - **Ranking change (affects every existing vault, no config needed):** lexical scores are now the plain BM25 sum. MiniSearch's matched-term coordination factor is divided out (`search.coordination: true` restores it), and the default field boosts drop from title 3 / tags 2 / description 1.5 to all 1 (`search.field_boosts`). Exact title/#tag matches are pinned first in every mode, so title lookup keeps working. On MultiHop-RAG, NDCG@10 goes 0.657 → 0.706. See `docs/retrieval-modes.md`.
+  - New `ctx embed` / MCP `context_embed` builds an embedding index of **published** documents only. It is keyed by id + version + content hash, stored in `.context/embeddings/` (git-ignored), and is incremental.
+  - `ctx search --mode lexical|semantic|hybrid [--rerank]` / `context_search` `mode` + `rerank`. Hybrid uses weighted reciprocal rank fusion (k0 = 60, default lexical 1 : semantic 2, `search.fusion_weights`) and pins exact title/#tag matches. Hits carry per-signal `scores`, and the response names the `mode` that ran.
+  - Rerank works on passages by default (`search.rerank.unit: passage`). Each candidate's best ~300-token window is picked locally with stemmed BM25 (no API call), and the windows go to the reranker in one request of up to 100 passages. The hit carries its window as `passage`. The default `top_n` is 100.
+  - Providers are pluggable and optional: Amazon Bedrock (Cohere Embed v4, Titan v2, Cohere Rerank 3.5, using a Bedrock API key over fetch or a lazily imported `@aws-sdk/client-bedrock-runtime`), and any OpenAI-compatible `/embeddings` endpoint (OpenAI, Ollama, vLLM). The base install adds no provider dependency.
+  - The default mode stays lexical. A vault's `search.mode` applies only once an index exists. See `docs/retrieval-modes.md`.
+
+### Patch Changes
+
+- **`ctx read` and the other commands that act on an existing document find a node at the root of an Obsidian (flat) vault.** `read`, `publish`, `history`, `reconstruct`, `update`, `delete`, `forget` and `forget-log` put `nodes/` in front of every id without a folder, so `ctx read my-node` looked for `nodes/my-node` and failed with `DOCUMENT_NOT_FOUND` for every node in a flat vault. They now send the id as typed (a `contextnest://` URI is reduced to its path, `.md` and a leading `/` are dropped) and let the engine resolve it for the vault's layout: the root-level node when there is one, else `nodes/<id>`. Against a remote nest the same commands, plus `move` and task `log`, retry a bare id once under `nodes/` when the nest answers `DOCUMENT_NOT_FOUND`, so nests that do not resolve a bare id themselves keep working. A `nodes/<id>` document that will not parse is still the one a bare id names, so the command reports why rather than a not-found.
+
 ## 3.2.0
 
 ### Minor Changes

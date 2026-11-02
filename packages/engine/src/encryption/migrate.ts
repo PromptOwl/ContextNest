@@ -17,7 +17,8 @@
  * Both run under the vault write lock, so no engine writer interleaves.
  */
 
-import { open, readFile, rename, unlink } from "node:fs/promises";
+import { open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { MANIFEST_DIR } from "../manifest.js";
 import { join } from "node:path";
 import { globFiles } from "../glob.js";
 import { withVaultLock } from "../vault-lock.js";
@@ -64,6 +65,10 @@ async function sweepTempFiles(root: string): Promise<void> {
   for (const rel of new Set(orphans)) {
     await unlink(join(root, rel)).catch(() => {});
   }
+  // The manifest (manifest.ts) is a cache sealed in the vault's current mode
+  // and lives under `.context/`, which migration skips: drop it, and the next
+  // write crawls and rewrites it in the new mode — never plaintext left behind.
+  await rm(join(root, MANIFEST_DIR), { recursive: true, force: true });
 }
 
 async function writeAtomic(path: string, content: string | Uint8Array): Promise<void> {

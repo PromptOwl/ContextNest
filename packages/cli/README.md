@@ -6,9 +6,7 @@
 
 **by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
 
-[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-cli.svg)](https://www.npmjs.com/package/@promptowl/contextnest-cli)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
+[![npm](https://img.shields.io/npm/v/@promptowl/contextnest-cli.svg)](https://www.npmjs.com/package/@promptowl/contextnest-cli) [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0) [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
 Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) — turn scattered knowledge into a structured, queryable brain your AI agents can use. Same instinct as the Obsidian-brain pattern, but with typed graph structure, ~100× cheaper queries (~500 tokens vs 50k), a sharing path, and governed change history when you need it.
 
@@ -22,21 +20,23 @@ Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) �
 npm install -g @promptowl/contextnest-cli
 ```
 
-**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install.
-For a lean install without terminal colour:
+**Two packages, no nesting, and no install scripts** — nothing of ours executes when you install. For a lean install without terminal colour:
 
 ```bash
 npm install -g @promptowl/contextnest-cli --omit=optional
 ```
 
-That leaves exactly one package, with every command, flag and output format unchanged. The rest of
-the code is compiled into the published bundle rather than resolved from npm, so the install is
-deterministic — and every bundled package is listed with its version and licence in
-[DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
+That leaves exactly one package, with every command, flag and output format unchanged. The rest of the code is compiled into the published bundle rather than resolved from npm, so the install is deterministic — and every bundled package is listed with its version and licence in [DEPENDENCIES.md](https://github.com/PromptOwl/ContextNest/blob/main/DEPENDENCIES.md).
 
 ## Quick Start
 
 ```bash
+# First run: bare `ctx` walks you through setup
+ctx
+
+# Or pick the vault options on a web page, then create it here
+ctx setup
+
 # Initialize a vault with a starter recipe
 ctx init --starter developer
 
@@ -46,6 +46,10 @@ ctx init --list-starters
 # Or initialize an empty vault and build it yourself
 ctx init --name "My Vault"
 ```
+
+**First run.** The first time you run `ctx` with no arguments, in a terminal, with no vault anywhere, it offers to create a local vault (`ctx init --starter developer`, registered as `main`), sign in to a team server (`ctx login https://nest.promptowl.ai --as promptowl`), do both, or skip. It never prompts in CI or without a TTY, and never onboards an existing user. After that, bare `ctx` prints the command list and exits 0.
+
+**`ctx setup`** opens https://nest.promptowl.ai/setup (`CONTEXTNEST_SETUP_URL` for another server; `--no-open` prints the URL instead), waits for your choices, then runs `ctx init` or `ctx login` with them. `ctx init --starter <recipe> --tools <claude,cursor,windsurf,copilot,gemini|none>` picks the agent config files without a prompt.
 
 ### Available Starters
 
@@ -86,10 +90,13 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx vault add <alias> [path]` — Register a vault
 - `ctx vault describe <alias> [description]` — Set or clear a registry description; omit the text to remove it
 - `ctx vault default <alias>` / `ctx vault remove <alias>` / `ctx vault which`
+- `ctx vault rename <old> <new>` — Renames an alias, local or remote. If the alias was the default, the default moves with it.
+- `ctx hints on|off` — Turns ctx's one-line hints on or off. Set `CONTEXTNEST_NO_HINTS=1` to silence them for a single run.
 
 ### Hosted nests
 - `ctx login <server>` — Sign in once in the browser; the CLI mints its own API key and keeps it in your OS keyring (or the encrypted file store — never plaintext). `--key-stdin` saves an existing `cnst_…` key instead (hidden prompt on a terminal; a server without browser login falls back to it)
-- `ctx login <server> --as <alias> [--set-default]` — Sign in and register the server as a vault in one step: `ctx vault list` then shows every nest as `<alias>/<nest>`. With `--nest <id>` the alias points at that nest
+- `ctx login <server> [--as <alias>] [--set-default]` — Signing in also registers the server as a vault: `ctx vault list` then shows every nest as `<alias>/<nest>` (marked `[server]`). The alias comes from the host (`nest.promptowl.ai` → `promptowl`) unless you pass `--as`; it never takes your default vault unless it is your first one. `--no-register` saves the key without registering the server. With `--nest <id>`, the alias points at that nest.
+- `ctx login <alias>` — Signs you in again for a registered alias. Auth errors print the exact `ctx login …` command to run, and at a terminal a rejected key offers to sign you in on the spot. If you logged in before 3.4 but never registered the server, a one-line hint shows the `ctx vault add …` command to run. Don't re-run `ctx login` in that case, because it mints a second key.
 - `ctx vault add <alias> --url <server>/mcp` — Register the server; with a saved login no `--bearer-env` is needed. Then `ctx --vault <alias> query …`
 - `ctx push --server <server> --nest <id>` — Uses the saved key when `--key` / `CONTEXTNEST_API_KEY` are absent
 - `ctx login --list [server]` — Show the servers and nests you're logged into (never prints keys)
@@ -100,12 +107,14 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 ### Document Management
 - `ctx add <path>` — Create a new document (refuses a path that already holds one — use `ctx update`)
 - `ctx add <path> --type skill` — Create a skill node with trigger, inputs, and guard rails
-- `ctx read <path>` — Read and display a document in the terminal
+- `ctx add <path> --body-file <file|->` / `ctx update <path> --body-file <file|->` — Reads the body from a file or stdin, so newlines, quotes and `$` need no shell escaping.
+- `ctx read <path>` — Reads and displays a document in the terminal. A bare id (`ctx read my-node`) finds a node at the root of an Obsidian (flat) vault as well as at `nodes/my-node`.
+- `ctx read <path> --body` — Prints the body alone, so you can edit it and pass it back through `--body-file`.
 - `ctx read <path> --html` — Render as styled HTML and open in browser
 - `ctx read <path> --html --out file.html` — Save rendered HTML to file
 - `ctx skill <path>` — Render a `type: skill` node for an agent harness (`--harness claude-code|cursor|codex|raw`)
 - `ctx skill install <path> --write` — Install a vault skill locally. Defaults to `--mode loader` (fetches the procedure at runtime, cannot drift); `--mode full` embeds an offline copy that will
-- `ctx update <path>` — Update a document
+- `ctx update <path>` — Updates a document. It refuses to replace the body with an empty one unless you pass `--force`.
 - `ctx update <path> --assignee <email> --due <YYYY-MM-DD> --priority <urgent|high|medium|low> --parent <id>` — Remote (Community) nest only: set task fields; the nest checks the assignee is on its roster. `""` or `none` clears a field
 - `ctx list --assignee <email|none> --priority <p|none> --due-before <YYYY-MM-DD>` — Remote nest only: filter tasks
 - `ctx task log <path> --note "…" [--status working|done|blocked] [--claim] [--agent <name>]` — Remote nest only: record what you did on a task. Attributed to you, your API key and the agent (`--agent` or `$CONTEXTNEST_AGENT`), and shown in the task's activity. `--claim` assigns it to you if it is unassigned
@@ -117,6 +126,7 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx validate [path]` — Validate against the spec
 - `ctx list` — List documents (filter by `--type`, `--status`, `--tag`; cap with `--limit`)
 - `ctx search <query>` — Full-text search, best match first (documents matching every term, then partial matches, each by relevance score). Prints the top 10; `--limit <n>` to change, `--limit 0` for all; `--json` carries each hit's `score`. When combining with selector filters in `ctx query`, put the search term first (`contextnest://search/foo + type:document`) to keep ranked order — only the leftmost operand's order survives an AND/OR
+- `ctx search <query> --mode lexical|semantic|hybrid [--rerank]` — Searches by stemmed keywords (the default), by embeddings, or by both fused together. Semantic and hybrid search need an index, which `ctx embed` builds from published documents (`--rebuild` starts over). See [retrieval modes](https://github.com/PromptOwl/ContextNest/blob/main/docs/retrieval-modes.md).
 
 ### Context Queries
 - `ctx query <selector>` — Query context with graph traversal (default: 2 hops)
@@ -135,8 +145,7 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 
 ### File Safety
 
-No command writes to your working directory without telling you. Three global
-flags govern every write:
+No command writes to your working directory without telling you. Three global flags govern every write:
 
 | Flag | Effect |
 |------|--------|
@@ -150,45 +159,19 @@ ctx delete nodes/spec --yes                   # destructive, so it needs the fla
 ctx read nodes/spec --html --out out.html     # refuses to clobber out.html without --force
 ```
 
-**Action log.** Every write command ends with the list of files it created
-(`+`), modified (`~`) or deleted (`-`), computed by comparing the vault before
-and after — so it reflects what actually happened, not what was intended. The
-log goes to **stderr**, leaving `--json` output and redirected stdout clean.
+**Action log.** Every write command ends with the list of files it created (`+`), modified (`~`) or deleted (`-`), computed by comparing the vault before and after — so it reflects what actually happened, not what was intended. The log goes to **stderr**, leaving `--json` output and redirected stdout clean.
 
-`--dry-run` covers the vault registry too: `ctx vault add|remove|default|describe`
-run against a throwaway copy of `~/.contextnest/`, so a preview fails on an
-alias collision or an unregistered alias exactly where the real command would,
-rather than promising something that can't happen.
+`--dry-run` covers the vault registry too: `ctx vault add|remove|default|describe` run against a throwaway copy of `~/.contextnest/`, so a preview fails on an alias collision or an unregistered alias exactly where the real command would, rather than promising something that can't happen.
 
-**Confirmation.** On a terminal, write commands ask before proceeding.
-Destructive ones (`delete`, `checkpoint rebuild`, `drift approve`,
-`vault remove`, re-running `init` over an existing vault, overwriting an
-`--out` file, `push`) default to *no*. Without a TTY nothing blocks on stdin:
-additive commands take their own argv as consent, destructive ones **refuse**
-unless `--yes` or `--force` was passed.
+**Confirmation.** On a terminal, write commands ask before proceeding. Destructive ones (`delete`, `checkpoint rebuild`, `drift approve`, `vault remove`, re-running `init` over an existing vault, overwriting an `--out` file, `push`) default to *no*. Without a TTY nothing blocks on stdin: additive commands take their own argv as consent, destructive ones **refuse** unless `--yes` or `--force` was passed.
 
-**Network egress.** `ctx push` lists the documents leaving your machine and
-asks before sending them. Plaintext HTTP to a non-loopback host is refused —
-it would put both the documents and your API key on the wire in the clear.
-Prefer `CONTEXTNEST_API_KEY` over `--key`: command-line arguments are visible
-to other processes and land in shell history.
+**Network egress.** `ctx push` lists the documents leaving your machine and asks before sending them. Plaintext HTTP to a non-loopback host is refused — it would put both the documents and your API key on the wire in the clear. Prefer `CONTEXTNEST_API_KEY` over `--key`: command-line arguments are visible to other processes and land in shell history.
 
-**Confirmation gate.** A nest can require a human to confirm a push in the web
-UI before it is applied. When it does, `ctx push` prints a `Confirm in the UI:`
-link and waits for the decision, exiting `0` once the push is applied and
-non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to
-submit and exit without waiting, or `--timeout <sec>` to bound the wait (it
-defaults to the server's window, else 15 minutes). Ungated nests apply
-immediately, exactly as before. A push that runs straight through lists any
-document it skipped (already exists — never overwritten) or failed, and exits
-non-zero if one failed. On such a nest, `ctx add` against the remote vault is
-held the same way: it prints the nest's message and exits `0`, and the document
-does not exist until a reviewer confirms it.
+**Confirmation gate.** A nest can require a human to confirm a push in the web UI before it is applied. When it does, `ctx push` prints a `Confirm in the UI:` link and waits for the decision, exiting `0` once the push is applied and non-zero if it is rejected, expires, or the wait times out. Use `--no-wait` to submit and exit without waiting, or `--timeout <sec>` to bound the wait (it defaults to the server's window, else 15 minutes). Ungated nests apply immediately, exactly as before. A push that runs straight through lists any document it skipped (already exists — never overwritten) or failed, and exits non-zero if one failed. On such a nest, `ctx add` against the remote vault is held the same way: it prints the nest's message and exits `0`, and the document does not exist until a reviewer confirms it.
 
 ### Caller attribution
 
-Three global flags record *who is calling* on every read and write
-(spec §9.4):
+Three global flags record *who is calling* on every read and write (spec §9.4):
 
 | Flag | Effect |
 |------|--------|
@@ -204,26 +187,15 @@ ctx history nodes/spec
 #     Client: claude-code (session s-9f2)
 ```
 
-A write that publishes records the block on its version-history entry, so
-`ctx history` shows which agent produced each version — distinct from `By:`,
-which is the authoring identity. Reads carry it too; nothing is persisted for
-them locally, but a governed backend receives it.
+A write that publishes records the block on its version-history entry, so `ctx history` shows which agent produced each version — distinct from `By:`, which is the authoring identity. Reads carry it too; nothing is persisted for them locally, but a governed backend receives it.
 
-The env vars are the reason this is practical for agents: a plugin that shells
-out to `ctx` exports them once for a session instead of threading flags through
-every call. A flag beats the env var per key, so `--agent` on one command
-overrides the ambient agent while keeping the ambient session.
+The env vars are the reason this is practical for agents: a plugin that shells out to `ctx` exports them once for a session instead of threading flags through every call. A flag beats the env var per key, so `--agent` on one command overrides the ambient agent while keeping the ambient session.
 
-Values from `--client` are recorded as **strings** — a shell argument is text,
-and coercing `version=1.0` to `1` would quietly lose characters from an audit
-record. Attribution is a label, never an identity claim: nothing authenticates
-it, and it is never used to authorize.
+Values from `--client` are recorded as **strings** — a shell argument is text, and coercing `version=1.0` to `1` would quietly lose characters from an audit record. Attribution is a label, never an identity claim: nothing authenticates it, and it is never used to authorize.
 
 ### Errors
 
-Every failure prints as a single line — `Error [CODE]: message` for engine
-errors, a plain `Error: message` for everything else. No stack traces leak into
-normal output.
+Every failure prints as a single line — `Error [CODE]: message` for engine errors, a plain `Error: message` for everything else. No stack traces leak into normal output.
 
 ```bash
 CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
@@ -236,31 +208,18 @@ CONTEXTNEST_DEBUG=1 ctx verify   # full stack trace when you need to debug
 - `ctx checkpoint rebuild` — Rebuild checkpoint history
 
 ### Index & Agent Configs
-- `ctx index` — Regenerate context.yaml, INDEX.md, and agent config files (CLAUDE.md, GEMINI.md, .cursorrules, .windsurfrules, .github/copilot-instructions.md)
+- `ctx index` — Regenerates context.yaml and INDEX.md from a full crawl, which picks up edits made outside ctx. The agent config files (CLAUDE.md, GEMINI.md, .cursorrules, .windsurfrules, .github/copilot-instructions.md) are written by `ctx init` and refreshed on every document write.
 
 ## Upgrading to 2.0
 
 Your vault files are untouched — no migration to run. Behaviour that changes:
 
-- **A brand-new document now starts at v1.** `ctx add` used to write `version: 1`
-  into frontmatter and let publish bump it, so a new document's history began at
-  **v2 with no v1 keyframe**. Publish owns version assignment; existing documents
-  are unaffected.
-- **`ctx vault list` shows a vault's description** where it previously fell back
-  to its `name`. Vaults whose `.context/config.yaml` carries a `description` now
-  display it. Precedence: registry description → the vault's own config
-  description → its `name`.
-- **`ctx reconstruct` refuses a version that does not exist** instead of
-  returning the nearest keyframe's content as though it were the version asked
-  for.
-- **`ctx update --tags` replaces the tag set** rather than merging into it. Pass
-  the full set you want.
-- **`ctx list --type document` and `--status rejected` now actually match.**
-  Both silently returned nothing before — `--type` compared against an optional
-  field with no default, and rejected documents were dropped before the status
-  filter ran. Tags match with or without a leading `#`, and case-insensitively.
-- **`ctx init --description` reaches the vault's own config**, not just its
-  registry entry.
+- **A brand-new document now starts at v1.** `ctx add` used to write `version: 1` into frontmatter and let publish bump it, so a new document's history began at **v2 with no v1 keyframe**. Publish owns version assignment; existing documents are unaffected.
+- **`ctx vault list` shows a vault's description** where it previously fell back to its `name`. Vaults whose `.context/config.yaml` carries a `description` now display it. Precedence: registry description → the vault's own config description → its `name`.
+- **`ctx reconstruct` refuses a version that does not exist** instead of returning the nearest keyframe's content as though it were the version asked for.
+- **`ctx update --tags` replaces the tag set** rather than merging into it. Pass the full set you want.
+- **`ctx list --type document` and `--status rejected` now actually match.** Both silently returned nothing before — `--type` compared against an optional field with no default, and rejected documents were dropped before the status filter ran. Tags match with or without a leading `#`, and case-insensitively.
+- **`ctx init --description` reaches the vault's own config**, not just its registry entry.
 
 ## Graph Traversal
 
@@ -387,8 +346,7 @@ ctx kind apply seam --server https://nest.example.com --nest <id> --steward @sea
 ```
 
 - **Dry run by default.** Without `--yes`, only GETs are sent: they check the key and the nest, and find out which planes are on.
-- **Published kinds only.** `--yes` refuses a kind that is still a draft — review and `ctx publish` it first, or pass `--allow-draft` to apply an unreviewed one deliberately (stewards switch governance on).
-  "Published" means published under the vault's normal rules; it implies a review only when the vault has its review gate on.
+- **Published kinds only.** `--yes` refuses a kind that is still a draft — review and `ctx publish` it first, or pass `--allow-draft` to apply an unreviewed one deliberately (stewards switch governance on). "Published" means published under the vault's normal rules; it implies a review only when the vault has its review gate on.
 - **Re-runs are safe.** Anything the server already has (a 409) is reported as `exists`; an edge whose edge type failed in the same run is `skipped`, not sent. `--steward` emails are lowercased.
 - Authentication works as it does for `ctx push`: `--key`, `CONTEXTNEST_API_KEY`, or the key saved by `ctx login`; https (or localhost) only, and redirects are refused.
 - A plane the server has switched off answers 404. Its entries are skipped with a warning that names the flag (`FEATURE_WORKFLOW_PLANE`, `FEATURE_PLUGINS`). A plugin the server has not loaded is skipped too.
@@ -399,7 +357,7 @@ ctx kind apply seam --server https://nest.example.com --nest <id> --steward @sea
 
 ## AI Agent Integration
 
-Running `ctx index` auto-generates config files so AI tools discover your vault:
+`ctx init` writes config files so AI tools discover your vault, and every document write keeps them in step with the index:
 
 | File | Tool |
 |------|------|
@@ -413,7 +371,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **41 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
+For direct AI agent access via the Model Context Protocol — **44 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -432,7 +390,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 41 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 44 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 

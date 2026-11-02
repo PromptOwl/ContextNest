@@ -54,7 +54,7 @@ describe("retrieve.js IO shell", () => {
   });
 
   it("agent mode → exit 0, prints UserPromptSubmit additionalContext", () => {
-    const r = runScript(core("retrieve.js"), { prompt: "x" }, { CONTEXTNEST_RETRIEVAL_MODE: "agent" });
+    const r = runScript(core("retrieve.js"), { prompt: "how does auth work" }, { CONTEXTNEST_RETRIEVAL_MODE: "agent" });
     expect(r.status).toBe(0);
     const out = JSON.parse(r.stdout);
     expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");

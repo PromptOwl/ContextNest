@@ -4,7 +4,7 @@
  * structure, grandfathers existing content, and `context_structure` reads the
  * rules back. The pure checker is covered by structure-rules.test.ts.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, writeFile, access, mkdir, symlink, rename, readdir } from "node:fs/promises";
 import { createPatch } from "diff";
 import { tmpdir } from "node:os";
@@ -1427,9 +1427,11 @@ describe("QA round 7: heading cost, batch scaffolding cost, planted history, rul
       ids.push(id);
     }
     const rules = compileStructure(yaml.load(await readFile(join(dir, ".context", "config.yaml"), "utf-8")) as never);
-    const started = Date.now();
+    // Count directory crawls, not wall-clock: a timer flaked on busy CI runners.
+    // One crawl per ancestor (the depth² bug) would be ~100 here, not a handful.
+    const crawls = [vi.spyOn(storage, "listFolders"), vi.spyOn(storage, "discoverDocuments")];
     await scaffoldFirstPublish(storage, rules, ids);
-    expect(Date.now() - started).toBeLessThan(3000);
+    expect(crawls.reduce((n, s) => n + s.mock.calls.length, 0)).toBeLessThan(10);
     expect(await exists("nodes/t/overview.md")).toBe(true);
   });
 });

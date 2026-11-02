@@ -23,6 +23,7 @@ type SealHistory = {
 };
 import { computeCheckpointHash, computeChainHash } from "./integrity.js";
 import { NestStorage, type CheckpointChainState } from "./storage.js";
+import { manifestDocuments } from "./manifest.js";
 import { mapInBatches } from "./concurrency.js";
 import { VersionManager } from "./versioning.js";
 import { stageSuggestion } from "./suggestions.js";
@@ -296,21 +297,46 @@ export class CheckpointManager {
      * history.yaml; anything else is read as usual.
      */
     justSealed?: ReadonlyMap<string, Pick<VersionEntry, "version" | "chain_hash">>,
-    /** Receives the vault crawl, so the index rebuild after it need not crawl again. */
+    /**
+     * Receives the vault crawl when the seal took one (a stale or missing
+     * manifest, or `crawl`), so the index rebuild after it need not crawl again.
+     */
     onCrawl?: (docs: ContextNode[]) => void,
+    options: {
+      /** Documents written since the manifest besides `justSealed` (a forget's stub). */
+      changed?: string[];
+      /** Crawl even with a current manifest: a bulk import re-reads most of the vault anyway. */
+      crawl?: boolean;
+    } = {},
   ): Promise<Checkpoint> {
     return this.storage.withCheckpointLock(async () => {
-      // includeRetired only adds rejected docs, which the published filter drops
-      // anyway — and it is the set regenerateIndex needs. A document the crawl
-      // cannot read is not gone: its last sealed entry is carried forward.
-      const unreadable: string[] = [];
-      const crawled = await this.storage.discoverDocuments({ includeRetired: true, onUnreadable: (id) => unreadable.push(id) });
-      onCrawl?.(crawled);
-      const publishedDocuments = crawled.filter(isPublished);
-      // Snapshot before the reads: a write that lands during the seal stays
-      // marked for the next one.
-      const touched = this.storage.touchedHistorySnapshot();
       const chainState = await this.storage.readCheckpointChainState();
+      const head = chainState.kind === "head" ? chainState.checkpoint : undefined;
+      // A document that cannot be read is not gone: its last sealed entry is
+      // carried forward.
+      const unreadable: string[] = [];
+      // The manifest (manifest.ts) lists every document as of the head; only
+      // the ones written since are read. Otherwise crawl — includeRetired only
+      // adds rejected docs, which the published filter drops anyway, and it is
+      // the set regenerateIndex needs.
+      const manifest = options.crawl ? null : await this.storage.currentManifest([head?.checkpoint ?? 0]);
+      let publishedDocuments: ContextNode[];
+      if (manifest) {
+        // In memory only: the index update after the seal writes it back.
+        await this.storage.refreshManifest(
+          manifest,
+          [...(justSealed?.keys() ?? []), ...(options.changed ?? [])],
+          (id) => unreadable.push(id),
+        );
+        publishedDocuments = manifestDocuments(manifest).filter(isPublished);
+      } else {
+        const crawled = await this.storage.discoverDocuments({ includeRetired: true, onUnreadable: (id) => unreadable.push(id) });
+        onCrawl?.(crawled);
+        publishedDocuments = crawled.filter(isPublished);
+      }
+      // Snapshot before the history reads: a write that lands during the seal
+      // stays marked for the next one.
+      const touched = this.storage.touchedHistorySnapshot();
       // Every publish seals, so the head already holds the chain hash of each
       // document at the version it had then, and `justSealed` holds the ones
       // this publish appended. Read history.yaml only for documents neither
@@ -321,7 +347,6 @@ export class CheckpointManager {
       // a mismatched hash (the torn-snapshot fallback below), later seals at
       // that version keep it, where a full re-read would have healed it.
       // `verify` still flags it, and the next version bump re-reads the doc.
-      const head = chainState.kind === "head" ? chainState.checkpoint : undefined;
       const documentHistories = new Map<string, SealHistory>();
       const stale: string[] = [];
       for (const doc of publishedDocuments) {

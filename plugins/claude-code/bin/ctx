@@ -1,0 +1,6 @@
+#!/bin/sh
+# `ctx` for Claude's Bash tool: the CLI Claude Code installed with this plugin
+# (package.json pins it). A user's own `ctx` comes earlier on PATH and wins.
+cli="$(dirname "$0")/../node_modules/@promptowl/contextnest-cli/dist/index.js"
+[ -f "$cli" ] && exec node "$cli" "$@"
+exec npx -y @promptowl/contextnest-cli "$@"

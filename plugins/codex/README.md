@@ -56,14 +56,14 @@ Codex has no `userConfig`. Set environment variables, or put the same keys (`ret
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CONTEXTNEST_RETRIEVAL_MODE` | `search` | `off` \| `search` \| `query` \| `agent` |
-| `CONTEXTNEST_CAPTURE_MODE` | `propose` | `off` \| `propose` \| `auto` |
+| `CONTEXTNEST_CAPTURE_MODE` | `explicit` | `off` \| `explicit` \| `propose` \| `auto` |
 | `CONTEXTNEST_VAULT_ALIAS` | _(none)_ | Pinned vault alias |
 | `CONTEXTNEST_UNCLEAR_NEST` | `ask` | `ask` \| `default` |
 | `CONTEXTNEST_CTX_COMMAND` | `ctx` | The `ctx` binary |
 
 ## Limits
 
-- Codex calls its rollout transcript format unstable. The `Stop` reader uses three record shapes only. If the format changes, ambient capture becomes quieter. Explicit asks ("remember this") use the typed prompt record.
+- Codex calls its rollout transcript format unstable. The `Stop` reader uses a few record shapes only. If the format changes, ambient capture becomes quieter. Explicit asks ("remember this") use the typed prompt record.
 
 ## Verification
 

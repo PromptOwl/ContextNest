@@ -17,12 +17,13 @@ Makes any Antigravity or Gemini session **vault-aware** (effort-toggled auto-ret
 4. **End-of-Turn Capture Gating (`Stop`):**
    - Evaluates whether new decisions or architectural solutions occurred during the turn, parking capture jobs into the session ledger (`~/.contextnest/plugin-state/`); the next prompt's `PreInvocation` hands them over. Explicit asks ("remember this") and corrections always gate; the ambient heuristic depends on transcript record types Antigravity does not document yet.
 5. **Workspace Skills (`skills/`):**
-   - Generated from `plugins/shared/` by `pnpm plugins:sync`, identical to the Codex and Muse skills.
+   - The first four are generated from `plugins/shared/` by `pnpm plugins:sync`, identical to the Codex and Muse skills.
    - `contextnest-recall`: Cited retrieval, plus scout mode for corrections (shared `retriever.md`).
    - `contextnest-capture`: The capture ladder (shared `capture.md`).
    - `contextnest-curate`: The change and escalation ladders (shared `curate.md`).
    - `contextnest-structure`: Inspection of folder taxonomies and template scaffolding (shared `structure.md`).
-6. **Operating Rules (`rules/contextnest.md`, generated from `plugins/shared/prompts/rules.md`):**
+   - `contextnest-setup` (Gemini only, hand-written): Guided first connection — PromptOwl cloud (MCP + browser sign-in, no install), a company server, or a private local vault — plus how much runs on its own (Light / On demand / Hands-free). Offered automatically when no nest is connected; never replaces an existing setup.
+6. **Operating Rules (`rules/contextnest.md`, generated from `plugins/shared/prompts/rules.md`; the setup line below the shared region is Gemini only):**
    - Automatic guidance loaded by Antigravity covering vault citation rules (`vault:id`), review SLA escalation ladders, and edit-and-approve safeguards.
 
 ---
@@ -44,7 +45,8 @@ plugins/gemini/
     ├── contextnest-recall/        # Deep vault retrieval skill
     ├── contextnest-capture/       # Governed capture skill
     ├── contextnest-curate/        # Vault fact curation skill
-    └── contextnest-structure/     # Structure rules inspection skill
+    ├── contextnest-structure/     # Structure rules inspection skill
+    └── contextnest-setup/         # Guided first-connection skill
 ```
 
 ---
@@ -56,7 +58,7 @@ The adapter respects the standard ContextNest environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `CONTEXTNEST_RETRIEVAL_MODE` | `search` | Auto-retrieval effort: `off` \| `search` \| `query` \| `agent` |
-| `CONTEXTNEST_CAPTURE_MODE` | `propose` | Capture policy: `off` \| `propose` \| `auto` |
+| `CONTEXTNEST_CAPTURE_MODE` | `explicit` | Capture policy: `off` \| `explicit` \| `propose` \| `auto` |
 | `CONTEXTNEST_VAULT_ALIAS` | _(none)_ | Pinned vault alias (note: `_ALIAS`, not `CONTEXTNEST_VAULT`, which the CLI reads) |
 | `CONTEXTNEST_UNCLEAR_NEST` | `ask` | When no nest clearly fits a new note: `ask` \| `default` |
 | `CONTEXTNEST_CTX_COMMAND` | `ctx` | Path or name of the ContextNest CLI binary |

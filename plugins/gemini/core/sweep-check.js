@@ -17,9 +17,13 @@
  * actually read and confirmed are reported. Nothing here guesses, and none of
  * it depends on how the change was requested.
  *
- * PostToolUse cannot block and does not try to: it returns `additionalContext`,
- * which the model reads mid-turn — so it finishes the sweep in the same breath
- * (fanning out curators when the set is large) rather than a turn later.
+ * PostToolUse cannot block and does not try to: it returns `additionalContext`.
+ * In Claude Code the hook is registered `async` (claude-code/hooks/hooks.json):
+ * its ctx searches span every nest (up to 45 s), and run synchronously they
+ * held the turn after every update. Claude Code hands the result to the model
+ * on the next conversation turn, which then finishes the sweep (fanning out
+ * curators when the set is large). Other agents' adapters call run() as they
+ * see fit (Antigravity parks the report for the next prompt).
  *
  * SINGLE SOURCE OF TRUTH: plugins/shared/core/. Edit here, then `pnpm plugins:sync`.
  */
@@ -46,6 +50,8 @@ export const MAX_TERMS = 3;
  * CONTEXTNEST_SWEEP_MAX_CANDIDATES when a vault's latency budget differs.
  */
 export const MAX_CANDIDATES = 24;
+/** Per-call ctx timeout for the sweep: it reads many nodes after a large update (hook cap: 45s). */
+export const SWEEP_CTX_TIMEOUT_MS = 30000;
 
 /**
  * Words too common to identify anything. Deliberately short: the real filter is
@@ -416,5 +422,5 @@ export function run({ input, env, exec }) {
 }
 
 if (isMain(import.meta.url)) {
-  runAsHook(run);
+  runAsHook(run, { timeout: SWEEP_CTX_TIMEOUT_MS });
 }
