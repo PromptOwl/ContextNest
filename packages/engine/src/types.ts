@@ -155,7 +155,7 @@ export type ViewBlock = { id?: string } & (
   | { md: { ref: string; version?: number } }
   | { list: { select: string; fields?: Array<"id" | "title" | "version" | "status" | "tags">; limit?: number } }
   | { summary: { select: string; style?: "brief" | "detailed"; max_nodes?: number } }
-  | { html: { ref: string; data_from?: string[] } }
+  | { html: { ref: string; data_from?: string[]; write_to?: string[] } }
   | { table: { from: string; title?: string } }
   | { kpi: { from: string; title?: string } }
   | { chart: { from: string; title?: string } }
