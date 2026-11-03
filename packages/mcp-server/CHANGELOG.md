@@ -1,5 +1,11 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.14.0
+
+### Minor Changes
+
+- Bundle engine 3.5.0: view `html` blocks can declare `write_to` (the earlier `data` blocks their artifact may write rows back to), and checkpoints accept legacy decimal document versions instead of quarantining `context_history.yaml` as `.corrupt`.
+
 ## 2.13.0
 
 ### Minor Changes
