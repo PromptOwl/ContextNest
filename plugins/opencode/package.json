@@ -1,0 +1,9 @@
+{
+  "name": "@promptowl/contextnest-opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Context Nest plugin for OpenCode — vault-aware retrieval + governed capture via the ctx CLI",
+  "license": "AGPL-3.0"
+}

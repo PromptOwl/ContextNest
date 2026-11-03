@@ -1,6 +1,6 @@
 # Context Nest plugin core (shared)
 
-Agent-agnostic building blocks shared by every Context Nest coding-agent plugin (Claude Code, Codex, Gemini/Antigravity, Muse Code). **This is the single source of truth.** Edit here, then run `pnpm plugins:sync` from the repo root to vendor the result into each agent plugin.
+Agent-agnostic building blocks shared by every Context Nest coding-agent plugin (Claude Code, Codex, Gemini/Antigravity, OpenCode, Grok Build, Muse Code). **This is the single source of truth.** Edit here, then run `pnpm plugins:sync` from the repo root to vendor the result into each agent plugin.
 
 ## Contents
 
@@ -18,8 +18,8 @@ Agent-agnostic building blocks shared by every Context Nest coding-agent plugin 
 | `prompts/curate.md` | Body of the curator agent (the change and escalation ladders). |
 | `prompts/recall.md` | Body of the Claude Code manual recall skill. |
 | `prompts/structure.md` | Body of the portable structure skill. |
-| `prompts/rules.md` | Operating rules for Gemini, Codex and Muse (`rules/contextnest.md`, `AGENTS.md`), with the agent → skill map. |
-| `skills/<name>/SKILL.md` | Portable skill wrappers (frontmatter). The sync fills each body from a prompt and copies the skill into Gemini, Codex and Muse. |
+| `prompts/rules.md` | Operating rules for Gemini, Codex, OpenCode, Grok and Muse (`rules/contextnest.md`, `AGENTS.md`), with the agent → skill map. |
+| `skills/<name>/SKILL.md` | Portable skill wrappers (frontmatter). The sync fills each body from a prompt and copies the skill into Gemini, Codex, OpenCode, Grok and Muse. |
 
 ## Design contract
 
