@@ -143,7 +143,8 @@ describe("view node — validation", () => {
       { id: "doc", md: { ref: "nodes/a", version: 1 } },
       { id: "rows", list: { select: "#a", fields: ["status"], limit: 5 } },
       { summary: { select: "#a", style: "detailed", max_nodes: 10 } },
-      { html: { ref: "nodes/chart", data_from: ["rows"] } },
+      { id: "live", data: { binding: "nodes/bindings/sheet", as: "table" } },
+      { html: { ref: "nodes/chart", data_from: ["rows", "live"], write_to: ["live"] } },
       { table: { from: "rows", title: "T" } },
       { kpi: { from: "rows" } },
       { chart: { from: "rows" } },
@@ -167,6 +168,21 @@ describe("view node — validation", () => {
       /rule 35/,
     );
     expect(errorsFor({ blocks: [{ html: { ref: "nodes/chart", data_from: ["nope"] } }] })).toMatch(/rule 35/);
+  });
+
+  it("html `write_to` must name an EARLIER data block (rule 35)", () => {
+    const d = { id: "d", data: { binding: "nodes/bindings/sheet" } };
+    expect(errorsFor({ blocks: [d, { html: { ref: "nodes/app", write_to: ["d"] } }] })).toBe("");
+    expect(errorsFor({ blocks: [{ html: { ref: "nodes/app", write_to: ["nope"] } }] })).toMatch(
+      /writes to "nope", which is not the id of an earlier block \(§13 rule 35\)/,
+    );
+    expect(errorsFor({ blocks: [{ html: { ref: "nodes/app", write_to: ["d"] } }, d] })).toMatch(
+      /not the id of an earlier block \(§13 rule 35\)/,
+    );
+    expect(
+      errorsFor({ blocks: [{ id: "m", md: { ref: "nodes/x" } }, { html: { ref: "nodes/app", write_to: ["m"] } }] }),
+    ).toMatch(/writes to "m", which is not a data block \(§13 rule 35\)/);
+    expect(errorsFor({ blocks: [d, { html: { ref: "nodes/app", write_to: ["bad id!"] } }] })).toMatch(/rule 33|block id/);
   });
 
   it("round-trips through serialize/parse with the view block intact", () => {
