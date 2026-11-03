@@ -15,7 +15,7 @@
  * (every flag, every negative) stays in the dev-owned *.regression.test.ts.
  */
 import { expect } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   writeFileSync,
@@ -134,6 +134,49 @@ export function freshInstall(
   if (omitOptional) args.push("--omit=optional");
   npmExec(args, dir);
   return dir;
+}
+
+export interface MockProvider {
+  /** The base_url to drop in the vault's search config (`http://127.0.0.1:PORT/v1`). */
+  baseUrl: string;
+  /** Kill the provider process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback OpenAI-compatible embedder/reranker (`mock-embedder.mjs`)
+ * in its OWN process, resolving once it prints the port it bound. It MUST be a
+ * separate process: the journeys drive the CLI with `spawnSync`, which blocks
+ * this process's event loop until the CLI exits, so a same-process HTTP server
+ * could never answer the CLI's mid-run embed/rerank call — the run would
+ * deadlock. The returned `baseUrl` goes into the vault's `search` config
+ * (loopback needs no CONTEXTNEST_TRUSTED_ENDPOINTS); `close()` stops it.
+ */
+export function startMockProvider(): Promise<MockProvider> {
+  // stdin is a live pipe (not "ignore") so the mock can self-terminate when this
+  // end closes — i.e. if the test runner is hard-killed and afterAll never runs
+  // its close(), the child won't linger as an orphaned listener.
+  const child = spawn("node", [join(here, "mock-embedder.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock embedder never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}/v1`, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
 }
 
 /** A fresh isolated vault + config dir for one journey. Caller owns cleanup via `scratch`. */
