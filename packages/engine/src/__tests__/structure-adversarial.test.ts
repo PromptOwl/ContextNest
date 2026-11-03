@@ -871,15 +871,17 @@ describe("forget and tombstones", () => {
   // r23 evmerge: each imported event re-read, re-parsed and rewrote the whole
   // log, and each record was checked against every one before it: 5000
   // events took 338 s under the vault lock. One read and one write now.
+  // The fix runs in ~3 s alone but 20 s+ under a loaded parallel `pnpm test`,
+  // so the bound only separates linear from quadratic, not fast from slow.
   it("r23 evmerge: 5000 imported forgets merge in one pass", async () => {
     const events = Array.from({ length: 5000 }, (_, i) => forgetEvent(`nodes/gone/d${i}`, `e${i}`)).join("");
     const started = performance.now();
     const r = await importFiles([{ path: ".versions/chain_events.yaml", content: events }]);
     expect(r.failed).toEqual([]);
-    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(performance.now() - started).toBeLessThan(60_000);
     const logged = yaml.load(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8")) as { event_id: string }[];
     expect(logged.filter((e) => /^e\d+$/.test(e.event_id))).toHaveLength(5000);
-  }, 30_000);
+  }, 120_000);
 
   // r27 B4 (architecture review): the log was deduplicated by event_id alone,
   // so a forged record reusing a logged id (readable from context_forget_log)
