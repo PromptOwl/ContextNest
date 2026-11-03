@@ -810,13 +810,13 @@ A block is an object with an optional `id` (letters, digits, `_`, `-`; starting 
 | `md` | `ref`, `version?` | The body of the node `ref` names |
 | `list` | `select`, `fields?` (any of `id`, `title`, `version`, `status`, `tags`), `limit?` | The nodes the selector (§2) `select` matches |
 | `summary` | `select`, `style?` (`brief`\|`detailed`), `max_nodes?` | A generated summary of the nodes `select` matches |
-| `html` | `ref`, `data_from?` | The artifact node `ref` names, rendered in isolation, fed the output of the blocks `data_from` names |
+| `html` | `ref`, `data_from?`, `write_to?` | The artifact node `ref` names, rendered in isolation, fed the output of the blocks `data_from` names; `write_to` lists the `data` blocks it may write rows back to |
 | `table`, `kpi`, `chart` | `from`, `title?` | A presentation of the output of block `from` |
 | `callout` | `text`, `tone?` (`info`\|`warning`) | Static text |
 | `metric` | `ref` | The governed metric node `ref` names |
 | `data` | `binding`, `as?` (`table`\|`json`) | Data fetched through the binding node `binding` names |
 
-`ref` and `binding` are **vault references** — a node path (`nodes/finance/arr`) or a `contextnest://` URI (§4) without a checkpoint pin (`@N`) or anchor (`#section`); an `md` block pins a node's version with its own `version` field. A view never names a URL, credential or code to run: live data enters a view only through a node its `data` or `metric` block references, and that node is governed on its own. `from` and `data_from` name the `id` of an **earlier** block, which keeps the blocks acyclic.
+`ref` and `binding` are **vault references** — a node path (`nodes/finance/arr`) or a `contextnest://` URI (§4) without a checkpoint pin (`@N`) or anchor (`#section`); an `md` block pins a node's version with its own `version` field. A view never names a URL, credential or code to run: live data enters a view only through a node its `data` or `metric` block references, and that node is governed on its own. `from` and `data_from` name the `id` of an **earlier** block, which keeps the blocks acyclic. `write_to` names earlier `data` blocks only, and declares intent: whether a reader may actually write back is decided by the implementation on every write, never by the view.
 
 #### 1.12.3 Resolution
 
@@ -2086,7 +2086,7 @@ In addition to the base validation rules, `type: view` nodes MUST satisfy (rules
 32. `view.blocks` MUST be a non-empty array, and each block MUST declare exactly one kind from §1.12.2
 33. Every `ref` and `binding` MUST be a vault reference — a node path or a `contextnest://` URI, with no other scheme, no leading `/` or `//`, no `\`, no `@` pin or `#` anchor, and no empty, `.` or `..` segments — and no part of the `view` block may carry keys beyond those §1.12 defines
 34. Every `select` MUST parse as a selector (§2)
-35. Block `id`s MUST be unique within the view, and every `from` / `data_from` entry MUST name the `id` of an earlier block
+35. Block `id`s MUST be unique within the view, and every `from` / `data_from` entry MUST name the `id` of an earlier block, and every `write_to` entry MUST name the `id` of an earlier `data` block
 36. When `view.render` is `pinned`, every `md` block MUST carry a `version`
 
 Whether a reference resolves is not a validation rule: a view may name a node that does not exist yet, and resolution (§1.12.3) reports it.

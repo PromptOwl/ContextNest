@@ -36,7 +36,7 @@ export const VIEW_LAYOUTS = ["stack", "grid"] as const;
 /** What a `list` block may show per member — a closed set, like every other field here. */
 export const VIEW_LIST_FIELDS = ["id", "title", "version", "status", "tags"] as const;
 
-/** A block id: what `from` / `data_from` point at. */
+/** A block id: what `from` / `data_from` / `write_to` point at. */
 const BLOCK_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
 /**
@@ -102,7 +102,9 @@ const KIND_SCHEMAS: Record<(typeof VIEW_BLOCK_KINDS)[number], z.ZodTypeAny> = {
       max_nodes: z.number().int().min(1).max(200).optional(),
     })
     .strict(),
-  html: z.object({ ref: vaultRef("html.ref"), data_from: z.array(blockRef).optional() }).strict(),
+  html: z
+    .object({ ref: vaultRef("html.ref"), data_from: z.array(blockRef).optional(), write_to: z.array(blockRef).optional() })
+    .strict(),
   table: z.object({ from: blockRef, title: z.string().optional() }).strict(),
   kpi: z.object({ from: blockRef, title: z.string().optional() }).strict(),
   chart: z.object({ from: blockRef, title: z.string().optional() }).strict(),
@@ -165,10 +167,10 @@ export const viewMetaSchema: z.ZodType<ViewMeta, z.ZodTypeDef, unknown> = z
       .describe(
         "Ordered blocks. Each is an object with an optional `id` and exactly ONE kind: " +
           "{md:{ref,version?}} a node's body · {list:{select,fields?,limit?}} nodes matching a selector · " +
-          "{summary:{select,style?:brief|detailed,max_nodes?}} · {html:{ref,data_from?:[blockId]}} an artifact node · " +
+          "{summary:{select,style?:brief|detailed,max_nodes?}} · {html:{ref,data_from?:[blockId],write_to?:[blockId]}} an artifact node ·" +
           "{table|kpi|chart:{from:blockId,title?}} · {callout:{text,tone?:info|warning}} · {metric:{ref}} · " +
           "{data:{binding,as?:table|json}}. ref/binding are node paths or contextnest:// URIs, never URLs; " +
-          "from/data_from name an EARLIER block's id. Example: " +
+          "from/data_from name an EARLIER block's id; write_to names EARLIER data blocks the artifact may write rows back to. Example: " +
           '[{"md":{"ref":"nodes/finance/commentary"}},{"id":"metrics","list":{"select":"#board-metric"}},{"table":{"from":"metrics"}}]',
       ),
   })
@@ -196,8 +198,11 @@ export const viewMetaSchema: z.ZodType<ViewMeta, z.ZodTypeDef, unknown> = z
       });
     }
     // Rule 35: ids unique, and a block reads only from blocks BEFORE it — which
-    // also rules out cycles without a graph walk.
-    const seen = new Set<string>();
+    // also rules out cycles without a graph walk. An html block's `write_to`
+    // follows the same order and must name a `data` block: write-back is only
+    // for table-backed data. It declares intent only; the host still decides
+    // on every request whether the viewer may write.
+    const seen = new Map<string, ReturnType<typeof blockKind>>();
     view.blocks.forEach((block, i) => {
       for (const ref of readsFrom(block)) {
         if (!seen.has(ref)) {
@@ -208,6 +213,23 @@ export const viewMetaSchema: z.ZodType<ViewMeta, z.ZodTypeDef, unknown> = z
           });
         }
       }
+      const writeTo = (block.html as { write_to?: unknown } | undefined)?.write_to;
+      for (const ref of Array.isArray(writeTo) ? writeTo : []) {
+        if (typeof ref !== "string") continue;
+        if (!seen.has(ref)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `block ${i} writes to "${ref}", which is not the id of an earlier block (§13 rule 35)`,
+            path: ["blocks", i, "html", "write_to"],
+          });
+        } else if (seen.get(ref) !== "data") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `block ${i} writes to "${ref}", which is not a data block (§13 rule 35)`,
+            path: ["blocks", i, "html", "write_to"],
+          });
+        }
+      }
       if (typeof block.id === "string") {
         if (seen.has(block.id)) {
           ctx.addIssue({
@@ -215,8 +237,9 @@ export const viewMetaSchema: z.ZodType<ViewMeta, z.ZodTypeDef, unknown> = z
             message: `block id "${block.id}" is used more than once (§13 rule 35)`,
             path: ["blocks", i, "id"],
           });
+        } else {
+          seen.set(block.id, blockKind(block));
         }
-        seen.add(block.id);
       }
     });
   }) as unknown as z.ZodType<ViewMeta, z.ZodTypeDef, unknown>;
