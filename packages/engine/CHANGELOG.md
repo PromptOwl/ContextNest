@@ -1,5 +1,15 @@
 # @promptowl/contextnest-engine
 
+## 3.5.0
+
+### Minor Changes
+
+- 047de33: A view's `html` block may now declare `write_to`: the ids of earlier `data` blocks its artifact is allowed to write rows back to. Each entry must name an earlier block (the same rule `data_from` follows) and that block must be a `data` block; anything else is refused under §13 rule 35. The field only declares intent — the host still decides on every write whether the viewer may. Views without `write_to` validate exactly as before.
+
+### Patch Changes
+
+- b6d3bcd: Vaults imported before versions were made whole numbers no longer corrupt their checkpoint chain on every write. A published document still carrying a decimal front-matter version (`version: 2.1`) is recorded in the checkpoint as-is, and the checkpoint reader now accepts it instead of rejecting the whole `context_history.yaml` as `Expected integer, received float`, quarantining it as `.corrupt` and restarting the chain.
+
 ## 3.4.0
 
 ### Minor Changes
