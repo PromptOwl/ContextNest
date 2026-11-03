@@ -43,20 +43,28 @@ import {
   packCli,
   freshInstall,
   runJourney,
+  startMockProvider,
   repoRoot,
   type Journey,
+  type MockProvider,
   type RunResult,
 } from "./journey-harness.js";
 
 let INSTALL: string;
 const scratch: string[] = [];
+// The loopback embedder/reranker J18 drives semantic/hybrid search against. It
+// runs in its own process (see startMockProvider) and its base_url is only known
+// once it has bound a port, so J18's config-writing closures read it from here.
+let MOCK: MockProvider;
 
-beforeAll(() => {
+beforeAll(async () => {
   const tarball = packCli(scratch);
   INSTALL = freshInstall(tarball, scratch, "journeys");
+  MOCK = await startMockProvider();
 }, 180_000);
 
 afterAll(() => {
+  MOCK?.close();
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
@@ -3330,6 +3338,596 @@ const J16: Journey = {
   ],
 };
 
+/**
+ * J17 — "I onboard an AI agent to a new vault."
+ * `ctx init --starter <recipe> --tools <agents>` is how a fresh project becomes
+ * agent-aware: a starter scaffolds the vault AND `agent-configs.ts` writes the
+ * chosen agents' config files (`CLAUDE.md`, `.cursorrules`, `GEMINI.md`,
+ * `.windsurfrules`, `.github/copilot-instructions.md`). The user previews the
+ * recipes first (writes nothing), onboards one agent, checks the generated
+ * config is self-contained and actually works, onboards several agents at once,
+ * and confirms opting out (`--tools none`) builds the vault but leaves the
+ * project free of agent config.
+ *
+ * Each scenario onboards into its OWN fresh project dir (a plain init scaffolds
+ * into a directory). Like J14, those dirs are created once, memoized, pushed to
+ * `scratch` for the suite's afterAll, and targeted per action via
+ * `CONTEXTNEST_VAULT_PATH` (an absolute vault path wins over cwd in vault
+ * resolution). File assertions read those dirs directly in `check` — the
+ * harness's `files`/vault root is the journey's sandbox vault, which this
+ * journey never writes to.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const _j17dirs: Record<string, string> = {};
+const j17dir = (key: string) => {
+  if (!_j17dirs[key]) {
+    _j17dirs[key] = mkdtempSync(join(tmpdir(), `cn-journey-j17-${key}-`));
+    scratch.push(_j17dirs[key]); // cleaned by the suite's afterAll
+  }
+  return _j17dirs[key];
+};
+/** The agent config file each `--tools` id writes, relative to the project root. */
+const AGENT_CONFIGS = [
+  "CLAUDE.md",
+  ".cursorrules",
+  "GEMINI.md",
+  ".windsurfrules",
+  join(".github", "copilot-instructions.md"),
+];
+const J17: Journey = {
+  id: "J17",
+  title: "Onboard an AI agent to a new vault (developer)",
+  cases: [
+    {
+      id: "J17-01",
+      title: "Previewing the starter templates lists the recipes and writes nothing to disk",
+      actions: [
+        {
+          args: ["init", "--list-starters"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("list") }),
+          stdout: ["Available starter recipes:", "developer"],
+          // A pure preview: the target dir stays completely empty — no vault, no
+          // agent config, no context.yaml, nothing. Assert the whole dir is empty
+          // (not just a handful of named files) so any stray write is caught.
+          check: () => {
+            const d = j17dir("list");
+            expect(readdirSync(d), "list-starters must write nothing to disk").toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-02",
+      title: "Onboarding one agent scaffolds the vault and writes a CLAUDE.md",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer", "--tools", "claude", "--name", "onboard-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
+          stdout: ["Applied starter: Developer / Engineering", "Created 3 documents"],
+          check: () => {
+            const d = j17dir("claude");
+            // The vault was scaffolded...
+            expect(existsSync(join(d, "CONTEXT.md")), "vault CONTEXT.md").toBe(true);
+            expect(existsSync(join(d, "context.yaml")), "vault context.yaml").toBe(true);
+            // ...and the chosen agent's config file was written.
+            expect(existsSync(join(d, "CLAUDE.md")), "CLAUDE.md").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-03",
+      title: "The written CLAUDE.md is self-contained and correct: auto-generated marker plus how to run ctx query",
+      actions: [
+        {
+          // Reuses the vault J17-02 onboarded (same memoized `claude` dir) — this
+          // case must stay after J17-02; do not reorder.
+          // An agent following the generated config runs `ctx query` against the
+          // vault that was just created — and it answers with the starter nodes.
+          args: ["query", "type:document", "--json"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
+          json: (data) => {
+            // Precondition guard: a missing vault here means J17-02 didn't run
+            // first. Surface that directly instead of a bare "no docs" diff.
+            expect(
+              existsSync(join(j17dir("claude"), "CLAUDE.md")),
+              "J17-03 reuses the vault J17-02 onboarded — J17-02 must run first (do not reorder)",
+            ).toBe(true);
+            expect(queryDocIds(data)).toEqual([
+              "nodes/architecture/architecture-overview",
+              "nodes/onboarding/getting-started",
+              "nodes/standards/coding-conventions",
+            ]);
+          },
+          // The config is self-contained: it marks its own auto-generated block
+          // and teaches the agent the one command it needs — no external setup.
+          check: () => {
+            const claudeMd = readFileSync(join(j17dir("claude"), "CLAUDE.md"), "utf-8");
+            expect(claudeMd).toContain("do not edit this section");
+            expect(claudeMd).toContain("Context Nest vault");
+            expect(claudeMd).toContain("ctx query");
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-04",
+      title: "Onboarding several agents at once writes each one's config file",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer",
+            "--tools", "claude,cursor,gemini,windsurf,copilot", "--name", "multi-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("multi") }),
+          stdout: ["Applied starter: Developer / Engineering"],
+          // Every onboarded tool gets its config file — the positive mirror of
+          // J17-05's "all absent", so each AGENT_CONFIGS entry is covered both ways.
+          check: () => {
+            const d = j17dir("multi");
+            for (const f of AGENT_CONFIGS)
+              expect(existsSync(join(d, f)), `expected ${f} for its tool`).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-05",
+      title: "Opting out still builds the vault but writes no agent config files at all",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer", "--tools", "none", "--name", "none-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("none") }),
+          stdout: ["Applied starter: Developer / Engineering", "Created 3 documents"],
+          check: () => {
+            const d = j17dir("none");
+            // The vault is still built...
+            expect(existsSync(join(d, "CONTEXT.md")), "vault CONTEXT.md").toBe(true);
+            expect(existsSync(join(d, ".context")), "vault .context").toBe(true);
+            // ...but NOT a single agent config file was written.
+            for (const f of AGENT_CONFIGS)
+              expect(existsSync(join(d, f)), `--tools none must not write ${f}`).toBe(false);
+          },
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * A semantic/hybrid search hit as `search --mode semantic|hybrid [--rerank] --json`
+ * returns it: a total `score` plus a per-signal `scores` breakdown, and (when
+ * reranked) the best `passage`. Which signals appear depends on the mode and on
+ * whether the node matched that signal at all (a semantic-only hit carries no
+ * `scores.lexical`).
+ */
+type SemHit = {
+  id: string;
+  title: string;
+  score: number;
+  scores: { lexical?: number; semantic?: number; rrf?: number; rerank?: number };
+  passage?: string;
+};
+const semHits = (data: unknown) => data as SemHit[];
+const semOrder = (data: unknown) => (data as SemHit[]).map((h) => h.id);
+
+/** What `ctx embed --json` returns. */
+type EmbedResult = {
+  provider: string;
+  model: string;
+  path: string;
+  total: number;
+  embedded: number;
+  reused: number;
+  pruned: number;
+  dimensions: number;
+};
+
+// The index file the configured provider/model/dims resolve to (spec: one .vec
+// per provider--model--d<dims>), and the human path the CLI prints — both use
+// forward slashes even on Windows.
+const J18_VEC = ".context/embeddings/openai--text-embedding-3-small--d8.vec";
+
+/**
+ * The `search:` block appended to a vault's `.context/config.yaml` for J18 — the
+ * only CLI-reachable way to wire an offline provider: `provider: openai` pointed
+ * at the loopback mock's base_url (loopback needs no CONTEXTNEST_TRUSTED_ENDPOINTS).
+ * The rerank block carries its OWN base_url — the embeddings base_url does not
+ * carry over, and without it rerank would reach for api.openai.com. Pass
+ * `rerankBase: null` to omit the rerank block entirely (the "no rerank block"
+ * guardrail), or a different `embBase` to point embeddings at an untrusted host.
+ */
+const j18SearchBlock = (
+  embBase: string,
+  opts?: { rerankBase?: string | null },
+) => {
+  const rerankBase = opts?.rerankBase === undefined ? embBase : opts.rerankBase;
+  return [
+    "",
+    "search:",
+    "  mode: hybrid",
+    "  fusion_weights: { lexical: 1, semantic: 2 }",
+    "  embeddings:",
+    "    provider: openai",
+    "    model: text-embedding-3-small",
+    `    base_url: ${embBase}`,
+    "    dimensions: 8",
+    ...(rerankBase
+      ? [
+          "  rerank:",
+          "    provider: openai",
+          "    model: rerank-english-v3.0",
+          "    top_n: 100",
+          `    base_url: ${rerankBase}`,
+        ]
+      : []),
+    "",
+  ].join("\n");
+};
+
+/**
+ * A `mutate` that appends the search block to a vault's config. With `dir` empty
+ * it writes the journey's own vault (the vaultDir the mutate is handed); with a
+ * `dir` it writes that sub-vault instead. `embBase` is a thunk so the runtime
+ * mock base_url (only known after beforeAll) is read when the mutate runs.
+ */
+const appendSearchBlock =
+  (dir: string, embBase: () => string, opts?: { rerankBase?: string | null }) =>
+  (vaultDir: string) => {
+    const cfg = join(dir || vaultDir, ".context", "config.yaml");
+    writeFileSync(cfg, readFileSync(cfg, "utf-8") + j18SearchBlock(embBase(), opts));
+  };
+
+// J18's guardrail cases each need their own vault in a distinct state (no index,
+// an untrusted endpoint, encrypted) — separate temp vaults targeted per-action
+// via CONTEXTNEST_VAULT_PATH, the same way J17 drives several onboarded vaults.
+const _j18dirs: Record<string, string> = {};
+const j18dir = (key: string) => {
+  if (!_j18dirs[key]) {
+    _j18dirs[key] = mkdtempSync(join(tmpdir(), `cn-journey-j18-${key}-`));
+    scratch.push(_j18dirs[key]); // cleaned by the suite's afterAll
+  }
+  return _j18dirs[key];
+};
+const subEnv = (key: string) => () => ({ CONTEXTNEST_VAULT_PATH: j18dir(key) });
+// An encrypted sub-vault: keep the CLI off the OS keychain and blank any ambient
+// key so the key lives only in the sandboxed file store (same recipe as J8).
+const encEnv = (key: string) => () => ({
+  CONTEXTNEST_VAULT_PATH: j18dir(key),
+  CONTEXTNEST_CREDENTIALS_BACKEND: "file",
+  CONTEXTNEST_VAULT_KEY: undefined,
+  CONTEXTNEST_VAULT_PASSPHRASE: "",
+  CONTEXTNEST_CREDENTIALS_KEY: "",
+});
+
+// A paraphrase of the billing node that shares NO word with its body — the whole
+// point of semantic search. "charging / customers / payment" live in the mock
+// embedder's billing concept bucket alongside the node's "invoice / billing /
+// dunning", so they embed near each other while stemmed-keyword search finds no
+// overlap (J18-03 proves the miss). The empty lexical control in J18-03 depends
+// on this query sharing no stem with billing-faq's TITLE or body — so if you edit
+// either the node's title/body or this query, keep them lexically disjoint (and
+// in the same mock concept bucket, or J18-02 stops finding it).
+const J18_MEANING_QUERY = "charging customers and taking payment";
+// Hits BOTH signals: "pipeline" is a literal word in the deploy node (lexical),
+// "charging payment" is the billing concept (semantic). The node matching both
+// lists is lifted above the one matching only one — the essence of RRF fusion.
+const J18_FUSION_QUERY = "pipeline charging payment";
+
+/**
+ * J18 — "I find a node by meaning, not just by its words."
+ *
+ * The retrieval promise once embeddings are turned on (spec §semantic; the #190
+ * opt-in half): a paraphrase that shares no words with a node still finds it
+ * (semantic), plain keyword search is the honest control that misses it, hybrid
+ * fuses both signals so a node matching each ranks highest, and an optional
+ * rerank refines the top and surfaces the best passage. The index is built only
+ * from published nodes and the whole thing stays opt-in and safe — it refuses to
+ * run without an index, against an endpoint the user never trusted, or on an
+ * encrypted vault (where an embedding index would be a plaintext-derived copy of
+ * sealed content).
+ *
+ * OFFLINE BY DESIGN: a real embedder needs a network provider and an API key,
+ * neither available in CI. The only CLI-reachable substitute is `provider:
+ * openai` pointed at a loopback base_url, so this journey stands up a tiny
+ * OpenAI-compatible mock in its own process (startMockProvider → mock-embedder.mjs)
+ * that returns deterministic "concept" vectors — enough to prove meaning-based
+ * retrieval, not just that the plumbing is wired. Review is OFF in the main vault
+ * (like J10) so each node publishes and is indexable; J18-06 turns it back on to
+ * prove a held node is left OUT of the index.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J18: Journey = {
+  id: "J18",
+  title: "Find a node by meaning (semantic & hybrid search)",
+  cases: [
+    {
+      id: "J18-01",
+      title:
+        "Building the embedding index covers every published node and is kept out of version control",
+      actions: [
+        { args: ["init", "--name", "meaning"], stdout: ["Initialized"] },
+        // Review OFF so each add publishes and is embeddable (a held node is
+        // published-only-excluded — that contract is J18-06).
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/billing-faq",
+            "--type", "document",
+            "--title", "Collecting money from accounts",
+            "--tags", "#finance",
+            "--body", "We raise an invoice every billing cycle. Dunning emails chase any overdue invoice until it clears.",
+            "-y",
+          ],
+          files: [{ path: "nodes/billing-faq.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/deploy-guide",
+            "--type", "document",
+            "--title", "Deployment guide",
+            "--tags", "#ops",
+            "--body", "We ship each release through the pipeline nightly.",
+            "-y",
+          ],
+          files: [{ path: "nodes/deploy-guide.md", exists: true }],
+        },
+        // Wire the offline provider, then build the index: both published nodes
+        // are embedded into one .vec keyed by provider--model--d<dims>...
+        {
+          // The main vault is the journey's own isolated vault root; an empty
+          // `dir` makes the mutate write the config it is handed.
+          mutate: appendSearchBlock("", () => MOCK.baseUrl),
+          args: ["embed", "--json"],
+          json: (data) => {
+            const e = data as EmbedResult;
+            expect(e.provider).toBe("openai");
+            expect(e.model).toBe("text-embedding-3-small");
+            expect(e.path).toBe(J18_VEC);
+            expect(e.total).toBe(2);
+            expect(e.embedded).toBe(2);
+            expect(e.reused).toBe(0);
+            expect(e.pruned).toBe(0);
+            expect(e.dimensions).toBe(8);
+          },
+          files: [
+            { path: J18_VEC, exists: true },
+            // The index dir git-ignores everything — the embeddings never ride
+            // the version chain or land in a commit.
+            { path: ".context/embeddings/.gitignore", exists: true, contains: "*" },
+          ],
+        },
+        // Re-running reuses the unchanged index rather than re-embedding, and the
+        // human line reports it — the one wording a user reads after `ctx embed`.
+        {
+          args: ["embed"],
+          stdout: [
+            "Embedded 0, reused 2, pruned 0 — 2 published document(s) indexed",
+            "openai text-embedding-3-small (8d)",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J18-02",
+      title: "A search by meaning finds a node whose words never appear in the query",
+      actions: [
+        // The paraphrase shares no word with billing-faq's body, yet semantic
+        // search ranks it first — found by meaning. The hit carries a semantic
+        // score equal to the total (pure semantic mode), and NO lexical signal.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "semantic", "--json"],
+          json: (data) => {
+            const hits = semHits(data);
+            expect(hits[0].id).toBe("nodes/billing-faq");
+            expect(typeof hits[0].scores.semantic).toBe("number");
+            expect(hits[0].scores.semantic).toBe(hits[0].score);
+            expect(hits[0].scores.lexical).toBeUndefined();
+            // The off-topic node, if present, ranks strictly below.
+            const deploy = hits.find((h) => h.id === "nodes/deploy-guide");
+            if (deploy) expect(deploy.score).toBeLessThan(hits[0].score);
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-03",
+      title: "The same query in plain keyword search finds nothing — why meaning search matters",
+      actions: [
+        // The honest control: lexical (stemmed-keyword) search over the very same
+        // query returns an empty result, because the query and the node share no
+        // word stem. This is the delta that makes J18-02 meaningful.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "lexical", "--json"],
+          json: (data) => expect(data).toEqual([]),
+        },
+        { args: ["search", J18_MEANING_QUERY, "--mode", "lexical"], stdout: ["No results found."] },
+      ],
+    },
+    {
+      id: "J18-04",
+      title: "Hybrid search blends meaning and keywords, and a node matching both ranks highest",
+      actions: [
+        // "pipeline" is a literal word in deploy-guide (lexical hit); "charging
+        // payment" is the billing concept (semantic hit for billing-faq). Hybrid
+        // fuses the two ranked lists with RRF: deploy-guide appears in BOTH lists,
+        // so it outranks billing-faq even though billing-faq has the higher raw
+        // semantic score — the point of fusion. The leader carries all three of
+        // rrf/lexical/semantic, with the total equal to the rrf score.
+        {
+          args: ["search", J18_FUSION_QUERY, "--mode", "hybrid", "--json"],
+          json: (data) => {
+            const hits = semHits(data);
+            expect(semOrder(data)).toEqual(["nodes/deploy-guide", "nodes/billing-faq"]);
+            const [deploy, billing] = hits;
+            expect(typeof deploy.scores.rrf).toBe("number");
+            expect(typeof deploy.scores.lexical).toBe("number");
+            expect(typeof deploy.scores.semantic).toBe("number");
+            expect(deploy.score).toBe(deploy.scores.rrf);
+            // billing-faq matched on meaning only — a semantic score, no lexical...
+            expect(typeof billing.scores.semantic).toBe("number");
+            expect(billing.scores.lexical).toBeUndefined();
+            // ...and it even has the STRONGER raw semantic score of the two — the
+            // paraphrase is squarely its concept, only glancingly deploy's. So the
+            // ranking is not "deploy is simply more relevant"; fusion lifted the
+            // dual-signal node above the higher-semantic single-signal one. That
+            // "despite losing the semantic signal" is the whole point of RRF here.
+            expect(billing.scores.semantic!).toBeGreaterThan(deploy.scores.semantic!);
+            expect(deploy.score).toBeGreaterThan(billing.score);
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-05",
+      title: "Re-ranking the hits refines the order and surfaces the best passage",
+      actions: [
+        // With the meaning query, rerank re-scores the fused hits: billing-faq
+        // leads, each hit now carries a rerank score (equal to the total) and the
+        // best matching passage from its body — what a reader would quote.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "hybrid", "--rerank", "--json"],
+          json: (data) => {
+            const hits = semHits(data);
+            expect(hits[0].id).toBe("nodes/billing-faq");
+            expect(typeof hits[0].scores.rerank).toBe("number");
+            expect(hits[0].scores.rerank).toBe(hits[0].score);
+            expect(hits[0].passage).toContain("invoice every billing cycle");
+            // Every hit is reranked and surfaces a NON-EMPTY passage; order is by
+            // rerank score.
+            for (const h of hits) {
+              expect(typeof h.scores.rerank).toBe("number");
+              expect((h.passage ?? "").length).toBeGreaterThan(0);
+            }
+            const scores = hits.map((h) => h.score);
+            expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-06",
+      title: "Only published nodes are embedded — a node held for review stays out of the index",
+      actions: [
+        // Turn the review gate back on and capture a node: it is HELD, not
+        // published.
+        { args: ["config", "set", "review", "on"], stdout: ["review: on"] },
+        {
+          args: [
+            "add", "nodes/held-draft",
+            "--type", "document",
+            "--title", "Draft billing memo",
+            "--tags", "#finance",
+            "--body", "A draft note about invoices and billing, not yet approved.",
+            "-y",
+          ],
+          stdout: ["Held for review", "nodes/held-draft"],
+          files: [{ path: "nodes/held-draft.md", exists: true }],
+        },
+        // Re-embedding still indexes only the two published nodes — the held one
+        // is not counted (total stays 2, nothing new embedded).
+        {
+          args: ["embed", "--json"],
+          json: (data) => {
+            const e = data as EmbedResult;
+            expect(e.total).toBe(2);
+            expect(e.embedded).toBe(0);
+            expect(e.reused).toBe(2);
+          },
+        },
+        // And it is unreachable by meaning: a semantic search in its own concept
+        // returns the published billing node, never the held draft.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "semantic", "--json"],
+          json: (data) => {
+            const ids = semOrder(data);
+            expect(ids).toContain("nodes/billing-faq");
+            expect(ids).not.toContain("nodes/held-draft");
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-07",
+      title:
+        "Meaning search refuses to run without an index, against an untrusted endpoint, or on an encrypted vault",
+      actions: [
+        // (a) A configured vault with NO index yet: semantic search refuses and
+        // points the user at the one command that fixes it.
+        { args: ["init", "--name", "guard-noindex"], env: subEnv("noindex"), stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], env: subEnv("noindex"), stdout: ["review: off"] },
+        {
+          args: ["add", "nodes/a", "--type", "document", "--title", "A", "--body", "invoice billing dunning", "-y"],
+          env: subEnv("noindex"),
+        },
+        {
+          mutate: (v) => appendSearchBlock(j18dir("noindex"), () => MOCK.baseUrl)(v),
+          env: subEnv("noindex"),
+          args: ["search", "charging payment", "--mode", "semantic", "--json"],
+          status: 1,
+          stderr: ["needs an embedding index", "ctx embed"],
+        },
+        // (b) An embeddings endpoint the user never trusted (a non-loopback host
+        // that is not the OpenAI default): embed refuses before any call goes out.
+        { args: ["init", "--name", "guard-untrusted"], env: subEnv("untrusted"), stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], env: subEnv("untrusted"), stdout: ["review: off"] },
+        {
+          args: ["add", "nodes/a", "--type", "document", "--title", "A", "--body", "invoice billing", "-y"],
+          env: subEnv("untrusted"),
+        },
+        {
+          mutate: (v) =>
+            appendSearchBlock(j18dir("untrusted"), () => "https://attacker.example/v1", { rerankBase: null })(v),
+          env: subEnv("untrusted"),
+          args: ["embed", "--json"],
+          status: 1,
+          stderr: ["attacker.example", "not trusted", "CONTEXTNEST_TRUSTED_ENDPOINTS"],
+        },
+        // (c) An encrypted vault refuses embeddings and semantic search outright —
+        // the index would be a plaintext-derived copy of sealed content...
+        {
+          args: ["init", "--name", "guard-enc", "--layout", "structured", "--encrypted"],
+          env: encEnv("enc"),
+          // The marker-file contract is J8's; here the subject is the refusals below.
+          stdout: ["ENCRYPTED VAULT"],
+        },
+        { args: ["config", "set", "review", "off"], env: encEnv("enc"), stdout: ["review: off"] },
+        {
+          args: ["add", "nodes/sec", "--type", "document", "--title", "Sec", "--body", "invoice billing dunning", "-y"],
+          env: encEnv("enc"),
+          stdout: ["Created and published"],
+        },
+        {
+          mutate: (v) => appendSearchBlock(j18dir("enc"), () => MOCK.baseUrl)(v),
+          env: encEnv("enc"),
+          args: ["embed", "--json"],
+          status: 1,
+          stderr: ["not supported on an encrypted vault"],
+        },
+        {
+          env: encEnv("enc"),
+          args: ["search", "charging payment", "--mode", "semantic", "--json"],
+          status: 1,
+          stderr: ['"semantic" is not supported on an encrypted vault'],
+        },
+        // ...but a plain search (default mode) still works on an encrypted vault:
+        // it falls back to lexical and finds the node by a word in its body.
+        {
+          env: encEnv("enc"),
+          args: ["search", "invoice", "--json"],
+          json: (data) => expect(semOrder(data)).toContain("nodes/sec"),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3387,5 +3985,11 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J16 — organize work on a task board", () => {
     runJourney({ installDir: INSTALL, scratch }, J16);
+  });
+  it("J17 — onboard an AI agent to a new vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J17);
+  });
+  it("J18 — find a node by meaning (semantic & hybrid search)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J18);
   });
 });

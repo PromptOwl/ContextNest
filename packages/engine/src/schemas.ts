@@ -609,7 +609,9 @@ export const checkpointSchema = z.object({
   checkpoint: z.number().int().min(1),
   at: z.string(),
   triggered_by: z.string(),
-  document_versions: z.record(z.number().int()),
+  // Not .int(): vaults imported before import hygiene keep decimal front-matter
+  // versions (2.1), and the seal records them — rejecting them corrupted the chain.
+  document_versions: z.record(z.number().positive()),
   document_chain_hashes: z.record(z.string()),
   checkpoint_hash: z.string().regex(CHECKSUM_PATTERN),
 });
