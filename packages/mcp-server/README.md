@@ -240,7 +240,7 @@ The MCP server is one of four ways into the same vault — same file format, sam
 | **CLI** (`ctx`) | Build and query the vault from the terminal | [`@promptowl/contextnest-cli`](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
 | **MCP server** | Agent access over the Model Context Protocol (this package) | [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
-| **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
+| **PromptOwl cloud** | Hosted packs, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 
 Drop the server into any MCP-capable agent — Claude Desktop, Claude Code, Cursor, Gemini CLI, Windsurf — to plug the same vault into your IDE or chat client.
 

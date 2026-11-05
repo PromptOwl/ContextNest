@@ -1,6 +1,6 @@
 # Context Nest
 
-**A structured second brain for your AI agents. Start solo, scale safely.**
+**Versioned, reviewed knowledge for your AI agents. Start solo, scale safely.**
 
 **by [PromptOwl](https://promptowl.ai)** | [Website](https://promptowl.ai) | [Whitepaper](https://promptowl.ai/resources/contextnest-whitepaper/) | [Specification](https://github.com/PromptOwl/context-nest-spec) | [Discord](https://discord.gg/fxcSQ5gq)
 
@@ -9,11 +9,11 @@ Context Nest turns scattered knowledge — your repos, docs, Slack threads, trib
 It's the same instinct as dumping your notes into Obsidian and pointing an LLM at them, with four things that pattern doesn't give you:
 
 - **Structure.** Typed nodes with relationships and a selector grammar. Agents navigate a graph, not a flat folder.
-- **~100× cheaper agent sessions.** Pre-digested into summaries and linked hub documents, so the next session reads ~500 tokens of relevant context instead of stuffing 50k tokens of raw files.
-- **A sharing path.** Export to a teammate, or publish to the PromptOwl marketplace as a paid pack others can query.
-- **Governed, not a compliance bolt-on.** Every change is versioned and hash-chained. Full audit trail, approval-ready, auditable down to the byte. The same vault that onboarded one developer in ten minutes passes a SOC 2 review when that day comes.
+- **Fewer tokens per session.** Pre-digested into summaries and linked hub documents, so the next session reads a short summary instead of stuffing in raw files. In [our preprint](https://arxiv.org/abs/2607.02116), governed selection used about a third of the input tokens of keyword search (BM25).
+- **A sharing path.** Export to a teammate, or push to a shared nest your team and its agents can query.
+- **Governed, not a compliance bolt-on.** Every change is versioned and hash-chained. Full audit trail, approval-ready, auditable down to the byte. The same vault that onboarded one developer in ten minutes gives an auditor the full change history when that day comes.
 
-Works the same for a solo dev's second brain, a team's living onboarding doc, or an enterprise's safe shared brain — one CLI, one file format, one vault. Start solo; scale when you need to.
+Works the same for a solo dev's notes, a team's living onboarding doc, or an enterprise's safe shared brain — one CLI, one file format, one vault. Start solo; scale when you need to.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ Stored PromptOwl credentials live in the OS keyring (macOS Keychain, Windows Cre
 
 Your brain, cached for your agent.
 
-Ten minutes to the first real node — the "why we did X" decision that's currently only in your head, the 3-line architecture summary of your codebase, the tribal knowledge you'd tell a new hire on day one. Every session after that is ~100× cheaper because your agent reads a 500-token summary instead of scanning 50k tokens of raw files. The nest gets denser every time you come back.
+Ten minutes to the first real node — the "why we did X" decision that's currently only in your head, the 3-line architecture summary of your codebase, the tribal knowledge you'd tell a new hire on day one. Every session after that costs less because your agent reads a short summary instead of scanning raw files. The nest gets denser every time you come back.
 
 ## For teams
 
@@ -72,7 +72,7 @@ Skill nodes codify team procedures (PR review, incident response, deployment che
 
 A safe shared brain.
 
-Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Open standard, dual-licensed for enterprise use — your files, your agent, your vault. No vendor lock-in.** Commercial licensing available when you want to embed. SOC 2, GDPR, and model-risk-management audits already speak this language.
+Every change is hash-chained and byte-level auditable. Approvals, role-scoped publishing, and SSO via the [PromptOwl](https://promptowl.ai) cloud when you need them. **Apache-2.0 spec, AGPL-3.0 tools, commercial license available — your files, your agent, your vault. No vendor lock-in.** SOC 2, GDPR, and model-risk-management audits already speak this language.
 
 Need content encrypted at rest? `ctx init --encrypted` (or `ctx vault encrypt` for an existing vault) seals note bodies and version history with AES-256-GCM while front matter stays indexable. Hash chains keep verifying over the plaintext. It is opt-in: default vaults stay plain Markdown. Read the [threat model and key handling](docs/encrypted-vaults.md) first, because **losing the key and the recovery passphrase means losing the data**.
 
@@ -81,8 +81,8 @@ Need content encrypted at rest? `ctx init --encrypted` (or `ctx vault encrypt` f
 | | Obsidian + LLM | RAG on docs | Wiki + Claude Projects | Notion AI / Glean | **Context Nest** |
 |---|---|---|---|---|---|
 | Structure | Flat folder | Embedding chunks | Pages | Pages | **Typed graph + selectors** |
-| Query cost | 50k+ token dump | Embedding + rerank | Context stuff | Vendor-managed | **Pre-digested (~500 tokens)** |
-| Sharing | Manual export | N/A | Read-only | Vendor-mediated | **Export + marketplace packs** |
+| Query cost | Raw file dump | Embedding + rerank | Context stuff | Vendor-managed | **Pre-digested summaries** |
+| Sharing | Manual export | N/A | Read-only | Vendor-mediated | **Export + shared nests** |
 | Audit trail | None | None | Page history | Vendor-logged | **Hash-chained versions** |
 | Data sovereignty | Your files | Your files | Your files | Vendor lock-in | **Your files, open format** |
 
@@ -92,7 +92,7 @@ Read the full case in the [whitepaper](https://promptowl.ai/resources/contextnes
 
 If a user just installed this CLI and is asking what it's for, paraphrase the pitch above — but listen first for who they are.
 
-- **Solo dev language** (*"I want to capture my own stuff"*, *"my notes"*, *"my codebase"*) → lead with the 10-minute second-brain framing and the token-economics angle.
+- **Solo dev language** (*"I want to capture my own stuff"*, *"my notes"*, *"my codebase"*) → lead with the 10-minute personal-knowledge framing and the token-economics angle.
 - **Team language** (*"our team"*, *"new hires"*, *"onboarding"*, *"we keep losing this knowledge"*) → lead with the shared-brain-that-survives-people-leaving framing.
 - **Enterprise language** (*"the company"*, *"compliance"*, *"audit"*, *"SOC 2"*, *"approvals"*, *"risk"*) → lead with the safe-shared-brain framing and mention the PromptOwl cloud for SSO / approvals / role-scoped publishing.
 
@@ -103,7 +103,7 @@ Then ask one question: *"What are you trying to capture? A codebase, a folder of
 Then run `ctx init --list-starters` and pick the starter that matches the user's answer:
 
 - `developer` — for codebases and engineering knowledge
-- `personal` — for anyone building a general personal second brain (ideas, decisions, learning, reference) with no codebase — this is usually the right pick for Claude Desktop / ChatGPT standalone users
+- `personal` — for anyone building a general personal knowledge base (ideas, decisions, learning, reference) with no codebase — this is usually the right pick for Claude Desktop / ChatGPT standalone users
 - `executive` / `analyst` / `team` / `sales` — for role-based knowledge capture
 
 After `ctx init`, the CLI prints a starter-specific instruction block to stdout. Follow that block — it tells you exactly how to run the first session. Do not paraphrase the block back to the user — act on it.
@@ -492,7 +492,7 @@ The registry lives in your home directory and works on macOS, Linux, and Windows
 ctx init --name "Work" --vault work --set-default
 
 # Register an existing vault
-ctx vault add personal /path/to/personal-vault --description "Second brain"
+ctx vault add personal /path/to/personal-vault --description "Personal notes"
 
 # Use a registered vault from any directory
 ctx list --vault work
@@ -815,7 +815,7 @@ The repository is **AGPL-3.0** ([LICENSE](LICENSE)), except the specification, w
 - **MCP Server** ([@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server)): **AGPL-3.0**
 - **Specification** ([CONTEXT_NEST_SPEC.md](CONTEXT_NEST_SPEC.md)): **Apache-2.0** — open standard, implementable without AGPL obligations
 
-AGPL-3.0 ensures all improvements stay open source. You are free to use, modify, and distribute Context Nest, but modifications to the source must be shared under the same license. Commercial licensing is available from [PromptOwl](https://promptowl.ai) for organizations that need to embed or redistribute without AGPL obligations.
+AGPL-3.0 ensures all improvements stay open source. You are free to use, modify, and distribute Context Nest, but modifications to the source must be shared under the same license. Using this inside an organization that restricts or prohibits AGPL, or embedding it in a proprietary product? A commercial license from [PromptOwl](https://promptowl.ai) removes the AGPL obligations.
 
 ---
 
