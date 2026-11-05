@@ -119,10 +119,10 @@ export function droppedTerms(oldBody, newBody, limit = MAX_TERMS) {
 /**
  * Binary forms: bare `ctx`/`contextnest`, an EXPLICIT path to one (must start
  * with `/`, `./`, `../` or `~/` — `docs/ctx` in prose is not an invocation),
- * or the npx package (`npx -y @promptowl/contextnest-cli …`).
+ * or the npx package, with or without a pinned version.
  */
 const BINARY =
-  /(?:npx\s+(?:-y\s+)?)?(?:(?:\.{1,2}|~)?\/[\w.@~\/-]*\/)?(?:@[\w-]+\/)?(?:ctx|contextnest(?:-cli)?)/;
+  /(?:npx\s+(?:-y\s+)?)?(?:(?:\.{1,2}|~)?\/[\w.@~\/-]*\/)?(?:@[\w-]+\/)?(?:ctx|contextnest(?:-cli)?)(?:@[\w.-]+)?/;
 const UPDATE_RE = new RegExp(
   "(?:^|\\s)" + BINARY.source + "\\s+(?:--?[\\w-]+(?:[= ]\\S+)?\\s+)*update\\s+(?!-)(\"[^\"]+\"|'[^']+'|\\S+)",
 );
