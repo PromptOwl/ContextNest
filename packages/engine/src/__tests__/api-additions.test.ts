@@ -91,6 +91,22 @@ describe("catalog additions for remote nests", () => {
     expect(created.id).toBe("nodes/gtm/deals/derived-doc");
   });
 
+  it("a folder written with its nodes/ root is not rooted twice", async () => {
+    const created = await api.run<{ id: string }>(
+      "context_create",
+      { title: "Brief", content: "b", folder: "nodes/briefs" },
+      ctx,
+    );
+    expect(created.id).toBe("nodes/briefs/brief");
+
+    const imported = await api.run<{ published: Array<{ id: string }> }>(
+      "context_import",
+      { documents: [{ title: "Imported", content: "b", folder: "/Nodes/briefs/" }] },
+      ctx,
+    );
+    expect(imported.published[0].id).toBe("nodes/briefs/imported");
+  });
+
   it("the context_create input schema advertises the id property", () => {
     const schema = inputJsonSchema(getOperation("context_create")!) as {
       properties?: Record<string, unknown>;

@@ -168,6 +168,16 @@ function slugify(input: string): string {
   // (linear — avoids the `-+$` polynomial-backtracking ReDoS CodeQL flags)
 }
 
+/**
+ * A folder's slugged segments below nodes/. Ids start with nodes/, so callers
+ * write `nodes/briefs` for the folder `briefs`; the id builders add that root
+ * themselves, and keeping it here would file the doc under nodes/nodes/.
+ */
+function folderSegmentsOf(folder: unknown): string[] {
+  const segments = String(folder ?? "").split("/").map(slugify).filter(Boolean);
+  return segments[0] === "nodes" ? segments.slice(1) : segments;
+}
+
 /** Clamp a caller-supplied hop count into [0, MAX_HOPS]. */
 function clampHops(hops: unknown): number {
   const n = typeof hops === "number" ? hops : 2;
@@ -701,10 +711,7 @@ function buildDraftNode(input: {
   view?: ViewMeta;
 }): ContextNode {
   const now = new Date().toISOString();
-  const folderSegments = String(input.folder ?? "")
-    .split("/")
-    .map(slugify)
-    .filter(Boolean);
+  const folderSegments = folderSegmentsOf(input.folder);
   // An explicit id wins outright — callers that mint their own ids (system
   // nodes, path-addressed tools) still get the traversal/prefix normalization.
   const id = input.id
@@ -1845,10 +1852,7 @@ async function importPdfLocked(
       slugify(String(title)) ||
       slugify(filenameStem(input.filename) ?? "") ||
       `pdf-${extraction.sha256.slice("sha256:".length, "sha256:".length + 12)}`;
-    const folderSegments = String(input.folder ?? "")
-      .split("/")
-      .map(slugify)
-      .filter(Boolean);
+    const folderSegments = folderSegmentsOf(input.folder);
     id = normalizeDocumentId(["nodes", ...folderSegments, slug].join("/"));
     existing = await readIfExists(ctx, id);
     if (existing) {
