@@ -3928,6 +3928,137 @@ const J18: Journey = {
   ],
 };
 
+/**
+ * J19 — "I run `ctx` to see what it does." First-run onboarding for a bare
+ * `ctx`: a brand-new user gets a short "no notes yet" welcome and the command
+ * list; once a vault exists it just shows the list and records that setup is
+ * done; a second run is stable; and an automated/non-interactive environment
+ * never stops to ask questions.
+ *
+ * SCOPE (honest): the interactive setup wizard only runs with a real terminal,
+ * which the spawnSync harness has no pty for — so `shouldOnboard` always lands
+ * on the help/decision branch here. This journey proves that decision, help and
+ * automation-guard surface (the wizard's own branch is unit-tested in the CLI's
+ * first-run.test.ts), not the step-by-step prompts.
+ *
+ * STATE: the journey vault stays vault-less throughout, so the "brand-new
+ * machine" cases (01, 04) see no local vault; a separate registered vault stands
+ * in for "notes already exist" (02, 03) without turning the journey vault into
+ * one. The first-run stamp (onboarded_at) isn't surfaced by any command, so it's
+ * read from the sandboxed config dir the harness hands `check`.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+let _j19ext: string | undefined;
+const j19ExtVault = () => {
+  if (!_j19ext) {
+    _j19ext = mkdtempSync(join(tmpdir(), "cn-journey-j19-ext-"));
+    scratch.push(_j19ext); // cleaned by the suite's afterAll
+  }
+  return _j19ext;
+};
+const NO_NOTES_LINE = "No notes yet.";
+const RUN_IN_TERMINAL = "Run `ctx` in a terminal to get set up.";
+/** The top-level onboarded_at stamp first-run records in the registry, or "" if unset. */
+const onboardedAt = (cfgDir: string): string => {
+  const p = join(cfgDir, "config.yaml");
+  const m = existsSync(p) ? readFileSync(p, "utf-8").match(/onboarded_at:\s*'?([^'\n]+)'?/) : null;
+  return m ? m[1].trim() : "";
+};
+let j19Recorded = ""; // onboarded_at captured in J19-02, re-checked unchanged in J19-03
+const J19: Journey = {
+  id: "J19",
+  title: "A bare `ctx` welcomes you and points the way (first run)",
+  cases: [
+    {
+      id: "J19-01",
+      title:
+        'On a brand-new machine with nothing set up, running `ctx` shows a "no notes yet" line and the command list, exits cleanly, and creates or records nothing behind the scenes',
+      actions: [
+        {
+          args: [],
+          stdout: [NO_NOTES_LINE, "USAGE"],
+          stderr: [RUN_IN_TERMINAL],
+          check: (_v, cfg) => {
+            expect(onboardedAt(cfg), "a fresh run must record nothing").toBe("");
+            const p = join(cfg, "config.yaml");
+            if (existsSync(p))
+              expect(readFileSync(p, "utf-8"), "no skipped_at either").not.toContain("skipped_at");
+          },
+        },
+      ],
+    },
+    {
+      id: "J19-02",
+      title:
+        'Once a notes folder exists, running `ctx` shows the command list without the "no notes yet" line and quietly records that first-run setup is done',
+      actions: [
+        // A vault now exists and is registered — first run is about recognising an
+        // existing user, not creating one, so the journey vault itself stays empty.
+        {
+          args: ["init", "--register", "--name", "main", "--set-default"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j19ExtVault() }),
+          stdout: ["Initialized"],
+        },
+        {
+          args: [],
+          stdout: ["USAGE"],
+          stdoutNot: [NO_NOTES_LINE],
+          stderrNot: [RUN_IN_TERMINAL],
+          check: (_v, cfg) => {
+            j19Recorded = onboardedAt(cfg);
+            expect(j19Recorded, "first run with a vault present records onboarded_at").not.toBe("");
+          },
+        },
+      ],
+    },
+    {
+      id: "J19-03",
+      title:
+        "Running `ctx` a second time is stable — it does not welcome the user again or change the recorded setup date",
+      actions: [
+        {
+          args: [],
+          stdout: ["USAGE"],
+          stdoutNot: [NO_NOTES_LINE],
+          check: (_v, cfg) =>
+            expect(onboardedAt(cfg), "the recorded setup date must not change on re-run").toBe(j19Recorded),
+        },
+      ],
+    },
+    {
+      id: "J19-04",
+      title:
+        "In an automated, non-interactive environment, `ctx` never drops into the interactive setup — it shows the command list plus a hint to run it in a terminal to get set up",
+      actions: [
+        // Fresh, un-recorded registry (its own config dir) + CI set: the guard must
+        // show help + the hint, never block on a prompt, and record nothing.
+        {
+          args: [],
+          env: (v) => ({ CI: "1", CONTEXTNEST_CONFIG_DIR: join(v, "ci-reg") }),
+          stdout: [NO_NOTES_LINE, "USAGE"],
+          stderr: [RUN_IN_TERMINAL],
+          check: (v) =>
+            expect(onboardedAt(join(v, "ci-reg")), "the CI guard must record nothing").toBe(""),
+        },
+      ],
+    },
+    {
+      id: "J19-05",
+      title:
+        "Running `ctx` with any real command or flag behaves normally and never triggers first-run onboarding",
+      actions: [
+        {
+          args: ["list"],
+          stdout: ["No documents found."],
+          stdoutNot: [NO_NOTES_LINE],
+          stderrNot: [RUN_IN_TERMINAL],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3991,5 +4122,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J18 — find a node by meaning (semantic & hybrid search)", () => {
     runJourney({ installDir: INSTALL, scratch }, J18);
+  });
+  it("J19 — a bare `ctx` welcomes you and points the way", () => {
+    runJourney({ installDir: INSTALL, scratch }, J19);
   });
 });

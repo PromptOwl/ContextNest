@@ -264,9 +264,12 @@ export interface Action {
    * post-command counterpart to `mutate`. Use it for on-disk proofs the CLI's
    * own output can't surface, e.g. that a forgotten secret is absent from every
    * version-history file, or that an encrypted body is scrambled at rest.
-   * `vaultDir` is the journey's isolated vault root.
+   * `vaultDir` is the journey's isolated vault root; `cfgDir` is its sandboxed
+   * registry/config dir (CONTEXTNEST_CONFIG_DIR) — read it for registry-level
+   * proofs the CLI doesn't print, e.g. first-run onboarding recording
+   * `onboarded_at` in config.yaml.
    */
-  check?: (vaultDir: string) => void;
+  check?: (vaultDir: string, cfgDir: string) => void;
 }
 
 /**
@@ -332,7 +335,7 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
       for (const m of a.stderrNot ?? [])
         expect(matches(r.stderr, m), `${at} — stderr should not contain ${m}:\n${r.stderr}`).toBe(false);
       if (a.json) a.json(parseJson(r.stdout));
-      if (a.check) a.check(vault);
+      if (a.check) a.check(vault, cfg);
       for (const f of a.files ?? []) {
         const p = join(vault, f.path);
         if (f.exists !== undefined)
