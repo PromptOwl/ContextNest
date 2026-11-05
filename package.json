@@ -15,6 +15,7 @@
     "plugins:check": "node scripts/sync-plugins.mjs --check",
     "deps:graph": "node scripts/dep-graph.mjs",
     "deps:check": "node scripts/dep-graph.mjs --check",
+    "bench:write": "pnpm --filter @promptowl/contextnest-engine build && node scripts/bench-write.mjs",
     "prepublish": "pnpm -r build",
     "version-packages": "changeset version && pnpm install --lockfile-only && pnpm build:full",
     "release": "pnpm prepublish && changeset publish"

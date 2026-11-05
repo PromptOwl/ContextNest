@@ -109,6 +109,24 @@ for (const target of TARGETS) {
   }
 }
 
+// The Claude Code plugin ships the CLI as a pinned npm dependency that Claude
+// Code installs with it, so the pin must be exact and match the lockfile.
+// sync can't fix this one (it needs the registry), so it fails both modes.
+{
+  const dir = join(ROOT, "plugins", "claude-code");
+  const cli = "@promptowl/contextnest-cli";
+  const pin = JSON.parse(read(join(dir, "package.json"))).dependencies?.[cli];
+  const lock = existsSync(join(dir, "package-lock.json")) ? JSON.parse(read(join(dir, "package-lock.json"))) : {};
+  const locked = lock.packages?.[`node_modules/${cli}`]?.version;
+  if (!/^\d+\.\d+\.\d+$/.test(pin ?? "") || locked !== pin || lock.packages?.[""]?.dependencies?.[cli] !== pin) {
+    console.error(
+      `plugins/claude-code pins ${cli} at ${pin ?? "(none)"} but package-lock.json has ${locked ?? "(none)"}. ` +
+        "Pin an exact version, then run `npm install --package-lock-only --ignore-scripts` in plugins/claude-code.",
+    );
+    process.exit(1);
+  }
+}
+
 if (CHECK) {
   if (drift.length) {
     console.error("plugins:sync --check FAILED — vendored copies are out of date:");

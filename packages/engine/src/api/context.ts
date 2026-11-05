@@ -65,6 +65,15 @@ export interface OperationContext {
    * ask for it would have no rules at all.
    */
   readonly structure?: "skip";
+  /**
+   * `true`: create, update, publish and delete stop at the document and its
+   * version entry — no nest checkpoint, no index update. A publish answers
+   * `checkpoint: null`. The host owes `sealWrites` (publish.ts) for every id it
+   * wrote this way: until then context.yaml, INDEX.md and the head checkpoint
+   * do not show those writes. On the context, never in an input — only a host
+   * that runs the seal may skip it (the hosted server, from a background job).
+   */
+  readonly deferSeal?: boolean;
 }
 
 /** See {@link OperationContext.limits}. */

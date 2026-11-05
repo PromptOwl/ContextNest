@@ -1,5 +1,39 @@
 # @promptowl/contextnest-mcp-server
 
+## 2.14.0
+
+### Minor Changes
+
+- Bundle engine 3.5.0: view `html` blocks can declare `write_to` (the earlier `data` blocks their artifact may write rows back to), and checkpoints accept legacy decimal document versions instead of quarantining `context_history.yaml` as `.corrupt`.
+
+## 2.13.0
+
+### Minor Changes
+
+- e206eda: **Faster index regeneration on network storage; hosts can skip the agent config files.**
+
+  - `regenerateIndex` writes the agent config files (`CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.github/copilot-instructions.md`) side by side instead of one after another. They embed the document list, so they change on almost every write; on a GCS-mounted vault that loop cost about 1.3 s per save.
+  - New `NestStorage` option `agentConfigs` (default `true`). A host that serves the vault and never hands those files to a coding agent (the hosted Community server) passes `false`, and each write stops rewriting them. The CLI and MCP server keep the default, so nothing changes for local vaults.
+
+- 578da7a: **Hosts can seal writes later, in a batch.** A new `OperationContext.deferSeal` makes `context_create`, `context_update`, `context_publish`, `context_delete` and `context_import_pdf` stop at the document and its version entry: no nest checkpoint and no index update on the request. A publish answers `checkpoint: null` (the `context_publish` output schema now allows it). The host then calls `sealWrites(storage, { changed, published, triggeredBy })`, which seals every published document in one checkpoint and updates the index once, under the vault lock. `writePublishedVersion` (a publish without its checkpoint) is exported too. Version chains are written on the request, so `verify` is clean before and after the seal. The CLI and MCP server never defer: nothing changes for them.
+- 78f2ab5: **Hosts can supply the vault manifest themselves.** New `NestStorage` option `manifest`: a function returning every document's `manifestEntry`, from a record the host updates with each document write (the hosted Community server will serve it from its database). With it, a write's index update and checkpoint take the vault's documents from that record: no vault crawl, no folder re-reads, and no manifest file or pending list on disk. It works without `CONTEXTNEST_MANIFEST`. Returning `null` falls back to the crawl. `manifestEntry` and `ManifestEntry` are now exported, and manifest entries carry `updated_at` so INDEX.md can be built from them. The CLI and MCP server do not set the option: nothing changes for local vaults.
+
+### Patch Changes
+
+- **`ctx index` and suggestion approval update the index under the vault lock.** `ctx index` now crawls and writes inside the vault lock, and the index update after `approve_suggestion` (MCP) / `ctx drift approve` takes the lock too, so a concurrent write can no longer slip in between. Also ships an experimental manifest-based write path (`.context/manifest/`, off unless `CONTEXTNEST_MANIFEST=on`): with it on, a write's index update and checkpoint read only the changed folder instead of crawling the vault, and `ctx verify` / `context_verify` warn (`stale_index`) about documents changed outside ctx. With it off, which is the default, nothing else changes and no manifest files are written.
+
+## 2.12.0
+
+### Minor Changes
+
+- 1950fba: **`ctx login <server>` now registers the server, so its nests are usable straight away.**
+
+  - A server-wide login adds a remote to your vaults, marked `scope: server` in `~/.contextnest/config.yaml`. It holds no key (the alias borrows the one in the secure store) and never takes your default vault unless it is your first entry. Its nests show as `<alias>/<nest>` in `ctx vault list`; address one with `--vault <alias>/<nest>`, or read across all of them with `--vault <alias>`. The alias comes from the host (`nest.promptowl.ai` → `promptowl`) or `--as`; `--no-register` keeps the old key-only behaviour; a `--nest` login registers nothing.
+  - **Already logged in?** A person at a terminal now sees one line on stderr on every command, until the server is registered (`ctx vault add <alias> --url <server>/mcp`) or hints are off (`ctx hints off`, or `CONTEXTNEST_NO_HINTS=1`). Agents, CI, pipes and `--json` never see it. `ctx doctor` and `ctx login --list [--json]` show which login each alias uses, and the Claude Code plugin mentions an unregistered login at session start.
+  - **Re-authenticating:** auth errors now carry the exact command (`ctx login https://… [--account x]`) instead of `<server>`. `ctx login <alias>` signs in again for a registered alias. At a terminal, a rejected key offers to sign in on the spot and then runs the command you asked for.
+  - New: `ctx vault rename <old> <new>`; `vault list` shows `[server]` / `[nest]`, and a rejected key reads "key rejected" while an unreachable server reads "not answering". The registry's optional `scope` (`nest`, or `server` as written by login) is ignored by older versions, so mixed installs keep working.
+  - Migration: if you logged in before this release, run the `ctx vault add …` command the hint prints. (Don't re-run `ctx login`: it mints a second key on the server.) A registry rewritten by an older ctx drops `scope`; those remotes are then probed as before.
+
 ## 2.11.0
 
 ### Minor Changes

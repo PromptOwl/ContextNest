@@ -38,6 +38,7 @@ import {
 } from "../index.js";
 import { createEngineApi, type OperationContext } from "../api/index.js";
 import { textPdf, textPdfV2, toBase64 } from "./fixtures/pdf-fixtures.js";
+import { useManifest } from "./fixtures/manifest-on.js";
 
 const SUMMARY: StructureConfig = {
   structure: { enforce: true },
@@ -870,15 +871,17 @@ describe("forget and tombstones", () => {
   // r23 evmerge: each imported event re-read, re-parsed and rewrote the whole
   // log, and each record was checked against every one before it: 5000
   // events took 338 s under the vault lock. One read and one write now.
+  // The fix runs in ~3 s alone but 20 s+ under a loaded parallel `pnpm test`,
+  // so the bound only separates linear from quadratic, not fast from slow.
   it("r23 evmerge: 5000 imported forgets merge in one pass", async () => {
     const events = Array.from({ length: 5000 }, (_, i) => forgetEvent(`nodes/gone/d${i}`, `e${i}`)).join("");
     const started = performance.now();
     const r = await importFiles([{ path: ".versions/chain_events.yaml", content: events }]);
     expect(r.failed).toEqual([]);
-    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(performance.now() - started).toBeLessThan(60_000);
     const logged = yaml.load(await readFile(join(dir, ".versions/chain_events.yaml"), "utf-8")) as { event_id: string }[];
     expect(logged.filter((e) => /^e\d+$/.test(e.event_id))).toHaveLength(5000);
-  }, 30_000);
+  }, 120_000);
 
   // r27 B4 (architecture review): the log was deduplicated by event_id alone,
   // so a forged record reusing a logged id (readable from context_forget_log)
@@ -1908,5 +1911,68 @@ describe("plugin drafts", () => {
     expect(await exists("../escape.md")).toBe(false);
     expect(await exists(".versions/x.md")).toBe(false);
     expect((await readFile(join(dir, ".context", "config.yaml"), "utf-8"))).not.toContain("pwned");
+  });
+});
+
+// ─── manifest: context.yaml and seals without a crawl ────────────────────────
+// QA attacks on the manifest (manifest.ts, storage.refreshManifest) that need a
+// real filesystem; the rest live in manifest.test.ts and index-equivalence.test.ts.
+describe("manifest: the index without a crawl", () => {
+  useManifest();
+  let root: string;
+  let storage: NestStorage;
+  const published = (title: string) => `---\ntitle: ${title}\ntype: document\nstatus: published\nversion: 1\n---\n\nx\n`;
+  const indexedIds = async () => (await storage.readContextYaml())?.documents.map((d) => d.id) ?? [];
+  // Where an id's spelling and its folder's on-disk spelling can differ.
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "cn-manifest-adv-"));
+    storage = new NestStorage(root);
+    await storage.init("Manifest Adversarial");
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  // OPEN (storage.ts refreshManifest, ponytail note): a pending id spelled in
+  // another case whose folder is then removed outside the engine resolves to
+  // nothing, so the folder's entries stay in the index until `ctx index`.
+  // `verify` reports them (stale_index). Needs an out-of-engine `rm`.
+  (caseInsensitive ? it.fails : it.skip)(
+    "manifest casegone: a folder removed under a case-variant pending spelling leaves the index without ctx index",
+    async () => {
+      await storage.writeDocument("nodes/Foo/a", published("A"));
+      await storage.writeDocument("nodes/keep", published("Keep"));
+      await storage.regenerateIndex();
+      // An engine write under another spelling, killed before its index update…
+      await storage.writeDocument("nodes/FOO/a", published("A2"));
+      // …then the whole folder removed outside the engine.
+      await rm(join(root, "nodes", "Foo"), { recursive: true, force: true });
+      await storage.writeDocument("nodes/keep", published("Keep2"));
+      await storage.regenerateIndex({ changedIds: ["nodes/keep"] });
+      expect(await indexedIds()).not.toContain("nodes/Foo/a");
+    },
+  );
+
+  // QA pass 4 BL2: written through a Windows 8.3 short name, a published doc
+  // lands in the long-named folder; the index must list it there, never drop it.
+  it.runIf(process.platform === "win32")("manifest shortname: a write through an 8.3 short name indexes the real folder", async (t) => {
+    const { spawnSync } = await import("node:child_process");
+    await storage.writeDocument("nodes/averylongfoldername/x", published("X"));
+    await storage.regenerateIndex();
+    const long = join(root, "nodes", "averylongfoldername");
+    const shortPath = spawnSync("cmd", ["/d", "/s", "/c", `"for %I in ("${long}") do @echo %~sI"`], {
+      encoding: "utf-8",
+      windowsVerbatimArguments: true,
+    }).stdout.trim();
+    const short = shortPath.split("\\").pop() ?? "";
+    // 8.3 names can be disabled per volume: nothing to test then.
+    if (!short || short.toLowerCase() === "averylongfoldername") t.skip();
+    await storage.writeDocument(`nodes/${short}/y`, published("Y"));
+    await storage.regenerateIndex({ changedIds: [`nodes/${short}/y`] });
+    const ids = await indexedIds();
+    expect(ids).toContain("nodes/averylongfoldername/y");
+    expect(ids).not.toContain(`nodes/${short}/y`);
   });
 });

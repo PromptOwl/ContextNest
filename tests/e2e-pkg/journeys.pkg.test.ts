@@ -38,25 +38,33 @@ import {
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, isAbsolute } from "node:path";
 import {
   packCli,
   freshInstall,
   runJourney,
+  startMockProvider,
   repoRoot,
   type Journey,
+  type MockProvider,
   type RunResult,
 } from "./journey-harness.js";
 
 let INSTALL: string;
 const scratch: string[] = [];
+// The loopback embedder/reranker J18 drives semantic/hybrid search against. It
+// runs in its own process (see startMockProvider) and its base_url is only known
+// once it has bound a port, so J18's config-writing closures read it from here.
+let MOCK: MockProvider;
 
-beforeAll(() => {
+beforeAll(async () => {
   const tarball = packCli(scratch);
   INSTALL = freshInstall(tarball, scratch, "journeys");
+  MOCK = await startMockProvider();
 }, 180_000);
 
 afterAll(() => {
+  MOCK?.close();
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
@@ -2777,6 +2785,1149 @@ const J13: Journey = {
   ],
 };
 
+/**
+ * J14 — "I work across more than one vault."
+ *
+ * The consultant's workflow: a separate vault per client, switched between and
+ * kept isolated. Register two local vaults under friendly aliases, confirm the
+ * registry shows both and which is the default, switch the default, then prove
+ * that a query scoped to one vault by `--vault <alias>` only ever returns that
+ * vault's own nodes — never the other's.
+ *
+ * Both vaults deliberately share the same tag (#client) and the same kind of
+ * node id, so a naive un-scoped query WOULD surface both — the vault scoping is
+ * the thing under test, not just that the data happens to differ.
+ *
+ * The journey's own vault dir is used only as a NEUTRAL working directory and is
+ * never initialized: with no local .context to walk up to, `vault which`
+ * resolves through the registry default, so switching the default actually
+ * changes what it reports. The two real vaults (A and B) live in their own temp
+ * dirs, created on first use and cleaned up by the suite's afterAll, and every
+ * command targets them explicitly — by alias, or (for `init`) by pointing
+ * CONTEXTNEST_VAULT_PATH at the vault root.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+let _j14A: string | undefined;
+let _j14B: string | undefined;
+const j14VaultA = () => {
+  if (!_j14A) {
+    _j14A = mkdtempSync(join(tmpdir(), "cn-journey-j14-A-"));
+    scratch.push(_j14A); // cleaned by the suite's afterAll
+  }
+  return _j14A;
+};
+const j14VaultB = () => {
+  if (!_j14B) {
+    _j14B = mkdtempSync(join(tmpdir(), "cn-journey-j14-B-"));
+    scratch.push(_j14B);
+  }
+  return _j14B;
+};
+/** The id/isDefault rows `ctx vault list --json` returns. */
+type VaultRow = { alias: string; isDefault: boolean };
+const vaultRow = (data: unknown, alias: string) =>
+  (data as VaultRow[]).find((r) => r.alias === alias);
+
+const J14: Journey = {
+  id: "J14",
+  title: "Work across more than one vault (consultant — a vault per client)",
+  cases: [
+    {
+      id: "J14-01",
+      title: "Register two separate local vaults under two aliases; vault list shows both",
+      actions: [
+        // Scaffold vault A in its own temp dir. The cwd stays the neutral
+        // journey dir; `init` writes wherever CONTEXTNEST_VAULT_PATH points.
+        {
+          args: ["init", "--name", "Client Alpha"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j14VaultA() }),
+          stdout: ["Initialized"],
+          check: () =>
+            expect(
+              existsSync(join(j14VaultA(), ".context", "config.yaml")),
+              "vault A was not initialized",
+            ).toBe(true),
+        },
+        // Scaffold vault B likewise.
+        {
+          args: ["init", "--name", "Client Beta"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j14VaultB() }),
+          stdout: ["Initialized"],
+          check: () =>
+            expect(
+              existsSync(join(j14VaultB(), ".context", "config.yaml")),
+              "vault B was not initialized",
+            ).toBe(true),
+        },
+        // Register both under friendly aliases (alpha becomes the default).
+        { args: () => ["vault", "add", "alpha", j14VaultA(), "--set-default"] },
+        { args: () => ["vault", "add", "beta", j14VaultB()] },
+        // The registry now lists both aliases.
+        {
+          args: ["vault", "list", "--json"],
+          json: (d) => {
+            expect(vaultRow(d, "alpha"), "alpha not registered").toBeDefined();
+            expect(vaultRow(d, "beta"), "beta not registered").toBeDefined();
+          },
+        },
+      ],
+    },
+    {
+      id: "J14-02",
+      title: "vault list clearly marks which vault is the default",
+      actions: [
+        {
+          args: ["vault", "list", "--json"],
+          json: (d) => {
+            // alpha was registered with --set-default in J14-01.
+            expect(vaultRow(d, "alpha")?.isDefault, "alpha should be the default").toBe(true);
+            expect(vaultRow(d, "beta")?.isDefault, "beta should not be the default").toBe(false);
+          },
+        },
+        // The human listing marks the default with a leading "*" (matched
+        // tolerant of spacing so a cosmetic format tweak doesn't false-fail;
+        // the robust what-check is the isDefault field asserted above).
+        { args: ["vault", "list"], stdout: [/\*\s+alpha\b/] },
+      ],
+    },
+    {
+      id: "J14-03",
+      title: "Switch the default to the other vault; vault which confirms the active vault changed",
+      actions: [
+        // Before the switch, the ambient default (no --vault, neutral cwd) is alpha.
+        {
+          args: ["vault", "which", "--json"],
+          json: (d) => {
+            expect((d as { alias?: string }).alias, "default should start as alpha").toBe("alpha");
+            expect((d as { source?: string }).source).toBe("default");
+          },
+        },
+        {
+          args: ["vault", "default", "beta"],
+          stdout: ['Default vault is now "beta"'],
+        },
+        // After the switch, the ambient default is now beta.
+        {
+          args: ["vault", "which", "--json"],
+          json: (d) => {
+            expect((d as { alias?: string }).alias, "default should now be beta").toBe("beta");
+            expect((d as { source?: string }).source).toBe("default");
+          },
+        },
+      ],
+    },
+    {
+      id: "J14-04",
+      title: "Query a vault by its alias and get back only that vault's nodes",
+      actions: [
+        // Put one node in each vault — same tag, same kind of id — so vault
+        // scope is the only thing that can tell them apart. --publish bypasses
+        // the review gate so the nodes are immediately queryable.
+        {
+          args: [
+            "add", "nodes/alpha-roadmap", "--vault", "alpha",
+            "--type", "document", "--title", "Alpha Roadmap", "--tags", "client", "--publish",
+          ],
+          stdout: ["Created and published nodes/alpha-roadmap"],
+        },
+        {
+          args: [
+            "add", "nodes/beta-roadmap", "--vault", "beta",
+            "--type", "document", "--title", "Beta Roadmap", "--tags", "client", "--publish",
+          ],
+          stdout: ["Created and published nodes/beta-roadmap"],
+        },
+        // Listing alpha returns exactly alpha's node.
+        {
+          args: ["list", "--vault", "alpha", "--json"],
+          json: (d) => {
+            const ids = (d as Array<{ id: string }>).map((r) => r.id);
+            expect(ids).toEqual(["nodes/alpha-roadmap"]);
+          },
+        },
+        // Querying alpha's (shared) tag returns only alpha's node.
+        {
+          args: ["query", "#client", "--vault", "alpha", "--json"],
+          stdoutNot: ["beta-roadmap", "Beta Roadmap"],
+          json: (d) => expect(queryDocIds(d)).toEqual(["nodes/alpha-roadmap"]),
+        },
+      ],
+    },
+    {
+      id: "J14-05",
+      title: "No cross-vault leak: a node in one vault never appears when querying the other",
+      actions: [
+        // The mirror of J14-04: beta's scope returns only beta's node...
+        {
+          args: ["list", "--vault", "beta", "--json"],
+          json: (d) => {
+            const ids = (d as Array<{ id: string }>).map((r) => r.id);
+            expect(ids).toEqual(["nodes/beta-roadmap"]);
+          },
+        },
+        {
+          args: ["query", "#client", "--vault", "beta", "--json"],
+          stdoutNot: ["alpha-roadmap", "Alpha Roadmap"],
+          json: (d) => expect(queryDocIds(d)).toEqual(["nodes/beta-roadmap"]),
+        },
+        // Positive control: the SAME single-word search DOES find beta's node
+        // when scoped to beta — so the empty result in alpha below is produced
+        // by vault scoping, not by a dead index or a query that matches nothing
+        // anywhere.
+        {
+          args: ["search", "Beta", "--vault", "beta"],
+          stdout: ["nodes/beta-roadmap"],
+        },
+        // ...and full-text search is scoped too: the same "Beta" (unique to
+        // beta's node, absent from alpha's "Alpha Roadmap") finds nothing when
+        // the search is scoped to alpha.
+        {
+          args: ["search", "Beta", "--vault", "alpha"],
+          stdout: ["No results found."],
+          stdoutNot: ["beta-roadmap", "alpha-roadmap"],
+        },
+      ],
+    },
+  ],
+};
+
+// J15 exports a node to a file OUTSIDE the vault — a share you hand to someone
+// who doesn't run Context Nest. The destination is a module-level temp dir (NOT
+// the vault), created once and cleaned by the suite's afterAll; the export path
+// is a function-form arg so it resolves at run time.
+let _j15Out = "";
+const j15OutDir = () => {
+  if (!_j15Out) {
+    _j15Out = mkdtempSync(join(tmpdir(), "cn-journey-j15-out-"));
+    scratch.push(_j15Out); // cleaned by the suite's afterAll
+  }
+  return _j15Out;
+};
+// A distinct destination per case: `--out` refuses to overwrite an existing
+// file non-interactively, so each export that re-runs the command writes its own
+// file (a user exporting the node to share in more than one place).
+const j15Export = (name: string) => join(j15OutDir(), name);
+
+/** The *.html files inside the vault tree, vault-relative, forward-slashed. */
+const vaultHtml = (root: string): string[] => {
+  const out: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".html"))
+        out.push(p.slice(root.length + 1).replace(/\\/g, "/"));
+    }
+  };
+  walk(root);
+  return out.sort();
+};
+
+/**
+ * J15 — "I want to share one node with someone who doesn't use Context Nest."
+ * Export a published node to a standalone, styled HTML file via
+ * `read <id> --html --out <file>`, and prove the file is self-contained,
+ * carries the node's content, renders the markdown, lands outside the vault,
+ * and that the HTML-only `--out` guard can't silently litter a file.
+ *
+ * Review gate is OFF so the single `add` publishes directly — this journey is
+ * about export, not the review workflow (that is J7). Case ids + titles are the
+ * ticket's verbatim lines.
+ */
+const J15: Journey = {
+  id: "J15",
+  title: "Share a node outside the vault (HTML export)",
+  cases: [
+    {
+      id: "J15-01",
+      title: "I export a published node to an HTML file at a path I choose",
+      actions: [
+        { args: ["init", "--name", "share-demo"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/handoff",
+            "--type", "document",
+            "--title", "Project Handoff",
+            "--tags", "#share",
+            "--body",
+            "# Project Handoff\n\nStatus is **green**. See [[nodes/plan]] for the plan.\n\n- item one\n- item two",
+          ],
+          stdout: ["Created and published", "nodes/handoff"],
+        },
+        // The export: `--html --out` writes a styled HTML file to the path I name.
+        // "Written to <path>" (stdout) is the confirmation a user relies on.
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("share.html")],
+          stdout: ["Written to"],
+          check: () =>
+            expect(existsSync(j15Export("share.html")), "export file should be created").toBe(true),
+        },
+      ],
+    },
+    // J15-02..05 reuse the nodes/handoff node that J15-01 created — these cases
+    // share one vault and run in order (per the file header), so a case is not
+    // runnable on its own; vitest's -t selects whole journeys, not single cases.
+    {
+      id: "J15-02",
+      title: "The exported file is real HTML carrying the node's title and body",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("with-content.html")],
+          stdout: ["Written to"],
+          check: () => {
+            const html = readFileSync(j15Export("with-content.html"), "utf-8");
+            // A standalone HTML document a browser opens on its own...
+            expect(html).toContain("<!DOCTYPE html>");
+            expect(html).toMatch(/<html\b/);
+            expect(html).toContain("<body>");
+            // ...carrying the node's title and its body text, readable without the vault.
+            expect(html).toContain("Project Handoff");
+            expect(html).toContain("green");
+            expect(html).toContain("item one");
+          },
+        },
+      ],
+    },
+    {
+      id: "J15-03",
+      title: "The export lands outside the vault and nothing inside the vault changes",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("outside.html")],
+          stdout: ["Written to"],
+          check: (vaultDir) => {
+            // The export is a plain file OUTSIDE the vault directory. Compare via
+            // path.relative (not a raw string prefix, which false-positives on
+            // sibling dirs sharing a prefix and is unreliable under Windows 8.3
+            // names / drive-letter casing): a path outside vaultDir yields a
+            // relative that escapes with ".." or is absolute (different drive).
+            const rel = relative(vaultDir, j15Export("outside.html"));
+            expect(
+              rel.startsWith("..") || isAbsolute(rel),
+              `export must land outside the vault directory (relative: ${rel})`,
+            ).toBe(true);
+            // ...and the export writes nothing into the vault: the only .html in
+            // the vault tree is the init-time welcome page — no export leaked in.
+            expect(vaultHtml(vaultDir)).toEqual([".context/welcome.html"]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J15-04",
+      title: "Asking to save without --html writes no file (export is HTML-only)",
+      actions: [
+        // `--out` requires `--html`; without it the CLI just prints the node the
+        // normal way and writes no file — a fat-finger can't silently litter one.
+        {
+          args: () => ["read", "nodes/handoff", "--out", j15Export("guard.html")],
+          stdout: ["Project Handoff", "Status is"],
+          stdoutNot: ["Written to", "<!DOCTYPE html>"],
+          check: () =>
+            expect(
+              existsSync(j15Export("guard.html")),
+              "no file should be written without --html",
+            ).toBe(false),
+        },
+      ],
+    },
+    {
+      id: "J15-05",
+      title: "Markdown in the body renders as HTML, not raw markdown",
+      actions: [
+        {
+          args: () => ["read", "nodes/handoff", "--html", "--out", j15Export("rendered.html")],
+          stdout: ["Written to"],
+          check: () => {
+            const html = readFileSync(j15Export("rendered.html"), "utf-8");
+            // Markdown is rendered to real HTML elements...
+            // Match tags by name only (\b), so adding attributes to a tag in a
+            // future renderer change doesn't break the test.
+            expect(html).toMatch(/<h1\b/); // "# Project Handoff"
+            expect(html).toMatch(/<strong\b/); // "**green**"
+            expect(html).toMatch(/<li\b/); // "- item one / - item two"
+            expect(html).toContain('class="wikilink"'); // "[[nodes/plan]]"
+            // ...not dumped as the raw markdown source.
+            expect(html).not.toContain("**green**");
+            expect(html).not.toContain("[[nodes/plan]]");
+          },
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J16 — "I organize my work on a task board."
+ * The vault doubles as a personal task board. Work items are `task` nodes;
+ * their board column is just a tag (`#todo` / `#doing` / `#done`) alongside a
+ * shared project tag. The user pulls up a single column, the whole board, and a
+ * finished-only view by combining `type:task` with a column tag — then moves an
+ * item across columns by retagging it. The dedicated `ctx task` command is
+ * remote-only (it logs work against a remote nest); this is the fully-local
+ * board that works offline against a plain vault, driven entirely through
+ * `ctx add --tags` / `ctx update --tags` — no frontmatter hand-edits.
+ *
+ * The review gate is OFF (like J2/J10/J14): a board is about browsing what's
+ * there, so each item should land visible immediately rather than wait behind a
+ * gate. Membership is asserted with `--json` (`queryDocIds`, sorted) because the
+ * set of ids returned is the contract here, not the human wording.
+ *
+ * Cases share one vault and run top-to-bottom — a case is not runnable alone,
+ * and the retag in J16-06 depends on the board built in J16-02/J16-04. Case ids
+ * + titles are the ticket's verbatim lines.
+ */
+const J16: Journey = {
+  id: "J16",
+  title: "Organize work on a task board (solo maker)",
+  cases: [
+    {
+      id: "J16-01",
+      title: "Starting a fresh board: an empty vault is ready and asking for tasks returns nothing",
+      actions: [
+        {
+          args: ["init", "--name", "task-board"],
+          stdout: ["Initialized"],
+          files: [
+            { path: "CONTEXT.md", exists: true },
+            { path: ".context", exists: true },
+          ],
+        },
+        // A board is about browsing — writes should land visible, not wait behind the gate.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        // No task nodes yet, so the board is empty.
+        {
+          args: ["query", "type:task", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+      ],
+    },
+    {
+      id: "J16-02",
+      title: "I add several work items as task nodes, each tagged with its column and a shared project tag",
+      actions: [
+        {
+          args: [
+            "add", "nodes/ship-email",
+            "--type", "task",
+            "--title", "Ship the onboarding email",
+            "--tags", "project,todo",
+            "--body", "Draft and send the welcome email.",
+            "-y",
+          ],
+          stdout: ["Created and published", "nodes/ship-email"],
+          files: [{ path: "nodes/ship-email.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/fix-login",
+            "--type", "task",
+            "--title", "Fix the login bug",
+            "--tags", "project,doing",
+            "--body", "Add the missing null check.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/fix-login.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/release-notes",
+            "--type", "task",
+            "--title", "Write the release notes",
+            "--tags", "project,done",
+            "--body", "Summarize the v3 changes.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/release-notes.md", exists: true }],
+        },
+      ],
+    },
+    {
+      id: "J16-03",
+      title: 'Show my To-Do column: filtering by the todo tag returns only todo items',
+      actions: [
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/ship-email"]),
+        },
+      ],
+    },
+    {
+      id: "J16-04",
+      title: "Show everything on the board: filtering by node type task returns every work item and nothing else",
+      actions: [
+        // A non-task node in the same project — it must NOT show up on the board.
+        {
+          args: [
+            "add", "nodes/project-overview",
+            "--type", "document",
+            "--title", "Project overview",
+            "--tags", "project",
+            "--body", "Context for the project. Not a work item.",
+            "-y",
+          ],
+          stdout: ["Created and published"],
+          files: [{ path: "nodes/project-overview.md", exists: true }],
+        },
+        // The board = every task node, and only task nodes.
+        {
+          args: ["query", "type:task", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual([
+              "nodes/fix-login",
+              "nodes/release-notes",
+              "nodes/ship-email",
+            ]),
+        },
+        // Discriminator: the document DOES exist and shares the project tag — it's
+        // excluded from the board by TYPE, not because it's missing or unpublished.
+        {
+          args: ["query", "#project", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual([
+              "nodes/fix-login",
+              "nodes/project-overview",
+              "nodes/release-notes",
+              "nodes/ship-email",
+            ]),
+        },
+      ],
+    },
+    {
+      id: "J16-05",
+      title: "Show the Done column: combining the task type with the done tag returns only finished items",
+      actions: [
+        {
+          args: ["query", "type:task #done", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/release-notes"]),
+        },
+      ],
+    },
+    {
+      id: "J16-06",
+      title: "I move an item across columns by retagging it, and it leaves the old column and appears in the new one",
+      actions: [
+        // Starting position: ship-email is the only card in To-Do.
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual(["nodes/ship-email"]),
+        },
+        // Move it todo → doing. `--tags` REPLACES the tag set, so #todo is dropped
+        // and #doing is added in one edit (the project tag is carried over).
+        {
+          args: ["update", "nodes/ship-email", "--tags", "project,doing"],
+          stdout: ["Updated and published", "Version: 2"],
+        },
+        // It's gone from To-Do...
+        {
+          args: ["query", "type:task #todo", "--json"],
+          json: (data) => expect(queryDocIds(data)).toEqual([]),
+        },
+        // ...and now sits in Doing alongside the card that was already there.
+        {
+          args: ["query", "type:task #doing", "--json"],
+          json: (data) =>
+            expect(queryDocIds(data)).toEqual(["nodes/fix-login", "nodes/ship-email"]),
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J17 — "I onboard an AI agent to a new vault."
+ * `ctx init --starter <recipe> --tools <agents>` is how a fresh project becomes
+ * agent-aware: a starter scaffolds the vault AND `agent-configs.ts` writes the
+ * chosen agents' config files (`CLAUDE.md`, `.cursorrules`, `GEMINI.md`,
+ * `.windsurfrules`, `.github/copilot-instructions.md`). The user previews the
+ * recipes first (writes nothing), onboards one agent, checks the generated
+ * config is self-contained and actually works, onboards several agents at once,
+ * and confirms opting out (`--tools none`) builds the vault but leaves the
+ * project free of agent config.
+ *
+ * Each scenario onboards into its OWN fresh project dir (a plain init scaffolds
+ * into a directory). Like J14, those dirs are created once, memoized, pushed to
+ * `scratch` for the suite's afterAll, and targeted per action via
+ * `CONTEXTNEST_VAULT_PATH` (an absolute vault path wins over cwd in vault
+ * resolution). File assertions read those dirs directly in `check` — the
+ * harness's `files`/vault root is the journey's sandbox vault, which this
+ * journey never writes to.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const _j17dirs: Record<string, string> = {};
+const j17dir = (key: string) => {
+  if (!_j17dirs[key]) {
+    _j17dirs[key] = mkdtempSync(join(tmpdir(), `cn-journey-j17-${key}-`));
+    scratch.push(_j17dirs[key]); // cleaned by the suite's afterAll
+  }
+  return _j17dirs[key];
+};
+/** The agent config file each `--tools` id writes, relative to the project root. */
+const AGENT_CONFIGS = [
+  "CLAUDE.md",
+  ".cursorrules",
+  "GEMINI.md",
+  ".windsurfrules",
+  join(".github", "copilot-instructions.md"),
+];
+const J17: Journey = {
+  id: "J17",
+  title: "Onboard an AI agent to a new vault (developer)",
+  cases: [
+    {
+      id: "J17-01",
+      title: "Previewing the starter templates lists the recipes and writes nothing to disk",
+      actions: [
+        {
+          args: ["init", "--list-starters"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("list") }),
+          stdout: ["Available starter recipes:", "developer"],
+          // A pure preview: the target dir stays completely empty — no vault, no
+          // agent config, no context.yaml, nothing. Assert the whole dir is empty
+          // (not just a handful of named files) so any stray write is caught.
+          check: () => {
+            const d = j17dir("list");
+            expect(readdirSync(d), "list-starters must write nothing to disk").toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-02",
+      title: "Onboarding one agent scaffolds the vault and writes a CLAUDE.md",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer", "--tools", "claude", "--name", "onboard-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
+          stdout: ["Applied starter: Developer / Engineering", "Created 3 documents"],
+          check: () => {
+            const d = j17dir("claude");
+            // The vault was scaffolded...
+            expect(existsSync(join(d, "CONTEXT.md")), "vault CONTEXT.md").toBe(true);
+            expect(existsSync(join(d, "context.yaml")), "vault context.yaml").toBe(true);
+            // ...and the chosen agent's config file was written.
+            expect(existsSync(join(d, "CLAUDE.md")), "CLAUDE.md").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-03",
+      title: "The written CLAUDE.md is self-contained and correct: auto-generated marker plus how to run ctx query",
+      actions: [
+        {
+          // Reuses the vault J17-02 onboarded (same memoized `claude` dir) — this
+          // case must stay after J17-02; do not reorder.
+          // An agent following the generated config runs `ctx query` against the
+          // vault that was just created — and it answers with the starter nodes.
+          args: ["query", "type:document", "--json"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("claude") }),
+          json: (data) => {
+            // Precondition guard: a missing vault here means J17-02 didn't run
+            // first. Surface that directly instead of a bare "no docs" diff.
+            expect(
+              existsSync(join(j17dir("claude"), "CLAUDE.md")),
+              "J17-03 reuses the vault J17-02 onboarded — J17-02 must run first (do not reorder)",
+            ).toBe(true);
+            expect(queryDocIds(data)).toEqual([
+              "nodes/architecture/architecture-overview",
+              "nodes/onboarding/getting-started",
+              "nodes/standards/coding-conventions",
+            ]);
+          },
+          // The config is self-contained: it marks its own auto-generated block
+          // and teaches the agent the one command it needs — no external setup.
+          check: () => {
+            const claudeMd = readFileSync(join(j17dir("claude"), "CLAUDE.md"), "utf-8");
+            expect(claudeMd).toContain("do not edit this section");
+            expect(claudeMd).toContain("Context Nest vault");
+            expect(claudeMd).toContain("ctx query");
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-04",
+      title: "Onboarding several agents at once writes each one's config file",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer",
+            "--tools", "claude,cursor,gemini,windsurf,copilot", "--name", "multi-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("multi") }),
+          stdout: ["Applied starter: Developer / Engineering"],
+          // Every onboarded tool gets its config file — the positive mirror of
+          // J17-05's "all absent", so each AGENT_CONFIGS entry is covered both ways.
+          check: () => {
+            const d = j17dir("multi");
+            for (const f of AGENT_CONFIGS)
+              expect(existsSync(join(d, f)), `expected ${f} for its tool`).toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J17-05",
+      title: "Opting out still builds the vault but writes no agent config files at all",
+      actions: [
+        {
+          args: [
+            "init", "--starter", "developer", "--tools", "none", "--name", "none-demo",
+          ],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j17dir("none") }),
+          stdout: ["Applied starter: Developer / Engineering", "Created 3 documents"],
+          check: () => {
+            const d = j17dir("none");
+            // The vault is still built...
+            expect(existsSync(join(d, "CONTEXT.md")), "vault CONTEXT.md").toBe(true);
+            expect(existsSync(join(d, ".context")), "vault .context").toBe(true);
+            // ...but NOT a single agent config file was written.
+            for (const f of AGENT_CONFIGS)
+              expect(existsSync(join(d, f)), `--tools none must not write ${f}`).toBe(false);
+          },
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * A semantic/hybrid search hit as `search --mode semantic|hybrid [--rerank] --json`
+ * returns it: a total `score` plus a per-signal `scores` breakdown, and (when
+ * reranked) the best `passage`. Which signals appear depends on the mode and on
+ * whether the node matched that signal at all (a semantic-only hit carries no
+ * `scores.lexical`).
+ */
+type SemHit = {
+  id: string;
+  title: string;
+  score: number;
+  scores: { lexical?: number; semantic?: number; rrf?: number; rerank?: number };
+  passage?: string;
+};
+const semHits = (data: unknown) => data as SemHit[];
+const semOrder = (data: unknown) => (data as SemHit[]).map((h) => h.id);
+
+/** What `ctx embed --json` returns. */
+type EmbedResult = {
+  provider: string;
+  model: string;
+  path: string;
+  total: number;
+  embedded: number;
+  reused: number;
+  pruned: number;
+  dimensions: number;
+};
+
+// The index file the configured provider/model/dims resolve to (spec: one .vec
+// per provider--model--d<dims>), and the human path the CLI prints — both use
+// forward slashes even on Windows.
+const J18_VEC = ".context/embeddings/openai--text-embedding-3-small--d8.vec";
+
+/**
+ * The `search:` block appended to a vault's `.context/config.yaml` for J18 — the
+ * only CLI-reachable way to wire an offline provider: `provider: openai` pointed
+ * at the loopback mock's base_url (loopback needs no CONTEXTNEST_TRUSTED_ENDPOINTS).
+ * The rerank block carries its OWN base_url — the embeddings base_url does not
+ * carry over, and without it rerank would reach for api.openai.com. Pass
+ * `rerankBase: null` to omit the rerank block entirely (the "no rerank block"
+ * guardrail), or a different `embBase` to point embeddings at an untrusted host.
+ */
+const j18SearchBlock = (
+  embBase: string,
+  opts?: { rerankBase?: string | null },
+) => {
+  const rerankBase = opts?.rerankBase === undefined ? embBase : opts.rerankBase;
+  return [
+    "",
+    "search:",
+    "  mode: hybrid",
+    "  fusion_weights: { lexical: 1, semantic: 2 }",
+    "  embeddings:",
+    "    provider: openai",
+    "    model: text-embedding-3-small",
+    `    base_url: ${embBase}`,
+    "    dimensions: 8",
+    ...(rerankBase
+      ? [
+          "  rerank:",
+          "    provider: openai",
+          "    model: rerank-english-v3.0",
+          "    top_n: 100",
+          `    base_url: ${rerankBase}`,
+        ]
+      : []),
+    "",
+  ].join("\n");
+};
+
+/**
+ * A `mutate` that appends the search block to a vault's config. With `dir` empty
+ * it writes the journey's own vault (the vaultDir the mutate is handed); with a
+ * `dir` it writes that sub-vault instead. `embBase` is a thunk so the runtime
+ * mock base_url (only known after beforeAll) is read when the mutate runs.
+ */
+const appendSearchBlock =
+  (dir: string, embBase: () => string, opts?: { rerankBase?: string | null }) =>
+  (vaultDir: string) => {
+    const cfg = join(dir || vaultDir, ".context", "config.yaml");
+    writeFileSync(cfg, readFileSync(cfg, "utf-8") + j18SearchBlock(embBase(), opts));
+  };
+
+// J18's guardrail cases each need their own vault in a distinct state (no index,
+// an untrusted endpoint, encrypted) — separate temp vaults targeted per-action
+// via CONTEXTNEST_VAULT_PATH, the same way J17 drives several onboarded vaults.
+const _j18dirs: Record<string, string> = {};
+const j18dir = (key: string) => {
+  if (!_j18dirs[key]) {
+    _j18dirs[key] = mkdtempSync(join(tmpdir(), `cn-journey-j18-${key}-`));
+    scratch.push(_j18dirs[key]); // cleaned by the suite's afterAll
+  }
+  return _j18dirs[key];
+};
+const subEnv = (key: string) => () => ({ CONTEXTNEST_VAULT_PATH: j18dir(key) });
+// An encrypted sub-vault: keep the CLI off the OS keychain and blank any ambient
+// key so the key lives only in the sandboxed file store (same recipe as J8).
+const encEnv = (key: string) => () => ({
+  CONTEXTNEST_VAULT_PATH: j18dir(key),
+  CONTEXTNEST_CREDENTIALS_BACKEND: "file",
+  CONTEXTNEST_VAULT_KEY: undefined,
+  CONTEXTNEST_VAULT_PASSPHRASE: "",
+  CONTEXTNEST_CREDENTIALS_KEY: "",
+});
+
+// A paraphrase of the billing node that shares NO word with its body — the whole
+// point of semantic search. "charging / customers / payment" live in the mock
+// embedder's billing concept bucket alongside the node's "invoice / billing /
+// dunning", so they embed near each other while stemmed-keyword search finds no
+// overlap (J18-03 proves the miss). The empty lexical control in J18-03 depends
+// on this query sharing no stem with billing-faq's TITLE or body — so if you edit
+// either the node's title/body or this query, keep them lexically disjoint (and
+// in the same mock concept bucket, or J18-02 stops finding it).
+const J18_MEANING_QUERY = "charging customers and taking payment";
+// Hits BOTH signals: "pipeline" is a literal word in the deploy node (lexical),
+// "charging payment" is the billing concept (semantic). The node matching both
+// lists is lifted above the one matching only one — the essence of RRF fusion.
+const J18_FUSION_QUERY = "pipeline charging payment";
+
+/**
+ * J18 — "I find a node by meaning, not just by its words."
+ *
+ * The retrieval promise once embeddings are turned on (spec §semantic; the #190
+ * opt-in half): a paraphrase that shares no words with a node still finds it
+ * (semantic), plain keyword search is the honest control that misses it, hybrid
+ * fuses both signals so a node matching each ranks highest, and an optional
+ * rerank refines the top and surfaces the best passage. The index is built only
+ * from published nodes and the whole thing stays opt-in and safe — it refuses to
+ * run without an index, against an endpoint the user never trusted, or on an
+ * encrypted vault (where an embedding index would be a plaintext-derived copy of
+ * sealed content).
+ *
+ * OFFLINE BY DESIGN: a real embedder needs a network provider and an API key,
+ * neither available in CI. The only CLI-reachable substitute is `provider:
+ * openai` pointed at a loopback base_url, so this journey stands up a tiny
+ * OpenAI-compatible mock in its own process (startMockProvider → mock-embedder.mjs)
+ * that returns deterministic "concept" vectors — enough to prove meaning-based
+ * retrieval, not just that the plumbing is wired. Review is OFF in the main vault
+ * (like J10) so each node publishes and is indexable; J18-06 turns it back on to
+ * prove a held node is left OUT of the index.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J18: Journey = {
+  id: "J18",
+  title: "Find a node by meaning (semantic & hybrid search)",
+  cases: [
+    {
+      id: "J18-01",
+      title:
+        "Building the embedding index covers every published node and is kept out of version control",
+      actions: [
+        { args: ["init", "--name", "meaning"], stdout: ["Initialized"] },
+        // Review OFF so each add publishes and is embeddable (a held node is
+        // published-only-excluded — that contract is J18-06).
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/billing-faq",
+            "--type", "document",
+            "--title", "Collecting money from accounts",
+            "--tags", "#finance",
+            "--body", "We raise an invoice every billing cycle. Dunning emails chase any overdue invoice until it clears.",
+            "-y",
+          ],
+          files: [{ path: "nodes/billing-faq.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/deploy-guide",
+            "--type", "document",
+            "--title", "Deployment guide",
+            "--tags", "#ops",
+            "--body", "We ship each release through the pipeline nightly.",
+            "-y",
+          ],
+          files: [{ path: "nodes/deploy-guide.md", exists: true }],
+        },
+        // Wire the offline provider, then build the index: both published nodes
+        // are embedded into one .vec keyed by provider--model--d<dims>...
+        {
+          // The main vault is the journey's own isolated vault root; an empty
+          // `dir` makes the mutate write the config it is handed.
+          mutate: appendSearchBlock("", () => MOCK.baseUrl),
+          args: ["embed", "--json"],
+          json: (data) => {
+            const e = data as EmbedResult;
+            expect(e.provider).toBe("openai");
+            expect(e.model).toBe("text-embedding-3-small");
+            expect(e.path).toBe(J18_VEC);
+            expect(e.total).toBe(2);
+            expect(e.embedded).toBe(2);
+            expect(e.reused).toBe(0);
+            expect(e.pruned).toBe(0);
+            expect(e.dimensions).toBe(8);
+          },
+          files: [
+            { path: J18_VEC, exists: true },
+            // The index dir git-ignores everything — the embeddings never ride
+            // the version chain or land in a commit.
+            { path: ".context/embeddings/.gitignore", exists: true, contains: "*" },
+          ],
+        },
+        // Re-running reuses the unchanged index rather than re-embedding, and the
+        // human line reports it — the one wording a user reads after `ctx embed`.
+        {
+          args: ["embed"],
+          stdout: [
+            "Embedded 0, reused 2, pruned 0 — 2 published document(s) indexed",
+            "openai text-embedding-3-small (8d)",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J18-02",
+      title: "A search by meaning finds a node whose words never appear in the query",
+      actions: [
+        // The paraphrase shares no word with billing-faq's body, yet semantic
+        // search ranks it first — found by meaning. The hit carries a semantic
+        // score equal to the total (pure semantic mode), and NO lexical signal.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "semantic", "--json"],
+          json: (data) => {
+            const hits = semHits(data);
+            expect(hits[0].id).toBe("nodes/billing-faq");
+            expect(typeof hits[0].scores.semantic).toBe("number");
+            expect(hits[0].scores.semantic).toBe(hits[0].score);
+            expect(hits[0].scores.lexical).toBeUndefined();
+            // The off-topic node, if present, ranks strictly below.
+            const deploy = hits.find((h) => h.id === "nodes/deploy-guide");
+            if (deploy) expect(deploy.score).toBeLessThan(hits[0].score);
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-03",
+      title: "The same query in plain keyword search finds nothing — why meaning search matters",
+      actions: [
+        // The honest control: lexical (stemmed-keyword) search over the very same
+        // query returns an empty result, because the query and the node share no
+        // word stem. This is the delta that makes J18-02 meaningful.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "lexical", "--json"],
+          json: (data) => expect(data).toEqual([]),
+        },
+        { args: ["search", J18_MEANING_QUERY, "--mode", "lexical"], stdout: ["No results found."] },
+      ],
+    },
+    {
+      id: "J18-04",
+      title: "Hybrid search blends meaning and keywords, and a node matching both ranks highest",
+      actions: [
+        // "pipeline" is a literal word in deploy-guide (lexical hit); "charging
+        // payment" is the billing concept (semantic hit for billing-faq). Hybrid
+        // fuses the two ranked lists with RRF: deploy-guide appears in BOTH lists,
+        // so it outranks billing-faq even though billing-faq has the higher raw
+        // semantic score — the point of fusion. The leader carries all three of
+        // rrf/lexical/semantic, with the total equal to the rrf score.
+        {
+          args: ["search", J18_FUSION_QUERY, "--mode", "hybrid", "--json"],
+          json: (data) => {
+            const hits = semHits(data);
+            expect(semOrder(data)).toEqual(["nodes/deploy-guide", "nodes/billing-faq"]);
+            const [deploy, billing] = hits;
+            expect(typeof deploy.scores.rrf).toBe("number");
+            expect(typeof deploy.scores.lexical).toBe("number");
+            expect(typeof deploy.scores.semantic).toBe("number");
+            expect(deploy.score).toBe(deploy.scores.rrf);
+            // billing-faq matched on meaning only — a semantic score, no lexical...
+            expect(typeof billing.scores.semantic).toBe("number");
+            expect(billing.scores.lexical).toBeUndefined();
+            // ...and it even has the STRONGER raw semantic score of the two — the
+            // paraphrase is squarely its concept, only glancingly deploy's. So the
+            // ranking is not "deploy is simply more relevant"; fusion lifted the
+            // dual-signal node above the higher-semantic single-signal one. That
+            // "despite losing the semantic signal" is the whole point of RRF here.
+            expect(billing.scores.semantic!).toBeGreaterThan(deploy.scores.semantic!);
+            expect(deploy.score).toBeGreaterThan(billing.score);
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-05",
+      title: "Re-ranking the hits refines the order and surfaces the best passage",
+      actions: [
+        // With the meaning query, rerank re-scores the fused hits: billing-faq
+        // leads, each hit now carries a rerank score (equal to the total) and the
+        // best matching passage from its body — what a reader would quote.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "hybrid", "--rerank", "--json"],
+          json: (data) => {
+            const hits = semHits(data);
+            expect(hits[0].id).toBe("nodes/billing-faq");
+            expect(typeof hits[0].scores.rerank).toBe("number");
+            expect(hits[0].scores.rerank).toBe(hits[0].score);
+            expect(hits[0].passage).toContain("invoice every billing cycle");
+            // Every hit is reranked and surfaces a NON-EMPTY passage; order is by
+            // rerank score.
+            for (const h of hits) {
+              expect(typeof h.scores.rerank).toBe("number");
+              expect((h.passage ?? "").length).toBeGreaterThan(0);
+            }
+            const scores = hits.map((h) => h.score);
+            expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-06",
+      title: "Only published nodes are embedded — a node held for review stays out of the index",
+      actions: [
+        // Turn the review gate back on and capture a node: it is HELD, not
+        // published.
+        { args: ["config", "set", "review", "on"], stdout: ["review: on"] },
+        {
+          args: [
+            "add", "nodes/held-draft",
+            "--type", "document",
+            "--title", "Draft billing memo",
+            "--tags", "#finance",
+            "--body", "A draft note about invoices and billing, not yet approved.",
+            "-y",
+          ],
+          stdout: ["Held for review", "nodes/held-draft"],
+          files: [{ path: "nodes/held-draft.md", exists: true }],
+        },
+        // Re-embedding still indexes only the two published nodes — the held one
+        // is not counted (total stays 2, nothing new embedded).
+        {
+          args: ["embed", "--json"],
+          json: (data) => {
+            const e = data as EmbedResult;
+            expect(e.total).toBe(2);
+            expect(e.embedded).toBe(0);
+            expect(e.reused).toBe(2);
+          },
+        },
+        // And it is unreachable by meaning: a semantic search in its own concept
+        // returns the published billing node, never the held draft.
+        {
+          args: ["search", J18_MEANING_QUERY, "--mode", "semantic", "--json"],
+          json: (data) => {
+            const ids = semOrder(data);
+            expect(ids).toContain("nodes/billing-faq");
+            expect(ids).not.toContain("nodes/held-draft");
+          },
+        },
+      ],
+    },
+    {
+      id: "J18-07",
+      title:
+        "Meaning search refuses to run without an index, against an untrusted endpoint, or on an encrypted vault",
+      actions: [
+        // (a) A configured vault with NO index yet: semantic search refuses and
+        // points the user at the one command that fixes it.
+        { args: ["init", "--name", "guard-noindex"], env: subEnv("noindex"), stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], env: subEnv("noindex"), stdout: ["review: off"] },
+        {
+          args: ["add", "nodes/a", "--type", "document", "--title", "A", "--body", "invoice billing dunning", "-y"],
+          env: subEnv("noindex"),
+        },
+        {
+          mutate: (v) => appendSearchBlock(j18dir("noindex"), () => MOCK.baseUrl)(v),
+          env: subEnv("noindex"),
+          args: ["search", "charging payment", "--mode", "semantic", "--json"],
+          status: 1,
+          stderr: ["needs an embedding index", "ctx embed"],
+        },
+        // (b) An embeddings endpoint the user never trusted (a non-loopback host
+        // that is not the OpenAI default): embed refuses before any call goes out.
+        { args: ["init", "--name", "guard-untrusted"], env: subEnv("untrusted"), stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], env: subEnv("untrusted"), stdout: ["review: off"] },
+        {
+          args: ["add", "nodes/a", "--type", "document", "--title", "A", "--body", "invoice billing", "-y"],
+          env: subEnv("untrusted"),
+        },
+        {
+          mutate: (v) =>
+            appendSearchBlock(j18dir("untrusted"), () => "https://attacker.example/v1", { rerankBase: null })(v),
+          env: subEnv("untrusted"),
+          args: ["embed", "--json"],
+          status: 1,
+          stderr: ["attacker.example", "not trusted", "CONTEXTNEST_TRUSTED_ENDPOINTS"],
+        },
+        // (c) An encrypted vault refuses embeddings and semantic search outright —
+        // the index would be a plaintext-derived copy of sealed content...
+        {
+          args: ["init", "--name", "guard-enc", "--layout", "structured", "--encrypted"],
+          env: encEnv("enc"),
+          // The marker-file contract is J8's; here the subject is the refusals below.
+          stdout: ["ENCRYPTED VAULT"],
+        },
+        { args: ["config", "set", "review", "off"], env: encEnv("enc"), stdout: ["review: off"] },
+        {
+          args: ["add", "nodes/sec", "--type", "document", "--title", "Sec", "--body", "invoice billing dunning", "-y"],
+          env: encEnv("enc"),
+          stdout: ["Created and published"],
+        },
+        {
+          mutate: (v) => appendSearchBlock(j18dir("enc"), () => MOCK.baseUrl)(v),
+          env: encEnv("enc"),
+          args: ["embed", "--json"],
+          status: 1,
+          stderr: ["not supported on an encrypted vault"],
+        },
+        {
+          env: encEnv("enc"),
+          args: ["search", "charging payment", "--mode", "semantic", "--json"],
+          status: 1,
+          stderr: ['"semantic" is not supported on an encrypted vault'],
+        },
+        // ...but a plain search (default mode) still works on an encrypted vault:
+        // it falls back to lexical and finds the node by a word in its body.
+        {
+          env: encEnv("enc"),
+          args: ["search", "invoice", "--json"],
+          json: (data) => expect(semOrder(data)).toContain("nodes/sec"),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -2825,5 +3976,20 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J13 — keep the vault healthy (validate, index regen & doctor)", () => {
     runJourney({ installDir: INSTALL, scratch }, J13);
+  });
+  it("J14 — work across more than one vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J14);
+  });
+  it("J15 — share a node outside the vault (HTML export)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J15);
+  });
+  it("J16 — organize work on a task board", () => {
+    runJourney({ installDir: INSTALL, scratch }, J16);
+  });
+  it("J17 — onboard an AI agent to a new vault", () => {
+    runJourney({ installDir: INSTALL, scratch }, J17);
+  });
+  it("J18 — find a node by meaning (semantic & hybrid search)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J18);
   });
 });

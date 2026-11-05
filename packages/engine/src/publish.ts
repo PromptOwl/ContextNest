@@ -15,6 +15,7 @@ import type {
 import { NestStorage, assertWritableDocumentId, assertWritableDocumentPath } from "./storage.js";
 import { VersionManager, wholeVersion } from "./versioning.js";
 import { CheckpointManager } from "./checkpoint.js";
+import { withVaultLock } from "./vault-lock.js";
 import { serializeDocument, getChecksumContent, isRejected, parseDocument } from "./parser.js";
 import { computeContentHash } from "./integrity.js";
 import { ContextNestError, RejectedDocumentError } from "./errors.js";
@@ -46,11 +47,12 @@ export interface PublishResult {
   /** The checkpoint this publish sealed — hand it to regenerateIndex. */
   checkpoint: Checkpoint;
   /**
-   * The vault crawl the checkpoint took after the write — hand it to
-   * regenerateIndex as `docs`. Like `checkpoint`, only valid passed straight
-   * through under the same lock: any write in between makes it stale.
+   * The vault crawl the checkpoint took after the write, when it took one (no
+   * current manifest) — hand it to regenerateIndex as `docs`. Like
+   * `checkpoint`, only valid passed straight through under the same lock: any
+   * write in between makes it stale.
    */
-  vaultDocs: ContextNode[];
+  vaultDocs?: ContextNode[];
 }
 
 /**
@@ -62,6 +64,41 @@ export async function publishDocument(
   docId: string,
   options: PublishOptions,
 ): Promise<PublishResult> {
+  const { node, versionEntry } = await writePublishedVersion(storage, docId, options);
+
+  // Create checkpoint. The published-docs and histories snapshots are gathered
+  // INSIDE the checkpoint lock (createCheckpointFromVault) so a concurrent
+  // publish cannot slip between two separate reads and leave a doc missing from
+  // — or version-skewed within — the checkpoint this publish seals.
+  const checkpointManager = new CheckpointManager(storage);
+  let vaultDocs: ContextNode[] | undefined;
+  const checkpoint = await checkpointManager.createCheckpointFromVault(
+    docId,
+    new Map([[docId, versionEntry]]),
+    (docs) => (vaultDocs = docs),
+  );
+
+  return {
+    node,
+    versionEntry,
+    checkpointNumber: checkpoint.checkpoint,
+    checkpoint,
+    vaultDocs,
+  };
+}
+
+/**
+ * A publish up to and including its version entry, without the checkpoint:
+ * the document is published and its version is on its own hash chain, but no
+ * nest checkpoint binds it yet. For a host that seals later, in a batch
+ * ({@link sealWrites}); `verify` checks only what checkpoints recorded, so an
+ * unsealed version is not an error. Everyone else calls publishDocument.
+ */
+export async function writePublishedVersion(
+  storage: NestStorage,
+  docId: string,
+  options: PublishOptions,
+): Promise<{ node: ContextNode; versionEntry: VersionEntry }> {
   // Every publish surface (context_publish, ids[] imports, approvals, legacy
   // tools) ends here, so a reserved path is refused once, for all of them.
   await assertWritableDocumentPath(storage.root, docId);
@@ -159,25 +196,40 @@ export async function publishDocument(
   // Before the checkpoint, so the vault crawl it hands back includes them.
   if (rules && firstPublish) await scaffoldFirstPublish(storage, rules, [docId]);
 
-  // Create checkpoint. The published-docs and histories snapshots are gathered
-  // INSIDE the checkpoint lock (createCheckpointFromVault) so a concurrent
-  // publish cannot slip between two separate reads and leave a doc missing from
-  // — or version-skewed within — the checkpoint this publish seals.
-  const checkpointManager = new CheckpointManager(storage);
-  let vaultDocs: ContextNode[] = [];
-  const checkpoint = await checkpointManager.createCheckpointFromVault(
-    docId,
-    new Map([[docId, versionEntry]]),
-    (docs) => (vaultDocs = docs),
-  );
+  return { node, versionEntry };
+}
 
-  return {
-    node,
-    versionEntry,
-    checkpointNumber: checkpoint.checkpoint,
-    checkpoint,
-    vaultDocs,
-  };
+/**
+ * The deferred half of a batch of writes made with `OperationContext.deferSeal`:
+ * one checkpoint sealing every document `published` since the head, then one
+ * index update for every id `changed` (published, drafted or deleted). Under
+ * the vault lock, like every write. A batch with nothing published seals no
+ * checkpoint, as a draft save or a delete never did.
+ */
+export async function sealWrites(
+  storage: NestStorage,
+  batch: { changed: string[]; published: string[]; triggeredBy: string },
+): Promise<Checkpoint | null> {
+  return withVaultLock(storage.root, async () => {
+    let checkpoint: Checkpoint | null = null;
+    let vaultDocs: ContextNode[] | undefined;
+    if (batch.published.length) {
+      checkpoint = await new CheckpointManager(storage).createCheckpointFromVault(
+        batch.triggeredBy,
+        undefined,
+        (docs) => (vaultDocs = docs),
+        { changed: batch.published },
+      );
+    }
+    if (batch.changed.length || checkpoint) {
+      await storage.regenerateIndex({
+        changedIds: [...new Set([...batch.changed, ...batch.published])],
+        ...(checkpoint ? { latestCheckpoint: checkpoint } : {}),
+        ...(vaultDocs ? { docs: vaultDocs } : {}),
+      });
+    }
+    return checkpoint;
+  });
 }
 
 /**
@@ -431,6 +483,7 @@ export async function publishDocuments(
       `bulk-import (${published.length} docs)`,
       new Map(published.map((p) => [p.id, { version: p.version, chain_hash: p.chainHash }])),
       (docs) => (vaultDocs = docs),
+      { crawl: true },
     );
   }
 
