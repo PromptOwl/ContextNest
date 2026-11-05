@@ -184,6 +184,7 @@ import {
 import { hintsDisabled, setHintsEnabled } from "./hints.js";
 import { CliVaultKeyStore } from "./vault-key-store.js";
 import { renderDocumentHtml } from "./render-html.js";
+import { registerPluginCommands } from "./plugin-cmd.js";
 import { collectJatsFiles, enrichPubTator, fetchPmcSources, importJats } from "./import-papers.js";
 import { parseLicenseList } from "./pubmed.js";
 import {
@@ -523,6 +524,11 @@ const VAULT_WRITE_COMMANDS = new Set([
   "drift stage",
   "drift approve",
   "drift reject",
+  "plugin add",
+  "plugin set",
+  "plugin remove",
+  "plugin pull",
+  "plugin promote",
   "config set",
   "review approve",
   "review reject",
@@ -5388,6 +5394,12 @@ program
     row("Privacy", `telemetry + welcome-page analytics ${report.privacy.telemetry ? chalk.yellow("on") : "off"} · credentials: ${report.privacy.credentials}`);
     console.log("");
   });
+
+registerPluginCommands(program, {
+  getVaultRoot,
+  opContext: (root) => opContext(new NestStorage(root), "cli@contextnest.local"),
+  client: () => callClient as Record<string, unknown> | undefined,
+});
 
 // Bare `ctx`: first-run onboarding, otherwise the help list (stdout, exit 0).
 async function bareCtx(): Promise<void> {
