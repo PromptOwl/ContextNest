@@ -984,6 +984,20 @@ describe("[regression] ctx delete", () => {
     expect(existsSync(join(tmp, "nodes", "disposable.md"))).toBe(false);
     expect(existsSync(join(tmp, "nodes", ".versions", "disposable"))).toBe(false);
   });
+
+  it("names the documents left linking to it, and still deletes", () => {
+    writeFileSync(join(tmp, "nodes", "a.md"), "---\ntitle: A\ntype: document\n---\n\n[[Disposable]]\n", "utf-8");
+    writeFileSync(join(tmp, "nodes", "c.md"), "---\ntitle: C\ntype: document\n---\n\n[[nodes/disposable]]\n", "utf-8");
+    const out = runCtx(tmp, ["delete", "nodes/disposable", "--yes"]);
+    expect(out).toMatch(/2 documents link here/);
+    expect(out).toContain("nodes/a");
+    expect(out).toContain("nodes/c");
+    expect(existsSync(join(tmp, "nodes", "disposable.md"))).toBe(false);
+  });
+
+  it("warns about nothing when no document links to it", () => {
+    expect(runCtx(tmp, ["delete", "nodes/disposable", "--yes"])).not.toMatch(/link here/);
+  });
 });
 
 // ─── forget protocol (spec §6.3) ─────────────────────────────────────────────
@@ -1150,6 +1164,24 @@ describe("[regression] ctx validate", () => {
     const res = runCtxResult(tmp, ["validate"]);
     expect(res.status).toBe(0);
     expect(res.stdout).toMatch(/and [1-9]\d* packs valid/);
+  });
+
+  it("lists dangling references as warnings without failing", () => {
+    writeFileSync(join(tmp, "nodes", "a.md"), "---\ntitle: A\ntype: document\n---\n\n[[Gone]]\n", "utf-8");
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/nodes\/a:6.*Gone/);
+
+    const json = JSON.parse(runCtxResult(tmp, ["validate", "--json"]).stdout);
+    expect(json.valid).toBe(true);
+    expect(json.dangling).toContainEqual({ from: "nodes/a", target: "Gone", line: 6 });
+  });
+
+  it("reports no dangling references in a vault without any", () => {
+    runCtx(tmp, ["add", "nodes/clean", "--title", "Clean Doc"]);
+    const res = runCtxResult(tmp, ["validate"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).not.toMatch(/dangling/i);
   });
 });
 

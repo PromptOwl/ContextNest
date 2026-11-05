@@ -34,6 +34,7 @@ import {
   buildRelationships,
   buildRelationshipsWithStats,
   buildBacklinks,
+  findDanglingReferences,
 } from "../inline.js";
 import type { ContextNode, Frontmatter, RelationshipEdge } from "../types.js";
 
@@ -291,5 +292,48 @@ describe("GraphQueryEngine — --hops follows wikilink edges", () => {
         new Set(["nodes/source", "nodes/target-a", "nodes/target-b"]),
       );
     }
+  });
+});
+
+describe("findDanglingReferences", () => {
+  it("names the document, target and line of each unresolved link", () => {
+    const a = doc("nodes/a", "A", "Intro\n\nSee [[Gone]] and [[B]].\nThen [x](contextnest://nodes/missing@2#s).");
+    const b = doc("nodes/b", "B", "# B");
+    expect(findDanglingReferences([a, b])).toEqual([
+      { from: "nodes/a", target: "Gone", line: 3 },
+      { from: "nodes/a", target: "contextnest://nodes/missing@2#s", line: 4 },
+    ]);
+  });
+
+  it("counts lines from the top of the file, frontmatter included", () => {
+    const a = {
+      ...doc("nodes/a", "A", "[[Gone]]\n"),
+      rawContent: "---\ntitle: A\n---\n[[Gone]]\n",
+    };
+    expect(findDanglingReferences([a])[0].line).toBe(4);
+  });
+
+  it("reports a depends_on target that is no document, with no line", () => {
+    const source = doc("sources/s", "S", "");
+    source.frontmatter.source = { depends_on: ["contextnest://sources/gone"] } as never;
+    expect(findDanglingReferences([source])).toEqual([
+      { from: "sources/s", target: "contextnest://sources/gone" },
+    ]);
+  });
+
+  it("ignores what is not a link to a node here", () => {
+    const a = doc(
+      "nodes/a",
+      "A",
+      [
+        "[[#section]]",
+        "`[[Quoted]]`",
+        "[t](contextnest://tag/api) [f](contextnest://nodes/gtm/) [s](contextnest://search/x)",
+        "```",
+        "[[Fenced]]",
+        "```",
+      ].join("\n"),
+    );
+    expect(findDanglingReferences([a])).toEqual([]);
   });
 });

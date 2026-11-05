@@ -12,7 +12,7 @@ The same operations had forked into three vocabularies — OSS MCP (`read_docume
 
 | Piece | What |
 |---|---|
-| **Catalog (schemas)** | `core` namespace — 23 ops. Zod input/output + draft-07 JSON Schema per op. Canonical names are `context_*`; OSS legacy names are captured as `aliases`. Schemas compose the engine's existing domain schemas (`frontmatterSchema`, `NODE_TYPES`, …) — no duplication. |
+| **Catalog (schemas)** | `core` namespace — 26 ops. Zod input/output + draft-07 JSON Schema per op. Canonical names are `context_*`; OSS legacy names are captured as `aliases`. Schemas compose the engine's existing domain schemas (`frontmatterSchema`, `NODE_TYPES`, …) — no duplication. |
 | **Executable ops** | `createEngineApi().run(name, input, ctx)` — one implementation bound to engine primitives (`GraphQueryEngine`, `NestStorage`, `publishDocument`). Ungated mechanics only; no governance policy in the engine (preserves the AGPL↔Commercial line). |
 | **Extension framework** | `EngineExtension` lets consumers register new ops (governance/workflow/sync) and wrap every op with `authorize` + `onResult`, without forking the engine. |
 | **Namespace discovery** | `NAMESPACES` advertises the implemented set for MCP `initialize` / REST manifest. |

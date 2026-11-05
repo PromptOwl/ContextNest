@@ -119,6 +119,9 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx list --assignee <email|none> --priority <p|none> --due-before <YYYY-MM-DD>` — Remote nest only: filter tasks
 - `ctx task log <path> --note "…" [--status working|done|blocked] [--claim] [--agent <name>]` — Remote nest only: record what you did on a task. Attributed to you, your API key and the agent (`--agent` or `$CONTEXTNEST_AGENT`), and shown in the task's activity. `--claim` assigns it to you if it is unassigned
 - `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
+- `ctx archive <path> [--reason <text>]` — Archive a document: out of lists and retrieval, history kept (spec §1.13)
+- `ctx unarchive <path>` — Bring an archived document back in the status it left
+- `ctx move <path> <folder>` — Move a document to another folder with its history; its id changes
 - `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
 - `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
 - `ctx publish <path>` — Publish (bump version, create checkpoint)

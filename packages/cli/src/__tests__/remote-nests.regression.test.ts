@@ -592,17 +592,19 @@ describe("[regression] remote nests — unsupported options fail loudly", () => 
     expect(res.stderr + res.stdout).toMatch(/not supported/i);
   });
 
-  it("ctx move reaches the remote's context_move (the OSS server has none: a clear refusal, nothing moved)", () => {
+  it("ctx move reaches the remote's context_move and moves the file there", () => {
     const res = run(cwd, ["move", "nodes/api-design", "archive", "--vault", "farnest", "--yes"]);
-    expect(res.status).toBe(1);
-    expect(res.stderr + res.stdout).toMatch(/context_move/);
-    expect(existsSync(join(serverVault, "nodes", "api-design.md"))).toBe(true);
+    expect(res.status).toBe(0);
+    expect(existsSync(join(serverVault, "nodes", "archive", "api-design.md"))).toBe(true);
+    expect(existsSync(join(serverVault, "nodes", "api-design.md"))).toBe(false);
+    expect(run(cwd, ["move", "nodes/archive/api-design", "", "--vault", "farnest", "--yes"]).status).toBe(0);
   });
 
-  it("ctx move on a local vault refuses: the engine has no move operation yet", () => {
+  it("ctx move works on a local vault", () => {
     const res = run(cwd, ["move", "nodes/api-design", "archive"]);
-    expect(res.status).toBe(1);
-    expect(res.stderr + res.stdout).toMatch(/remote Community nest only/);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Moved nodes\/api-design to nodes\/archive\/api-design/);
+    expect(run(cwd, ["move", "nodes/archive/api-design", ""]).status).toBe(0);
   });
 
   it("ctx update --title on a remote errors clearly instead of diverging", () => {
@@ -974,10 +976,8 @@ describe("[regression] remote nests — governed nest without publish/verify", (
 
 // ─── 7. ctx move against a nest that DOES expose context_move ────────────────
 //
-// §3c already pins the two refusals the OSS surface can produce: a local vault
-// has no move op, and this repo's MCP server has no `context_move` tool. What
-// neither can exercise is a nest that exposes the tool and then FAILS the move
-// server-side — the move-under-review path. Moving a pending_review document on
+// §3c pins a move that works. What it cannot exercise is a nest that FAILS the
+// move server-side — the move-under-review path. Moving a pending_review document on
 // a hosted Community nest crashes on its YAML dump and returns
 // "unacceptable kind of an object to dump [object Undefined]" (contextnest-
 // community #191). The CLI's job is to relay that cleanly, never to crash on
