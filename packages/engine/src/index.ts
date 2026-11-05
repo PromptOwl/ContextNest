@@ -348,9 +348,10 @@ export {
   buildRelationships,
   buildRelationshipsWithStats,
   buildBacklinks,
+  findDanglingReferences,
   extractSection,
 } from "./inline.js";
-export type { RelationshipStats } from "./inline.js";
+export type { DanglingReference, RelationshipStats } from "./inline.js";
 
 // Selector grammar
 export { tokenize } from "./selector/lexer.js";

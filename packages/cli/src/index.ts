@@ -31,6 +31,8 @@ import {
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
+  buildRelationships,
+  findDanglingReferences,
   buildManifest,
   withVaultLock,
   generateIndexMd,
@@ -2009,9 +2011,16 @@ program
       }
     }
 
+    // Warnings, never failures: a reference is kept when its target is missing.
+    // Resolving needs the whole vault, so `validate <path>` skips this too.
+    const dangling = path ? [] : findDanglingReferences(docs);
+
     if (opts.json) {
-      console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors }, null, 2));
+      console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors, dangling }, null, 2));
     } else {
+      for (const d of dangling) {
+        console.log(chalk.yellow(`⚠ ${d.from}${d.line ? `:${d.line}` : ""} dangling reference: ${d.target}`));
+      }
       console.log(
         hasErrors
           ? chalk.red(`\nValidation failed with errors`)
@@ -3010,6 +3019,21 @@ program
     }
     const storage = getStorage();
     const id = await resolvedDocumentId(storage, path);
+    // Forget needs no such warning: its stub stays at the id, so links resolve.
+    const inbound = [
+      ...new Set(
+        buildRelationships(await storage.discoverDocuments({ includeRetired: true }))
+          .filter((edge) => edge.to === id)
+          .map((edge) => edge.from),
+      ),
+    ];
+    if (inbound.length) {
+      console.log(
+        chalk.yellow(
+          `${inbound.length} document${inbound.length === 1 ? " links" : "s link"} here and will dangle: ${inbound.join(", ")}`,
+        ),
+      );
+    }
     await confirmOrExit(
       `Delete ${id} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
         (opts.purge ? " --purge leaves no audit record." : ""),
