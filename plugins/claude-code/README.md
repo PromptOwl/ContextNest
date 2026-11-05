@@ -61,13 +61,15 @@ On enable you'll be prompted for the settings below (all optional):
 
 ## One server, many nests
 
-Register a Community server's all-nests endpoint once:
+Sign in to a Community server once. This registers all its nests:
 
 ```text
-ctx vault add contextnest --url https://<server>/mcp --bearer-env CONTEXTNEST_API_KEY
+ctx login https://<server> --as contextnest
 ```
 
-`ctx vault list` then shows a `contextnest/<nest>` row for every nest your key can reach, with each nest's description. Nests shared with you later appear on their own. The plugin searches `contextnest` (every nest, in one call) and cites each hit as `contextnest/<nest>:<id>`. Edits go back to that nest, and a new note goes to the nest whose description fits. When none clearly fits, the **unclear nest** setting decides: ask you (default), or use the default vault.
+A server without browser sign-in takes a pasted key instead: add `--key-stdin`.
+
+`ctx vault list` then shows a `contextnest/<nest>` row for every nest you can reach, with each nest's description. Nests shared with you later appear on their own. The plugin searches `contextnest` (every nest, in one call) and cites each hit as `contextnest/<nest>:<id>`. Edits go back to that nest, and a new note goes to the nest whose description fits. When none clearly fits, the **unclear nest** setting decides: ask you (default), or use the default vault.
 
 ## Changing settings later
 
@@ -109,6 +111,20 @@ When the same fact turns out to live in several nodes, fixing all of them is the
 A change is "structural" when the vault would end up contradicting itself, when a node's title or type no longer fits its body, when the corrected term is a concept the vault is organised around (a rename, not an edit), or when a recorded decision has been reversed so the stated reasoning is now wrong. Those are presented for your approval rather than applied.
 
 The ladders are domain-free — the capture agent calibrates what counts as durable from the target vault's own `description`, so a positioning vault and a security vault are judged on their own terms.
+
+## What this plugin runs and sends
+
+**What runs.** Four hooks (listed under Components) run the readable scripts in `core/` under Node. Those scripts and `bin/ctx` call the `ctx` CLI: your own install first, then the copy installed with the plugin, then `npx` at the exact version this plugin pins.
+
+**What it downloads.** When you install or update the plugin, Claude Code installs the CLI and its dependencies from `registry.npmjs.org`, at the versions in `package-lock.json`. The `npx` fallback fetches the same CLI version from there.
+
+**What stays on your computer.** With local vaults, your notes stay on your computer. What retrieval finds is added to your Claude Code conversation, like anything else you show Claude. Plugin settings and session state live in `~/.contextnest/`.
+
+**What goes to a server.** Only to servers you add yourself, with `/contextnest:setup`, `ctx login` or `ctx vault add`. With retrieval on, the text of each prompt goes to those servers as a search query. Reads, writes and sweep-check searches for their nests go there too. To stop this, set **Retrieval effort** to `off`, or pin a local vault. If you configure embeddings for a vault, its search also sends text to the provider you chose. `ctx query @org/pack` fetches a cloud pack from `api.promptowl.ai`, and only when you ask for one.
+
+**Credentials.** The plugin's own scripts never read or send a credential. `ctx login` keeps your key in the OS keyring or an encrypted file, and `ctx` sends it to the server it belongs to.
+
+**Telemetry.** Off unless a vault opts in with `telemetry: true` in `.context/config.yaml`. Then `ctx` sends usage events to `api.promptowl.ai`, never vault content, and the vault's welcome page loads Google Analytics. `DO_NOT_TRACK=1` or `CONTEXTNEST_TELEMETRY=0` turns it off whatever the file says.
 
 ## Components
 

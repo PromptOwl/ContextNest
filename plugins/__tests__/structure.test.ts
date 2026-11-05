@@ -214,3 +214,44 @@ describe("vendored core sync", () => {
     }
   });
 });
+
+// What the Claude plugin directory's validator reads. An unpinned npx launcher
+// blocks submission, and a credential read from the environment is held even in
+// a README example. https://claude.com/docs/plugins/pre-submission-checklist.md
+describe("directory submission", () => {
+  const cli = "@promptowl/contextnest-cli";
+  const pin = readJson(join(plugin, "package.json")).dependencies[cli];
+  const shipped = execFileSync("git", ["ls-files", "plugins/claude-code"], { cwd: repo, encoding: "utf-8" })
+    .split("\n")
+    .filter((f) => f && !f.endsWith(".png") && !f.endsWith("CHANGELOG.md") && !f.endsWith("package-lock.json"));
+
+  it.each(["bin/ctx", "bin/ctx.cmd"])("%s falls back to npx at the exact pinned version", (rel) => {
+    expect(read(join(plugin, rel))).toContain(`npx -y ${cli}@${pin} `);
+  });
+
+  it("no shipped file names an unpinned npx launch of the CLI", () => {
+    const unpinned = new RegExp(`npx\\s+(?:-y\\s+)?${cli}(?!@\\d+\\.\\d+\\.\\d+)`);
+    expect(shipped.filter((f) => unpinned.test(read(join(repo, f))))).toEqual([]);
+  });
+
+  it("no shipped file reads a credential from the environment", () => {
+    expect(shipped.filter((f) => /--bearer-env|CONTEXTNEST_API_KEY/.test(read(join(repo, f))))).toEqual([]);
+  });
+
+  it("ships a square PNG listing icon of 512 to 2048 px under 2 MB", () => {
+    const icon = readFileSync(join(plugin, ".claude-plugin", "icon.png"));
+    expect(icon.subarray(1, 4).toString()).toBe("PNG");
+    const [width, height] = [icon.readUInt32BE(16), icon.readUInt32BE(20)];
+    expect(width).toBe(height);
+    expect(width).toBeGreaterThanOrEqual(512);
+    expect(width).toBeLessThanOrEqual(2048);
+    expect(icon.length).toBeLessThan(2 * 1024 * 1024);
+  });
+
+  it("the README says what the plugin runs and sends", () => {
+    const readme = read(join(plugin, "README.md"));
+    expect(readme).toContain("## What this plugin runs and sends");
+    expect(readme).toContain("api.promptowl.ai");
+    expect(readme).toContain("registry.npmjs.org");
+  });
+});

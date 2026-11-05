@@ -125,7 +125,8 @@ Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), th
 
 1. Set the pin to the new version.
 2. Run `npm install --package-lock-only --ignore-scripts` in `plugins/claude-code/` to refresh `package-lock.json`.
-3. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
+3. Set the same version in the `npx` fallback in `bin/ctx` and `bin/ctx.cmd`. The Claude plugin directory blocks an unpinned launcher, and a test in `plugins/__tests__/structure.test.ts` fails when these disagree with the pin.
+4. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
 
 This can't go in the changesets version PR, because the lockfile needs the published tarball's integrity hash. `pnpm plugins:check` fails when the pin and the lockfile disagree. The pin is added by CU-wdqcq067m5; until that lands there is nothing to bump.
 

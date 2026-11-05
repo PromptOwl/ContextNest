@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1
+
+Ready for the Claude plugin directory.
+
+- **The `npx` fallback runs the exact CLI version this plugin pins.** It used to run whatever was latest. The sweep-check also recognises the pinned form.
+- **The plugin has a listing icon.**
+- **The README says what the plugin runs, downloads and sends**, including that prompt text goes to any server you add when retrieval is on.
+- **The README connects a server with `ctx login`** instead of a key read from an environment variable.
+
 ## 0.8.0
 
 Setup matches the `ctx` first run, and the CLI comes with the plugin (CU-wdqcq067m5).

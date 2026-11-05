@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "contextnest",
   "displayName": "Context Nest",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
   "author": { "name": "PromptOwl" },
   "homepage": "https://github.com/promptowl/contextnest",
@@ -43,7 +43,7 @@
     "ctx_command": {
       "type": "string",
       "title": "ctx binary",
-      "description": "Command used to invoke the Context Nest CLI. Falls back to `npx -y @promptowl/contextnest-cli` if not found.",
+      "description": "Command used to invoke the Context Nest CLI. Falls back to the copy installed with this plugin if not found.",
       "default": "ctx"
     }
   }
