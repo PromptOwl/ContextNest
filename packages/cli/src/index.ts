@@ -518,6 +518,8 @@ const VAULT_WRITE_COMMANDS = new Set([
   "update",
   "delete",
   "forget",
+  "archive",
+  "unarchive",
   "publish",
   "index",
   "welcome",
@@ -3179,20 +3181,56 @@ program
 
 program
   .command("move <path> <folder>")
-  .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
-  // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
-  // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
+  .description('Move a document to another folder ("" for the root), with its history; its id changes')
   .action(async (path, folder) => {
     const remote = remoteTarget(selectedVaultAlias);
-    if (!remote) {
-      // ponytail: remote-only — the engine has no move op yet (a local move must
-      // rename the file, its history and every [[link]]). Add it upstream first.
-      throw new ContextNestError(
-        "ctx move works against a remote Community nest only (--vault <alias>); a local vault has no move operation yet.",
-        "NOT_IMPLEMENTED",
-      );
+    if (remote) {
+      await remoteMove(remote, path, folder);
+      return;
     }
-    await remoteMove(remote, path, folder);
+    const storage = getStorage();
+    const result = await cliApi().run<{ id: string; previous_id: string }>(
+      "context_move",
+      { id: await resolvedDocumentId(storage, path), folder },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    console.log(chalk.green(`Moved ${result.previous_id} to ${result.id}`));
+  });
+
+// ─── ctx archive / unarchive ──────────────────
+
+program
+  .command("archive <path>")
+  .description("Archive a document: out of lists and retrieval, history kept, recoverable with `ctx unarchive`")
+  .option("--reason <text>", "Why it was archived, recorded on the document")
+  .option("-a, --author <email>", "Actor recorded as archived by", "cli@contextnest.local")
+  .action(async (path, opts) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError("ctx archive works against a local vault only for now.", "NOT_IMPLEMENTED");
+    }
+    const storage = getStorage();
+    const result = await cliApi().run<{ id: string }>(
+      "context_archive",
+      { id: await resolvedDocumentId(storage, path), ...(opts.reason ? { reason: opts.reason } : {}) },
+      opContext(storage, opts.author),
+    );
+    console.log(chalk.green(`Archived ${result.id}`));
+  });
+
+program
+  .command("unarchive <path>")
+  .description("Bring an archived document back in the status it was archived from")
+  .action(async (path) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError("ctx unarchive works against a local vault only for now.", "NOT_IMPLEMENTED");
+    }
+    const storage = getStorage();
+    const result = await cliApi().run<{ id: string; status: string }>(
+      "context_unarchive",
+      { id: await resolvedDocumentId(storage, path) },
+      opContext(storage, "cli@contextnest.local"),
+    );
+    console.log(chalk.green(`Unarchived ${result.id} (${result.status})`));
   });
 
 // ─── ctx import ───────────────────────────────────────────────────────────────

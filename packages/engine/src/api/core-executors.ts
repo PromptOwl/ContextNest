@@ -27,6 +27,7 @@ import {
   normalizeTags,
   normalizeStatus,
   isRejected,
+  isArchived,
   isPublished,
   isForgotten,
   explicitStatus,
@@ -89,6 +90,7 @@ import { applyTypedBlocks } from "../typed-blocks.js";
 import { mapInBatches, VAULT_IO_CONCURRENCY } from "../concurrency.js";
 import { withVaultLock } from "../vault-lock.js";
 import { currentReviewProposal, stageReviewHold } from "../review.js";
+import { archiveDocument, moveDocument, unarchiveDocument } from "../lifecycle.js";
 import { TITLE_MAX_LENGTH } from "../schemas.js";
 import {
   isVersionArtifactPath,
@@ -850,6 +852,11 @@ const update: OperationExecutor = async (ctx, input: any) => {
   const holdAsSuggestion = hold && isPublished(live);
   const proposal = holdAsSuggestion ? await currentReviewProposal(ctx.storage, id) : null;
   const existing = proposal ? parseDocument(live.filePath, proposal.proposedRaw, id) : live;
+  // Editing is how a rejected node comes back, but an archived one comes back
+  // only through context_unarchive, which restores the status it left.
+  if (isArchived(existing)) {
+    throw new ContextNestError(`${id} is archived. Unarchive it first.`, "REJECTED_DOCUMENT");
+  }
   // Guard BEFORE any write: republishing a rejected doc would flip it back into
   // retrieval, and writing first would mutate the file even though publish then
   // rejects (no version/checksum/history). Reviving one — moving it to some
@@ -1033,6 +1040,44 @@ const del: OperationExecutor = async (ctx, input: any) => {
   return { id, title: result.title, deleted: true as const, tombstoned: result.tombstoned };
 };
 
+const archive: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const node = await archiveDocument(ctx.storage, id, {
+    by: ctx.actor ?? "engine",
+    ...(input.reason ? { reason: input.reason } : {}),
+  });
+  await purgeEmbeddings(ctx.storage.root, [id]);
+  await indexAfterWrite(ctx, id);
+  return { id, status: "rejected" as const, archived: node.frontmatter.archived };
+};
+
+const unarchive: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const node = await unarchiveDocument(ctx.storage, id);
+  await indexAfterWrite(ctx, id);
+  return { id, status: node.frontmatter.status };
+};
+
+const move: OperationExecutor = async (ctx, input: any) => {
+  const id = await resolveId(ctx, input);
+  const to = normalizeDocumentId(["nodes", ...folderSegmentsOf(input.folder), id.split("/").pop()!].join("/"));
+  if (to === id) return { id, previous_id: id };
+  assertWritableDocumentId(to);
+  // Under enforced rules a move is a delete there and a create here (§11.1.1).
+  const rules = await structureRules(ctx);
+  if (rules) {
+    await assertStructureDelete(ctx.storage, id);
+    const live = await ctx.storage.readDocument(id);
+    enforceStructure(rules, checkDocument(rules, structureDoc({ ...live, id: to })));
+  }
+  const created = rules ? await missingFolders(ctx.storage, to) : null;
+  await moveDocument(ctx.storage, id, to);
+  if (rules && created) await scaffoldFolders(ctx.storage, rules, created);
+  await purgeEmbeddings(ctx.storage.root, [id]);
+  if (!ctx.deferSeal) await ctx.storage.regenerateIndex({ changedIds: [id, to] });
+  return { id: to, previous_id: id };
+};
+
 const forget: OperationExecutor = async (ctx, input: any) => {
   const id = await resolveId(ctx, input);
   const result = await forgetDocument(ctx.storage, id, {
@@ -1214,6 +1259,7 @@ async function loadSkillNode(ctx: OperationContext, input: any) {
   if (isForgotten(live)) throw new ForgottenDocumentError(id);
   let node = live;
   let servedVersion: number | null = null;
+  if (isArchived(live)) throw new RejectedDocumentError(id);
   if (isRejected(live)) {
     const history = await ctx.versions.getHistory(id);
     // published_at is the local marker of an approved version — the approval
@@ -2155,6 +2201,9 @@ export const CORE_EXECUTORS: Readonly<Record<string, OperationExecutor>> = Objec
   context_update: locked(update),
   context_publish: locked(publish),
   context_delete: locked(del),
+  context_archive: locked(archive),
+  context_unarchive: locked(unarchive),
+  context_move: locked(move),
   context_versions: versions,
   context_reconstruct: reconstruct,
   context_verify: verify,
