@@ -3,12 +3,12 @@
   "name": "contextnest",
   "displayName": "Context Nest",
   "version": "0.8.1",
-  "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
+  "description": "A shared, governed brain for Claude Code. Claude checks your team's versioned notes on each prompt and updates them when you correct something.",
   "author": { "name": "PromptOwl" },
-  "homepage": "https://github.com/promptowl/contextnest",
+  "homepage": "https://promptowl.ai/contextnest",
   "repository": "https://github.com/promptowl/contextnest",
   "license": "AGPL-3.0",
-  "keywords": ["context", "knowledge-base", "rag", "memory", "contextnest"],
+  "keywords": ["context", "context-layer", "knowledge-base", "team-knowledge", "agent-memory", "memory", "rag", "governance", "markdown", "contextnest"],
   "userConfig": {
     "retrieval_mode": {
       "type": "string",

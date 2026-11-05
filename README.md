@@ -673,6 +673,17 @@ docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
 
 The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
 
+### Claude Code plugin
+
+The plugin is the quickest way in. Claude checks your notes on each prompt and updates them when you correct something, and the CLI comes with it:
+
+```text
+/plugin install contextnest --marketplace promptowl/contextnest
+/contextnest:setup
+```
+
+See the [plugin README](plugins/claude-code/README.md) for what it does and what it sends.
+
 ### Configuring with Claude Code
 
 Add to your project's `.mcp.json`:

@@ -248,6 +248,27 @@ describe("directory submission", () => {
     expect(icon.length).toBeLessThan(2 * 1024 * 1024);
   });
 
+  it("the listing opens with the one-step install and has no repo-relative links", () => {
+    const readme = read(join(plugin, "README.md"));
+    const install = "/plugin install contextnest --marketplace promptowl/contextnest";
+    expect(readme.indexOf(install)).toBeGreaterThan(-1);
+    expect(readme.indexOf(install)).toBeLessThan(readme.indexOf("## Setup"));
+    expect(readme).not.toMatch(/\]\(\.\.?\//);
+  });
+
+  it("the listing fields point people at the product", () => {
+    const manifest = readJson(join(plugin, ".claude-plugin", "plugin.json"));
+    const entry = readJson(join(repo, ".claude-plugin", "marketplace.json")).plugins[0];
+    expect(manifest.homepage).toBe("https://promptowl.ai/contextnest");
+    expect(manifest.keywords).toContain("context-layer");
+    expect(entry.homepage).toBe(manifest.homepage);
+    expect(entry.description).toBe(manifest.description);
+  });
+
+  it("the root README shows how to install the plugin", () => {
+    expect(read(join(repo, "README.md"))).toContain("/plugin install contextnest --marketplace promptowl/contextnest");
+  });
+
   it("the README says what the plugin runs and sends", () => {
     const readme = read(join(plugin, "README.md"));
     expect(readme).toContain("## What this plugin runs and sends");
