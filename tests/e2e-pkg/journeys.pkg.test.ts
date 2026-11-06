@@ -4059,6 +4059,198 @@ const J19: Journey = {
   ],
 };
 
+/**
+ * J20 — "I reorganize and retire nodes without losing anything."
+ * The housekeeping promise for a growing vault: `ctx move` relocates a node to
+ * a better folder and its full version history comes along (the id changes);
+ * `ctx archive` takes a stale node out of lists, tag queries and search while
+ * keeping it readable and its history intact; `ctx unarchive` brings it back
+ * exactly as it was. Unlike forget/delete (J5), every step here is reversible.
+ *
+ * One accumulating vault, review gate OFF (like J2/J3) so each write is
+ * published knowledge that lands as its own version — no gate between steps.
+ * A second node (`nodes/keep/anchor`, same `#plan` tag) is the discriminator:
+ * archiving the first must hide only it, leaving the anchor in every listing.
+ * Two body phrases — "mango" (v1) and "pineapple" (v2) — pin which version a
+ * reconstruct returns and give search a word that lives only in the moved node.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J20: Journey = {
+  id: "J20",
+  title: "Reorganize and retire nodes (move, archive & unarchive)",
+  cases: [
+    {
+      id: "J20-01",
+      title:
+        "Move a node to another folder: it gets a new id, keeps its full version history, and is gone from the old path",
+      actions: [
+        { args: ["init", "--name", "tidy-vault"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/drafts/idea",
+            "--type", "document",
+            "--title", "Bright Idea",
+            "--tags", "#plan",
+            "--body", "first body about mango",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/drafts/idea.md", exists: true }],
+        },
+        {
+          args: ["update", "nodes/drafts/idea", "--body", "second body about pineapple", "-y"],
+          stdout: ["Version: 2"],
+        },
+        // The move reports old id → new id; the new id is folder + basename.
+        {
+          args: ["move", "nodes/drafts/idea", "approved"],
+          stdout: ["Moved nodes/drafts/idea to nodes/approved/idea"],
+        },
+        // Gone from the old path.
+        {
+          args: ["read", "nodes/drafts/idea"],
+          status: 1,
+          stderr: ["DOCUMENT_NOT_FOUND"],
+        },
+        // The vault now holds exactly the node at its new id — nothing left behind.
+        {
+          args: ["list", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/approved/idea"]),
+        },
+        // Both versions rode along to the new id.
+        {
+          args: ["history", "nodes/approved/idea", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1, 2]),
+        },
+        // v1 reconstructs from the carried history — its original body, not v2's.
+        {
+          args: ["reconstruct", "nodes/approved/idea", "1"],
+          stdout: ["first body about mango", "version: 1"],
+          stdoutNot: ["pineapple"],
+        },
+      ],
+    },
+    {
+      id: "J20-02",
+      title:
+        "Archive a node: it drops out of list, query and search, but its history is kept and it stays readable directly",
+      actions: [
+        // Baseline: while published, a word unique to this node finds it — so the
+        // "No results found" after archiving is a real disappearance, not a word
+        // that was never in the index.
+        { args: ["search", "pineapple"], stdout: ["1 result(s):", "nodes/approved/idea"] },
+        // A second, untouched node tagged the same way — archiving must hide only
+        // the one node, never the anchor.
+        {
+          args: [
+            "add", "nodes/keep/anchor",
+            "--type", "document",
+            "--title", "Anchor",
+            "--tags", "#plan",
+            "--body", "anchor body",
+          ],
+          stdout: ["Version: 1"],
+        },
+        {
+          args: ["archive", "nodes/approved/idea", "--reason", "stale"],
+          stdout: ["Archived nodes/approved/idea"],
+          // On disk it is status:rejected with an archived block remembering where
+          // to return to — the reversible contract, not an erasure.
+          check: (vault) => {
+            const raw = readFileSync(join(vault, "nodes", "approved", "idea.md"), "utf-8");
+            expect(raw).toContain("status: rejected");
+            expect(raw).toContain("previous_status: published");
+          },
+        },
+        // Out of the listing — only the anchor remains.
+        {
+          args: ["list", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/keep/anchor"]),
+        },
+        // Out of tag queries — the anchor still answers, the archived node does not.
+        {
+          args: ["query", "#plan"],
+          stdout: ["nodes/keep/anchor"],
+          stdoutNot: ["nodes/approved/idea"],
+        },
+        // Out of search — a word that lives only in the archived node finds nothing.
+        { args: ["search", "pineapple"], stdout: ["No results found."] },
+        // Still readable directly, and its status shows it is archived.
+        {
+          args: ["read", "nodes/approved/idea"],
+          stdout: ["Bright Idea", "pineapple", "status: rejected"],
+        },
+        // History is kept in full.
+        {
+          args: ["history", "nodes/approved/idea", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1, 2]),
+        },
+      ],
+    },
+    {
+      id: "J20-03",
+      title: "An archived node refuses edits until it is unarchived",
+      actions: [
+        {
+          args: ["update", "nodes/approved/idea", "--body", "sneaky edit", "-y"],
+          status: 1,
+          stderr: ["is archived. Unarchive it first."],
+        },
+      ],
+    },
+    {
+      id: "J20-04",
+      title:
+        "Unarchive the node: it returns to its previous status and reappears in listings and retrieval",
+      actions: [
+        // Comes back in the status it was archived from (published).
+        {
+          args: ["unarchive", "nodes/approved/idea"],
+          stdout: ["Unarchived nodes/approved/idea (published)"],
+        },
+        // Back in the listing alongside the anchor.
+        {
+          args: ["list", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/approved/idea", "nodes/keep/anchor"]),
+        },
+        // Back in tag queries.
+        { args: ["query", "#plan"], stdout: ["nodes/approved/idea", "nodes/keep/anchor"] },
+        // Back in search — the word that found nothing while archived finds it now.
+        { args: ["search", "pineapple"], stdout: ["1 result(s):", "nodes/approved/idea"] },
+      ],
+    },
+    {
+      id: "J20-05",
+      title:
+        "Guardrails: archiving an already-archived node is refused, and moving onto an occupied destination is refused — nothing is lost",
+      actions: [
+        // Archiving the anchor succeeds once...
+        { args: ["archive", "nodes/keep/anchor"], stdout: ["Archived nodes/keep/anchor"] },
+        // ...and a second archive is refused, with the node left untouched.
+        {
+          args: ["archive", "nodes/keep/anchor"],
+          status: 1,
+          stderr: ["is already archived."],
+        },
+        { args: ["read", "nodes/keep/anchor"], stdout: ["status: rejected"] },
+        // Two nodes share a basename in different folders; moving one onto the
+        // other's folder would collide.
+        { args: ["add", "nodes/x/dup", "--title", "Dup X", "--body", "x body"], stdout: ["Version: 1"] },
+        { args: ["add", "nodes/y/dup", "--title", "Dup Y", "--body", "y body"], stdout: ["Version: 1"] },
+        {
+          args: ["move", "nodes/x/dup", "y"],
+          status: 1,
+          stderr: ["already exists"],
+        },
+        // Nothing lost: both the source and the occupied destination still read.
+        { args: ["read", "nodes/x/dup"], stdout: ["Dup X"] },
+        { args: ["read", "nodes/y/dup"], stdout: ["Dup Y"] },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -4125,5 +4317,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J19 — a bare `ctx` welcomes you and points the way", () => {
     runJourney({ installDir: INSTALL, scratch }, J19);
+  });
+  it("J20 — reorganize and retire nodes (move, archive & unarchive)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J20);
   });
 });
