@@ -242,4 +242,4 @@ The engine is the library layer. Most users reach it through one of these:
 
 ## License
 
-AGPL-3.0. Commercial licensing available from [PromptOwl](https://promptowl.ai) for embedding without AGPL obligations.
+AGPL-3.0. If your organization restricts AGPL, or you need to embed this in a proprietary product, a commercial license is available from [PromptOwl](https://promptowl.ai).
