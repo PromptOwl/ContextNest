@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.PromptOwl/contextnest",
+  "title": "Context Nest",
+  "description": "A shared, governed brain for AI agents: versioned context with approvals, local or hosted.",
+  "repository": {
+    "url": "https://github.com/PromptOwl/ContextNest",
+    "source": "github",
+    "subfolder": "packages/mcp-server"
+  },
+  "websiteUrl": "https://promptowl.ai/contextnest",
+  "version": "2.14.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@promptowl/contextnest-mcp-server",
+      "version": "2.14.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CONTEXTNEST_VAULT_PATH",
+          "description": "Absolute path to your vault. Optional: without it, the server uses a vault above the current directory, then the registry default.",
+          "isRequired": false,
+          "format": "filepath"
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://nest.promptowl.ai/mcp"
+    }
+  ]
+}
