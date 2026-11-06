@@ -6,7 +6,7 @@ on:
       - main
       - development
   pull_request:
-    branches: [main, development]
+    branches: [main, development, directory]
   workflow_dispatch:
 
 permissions:

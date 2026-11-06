@@ -1,6 +1,6 @@
 ---
 name: contextnest-retriever
-description: Retrieves relevant context from the Context Nest vault(s) for a topic and returns a tight, cited digest. Invoke before answering domain questions, or when retrieval_mode is "agent".
+description: Retrieves relevant context from the Context Nest vault(s) for a topic and returns a tight, cited digest. Invoke before answering domain questions.
 tools: Bash, Read
 model: sonnet
 ---

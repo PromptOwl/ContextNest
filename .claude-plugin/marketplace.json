@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "contextnest",
-      "description": "A shared, governed brain for Claude Code. Claude checks your team's versioned notes on each prompt and updates them when you correct something.",
+      "description": "A shared, governed brain for Claude Code. Claude checks your team's versioned notes when a question needs them and updates them when you correct something.",
       "homepage": "https://promptowl.ai/contextnest",
       "category": "productivity",
       "keywords": ["context-layer", "knowledge-base", "team-knowledge", "agent-memory", "governance"],

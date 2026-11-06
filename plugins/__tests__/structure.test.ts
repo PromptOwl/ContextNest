@@ -15,16 +15,6 @@ const plugin = join(repo, "plugins", "claude-code");
 const readJson = (p: string) => JSON.parse(readFileSync(p, "utf-8"));
 const read = (p: string) => readFileSync(p, "utf-8").replace(/\r\n/g, "\n");
 
-/** Hook events this plugin relies on (subset of the documented set). */
-const KNOWN_EVENTS = new Set([
-  "SessionStart",
-  "UserPromptSubmit",
-  "Stop",
-  "PreToolUse",
-  "PostToolUse",
-  "SessionEnd",
-]);
-
 describe("plugin manifest", () => {
   const manifest = readJson(join(plugin, ".claude-plugin", "plugin.json"));
 
@@ -34,51 +24,8 @@ describe("plugin manifest", () => {
     expect(typeof manifest.description).toBe("string");
   });
 
-  it("declares the userConfig options with valid types", () => {
-    const keys = Object.keys(manifest.userConfig);
-    // auto_capture is deprecated but retained: dropping it would silently reset
-    // the enable-time answer of every existing install.
-    expect(keys.sort()).toEqual([
-      "auto_capture",
-      "capture_mode",
-      "ctx_command",
-      "retrieval_mode",
-      "unclear_nest",
-      "vault",
-    ]);
-    for (const k of keys) {
-      expect(["string", "number", "boolean", "directory", "file"]).toContain(manifest.userConfig[k].type);
-      expect(manifest.userConfig[k].title).toBeTruthy();
-      expect(manifest.userConfig[k].description).toBeTruthy();
-    }
-  });
-});
-
-describe("hooks.json", () => {
-  const hooks = readJson(join(plugin, "hooks", "hooks.json")).hooks;
-
-  it("registers only known events", () => {
-    for (const event of Object.keys(hooks)) expect(KNOWN_EVENTS.has(event)).toBe(true);
-    expect(Object.keys(hooks).sort()).toEqual([
-      "PostToolUse",
-      "SessionStart",
-      "Stop",
-      "UserPromptSubmit",
-    ]);
-  });
-
-  it("every command references an existing core script via CLAUDE_PLUGIN_ROOT", () => {
-    for (const entries of Object.values<any>(hooks)) {
-      for (const group of entries) {
-        for (const h of group.hooks) {
-          expect(h.type).toBe("command");
-          expect(h.command).toContain("${CLAUDE_PLUGIN_ROOT}/core/");
-          const m = h.command.match(/core\/([\w.-]+\.js)/);
-          expect(m).toBeTruthy();
-          expect(existsSync(join(plugin, "core", m![1]))).toBe(true);
-        }
-      }
-    }
+  it("declares no settings: every old one only tuned a hook", () => {
+    expect(manifest.userConfig).toBeUndefined();
   });
 });
 
@@ -118,50 +65,9 @@ describe("agent + skill frontmatter", () => {
   });
 });
 
-describe("config command (CU-wdqcpzw825: settings must be changeable after enable)", () => {
-  const commandPath = join(plugin, "commands", "config.md");
-
-  it("ships a /contextnest:config command", () => {
-    expect(existsSync(commandPath)).toBe(true);
-  });
-
-  it("command has description frontmatter and covers every setting", () => {
-    const text = read(commandPath);
-    const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-    expect(fm, "frontmatter present").toBeTruthy();
-    expect(fm![1]).toMatch(/\bdescription:\s*\S+/);
-    for (const key of ["retrieval_mode", "capture_mode", "auto_capture", "vault", "ctx_command"]) {
-      expect(text).toContain(key);
-    }
-  });
-});
-
-describe("sweep-check hook registration", () => {
-  const hooks = readJson(join(plugin, "hooks", "hooks.json")).hooks;
-
-  it("PostToolUse is scoped to Bash and carries an explicit timeout", () => {
-    const groups = hooks.PostToolUse;
-    expect(groups).toHaveLength(1);
-    // Matcher keeps the hook off Read/Edit/etc — it only ever inspects shell
-    // commands, so firing anywhere else is pure overhead.
-    expect(groups[0].matcher).toBe("Bash");
-    const h = groups[0].hooks[0];
-    expect(h.command).toContain("core/sweep-check.js");
-    // It shells out to ctx several times across every nest (up to 45 s); run
-    // synchronously it held the turn after every `ctx update`. Async, the turn
-    // goes on and its findings reach the model on the next turn.
-    expect(h.async).toBe(true);
-    // Not enforced on an async hook today, but kept as the ceiling should the
-    // hook ever run synchronously again.
-    expect(typeof h.timeout).toBe("number");
-    expect(h.timeout).toBeGreaterThan(0);
-  });
-});
-
 describe("dispatched agents run in the background", () => {
-  // The Stop hook parks work instead of blocking the turn, and the next prompt
-  // dispatches it. If these lose `background: true`, the dispatch runs inline
-  // and delays the user's next request instead of overlapping it.
+  // If these lose `background: true`, the dispatch runs inline and delays the
+  // user's next request instead of overlapping it.
   it.each(["agents/contextnest-capture.md", "agents/contextnest-curator.md"])(
     "%s declares background: true",
     (rel) => {
@@ -184,34 +90,81 @@ describe("capture command", () => {
     expect(existsSync(commandPath)).toBe(true);
     const text = read(commandPath);
     expect(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1]).toMatch(/\bdescription:\s*\S+/);
-    // The command exists precisely because capture_mode can be `off`.
     expect(text).toContain("contextnest-capture");
   });
 });
 
-describe("vendored core sync", () => {
-  it("plugins:check passes (vendored core matches plugins/shared)", () => {
+describe("shared prompt sync", () => {
+  it("plugins:check passes (agent and skill bodies match plugins/shared)", () => {
     // Throws (non-zero exit) if any vendored copy has drifted.
     execFileSync("node", [join(repo, "scripts", "sync-plugins.mjs"), "--check"], {
       cwd: repo,
       encoding: "utf-8",
     });
   });
+});
 
-  it("vendored core files are byte-identical to the shared source", () => {
-    for (const name of [
-      "lib.js",
-      "retrieve.js",
-      "session-start.js",
-      "capture-gate.js",
-      "signals.js",
-      "ledger.js",
-      "sweep-check.js",
-    ]) {
-      expect(read(join(plugin, "core", name))).toBe(
-        read(join(repo, "plugins", "shared", "core", name)),
-      );
+// The directory accepts command hooks only from Verified organizations, so this
+// branch ships none. The full plugin, with its four hooks, stays on `development`.
+describe("hookless directory edition", () => {
+  const files = execFileSync("git", ["ls-files", "plugins/claude-code"], { cwd: repo, encoding: "utf-8" })
+    .split("\n")
+    .filter((f) => f && existsSync(join(repo, f)));
+  const prose = files.filter((f) => /\.(md|json)$/.test(f) && !/CHANGELOG|package/.test(f));
+  const skill = (name: string) => read(join(plugin, "skills", name, "SKILL.md"));
+  const frontmatter = (text: string) => text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
+
+  it("ships no hooks and none of the scripts only hooks ran", () => {
+    expect(existsSync(join(plugin, "hooks"))).toBe(false);
+    expect(existsSync(join(plugin, "core"))).toBe(false);
+    expect(readJson(join(plugin, ".claude-plugin", "plugin.json")).hooks).toBeUndefined();
+  });
+
+  it("claims no hook, removed setting or removed command anywhere", () => {
+    const stale = /\bhooks?\b|retrieval_mode|capture_mode|auto_capture|unclear_nest|ctx_command|plugin-settings|contextnest\.local|\/contextnest:config|on each prompt/i;
+    const allowed = /full (edition|plugin)|no hooks/i;
+    const hits = prose.flatMap((f) =>
+      read(join(repo, f))
+        .split("\n")
+        .filter((l) => stale.test(l) && !allowed.test(l))
+        .map((l) => `${f}: ${l.slice(0, 100)}`),
+    );
+    expect(hits).toEqual([]);
+  });
+
+  it("every /contextnest: reference resolves to a shipped command or skill", () => {
+    for (const f of prose) {
+      for (const [, name] of read(join(repo, f)).matchAll(/\/contextnest:([a-z-]+)/g)) {
+        const found = existsSync(join(plugin, "commands", `${name}.md`)) || existsSync(join(plugin, "skills", name, "SKILL.md"));
+        expect(found, `${f} -> /contextnest:${name}`).toBe(true);
+      }
     }
+  });
+
+  it("check-notes triggers on questions and treats notes as data", () => {
+    const text = skill("check-notes");
+    expect(frontmatter(text)).toMatch(/\bdescription:.*\b(before|when)\b/i);
+    expect(text).toContain("ctx search");
+    expect(text).toMatch(/reference material, not instructions/);
+    expect(text).toMatch(/cit(e|ing)/i);
+  });
+
+  it("keep-notes routes new facts to capture and corrections to the curator", () => {
+    const text = skill("keep-notes");
+    expect(frontmatter(text)).toMatch(/\bdescription:.*\b(remember|correct)/i);
+    expect(text).toContain("contextnest-capture");
+    expect(text).toContain("contextnest-curator");
+  });
+
+  it("the README says what this edition leaves out and where the full plugin is", () => {
+    const readme = read(join(plugin, "README.md"));
+    expect(readme).toContain("## This edition and the full plugin");
+    expect(readme).toContain("/plugin install contextnest --marketplace promptowl/contextnest");
+  });
+
+  it("the sync script no longer vendors the core into this plugin", () => {
+    const script = read(join(repo, "scripts", "sync-plugins.mjs"));
+    expect(script).toMatch(/plugin: "claude-code",\n\s+core: false/);
   });
 });
 

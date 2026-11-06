@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+The directory edition. The Claude plugin directory accepts command hooks only from Verified organizations, so this edition has none. The full plugin stays on our own marketplace.
+
+- **Claude checks your notes when a question needs them,** through the new `check-notes` skill, instead of searching on every prompt.
+- **`keep-notes` saves what you ask to remember and routes corrections to the curator.**
+- **Removed:** the four hooks, the scripts in `core/`, the plugin settings and `/contextnest:config`.
+
 ## 0.8.1
 
 Ready for the Claude plugin directory.
