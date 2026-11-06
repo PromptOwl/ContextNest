@@ -1,0 +1,26 @@
+{
+  "name": "contextnest",
+  "version": "0.1.0",
+  "description": "Vault-aware context retrieval and governed knowledge capture for Codex, powered by the Context Nest `ctx` CLI.",
+  "author": { "name": "PromptOwl", "email": "support@promptowl.ai" },
+  "homepage": "https://github.com/promptowl/contextnest",
+  "repository": "https://github.com/promptowl/contextnest",
+  "license": "AGPL-3.0",
+  "keywords": ["context", "knowledge-base", "rag", "memory", "contextnest"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Context Nest",
+    "shortDescription": "Governed, versioned memory for Codex",
+    "longDescription": "Searches your Context Nest vault on each prompt, sweeps stale facts after a ctx update, and queues capture passes for knowledge worth keeping.",
+    "developerName": "PromptOwl",
+    "category": "Productivity",
+    "capabilities": ["Instructions", "Lifecycle hooks"],
+    "websiteURL": "https://github.com/promptowl/contextnest",
+    "defaultPrompt": [
+      "What does our Context Nest say about this?",
+      "Remember this decision in Context Nest.",
+      "Check the vault structure rules for this folder."
+    ]
+  }
+}

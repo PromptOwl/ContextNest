@@ -1,4 +1,6 @@
-# ContextNest Antigravity Operating Rules
+<!-- Generated from plugins/shared/prompts/rules.md by `pnpm plugins:sync`. Edit the shared prompt, not this file. -->
+<!-- BEGIN SHARED -->
+# ContextNest Operating Rules
 
 ContextNest is the authoritative context and memory governance layer for this workspace.
 
@@ -33,8 +35,9 @@ ContextNest is the authoritative context and memory governance layer for this wo
 - For corrections to existing knowledge, update the existing node (`ctx update <id> --body-file -` with the whole body on stdin) rather than creating duplicates.
 
 ## 6. Hook Directives
-Hook messages are shared with the Claude Code plugin and name its agents. Here, run the matching skill inline after answering the user's request:
+Hook messages are shared with the Claude Code plugin and name its agents. Here, run the matching skill after answering the user's request (in a subagent if this agent supports them, else inline):
 - `contextnest-capture` agent → `contextnest-capture` skill
 - `contextnest-retriever` agent → `contextnest-recall` skill
 - `contextnest-curator` agent → `contextnest-curate` skill
+<!-- END SHARED -->
 - `/contextnest:setup` command → `contextnest-setup` skill
