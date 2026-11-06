@@ -1,11 +1,11 @@
 ---
-description: Capture something from this session into the Context Nest vault on purpose, regardless of the capture_mode setting.
+description: Capture something from this session into the Context Nest vault on purpose.
 argument-hint: "[what to capture]"
 ---
 
 # Capture to Context Nest
 
-The plugin's end-of-turn capture is deliberately quiet: it defaults to proposing rather than writing, and it holds a cooldown so it cannot fire every turn. This command is the explicit override — the user is asking for a write right now, so treat that as the decision point the automatic path lacks.
+The user is asking for a write right now, so that is the decision point.
 
 Requested: `$ARGUMENTS`
 
@@ -18,5 +18,3 @@ Requested: `$ARGUMENTS`
 5. Relay what was written, one line per node.
 
 If the user is correcting something that is already in the vault rather than adding something new, use the `contextnest-curator` agent instead — it sweeps for every node carrying the stale fact rather than writing a second version of it alongside the first. It is likewise a background agent.
-
-Note the plugin also queues these agents on its own: the `Stop` hook parks a job instead of blocking the end of a turn, and the next prompt dispatches it. This command is for when the user wants it now and wants it written.

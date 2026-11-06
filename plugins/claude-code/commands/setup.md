@@ -1,7 +1,7 @@
 ---
 description: Set up Context Nest in one question — notes on this computer, online at nest.promptowl.ai (or your company's server), or both. Safe to re-run; it never replaces an existing setup.
 argument-hint: "[local|online|both] [server-url]"
-allowed-tools: Bash(ctx --version), Bash(ctx vault list:*), Bash(ctx vault which:*), Bash(ctx login --list:*), Bash(ctx init:*), Bash(ctx login:*), Bash(ctx vault add:*), Bash(ctx list:*), Bash(ctx structure:*), Bash(mkdir -p:*)
+allowed-tools: Bash(ctx --version), Bash(ctx vault list:*), Bash(ctx vault which:*), Bash(ctx login --list:*), Bash(ctx init:*), Bash(ctx login:*), Bash(ctx vault add:*), Bash(ctx vault default:*), Bash(ctx list:*), Bash(ctx structure:*), Bash(mkdir -p:*)
 ---
 
 # Context Nest setup
@@ -26,9 +26,9 @@ Check quietly:
 
 - **Done**
 - **Add my team's notes** (or **Add notes on this computer** when only online notes exist) → the matching path in Step 3
-- **Change which notes Claude uses first** → hand over to `/contextnest:config vault`
+- **Change which notes Claude uses first** → ask which of the listed notes, then run `ctx vault default <alias>`
 
-Write `"setup": "done"` (see **Record the outcome**). Never remove, replace or re-default anything that exists.
+Never remove, replace or re-default anything that exists.
 
 ## Step 2 — one question
 
@@ -42,7 +42,7 @@ Skip this when `$ARGUMENTS` says `local`, `online` (or `cloud`) or `both`. A URL
 
 Always recommend this computer, the same default as the CLI's own setup. Before connecting anything, say once: "Nothing leaves this computer unless you choose to put it online."
 
-There are no other questions. Claude checks the notes on each prompt and saves only when the user asks or corrects something (the plugin's default). Say at the end how to change that.
+There are no other questions. Claude checks the notes when a question needs them and saves only when the user asks or corrects something.
 
 ## Step 3a — on this computer
 
@@ -79,19 +79,13 @@ Only when Step 1 found no working `ctx` and the user declined the npm install. T
 1. Run `claude mcp add --transport http --scope user contextnest "<server>/mcp"`. If a server named `contextnest` exists, ask before using another name, and never remove the existing one.
 2. Tell the user to run `/mcp`, pick **contextnest**, choose **Authenticate**, and approve in the browser. If it doesn't show, restart Claude Code first.
 3. Wait for them to say it worked. If there is no **Authenticate** option, remove only the entry you added (`claude mcp remove contextnest --scope user`) and say a local setup needs Node.
-4. The hooks need `ctx`, so say plainly that Claude reaches these notes only through the MCP tools.
+4. The skills need `ctx`, so say plainly that Claude reaches these notes only through the MCP tools.
 
 ## Not now
 
-Write `"setup": "declined"` and say "OK — run /contextnest:setup any time." Stop.
-
-## Record the outcome
-
-Merge the `setup` key into `~/.contextnest/plugin-settings.json`: read it, keep every other key, create the folder if needed, and write pretty JSON. The values are `"done"` (set up, or already set up) and `"declined"` (Not now). This is what stops the "isn't set up yet" message at session start.
+Say "OK — run /contextnest:setup any time." Stop.
 
 ## Step 4 — first note, then three lines
-
-Write `"setup": "done"`.
 
 - **New local notes.** `ctx init --starter` printed a brief addressed to you about a first note. Follow it, but ask first: one question about what to capture first, then exactly one real note, written only after the user agrees. Don't read the brief out to them. Don't search the new folder to "prove it works": it holds only template pages. New notes folders hold Claude's writes for the user's OK, so `ctx` prints `Held for review: ctx review approve <id>`. Tell the user in one line that the note is waiting for them and how to approve it. Never approve it yourself.
 - **Online notes.** Run `ctx --vault <alias> list --limit 20` and `ctx --vault <alias> structure --json`. Name the nests you found in one line each.
@@ -99,7 +93,7 @@ Write `"setup": "done"`.
 Then close in at most three lines:
 
 1. Where the notes are (the folder or hostname).
-2. What Claude now does on its own: checks the notes on each prompt, and saves when you say "remember…" or correct it.
-3. How to change that: `/contextnest:config`.
+2. What Claude now does: checks the notes when a question needs them, and saves when you say "remember…" or correct it.
+3. How to look deeper: `/contextnest:recall <topic>`.
 
 If `command -v ctx` points inside the plugin's own folder, the user has no `ctx` of their own. Offer once: "Want `ctx` in your own terminal too? `npm i -g @promptowl/contextnest-cli`". Never write a test note unasked.

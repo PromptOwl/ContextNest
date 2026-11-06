@@ -2,49 +2,24 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "contextnest",
   "displayName": "Context Nest",
-  "version": "0.8.1",
-  "description": "A shared, governed brain for Claude Code. Claude checks your team's versioned notes on each prompt and updates them when you correct something.",
-  "author": { "name": "PromptOwl" },
+  "version": "0.9.0",
+  "description": "A shared, governed brain for Claude Code. Claude checks your team's versioned notes when a question needs them and updates them when you correct something.",
+  "author": {
+    "name": "PromptOwl"
+  },
   "homepage": "https://promptowl.ai/contextnest",
   "repository": "https://github.com/promptowl/contextnest",
   "license": "AGPL-3.0",
-  "keywords": ["context", "context-layer", "knowledge-base", "team-knowledge", "agent-memory", "memory", "rag", "governance", "markdown", "contextnest"],
-  "userConfig": {
-    "retrieval_mode": {
-      "type": "string",
-      "title": "Retrieval effort",
-      "description": "How much context to auto-inject on each prompt: off | search (cheap full-text) | query (graph) | agent (full reasoning).",
-      "default": "search"
-    },
-    "capture_mode": {
-      "type": "string",
-      "title": "Capture behaviour",
-      "description": "What happens when the plugin spots something worth keeping: off (never on its own, use /contextnest:capture) | explicit (default — only when you ask to remember something or correct a fact; no background review) | propose (also reviews finished turns and proposes in one line, writes only once you agree; each review is a background agent run) | auto (write unattended). Supersedes auto_capture.",
-      "default": "explicit"
-    },
-    "auto_capture": {
-      "type": "boolean",
-      "title": "Auto-capture knowledge (deprecated)",
-      "description": "Deprecated — use capture_mode. Kept so existing installs keep working: true maps to propose, false maps to off. capture_mode wins when both are set.",
-      "default": true
-    },
-    "unclear_nest": {
-      "type": "string",
-      "title": "When the nest for a new note is unclear",
-      "description": "ask (default) — capture asks which nest before writing; default — it writes to the pinned vault, else the registry default. Matters when one server alias spans several nests (e.g. partner nests).",
-      "default": "ask"
-    },
-    "vault": {
-      "type": "string",
-      "title": "Pinned vault alias",
-      "description": "Always use this registered vault. Leave empty to let the agents pick the relevant vault(s) automatically.",
-      "default": ""
-    },
-    "ctx_command": {
-      "type": "string",
-      "title": "ctx binary",
-      "description": "Command used to invoke the Context Nest CLI. Falls back to the copy installed with this plugin if not found.",
-      "default": "ctx"
-    }
-  }
+  "keywords": [
+    "context",
+    "context-layer",
+    "knowledge-base",
+    "team-knowledge",
+    "agent-memory",
+    "memory",
+    "rag",
+    "governance",
+    "markdown",
+    "contextnest"
+  ]
 }
