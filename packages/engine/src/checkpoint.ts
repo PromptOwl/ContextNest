@@ -272,7 +272,7 @@ export class CheckpointManager {
     publishedDocuments: ContextNode[],
     documentHistories: Map<string, DocumentHistory>,
   ): Promise<Checkpoint> {
-    // Serialize the read-modify-write of context_history.yaml. Concurrent
+    // Serialize the read-head-then-append of the checkpoint chain. Concurrent
     // publishes (e.g. Promise.all) would otherwise each read the same base
     // history and the last writer would clobber the others, silently dropping
     // checkpoints. The lock is in-process only — separate OS processes would
@@ -485,7 +485,7 @@ export class CheckpointManager {
       // and calling either of those corrupt would litter the vault with
       // `.corrupt-*` files and cry a break that never happened.
       if (chainState.kind === "head") {
-        await this.storage.appendCheckpoint(checkpoint);
+        await this.storage.appendCheckpoint(checkpoint, chainState);
       } else {
         await this.storage.startCheckpointHistory(
           checkpoint,
@@ -509,9 +509,9 @@ export class CheckpointManager {
   /**
    * Rebuild checkpoint history from per-document history.yaml files (§7.3).
    *
-   * Rebuild is a full re-derivation that overwrites context_history.yaml. A
-   * naive single read-compute-write races with a concurrent createCheckpoint:
-   * a publish that commits between our read of the per-doc histories and our
+   * Rebuild is a full re-derivation that replaces the whole chain. A naive
+   * single read-compute-write races with a concurrent createCheckpoint: a
+   * publish that commits between our read of the per-doc histories and our
    * write would be silently clobbered. We cannot simply hold withCheckpointLock
    * across the write — createCheckpoint also takes that lock, so a publish that
    * begins during the rebuild would deadlock against us.

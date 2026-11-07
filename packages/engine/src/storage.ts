@@ -20,6 +20,7 @@ import {
 import { constants as fsConstants } from "node:fs";
 import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import yaml from "js-yaml";
+import type { z } from "zod";
 import { globFiles } from "./glob.js";
 import { comparableSegment } from "./structure.js";
 import { parseDocument, serializeDocument } from "./parser.js";
@@ -88,6 +89,8 @@ import {
   documentHistorySchema,
   checkpointSchema,
   checkpointHistorySchema,
+  checkpointDeltaSchema,
+  checkpointSegmentSchema,
 } from "./schemas.js";
 import {
   ForeignVaultKeyError,
@@ -108,7 +111,8 @@ import {
 export const UNSTAGED_DRIFT_SENTINEL = "unstaged-drift";
 
 /**
- * What a read of `.versions/context_history.yaml` found.
+ * What a read of the checkpoint chain found (`.versions/.checkpoints/`, or the
+ * legacy `.versions/context_history.yaml` before the first segment).
  *
  * Deliberately four cases, not a nullable checkpoint. The publish seal
  * quarantines a chain it cannot read, so "unreadable" has to be separable from
@@ -121,8 +125,12 @@ export type CheckpointChainState =
   | { kind: "absent" }
   /** Valid, with no checkpoints — what a rebuild writes over an empty vault. */
   | { kind: "empty" }
-  /** The newest checkpoint, to link the next one onto. */
-  | { kind: "head"; checkpoint: Checkpoint }
+  /**
+   * The newest checkpoint, to link the next one onto. `segment` names the
+   * segment file holding it (by its first checkpoint number); absent when the
+   * head is still in the legacy `context_history.yaml`.
+   */
+  | { kind: "head"; checkpoint: Checkpoint; segment?: number }
   /** Present and genuinely unparseable. The only state that licenses a quarantine. */
   | { kind: "unreadable"; reason: string };
 
@@ -565,9 +573,108 @@ async function renameWithRetry(from: string, to: string): Promise<void> {
  */
 async function quarantine(path: string): Promise<string> {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const dest = path.replace(/\.yaml$/, "") + `.corrupt-${stamp}.yaml`;
+  const dest = path.endsWith(".yaml")
+    ? path.slice(0, -".yaml".length) + `.corrupt-${stamp}.yaml`
+    : `${path}.corrupt-${stamp}`; // a folder: the chain's segments
   await renameWithRetry(path, dest);
   return dest;
+}
+
+const CHECKPOINT_HISTORY_HEADER = "# Auto-generated. Do not edit manually.\n";
+
+/** The legacy single-file chain, relative to `.versions/`. Read-only once a segment exists. */
+const LEGACY_HISTORY_FILE = "context_history.yaml";
+
+/**
+ * Segments of the chain, relative to `.versions/`. The leading dot keeps it
+ * clear of every document's history folder (no document is named so) and makes
+ * an import refuse it as the vault's own machinery.
+ */
+const CHECKPOINT_SEGMENT_DIR = ".checkpoints";
+
+/** Default for {@link NestStorageOptions.checkpointsPerSegment}. */
+const CHECKPOINTS_PER_SEGMENT = 500;
+
+type CheckpointDelta = z.infer<typeof checkpointDeltaSchema>;
+
+/** A segment's file name: the number of the checkpoint it opens with. */
+function segmentFileName(first: number): string {
+  return `${String(first).padStart(9, "0")}.yaml`;
+}
+
+/** What `next` changed in one map since `prev`. Own keys only: ids are data. */
+function diffMap<V>(prev: Record<string, V>, next: Record<string, V>): { changed: Record<string, V>; removed: string[] } {
+  const changed: Record<string, V> = {};
+  for (const [k, v] of Object.entries(next)) {
+    if (!Object.hasOwn(prev, k) || prev[k] !== v) changed[k] = v;
+  }
+  return { changed, removed: Object.keys(prev).filter((k) => !Object.hasOwn(next, k)) };
+}
+
+function applyMap<V>(prev: Record<string, V>, changed: Record<string, V>, removed: string[] = []): Record<string, V> {
+  const next = { ...prev, ...changed };
+  for (const k of removed) delete next[k];
+  return next;
+}
+
+/** `next` as what changed since `prev`; same hash, a fraction of the bytes. */
+function checkpointDelta(prev: Checkpoint, next: Checkpoint): CheckpointDelta {
+  const versions = diffMap(prev.document_versions, next.document_versions);
+  const hashes = diffMap(prev.document_chain_hashes, next.document_chain_hashes);
+  return {
+    checkpoint: next.checkpoint,
+    at: next.at,
+    triggered_by: next.triggered_by,
+    changed_versions: versions.changed,
+    changed_chain_hashes: hashes.changed,
+    ...(versions.removed.length > 0 ? { removed_versions: versions.removed } : {}),
+    ...(hashes.removed.length > 0 ? { removed_chain_hashes: hashes.removed } : {}),
+    checkpoint_hash: next.checkpoint_hash,
+  };
+}
+
+/**
+ * A segment's text: its first checkpoint whole, every later one as a delta on
+ * the one before. Appending `segmentItem(delta)` to it yields exactly the text
+ * this would produce for the longer list.
+ */
+function encodeSegment(checkpoints: readonly Checkpoint[]): string {
+  const entries = checkpoints.map((cp, i) => (i === 0 ? cp : checkpointDelta(checkpoints[i - 1], cp)));
+  return CHECKPOINT_HISTORY_HEADER + yaml.dump({ checkpoints: entries }, { lineWidth: -1, noRefs: true });
+}
+
+/** One list item as it sits under `checkpoints:`, indented two spaces. */
+function segmentItem(entry: Checkpoint | CheckpointDelta): string {
+  return yaml
+    .dump([entry], { lineWidth: -1, noRefs: true })
+    .split("\n")
+    .map((line) => (line.length > 0 ? `  ${line}` : line))
+    .join("\n");
+}
+
+/**
+ * Full checkpoints from a parsed segment, or why it cannot yield them. Only the
+ * first entry may lack a predecessor, so it must be whole.
+ */
+function decodeSegment(entries: ReadonlyArray<Checkpoint | CheckpointDelta>): Checkpoint[] | string {
+  const out: Checkpoint[] = [];
+  for (const entry of entries) {
+    if ("document_versions" in entry) {
+      out.push(entry);
+      continue;
+    }
+    const prev = out.at(-1);
+    if (!prev) return `checkpoint ${entry.checkpoint} is a delta with nothing before it`;
+    out.push({
+      checkpoint: entry.checkpoint,
+      at: entry.at,
+      triggered_by: entry.triggered_by,
+      document_versions: applyMap(prev.document_versions, entry.changed_versions, entry.removed_versions),
+      document_chain_hashes: applyMap(prev.document_chain_hashes, entry.changed_chain_hashes, entry.removed_chain_hashes),
+      checkpoint_hash: entry.checkpoint_hash,
+    });
+  }
+  return out;
 }
 
 /** Options for {@link NestStorage}. */
@@ -598,6 +705,15 @@ export interface NestStorageOptions {
    * otherwise rewrite five files nobody reads.
    */
   agentConfigs?: boolean;
+
+  /**
+   * Checkpoints per segment file of the chain (default 500). A segment opens
+   * with one whole checkpoint and records only what changed after it, and a
+   * seal writes to the newest segment alone — which is all a network-backed
+   * mount re-uploads per seal. Lower bounds that upload; higher writes fewer
+   * whole checkpoints.
+   */
+  checkpointsPerSegment?: number;
 }
 
 /**
@@ -933,8 +1049,8 @@ export class NestStorage {
 
   /**
    * Run `fn` with exclusive access to the checkpoint history file, serializing
-   * concurrent callers in this process. `createCheckpoint` reads, mutates, and
-   * rewrites `context_history.yaml`; without this lock concurrent publishes
+   * concurrent callers in this process. `createCheckpoint` reads the chain's
+   * head and appends a checkpoint linked onto it; without this lock concurrent publishes
    * (e.g. `Promise.all`) each read the same base history and the last writer
    * clobbers the rest, silently dropping checkpoints.
    *
@@ -1276,8 +1392,8 @@ export class NestStorage {
   ): Promise<void> {
     const config = await this.readConfig();
     // Only the LATEST checkpoint reaches context.yaml, so this must not load the
-    // whole chain: regenerateIndex runs after every single write, and
-    // context_history.yaml grows by one entry per published doc per checkpoint.
+    // whole chain: regenerateIndex runs after every single write, and the
+    // chain grows by one entry per checkpoint.
     // Parsing it here is what made writes time out on a mature vault while reads
     // — which never come through this path — stayed instant.
     const latestCheckpoint = opts.latestCheckpoint ?? (await this.readLatestCheckpoint());
@@ -2640,17 +2756,15 @@ export class NestStorage {
    * the machine loses power) after the metadata grows but before the data is
    * flushed, the file comes back zero-filled — the "null byte is not allowed in
    * input" YAMLException seen from `findAllHistories`. Reserved for
-   * history.yaml / context_history.yaml: they are the integrity anchors, and a
-   * torn one is unrecoverable, unlike a regenerable index.
+   * history.yaml and the checkpoint chain's segments: they are the integrity
+   * anchors, and a torn one is unrecoverable, unlike a regenerable index.
    *
    * The temp name is unique per call. A shared `{path}.tmp` would make
    * concurrent writers to the same target collide: both open and truncate the
    * same temp file, the first rename consumes it, and the second fails ENOENT.
-   * That is not hypothetical — `rebuildCheckpointHistory` deliberately writes
-   * context_history.yaml outside `withCheckpointLock` (holding it would deadlock
-   * against the publishes it retries around), so it can overlap a publish's
-   * write. Unique temps keep the old last-write-wins semantics instead of
-   * turning that overlap into a throw.
+   * That is not hypothetical — concurrent `writeHistory` calls on one document
+   * overlap. Unique temps keep last-write-wins semantics instead of turning
+   * that overlap into a throw.
    */
   private async writeFileDurable(path: string, content: string | Uint8Array): Promise<void> {
     const tmp = `${path}.${process.pid}.${++this.tmpWriteCounter}.tmp`;
@@ -3110,36 +3224,111 @@ export class NestStorage {
     return destDir;
   }
 
-  /** Absolute path of the checkpoint chain file. */
-  private checkpointHistoryPath(): string {
-    return join(this.root, ".versions", "context_history.yaml");
+  /** Absolute path of a file under `.versions/`. */
+  private versionsPath(file: string): string {
+    return join(this.root, ".versions", file);
+  }
+
+  /** Absolute path of the folder holding the chain's segments. */
+  private checkpointSegmentDir(): string {
+    return this.versionsPath(CHECKPOINT_SEGMENT_DIR);
+  }
+
+  /** A segment's path relative to `.versions/`, as the pointer records it. */
+  private segmentFile(first: number): string {
+    return `${CHECKPOINT_SEGMENT_DIR}/${segmentFileName(first)}`;
   }
 
   /**
    * Absolute path of the latest-checkpoint pointer.
    *
-   * A cache, never an authority: it is validated against the size of
-   * context_history.yaml before use and can be deleted at any time without
-   * losing anything — see {@link readLatestCheckpoint}.
+   * A cache, never an authority: it is validated against the size and mtime of
+   * the chain file holding the head before use and can be deleted at any time
+   * without losing anything — see {@link readLatestCheckpoint}.
    */
   private latestCheckpointPath(): string {
-    return join(this.root, ".versions", "context_latest.yaml");
+    return this.versionsPath("context_latest.yaml");
   }
 
   /**
-   * Read checkpoint history from .versions/context_history.yaml (§7.2).
+   * The first checkpoint number of every segment, ascending; [] when there are
+   * none. The listing, not the pointer, says which segment is newest: a seal
+   * that rolled to a new segment may have died before re-pointing.
+   */
+  private async listCheckpointSegments(): Promise<number[]> {
+    let names: string[];
+    try {
+      names = await readdir(this.checkpointSegmentDir());
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    return names
+      .filter((name) => /^\d+\.yaml$/.test(name))
+      .map((name) => Number(name.slice(0, -".yaml".length)))
+      .sort((a, b) => a - b);
+  }
+
+  /**
+   * One segment's checkpoints, deltas expanded, or why it does not parse. An
+   * I/O failure propagates: only a file that reads and will not parse is
+   * unreadable.
+   */
+  private async readCheckpointSegment(first: number): Promise<Checkpoint[] | { unreadable: string }> {
+    const file = this.segmentFile(first);
+    const content = await readFile(this.versionsPath(file), "utf-8");
+    let raw: unknown;
+    try {
+      raw = yaml.load(content);
+    } catch (err) {
+      return { unreadable: `${file}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    const result = checkpointSegmentSchema.safeParse(raw);
+    if (!result.success) {
+      return { unreadable: `${file}: failed schema validation (${result.error.issues[0]?.message ?? "unknown issue"})` };
+    }
+    const decoded = decodeSegment(result.data.checkpoints as Array<Checkpoint | CheckpointDelta>);
+    return typeof decoded === "string" ? { unreadable: `${file}: ${decoded}` } : decoded;
+  }
+
+  /**
+   * Read the whole checkpoint chain (§7.2): the legacy `context_history.yaml`
+   * if there is one, then every segment in order, deltas expanded to full
+   * checkpoints.
    *
-   * Loads and validates the WHOLE chain, which is O(checkpoints × published
-   * docs). Only the paths that genuinely need every checkpoint — verify, the
-   * §7.3 rebuild — should call it. To link a new checkpoint onto the chain, or
-   * to stamp the latest one into context.yaml, use {@link readLatestCheckpoint}.
+   * Loads every checkpoint, which is O(checkpoints × published docs) in
+   * memory. Only the paths that genuinely need every checkpoint — verify, the
+   * §7.3 rebuild, listings — should call it. To link a new checkpoint onto the
+   * chain, or to stamp the latest one into context.yaml, use
+   * {@link readLatestCheckpoint}. Null when there is no chain, or when any part
+   * of it does not read.
    */
   async readCheckpointHistory(): Promise<CheckpointHistory | null> {
     try {
-      const content = await readFile(this.checkpointHistoryPath(), "utf-8");
-      const raw = yaml.load(content);
-      const result = checkpointHistorySchema.safeParse(raw);
-      return result.success ? (result.data as CheckpointHistory) : null;
+      const checkpoints: Checkpoint[] = [];
+      let found = false;
+      const firsts = await this.listCheckpointSegments();
+      // The legacy file is the chain's prefix only when the segments start after
+      // it. Beside segments that start at 1 it is a stray (an imported copy, a
+      // rebuild that died before removing it), not part of this chain.
+      if (firsts.length === 0 || firsts[0] > 1) {
+        try {
+          const raw = yaml.load(await readFile(this.versionsPath(LEGACY_HISTORY_FILE), "utf-8"));
+          const result = checkpointHistorySchema.safeParse(raw);
+          if (!result.success) return null;
+          for (const checkpoint of result.data.checkpoints as Checkpoint[]) checkpoints.push(checkpoint);
+          found = true;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+        }
+      }
+      for (const first of firsts) {
+        const segment = await this.readCheckpointSegment(first);
+        if (!Array.isArray(segment)) return null;
+        for (const checkpoint of segment) checkpoints.push(checkpoint);
+        found = true;
+      }
+      return found ? { checkpoints } : null;
     } catch {
       return null;
     }
@@ -3160,14 +3349,45 @@ export class NestStorage {
    * propagates, so the write fails loudly and is retried rather than silently
    * discarding the chain.
    *
-   * The head itself comes from three sources, cheapest first: the pointer file,
-   * a bounded tail read, then a full read for a file too small to have a usable
-   * tail. None of the three grows with the chain.
+   * Once a segment exists the head is in the newest one, and the legacy
+   * `context_history.yaml` is never read here again. The head comes from the
+   * pointer file, else from reading that one segment — bounded by the segment
+   * size, never by the chain.
    */
   async readCheckpointChainState(): Promise<CheckpointChainState> {
+    const first = (await this.listCheckpointSegments()).at(-1);
+    if (first === undefined) return this.readLegacyChainState();
+
+    // A failed stat or read propagates, never reads as "absent": that would
+    // start a new chain over the top of this one.
+    const file = this.segmentFile(first);
+    const s = await stat(this.versionsPath(file));
+    const pointed = await this.readLatestCheckpointPointer(file, { size: s.size, mtimeMs: s.mtimeMs });
+    if (pointed) return { kind: "head", checkpoint: pointed, segment: first };
+
+    // No tail shortcut: the last entry is usually a delta, so the head is
+    // rebuilt from the whole checkpoint the segment opens with.
+    const segment = await this.readCheckpointSegment(first);
+    if (!Array.isArray(segment)) return { kind: "unreadable", reason: segment.unreadable };
+    const head = segment.at(-1);
+    // A segment is never written empty (rebuild writes none instead), so an
+    // empty one is damage: quarantined, not treated as a fresh start that would
+    // overwrite the segments before it.
+    if (!head) return { kind: "unreadable", reason: `${file}: holds no checkpoint` };
+    return { kind: "head", checkpoint: head, segment: first };
+  }
+
+  /**
+   * {@link readCheckpointChainState} for a vault with no segment yet: the head
+   * is in `context_history.yaml`, from three sources, cheapest first: the
+   * pointer file, a bounded tail read, then a full read for a file too small to
+   * have a usable tail.
+   */
+  private async readLegacyChainState(): Promise<CheckpointChainState> {
+    const path = this.versionsPath(LEGACY_HISTORY_FILE);
     let info: { size: number; mtimeMs: number };
     try {
-      const s = await stat(this.checkpointHistoryPath());
+      const s = await stat(path);
       info = { size: s.size, mtimeMs: s.mtimeMs };
     } catch (err) {
       // Absent is the only benign case; a permission or I/O failure here must
@@ -3176,7 +3396,7 @@ export class NestStorage {
       throw err;
     }
 
-    const pointed = await this.readLatestCheckpointPointer(info);
+    const pointed = await this.readLatestCheckpointPointer(LEGACY_HISTORY_FILE, info);
     if (pointed) return { kind: "head", checkpoint: pointed };
 
     const tailed = await this.readLatestCheckpointFromTail(info.size);
@@ -3186,7 +3406,7 @@ export class NestStorage {
     // and this read is the one that decides corrupt vs merely empty.
     let content: string;
     try {
-      content = await readFile(this.checkpointHistoryPath(), "utf-8");
+      content = await readFile(path, "utf-8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
       throw err;
@@ -3205,8 +3425,8 @@ export class NestStorage {
       };
     }
     const head = (result.data as CheckpointHistory).checkpoints.at(-1);
-    // Valid YAML with no checkpoints — what rebuildCheckpointHistory writes for
-    // a vault with nothing published. Empty is not broken.
+    // Valid YAML with no checkpoints — what older rebuilds wrote for a vault
+    // with nothing published. Empty is not broken.
     return head ? { kind: "head", checkpoint: head } : { kind: "empty" };
   }
 
@@ -3246,22 +3466,28 @@ export class NestStorage {
   /**
    * Pointer-file half of {@link readCheckpointChainState}.
    *
-   * Validated against the chain file's size AND mtime. That is a cheap staleness
-   * check, not a proof of identity: an external rewrite that lands on the same
-   * byte count within the same mtime tick would still validate. It closes the
-   * realistic cases — a rebuild, a restored backup, an append from another
-   * process — and the chain's own hash linkage remains what `verify` checks.
+   * Valid only for the chain file it names (`history_file`, relative to
+   * `.versions/`; absent in pointers written before segments, which named the
+   * legacy file) and only while that file's size AND mtime match. That is a
+   * cheap staleness check, not a proof of identity: an external rewrite that
+   * lands on the same byte count within the same mtime tick would still
+   * validate. It closes the realistic cases — a rebuild, a restored backup, an
+   * append from another process — and the chain's own hash linkage remains
+   * what `verify` checks.
    */
   private async readLatestCheckpointPointer(
+    file: string,
     info: { size: number; mtimeMs: number },
   ): Promise<Checkpoint | null> {
     try {
       const raw = yaml.load(await readFile(this.latestCheckpointPath(), "utf-8"));
       const pointer = raw as {
+        history_file?: unknown;
         history_bytes?: unknown;
         history_mtime_ms?: unknown;
         checkpoint?: unknown;
       };
+      if ((pointer?.history_file ?? LEGACY_HISTORY_FILE) !== file) return null;
       if (pointer?.history_bytes !== info.size) return null;
       if (pointer?.history_mtime_ms !== info.mtimeMs) return null;
       const parsed = checkpointSchema.safeParse(pointer.checkpoint);
@@ -3272,7 +3498,7 @@ export class NestStorage {
   }
 
   /**
-   * Tail-read half of {@link readCheckpointChainState}.
+   * Tail-read half of {@link readLegacyChainState}.
    *
    * Finds the last list item by scanning for a two-space-indented
    * `- checkpoint:` line. That is exact for files this class writes, and only
@@ -3291,7 +3517,7 @@ export class NestStorage {
     const start = Math.max(0, historyBytes - TAIL_BYTES);
     let text: string;
     try {
-      const handle = await open(this.checkpointHistoryPath(), "r");
+      const handle = await open(this.versionsPath(LEGACY_HISTORY_FILE), "r");
       try {
         const buf = Buffer.alloc(historyBytes - start);
         // A short read is normal on network-backed mounts. Decoding the
@@ -3333,25 +3559,27 @@ export class NestStorage {
     }
   }
 
-  /** Re-point the cache at `checkpoint`, stamped with the chain file's identity. */
+  /** Re-point the cache at `checkpoint`, stamped with the identity of `file`, the chain file holding it. */
   private async writeLatestCheckpointPointer(
     checkpoint: Checkpoint,
+    file: string,
   ): Promise<void> {
     let info: { size: number; mtimeMs: number };
     try {
-      const s = await stat(this.checkpointHistoryPath());
+      const s = await stat(this.versionsPath(file));
       info = { size: s.size, mtimeMs: s.mtimeMs };
     } catch {
       return; // nothing to point at; the read path falls back cleanly
     }
     // Not writeFileDurable: this file is a cache. A torn one fails its staleness
-    // check and costs one tail read, so paying an fsync per write to protect it
-    // would trade away the thing being fixed for nothing.
+    // check and costs one segment read, so paying an fsync per write to protect
+    // it would trade away the thing being fixed for nothing.
     await writeFile(
       this.latestCheckpointPath(),
       "# Auto-generated cache of the newest checkpoint. Safe to delete.\n" +
         yaml.dump(
           {
+            history_file: file,
             history_bytes: info.size,
             history_mtime_ms: info.mtimeMs,
             checkpoint,
@@ -3363,41 +3591,57 @@ export class NestStorage {
   }
 
   /**
-   * Append one checkpoint to the chain (§7.2).
+   * Append one checkpoint to the chain (§7.2), linked onto `head`: the state
+   * {@link readCheckpointChainState} returned under the same lock. Read again
+   * when omitted.
    *
-   * APPEND, not read-modify-write. Sealing used to load the entire chain, push
-   * one entry and dump it back, so every publish cost O(chain size) in parse,
-   * serialize and fsync — on a network-backed mount, a full re-upload of a file
-   * that grows by one entry per published document per checkpoint. The bytes
-   * written are identical either way: `yaml.dump({checkpoints: [...]})` emits
-   * exactly `checkpoints:\n` followed by each item indented two spaces.
+   * APPEND, to a bounded file, of only what changed. Sealing once loaded the
+   * whole chain, pushed one entry and dumped it back; then it appended a whole
+   * checkpoint — every published document's version and chain hash — to one
+   * ever-growing `context_history.yaml`, which a network-backed mount
+   * re-uploads in full on every append (hundreds of MB, seconds per write).
+   * Now the newest segment takes the checkpoint as a delta on `head`, so both
+   * the bytes a seal writes and the file it rewrites stay the same size however
+   * long the chain gets.
    *
-   * Only valid when the file already ends in a non-empty `checkpoints:` list —
-   * i.e. when {@link readLatestCheckpoint} returned an entry. Callers with no
-   * previous checkpoint use {@link startCheckpointHistory}.
+   * A full segment rolls to a new one that opens with the whole checkpoint, so
+   * every segment decodes on its own. So does a head still in the legacy
+   * `context_history.yaml`: that file is never written again, which is the
+   * whole migration — no rewrite of it on the hot path.
    */
-  async appendCheckpoint(checkpoint: Checkpoint): Promise<void> {
-    // No mkdir: this only extends a chain file that exists (see above).
-    const path = this.checkpointHistoryPath();
-    const block = yaml
-      .dump([checkpoint], { lineWidth: -1, noRefs: true })
-      .split("\n")
-      .map((line) => (line.length > 0 ? `  ${line}` : line))
-      .join("\n");
-    const handle = await open(path, "a");
+  async appendCheckpoint(
+    checkpoint: Checkpoint,
+    head?: { checkpoint: Checkpoint; segment?: number },
+  ): Promise<void> {
+    if (!head) {
+      const state = await this.readCheckpointChainState();
+      if (state.kind !== "head") throw new Error(`no checkpoint to append onto (the chain is ${state.kind})`);
+      head = state;
+    }
+    const perSegment = this.options.checkpointsPerSegment ?? CHECKPOINTS_PER_SEGMENT;
+    if (head.segment === undefined || checkpoint.checkpoint - head.segment >= perSegment) {
+      const file = this.segmentFile(checkpoint.checkpoint);
+      await mkdir(this.checkpointSegmentDir(), { recursive: true });
+      await this.writeFileDurable(this.versionsPath(file), encodeSegment([checkpoint]));
+      await this.writeLatestCheckpointPointer(checkpoint, file);
+      return;
+    }
+    // No mkdir: this only extends a segment that exists.
+    const file = this.segmentFile(head.segment);
+    const handle = await open(this.versionsPath(file), "a");
     try {
-      await handle.write(block);
+      await handle.write(segmentItem(checkpointDelta(head.checkpoint, checkpoint)));
       await handle.sync();
     } finally {
       await handle.close();
     }
-    await this.writeLatestCheckpointPointer(checkpoint);
+    await this.writeLatestCheckpointPointer(checkpoint, file);
   }
 
   /**
    * Begin a fresh chain with `checkpoint` as its first entry.
    *
-   * For the states {@link appendCheckpoint} cannot extend: no chain file, or one
+   * For the states {@link appendCheckpoint} cannot extend: no chain, or one
    * holding no checkpoint to link onto.
    *
    * `quarantineExisting` is the CALLER's finding, never inferred here. Deciding
@@ -3405,47 +3649,67 @@ export class NestStorage {
    * — far worse — with a transient read failure, so a flaky mount could rename a
    * healthy chain aside and restart numbering at 1. Only
    * {@link readCheckpointChainState} can tell those apart, so only it decides.
+   * The whole chain goes aside, legacy file and segments alike: the new chain
+   * restarts at 1, and nothing older may sit in front of it.
    */
   async startCheckpointHistory(
     checkpoint: Checkpoint,
     options: { quarantineExisting?: string } = {},
   ): Promise<void> {
-    const path = this.checkpointHistoryPath();
-    await mkdir(dirname(path), { recursive: true });
     if (options.quarantineExisting !== undefined) {
-      try {
-        const quarantined = await quarantine(path);
-        console.warn(
-          `[checkpoint] ${path} is unreadable (${options.quarantineExisting}); ` +
-            `preserved as ${basename(quarantined)} and starting a new chain`,
-        );
-      } catch (err) {
-        // Another process moved it first. Losing that race is fine — the file
-        // is preserved either way, and failing the publish over it is not.
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      for (const path of [this.versionsPath(LEGACY_HISTORY_FILE), this.checkpointSegmentDir()]) {
+        try {
+          const quarantined = await quarantine(path);
+          console.warn(
+            `[checkpoint] the chain is unreadable (${options.quarantineExisting}); ` +
+              `${path} preserved as ${basename(quarantined)}, starting a new chain`,
+          );
+        } catch (err) {
+          // Absent, or another process moved it first. Losing that race is
+          // fine — the file is preserved either way, and failing the publish
+          // over it is not.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
       }
     }
     await this.writeCheckpointHistory({ checkpoints: [checkpoint] });
   }
 
   /**
-   * Write checkpoint history.
+   * Write the whole checkpoint chain — for the rebuild path (§7.3) and for
+   * starting a fresh chain. The publish path appends instead; see
+   * {@link appendCheckpoint}.
    *
-   * Rewrites the file whole — for the rebuild path (§7.3) and for starting a
-   * fresh chain. The publish path appends instead; see {@link appendCheckpoint}.
+   * Replaces every segment and the legacy `context_history.yaml`. Each segment
+   * is written atomically (temp + rename) before anything stale is removed, so
+   * the folder never empties mid-write. Takes no lock: a fresh chain is started
+   * under the checkpoint lock already, and the rebuild re-derives if a publish
+   * lands mid-write (see `rebuildCheckpointHistory`).
    */
   async writeCheckpointHistory(history: CheckpointHistory): Promise<void> {
-    const dir = join(this.root, ".versions");
+    const dir = this.checkpointSegmentDir();
     await mkdir(dir, { recursive: true });
-    const content =
-      "# Auto-generated. Do not edit manually.\n" +
-      yaml.dump(history, { lineWidth: -1, noRefs: true });
-    await this.writeFileDurable(this.checkpointHistoryPath(), content);
-    // Keep the pointer in step with the file it caches. Without this a rebuild
+    const perSegment = Math.max(1, this.options.checkpointsPerSegment ?? CHECKPOINTS_PER_SEGMENT);
+    const written = new Set<number>();
+    for (let i = 0; i < history.checkpoints.length; i += perSegment) {
+      const segment = history.checkpoints.slice(i, i + perSegment);
+      written.add(segment[0].checkpoint);
+      await this.writeFileDurable(join(dir, segmentFileName(segment[0].checkpoint)), encodeSegment(segment));
+    }
+    // ponytail: a crash between here and the end leaves old segments beside the
+    // new ones; verify flags the break and a re-run of the rebuild clears it.
+    for (const first of await this.listCheckpointSegments()) {
+      if (!written.has(first)) await unlink(join(dir, segmentFileName(first))).catch(() => {});
+    }
+    await unlink(this.versionsPath(LEGACY_HISTORY_FILE)).catch((err: NodeJS.ErrnoException) => {
+      if (err.code !== "ENOENT") throw err;
+    });
+    // Keep the pointer in step with the chain it caches. Without this a rebuild
     // would leave it naming a checkpoint the rewritten chain no longer ends
-    // with; the size check would catch that, but re-pointing is exact and free.
+    // with; the staleness check would catch that, but re-pointing is exact and free.
     const latest = history.checkpoints.at(-1);
-    if (latest) await this.writeLatestCheckpointPointer(latest);
+    const last = [...written].at(-1);
+    if (latest && last !== undefined) await this.writeLatestCheckpointPointer(latest, this.segmentFile(last));
     else await unlink(this.latestCheckpointPath()).catch(() => {});
   }
 

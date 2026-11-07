@@ -19,7 +19,10 @@ import type { CheckpointHistory } from "../types.js";
  *
  * These cover the two halves of the fix from the outside: a write must not
  * depend on parsing the whole chain, and appending must produce exactly the
- * bytes a full rewrite would.
+ * bytes a full rewrite would. New seals go to segment files under
+ * `.versions/.checkpoints/` (see checkpoint-segments.test.ts); a vault this
+ * small has one, `000000001.yaml`. The legacy `context_history.yaml` is only
+ * read, so the tests of its states set one up by hand.
  */
 
 const draft = (title: string): string =>
@@ -44,13 +47,13 @@ describe("checkpoint chain — sealing appends instead of rewriting", () => {
   }
 
   const readChain = async (): Promise<CheckpointHistory> =>
-    yaml.load(await readFile(historyPath, "utf-8")) as CheckpointHistory;
+    (await storage.readCheckpointHistory())!;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "cn-cp-append-"));
     storage = new NestStorage(root);
     await storage.init("Append Checkpoint Vault");
-    historyPath = join(root, ".versions", "context_history.yaml");
+    historyPath = join(root, ".versions", ".checkpoints", "000000001.yaml");
   });
 
   afterEach(async () => {
@@ -61,10 +64,9 @@ describe("checkpoint chain — sealing appends instead of rewriting", () => {
     await sealCheckpoints(4);
 
     const onDisk = await readFile(historyPath, "utf-8");
-    const rewritten =
-      HEADER + yaml.dump(await readChain(), { lineWidth: -1, noRefs: true });
+    await storage.writeCheckpointHistory(await readChain());
 
-    expect(onDisk).toBe(rewritten);
+    expect(await readFile(historyPath, "utf-8")).toBe(onDisk);
   });
 
   it("numbers checkpoints consecutively across appends", async () => {
@@ -112,8 +114,8 @@ describe("checkpoint chain — sealing appends instead of rewriting", () => {
     // surface rather than be mistaken for "no chain".
     await sealCheckpoints(2);
     await rm(join(root, ".versions", "context_latest.yaml"), { force: true });
-    await rm(historyPath, { force: true });
-    await mkdir(historyPath, { recursive: true }); // forces a non-ENOENT error
+    await rm(join(root, ".versions", ".checkpoints"), { recursive: true, force: true });
+    await writeFile(join(root, ".versions", ".checkpoints"), ""); // forces a non-ENOENT error
 
     expect(await storage.readLatestCheckpointNumber()).toBe(0);
 
@@ -169,12 +171,22 @@ describe("checkpoint chain — sealing appends instead of rewriting", () => {
 describe("checkpoint chain — a broken chain never blocks the write", () => {
   let root: string;
   let storage: NestStorage;
+  /** The one segment a vault this small holds. */
+  let segmentPath: string;
+  /** The legacy single-file chain, read when there is no segment. */
   let historyPath: string;
+
+  /** Leave only a legacy chain file, as an older engine would have. */
+  const toLegacy = async (content: string) => {
+    await rm(join(root, ".versions", ".checkpoints"), { recursive: true, force: true });
+    await writeFile(historyPath, content, "utf-8");
+  };
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "cn-cp-broken-"));
     storage = new NestStorage(root);
     await storage.init("Broken Chain Vault");
+    segmentPath = join(root, ".versions", ".checkpoints", "000000001.yaml");
     historyPath = join(root, ".versions", "context_history.yaml");
     await storage.writeDocument("nodes/seed", draft("seed"));
     await publishDocument(storage, "nodes/seed", { editedBy: "tester" });
@@ -185,7 +197,7 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
   });
 
   it("publishes over an unreadable chain, preserving the old file", async () => {
-    await writeFile(historyPath, "checkpoints:\n  - checkpoint: 1\0\0\0\n", "utf-8");
+    await writeFile(segmentPath, "checkpoints:\n  - checkpoint: 1\0\0\0\n", "utf-8");
 
     await storage.writeDocument("nodes/next", draft("next"));
     await expect(
@@ -194,11 +206,11 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
 
     // The unreadable bytes are moved aside, never overwritten.
     const quarantined = (await readdir(join(root, ".versions"))).filter((f) =>
-      /^context_history\.corrupt-.*\.yaml$/.test(f),
+      /^\.checkpoints\.corrupt-/.test(f),
     );
     expect(quarantined).toHaveLength(1);
     expect(
-      await readFile(join(root, ".versions", quarantined[0]), "utf-8"),
+      await readFile(join(root, ".versions", quarantined[0], "000000001.yaml"), "utf-8"),
     ).toContain("\0");
 
     // And the replacement chain is readable.
@@ -207,9 +219,9 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
   });
 
   it("does not append into a chain file that holds an empty list", async () => {
-    // What rebuildCheckpointHistory writes for a vault with nothing published.
-    // Appending items after `checkpoints: []` would produce invalid YAML.
-    await writeFile(historyPath, HEADER + "checkpoints: []\n", "utf-8");
+    // What rebuildCheckpointHistory once wrote for a vault with nothing
+    // published. Appending items after `checkpoints: []` would produce invalid YAML.
+    await toLegacy(HEADER + "checkpoints: []\n");
 
     await storage.writeDocument("nodes/next", draft("next"));
     await publishDocument(storage, "nodes/next", { editedBy: "tester" });
@@ -222,7 +234,7 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
     // `checkpoints: []` is what a rebuild writes over a vault with nothing
     // published — valid YAML, zero entries. Quarantining it would litter the
     // vault with `.corrupt-*` files and cry a break that never happened.
-    await writeFile(historyPath, HEADER + "checkpoints: []\n", "utf-8");
+    await toLegacy(HEADER + "checkpoints: []\n");
     expect(await storage.readCheckpointChainState()).toEqual({ kind: "empty" });
 
     await storage.writeDocument("nodes/next", draft("next"));
@@ -241,23 +253,30 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
     // healthy chain gets renamed aside.
     expect((await storage.readCheckpointChainState()).kind).toBe("head");
 
-    await rm(historyPath, { force: true });
+    await writeFile(segmentPath, "checkpoints:\n  - checkpoint: 1\0\0\0\n", "utf-8");
+    expect((await storage.readCheckpointChainState()).kind).toBe("unreadable");
+
+    await rm(join(root, ".versions", ".checkpoints"), { recursive: true, force: true });
     expect(await storage.readCheckpointChainState()).toEqual({ kind: "absent" });
 
-    await writeFile(historyPath, HEADER + "checkpoints: []\n", "utf-8");
+    await toLegacy(HEADER + "checkpoints: []\n");
     expect(await storage.readCheckpointChainState()).toEqual({ kind: "empty" });
 
-    await writeFile(historyPath, "checkpoints:\n  - checkpoint: 1\0\0\0\n", "utf-8");
+    await toLegacy("checkpoints:\n  - checkpoint: 1\0\0\0\n");
     expect((await storage.readCheckpointChainState()).kind).toBe("unreadable");
   });
 
   it("propagates a read error rather than reporting an absent chain", async () => {
     // A non-ENOENT failure is neither "no chain" nor "corrupt". Reported as
     // either one, it licenses a quarantine of a chain nobody has actually read.
-    // A directory where the file belongs is the portable way to force one.
-    await rm(historyPath, { force: true });
-    await mkdir(historyPath, { recursive: true });
+    // A file where the segment folder belongs, or a folder where the legacy
+    // file belongs, is the portable way to force one.
+    await rm(join(root, ".versions", ".checkpoints"), { recursive: true, force: true });
+    await writeFile(join(root, ".versions", ".checkpoints"), "");
+    await expect(storage.readCheckpointChainState()).rejects.toThrow();
 
+    await rm(join(root, ".versions", ".checkpoints"), { force: true });
+    await mkdir(historyPath, { recursive: true });
     await expect(storage.readCheckpointChainState()).rejects.toThrow();
   });
 
@@ -268,7 +287,7 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
     // multi-megabyte chain and restart numbering at 1.
     await storage.writeDocument("nodes/two", draft("two"));
     await publishDocument(storage, "nodes/two", { editedBy: "tester" });
-    const intact = await readFile(historyPath, "utf-8");
+    const intact = await readFile(segmentPath, "utf-8");
 
     const realStat = storage.readCheckpointChainState.bind(storage);
     let failNext = true;
@@ -288,7 +307,7 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
     ).rejects.toThrow(/EIO/);
 
     // The chain is untouched and nothing was quarantined.
-    expect(await readFile(historyPath, "utf-8")).toBe(intact);
+    expect(await readFile(segmentPath, "utf-8")).toBe(intact);
     expect(
       (await readdir(join(root, ".versions"))).filter((f) => /corrupt/.test(f)),
     ).toEqual([]);
@@ -305,17 +324,12 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
     const chain = (await storage.readCheckpointHistory())!;
     expect(chain.checkpoints).toHaveLength(3);
 
-    // Truncate to two checkpoints WITHOUT going through writeCheckpointHistory,
-    // so the pointer keeps naming checkpoint 3.
-    await writeFile(
-      historyPath,
-      HEADER +
-        yaml.dump({ checkpoints: chain.checkpoints.slice(0, 2) }, {
-          lineWidth: -1,
-          noRefs: true,
-        }),
-      "utf-8",
-    );
+    // Truncate to two checkpoints behind the pointer's back, so it keeps
+    // naming checkpoint 3.
+    const pointerPath = join(root, ".versions", "context_latest.yaml");
+    const pointer = await readFile(pointerPath, "utf-8");
+    await storage.writeCheckpointHistory({ checkpoints: chain.checkpoints.slice(0, 2) });
+    await writeFile(pointerPath, pointer, "utf-8");
 
     const sealed = await new CheckpointManager(storage).createCheckpointFromVault(
       "test",
@@ -325,7 +339,7 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
     expect(sealed.document_chain_hashes).not.toEqual({});
   });
 
-  it("recovers the head by tail-read when the pointer file is deleted", async () => {
+  it("recovers the head from the segment when the pointer file is deleted", async () => {
     await storage.writeDocument("nodes/two", draft("two"));
     await publishDocument(storage, "nodes/two", { editedBy: "tester" });
     await rm(join(root, ".versions", "context_latest.yaml"), { force: true });
@@ -336,8 +350,8 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
   });
 
   it("reads the head from a chain longer than the tail window", async () => {
-    // The tail read looks at the last 64 KB. A chain past that must still
-    // resolve its head, or a big vault silently restarts numbering at 1.
+    // The tail read of a legacy chain looks at the last 64 KB. A chain past that
+    // must still resolve its head, or a big vault silently restarts numbering at 1.
     const bulk: CheckpointHistory = { checkpoints: [] };
     const head = (await storage.readCheckpointHistory())!.checkpoints[0];
     for (let i = 1; i <= 400; i++) {
@@ -352,11 +366,7 @@ describe("checkpoint chain — a broken chain never blocks the write", () => {
         ),
       });
     }
-    await writeFile(
-      historyPath,
-      HEADER + yaml.dump(bulk, { lineWidth: -1, noRefs: true }),
-      "utf-8",
-    );
+    await toLegacy(HEADER + yaml.dump(bulk, { lineWidth: -1, noRefs: true }));
     expect((await stat(historyPath)).size).toBeGreaterThan(64 * 1024);
 
     expect((await storage.readLatestCheckpoint())?.checkpoint).toBe(400);

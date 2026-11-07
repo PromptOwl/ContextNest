@@ -454,8 +454,18 @@ describe("import path rules", () => {
     ["nodes/.versions/doc/a/b", "refused"],
     ["nodes/.versions/../x.md", "refused"],
     ["nodes/x/.versions/.lock/owner", "refused"],
+    [".versions/.checkpoints", "refused"],
+    [".versions/.checkpoints/x.yaml", "refused"],
+    [".versions/.checkpoints/1.yml", "refused"],
+    [".versions/.checkpoints/000000001.yaml/x", "refused"],
+    [".versions/.checkpoints/sub/000000001.yaml", "refused"],
+    ["nodes/.versions/.checkpoints/000000001.yaml", "refused"],
     [".versions/context_history.yaml", "lands"],
     [".versions/context_latest.yaml", "lands"],
+    [".versions/.checkpoints/000000001.yaml", "lands"],
+    // The planner folds these onto the canonical spelling, where they land.
+    [".versions/.Checkpoints/000000001.yaml", "lands"],
+    [".versions/.checkpoints./000000001.yaml", "lands"],
     [`nodes/.versions/${ZWSP}.lock/owner`, "lands"],
     ["nodes/.versions/doc/a", "lands"],
     ["nodes/.versions/./doc/v1.md", "lands"],
@@ -511,9 +521,13 @@ describe("import path rules", () => {
     }
     const made = await api.run<{ id: string }>("context_create", { id: "notes/other", title: "o", content: "y\n" }, c);
     await api.run("context_forget", { id: made.id, reason_code: "user_request" }, c);
-    for (const ledger of ["context_history.yaml", "context_latest.yaml", "chain_events.yaml"]) {
+    for (const ledger of ["context_latest.yaml", "chain_events.yaml"]) {
       expect((await stat(join(root, ".versions", ledger))).isFile(), ledger).toBe(true);
     }
+    // The chain lives in segments now; the legacy file is never written, so
+    // nothing may stand in its place either.
+    expect(await stat(join(root, ".versions", "context_history.yaml")).catch(() => null)).toBeNull();
+    expect((await stat(join(root, ".versions", ".checkpoints", "000000001.yaml"))).isFile()).toBe(true);
   });
 
   it.each([

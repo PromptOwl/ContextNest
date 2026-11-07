@@ -31,7 +31,7 @@ ctx vault decrypt               # back to plain Markdown
 | `context.yaml` | **Yes** | Its edge list is derived from links inside bodies |
 | pdf sidecars and archived binaries | **Yes** | |
 | `INDEX.md`, `CLAUDE.md` / agent configs | No | Built from front matter only (already plaintext) |
-| `.context/config.yaml`, `CONTEXT.md`, packs, `context_history.yaml`, `chain_events.yaml` | No | Configuration and hashes; do not put secrets in the vault name or CONTEXT.md |
+| `.context/config.yaml`, `CONTEXT.md`, packs, the checkpoint chain (`.checkpoints/`, legacy `context_history.yaml`), `chain_events.yaml` | No | Configuration and hashes; do not put secrets in the vault name or CONTEXT.md |
 | File and folder names (document ids) | No | Choose non-sensitive slugs |
 
 Search and indexing decrypt **in memory only**. The engine writes no plaintext
