@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "contextnest",
   "displayName": "Context Nest",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Vault-aware context retrieval and automatic knowledge capture, powered by the Context Nest `ctx` CLI.",
   "author": { "name": "PromptOwl" },
   "homepage": "https://github.com/promptowl/contextnest",
@@ -33,6 +33,13 @@
       "title": "When the nest for a new note is unclear",
       "description": "ask (default) — capture asks which nest before writing; default — it writes to the pinned vault, else the registry default. Matters when one server alias spans several nests (e.g. partner nests).",
       "default": "ask"
+    },
+    "connection": {
+      "type": "string",
+      "title": "Connection",
+      "description": "How Claude reaches your notes. cli (default) — through the ctx CLI only. mcp-local — also start the Context Nest MCP server on your local vault (tools plus the recall and capture prompts). mcp-community — the same against a hosted nest (nest.promptowl.ai), signed in with ctx login; set Pinned vault to <server>/<nest>, else promptowl is used. Run /reload-plugins after changing it.",
+      "options": ["cli", "mcp-local", "mcp-community"],
+      "default": "cli"
     },
     "vault": {
       "type": "string",

@@ -41,6 +41,7 @@ describe("plugin manifest", () => {
     expect(keys.sort()).toEqual([
       "auto_capture",
       "capture_mode",
+      "connection",
       "ctx_command",
       "retrieval_mode",
       "unclear_nest",

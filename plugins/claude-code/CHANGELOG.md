@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0
+
+The plugin can start the Context Nest MCP server, chosen by a new **Connection** setting.
+
+- **`connection`: `cli` (default) | `mcp-local` | `mcp-community`.** `cli` is today's behaviour: everything goes through `ctx`. `mcp-local` also starts `contextnest-mcp-server` on your local vault. `mcp-community` starts `ctx --vault <pinned vault, else promptowl> mcp`, which serves a hosted nest with the key `ctx login` saved. Both MCP modes add the `context_*` tools and the `recall` and `capture` prompts. Hooks keep using `ctx` in every mode.
+- **`.mcp.json`** declares one stdio server, `core/mcp-launch.js`, which reads the setting. In `cli` mode it answers as an MCP server with nothing in it, so it never shows as failed in `/mcp`.
+- **`package.json` also pins `@promptowl/contextnest-mcp-server`**, installed with the plugin like the CLI.
+- The setting's picker needs Claude Code 2.1.271 or later. Run `/reload-plugins` after changing it: the server starts with the session.
+- `mcp-community` needs a CLI that has `ctx mcp`. That ships in the next CLI release, and the plugin's CLI pin is bumped after it (see Releasing in CLAUDE.md).
+
 ## 0.8.0
 
 Setup matches the `ctx` first run, and the CLI comes with the plugin (CU-wdqcq067m5).

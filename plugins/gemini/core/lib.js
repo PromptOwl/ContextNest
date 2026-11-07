@@ -103,6 +103,9 @@ export const VALID_CAPTURE_MODES = ["off", "explicit", "propose", "auto"];
  */
 export const VALID_UNCLEAR_NEST = ["ask", "default"];
 
+/** What the plugin's MCP server entry runs (see mcp-launch.js). `cli`: nothing, hooks use ctx. */
+export const VALID_CONNECTIONS = ["cli", "mcp-local", "mcp-community"];
+
 /** Recognized truthy / falsy spellings for the boolean auto_capture setting. */
 export const TRUTHY_VALUES = ["true", "1", "yes", "on"];
 export const FALSY_VALUES = ["false", "0", "no", "off"];
@@ -150,7 +153,7 @@ function readSettingsFile(path) {
  *   5. defaults
  *
  * File keys mirror the manifest: retrieval_mode, auto_capture, vault,
- * ctx_command. An explicit "" in a file is honoured (e.g. vault:"" unpins).
+ * ctx_command, connection. An explicit "" in a file is honoured (e.g. vault:"" unpins).
  *
  * @param {Record<string, string | undefined>} env
  * @param {{ cwd?: string, homedir?: string }} [opts] injection points for tests
@@ -267,6 +270,11 @@ export function getConfig(env = process.env, opts = {}) {
         normalize: (s) => s.trim().toLowerCase(),
         accept: (s) => s === "done" || s === "declined",
       }) || "",
+    connection:
+      pick("connection", ["CLAUDE_PLUGIN_OPTION_CONNECTION", "CONTEXTNEST_CONNECTION"], {
+        normalize: (s) => s.trim().toLowerCase(),
+        accept: (s) => VALID_CONNECTIONS.includes(s),
+      }) || "cli",
     // Pinned vault alias. Deliberately NOT named CONTEXTNEST_VAULT so it never
     // collides with the env var the ctx CLI itself consumes for resolution.
     vault: rawVault === undefined ? "" : rawVault,

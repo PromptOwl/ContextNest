@@ -214,7 +214,29 @@ context_list({ type: "skill" })                             → all skill nodes
 context_create({ type: "skill", trigger: "..." })           → create a new skill
 ```
 
-## Upgrading to 2.0
+## Prompts and instructions
+
+The server offers two prompts, the same ones the Claude Code plugin uses (`plugins/shared/prompts`). A short preamble maps each `ctx` step to the matching tool.
+
+| Prompt | Arguments | Does |
+|---|---|---|
+| `recall` | `topic` (required) | Deep lookup across the nest; answers with `vault:id` citations. Read-only |
+| `capture` | `note` (optional) | Saves something now, through the capture ladder (no duplicates, one idea per node). Empty `note` reviews the recent exchange |
+
+How you start one depends on the client:
+
+| Client | How |
+|---|---|
+| Claude Code | `/contextnest:recall billing` (listed as `/contextnest:recall (MCP)`) |
+| Claude Desktop, claude.ai | **+** → Connectors → contextnest → pick the prompt |
+| VS Code (Copilot) | `/contextnest.recall` |
+| Gemini CLI | `/recall --topic=billing` |
+| Codex, ChatGPT | Not supported: these clients don't read MCP prompts |
+
+The server also sends short **instructions** when a client connects: what a nest is, to start with `context_init`, and the selector grammar. Clients that support them (Claude Code, VS Code, Gemini CLI, Codex) add them to the model's context.
+
+For a hosted nest, `ctx --vault <server>/<nest> mcp` serves the same tools, prompts and instructions over stdio, signed in with your `ctx login` key.
+
 
 Nothing in your MCP client config changes. The old tools are all still registered. Four things do change:
 

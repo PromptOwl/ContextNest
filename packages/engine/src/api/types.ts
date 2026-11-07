@@ -12,8 +12,8 @@
 import type { z } from "zod";
 
 /**
- * Capability namespaces. A server advertises which it implements via the MCP
- * `initialize` result / REST manifest; agents discover tools from that set.
+ * Capability namespaces. A server or REST manifest may advertise which it
+ * implements; agents discover tools from that set.
  *
  *  - `core`       — read/query/list/create/update/search. Always present.
  *  - `governance` — stewardship: submit_review / approve / reject, drift.

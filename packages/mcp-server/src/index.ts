@@ -72,6 +72,9 @@ import type {
 import {
   createEngineApi,
   listOperations,
+  MCP_SERVER_INSTRUCTIONS,
+  NEST_PROMPTS,
+  renderNestPrompt,
 } from "@promptowl/contextnest-engine/api";
 import type { OperationContext, OperationDescriptor } from "@promptowl/contextnest-engine/api";
 import { resolveMcpVaultPath } from "./vault-resolution.js";
@@ -99,10 +102,10 @@ const { version } = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ) as { version: string };
 
-const server = new McpServer({
-  name: "contextnest",
-  version,
-});
+const server = new McpServer(
+  { name: "contextnest", version },
+  { instructions: MCP_SERVER_INSTRUCTIONS },
+);
 
 /** Second argument every tool callback receives (request id, signal, auth, …). */
 type ToolCtx = Parameters<ToolCallback<z.ZodRawShape>>[1];
@@ -385,6 +388,28 @@ const GATED_OPS = new Set(["context_create", "context_update"]);
 for (const op of listOperations("core")) {
   tool(op.name, op.description, inputShape(op), async (args: Record<string, unknown>) =>
     GATED_OPS.has(op.name) ? runGatedWrite(op.name, args) : runOp(op.name, args),
+  );
+}
+
+// ─── Prompts ─────────────────────────────────────────────────────────────────
+//
+// The coding-agent plugin's recall/capture prompts, served as MCP prompts
+// (slash commands in Claude Code, VS Code, Gemini CLI; the "+" menu in Claude
+// Desktop). Text and arguments come from the engine, shared with `ctx mcp`.
+
+for (const p of NEST_PROMPTS) {
+  server.registerPrompt(
+    p.name,
+    {
+      title: p.title,
+      description: p.description,
+      argsSchema: Object.fromEntries(
+        p.arguments.map((a) => [a.name, (a.required ? z.string() : z.string().optional()).describe(a.description)]),
+      ),
+    },
+    (args: Record<string, string | undefined>) => ({
+      messages: [{ role: "user" as const, content: { type: "text" as const, text: renderNestPrompt(p.name, args) } }],
+    }),
   );
 }
 

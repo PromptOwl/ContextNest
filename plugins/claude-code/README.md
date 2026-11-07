@@ -58,8 +58,20 @@ On enable you'll be prompted for the settings below (all optional):
 | **When the nest for a new note is unclear** | `ask` | `ask` (capture asks which nest) · `default` (write to the pinned vault, else the registry default) |
 | **Pinned vault** | _(empty)_ | A registered vault alias, or `<server>/<nest>`. Empty → the agents pick the relevant vault(s) automatically |
 | **ctx binary** | `ctx` | Override the CLI command |
+| **Connection** | `cli` | `cli` · `mcp-local` · `mcp-community` — whether the plugin also starts the MCP server; see below |
 
-## One server, many nests
+## Connection: CLI or MCP
+
+The **Connection** setting decides whether the plugin also starts the Context Nest MCP server:
+
+| Value | What starts | Notes |
+| --- | --- | --- |
+| `cli` (default) | Nothing extra | Hooks, agents and `/contextnest:*` commands use `ctx`, as before |
+| `mcp-local` | `contextnest-mcp-server` on the pinned vault (else the project's vault or your default) | Adds the `context_*` tools and the `recall` / `capture` prompts |
+| `mcp-community` | `ctx --vault <pinned vault, else promptowl> mcp` | The same tools and prompts against a hosted nest, signed in with `ctx login`. Pin `<server>/<nest>` to pick one nest |
+
+The plugin's `.mcp.json` declares one stdio server, `core/mcp-launch.js`, that reads this setting: Claude Code can't turn a plugin's MCP server on or off from a setting. Hooks use `ctx` in every mode. The server starts with the session, so run `/reload-plugins` after changing the setting.
+
 
 Register a Community server's all-nests endpoint once:
 
@@ -81,7 +93,7 @@ Claude Code only prompts for the settings above once, at enable time. To view or
 
 Run bare `/contextnest:config` and it shows the current settings, then walks you through a picker — choose the setting, choose the value from its valid options (pinned vault is filled from your registered aliases), and choose the scope. No need to remember exact values; typing a `<setting> <value>` pair still works for scripting.
 
-Changes are written to a settings override file and take effect on the next prompt — no restart or re-enable needed. You can also edit the files directly (keys: `retrieval_mode`, `capture_mode`, `unclear_nest`, `vault`, `ctx_command`):
+Changes are written to a settings override file and take effect on the next prompt — no restart or re-enable needed (except `connection`, which needs `/reload-plugins`). You can also edit the files directly (keys: `retrieval_mode`, `capture_mode`, `unclear_nest`, `vault`, `ctx_command`, `connection`):
 
 | Scope | File | Precedence |
 | --- | --- | --- |
@@ -126,6 +138,7 @@ The ladders are domain-free — the capture agent calibrates what counts as dura
 | Command | `/contextnest:capture` | Capture on purpose, even when `capture_mode` is `off` |
 | Command | `/contextnest:setup` | One-question setup: notes on this computer, online, or both |
 | Executable | `bin/ctx` | The bundled CLI, on Claude's `PATH` while the plugin is enabled |
+| MCP server | `contextnest` (`.mcp.json`) | Per the **Connection** setting: nothing (`cli`), the local MCP server, or a hosted nest via `ctx mcp` |
 
 ## Local development
 

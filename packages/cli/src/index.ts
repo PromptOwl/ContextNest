@@ -1931,6 +1931,18 @@ program
     printStructure(out, opts);
   });
 
+// ─── ctx mcp ───────────────────────────────────────────────────────────────────
+
+program
+  .command("mcp")
+  .description(
+    "Serve a hosted nest as a local stdio MCP server, signed in with your `ctx login` key (ctx --vault <server>/<nest> mcp)",
+  )
+  .action(async () => {
+    const { serveRemoteNest } = await import("./mcp-proxy.js");
+    await serveRemoteNest(selectedVaultAlias);
+  });
+
 // ─── ctx validate ──────────────────────────────────────────────────────────────
 
 program

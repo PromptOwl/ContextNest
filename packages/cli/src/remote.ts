@@ -475,17 +475,27 @@ async function reauthOnce<T>(target: RemoteTarget, open: () => Promise<T>): Prom
   }
 }
 
-async function withRemote<T>(
-  target: RemoteTarget,
-  fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
-): Promise<T> {
+/**
+ * Resolve the nest and connect, signing in with the saved key. With a
+ * `<server>/<nest>` target the returned `run` sends that nest's id on every call.
+ * The caller closes the connection.
+ */
+export async function openTarget(target: RemoteTarget): Promise<{ conn: RemoteNestConnection; nestId?: string }> {
   const { nestId, conn } = await reauthOnce(target, async () => {
     const id = target.nest ? await resolveTargetNest(target) : undefined;
     return { nestId: id, conn: await connectTarget(target, undefined, undefined, id) };
   });
+  if (!nestId) return { conn };
+  return { conn: { ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) }, nestId };
+}
+
+async function withRemote<T>(
+  target: RemoteTarget,
+  fn: (conn: RemoteNestConnection, nestId?: string) => Promise<T>,
+): Promise<T> {
+  const { nestId, conn } = await openTarget(target);
   try {
-    if (!nestId) return await fn(conn);
-    return await fn({ ...conn, run: (op, input) => conn.run(op, { ...input, nest: nestId }) }, nestId);
+    return await fn(conn, nestId);
   } catch (err) {
     // A write through a server-level alias with no nest named: say how to name one.
     // Coupled to contextnest-community's wording — the SDK's zod refusal of a

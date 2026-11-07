@@ -39,6 +39,8 @@ import {
   getOperation,
   inputJsonSchema,
   ERROR_CODES,
+  MCP_SERVER_INSTRUCTIONS,
+  renderNestPrompt,
 } from "@promptowl/contextnest-engine/api";
 
 const SERVER_ENTRY = fileURLToPath(new URL("../../dist/index.js", import.meta.url));
@@ -228,6 +230,46 @@ describe("[regression] catalog binding — tool surface", () => {
         expect(getOperation(alias)?.name).toBe(op.name);
       }
     }
+  });
+});
+
+// ─── Prompts and instructions ───────────────────────────────────────────────
+
+describe("[regression] prompts and server instructions", () => {
+  let vault: string;
+  let client: Client;
+
+  beforeAll(async () => {
+    vault = await freshVault();
+    client = await connect(vault);
+  });
+
+  afterAll(async () => {
+    await client.close();
+    await rm(vault, { recursive: true, force: true });
+  });
+
+  it("sends the shared instructions in the initialize result", () => {
+    expect(client.getInstructions()).toBe(MCP_SERVER_INSTRUCTIONS);
+  });
+
+  it("lists the plugin prompts with their arguments", async () => {
+    const { prompts } = await client.listPrompts();
+    const byName = new Map(prompts.map((p) => [p.name, p]));
+    expect([...byName.keys()].sort()).toEqual(["capture", "recall"]);
+    expect(byName.get("recall")!.arguments).toEqual([expect.objectContaining({ name: "topic", required: true })]);
+    expect(byName.get("capture")!.arguments).toEqual([expect.objectContaining({ name: "note", required: false })]);
+  });
+
+  it("renders recall with the caller's topic", async () => {
+    const res = await client.getPrompt({ name: "recall", arguments: { topic: "billing" } });
+    expect(res.messages).toEqual([
+      { role: "user", content: { type: "text", text: renderNestPrompt("recall", { topic: "billing" }) } },
+    ]);
+  });
+
+  it("refuses recall without a topic", async () => {
+    await expect(client.getPrompt({ name: "recall", arguments: {} })).rejects.toThrow();
   });
 });
 

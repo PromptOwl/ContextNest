@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "contextnest": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/core/mcp-launch.js"],
+      "env": {
+        "CLAUDE_PLUGIN_OPTION_CONNECTION": "${user_config.connection}",
+        "CLAUDE_PLUGIN_OPTION_VAULT": "${user_config.vault}",
+        "CLAUDE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
+}

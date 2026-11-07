@@ -45,6 +45,13 @@ export {
   type EngineApi,
   type CreateEngineApiOptions,
 } from "./runtime.js";
+export {
+  NEST_PROMPTS,
+  MCP_SERVER_INSTRUCTIONS,
+  renderNestPrompt,
+  type NestPrompt,
+  type NestPromptArgument,
+} from "./prompts.js";
 
 /** Every operation across every implemented namespace. */
 const ALL_OPERATIONS: readonly OperationDescriptor[] = [...CORE_OPERATIONS];
@@ -55,9 +62,9 @@ export const OPERATIONS: OperationCatalog = Object.freeze(
 );
 
 /**
- * Capability namespaces and whether this catalog implements them. A server
- * advertises the implemented subset it actually exposes via the MCP
- * `initialize` result / REST manifest.
+ * Capability namespaces and whether this catalog implements them, for a
+ * server or REST manifest to advertise the subset it exposes. (The OSS MCP
+ * server does not advertise them; its tools are the `core` namespace.)
  */
 export const NAMESPACES: Readonly<Record<CapabilityNamespace, { implemented: boolean }>> =
   Object.freeze({

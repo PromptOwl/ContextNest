@@ -80,6 +80,8 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 Every tool is registered through the local `tool()` helper, NOT `server.tool()`. `server.tool()` takes a raw shape and wraps it in a non-strict `z.object()`, which STRIPS unknown keys while the JSON Schema it publishes claims `additionalProperties: false`: a client that misnames a parameter gets a success response for a write that silently dropped its text. `tool()` goes through `registerTool` with a `.strict()` ZodObject so the advertised contract is the enforced one. `EngineApi.run()` refuses unknown keys for the same reason, one layer down.
 
+Beyond tools, the server sends `instructions` and two prompts, `recall` and `capture`. Both come from the engine (`api/prompts.ts`: `MCP_SERVER_INSTRUCTIONS`, `NEST_PROMPTS`, `renderNestPrompt`), so `ctx mcp` (a hosted nest served over stdio with the `ctx login` key) and the Community server bind the same ones. The prompt bodies are the plugin's `plugins/shared/prompts/{recall,capture}.md`, which `pnpm plugins:sync` copies into the generated `api/plugin-prompts.ts`. Never edit that file; edit the shared prompt.
+
 ### Plugins (`plugins/`)
 
 Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Only the Claude Code plugin is built; Codex/Gemini are README-only.
@@ -93,6 +95,8 @@ Config comes from env, `CLAUDE_PLUGIN_OPTION_*` with `CONTEXTNEST_*` fallbacks (
 **Writes are gated in code, not in prose.** `capture-gate.js` decides *whether* to engage the vault (explicit intent → correction → substantive-and-out-of-cooldown, tracked per session in `~/.contextnest/plugin-state/`); the prompts decide *what*. When changing capture behaviour, change the gate — a prompt cannot be unit-tested and the old "under-capture is the failure mode" framing is exactly what made the plugin noisy.
 
 Hooks: `SessionStart` → vault overview injection (plus a compact blueprint of the pinned/working-directory vault's structure rules via `ctx structure --json`), `UserPromptSubmit` → retrieval **and dispatch of any parked job**, `Stop` → capture gate, `PostToolUse` (Bash, registered `async` so it never holds the turn — its report reaches the model on the next turn) → sweep-check: after a `ctx update`, diff against the prior version and report every node in every registered nest still carrying the removed value (two channels: exact entity-tag lookup via `ctx list --tag` — agents tag nodes with the concrete values they assert and retag on edit — plus confirmed full-text search for untagged prose). The sweep-check keys on the write, not the phrasing — `correctionIntent()` misses declarative updates entirely, which is why it exists. Concurrent same-vault writes are serialized by a per-vault `mkdir` lock in the engine's mutating executors (`packages/engine/src/vault-lock.ts`); without it, parallel writers silently corrupt the checkpoint chain.
+
+**MCP is a setting, not a second plugin.** `.mcp.json` declares one stdio server, `core/mcp-launch.js`, because Claude Code can't turn a plugin's MCP server on or off from a setting. The `connection` setting (`cli` default / `mcp-local` / `mcp-community`) picks what it runs: an empty MCP server, the pinned `contextnest-mcp-server`, or `ctx --vault <vault or promptowl> mcp`. Hooks use `ctx` in every mode.
 
 **The Stop hook never blocks.** It used to return `decision: "block"`, which held the turn open while a subagent ran. It now parks `{kind, reason, turn}` in the session ledger and returns only a `systemMessage`; the next `UserPromptSubmit` drains the queue and hands the directive over as `additionalContext` (the field the model acts on — Stop's own `additionalContext` is transcript metadata it does not act on). `contextnest-capture` and `contextnest-curator` are `background: true` so the dispatched work overlaps the user's next request. Note `saveLedger` writes an explicit key projection: a new ledger field must be added to the `EMPTY` sentinel, the `loadLedger` projection **and** the `saveLedger` stringify, or it is dropped silently.
 
@@ -121,13 +125,13 @@ Every PR — human- or AI-authored — must have both of these, or the Claude re
 
 Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), then `pnpm release`. All three packages are AGPL-3.0 and versioned together. `CONTEXT_NEST_SPEC.md` is the one exception in the repo: Apache-2.0, per `LICENSE-SPEC`.
 
-**After a release that publishes the CLI, update the Claude Code plugin's pin.** `plugins/claude-code/package.json` pins `@promptowl/contextnest-cli` to an exact version, and Claude Code installs it with the plugin. Do these steps, then commit them together:
+**After a release, update the Claude Code plugin's pins.** `plugins/claude-code/package.json` pins `@promptowl/contextnest-cli` and `@promptowl/contextnest-mcp-server` to exact versions, and Claude Code installs both with the plugin. Do these steps, then commit them together:
 
-1. Set the pin to the new version.
+1. Set each pin to its new version.
 2. Run `npm install --package-lock-only --ignore-scripts` in `plugins/claude-code/` to refresh `package-lock.json`.
 3. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
 
-This can't go in the changesets version PR, because the lockfile needs the published tarball's integrity hash. `pnpm plugins:check` fails when the pin and the lockfile disagree. The pin is added by CU-wdqcq067m5; until that lands there is nothing to bump.
+This can't go in the changesets version PR, because the lockfile needs the published tarball's integrity hash. `pnpm plugins:check` fails when a pin and the lockfile disagree.
 
 ## Specification
 
