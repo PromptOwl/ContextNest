@@ -179,6 +179,53 @@ export function startMockProvider(): Promise<MockProvider> {
   });
 }
 
+export interface MockKindServer {
+  /** The `--server` value `ctx kind apply` is pointed at (`http://127.0.0.1:PORT`). */
+  baseUrl: string;
+  /** File the mock appends every received request to, one JSON object per line.
+   * A journey truncates it before an action and reads it after, to prove the
+   * CLI sent only GETs on a dry run (or exactly the planned writes on `--yes`). */
+  logPath: string;
+  /** Kill the mock process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback nest REST mock (`mock-kind-server.mjs`) the J21 journey
+ * drives `ctx kind apply` against, in its OWN process (same reason as
+ * startMockProvider: spawnSync blocks this process's loop, so a same-process
+ * server would deadlock). The scenario is encoded in the nest id the journey
+ * passes (`flags-off`, `denied`, `ghost`, or a healthy nest), so no control
+ * channel is needed; the request log goes to a temp file the caller cleans up.
+ */
+export function startMockKindServer(scratch: string[]): Promise<MockKindServer> {
+  const logPath = join(mkdtempSync(join(tmpdir(), "cn-kindmock-")), "requests.log");
+  scratch.push(dirname(logPath));
+  writeFileSync(logPath, "");
+  const child = spawn("node", [join(here, "mock-kind-server.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, KIND_MOCK_LOG: logPath },
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock kind server never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}`, logPath, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
 /** A fresh isolated vault + config dir for one journey. Caller owns cleanup via `scratch`. */
 export function makeSandbox(
   scratch: string[],
