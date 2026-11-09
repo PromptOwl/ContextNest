@@ -46,6 +46,7 @@ const ENV = {
   CONTEXTNEST_CREDENTIALS_KEY: "",
   CONTEXTNEST_AGENT: "",
   CONTEXTNEST_SESSION_ID: "",
+  CONTEXTNEST_AUTHOR: "",
 } as NodeJS.ProcessEnv;
 
 /** Run the CLI and return stdout. Throws on a non-zero exit. */
