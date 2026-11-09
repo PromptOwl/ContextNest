@@ -11,7 +11,8 @@ plugins/
 ├── gemini/        Gemini CLI & Antigravity adapter (built). Hooks + skills + rules.
 ├── opencode/      OpenCode plugin (built). In-process hooks + skills + rules.
 ├── grok/          Grok Build (built, instruction tier). Skills + AGENTS.md.
-└── muse/          Meta Muse Code (built, instruction tier). AGENTS.md + skills.
+├── muse/          Meta Muse Code (built, instruction tier). AGENTS.md + skills.
+└── zed/           Zed Agent (built, instruction tier). AGENTS.md + skills.
 ```
 
 ## How the pieces fit
@@ -27,7 +28,7 @@ Edit `plugins/shared/`, never the vendored `plugins/<agent>/core/` copies.
 
 The sync also renders the portable skills (`shared/skills/*`, filled from
 `shared/prompts/*`) and the operating rules (`shared/prompts/rules.md`) into each
-plugin that has no agents of its own: Gemini, Codex, OpenCode, Grok and Muse. Hook messages name
+plugin that has no agents of its own: Gemini, Codex, OpenCode, Grok, Muse and Zed. Hook messages name
 the Claude Code agents; the rules map each one to the matching skill.
 
 ## Integration surface per agent
@@ -40,5 +41,6 @@ the Claude Code agents; the rules map each one to the matching skill.
 | OpenCode | `ctx` CLI via in-process plugin hooks (OpenCode 1 and 2) + skills + rules | **Built** |
 | Grok Build | `ctx` CLI via `AGENTS.md` rules + skills (hook output is ignored) | **Built** |
 | Muse Code | `ctx` CLI via `AGENTS.md` rules + skills (no hooks) | **Built** |
+| Zed | `ctx` CLI via `AGENTS.md` rules + skills (no hooks) | **Built** |
 
 See each subdirectory's README for specifics.

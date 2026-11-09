@@ -82,7 +82,7 @@ Every tool is registered through the local `tool()` helper, NOT `server.tool()`.
 
 ### Plugins (`plugins/`)
 
-Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Built for Claude Code, Codex and Gemini/Antigravity (hooks) and OpenCode (in-process plugin, `plugins/opencode/adapter.js`, OpenCode 1 and 2 APIs); Grok Build and Muse Code are rules + skills only (Grok ignores hook output). Codex and Antigravity reuse the shared core through a thin adapter in `plugins/<agent>/hooks/`; portable skills and rules are rendered from `plugins/shared/skills` and `shared/prompts` by the same sync.
+Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Built for Claude Code, Codex and Gemini/Antigravity (hooks) and OpenCode (in-process plugin, `plugins/opencode/adapter.js`, OpenCode 1 and 2 APIs); Grok Build, Muse Code and Zed are rules + skills only (Grok ignores hook output; Zed has no hooks). Codex and Antigravity reuse the shared core through a thin adapter in `plugins/<agent>/hooks/`; portable skills and rules are rendered from `plugins/shared/skills` and `shared/prompts` by the same sync.
 
 **`plugins/shared/` is the single source of truth. Never edit `plugins/claude-code/core/` — it is a vendored byte-identical copy.** Installed Claude plugins can't read files outside their own directory, so `pnpm plugins:sync` copies `shared/core/*` into each agent plugin and fills the `<!-- BEGIN SHARED -->…<!-- END SHARED -->` regions of agent/skill markdown from `shared/prompts/*.md`. `pnpm plugins:check` fails CI on drift.
 
