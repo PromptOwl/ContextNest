@@ -44,9 +44,11 @@ import {
   freshInstall,
   runJourney,
   startMockProvider,
+  startMockKindServer,
   repoRoot,
   type Journey,
   type MockProvider,
+  type MockKindServer,
   type RunResult,
 } from "./journey-harness.js";
 
@@ -56,15 +58,21 @@ const scratch: string[] = [];
 // runs in its own process (see startMockProvider) and its base_url is only known
 // once it has bound a port, so J18's config-writing closures read it from here.
 let MOCK: MockProvider;
+// The loopback nest REST mock J21 drives `ctx kind apply` against — its own
+// process (see startMockKindServer), its base_url and request-log path known
+// only once it has bound a port, so J21's closures read them from here.
+let KIND_MOCK: MockKindServer;
 
 beforeAll(async () => {
   const tarball = packCli(scratch);
   INSTALL = freshInstall(tarball, scratch, "journeys");
   MOCK = await startMockProvider();
+  KIND_MOCK = await startMockKindServer(scratch);
 }, 180_000);
 
 afterAll(() => {
   MOCK?.close();
+  KIND_MOCK?.close();
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
@@ -4251,6 +4259,299 @@ const J20: Journey = {
   ],
 };
 
+/**
+ * J21 — "I apply a recipe's server-side kind to my hosted nest."
+ * A recipe can carry a "kind" — the structure a hosted nest needs: edge types,
+ * edges, schedules, plugin config and steward seats. `ctx pull` lands it in the
+ * vault as a node (`nodes/kinds/<id>`); `ctx kind apply` reads it back and maps
+ * each entry onto the nest's REST API. It plans with GETs first and writes only
+ * on `--yes`, refuses an unreviewed kind, skips a plane the server turned off
+ * instead of erroring, never enables a plugin, and needs steward placeholders
+ * mapped to people by hand. This journey proves that whole careful surface.
+ *
+ * NOTE: unlike the other journeys — whose only accumulating state is an on-disk
+ * vault re-created fresh by makeSandbox — J21's mock keeps per-nest server state
+ * across its cases IN ANOTHER PROCESS (nest "main" is populated by J21-02 and
+ * J21-03 re-applies onto it to prove idempotency). That is safe because the
+ * suite runs in a fresh process with no `test.retry` (see vitest.config.ts); do
+ * not enable retry for this file, or a second in-process pass would find "main"
+ * already populated and J21-01/02's "created" assertions would flip to "updated".
+ *
+ * OFFLINE BY DESIGN: a real apply needs a hosted nest and an API key, neither
+ * available in CI. The journey stands up a loopback REST mock in its own process
+ * (startMockKindServer → mock-kind-server.mjs) that records every request to a
+ * log file and encodes each scenario in the nest id it is pointed at — a healthy
+ * nest ("main"/"jnest"/…), "flags-off" (a plane switched off), "denied" (a bad
+ * key), "ghost" (no such nest). The kind documents are written to disk exactly
+ * as `ctx pull` would land them (the `--server`/key path is the journey's
+ * subject, not the pull), and the API key is supplied through the env the way a
+ * logged-in user's would be.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J21_KIND = {
+  plugins: [{ name: "gmail", mode: "raw", settings: { label: "ops" } }],
+  edge_types: [
+    { name: "escalates-to", description: "An alert escalates to its on-call owner" },
+    { name: "routes-to", description: "A triage step routes to the next", is_flow: true },
+  ],
+  edges: [{ from: "nodes/alert", to: "nodes/oncall", type: "escalates-to" }],
+  schedules: [{ agent: "nodes/triage-agent", every_minutes: 60 }],
+  // Left as a placeholder on purpose: an un-mapped steward seat is shown in the
+  // plan but never sent, so J21-02's write set is the five workflow/plugin
+  // requests and J21-06 can prove mapping resolves it.
+  stewards: [{ scope: "nest", role: "reviewer", principal: "@owner" }],
+  runner: { handlers: ["triage"] },
+};
+// A kind document the way `ctx pull` writes it: the section as JSON inside a
+// ```yaml kind fence (JSON is valid YAML, so it reads back through the same
+// parser). `ctx kind apply` reads this straight off disk by id. This mirrors
+// renderKindBody / KIND_FENCE in packages/cli/src/pull.ts — if the on-disk kind
+// format changes there, update this to match (a real pulled kind must parse).
+const kindDocBody = (kind: unknown) =>
+  ["# Kind demo", "", "```yaml kind", JSON.stringify(kind, null, 2), "```", ""].join("\n");
+function writeKindDoc(vault: string, id: string, status: "published" | "draft"): void {
+  const dir = join(vault, "nodes", "kinds");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${id}.md`),
+    `---\ntype: document\ntitle: Kind ${id}\nstatus: ${status}\n---\n` + kindDocBody(J21_KIND),
+  );
+}
+// The mock's request log is the proof of what left the machine. Truncate it
+// before an action; read it back after to assert the exact requests sent.
+const resetKindLog = () => writeFileSync(KIND_MOCK.logPath, "");
+const readKindLog = (): Array<{ method: string; path: string; body?: unknown; auth?: string }> =>
+  readFileSync(KIND_MOCK.logPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const kindWrites = () => readKindLog().filter((r) => r.method !== "GET");
+// `--server <mock> --nest <id>`, built at run time (the base_url is only known
+// once the mock has bound a port).
+const kindApply = (kindId: string, nest: string, ...rest: string[]) => () =>
+  ["kind", "apply", kindId, "--server", KIND_MOCK.baseUrl, "--nest", nest, ...rest];
+
+const J21: Journey = {
+  id: "J21",
+  title: "Apply a recipe's server-side kind to a hosted nest",
+  // The API key reaches the CLI through the env, as a logged-in user's would;
+  // the file credentials backend keeps every run off the OS keychain on CI.
+  env: { CONTEXTNEST_API_KEY: "cnst_test", CONTEXTNEST_CREDENTIALS_BACKEND: "file" },
+  cases: [
+    {
+      id: "J21-01",
+      title: "A dry run prints the plan and sends nothing but GETs",
+      actions: [
+        { args: ["init", "--name", "kinds-vault"], stdout: ["Initialized"] },
+        {
+          // The kind lands in the vault as `ctx pull` would leave it, then the
+          // dry run reads it and plans — reaching the server only to look.
+          mutate: (v) => {
+            writeKindDoc(v, "demo", "published");
+            resetKindLog();
+          },
+          args: kindApply("demo", "main"),
+          stdout: [
+            "Kind demo →",
+            "nest main",
+            "Edge types",
+            "+ apply  escalates-to — create",
+            "routes-to (flow)",
+            "Edges",
+            "Schedules",
+            "nodes/triage-agent every 60 min",
+            "Plugins",
+            "Stewards",
+            "- skip   reviewer of nest → @owner — unresolved placeholder",
+            "Dry run — 5 request(s) planned, nothing sent. Rerun with --yes to apply.",
+          ],
+          stdoutNot: ["✓ created", "applied (of"],
+          // Proof, not the CLI's word for it: only GETs reached the server.
+          check: () => {
+            const log = readKindLog();
+            expect(log.length, "a dry run still probes the server with GETs").toBeGreaterThan(0);
+            expect(log.every((r) => r.method === "GET"), "a dry run must send no writes").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J21-02",
+      title: "Applying with --yes sends exactly the planned requests, edge types before edges",
+      actions: [
+        {
+          // Same published kind, same nest — its state is still empty (J21-01
+          // only looked), so every step is a create.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "main", "--yes"),
+          stdout: [
+            "✓ created escalates-to",
+            "✓ created routes-to (flow)",
+            "✓ created nodes/alert -[escalates-to]-> nodes/oncall",
+            "✓ created nodes/triage-agent every 60 min",
+            "5 applied (of 5 planned request(s)).",
+          ],
+          check: () => {
+            const sig = kindWrites().map((r) => `${r.method} ${r.path}`);
+            expect(sig).toEqual([
+              "POST /nests/main/edge-types",
+              "POST /nests/main/edge-types",
+              "POST /nests/main/edges",
+              "POST /nests/main/schedules",
+              "PUT /nests/main/plugins/gmail",
+            ]);
+            // The edge lands only after the type it needs is defined.
+            expect(sig.indexOf("POST /nests/main/edges")).toBeGreaterThan(
+              sig.lastIndexOf("POST /nests/main/edge-types"),
+            );
+            // The un-mapped steward seat is never sent.
+            expect(sig.some((s) => s.includes("stewards"))).toBe(false);
+            // The edge carries the nodes it connects.
+            const edge = kindWrites().find((r) => r.path.endsWith("/edges"));
+            expect(edge?.body).toMatchObject({
+              from_node: "nodes/alert",
+              to_node: "nodes/oncall",
+              type: "escalates-to",
+            });
+            // Writes to a hosted nest are authorized: the API key reaches the
+            // wire as a bearer token — a regression that dropped it would fail.
+            expect(kindWrites().every((r) => r.auth === "Bearer cnst_test")).toBe(true);
+          },
+        },
+        // The plan is also machine-readable, and `dry_run` tells apart a preview
+        // from a real apply: true without --yes…
+        {
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "jnest", "--json"),
+          json: (data) => {
+            const d = data as { kind: string; dry_run: boolean; steps: unknown[] };
+            expect(d.kind).toBe("demo");
+            expect(d.dry_run).toBe(true);
+            expect(Array.isArray(d.steps)).toBe(true);
+          },
+          check: () => expect(kindWrites(), "a --json preview sends no writes").toEqual([]),
+        },
+        // …and false once it is applied.
+        {
+          args: kindApply("demo", "jnest", "--json", "--yes"),
+          json: (data) => expect((data as { dry_run: boolean }).dry_run).toBe(false),
+        },
+      ],
+    },
+    {
+      id: "J21-03",
+      title: "Re-applying the same kind is idempotent — nothing is double-created",
+      actions: [
+        {
+          // "main" already holds everything from J21-02, so this run updates the
+          // types in place, the edge comes back 409, and the schedule is left be.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "main", "--yes"),
+          stdout: [
+            "✓ updated escalates-to — update (already defined)",
+            "already on the server (409",
+            "already scheduled every 60 min — left as is",
+            "3 applied, 1 already there (of 4 planned request(s)).",
+          ],
+          stdoutNot: ["✗ failed"],
+          check: () => {
+            // The schedule is recognized as unchanged and is not re-sent.
+            expect(kindWrites().some((r) => r.path.endsWith("/schedules"))).toBe(false);
+            // Exactly one edge re-attempt (it answers 409 → "already there").
+            expect(kindWrites().filter((r) => r.path.endsWith("/edges")).length).toBe(1);
+          },
+        },
+      ],
+    },
+    {
+      id: "J21-04",
+      title: "An unreviewed (draft) kind is refused without --allow-draft",
+      actions: [
+        {
+          // A kind a pull landed but nobody reviewed.
+          mutate: (v) => {
+            writeKindDoc(v, "draft-demo", "draft");
+            resetKindLog();
+          },
+          args: kindApply("draft-demo", "draftnest", "--yes"),
+          status: 1,
+          stderr: [
+            "is draft, not published — refusing to apply an unreviewed kind.",
+            "--allow-draft",
+          ],
+          // The refusal is decided before any request — nothing reached the server.
+          check: () => expect(readKindLog()).toEqual([]),
+        },
+        {
+          // Applied deliberately, it goes through, with the draft called out.
+          mutate: () => resetKindLog(),
+          args: kindApply("draft-demo", "draftnest", "--yes", "--allow-draft"),
+          stdout: [
+            "is draft, not published — review it before applying.",
+            "5 applied (of 5 planned request(s)).",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J21-05",
+      title: "A plane the server switched off is skipped with a reason, not failed",
+      actions: [
+        {
+          // The "flags-off" nest answers 404 for the workflow and plugins planes.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "flags-off"),
+          status: 0,
+          stdout: [
+            "- skip   escalates-to — workflow plane off",
+            "- skip   gmail (raw) — plugins off",
+            "FEATURE_WORKFLOW_PLANE=true",
+            "FEATURE_PLUGINS=true",
+            "Dry run — 0 request(s) planned, nothing sent. Rerun with --yes to apply.",
+          ],
+          stdoutNot: ["+ apply"],
+          check: () => {
+            const log = readKindLog();
+            // The planes were probed (GETs) and found off — but nothing was sent.
+            expect(log.length, "the skipped planes were still probed").toBeGreaterThan(0);
+            expect(log.every((r) => r.method === "GET"), "only GETs on a skipped dry run").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J21-06",
+      title: "Steward seats and bad inputs are guarded",
+      actions: [
+        {
+          // An un-mapped placeholder is a skip; mapping it to a person makes it a
+          // planned request, and the governance it switches on is called out.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "stewardnest", "--steward", "@owner=lead@example.com"),
+          stdout: [
+            "+ apply  reviewer of nest → lead@example.com",
+            "Assigning a steward turns governance (stewardship) on",
+            "Dry run — 6 request(s) planned, nothing sent. Rerun with --yes to apply.",
+          ],
+        },
+        {
+          // A placeholder the kind never declares is refused outright.
+          args: kindApply("demo", "stewardnest", "--steward", "@nope=x@y.com"),
+          status: 1,
+          stderr: ['@nope is not a steward placeholder in kind "demo"', "it uses @owner"],
+        },
+        {
+          // No API key at all: a clear message, before anything is read or sent.
+          mutate: () => resetKindLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: undefined }),
+          args: kindApply("demo", "main"),
+          status: 1,
+          stderr: ["Missing API key", "CONTEXTNEST_API_KEY"],
+          check: () => expect(readKindLog(), "a keyless run reaches no server").toEqual([]),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -4320,5 +4621,8 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J20 — reorganize and retire nodes (move, archive & unarchive)", () => {
     runJourney({ installDir: INSTALL, scratch }, J20);
+  });
+  it("J21 — apply a recipe's server-side kind to a hosted nest", () => {
+    runJourney({ installDir: INSTALL, scratch }, J21);
   });
 });
