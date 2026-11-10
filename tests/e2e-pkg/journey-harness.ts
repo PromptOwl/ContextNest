@@ -33,6 +33,25 @@ export const cliPkg = JSON.parse(
   readFileSync(join(cliDir, "package.json"), "utf-8"),
 ) as { name: string; version: string };
 
+/**
+ * The built MCP server's entrypoint — a stand-in "team nest" that a journey can
+ * point a stdio remote at (the J22 `ctx pull` half spawns it over stdio against
+ * a server vault, exactly as pull.regression.test.ts does). `test:pkg` builds
+ * it alongside the CLI; a journey that needs it calls `requireMcpServer()`.
+ */
+export const mcpServerEntry = join(repoRoot, "packages", "mcp-server", "dist", "index.js");
+
+/** Fail loudly if the MCP server isn't built — a stale build, not a bug. */
+export function requireMcpServer(): string {
+  if (!existsSync(mcpServerEntry)) {
+    throw new Error(
+      "packages/mcp-server/dist/index.js is missing — build it: " +
+        "`pnpm --filter @promptowl/contextnest-mcp-server build` (or run via `pnpm test:pkg`).",
+    );
+  }
+  return mcpServerEntry;
+}
+
 export const isWin = process.platform === "win32";
 const npm = isWin ? "npm.cmd" : "npm";
 
@@ -226,6 +245,53 @@ export function startMockKindServer(scratch: string[]): Promise<MockKindServer> 
   });
 }
 
+export interface MockNestServer {
+  /** The `--server` value `ctx push` is pointed at (`http://127.0.0.1:PORT`). */
+  baseUrl: string;
+  /** File the mock appends every received request to, one JSON object per line
+   * (method, url, auth header, body). A journey reads it to prove the CLI sent a
+   * Bearer key and exactly the documents it disclosed. */
+  logPath: string;
+  /** Kill the mock process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback nest REST mock (`mock-nest-server.mjs`) the J22 remote-sync
+ * journey drives `ctx push` against, in its OWN process (same reason as
+ * startMockProvider/startMockKindServer: spawnSync blocks this process's loop,
+ * so a same-process server would deadlock). The scenario is encoded in the nest
+ * id the journey pushes to (`gated` holds for confirmation; any other id applies
+ * and is stateful); the request log goes to a temp file the caller cleans up.
+ */
+export function startMockNestServer(scratch: string[]): Promise<MockNestServer> {
+  const logPath = join(mkdtempSync(join(tmpdir(), "cn-nestmock-")), "requests.log");
+  scratch.push(dirname(logPath));
+  writeFileSync(logPath, "");
+  const child = spawn("node", [join(here, "mock-nest-server.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, NEST_MOCK_LOG: logPath },
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock nest server never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}`, logPath, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
 /** A fresh isolated vault + config dir for one journey. Caller owns cleanup via `scratch`. */
 export function makeSandbox(
   scratch: string[],
@@ -261,12 +327,15 @@ export interface Action {
   /**
    * Mutate the vault on disk BEFORE this action's command runs — e.g. corrupt a
    * version-history file to prove `verify` catches tampering, or delete a node
-   * to set up a restore. `vaultDir` is the journey's isolated vault root. This
-   * is the one escape hatch from the pure drive-the-bin model, for the handful
-   * of journeys (integrity, disaster-recovery, forget) whose story requires the
-   * vault to change out from under the CLI between commands.
+   * to set up a restore. `vaultDir` is the journey's isolated vault root;
+   * `cfgDir` is its sandboxed registry/config dir (CONTEXTNEST_CONFIG_DIR) —
+   * write it to seed registry-level state the command needs, e.g. a `remotes:`
+   * entry pointing a `ctx pull` at a stdio MCP server. This is the one escape
+   * hatch from the pure drive-the-bin model, for the handful of journeys
+   * (integrity, disaster-recovery, forget, remote-sync) whose story requires the
+   * vault or registry to change out from under the CLI between commands.
    */
-  mutate?: (vaultDir: string) => void;
+  mutate?: (vaultDir: string, cfgDir: string) => void;
   /**
    * The ctx args to run (e.g. ["add", "nodes/x", "-y"]). A function form is
    * evaluated at run time (after this action's `mutate`), with the journey's
@@ -364,7 +433,7 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
   const { vault, cfg } = makeSandbox(ctx.scratch, journey.id.toLowerCase());
   for (const c of journey.cases) {
     for (const a of c.actions) {
-      if (a.mutate) a.mutate(vault);
+      if (a.mutate) a.mutate(vault, cfg);
       const argv = typeof a.args === "function" ? a.args(vault) : a.args;
       const extraEnv = { ...journey.env, ...(a.env ? a.env(vault) : undefined) };
       const r = runInstalled(ctx.installDir, vault, argv, cfg, extraEnv);

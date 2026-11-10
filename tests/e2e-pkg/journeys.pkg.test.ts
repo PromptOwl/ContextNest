@@ -36,19 +36,23 @@ import {
   readdirSync,
   statSync,
   existsSync,
+  cpSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, isAbsolute } from "node:path";
+import { join, dirname, relative, isAbsolute } from "node:path";
 import {
   packCli,
   freshInstall,
   runJourney,
   startMockProvider,
   startMockKindServer,
+  startMockNestServer,
+  requireMcpServer,
   repoRoot,
   type Journey,
   type MockProvider,
   type MockKindServer,
+  type MockNestServer,
   type RunResult,
 } from "./journey-harness.js";
 
@@ -62,17 +66,23 @@ let MOCK: MockProvider;
 // process (see startMockKindServer), its base_url and request-log path known
 // only once it has bound a port, so J21's closures read them from here.
 let KIND_MOCK: MockKindServer;
+// The loopback nest REST mock J22 drives `ctx push` against — its own process
+// (see startMockNestServer), base_url and request-log path known only once it
+// has bound a port, so J22's push closures read them from here.
+let NEST_MOCK: MockNestServer;
 
 beforeAll(async () => {
   const tarball = packCli(scratch);
   INSTALL = freshInstall(tarball, scratch, "journeys");
   MOCK = await startMockProvider();
   KIND_MOCK = await startMockKindServer(scratch);
+  NEST_MOCK = await startMockNestServer(scratch);
 }, 180_000);
 
 afterAll(() => {
   MOCK?.close();
   KIND_MOCK?.close();
+  NEST_MOCK?.close();
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
@@ -4552,6 +4562,256 @@ const J21: Journey = {
   ],
 };
 
+/**
+ * J22 — "As a team member, I sync my vault with our hosted nest: pushing my
+ * nodes up to the server and pulling shared recipes back down."
+ *
+ * Two transports, one story. `ctx push` is an HTTP POST to a hosted engine, so
+ * it runs against a loopback REST mock (NEST_MOCK) whose behaviour is keyed on
+ * the nest id — a normal nest applies and is stateful (a title it has seen comes
+ * back skipped); the `gated` nest holds the push for a human and answers 202.
+ * `ctx pull` connects to a remote over stdio (an MCP server), so its half spawns
+ * the built MCP server against a seeded "team nest" vault, exactly as
+ * pull.regression.test.ts does — the remote is registered in the sandbox config
+ * dir via the `mutate` hook (which now receives it).
+ *
+ * The API key reaches the CLI through the env as a logged-in user's would; the
+ * file credentials backend keeps every run off the OS keychain on CI. Review is
+ * turned OFF so the pushed nodes are published (push sends published only).
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+
+// A recipe the "team nest" serves: one included node, pulled to nodes/handbook.
+// The ```yaml recipe fence is how a recipe node is authored (spec §3); the
+// included node must exist in the server vault.
+const J22_RECIPE_BODY = [
+  "# Starter Kit",
+  "",
+  "```yaml recipe",
+  "id: starter-kit",
+  "includes:",
+  "  - from: nodes/org/handbook",
+  "    to: nodes/handbook/handbook",
+  "```",
+  "",
+].join("\n");
+
+function writeServerNode(vault: string, id: string, frontmatter: string, body: string): void {
+  const file = join(vault, `${id}.md`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `---\n${frontmatter}\nstatus: published\n---\n\n${body}\n`, "utf-8");
+}
+
+// The "team nest" the pull half reads from: a real vault served by the built MCP
+// server over stdio. Seeded once (minimal-vault + the recipe and its node), kept
+// for the whole suite, cleaned up via `scratch`.
+let j22Server: string | undefined;
+function j22ServerVault(): string {
+  if (j22Server) return j22Server;
+  requireMcpServer();
+  const dir = mkdtempSync(join(tmpdir(), "cn-j22-server-"));
+  scratch.push(dir);
+  cpSync(join(repoRoot, "fixtures", "minimal-vault"), dir, { recursive: true });
+  writeServerNode(dir, "nodes/recipes/recipe-starter-kit", "title: Starter Kit\ntype: document", J22_RECIPE_BODY);
+  writeServerNode(
+    dir,
+    "nodes/org/handbook",
+    'title: Team Handbook\ntype: document\ntags:\n  - "#handbook"',
+    "# Team Handbook\n\nOnboarding, process, and team norms.",
+  );
+  j22Server = dir;
+  return dir;
+}
+
+// Register the team nest as a stdio remote in the sandbox config dir, so
+// `ctx pull teamnest` spawns the MCP server against the seeded vault. The local
+// pull target resolves from cwd (the journey's own vault), so only `remotes:` is
+// needed here.
+function writeRemoteConfig(cfgDir: string, serverVault: string): void {
+  const q = (s: string) => JSON.stringify(s);
+  writeFileSync(
+    join(cfgDir, "config.yaml"),
+    [
+      "version: 1",
+      "remotes:",
+      "  teamnest:",
+      "    transport: stdio",
+      `    command: ${q(process.execPath)}`,
+      "    args:",
+      `      - ${q(requireMcpServer())}`,
+      `      - ${q(serverVault)}`,
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+}
+
+// The push mock's request log is the proof of what left the machine: truncate it
+// before an action, read it back after to assert the exact requests (and that a
+// Bearer key rode along).
+const resetNestLog = () => writeFileSync(NEST_MOCK.logPath, "");
+const readNestLog = (): Array<{ method: string; url: string; auth?: string; body?: { documents?: Array<{ title: string }> } }> =>
+  readFileSync(NEST_MOCK.logPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const nestPosts = () => readNestLog().filter((r) => r.method === "POST");
+// `push --server <mock> --nest <id> …`, built at run time (base_url is only known
+// once the mock has bound a port).
+const push = (nest: string, ...rest: string[]) => () =>
+  ["push", "--server", NEST_MOCK.baseUrl, "--nest", nest, ...rest];
+
+const J22: Journey = {
+  id: "J22",
+  title: "Sync a vault with a team server (push / pull)",
+  env: { CONTEXTNEST_API_KEY: "cnst_test", CONTEXTNEST_CREDENTIALS_BACKEND: "file" },
+  cases: [
+    {
+      id: "J22-01",
+      title: "Push the vault's published nodes to a hosted nest; the server reports how many it took and lists each one",
+      actions: [
+        { args: ["init", "--name", "team-vault"], stdout: ["Initialized"] },
+        // Review off so the nodes publish on add — push sends published only.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        { args: ["add", "nodes/runbook", "--title", "Team Runbook", "--tags", "team", "-y"], stdout: ["Version: 1"] },
+        { args: ["add", "nodes/process/onboarding", "--title", "Onboarding Guide", "--tags", "team", "-y"], stdout: ["Version: 1"] },
+        {
+          mutate: () => resetNestLog(),
+          args: push("alpha", "--yes"),
+          stdout: ["Pushed 2 documents", "+ nodes/team-runbook", "+ nodes/process/onboarding-guide"],
+          // Proof the push actually went out, authorized, carrying both nodes.
+          check: () => {
+            const posts = nestPosts();
+            expect(posts).toHaveLength(1);
+            expect(posts[0].url).toBe("/nests/alpha/publish");
+            expect(posts[0].auth).toBe("Bearer cnst_test");
+            expect(posts[0].body?.documents?.map((d) => d.title).sort()).toEqual([
+              "Onboarding Guide",
+              "Team Runbook",
+            ]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J22-02",
+      title: "Push again; nodes already on the server are reported as \"already there, not overwritten\" and nothing is duplicated",
+      actions: [
+        {
+          // Same nest "alpha" — the stateful mock has both titles already, so it
+          // skips them. The real idempotency contract: a re-push adds nothing.
+          mutate: () => resetNestLog(),
+          args: push("alpha", "--yes"),
+          stdout: [
+            "Pushed 0 documents",
+            "Team Runbook (already exists, not overwritten)",
+            "Onboarding Guide (already exists, not overwritten)",
+          ],
+          stdoutNot: ["+ nodes/"],
+        },
+      ],
+    },
+    {
+      id: "J22-03",
+      title: "Push to a nest that holds pushes for a human to confirm; the CLI prints the confirmation link and, with --no-wait, exits without claiming the push landed",
+      actions: [
+        {
+          mutate: () => resetNestLog(),
+          args: push("gated", "--yes", "--no-wait"),
+          status: 0,
+          stdout: [
+            "This nest requires confirmation before the push is applied.",
+            "Confirm in the UI:",
+            "/nest/gated",
+          ],
+          // The push was parked, not applied — it must not claim it landed.
+          stdoutNot: ["Pushed"],
+          stderr: ["Submitted. Not waiting for the decision (--no-wait)."],
+        },
+      ],
+    },
+    {
+      id: "J22-04",
+      title: "A dry-run push lists what would be sent and sends nothing",
+      actions: [
+        {
+          mutate: () => resetNestLog(),
+          // --dry-run is a program-level flag, before the subcommand.
+          args: () => ["--dry-run", "push", "--server", NEST_MOCK.baseUrl, "--nest", "alpha", "--yes"],
+          status: 0,
+          // The disclosure (what would leave) and the dry-run verdict are on
+          // stderr, like the file-safety action log.
+          stderr: ["nodes/runbook", "Dry run — nothing was sent."],
+          // Nothing reached the server.
+          check: () => expect(readNestLog(), "a dry run sends no request").toEqual([]),
+        },
+      ],
+    },
+    {
+      id: "J22-05",
+      title: "Pull a shared recipe from a remote nest; its documents land locally as drafts to review and publish, not as live published nodes",
+      actions: [
+        {
+          // Register the team nest, then preview: a dry run plans a create and
+          // writes nothing.
+          mutate: (_v, cfg) => writeRemoteConfig(cfg, j22ServerVault()),
+          args: ["pull", "teamnest", "--recipe", "starter-kit", "--dry-run", "--json"],
+          json: (data) => {
+            const d = data as { dry_run: boolean; written: string[]; steps: Array<{ action: string; to: string }> };
+            expect(d.dry_run).toBe(true);
+            expect(d.written).toEqual([]);
+            expect(d.steps[0]).toMatchObject({ action: "create", to: "nodes/handbook/handbook" });
+          },
+          files: [{ path: "nodes/handbook/handbook.md", exists: false }],
+        },
+        {
+          // The real pull: the shared node lands as a draft with lineage, not live.
+          args: ["pull", "teamnest", "--recipe", "starter-kit"],
+          stdout: [
+            "Recipe starter-kit from teamnest",
+            "Wrote 1 item(s).",
+            "Pulled documents are drafts. Review them, then publish: ctx publish",
+          ],
+          files: [
+            { path: "nodes/handbook/handbook.md", exists: true, contains: "status: draft" },
+          ],
+          // Lineage records where it came from, and it is not published.
+          check: (v) => {
+            const pulled = readFileSync(join(v, "nodes", "handbook", "handbook.md"), "utf-8");
+            expect(pulled).toContain("derived_from:");
+            expect(pulled).toContain("contextnest://teamnest/nodes/org/handbook");
+            expect(pulled).not.toMatch(/^status: published/m);
+          },
+        },
+      ],
+    },
+    {
+      id: "J22-06",
+      title: "Guardrails: a push with no API key is refused before anything touches the network; a re-pull skips documents already current and only overwrites with --update",
+      actions: [
+        {
+          // No key at all: refused up front, before anything is sent.
+          mutate: () => resetNestLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: undefined }),
+          args: push("alpha", "--yes"),
+          status: 1,
+          stderr: ["Missing API key", "CONTEXTNEST_API_KEY"],
+          check: () => expect(readNestLog(), "a keyless push reaches no server").toEqual([]),
+        },
+        {
+          // A second pull leaves current documents untouched — the recipe is
+          // up to date, so nothing is written (overwriting newer upstream is the
+          // opt-in --update path).
+          args: ["pull", "teamnest", "--recipe", "starter-kit", "--json"],
+          json: (data) => {
+            const d = data as { written: string[]; steps: Array<{ action: string }> };
+            expect(d.written).toEqual([]);
+            expect(d.steps[0].action).toBe("up-to-date");
+          },
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -4624,5 +4884,9 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J21 — apply a recipe's server-side kind to a hosted nest", () => {
     runJourney({ installDir: INSTALL, scratch }, J21);
+  });
+
+  it("J22 — sync a vault with a team server (push / pull)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J22);
   });
 });
