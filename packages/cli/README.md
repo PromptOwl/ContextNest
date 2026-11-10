@@ -194,6 +194,23 @@ A write that publishes records the block on its version-history entry, so `ctx h
 
 The env vars are the reason this is practical for agents: a plugin that shells out to `ctx` exports them once for a session instead of threading flags through every call. A flag beats the env var per key, so `--agent` on one command overrides the ambient agent while keeping the ambient session.
 
+### Human author
+
+`--author <email>` (env: `CONTEXTNEST_AUTHOR`) records the human a write is for as `edited_by` — the `By:` line in `ctx history`. It applies to every local write: `add`, `update` (which auto-publishes), `publish`, `delete`, `archive`, `forget`, imports and the rest. Commands that already take `-a, --author` (`publish`, `forget`, `archive`, the paper imports) read the same value, so the env var is their default too. With neither, `edited_by` stays `cli@contextnest.local`. The flag beats the env var.
+
+`--author` and `--agent` answer different questions, so one version can carry both: the human who approved the write, and the agent that made it.
+
+```bash
+export CONTEXTNEST_AUTHOR=you@example.com CONTEXTNEST_AGENT=claude-code
+ctx update nodes/spec --body "…"
+ctx history nodes/spec
+#   v2 published
+#     By: you@example.com at 2026-11-08T12:00:00.000Z
+#     Client: claude-code
+```
+
+Remote (Community) nests ignore it: the server records the author from the API key.
+
 Values from `--client` are recorded as **strings** — a shell argument is text, and coercing `version=1.0` to `1` would quietly lose characters from an audit record. Attribution is a label, never an identity claim: nothing authenticates it, and it is never used to authorize.
 
 ### Errors
