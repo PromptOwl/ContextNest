@@ -11,7 +11,7 @@ Gives the [Zed Agent](https://zed.dev/docs/ai/agent-panel) the Context Nest oper
    mkdir -p ~/.agents/skills && cp -R plugins/zed/skills/* ~/.agents/skills/
    ```
    For one project only, copy the folders into `<project>/.agents/skills/`. Zed loads project skills only from trusted worktrees.
-2. Add the rules. Copy `plugins/zed/AGENTS.md` into the project `AGENTS.md`, or into `~/.config/zed/AGENTS.md` for all projects. Zed reads only the first rules file it finds, and `.rules`, `.cursorrules` and some other names come before `AGENTS.md`. If the project has one of these files, append the rules to that file.
+2. Add the rules. Copy `plugins/zed/AGENTS.md` into the project `AGENTS.md`, or into `~/.config/zed/AGENTS.md` for all projects. Zed reads only the first rules file it finds, and `.rules`, `.cursorrules` and some other names come before `AGENTS.md`. If the project has one of these files, append the rules to that file. `ctx init` writes `.cursorrules` and `.windsurfrules` into a new vault, so a vault folder always has one.
 3. Optional: add the Context Nest MCP server. Open the settings with `zed: open settings file`, then add:
    ```json
    {
