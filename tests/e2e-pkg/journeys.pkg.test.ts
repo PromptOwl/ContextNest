@@ -4812,6 +4812,197 @@ const J22: Journey = {
   ],
 };
 
+// ── J23: sign in once and reuse the key (ctx login / logout) ────────────────
+// A sandbox HOME, created once and cleaned by the suite's afterAll. `ctx login`
+// writes the encrypted key store under `<home>/.promptowl/`; overriding HOME (and
+// USERPROFILE on Windows) keeps every saved key inside the sandbox and off the
+// real machine. One home across the whole journey so a key saved by J23-01's
+// login is the same store a later push reads.
+const _j23 = { home: "" };
+const j23Home = (): string => {
+  if (!_j23.home) {
+    _j23.home = mkdtempSync(join(tmpdir(), "cn-journey-j23-home-"));
+    scratch.push(_j23.home); // cleaned by the suite's afterAll
+  }
+  return _j23.home;
+};
+// The last Authorization header the push mock recorded — proof of which key
+// actually reached the wire (saved, env, or --key).
+const lastPushAuth = (): string | undefined => {
+  const posts = nestPosts();
+  return posts.length ? posts[posts.length - 1].auth : undefined;
+};
+
+const J23: Journey = {
+  id: "J23",
+  title: "Sign in once and reuse the key (login / logout)",
+  // No CONTEXTNEST_API_KEY here (undefined unsets any ambient one): the saved
+  // login must be what authenticates. The file-backed store + a stable key keep
+  // the CLI off the OS keychain and let the encrypted store round-trip; HOME is
+  // sandboxed so the key never lands in the real home.
+  env: {
+    CONTEXTNEST_API_KEY: undefined,
+    CONTEXTNEST_CREDENTIALS_BACKEND: "file",
+    CONTEXTNEST_CREDENTIALS_KEY: "j23-store-passphrase",
+    HOME: j23Home(),
+    USERPROFILE: j23Home(),
+  },
+  cases: [
+    {
+      id: "J23-01",
+      title: "Login saves the key to the store and registers the server; `login --list` shows it, never the key",
+      actions: [
+        { args: ["init", "--name", "signin-vault"], stdout: ["Initialized"] },
+        // Review off so the node publishes on add — push (later cases) sends published only.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        { args: ["add", "nodes/doc", "--title", "Doc One", "--tags", "team", "-y"], stdout: ["Version: 1"] },
+        {
+          // --key-stdin reads the key from stdin (no browser): the one headless
+          // way to save a key. The key must never echo back.
+          args: () => ["login", NEST_MOCK.baseUrl, "--key-stdin"],
+          input: "cnst_saved\n",
+          stdout: ["Logged in to", "Key saved to encrypted file", "Registered"],
+          stdoutNot: ["cnst_saved"],
+          stderrNot: ["cnst_saved"],
+          // "encrypted file" at rest, not just absent from the terminal: the key
+          // the store wrote to <home>/.promptowl must not be the plaintext key.
+          check: () => {
+            const store = join(j23Home(), ".promptowl", "credentials.enc.json");
+            expect(existsSync(store), "login wrote the encrypted key store").toBe(true);
+            expect(readFileSync(store, "utf-8")).not.toContain("cnst_saved");
+          },
+        },
+        {
+          args: ["login", "--list"],
+          // The loopback host is stable; only the port varies (see the json case
+          // below for the exact base_url, read at run time).
+          stdout: ["http://127.0.0.1", "used by"],
+          stdoutNot: ["cnst_saved"], // the list shows servers, never the secret
+        },
+        {
+          args: ["login", "--list", "--json"],
+          json: (data) => {
+            const rows = data as Array<{ url: string; usedBy: string[] }>;
+            expect(rows).toHaveLength(1);
+            expect(rows[0].url).toBe(NEST_MOCK.baseUrl);
+            expect(rows[0].usedBy.length).toBeGreaterThan(0);
+            // The structured form carries no key either.
+            expect(JSON.stringify(rows)).not.toContain("cnst_saved");
+          },
+        },
+      ],
+    },
+    {
+      id: "J23-02",
+      title: "A later push reuses the saved key with no --key or env var",
+      actions: [
+        {
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes"),
+          stdout: ["Pushed 1 document"],
+          // The saved login — not any ambient key — is what authorized the push.
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_saved"),
+        },
+      ],
+    },
+    {
+      id: "J23-03",
+      title: "Precedence holds: --key beats CONTEXTNEST_API_KEY, which beats the saved login",
+      actions: [
+        {
+          // --key wins over the saved login.
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes", "--key", "cnst_flag"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_flag"),
+        },
+        {
+          // The env key wins over the saved login.
+          mutate: () => resetNestLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: "cnst_env" }),
+          args: push("team", "--yes"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_env"),
+        },
+        {
+          // --key wins even over the env key.
+          mutate: () => resetNestLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: "cnst_env" }),
+          args: push("team", "--yes", "--key", "cnst_flag"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_flag"),
+        },
+      ],
+    },
+    {
+      id: "J23-04",
+      title: "A nest-scoped key wins over the server-wide key for that nest",
+      actions: [
+        {
+          // Save a key for one nest only (nest scope needs --key-stdin).
+          args: () => ["login", NEST_MOCK.baseUrl, "--nest", "special", "--key-stdin"],
+          input: "cnst_nest\n",
+          stdout: ["this nest only"],
+          stdoutNot: ["cnst_nest"],
+        },
+        {
+          // Working in that nest, the nest key is preferred.
+          mutate: () => resetNestLog(),
+          args: push("special", "--yes"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_nest"),
+        },
+        {
+          // Elsewhere, the server-wide key still applies.
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_saved"),
+        },
+      ],
+    },
+    {
+      id: "J23-05",
+      title: "Logout forgets the key — the next push fails \"Missing API key\" and it drops off --list",
+      actions: [
+        {
+          args: () => ["logout", NEST_MOCK.baseUrl],
+          stdout: ["Logged out of"],
+        },
+        {
+          // No saved key, no env key: the push is refused before any request.
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes"),
+          status: 1,
+          stderr: ["Missing API key"],
+          check: () => expect(readNestLog(), "a logged-out push reaches no server").toEqual([]),
+        },
+        {
+          args: ["login", "--list"],
+          stdout: ["Not logged in to any server"],
+        },
+      ],
+    },
+    {
+      id: "J23-06",
+      title: "Keys never reach stdout, and a non-loopback server is refused",
+      actions: [
+        {
+          // Nothing to log in to, and no --list: a plain usage error.
+          args: ["login"],
+          status: 1,
+          stderr: ["Name the <server>"],
+        },
+        {
+          // A plaintext, non-loopback address would leak the key over the wire —
+          // refused unless the user forces it.
+          args: ["login", "http://attacker.example", "--key-stdin"],
+          input: "cnst_leak\n",
+          status: 1,
+          stderr: ["plaintext HTTP", "--force"],
+          stdoutNot: ["cnst_leak"],
+          stderrNot: ["cnst_leak"],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -4888,5 +5079,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J22 — sync a vault with a team server (push / pull)", () => {
     runJourney({ installDir: INSTALL, scratch }, J22);
+  });
+
+  it("J23 — sign in once and reuse the key (login / logout)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J23);
   });
 });
