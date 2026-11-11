@@ -102,6 +102,7 @@ export function runInstalled(
   args: string[],
   configDir: string,
   extraEnv?: Record<string, string | undefined>,
+  input?: string,
 ): RunResult {
   const env = { ...sandboxEnv(configDir), ...extraEnv } as NodeJS.ProcessEnv;
   for (const [k, v] of Object.entries(extraEnv ?? {})) if (v === undefined) delete env[k];
@@ -109,6 +110,7 @@ export function runInstalled(
     cwd,
     env,
     encoding: "utf-8",
+    input,
   });
   return {
     status: typeof res.status === "number" ? res.status : 1,
@@ -344,6 +346,12 @@ export interface Action {
    * `capture` hook. Static args stay a plain array.
    */
   args: string[] | ((vaultDir: string) => string[]);
+  /**
+   * Text piped to the command's stdin — e.g. the API key a browserless
+   * `ctx login --key-stdin` reads instead of opening a browser. Omitted for the
+   * vast majority of actions, which read no stdin.
+   */
+  input?: string;
   /** Expected exit status (default 0). */
   status?: number;
   /** Every matcher must appear in stdout. */
@@ -436,7 +444,7 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
       if (a.mutate) a.mutate(vault, cfg);
       const argv = typeof a.args === "function" ? a.args(vault) : a.args;
       const extraEnv = { ...journey.env, ...(a.env ? a.env(vault) : undefined) };
-      const r = runInstalled(ctx.installDir, vault, argv, cfg, extraEnv);
+      const r = runInstalled(ctx.installDir, vault, argv, cfg, extraEnv, a.input);
       const at = `${c.id} — ${c.title} [ctx ${argv.join(" ")}]`;
       expect(r.status, `${at} — exit ${r.status}: ${r.stderr || r.stdout}`).toBe(
         a.status ?? 0,
