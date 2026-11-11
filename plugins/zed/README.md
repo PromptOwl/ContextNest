@@ -10,7 +10,7 @@ Gives the [Zed Agent](https://zed.dev/docs/ai/agent-panel) the Context Nest oper
    ```bash
    mkdir -p ~/.agents/skills && cp -R plugins/zed/skills/* ~/.agents/skills/
    ```
-   For one project only, copy the folders into `<project>/.agents/skills/`. Zed loads project skills only from trusted worktrees.
+   For one project only, copy the folders into `<project>/.agents/skills/`. Zed loads project skills and `.zed/settings.json` only from a trusted worktree. A new folder opens in Restricted Mode: click the exclamation mark icon in the title bar, or run `workspace: toggle worktree security`, then trust it.
 2. Add the rules. Copy `plugins/zed/AGENTS.md` into the project `AGENTS.md`, or into `~/.config/zed/AGENTS.md` for all projects. Zed reads only the first rules file it finds, and `.rules`, `.cursorrules` and some other names come before `AGENTS.md`. If the project has one of these files, append the rules to that file. `ctx init` writes `.cursorrules` and `.windsurfrules` into a new vault, so a vault folder always has one.
 3. Optional: add the Context Nest MCP server. Open the settings with `zed: open settings file`, then add:
    ```json
@@ -26,7 +26,7 @@ Gives the [Zed Agent](https://zed.dev/docs/ai/agent-panel) the Context Nest oper
    ```
    The server uses the registry default vault. To use a different vault, put its path in `args` after the package name.
 4. Open the Agent Panel and start a new thread.
-5. Type `/contextnest`. Expected result: the four skills show as slash commands, for example `/contextnest-recall`.
+5. Type `/`. Expected result: the four skills show as slash commands. A global skill has an empty prefix (`/:contextnest-recall`). A project skill has the folder name as its prefix (`/<folder>:contextnest-recall`).
 
 Skills and rules apply only to the Zed Agent. External agents in Zed (Claude Code, Codex, Gemini CLI) use their own plugin from this repository.
 
