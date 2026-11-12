@@ -96,7 +96,7 @@ describe("last_edit — served from version history", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  async function create(title: string, actor = HUMAN, client: object | undefined = CLIENT) {
+  async function create(title: string, actor = HUMAN, client: object | null = CLIENT) {
     const { id } = await api.run<{ id: string }>(
       "context_create",
       { title, content: `${title} body`, ...(client ? { client } : {}) },
@@ -138,7 +138,7 @@ describe("last_edit — served from version history", () => {
   });
 
   it("omits client when the write named no agent — the human still stands alone", async () => {
-    const id = await create("Plain", HUMAN, undefined);
+    const id = await create("Plain", HUMAN, null);
     const doc = await api.run<{ last_edit?: LastEdit }>(
       "context_get",
       { id },
@@ -177,7 +177,7 @@ describe("last_edit — served from version history", () => {
   });
 
   it("has no last_edit when every entry is a system entry", async () => {
-    const id = await create("Seeded", "system:seed", undefined);
+    const id = await create("Seeded", "system:seed", null);
     const doc = await api.run<Record<string, unknown>>(
       "context_get",
       { id },

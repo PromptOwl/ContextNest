@@ -74,6 +74,15 @@ export interface OperationContext {
    * that runs the seal may skip it (the hosted server, from a background job).
    */
   readonly deferSeal?: boolean;
+  /**
+   * `true`: this caller may see who edited documents, so `context_get` (and
+   * `context_list` with `include_last_edit`) serve `last_edit` — the human
+   * and agent behind the latest edit (spec §9.5). Default off: the engine is
+   * identity-agnostic and cannot tell a member from a public reader, so the
+   * host decides. On the context, never in an input — a caller that could
+   * ask for it would see people wherever it liked.
+   */
+  readonly showEditors?: boolean;
 }
 
 /** See {@link OperationContext.limits}. */

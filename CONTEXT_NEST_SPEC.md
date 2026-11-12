@@ -1798,6 +1798,49 @@ Defaults do not change the trust level of anything in §9.4: `clientInfo.name` i
 a client's self-report, exactly like a caller-supplied `agent`, and neither is
 authenticated.
 
+### 9.5 Last Edit on Reads
+
+§6.2 records who sealed each version and §9.4 records which agent made the
+call. A reader asking "who last changed this?" should not have to page through
+the history to find out. A read that serves a document MAY therefore carry a
+`last_edit` block, read back from that history:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | integer | The history entry that is the last edit |
+| `edited_by` | string | That entry's `edited_by`: the human or service account accountable for the edit. REQUIRED |
+| `edited_by_system` | string | Display name when `edited_by` is a system account. OPTIONAL; set by an implementation that has such accounts |
+| `edited_at` | string | That entry's `edited_at` (ISO 8601) |
+| `client` | object | That entry's `client` (§9.4), when it has one; `client.agent` names the agent that made the call |
+
+Rules:
+
+1. **The human comes first.** `edited_by` is always present. `client.agent`
+   sits beside it and MUST NOT replace it: an agent is the tool that made the
+   call, not the party accountable for the edit. A reader that renders the
+   block SHOULD name the human first (for example "jane@example.com via
+   claude-code").
+2. **Only edits count.** An entry whose `edited_by` begins with `system:` (a
+   seed snapshot taken on a first publish, an implementation's automatic
+   publish of an already-edited version) sealed a version without editing it.
+   Implementations MUST skip such entries and name the newest entry beneath
+   them. With none left, `last_edit` is omitted.
+3. **It names the version served.** For a read of one document, `last_edit`
+   is the newest qualifying entry at or below the version being served — so a
+   read that falls back to an earlier version (§8) names that version's
+   editor, not a later one. A draft change not yet sealed into history has no
+   entry and is not named.
+4. **Seeing people is the host's decision.** `edited_by` identifies a person.
+   An implementation MUST omit `last_edit` for callers that may not see who
+   edited a document (anonymous or public readers, keys that act for no
+   person), and MUST NOT let a caller turn it on by asking. A caller MAY ask
+   to leave it out, or to include it on listings where it costs extra reads.
+5. **It never fails a read.** A missing or unreadable history omits the block;
+   integrity failures are reported as §8 prescribes.
+
+`last_edit` is a read-time view of §6.2, not new evidence: it carries nothing
+the history does not, and like `client` it is not an input to any hash.
+
 ---
 
 ## 10. INDEX.md Format
@@ -2171,6 +2214,7 @@ The following components remain proprietary:
 
 ### 1.2 — draft
 
+- **Last edit on reads** (§9.5). New optional `last_edit` block on reads that serve a document: the newest version-history entry that is an edit (`version`, `edited_by`, optional `edited_by_system`, `edited_at`, `client`). The human always comes first, `system:` entries are skipped, and implementations omit it for callers that may not see people.
 - **Structure rules** (§11.1.1). New optional `structure`, extended `folders` (path patterns, `types`, `folder_name`, `file_name`, `required`, `files`) and `templates` config keys: hard rules on folder layout, node-type placement, folder/file-name formats (tokens or a guarded regex), templates with required sections, and required subfolders/files. Enforced by write surfaces when `structure.enforce` is true; existing content is grandfathered. `.context/` is not writable through bulk import.
 - **New node type `view`** (§1.12): a governed composition of other nodes. The required `view` block is a layout of `md`, `list`, `summary`, `html`, `table`, `kpi`, `chart`, `callout`, `metric` and `data` blocks whose references are vault references, never URLs. `md`, `list` and `callout` resolve from the vault under retrieval visibility; the rest are resolved by the serving implementation. Validation rules 30–36 (§13.5). §13 rule 6 corrected to 15 node types.
 - **Forget protocol** (§6.3). New section. It adds the sixth status `forgotten` (§1.5.1), tombstoned version entries (`tombstone`, `forgotten_at`, `forgotten_by`, `reason_code`) and the `forget_stub` entry. It also adds forgotten-resolution semantics for floating and pinned URIs, the `document.forgotten` audit event, anti-resurrection rules for publish and import, and an audit-only record on delete. §7.3 rebuild handles `forget_stub`. §8.4 adds hash-only verification of tombstones and the `forgotten_content_present` and `unrecorded_tombstone` checks. Version-range forget, lineage flags and lifespan keys remain proposed.
