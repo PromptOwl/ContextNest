@@ -47,12 +47,14 @@ import {
   startMockProvider,
   startMockKindServer,
   startMockNestServer,
+  startMockNcbiServer,
   requireMcpServer,
   repoRoot,
   type Journey,
   type MockProvider,
   type MockKindServer,
   type MockNestServer,
+  type MockNcbiServer,
   type RunResult,
 } from "./journey-harness.js";
 
@@ -70,6 +72,11 @@ let KIND_MOCK: MockKindServer;
 // (see startMockNestServer), base_url and request-log path known only once it
 // has bound a port, so J22's push closures read them from here.
 let NEST_MOCK: MockNestServer;
+// The loopback NCBI E-utilities/PubTator mock J24 drives `ctx import pubmed` and
+// `ctx enrich pubtator` against — its own process (see startMockNcbiServer), its
+// base_url known only once it has bound a port, so J24's env closures read it
+// from here.
+let NCBI_MOCK: MockNcbiServer;
 
 beforeAll(async () => {
   const tarball = packCli(scratch);
@@ -77,12 +84,14 @@ beforeAll(async () => {
   MOCK = await startMockProvider();
   KIND_MOCK = await startMockKindServer(scratch);
   NEST_MOCK = await startMockNestServer(scratch);
+  NCBI_MOCK = await startMockNcbiServer();
 }, 180_000);
 
 afterAll(() => {
   MOCK?.close();
   KIND_MOCK?.close();
   NEST_MOCK?.close();
+  NCBI_MOCK?.close();
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
@@ -5003,6 +5012,167 @@ const J23: Journey = {
   ],
 };
 
+// ── J24: import research papers from PubMed and enrich them ──────────────────
+// A researcher pulls open-access full texts straight into the vault as readable
+// nodes, finds them by topic, then enriches them with normalized disease/chemical
+// labels — all against a loopback NCBI stand-in (mock-ncbi-server.mjs), the same
+// E-utilities/PubTator contract the dev regression stub serves. Every run points
+// the CLI's two network bases at the mock; the base_url is only known once the
+// mock has bound a port, so it is read from NCBI_MOCK inside this closure.
+const ncbiEnv = () => ({
+  CONTEXTNEST_EUTILS_BASE: NCBI_MOCK.baseUrl,
+  CONTEXTNEST_PUBTATOR_BASE: NCBI_MOCK.baseUrl,
+});
+
+const J24: Journey = {
+  id: "J24",
+  title: "Import research papers from PubMed and enrich them",
+  cases: [
+    {
+      id: "J24-01",
+      title:
+        "Searching PubMed pulls the matching open-access papers into the vault and reports how many were found and brought in",
+      actions: [
+        { args: ["init", "--name", "papers"], env: ncbiEnv, stdout: ["Initialized"] },
+        {
+          args: ["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"],
+          env: ncbiEnv,
+          stdout: [
+            "2 match(es) in PubMed with PMC full text; fetched 2",
+            "Published 2 document(s)",
+          ],
+          files: [
+            { path: "nodes/papers/pmid-99900001.md", exists: true },
+            { path: "nodes/papers/doi-10-9999-jsg-2024-002.md", exists: true },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J24-02",
+      title:
+        "An imported paper opens as a normal, readable node with its title, authors, and source details intact",
+      actions: [
+        {
+          args: ["read", "nodes/papers/pmid-99900001"],
+          env: ncbiEnv,
+          stdout: [
+            "Fecal Microbiota Transplantation",
+            "type: reference",
+            "status: published",
+            // The byline and the source identifiers survived the import.
+            "PMID 99900001",
+            "## Abstract",
+          ],
+          files: [
+            { path: "nodes/papers/pmid-99900001.md", contains: "type: reference" },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J24-03",
+      title: "Looking the papers up later by topic finds them",
+      actions: [
+        {
+          args: ["query", "#paper", "--json"],
+          env: ncbiEnv,
+          // Both imported papers carry the #paper tag and come back by it.
+          json: (data) => {
+            const ids = (data as { documents: Array<{ id: string }> }).documents
+              .map((r) => r.id)
+              .sort();
+            expect(ids).toEqual([
+              "nodes/papers/doi-10-9999-jsg-2024-002",
+              "nodes/papers/pmid-99900001",
+            ]);
+          },
+        },
+        {
+          // And a tag no paper carries returns nothing — proof the lookup
+          // actually filters, not that a two-node vault returns everything.
+          args: ["query", "#not-a-real-tag", "--json"],
+          env: ncbiEnv,
+          json: (data) => {
+            expect((data as { documents: unknown[] }).documents).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J24-04",
+      title:
+        "A licence filter imports only papers under an allowed licence and reports the rest as skipped, with the reason",
+      actions: [
+        {
+          // Narrowing to cc-by-nc leaves both papers out: the PMC licence
+          // prefilter finds no match for them, so the filter excludes them and
+          // says exactly why — nothing is imported.
+          args: ["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--license", "cc-by-nc", "-y"],
+          env: ncbiEnv,
+          status: 0,
+          stdout: [
+            "skipped 2 for licence",
+            "licence not in cc-by-nc",
+            "Nothing to import.",
+          ],
+          stdoutNot: ["Published 2 document(s)"],
+        },
+      ],
+    },
+    {
+      id: "J24-05",
+      title:
+        "Enriching a paper adds its disease and chemical labels and surfaces the most-mentioned ones as topic tags",
+      actions: [
+        {
+          // The one paper PubTator has a record for is enriched; the other is
+          // reported (unresolved), not lost. --tag-limit 1 promotes one #mesh- tag.
+          args: ["enrich", "pubtator", "--tag-limit", "1", "-y"],
+          env: ncbiEnv,
+          stdout: [
+            "Enriched 1 document(s)",
+            "PubTator has no record for PMID 99900001",
+          ],
+          // The enriched twin gained its normalized PMID and a #mesh- topic tag.
+          check: (v) => {
+            const twin = readFileSync(
+              join(v, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"),
+              "utf-8",
+            );
+            expect(twin).toContain("pmid: '30056182'");
+            expect((twin.match(/#mesh-/g) ?? []).length).toBe(1);
+          },
+        },
+      ],
+    },
+    {
+      id: "J24-06",
+      title:
+        "Running the same import again changes nothing, and a search that finds nothing ends cleanly instead of erroring",
+      actions: [
+        {
+          // Re-import: the papers are already current, so nothing is republished.
+          args: ["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"],
+          env: ncbiEnv,
+          stdout: ["Published 0 document(s), skipped 2"],
+          stdoutNot: ["Published 2 document(s)"],
+        },
+        {
+          // A search that matches nothing is a clean no-op, not a crash.
+          args: ["import", "pubmed", "--term", "emptyterm[Title]", "--max", "2", "-y"],
+          env: ncbiEnv,
+          status: 0,
+          stdout: [
+            "0 match(es) in PubMed with PMC full text; fetched 0",
+            "Nothing to import.",
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -5083,5 +5253,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J23 — sign in once and reuse the key (login / logout)", () => {
     runJourney({ installDir: INSTALL, scratch }, J23);
+  });
+
+  it("J24 — import research papers from PubMed and enrich them", () => {
+    runJourney({ installDir: INSTALL, scratch }, J24);
   });
 });
