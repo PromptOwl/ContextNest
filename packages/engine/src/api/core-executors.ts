@@ -14,6 +14,7 @@
 import type {
   ClientMetadata,
   ContextNode,
+  DocumentHistory,
   Frontmatter,
   IntegrityFailure,
   PdfMeta,
@@ -62,7 +63,7 @@ import {
 import { filterDocuments } from "../filters.js";
 import { listVaults } from "../registry.js";
 import { publishDocument, publishDocuments, writePublishedVersion } from "../publish.js";
-import { VersionManager } from "../versioning.js";
+import { VersionManager, wholeVersion } from "../versioning.js";
 import { parseUri } from "../uri.js";
 import {
   ContextNestError,
@@ -159,6 +160,56 @@ function toSummary(node: ContextNode, includeBody = false, includeFrontmatter = 
     ...(includeBody ? { body: node.body } : {}),
     ...(includeFrontmatter ? { frontmatter: node.frontmatter } : {}),
   };
+}
+
+/** The wire `last_edit` block (spec §9.5). */
+interface LastEdit {
+  version: number;
+  edited_by: string;
+  edited_at: string;
+  client?: ClientMetadata;
+}
+
+/**
+ * The newest history entry that is an edit, at or below `upTo` (the version
+ * being served) when one is given. `system:` authors — the seed snapshot a
+ * first publish takes, a host's auto-publish bump — sealed a version but did
+ * not edit it, so the edit beneath them is the one named.
+ */
+function lastEditFrom(
+  history: DocumentHistory | null,
+  upTo?: number,
+): LastEdit | undefined {
+  const versions = history?.versions ?? [];
+  for (let i = versions.length - 1; i >= 0; i--) {
+    const e = versions[i];
+    if (upTo !== undefined && e.version > upTo) continue;
+    if (typeof e.edited_by !== "string" || e.edited_by.startsWith("system:")) continue;
+    return {
+      version: e.version,
+      edited_by: e.edited_by,
+      edited_at: e.edited_at,
+      ...(e.client && Object.keys(e.client).length > 0 ? { client: e.client } : {}),
+    };
+  }
+  return undefined;
+}
+
+/**
+ * `last_edit` for a served node, or undefined. Never fails the read: an
+ * unreadable history means the block is absent, and the integrity verdict is
+ * what reports the broken history.
+ */
+async function lastEditOf(ctx: OperationContext, node: ContextNode): Promise<LastEdit | undefined> {
+  if (ctx.showEditors !== true) return undefined;
+  let history: DocumentHistory | null;
+  try {
+    history = await ctx.storage.readHistory(node.id);
+  } catch {
+    return undefined;
+  }
+  const served = wholeVersion(node.frontmatter.version);
+  return lastEditFrom(history, served > 0 ? served : undefined);
 }
 
 /** Lowercase, hyphenate — used to derive a slug from a title/folder segment. */
@@ -626,10 +677,12 @@ const get: OperationExecutor = async (ctx, input: any) => {
   // still catches a corrupted history behind it. With no keyframe to fall back
   // to, the drifted live node is served and body_drift is reported.
   const integrity = await ctx.storage.verifyServedDocument(node);
+  const lastEdit = await lastEditOf(ctx, node);
   return {
     id: node.id,
     frontmatter: node.frontmatter,
     ...(integrity ? { integrity } : {}),
+    ...(lastEdit ? { last_edit: lastEdit } : {}),
     body: node.body,
     ...(input.include_raw ? { raw: node.rawContent } : {}),
     ...(node.pendingChange ? { pendingChange: node.pendingChange } : {}),
@@ -651,7 +704,15 @@ const list: OperationExecutor = async (ctx, input: any) => {
   // `full` serves bodies, so it gets the same integrity verdict as every other
   // body-serving path. Summary mode (no body) stays cheap: nothing is hashed.
   if (input.full === true) await annotateIntegrity(ctx.storage, kept);
-  return { documents: kept.map((d) => toSummary(d, input.full === true, input.full === true)) };
+  const documents = kept.map((d) => toSummary(d, input.full === true, input.full === true));
+  // Opt-in and host-gated (§9.5): one history read per row, so not on every list.
+  if (input.include_last_edit === true && ctx.showEditors === true) {
+    const edits = await mapInBatches(kept, (d) => lastEditOf(ctx, d), ioConcurrency(ctx));
+    return {
+      documents: documents.map((row, i) => (edits[i] ? { ...row, last_edit: edits[i] } : row)),
+    };
+  }
+  return { documents };
 };
 
 const folders: OperationExecutor = async (ctx, input: any) => {
