@@ -25,14 +25,27 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const jats = readFileSync(
-  join(here, "..", "..", "packages", "engine", "src", "__tests__", "fixtures", "jats-sample.xml"),
-  "utf-8",
-);
-const bioc = readFileSync(
-  join(here, "..", "..", "packages", "cli", "src", "__tests__", "fixtures", "pubtator-30056182.json"),
-  "utf-8",
-);
+
+// Shared with the dev regression stub (cli.regression.test.ts) on purpose: both
+// read the SAME two fixtures so the pkg gate and the depth test can't disagree
+// on the NCBI contract. The coupling is one-directional and invisible from the
+// dev side — moving or renaming either fixture breaks this pkg mock. Fail with a
+// message that names that coupling rather than a bare ENOENT, so the breakage
+// points at its cause instead of at a seemingly-unrelated pkg test.
+const fixture = (...segs) => {
+  const path = join(here, "..", "..", "packages", ...segs);
+  try {
+    return readFileSync(path, "utf-8");
+  } catch (err) {
+    throw new Error(
+      `mock-ncbi-server: fixture not found at ${path}. The e2e-pkg J24 journey ` +
+        `reuses this dev-suite fixture; if you moved or renamed it, update this ` +
+        `mock (and keep it in step with cli.regression.test.ts).\n${err}`,
+    );
+  }
+};
+const jats = fixture("engine", "src", "__tests__", "fixtures", "jats-sample.xml");
+const bioc = fixture("cli", "src", "__tests__", "fixtures", "pubtator-30056182.json");
 
 const server = createServer((req, res) => {
   const url = req.url ?? "";
@@ -46,6 +59,13 @@ const server = createServer((req, res) => {
     // The import search (PubMed, restricted to PMC full text) yields two hits;
     // a sentinel term yields none; any other PubMed search (the PMID lookup by
     // DOI/PMCID that enrich runs) yields the one id PubTator has a record for.
+    //
+    // This keys on the "pubmed pmc"[sb] filter exactly as the dev regression
+    // stub does (cli.regression.test.ts) — the two MUST branch alike to stay a
+    // faithful mirror of the NCBI contract. If the CLI changes how it builds the
+    // import query, this falls through to the single-id (enrich-lookup) branch
+    // and J24-01 fails on a count mismatch; the dev stub shares the key and trips
+    // first in the fast unit suite, so fix the contract in both places together.
     const importSearch = query.includes('"pubmed pmc"[sb]');
     const empty = query.includes("emptyterm");
     const result = empty

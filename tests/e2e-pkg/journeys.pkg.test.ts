@@ -5019,6 +5019,12 @@ const J23: Journey = {
 // E-utilities/PubTator contract the dev regression stub serves. Every run points
 // the CLI's two network bases at the mock; the base_url is only known once the
 // mock has bound a port, so it is read from NCBI_MOCK inside this closure.
+//
+// The six cases share one vault and run in order: J24-01 imports the two papers
+// and the rest build on that state — J24-02/03 read and query them, J24-05
+// enriches them, J24-06 re-imports. They are not independently selectable (the
+// whole journey is a single it("J24 …"), so `-t` picks the journey, not a case),
+// and must stay in this sequence.
 const ncbiEnv = () => ({
   CONTEXTNEST_EUTILS_BASE: NCBI_MOCK.baseUrl,
   CONTEXTNEST_PUBTATOR_BASE: NCBI_MOCK.baseUrl,
