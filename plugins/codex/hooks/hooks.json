@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'hooks','codex.js')).href).then(m=>m.main('SessionStart'))\"",
+            "timeout": 20,
+            "statusMessage": "Loading Context Nest vault overview..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'hooks','codex.js')).href).then(m=>m.main('UserPromptSubmit'))\"",
+            "timeout": 20,
+            "statusMessage": "Searching Context Nest vault..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'hooks','codex.js')).href).then(m=>m.main('PostToolUse'))\"",
+            "timeout": 45,
+            "statusMessage": "Checking the nest for nodes the change missed..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'hooks','codex.js')).href).then(m=>m.main('Stop'))\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -16,13 +16,13 @@
  *   Stop          → capture-gate    (parks a capture/change job in the ledger)
  */
 
-import { closeSync, openSync, readFileSync, readSync, fstatSync } from "node:fs";
+import { closeSync, openSync, readSync, fstatSync } from "node:fs";
 import { getConfig, isMain, makeExec, readStdin, safeJson } from "../core/lib.js";
 import { clearPending, loadLedger, parkJob } from "../core/ledger.js";
 import { run as sessionStart } from "../core/session-start.js";
 import { run as retrieve } from "../core/retrieve.js";
 import { run as sweepCheck, SWEEP_CTX_TIMEOUT_MS } from "../core/sweep-check.js";
-import { run as captureGate } from "../core/capture-gate.js";
+import { run as captureGate, transcriptReader } from "../core/capture-gate.js";
 
 // ponytail: the transcript record schema is undocumented; `USER_INPUT` +
 // `content` is the only record shape relied on. Everything else passes through
@@ -59,25 +59,11 @@ export function lastRecord(path, tailBytes = 256 * 1024) {
   }
 }
 
-/** capture-gate reader: Antigravity user records rewritten into the shape the core counts. */
-export function readTranscript(path, maxLines = 200) {
-  if (!path) return { lines: [], userTurns: 0 };
-  try {
-    let userTurns = 0;
-    const all = readFileSync(path, "utf-8")
-      .split(/\r?\n/)
-      .filter((l) => l.trim())
-      .map((line) => {
-        const text = userText(safeJson(line, null));
-        if (!text) return line;
-        userTurns++;
-        return JSON.stringify({ type: "user", message: { role: "user", content: text } });
-      });
-    return { lines: all.slice(-maxLines), userTurns };
-  } catch {
-    return { lines: [], userTurns: 0 };
-  }
-}
+/** capture-gate reader: Antigravity user records rewritten into the shape the core counts; the rest pass through raw. */
+export const readTranscript = transcriptReader((record) => {
+  const text = userText(record);
+  return text ? { type: "user", message: { role: "user", content: text } } : record;
+});
 
 /** Both jobs' directives in one slot. Keeps a known turn, so the capture gate's per-turn dedupe still holds. */
 const joinJobs = (older, newer) => ({

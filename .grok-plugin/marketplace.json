@@ -1,0 +1,13 @@
+{
+  "name": "contextnest",
+  "description": "Context Nest plugins for coding agents — vault-aware retrieval and governed knowledge capture.",
+  "owner": { "name": "PromptOwl" },
+  "plugins": [
+    {
+      "name": "contextnest",
+      "description": "Context Nest skills for Grok Build, driven by the ctx CLI.",
+      "source": "./plugins/grok",
+      "category": "productivity"
+    }
+  ]
+}

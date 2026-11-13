@@ -1,0 +1,10 @@
+{
+  "name": "contextnest",
+  "version": "0.1.0",
+  "description": "Context Nest skills for Grok Build: cited vault recall, governed capture, correction sweeps and structure rules, driven by the ctx CLI.",
+  "author": { "name": "PromptOwl", "email": "support@promptowl.ai" },
+  "homepage": "https://github.com/promptowl/contextnest",
+  "repository": "https://github.com/promptowl/contextnest",
+  "license": "AGPL-3.0",
+  "keywords": ["context", "knowledge-base", "rag", "memory", "contextnest"]
+}
