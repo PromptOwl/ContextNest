@@ -1,5 +1,12 @@
 # @promptowl/contextnest-engine
 
+## 3.6.0
+
+### Minor Changes
+
+- `ctx validate` lists every dangling reference (`[[wikilink]]`, `contextnest://` node link, `depends_on`) with its document and line, as warnings that leave the exit code alone; `--json` adds a `dangling` array. `ctx delete` names the documents that will be left linking to a deleted one, and still deletes it. The engine exports `findDanglingReferences`. A `folder` given with its `nodes/` root (`nodes/briefs`) now files under `nodes/briefs` on create and import, not `nodes/nodes/briefs`.
+- Archive and move are engine operations. `context_archive` takes a node out of lists and retrieval and keeps its history; `context_unarchive` restores the status it left. `context_move` moves a node with its history and any PDF, so `ctx move` now works on local vaults. `ctx archive` and `ctx unarchive` are new. The engine also exports `moveDocument`, `restoreSealedVersion` and `readVersionSource` for hosts that keep their own records beside the vault.
+
 ## 3.5.0
 
 ### Minor Changes
