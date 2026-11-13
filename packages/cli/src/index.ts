@@ -3547,7 +3547,7 @@ cpCmd
   .action(async () => {
     const storage = getStorage();
     await confirmOrExit(
-      `Rebuild checkpoint history in ${realRootPath() ?? storage.root}? The existing .versions/context_history.yaml is replaced.`,
+      `Rebuild checkpoint history in ${realRootPath() ?? storage.root}? The existing checkpoint chain (.versions/.checkpoints/, and any legacy context_history.yaml) is replaced.`,
       { destructive: true },
     );
     const cm = new CheckpointManager(storage);

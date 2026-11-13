@@ -183,6 +183,21 @@ const HISTORY_LIMIT = { maxBytes: 16 * 2 ** 20 };
 /** What the vault root's .versions/ holds besides documents' folders. */
 const ROOT_LEDGERS = new Set(["context_history.yaml", "context_latest.yaml", "chain_events.yaml"]);
 
+/**
+ * Whether `segs` (a path split on `/`) is one of the checkpoint chain's segment
+ * files, `.versions/.checkpoints/<n>.yaml`, spelled exactly so — the one entry
+ * of the vault root's `.versions/` named with a leading dot that an import
+ * carries. It is the nest's own ledger, part of no document's history.
+ */
+function isCheckpointSegment(segs: string[]): boolean {
+  return (
+    segs.length === 3 &&
+    comparableSegment(segs[0]) === ".versions" &&
+    segs[1] === ".checkpoints" &&
+    /^\d+\.yaml$/.test(segs[2])
+  );
+}
+
 /** Histories one import call judges at once (see importRefusals). */
 const SEALED_READS_AT_ONCE = 4;
 
@@ -353,8 +368,9 @@ async function assertImportable(
     throw new ContextNestError(`${f.raw}: .versions/${segs[1]} is the nest's own ledger, not a folder`, "VALIDATION_FAILED");
   }
   // No document is named with a leading dot: such an entry is machinery — the
-  // vault's own write lock (`.versions/.lock`) among it.
-  if (k !== -1 && comparableSegment(segs[k + 1] ?? "").startsWith(".")) {
+  // vault's own write lock (`.versions/.lock`) among it. Only the checkpoint
+  // chain's segments travel with an export.
+  if (k !== -1 && comparableSegment(segs[k + 1] ?? "").startsWith(".") && !isCheckpointSegment(segs)) {
     throw new ContextNestError(`${f.raw}: .versions/${segs[k + 1]} is the vault's own, not a document's history`, "VALIDATION_FAILED");
   }
   await assertNoCaseTwin(ctx, f);
@@ -471,7 +487,7 @@ async function assertNoCaseTwin(ctx: OperationContext, f: PlannedFile): Promise<
 export function versionsArtifact(relPath: string): { owner: string; name: string } | null {
   const segs = relPath.replace(/\\/g, "/").split("/").filter((s) => s !== "" && s !== ".");
   const k = segs.findIndex((seg) => comparableSegment(seg) === ".versions");
-  if (k === -1 || k + 2 >= segs.length) return null;
+  if (k === -1 || k + 2 >= segs.length || isCheckpointSegment(segs)) return null;
   return { owner: [...segs.slice(0, k), segs[k + 1]].join("/"), name: segs.slice(k + 2).join("/") };
 }
 

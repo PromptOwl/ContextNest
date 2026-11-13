@@ -630,6 +630,28 @@ export const checkpointHistorySchema = z.object({
 });
 
 /**
+ * A checkpoint stored as what changed since the one before it (§7.2, segment
+ * files). `checkpoint_hash` is still computed over the FULL maps, so a reader
+ * rebuilds them from the previous checkpoint before verifying. The keys differ
+ * from a full checkpoint's on purpose: a delta can never parse as one.
+ */
+export const checkpointDeltaSchema = z.object({
+  checkpoint: z.number().int().min(1),
+  at: z.string(),
+  triggered_by: z.string(),
+  changed_versions: z.record(z.number().positive()),
+  changed_chain_hashes: z.record(z.string()),
+  removed_versions: z.array(z.string()).optional(),
+  removed_chain_hashes: z.array(z.string()).optional(),
+  checkpoint_hash: z.string().regex(CHECKSUM_PATTERN),
+});
+
+/** One segment file of the chain: full checkpoints and deltas, in order. */
+export const checkpointSegmentSchema = z.object({
+  checkpoints: z.array(z.union([checkpointSchema, checkpointDeltaSchema])),
+});
+
+/**
  * Suggestion metadata schema — persisted in `_suggestions/{doc}-...meta.yaml`
  * alongside the patch file. One per staged drift (bridge-function-spec
  * Story 3.1, hootie-inbox-spec §4.1).
