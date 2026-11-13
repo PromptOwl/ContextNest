@@ -12,7 +12,7 @@
  *      agent/skill markdown file from the matching `plugins/shared/prompts/*.md`.
  *   3. Renders the portable skills (`plugins/shared/skills/<name>/SKILL.md`, a
  *      frontmatter wrapper filled from its prompt) and copies them into each
- *      plugin that has no agents of its own (Gemini, Codex, OpenCode, Grok, Zed).
+ *      plugin that has no agents of its own (Gemini, Codex, OpenCode, Grok, Muse, Zed).
  *
  * Usage:
  *   node scripts/sync-plugins.mjs           # write the vendored copies
@@ -82,6 +82,12 @@ const TARGETS = [
   {
     // Instruction tier: Grok ignores the output of every hook but PreToolUse.
     plugin: "grok",
+    skills: true,
+    prompts: [{ file: "AGENTS.md", prompt: "rules" }],
+  },
+  {
+    // Instruction tier: Muse Code hook payloads are undocumented, so no core.
+    plugin: "muse",
     skills: true,
     prompts: [{ file: "AGENTS.md", prompt: "rules" }],
   },

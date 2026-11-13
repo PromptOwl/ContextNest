@@ -17,7 +17,7 @@ Makes any Antigravity or Gemini session **vault-aware** (effort-toggled auto-ret
 4. **End-of-Turn Capture Gating (`Stop`):**
    - Evaluates whether new decisions or architectural solutions occurred during the turn, parking capture jobs into the session ledger (`~/.contextnest/plugin-state/`); the next prompt's `PreInvocation` hands them over. Explicit asks ("remember this") and corrections always gate; the ambient heuristic depends on transcript record types Antigravity does not document yet.
 5. **Workspace Skills (`skills/`):**
-   - The first four are generated from `plugins/shared/` by `pnpm plugins:sync`, identical to the Codex skills.
+   - The first four are generated from `plugins/shared/` by `pnpm plugins:sync`, identical to the Codex and Muse skills.
    - `contextnest-recall`: Cited retrieval, plus scout mode for corrections (shared `retriever.md`).
    - `contextnest-capture`: The capture ladder (shared `capture.md`).
    - `contextnest-curate`: The change and escalation ladders (shared `curate.md`).
