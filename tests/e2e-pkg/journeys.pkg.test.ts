@@ -5173,6 +5173,223 @@ const J24: Journey = {
   ],
 };
 
+/** One row of `ctx checkpoint list --json` — a nest-level snapshot. */
+type CheckpointRow = {
+  checkpoint: number;
+  triggered_by: string;
+  checkpoint_hash: string;
+  document_versions: Record<string, number>;
+  document_chain_hashes: Record<string, string>;
+};
+const checkpoints = (data: unknown) => data as CheckpointRow[];
+/** The nest-level checkpoint chain, at the vault root (NOT the per-document
+ * histories under nodes/.versions/). Deleting it is how J25-05 simulates a lost
+ * snapshot trail; rebuild regenerates it from the per-document histories. */
+const j25HistPath = (v: string) => join(v, ".versions", "context_history.yaml");
+// Bytes of the checkpoint history captured before the J25-06 guard actions run,
+// so each can prove the refuse / dry-run left the file byte-for-byte untouched.
+let j25HistBytes: string;
+
+/**
+ * J25 — "I audit the vault's snapshot trail, and rebuild it after a loss."
+ * The admin's seat on Context Nest's nest-level checkpoints (spec §6–8): every
+ * change to the vault cuts a hash-chained snapshot, and those snapshots are an
+ * audit trail that must survive even its own history file being lost. Capture a
+ * few nodes so the trail grows, list it (human + json + most-recent-N), confirm
+ * the integrity check vouches for the chain, then delete the snapshot history
+ * off disk and prove `checkpoint rebuild` regenerates it from the per-document
+ * histories — and that rebuild is guarded so it can't clobber the trail by
+ * accident.
+ *
+ * Distinct from J2: J2 audits ONE node's version history (history/reconstruct/
+ * diff); J25 audits the vault-wide checkpoint chain (checkpoint list/rebuild).
+ *
+ * The review gate is turned OFF (like J2/J13): each write should cut its own
+ * checkpoint directly, with no gate in between — so the snapshot count maps 1:1
+ * to the writes this journey makes.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J25: Journey = {
+  id: "J25",
+  title: "Audit the vault's snapshot trail and rebuild it after a loss (admin)",
+  cases: [
+    {
+      id: "J25-01",
+      title: "A brand-new vault has no snapshots yet",
+      actions: [
+        { args: ["init", "--name", "snapshot-trail"], stdout: ["Initialized"] },
+        // Writes should cut checkpoints directly — no review gate in between.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        // Nothing has changed yet, so the trail is empty and says so plainly.
+        { args: ["checkpoint", "list"], stdout: ["No checkpoints found."] },
+        {
+          // Quirk worth pinning: with no checkpoints, `--json` prints the SAME
+          // human line (not an empty array), so assert the string, not JSON.
+          args: ["checkpoint", "list", "--json"],
+          stdout: ["No checkpoints found."],
+        },
+      ],
+    },
+    {
+      id: "J25-02",
+      title: "Each change the vault records lands on the snapshot trail",
+      actions: [
+        {
+          args: [
+            "add", "nodes/alpha",
+            "--type", "document",
+            "--title", "Alpha",
+            "--tags", "#ops",
+            "--body", "alpha body one",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/alpha.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/beta",
+            "--type", "document",
+            "--title", "Beta",
+            "--tags", "#ops",
+            "--body", "beta body one",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/beta.md", exists: true }],
+        },
+        { args: ["update", "nodes/alpha", "--body", "alpha body two", "-y"], stdout: ["Version: 2"] },
+        // Three writes → three snapshots, newest last, the last one triggered by
+        // the node that was just edited, and each carrying its hash + per-doc
+        // versions (the audit payload).
+        {
+          args: ["checkpoint", "list", "--json"],
+          json: (data) => {
+            const cps = checkpoints(data);
+            expect(cps.map((c) => c.checkpoint)).toEqual([1, 2, 3]);
+            const last = cps[2];
+            expect(last.triggered_by).toBe("nodes/alpha");
+            expect(last.checkpoint_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+            // By the third snapshot the vault holds both nodes, alpha at v2.
+            expect(last.document_versions["nodes/alpha"]).toBe(2);
+            expect(last.document_versions["nodes/beta"]).toBe(1);
+            expect(last.document_chain_hashes["nodes/alpha"]).toMatch(/^sha256:/);
+          },
+        },
+        // Human report shows the same, including the growing document count.
+        {
+          args: ["checkpoint", "list"],
+          stdout: ["Checkpoint 3", "Triggered by: nodes/alpha", "Documents: 2"],
+        },
+      ],
+    },
+    {
+      id: "J25-03",
+      title: "Asking for only the most recent snapshots returns just those",
+      actions: [
+        {
+          // --limit keeps the N most recent (2 and 3), dropping the oldest (1).
+          args: ["checkpoint", "list", "--limit", "2", "--json"],
+          json: (data) => expect(checkpoints(data).map((c) => c.checkpoint)).toEqual([2, 3]),
+        },
+        {
+          args: ["checkpoint", "list", "--limit", "2"],
+          stdout: ["Checkpoint 3"],
+          stdoutNot: ["Checkpoint 1"],
+        },
+      ],
+    },
+    {
+      id: "J25-04",
+      title: "An integrity check reports the snapshot chain is intact",
+      actions: [
+        {
+          // Avoid the ✓ glyph (Windows stdout decoding) — the "Checkpoint chain"
+          // line is the snapshot-chain check; --json below is the structural proof.
+          args: ["verify"],
+          stdout: ["Checkpoint chain", "All integrity checks passed"],
+        },
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J25-05",
+      title: "A lost snapshot trail is rebuilt from the per-document history",
+      actions: [
+        {
+          // Simulate the snapshot history being lost/corrupted on disk.
+          mutate: (v) => rmSync(j25HistPath(v), { force: true }),
+          args: ["checkpoint", "list"],
+          stdout: ["No checkpoints found."],
+          files: [{ path: ".versions/context_history.yaml", exists: false }],
+        },
+        {
+          // Rebuild regenerates the whole trail from the per-document histories.
+          // "Rebuilt N" is on stdout; the file-change log is on the file-safety
+          // stderr channel (like `ctx index`). The history file was deleted above,
+          // so it is CREATED (+), not modified (~) — proof it came back from nothing.
+          args: ["checkpoint", "rebuild", "--yes"],
+          stdout: ["Rebuilt 3 checkpoints"],
+          stderr: ["file(s) changed", "+ .versions/context_history.yaml"],
+          files: [{ path: ".versions/context_history.yaml", exists: true }],
+        },
+        {
+          // The three snapshots are back. (Rebuild regenerates a fresh, internally
+          // consistent chain — the snapshot HASHES may differ from the originals,
+          // which is why we assert the count + verify, not hash stability.)
+          args: ["checkpoint", "list", "--json"],
+          json: (data) => expect(checkpoints(data).map((c) => c.checkpoint)).toEqual([1, 2, 3]),
+        },
+        // And the rebuilt chain checks out clean.
+        { args: ["verify"], stdout: ["Checkpoint chain", "All integrity checks passed"] },
+      ],
+    },
+    {
+      id: "J25-06",
+      title: "Rebuild is guarded — it refuses without confirmation and previews with a dry run",
+      actions: [
+        {
+          // Snapshot the history bytes so the next two actions can prove neither
+          // touched the file.
+          mutate: (v) => {
+            j25HistBytes = readFileSync(j25HistPath(v), "utf-8");
+          },
+          // No --yes in a non-interactive session → refuse, exit 1, write nothing.
+          args: ["checkpoint", "rebuild"],
+          status: 1,
+          stderr: ["Refusing without confirmation", "Aborted — nothing was written."],
+          check: (v) =>
+            expect(readFileSync(j25HistPath(v), "utf-8"), "refuse must not touch the history").toBe(
+              j25HistBytes,
+            ),
+        },
+        {
+          // A dry run computes the rebuild ("Rebuilt 3 checkpoints") but writes
+          // nothing — the "Dry run — no files were written." line is that proof.
+          // The byte-compare is a belt-and-suspenders on the history file itself.
+          // (We deliberately don't pin the "would change" file list: the trail was
+          // already rebuilt in J25-05, so a re-rebuild is idempotent and the only
+          // flagged file is the incidental latest-pointer — not a stable contract.)
+          args: ["checkpoint", "rebuild", "--dry-run"],
+          stdout: ["Rebuilt 3 checkpoints"],
+          stderr: ["Dry run — no files were written."],
+          check: (v) =>
+            expect(readFileSync(j25HistPath(v), "utf-8"), "dry run must not touch the history").toBe(
+              j25HistBytes,
+            ),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -5257,5 +5474,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J24 — import research papers from PubMed and enrich them", () => {
     runJourney({ installDir: INSTALL, scratch }, J24);
+  });
+
+  it("J25 — audit the vault's snapshot trail and rebuild it after a loss", () => {
+    runJourney({ installDir: INSTALL, scratch }, J25);
   });
 });
