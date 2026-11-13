@@ -551,6 +551,9 @@ export CONTEXTNEST_VAULT_PATH=/path/to/your/vault
 | `ctx update <path>` | Update a document's title, tags, or body (publishes, or holds the edit for review when the gate is on; `--publish` to bypass). It refuses to replace a body with an empty one unless you pass `--force`. |
 | `ctx add` / `ctx update <path> --body-file <file\|->` | Reads the body from a file or stdin, so newlines, quotes and `$` need no shell escaping. |
 | `ctx delete <path>` | Delete a document and its version history, recorded in `ctx forget-log` (`--reason`, `--requested-by`; `--purge` for no record) |
+| `ctx archive <path> [--reason <text>]` | Archive a document: out of lists and retrieval, history kept (spec §1.13) |
+| `ctx unarchive <path>` | Bring an archived document back in the status it left |
+| `ctx move <path> <folder>` | Move a document to another folder with its history; its id changes |
 | `ctx forget <path> --reason <code>` | Forget a document (right to be forgotten, spec §6.3): erase every version's content, keep the hashes so `ctx verify` still passes; leaves an empty `status: forgotten` stub. `--reason` is `user_request`, `legal`, `retention_expiry` or `error` |
 | `ctx read <path>` | Reads and displays a document in the terminal. A bare id also finds a node at the root of an Obsidian-layout vault. |
 | `ctx read <path> --body` | Prints the body alone, so you can edit it and pass it back with `--body-file`. |
@@ -649,7 +652,7 @@ Imports are idempotent: unchanged XML (same `source_sha256`) is skipped, a chang
 
 ## MCP Server
 
-The MCP server exposes vault operations as 44 tools for AI agents over stdio transport.
+The MCP server exposes vault operations as 47 tools for AI agents over stdio transport.
 
 ### Running the server
 
@@ -669,6 +672,17 @@ docker run -i --rm -v "$PWD:/vault" contextnest-mcp   # serve your own vault
 ```
 
 The mounted directory is the one containing `.context/config.yaml`. The server runs as uid 1000 — add `--user "$(id -u):$(id -g)"` if your vault is owned by a different uid. Build with `--build-arg SEED_DEMO_VAULT=false` for an image that only serves a mounted vault.
+
+### Claude Code plugin
+
+The plugin is the quickest way in. Claude checks your notes on each prompt and updates them when you correct something, and the CLI comes with it:
+
+```text
+/plugin install contextnest --marketplace promptowl/contextnest
+/contextnest:setup
+```
+
+See the [plugin README](plugins/claude-code/README.md) for what it does and what it sends.
 
 ### Configuring with Claude Code
 
@@ -730,6 +744,9 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 | `context_verify` | Verify every hash chain in the vault |
 | `context_forget` | Forget a node: erase its content from history, keep the hashes (verify still passes), leave a `status: forgotten` stub |
 | `context_forget_log` | The forget audit trail — never the forgotten content |
+| `context_archive` | Archive a node: out of lists and retrieval, history kept, recoverable |
+| `context_unarchive` | Bring an archived node back in the status it left |
+| `context_move` | Move a node to another folder, with its history and any PDF |
 | `context_create` | Create a node — own `id`, `publish: false`, initial `status`, `note`, full `skill` block |
 | `context_update` | Update a node — rename, set `status`, stamp a `version`, clear metadata with `null` |
 | `context_publish` | Publish a node; takes a `note`, returns the `chain_hash` |

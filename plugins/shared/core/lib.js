@@ -300,7 +300,7 @@ export function getConfig(env = process.env, opts = {}) {
  * (the sweep check); the env override still wins.
  *
  * @param {ReturnType<typeof getConfig>} config
- * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeout?: number, bundledCli?: string }} [opts]
+ * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, timeout?: number, bundledCli?: string, cliPin?: string }} [opts]
  */
 export function makeExec(config, opts = {}) {
   const cwd = opts.cwd || process.cwd();
@@ -349,7 +349,9 @@ export function makeExec(config, opts = {}) {
     // (never rerun a real ctx failure through the fallback).
     if (res.code === "ENOENT" || res.code === "EINVAL" || (WIN32 && (res.status === 9009 || (res.status === 1 && !winCommandExists(config.ctxCommand))))) {
       if (existsSync(bundledCli)) return attempt(process.execPath, [bundledCli, ...args]);
-      return attempt("npx", ["-y", CLI_PACKAGE, ...args]);
+      // The Claude plugin directory blocks an unpinned launcher. No pin means Gemini.
+      const pin = opts.cliPin ?? bundledCliPin();
+      return attempt("npx", ["-y", pin ? `${CLI_PACKAGE}@${pin}` : CLI_PACKAGE, ...args]);
     }
     return res;
   };

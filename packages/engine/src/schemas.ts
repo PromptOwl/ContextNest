@@ -307,6 +307,14 @@ export const pdfMetaSchema = z.object({
   extracted_at: z.string().min(1),
 });
 
+/** Non-strict, like {@link pdfMetaSchema}: this parses documents already on disk. */
+export const archivedMetaSchema = z.object({
+  at: z.string().min(1),
+  by: z.string().min(1),
+  previous_status: z.enum(STATUSES),
+  reason: z.string().optional(),
+});
+
 export const frontmatterSchema = z
   .object({
     title: z.string().min(1).max(TITLE_MAX_LENGTH),       // Rule 2
@@ -330,6 +338,7 @@ export const frontmatterSchema = z
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
       .optional(),
     governance: z.enum(GOVERNANCE_TIERS).optional(),
+    archived: archivedMetaSchema.optional(),
   })
   .superRefine((data, ctx) => {
     // Rule 9: source block MUST be present when type is "source"

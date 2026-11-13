@@ -1416,6 +1416,7 @@ describe("sweep-check", () => {
     // Explicit binary paths and the npx package form are invocations.
     expect(parseUpdates("/usr/local/bin/ctx update nodes/e --yes")).toHaveLength(1);
     expect(parseUpdates("npx -y @promptowl/contextnest-cli update nodes/b")).toHaveLength(1);
+    expect(parseUpdates("npx -y @promptowl/contextnest-cli@3.4.0 update nodes/b")).toHaveLength(1);
   });
 
   it("run: sweeps every node of a chained update, not just the first", () => {
@@ -1766,6 +1767,24 @@ describe("capture-gate", () => {
 });
 
 describe("makeExec", () => {
+  // A stub npx on an otherwise empty PATH: prints the argv it was launched with.
+  const npxStub = () => {
+    const dir = mkdtempSync(join(tmpdir(), "cn-npx-"));
+    writeFileSync(join(dir, "npx"), '#!/bin/sh\necho "$@"\n', { mode: 0o755 });
+    return { ...process.env, PATH: dir };
+  };
+  const missing = { ctxCommand: "contextnest-no-such-binary" };
+
+  it.skipIf(process.platform === "win32")("the npx fallback runs the exact pinned version", () => {
+    const exec = makeExec(missing, { env: npxStub(), bundledCli: "/nonexistent", cliPin: "9.9.9" });
+    expect(exec(["--version"]).stdout.trim()).toBe("-y @promptowl/contextnest-cli@9.9.9 --version");
+  });
+
+  it.skipIf(process.platform === "win32")("with no pin (Gemini) the npx fallback stays on the package name", () => {
+    const exec = makeExec(missing, { env: npxStub(), bundledCli: "/nonexistent" });
+    expect(exec(["--version"]).stdout.trim()).toBe("-y @promptowl/contextnest-cli --version");
+  });
+
   // The Windows shim path is the whole reason this quoting exists: npm installs
   // ctx as ctx.cmd there, Node refuses to execFile a .cmd without a shell, and
   // cmd.exe does no quoting of its own. On mac/linux `ctx` is a shebang symlink

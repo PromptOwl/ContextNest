@@ -118,12 +118,15 @@ After `ctx init`, the CLI prints a starter-specific instruction block to stdout.
 - `ctx update <path> --assignee <email> --due <YYYY-MM-DD> --priority <urgent|high|medium|low> --parent <id>` — Remote (Community) nest only: set task fields; the nest checks the assignee is on its roster. `""` or `none` clears a field
 - `ctx list --assignee <email|none> --priority <p|none> --due-before <YYYY-MM-DD>` — Remote nest only: filter tasks
 - `ctx task log <path> --note "…" [--status working|done|blocked] [--claim] [--agent <name>]` — Remote nest only: record what you did on a task. Attributed to you, your API key and the agent (`--agent` or `$CONTEXTNEST_AGENT`), and shown in the task's activity. `--claim` assigns it to you if it is unassigned
-- `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record)
+- `ctx delete <path>` — Delete a document (recorded in `ctx forget-log`; `--purge` for no record). Names the documents that will be left linking to it, and still deletes it
+- `ctx archive <path> [--reason <text>]` — Archive a document: out of lists and retrieval, history kept (spec §1.13)
+- `ctx unarchive <path>` — Bring an archived document back in the status it left
+- `ctx move <path> <folder>` — Move a document to another folder with its history; its id changes
 - `ctx forget <path> --reason <code>` — Forget a document (spec §6.3): erase its content from history, keep the hashes so `ctx verify` still passes
 - `ctx import pdf <file...> [--folder f] [--tags t] [--id id] [--title t] [--no-publish]` — Import PDFs as `type: pdf` nodes: the extracted text becomes the body and the PDF is kept beside it, bound by SHA-256. `--id` on an existing pdf node adds a new version (the old PDF stays in history). Scanned PDFs import with an empty body and a warning (no OCR)
 - `ctx publish <path>` — Publish (bump version, create checkpoint)
 - `ctx publish --all` — Publish every unpublished document in one batch, with a live counter. Seals one checkpoint and regenerates the index once, instead of once per document
-- `ctx validate [path]` — Validate against the spec
+- `ctx validate [path]` — Validate against the spec. Also lists every dangling reference (`[[wikilink]]`, `contextnest://` link, `depends_on`) with its document and line, as warnings that leave the exit code alone; `--json` adds a `dangling` array
 - `ctx list` — List documents (filter by `--type`, `--status`, `--tag`; cap with `--limit`)
 - `ctx search <query>` — Full-text search, best match first (documents matching every term, then partial matches, each by relevance score). Prints the top 10; `--limit <n>` to change, `--limit 0` for all; `--json` carries each hit's `score`. When combining with selector filters in `ctx query`, put the search term first (`contextnest://search/foo + type:document`) to keep ranked order — only the leftmost operand's order survives an AND/OR
 - `ctx search <query> --mode lexical|semantic|hybrid [--rerank]` — Searches by stemmed keywords (the default), by embeddings, or by both fused together. Semantic and hybrid search need an index, which `ctx embed` builds from published documents (`--rebuild` starts over). See [retrieval modes](https://github.com/PromptOwl/ContextNest/blob/main/docs/retrieval-modes.md).
@@ -190,6 +193,23 @@ ctx history nodes/spec
 A write that publishes records the block on its version-history entry, so `ctx history` shows which agent produced each version — distinct from `By:`, which is the authoring identity. Reads carry it too; nothing is persisted for them locally, but a governed backend receives it.
 
 The env vars are the reason this is practical for agents: a plugin that shells out to `ctx` exports them once for a session instead of threading flags through every call. A flag beats the env var per key, so `--agent` on one command overrides the ambient agent while keeping the ambient session.
+
+### Human author
+
+`--author <email>` (env: `CONTEXTNEST_AUTHOR`) records the human a write is for as `edited_by` — the `By:` line in `ctx history`. It applies to every local write: `add`, `update` (which auto-publishes), `publish`, `delete`, `archive`, `forget`, imports and the rest. Commands that already take `-a, --author` (`publish`, `forget`, `archive`, the paper imports) read the same value, so the env var is their default too. With neither, `edited_by` stays `cli@contextnest.local`. The flag beats the env var.
+
+`--author` and `--agent` answer different questions, so one version can carry both: the human who approved the write, and the agent that made it.
+
+```bash
+export CONTEXTNEST_AUTHOR=you@example.com CONTEXTNEST_AGENT=claude-code
+ctx update nodes/spec --body "…"
+ctx history nodes/spec
+#   v2 published
+#     By: you@example.com at 2026-11-08T12:00:00.000Z
+#     Client: claude-code
+```
+
+Remote (Community) nests ignore it: the server records the author from the API key.
 
 Values from `--client` are recorded as **strings** — a shell argument is text, and coercing `version=1.0` to `1` would quietly lose characters from an audit record. Attribution is a label, never an identity claim: nothing authenticates it, and it is never used to authorize.
 
