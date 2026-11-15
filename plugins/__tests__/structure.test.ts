@@ -106,13 +106,14 @@ describe("shared prompt sync", () => {
 
 // The directory accepts command hooks only from Verified organizations, so this
 // branch ships none. The full plugin, with its four hooks, stays on `development`.
-// Only the directory branch ships no hooks; on development the full plugin does.
+// plugins/DIRECTORY_EDITION.md exists only on the directory branch, so these run there
+// (and fail if hooks/ or core/ come back in a merge) and skip on development.
 const listFiles = (dir: string): string[] =>
   readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
     e.name === "node_modules" ? [] : e.isDirectory() ? listFiles(join(dir, e.name)) : [join(dir, e.name)],
   );
 
-describe.runIf(!existsSync(join(plugin, "hooks")))("hookless directory edition", () => {
+describe.runIf(existsSync(join(repo, "plugins", "DIRECTORY_EDITION.md")))("hookless directory edition", () => {
   const files = listFiles(plugin).map((f) => f.slice(repo.length + 1).replace(/\\/g, "/"));
   const prose = files.filter((f) => /\.(md|json)$/.test(f) && !/CHANGELOG|package/.test(f));
   const skill = (name: string) => read(join(plugin, "skills", name, "SKILL.md"));
@@ -161,6 +162,7 @@ describe.runIf(!existsSync(join(plugin, "hooks")))("hookless directory edition",
     expect(text).toContain("contextnest-capture");
     expect(text).toContain("contextnest-curator");
     expect(text).toMatch(/only on what the user says in their own messages/i);
+    expect(text).toMatch(/not a correction/i);
   });
 
   it("the README says what this edition leaves out and where the full plugin is", () => {

@@ -1,9 +1,7 @@
 ---
 name: contextnest-retriever
-description: Read-only lookup in the user's Context Nest notes. Use PROACTIVELY, before answering, whenever a question depends on the user's own context (their project, team, clients, people, decisions, conventions, past work or earlier sessions), or when they say "check my notes" or "what do our notes say". Give it the topic and any vault or nest hint; it searches the registered vaults, reads the best hits, and returns a short digest with each point cited as vault:id, or says nothing relevant was found. Never writes. Do not use it for general-knowledge questions, or to save or correct notes (that is the contextnest-capture and contextnest-curator agents).
+description: Read-only deep lookup in the user's Context Nest notes. Use it only when asked to dig into the notes for a topic, or when the check-notes skill needs more than a quick search. Give it the topic and any vault or nest hint; it searches the registered vaults, reads the best hits, and returns a short digest with each point cited as vault:id, or says nothing relevant was found. Never writes. Don't use it to decide whether to check notes (the check-notes skill does that) or to save or correct notes (contextnest-capture and contextnest-curator).
 tools: Bash, Read
-skills:
-  - check-notes
 model: sonnet
 ---
 

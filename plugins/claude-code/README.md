@@ -27,6 +27,8 @@ This directory edition runs nothing automatically. Claude decides when to use yo
 /plugin install contextnest --marketplace promptowl/contextnest
 ```
 
+Writes are also judged by Claude alone in this edition. The full plugin gates them in code (a script decides whether a turn is worth saving), and here nothing does. Claude saves only when you ask it to remember something or state a correction, and the curator can then edit every note carrying the old fact. See what changed with `ctx history <node>`.
+
 Use one edition or the other, because they share the name `contextnest`.
 
 ## Setup

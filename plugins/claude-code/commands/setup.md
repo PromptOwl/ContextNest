@@ -26,7 +26,7 @@ Check quietly:
 
 - **Done**
 - **Add my team's notes** (or **Add notes on this computer** when only online notes exist) → the matching path in Step 3
-- **Change which notes Claude uses first** → ask which of the listed notes, then run `ctx vault default <alias>`
+- **Change which notes Claude uses first** → ask which of the listed notes, then run `ctx vault default <alias>` only after the user has picked one of the listed notes
 
 Never remove, replace or re-default anything that exists.
 
