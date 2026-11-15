@@ -31,6 +31,8 @@ import {
   assertVaultRoot,
   isRefusedCwd,
   generateContextYamlWithStats,
+  buildRelationships,
+  findDanglingReferences,
   buildManifest,
   withVaultLock,
   generateIndexMd,
@@ -250,6 +252,14 @@ program
     "--session <id>",
     "Calling session id, recorded with reads and writes (env: CONTEXTNEST_SESSION_ID)",
   )
+  // The human the write is recorded for (`edited_by`, the `By:` line in
+  // history) — distinct from --agent, which names the program that wrote it.
+  // Env-backed for the same reason: set once per session, one version carries
+  // both. Commands with their own `-a, --author` share this same value.
+  .option(
+    "--author <email>",
+    "Human author recorded as edited_by on writes (env: CONTEXTNEST_AUTHOR)",
+  )
   .option(
     "--client <key=value>",
     "Extra caller metadata, repeatable (e.g. --client workspace=acme)",
@@ -374,6 +384,7 @@ function renderRootHelp(): string {
   lines.push(`${indent}${chalk.cyan("--force".padEnd(col + 2))}allow overwriting existing files`);
   lines.push(`${indent}${chalk.cyan("--agent <name>".padEnd(col + 2))}name of the calling agent, recorded with reads and writes`);
   lines.push(`${indent}${chalk.cyan("--session <id>".padEnd(col + 2))}calling session id, recorded with reads and writes`);
+  lines.push(`${indent}${chalk.cyan("--author <email>".padEnd(col + 2))}human author recorded as edited_by on writes`);
   lines.push(`${indent}${chalk.cyan("--client <k=v>".padEnd(col + 2))}extra caller metadata, repeatable`);
   lines.push(`${indent}${chalk.cyan("-V, --version".padEnd(col + 2))}print the version number`);
   lines.push(`${indent}${chalk.cyan("-h, --help".padEnd(col + 2))}show this help`);
@@ -382,6 +393,8 @@ function renderRootHelp(): string {
   lines.push(`${indent}${chalk.cyan("--agent")} and ${chalk.cyan("--session")} record WHO is calling on every read and write.`);
   lines.push(`${indent}A write stores them in version history, where ${chalk.cyan("ctx history")} shows them. Set`);
   lines.push(`${indent}${chalk.cyan("CONTEXTNEST_AGENT")}/${chalk.cyan("CONTEXTNEST_SESSION_ID")} to attribute a whole session at once.`);
+  lines.push(`${indent}${chalk.cyan("--author")} records the human the write is for, as ${chalk.cyan("edited_by")} (the ${chalk.cyan("By:")} line).`);
+  lines.push(`${indent}Set ${chalk.cyan("CONTEXTNEST_AUTHOR")} to apply it to a whole session. Default: cli@contextnest.local.`);
   lines.push("");
   lines.push(chalk.bold("FILE SAFETY"));
   lines.push(`${indent}Every command that writes asks before it does, then prints the exact list of`);
@@ -417,6 +430,34 @@ let selectedVaultAlias: string | undefined;
  * the subcommand.
  */
 let callClient: ClientMetadata | undefined;
+
+/** `edited_by` when neither --author nor CONTEXTNEST_AUTHOR is given. */
+const DEFAULT_AUTHOR = "cli@contextnest.local";
+
+/**
+ * The human author for the currently-running command, captured by the same
+ * preAction hook as `callClient`. Undefined means "use the default".
+ */
+let callAuthor: string | undefined;
+
+/**
+ * Resolve the human author from the flag and env.
+ *
+ * Same precedence as --agent: the flag (global `--author`, or a command's own
+ * `-a, --author`) beats CONTEXTNEST_AUTHOR. Blank values count as unset, so an
+ * exported-but-empty variable cannot record an empty `edited_by`.
+ */
+function resolveAuthor(flag: string | undefined): string | undefined {
+  const fromFlag = flag?.trim();
+  if (fromFlag) return fromFlag;
+  const fromEnv = process.env.CONTEXTNEST_AUTHOR?.trim();
+  return fromEnv || undefined;
+}
+
+/** The actor every local write of this run records as `edited_by`. */
+function cliActor(): string {
+  return callAuthor ?? DEFAULT_AUTHOR;
+}
 
 /**
  * Build the `client` block from flags and env.
@@ -516,6 +557,8 @@ const VAULT_WRITE_COMMANDS = new Set([
   "update",
   "delete",
   "forget",
+  "archive",
+  "unarchive",
   "publish",
   "index",
   "welcome",
@@ -587,6 +630,7 @@ program.hook("preAction", async (_thisCommand, actionCommand) => {
   const opts = actionCommand.optsWithGlobals();
   selectedVaultAlias = opts.vault as string | undefined;
   callClient = buildCallClient(opts as { agent?: string; session?: string; client?: string[] });
+  callAuthor = resolveAuthor(opts.author as string | undefined);
   configureSafety({ dryRun: opts.dryRun, yes: opts.yes, force: opts.force });
 
   const name = commandPath(actionCommand);
@@ -726,7 +770,7 @@ async function resolvedDocumentId(storage: NestStorage, path: string): Promise<s
   const { id } = await cliApi().run<{ id: string }>(
     "context_versions",
     { id: documentId(path) },
-    opContext(storage, "cli@contextnest.local"),
+    opContext(storage, cliActor()),
   );
   return id;
 }
@@ -1130,7 +1174,7 @@ async function applyStarter(
   const published = await publishDocuments(
     storage,
     nodes.map((node) => node.path),
-    { editedBy: "cli@contextnest.local", note: `Created by ${starter.id} starter` },
+    { editedBy: cliActor(), note: `Created by ${starter.id} starter` },
   );
   if (published.failed.length > 0) {
     throw new Error(`Could not publish starter documents: ${published.failed.map((f) => `${f.id}: ${f.error}`).join("; ")}`);
@@ -1520,7 +1564,7 @@ program
     }>(
       "context_get",
       { id, include_raw: true, allow_rejected: true },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
     const doc: ContextNode = {
       id: got.id,
@@ -1651,7 +1695,7 @@ async function runSkillOp<T>(op: string, input: Record<string, unknown>): Promis
   const storage = getStorage();
   // cliApi(), not createEngineApi(): the skill ops are catalog calls like any
   // other, so they carry this run's caller attribution too.
-  return cliApi().run<T>(op, input, opContext(storage, "cli@contextnest.local"));
+  return cliApi().run<T>(op, input, opContext(storage, cliActor()));
 }
 
 const skillCmd = program
@@ -1836,7 +1880,7 @@ program
             await cliApi().run<StructureOutput>(
               "context_structure",
               { folder: id.split("/").slice(0, -1).join("/") },
-              opContext(storage, "cli@contextnest.local"),
+              opContext(storage, cliActor()),
             )
           ).resolved?.template_body
         : undefined;
@@ -1870,7 +1914,7 @@ program
         ...(hold ? { review: true } : {}),
         note: "Created via CLI",
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
 
     if (result.held_for_review) {
@@ -1892,7 +1936,7 @@ async function afterHold(storage: NestStorage, id: string): Promise<void> {
     interactive: canAskUser(),
     prompt: ask,
     publish: async () => {
-      const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
+      const r = await approveReview(storage, id, { actor: cliActor() });
       console.log(chalk.green(`Published ${r.id}`));
       console.log(`  Version: ${r.version}`);
       console.log(`  Checkpoint: ${r.checkpoint}`);
@@ -1926,7 +1970,7 @@ program
         ...(opts.folder !== undefined ? { folder: opts.folder } : {}),
         ...(opts.report ? { report: true } : {}),
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
     printStructure(out, opts);
   });
@@ -2009,9 +2053,16 @@ program
       }
     }
 
+    // Warnings, never failures: a reference is kept when its target is missing.
+    // Resolving needs the whole vault, so `validate <path>` skips this too.
+    const dangling = path ? [] : findDanglingReferences(docs);
+
     if (opts.json) {
-      console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors }, null, 2));
+      console.log(JSON.stringify({ valid: !hasErrors, errors: allErrors, dangling }, null, 2));
     } else {
+      for (const d of dangling) {
+        console.log(chalk.yellow(`⚠ ${d.from}${d.line ? `:${d.line}` : ""} dangling reference: ${d.target}`));
+      }
       console.log(
         hasErrors
           ? chalk.red(`\nValidation failed with errors`)
@@ -2101,7 +2152,7 @@ program
 program
   .command("publish [path]")
   .description("Publish a document, or every unpublished document with --all")
-  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("-a, --author <email>", "Author email (default: $CONTEXTNEST_AUTHOR, else cli@contextnest.local)")
   .option("-m, --message <note>", "Version note")
   .option("--all", "Publish every unpublished document in the vault, in one batch")
   .action(async (path, opts) => {
@@ -2117,7 +2168,7 @@ program
         console.error(chalk.red("Pass a path or --all, not both"));
         process.exit(1);
       }
-      await publishAll(storage, opts.author);
+      await publishAll(storage, cliActor());
       return;
     }
     if (!path) {
@@ -2138,7 +2189,7 @@ program
         id: documentId(path),
         ...(opts.message ? { note: opts.message } : {}),
       },
-      opContext(storage, opts.author),
+      opContext(storage, cliActor()),
     );
 
     console.log(chalk.green(`Published ${result.id}`));
@@ -2226,7 +2277,7 @@ program
         reason_code?: string;
         forget_stub?: boolean;
       }>;
-    }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, "cli@contextnest.local"));
+    }>("context_versions", { id, ...(opts.diff ? { include_diff: true } : {}) }, opContext(storage, cliActor()));
 
     if (history.versions.length === 0) {
       console.log(chalk.yellow(`No version history for ${id}`));
@@ -2274,7 +2325,7 @@ program
     }>(
       "context_reconstruct",
       { id: documentId(path), version: parseInt(version, 10) },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
     // stderr, like `read --raw`: stdout stays the reconstructed bytes.
     if (integrity) console.error(chalk.red(integrity.warning));
@@ -2306,7 +2357,7 @@ program
     }>(
       "context_init",
       opts.nodes ? { include_nodes: true } : {},
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
 
     if (opts.json) {
@@ -2728,7 +2779,7 @@ program
         ...(opts.full ? { full: true } : {}),
         ...(opts.includeDrafts ? { include_drafts: true } : {}),
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
 
     if (opts.json) {
@@ -2834,7 +2885,7 @@ program
         ...(opts.tag ? { tag: opts.tag } : {}),
         ...(opts.limit ? { limit: opts.limit } : {}),
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
 
     if (opts.json) {
@@ -2931,7 +2982,7 @@ program
         ...(opts.body !== undefined ? { content: `\n${opts.body}\n` } : {}),
         note: "Updated via CLI",
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
 
     if (result.held_for_review) {
@@ -3010,6 +3061,21 @@ program
     }
     const storage = getStorage();
     const id = await resolvedDocumentId(storage, path);
+    // Forget needs no such warning: its stub stays at the id, so links resolve.
+    const inbound = [
+      ...new Set(
+        buildRelationships(await storage.discoverDocuments({ includeRetired: true }))
+          .filter((edge) => edge.to === id)
+          .map((edge) => edge.from),
+      ),
+    ];
+    if (inbound.length) {
+      console.log(
+        chalk.yellow(
+          `${inbound.length} document${inbound.length === 1 ? " links" : "s link"} here and will dangle: ${inbound.join(", ")}`,
+        ),
+      );
+    }
     await confirmOrExit(
       `Delete ${id} and its entire version history from ${realRootPath() ?? storage.root}? This cannot be undone.` +
         (opts.purge ? " --purge leaves no audit record." : ""),
@@ -3023,7 +3089,7 @@ program
         ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
         ...(opts.purge ? { purge: true } : {}),
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
     console.log(chalk.green(`Deleted ${result.id} (${result.title})`));
     if (result.tombstoned) {
@@ -3053,7 +3119,7 @@ program
     parseForgetReason,
   )
   .option("--requested-by <who>", "Who asked for it (data subject, steward, regulator)")
-  .option("-a, --author <email>", "Actor recorded as forgotten_by", "cli@contextnest.local")
+  .option("-a, --author <email>", "Actor recorded as forgotten_by (default: $CONTEXTNEST_AUTHOR, else cli@contextnest.local)")
   .option("--json", "Output as JSON")
   .addHelpText(
     "after",
@@ -3090,7 +3156,7 @@ Example:
         reason_code: opts.reason,
         ...(opts.requestedBy ? { requested_by: opts.requestedBy } : {}),
       },
-      opContext(storage, opts.author),
+      opContext(storage, cliActor()),
     );
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
@@ -3128,7 +3194,7 @@ program
     }>(
       "context_forget_log",
       path ? { id: documentId(path) } : {},
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
     if (opts.json) {
       console.log(JSON.stringify({ events }, null, 2));
@@ -3155,20 +3221,56 @@ program
 
 program
   .command("move <path> <folder>")
-  .description('Move a document to another folder on a remote nest ("" for the root); its id changes')
-  // Deliberately absent from VAULT_WRITE_COMMANDS: it never writes a local
-  // vault, and its remote path is gated by confirmRemoteWrite/isDryRun.
+  .description('Move a document to another folder ("" for the root), with its history; its id changes')
   .action(async (path, folder) => {
     const remote = remoteTarget(selectedVaultAlias);
-    if (!remote) {
-      // ponytail: remote-only — the engine has no move op yet (a local move must
-      // rename the file, its history and every [[link]]). Add it upstream first.
-      throw new ContextNestError(
-        "ctx move works against a remote Community nest only (--vault <alias>); a local vault has no move operation yet.",
-        "NOT_IMPLEMENTED",
-      );
+    if (remote) {
+      await remoteMove(remote, path, folder);
+      return;
     }
-    await remoteMove(remote, path, folder);
+    const storage = getStorage();
+    const result = await cliApi().run<{ id: string; previous_id: string }>(
+      "context_move",
+      { id: await resolvedDocumentId(storage, path), folder },
+      opContext(storage, cliActor()),
+    );
+    console.log(chalk.green(`Moved ${result.previous_id} to ${result.id}`));
+  });
+
+// ─── ctx archive / unarchive ──────────────────
+
+program
+  .command("archive <path>")
+  .description("Archive a document: out of lists and retrieval, history kept, recoverable with `ctx unarchive`")
+  .option("--reason <text>", "Why it was archived, recorded on the document")
+  .option("-a, --author <email>", "Actor recorded as archived by (default: $CONTEXTNEST_AUTHOR, else cli@contextnest.local)")
+  .action(async (path, opts) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError("ctx archive works against a local vault only for now.", "NOT_IMPLEMENTED");
+    }
+    const storage = getStorage();
+    const result = await cliApi().run<{ id: string }>(
+      "context_archive",
+      { id: await resolvedDocumentId(storage, path), ...(opts.reason ? { reason: opts.reason } : {}) },
+      opContext(storage, cliActor()),
+    );
+    console.log(chalk.green(`Archived ${result.id}`));
+  });
+
+program
+  .command("unarchive <path>")
+  .description("Bring an archived document back in the status it was archived from")
+  .action(async (path) => {
+    if (remoteTarget(selectedVaultAlias)) {
+      throw new ContextNestError("ctx unarchive works against a local vault only for now.", "NOT_IMPLEMENTED");
+    }
+    const storage = getStorage();
+    const result = await cliApi().run<{ id: string; status: string }>(
+      "context_unarchive",
+      { id: await resolvedDocumentId(storage, path) },
+      opContext(storage, cliActor()),
+    );
+    console.log(chalk.green(`Unarchived ${result.id} (${result.status})`));
   });
 
 // ─── ctx import ───────────────────────────────────────────────────────────────
@@ -3223,7 +3325,7 @@ importCmd
             ...(opts.publish === false ? { publish: false } : {}),
             ...(opts.message ? { note: opts.message } : {}),
           },
-          opContext(storage, "cli@contextnest.local"),
+          opContext(storage, cliActor()),
         );
         results.push({ ...res, file });
         if (opts.json) continue;
@@ -3283,7 +3385,7 @@ program
         ...(opts.mode ? { mode: opts.mode } : {}),
         ...(opts.rerank ? { rerank: true } : {}),
       },
-      opContext(storage, "cli@contextnest.local"),
+      opContext(storage, cliActor()),
     );
     // Rendering shared with the remote branch (doc-views.ts).
     printSearchResults(out, opts);
@@ -3338,7 +3440,7 @@ program
         !opts.json && process.stderr.isTTY
           ? (done: number, total: number) => process.stderr.write(`\r  embedding ${done}/${total}`)
           : undefined;
-      out = await cliApi().run<EmbedOut>("context_embed", input, opContext(storage, "cli@contextnest.local", progress));
+      out = await cliApi().run<EmbedOut>("context_embed", input, opContext(storage, cliActor(), progress));
       if (progress) process.stderr.write("\n");
     }
     if (opts.json) {
@@ -3365,7 +3467,7 @@ packCmd
     const storage = getStorage();
     const { packs } = await cliApi().run<{
       packs: Array<{ id: string; label: string; description?: string }>;
-    }>("context_packs", {}, opContext(storage, "cli@contextnest.local"));
+    }>("context_packs", {}, opContext(storage, cliActor()));
 
     if (opts.json) {
       console.log(JSON.stringify(packs, null, 2));
@@ -3491,7 +3593,7 @@ importCmd
   .option("--keep-xml", "Also store each original under assets/jats/")
   .option("--no-relink", "Do not update existing papers whose references now resolve")
   // No local --force: the global one (see the root command) republishes unchanged twins.
-  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("-a, --author <email>", "Author email (default: $CONTEXTNEST_AUTHOR, else cli@contextnest.local)")
   .option("--json", "Output as JSON")
   .action(async (paths: string[], opts) => {
     const storage = getStorage();
@@ -3506,7 +3608,7 @@ importCmd
     const r = await importJats({
       storage,
       api: cliApi(),
-      ctx: opContext(storage, opts.author),
+      ctx: opContext(storage, cliActor()),
       sources,
       folder: opts.folder,
       keepXml: opts.keepXml,
@@ -3529,7 +3631,7 @@ importCmd
   .option("--keep-xml", "Also store each original under assets/jats/")
   .option("--no-relink", "Do not update existing papers whose references now resolve")
   .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY) — raises the rate limit from 3/s to 10/s")
-  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("-a, --author <email>", "Author email (default: $CONTEXTNEST_AUTHOR, else cli@contextnest.local)")
   .option("--json", "Output as JSON")
   .action(async (opts) => {
     const storage = getStorage();
@@ -3574,7 +3676,7 @@ importCmd
     const r = await importJats({
       storage,
       api: cliApi(),
-      ctx: opContext(storage, opts.author),
+      ctx: opContext(storage, cliActor()),
       sources: fetched.sources,
       folder: opts.folder,
       keepXml: opts.keepXml,
@@ -3596,7 +3698,7 @@ enrichCmd
   // No local --force: the global one (see the root command) re-fetches enriched papers.
   .option("--tag-limit <n>", "Most-mentioned disease/chemical entities to promote to #mesh- tags", "12")
   .option("--api-key <key>", "NCBI API key (or NCBI_API_KEY)")
-  .option("-a, --author <email>", "Author email", "cli@contextnest.local")
+  .option("-a, --author <email>", "Author email (default: $CONTEXTNEST_AUTHOR, else cli@contextnest.local)")
   .option("--json", "Output as JSON")
   .action(async (ids: string[], opts) => {
     const storage = getStorage();
@@ -3606,7 +3708,7 @@ enrichCmd
     const r = await enrichPubTator({
       storage,
       api: cliApi(),
-      ctx: opContext(storage, opts.author),
+      ctx: opContext(storage, cliActor()),
       folder: opts.folder,
       // Raw: enrichPubTator resolves short ids against the papers folder itself.
       ids,
@@ -4600,7 +4702,7 @@ reviewCmd
     const storage = localGateStorage("review");
     const id = normalizeDocumentId(path);
     await confirmOrExit(`Publish what is held for review for ${id}?`);
-    const r = await approveReview(storage, id, { actor: "cli@contextnest.local" });
+    const r = await approveReview(storage, id, { actor: cliActor() });
     console.log(chalk.green(`Published ${r.id}`));
     console.log(`  Version: ${r.version}`);
     console.log(`  Checkpoint: ${r.checkpoint}`);
@@ -4613,7 +4715,7 @@ reviewCmd
     const storage = localGateStorage("review");
     const id = normalizeDocumentId(path);
     await confirmOrExit(`Reject what is held for review for ${id}?`);
-    const r = await rejectReview(storage, id, { actor: "cli@contextnest.local" });
+    const r = await rejectReview(storage, id, { actor: cliActor() });
     console.log(chalk.yellow(r.kind === "edit" ? `Discarded held edit for ${id}` : `Rejected ${id} (status: rejected)`));
   });
 

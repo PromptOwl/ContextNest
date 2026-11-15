@@ -6,7 +6,7 @@
 
 [![npm](https://img.shields.io/npm/v/@promptowl/contextnest-mcp-server.svg)](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0) [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **44 tools** over stdio transport: 24 canonical `context_*` tools, 9 vault, review and drift tools, and 11 deprecated aliases.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **47 tools** over stdio transport: 24 canonical `context_*` tools, 9 vault, review and drift tools, and 11 deprecated aliases.
 
 > **New in 2.2.1** — `context_folders` lists the vault's folders and their
 > document counts without opening a document, and `context_list` takes a
@@ -111,6 +111,9 @@ Name, description and input schema for each of these come from the engine's oper
 | `context_verify` | Verify every hash chain in the vault and rebuild every recorded version (`version_unreconstructable` when one cannot be rebuilt). Forgotten versions verify hash-only (`tombstoned`) |
 | `context_forget` | Forget a node (spec §6.3): erase every version's content, keep the hashes so verify still passes, leave an empty `status: forgotten` stub every URI resolves to. `reason_code` is a closed set, never free text. Later republish/re-import of the content is refused |
 | `context_forget_log` | The forget audit trail: who, when, reason code, which versions. Never the content |
+| `context_archive` | Archive a node: out of lists and retrieval, history kept (spec §1.13) |
+| `context_unarchive` | Bring an archived node back in the status it left |
+| `context_move` | Move a node to another folder with its history and any PDF |
 | `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |
 | `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
 | `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |

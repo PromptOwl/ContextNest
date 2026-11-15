@@ -34,7 +34,7 @@ import { join } from "node:path";
 import { parseConfig } from "./config.js";
 import { ConfigError, ContextNestError, IntegrityError } from "./errors.js";
 import { computeContentHash } from "./integrity.js";
-import { getChecksumContent, isPublished, isRejected, parseDocument, serializeDocument } from "./parser.js";
+import { getChecksumContent, isPublished, isRejected, parseDocument } from "./parser.js";
 import { publishDocument } from "./publish.js";
 import { applyStagedEdit, listSuggestions, readSuggestion, stageSuggestion } from "./suggestions.js";
 import { VersionManager } from "./versioning.js";
@@ -410,9 +410,7 @@ export async function rejectReview(
     if (node.frontmatter.status !== "pending_review") {
       throw new ContextNestError(`Nothing is pending review for ${id}.`, "VALIDATION_FAILED");
     }
-    node.frontmatter.status = "rejected";
-    node.frontmatter.updated_at = new Date().toISOString();
-    await storage.writeDocument(id, serializeDocument(node));
+    await storage.patchFrontmatter(node, { status: "rejected", updated_at: new Date().toISOString() });
     await storage.regenerateIndex({ changedIds: [id] });
     return { id, kind: "new" };
   });

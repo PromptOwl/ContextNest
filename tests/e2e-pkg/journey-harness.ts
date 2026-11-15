@@ -33,6 +33,25 @@ export const cliPkg = JSON.parse(
   readFileSync(join(cliDir, "package.json"), "utf-8"),
 ) as { name: string; version: string };
 
+/**
+ * The built MCP server's entrypoint — a stand-in "team nest" that a journey can
+ * point a stdio remote at (the J22 `ctx pull` half spawns it over stdio against
+ * a server vault, exactly as pull.regression.test.ts does). `test:pkg` builds
+ * it alongside the CLI; a journey that needs it calls `requireMcpServer()`.
+ */
+export const mcpServerEntry = join(repoRoot, "packages", "mcp-server", "dist", "index.js");
+
+/** Fail loudly if the MCP server isn't built — a stale build, not a bug. */
+export function requireMcpServer(): string {
+  if (!existsSync(mcpServerEntry)) {
+    throw new Error(
+      "packages/mcp-server/dist/index.js is missing — build it: " +
+        "`pnpm --filter @promptowl/contextnest-mcp-server build` (or run via `pnpm test:pkg`).",
+    );
+  }
+  return mcpServerEntry;
+}
+
 export const isWin = process.platform === "win32";
 const npm = isWin ? "npm.cmd" : "npm";
 
@@ -83,6 +102,7 @@ export function runInstalled(
   args: string[],
   configDir: string,
   extraEnv?: Record<string, string | undefined>,
+  input?: string,
 ): RunResult {
   const env = { ...sandboxEnv(configDir), ...extraEnv } as NodeJS.ProcessEnv;
   for (const [k, v] of Object.entries(extraEnv ?? {})) if (v === undefined) delete env[k];
@@ -90,6 +110,7 @@ export function runInstalled(
     cwd,
     env,
     encoding: "utf-8",
+    input,
   });
   return {
     status: typeof res.status === "number" ? res.status : 1,
@@ -179,6 +200,144 @@ export function startMockProvider(): Promise<MockProvider> {
   });
 }
 
+export interface MockKindServer {
+  /** The `--server` value `ctx kind apply` is pointed at (`http://127.0.0.1:PORT`). */
+  baseUrl: string;
+  /** File the mock appends every received request to, one JSON object per line.
+   * A journey truncates it before an action and reads it after, to prove the
+   * CLI sent only GETs on a dry run (or exactly the planned writes on `--yes`). */
+  logPath: string;
+  /** Kill the mock process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback nest REST mock (`mock-kind-server.mjs`) the J21 journey
+ * drives `ctx kind apply` against, in its OWN process (same reason as
+ * startMockProvider: spawnSync blocks this process's loop, so a same-process
+ * server would deadlock). The scenario is encoded in the nest id the journey
+ * passes (`flags-off`, `denied`, `ghost`, or a healthy nest), so no control
+ * channel is needed; the request log goes to a temp file the caller cleans up.
+ */
+export function startMockKindServer(scratch: string[]): Promise<MockKindServer> {
+  const logPath = join(mkdtempSync(join(tmpdir(), "cn-kindmock-")), "requests.log");
+  scratch.push(dirname(logPath));
+  writeFileSync(logPath, "");
+  const child = spawn("node", [join(here, "mock-kind-server.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, KIND_MOCK_LOG: logPath },
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock kind server never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}`, logPath, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+export interface MockNestServer {
+  /** The `--server` value `ctx push` is pointed at (`http://127.0.0.1:PORT`). */
+  baseUrl: string;
+  /** File the mock appends every received request to, one JSON object per line
+   * (method, url, auth header, body). A journey reads it to prove the CLI sent a
+   * Bearer key and exactly the documents it disclosed. */
+  logPath: string;
+  /** Kill the mock process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback nest REST mock (`mock-nest-server.mjs`) the J22 remote-sync
+ * journey drives `ctx push` against, in its OWN process (same reason as
+ * startMockProvider/startMockKindServer: spawnSync blocks this process's loop,
+ * so a same-process server would deadlock). The scenario is encoded in the nest
+ * id the journey pushes to (`gated` holds for confirmation; any other id applies
+ * and is stateful); the request log goes to a temp file the caller cleans up.
+ */
+export function startMockNestServer(scratch: string[]): Promise<MockNestServer> {
+  const logPath = join(mkdtempSync(join(tmpdir(), "cn-nestmock-")), "requests.log");
+  scratch.push(dirname(logPath));
+  writeFileSync(logPath, "");
+  const child = spawn("node", [join(here, "mock-nest-server.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, NEST_MOCK_LOG: logPath },
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock nest server never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}`, logPath, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+export interface MockNcbiServer {
+  /** The base the CLI's E-utilities/PubTator calls are pointed at via
+   * CONTEXTNEST_EUTILS_BASE / CONTEXTNEST_PUBTATOR_BASE (`http://127.0.0.1:PORT`). */
+  baseUrl: string;
+  /** Kill the mock process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback NCBI E-utilities + PubTator mock (`mock-ncbi-server.mjs`)
+ * the J24 journey drives `ctx import pubmed` / `ctx enrich pubtator` against, in
+ * its OWN process (same reason as startMockProvider: spawnSync blocks this
+ * process's loop, so a same-process server would deadlock). The scenario is
+ * encoded in the search term (an "emptyterm" query returns no hits), so no
+ * control channel is needed; it prints the port it bound on stdout as `PORT <n>`.
+ * The returned `baseUrl` goes into CONTEXTNEST_EUTILS_BASE and
+ * CONTEXTNEST_PUBTATOR_BASE; `close()` stops it.
+ */
+export function startMockNcbiServer(): Promise<MockNcbiServer> {
+  // stdin is a live pipe (not "ignore") so the mock self-terminates if this end
+  // closes (a hard-killed runner that never ran afterAll) — see startMockProvider.
+  const child = spawn("node", [join(here, "mock-ncbi-server.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock NCBI server never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}`, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
 /** A fresh isolated vault + config dir for one journey. Caller owns cleanup via `scratch`. */
 export function makeSandbox(
   scratch: string[],
@@ -214,12 +373,15 @@ export interface Action {
   /**
    * Mutate the vault on disk BEFORE this action's command runs — e.g. corrupt a
    * version-history file to prove `verify` catches tampering, or delete a node
-   * to set up a restore. `vaultDir` is the journey's isolated vault root. This
-   * is the one escape hatch from the pure drive-the-bin model, for the handful
-   * of journeys (integrity, disaster-recovery, forget) whose story requires the
-   * vault to change out from under the CLI between commands.
+   * to set up a restore. `vaultDir` is the journey's isolated vault root;
+   * `cfgDir` is its sandboxed registry/config dir (CONTEXTNEST_CONFIG_DIR) —
+   * write it to seed registry-level state the command needs, e.g. a `remotes:`
+   * entry pointing a `ctx pull` at a stdio MCP server. This is the one escape
+   * hatch from the pure drive-the-bin model, for the handful of journeys
+   * (integrity, disaster-recovery, forget, remote-sync) whose story requires the
+   * vault or registry to change out from under the CLI between commands.
    */
-  mutate?: (vaultDir: string) => void;
+  mutate?: (vaultDir: string, cfgDir: string) => void;
   /**
    * The ctx args to run (e.g. ["add", "nodes/x", "-y"]). A function form is
    * evaluated at run time (after this action's `mutate`), with the journey's
@@ -228,6 +390,12 @@ export interface Action {
    * `capture` hook. Static args stay a plain array.
    */
   args: string[] | ((vaultDir: string) => string[]);
+  /**
+   * Text piped to the command's stdin — e.g. the API key a browserless
+   * `ctx login --key-stdin` reads instead of opening a browser. Omitted for the
+   * vast majority of actions, which read no stdin.
+   */
+  input?: string;
   /** Expected exit status (default 0). */
   status?: number;
   /** Every matcher must appear in stdout. */
@@ -264,9 +432,12 @@ export interface Action {
    * post-command counterpart to `mutate`. Use it for on-disk proofs the CLI's
    * own output can't surface, e.g. that a forgotten secret is absent from every
    * version-history file, or that an encrypted body is scrambled at rest.
-   * `vaultDir` is the journey's isolated vault root.
+   * `vaultDir` is the journey's isolated vault root; `cfgDir` is its sandboxed
+   * registry/config dir (CONTEXTNEST_CONFIG_DIR) — read it for registry-level
+   * proofs the CLI doesn't print, e.g. first-run onboarding recording
+   * `onboarded_at` in config.yaml.
    */
-  check?: (vaultDir: string) => void;
+  check?: (vaultDir: string, cfgDir: string) => void;
 }
 
 /**
@@ -314,10 +485,10 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
   const { vault, cfg } = makeSandbox(ctx.scratch, journey.id.toLowerCase());
   for (const c of journey.cases) {
     for (const a of c.actions) {
-      if (a.mutate) a.mutate(vault);
+      if (a.mutate) a.mutate(vault, cfg);
       const argv = typeof a.args === "function" ? a.args(vault) : a.args;
       const extraEnv = { ...journey.env, ...(a.env ? a.env(vault) : undefined) };
-      const r = runInstalled(ctx.installDir, vault, argv, cfg, extraEnv);
+      const r = runInstalled(ctx.installDir, vault, argv, cfg, extraEnv, a.input);
       const at = `${c.id} — ${c.title} [ctx ${argv.join(" ")}]`;
       expect(r.status, `${at} — exit ${r.status}: ${r.stderr || r.stdout}`).toBe(
         a.status ?? 0,
@@ -332,7 +503,7 @@ export function runJourney(ctx: JourneyContext, journey: Journey): void {
       for (const m of a.stderrNot ?? [])
         expect(matches(r.stderr, m), `${at} — stderr should not contain ${m}:\n${r.stderr}`).toBe(false);
       if (a.json) a.json(parseJson(r.stdout));
-      if (a.check) a.check(vault);
+      if (a.check) a.check(vault, cfg);
       for (const f of a.files ?? []) {
         const p = join(vault, f.path);
         if (f.exists !== undefined)

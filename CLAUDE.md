@@ -72,9 +72,9 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 ### MCP Server (`@promptowl/contextnest-mcp-server`)
 
-44 tools over stdio, in three groups:
+47 tools over stdio, in three groups:
 
-- **Catalog-driven** (24, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_embed`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`, `context_forget`, `context_forget_log`, `context_structure`. **Add new tools here, not by hand.**
+- **Catalog-driven** (27, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_embed`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`, `context_forget`, `context_forget_log`, `context_structure`. **Add new tools here, not by hand.**
 - **Hand-written, still current** (9): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`, `context_review` (review gate — hand-written on purpose so hosted catalog bindings cannot toggle it).
 - **Deprecated** (11, backward-compatible for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`. Additive parity fixes are allowed here — `list_documents` takes `path` (the `folder` filter of `context_list`), `create_document`/`update_document` take `description` and accept `content` as an alias for `body` — but nothing already accepted may change meaning.
 
@@ -125,7 +125,8 @@ Changesets. `pnpm version-packages` (`changeset version` + lockfile refresh), th
 
 1. Set the pin to the new version.
 2. Run `npm install --package-lock-only --ignore-scripts` in `plugins/claude-code/` to refresh `package-lock.json`.
-3. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
+3. Set the same version in the `npx` fallback in `bin/ctx` and `bin/ctx.cmd`. The Claude plugin directory blocks an unpinned launcher, and a test in `plugins/__tests__/structure.test.ts` fails when these disagree with the pin.
+4. Bump the plugin version in `.claude-plugin/plugin.json` and its CHANGELOG. Installed plugins only re-fetch dependencies on a new plugin version.
 
 This can't go in the changesets version PR, because the lockfile needs the published tarball's integrity hash. `pnpm plugins:check` fails when the pin and the lockfile disagree. The pin is added by CU-wdqcq067m5; until that lands there is nothing to bump.
 

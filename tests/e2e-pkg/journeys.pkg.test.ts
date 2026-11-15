@@ -36,17 +36,25 @@ import {
   readdirSync,
   statSync,
   existsSync,
+  cpSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, isAbsolute } from "node:path";
+import { join, dirname, relative, isAbsolute } from "node:path";
 import {
   packCli,
   freshInstall,
   runJourney,
   startMockProvider,
+  startMockKindServer,
+  startMockNestServer,
+  startMockNcbiServer,
+  requireMcpServer,
   repoRoot,
   type Journey,
   type MockProvider,
+  type MockKindServer,
+  type MockNestServer,
+  type MockNcbiServer,
   type RunResult,
 } from "./journey-harness.js";
 
@@ -56,15 +64,34 @@ const scratch: string[] = [];
 // runs in its own process (see startMockProvider) and its base_url is only known
 // once it has bound a port, so J18's config-writing closures read it from here.
 let MOCK: MockProvider;
+// The loopback nest REST mock J21 drives `ctx kind apply` against — its own
+// process (see startMockKindServer), its base_url and request-log path known
+// only once it has bound a port, so J21's closures read them from here.
+let KIND_MOCK: MockKindServer;
+// The loopback nest REST mock J22 drives `ctx push` against — its own process
+// (see startMockNestServer), base_url and request-log path known only once it
+// has bound a port, so J22's push closures read them from here.
+let NEST_MOCK: MockNestServer;
+// The loopback NCBI E-utilities/PubTator mock J24 drives `ctx import pubmed` and
+// `ctx enrich pubtator` against — its own process (see startMockNcbiServer), its
+// base_url known only once it has bound a port, so J24's env closures read it
+// from here.
+let NCBI_MOCK: MockNcbiServer;
 
 beforeAll(async () => {
   const tarball = packCli(scratch);
   INSTALL = freshInstall(tarball, scratch, "journeys");
   MOCK = await startMockProvider();
+  KIND_MOCK = await startMockKindServer(scratch);
+  NEST_MOCK = await startMockNestServer(scratch);
+  NCBI_MOCK = await startMockNcbiServer();
 }, 180_000);
 
 afterAll(() => {
   MOCK?.close();
+  KIND_MOCK?.close();
+  NEST_MOCK?.close();
+  NCBI_MOCK?.close();
   for (const d of scratch) rmSync(d, { recursive: true, force: true });
 });
 
@@ -3928,6 +3955,1441 @@ const J18: Journey = {
   ],
 };
 
+/**
+ * J19 — "I run `ctx` to see what it does." First-run onboarding for a bare
+ * `ctx`: a brand-new user gets a short "no notes yet" welcome and the command
+ * list; once a vault exists it just shows the list and records that setup is
+ * done; a second run is stable; and an automated/non-interactive environment
+ * never stops to ask questions.
+ *
+ * SCOPE (honest): the interactive setup wizard only runs with a real terminal,
+ * which the spawnSync harness has no pty for — so `shouldOnboard` always lands
+ * on the help/decision branch here. This journey proves that decision, help and
+ * automation-guard surface (the wizard's own branch is unit-tested in the CLI's
+ * first-run.test.ts), not the step-by-step prompts.
+ *
+ * STATE: the journey vault stays vault-less throughout, so the "brand-new
+ * machine" cases (01, 04) see no local vault; a separate registered vault stands
+ * in for "notes already exist" (02, 03) without turning the journey vault into
+ * one. The first-run stamp (onboarded_at) isn't surfaced by any command, so it's
+ * read from the sandboxed config dir the harness hands `check`.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+let _j19ext: string | undefined;
+const j19ExtVault = () => {
+  if (!_j19ext) {
+    _j19ext = mkdtempSync(join(tmpdir(), "cn-journey-j19-ext-"));
+    scratch.push(_j19ext); // cleaned by the suite's afterAll
+  }
+  return _j19ext;
+};
+const NO_NOTES_LINE = "No notes yet.";
+const RUN_IN_TERMINAL = "Run `ctx` in a terminal to get set up.";
+/** The top-level onboarded_at stamp first-run records in the registry, or "" if unset. */
+const onboardedAt = (cfgDir: string): string => {
+  const p = join(cfgDir, "config.yaml");
+  const m = existsSync(p) ? readFileSync(p, "utf-8").match(/onboarded_at:\s*'?([^'\n]+)'?/) : null;
+  return m ? m[1].trim() : "";
+};
+let j19Recorded = ""; // onboarded_at captured in J19-02, re-checked unchanged in J19-03
+const J19: Journey = {
+  id: "J19",
+  title: "A bare `ctx` welcomes you and points the way (first run)",
+  cases: [
+    {
+      id: "J19-01",
+      title:
+        'On a brand-new machine with nothing set up, running `ctx` shows a "no notes yet" line and the command list, exits cleanly, and creates or records nothing behind the scenes',
+      actions: [
+        {
+          args: [],
+          stdout: [NO_NOTES_LINE, "USAGE"],
+          stderr: [RUN_IN_TERMINAL],
+          check: (_v, cfg) => {
+            expect(onboardedAt(cfg), "a fresh run must record nothing").toBe("");
+            const p = join(cfg, "config.yaml");
+            if (existsSync(p))
+              expect(readFileSync(p, "utf-8"), "no skipped_at either").not.toContain("skipped_at");
+          },
+        },
+      ],
+    },
+    {
+      id: "J19-02",
+      title:
+        'Once a notes folder exists, running `ctx` shows the command list without the "no notes yet" line and quietly records that first-run setup is done',
+      actions: [
+        // A vault now exists and is registered — first run is about recognising an
+        // existing user, not creating one, so the journey vault itself stays empty.
+        {
+          args: ["init", "--register", "--name", "main", "--set-default"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j19ExtVault() }),
+          stdout: ["Initialized"],
+        },
+        {
+          args: [],
+          stdout: ["USAGE"],
+          stdoutNot: [NO_NOTES_LINE],
+          stderrNot: [RUN_IN_TERMINAL],
+          check: (_v, cfg) => {
+            j19Recorded = onboardedAt(cfg);
+            expect(j19Recorded, "first run with a vault present records onboarded_at").not.toBe("");
+          },
+        },
+      ],
+    },
+    {
+      id: "J19-03",
+      title:
+        "Running `ctx` a second time is stable — it does not welcome the user again or change the recorded setup date",
+      actions: [
+        {
+          args: [],
+          stdout: ["USAGE"],
+          stdoutNot: [NO_NOTES_LINE],
+          check: (_v, cfg) =>
+            expect(onboardedAt(cfg), "the recorded setup date must not change on re-run").toBe(j19Recorded),
+        },
+      ],
+    },
+    {
+      id: "J19-04",
+      title:
+        "In an automated, non-interactive environment, `ctx` never drops into the interactive setup — it shows the command list plus a hint to run it in a terminal to get set up",
+      actions: [
+        // Fresh, un-recorded registry (its own config dir) + CI set: the guard must
+        // show help + the hint, never block on a prompt, and record nothing.
+        {
+          args: [],
+          env: (v) => ({ CI: "1", CONTEXTNEST_CONFIG_DIR: join(v, "ci-reg") }),
+          stdout: [NO_NOTES_LINE, "USAGE"],
+          stderr: [RUN_IN_TERMINAL],
+          check: (v) =>
+            expect(onboardedAt(join(v, "ci-reg")), "the CI guard must record nothing").toBe(""),
+        },
+      ],
+    },
+    {
+      id: "J19-05",
+      title:
+        "Running `ctx` with any real command or flag behaves normally and never triggers first-run onboarding",
+      actions: [
+        {
+          args: ["list"],
+          stdout: ["No documents found."],
+          stdoutNot: [NO_NOTES_LINE],
+          stderrNot: [RUN_IN_TERMINAL],
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J20 — "I reorganize and retire nodes without losing anything."
+ * The housekeeping promise for a growing vault: `ctx move` relocates a node to
+ * a better folder and its full version history comes along (the id changes);
+ * `ctx archive` takes a stale node out of lists, tag queries and search while
+ * keeping it readable and its history intact; `ctx unarchive` brings it back
+ * exactly as it was. Unlike forget/delete (J5), every step here is reversible.
+ *
+ * One accumulating vault, review gate OFF (like J2/J3) so each write is
+ * published knowledge that lands as its own version — no gate between steps.
+ * A second node (`nodes/keep/anchor`, same `#plan` tag) is the discriminator:
+ * archiving the first must hide only it, leaving the anchor in every listing.
+ * Two body phrases — "mango" (v1) and "pineapple" (v2) — pin which version a
+ * reconstruct returns and give search a word that lives only in the moved node.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J20: Journey = {
+  id: "J20",
+  title: "Reorganize and retire nodes (move, archive & unarchive)",
+  cases: [
+    {
+      id: "J20-01",
+      title:
+        "Move a node to another folder: it gets a new id, keeps its full version history, and is gone from the old path",
+      actions: [
+        { args: ["init", "--name", "tidy-vault"], stdout: ["Initialized"] },
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          args: [
+            "add", "nodes/drafts/idea",
+            "--type", "document",
+            "--title", "Bright Idea",
+            "--tags", "#plan",
+            "--body", "first body about mango",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/drafts/idea.md", exists: true }],
+        },
+        {
+          args: ["update", "nodes/drafts/idea", "--body", "second body about pineapple", "-y"],
+          stdout: ["Version: 2"],
+        },
+        // The move reports old id → new id; the new id is folder + basename.
+        {
+          args: ["move", "nodes/drafts/idea", "approved"],
+          stdout: ["Moved nodes/drafts/idea to nodes/approved/idea"],
+        },
+        // Gone from the old path.
+        {
+          args: ["read", "nodes/drafts/idea"],
+          status: 1,
+          stderr: ["DOCUMENT_NOT_FOUND"],
+        },
+        // The vault now holds exactly the node at its new id — nothing left behind.
+        {
+          args: ["list", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/approved/idea"]),
+        },
+        // Both versions rode along to the new id.
+        {
+          args: ["history", "nodes/approved/idea", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1, 2]),
+        },
+        // v1 reconstructs from the carried history — its original body, not v2's.
+        {
+          args: ["reconstruct", "nodes/approved/idea", "1"],
+          stdout: ["first body about mango", "version: 1"],
+          stdoutNot: ["pineapple"],
+        },
+      ],
+    },
+    {
+      id: "J20-02",
+      title:
+        "Archive a node: it drops out of list, query and search, but its history is kept and it stays readable directly",
+      actions: [
+        // Baseline: while published, a word unique to this node finds it — so the
+        // "No results found" after archiving is a real disappearance, not a word
+        // that was never in the index.
+        { args: ["search", "pineapple"], stdout: ["1 result(s):", "nodes/approved/idea"] },
+        // A second, untouched node tagged the same way — archiving must hide only
+        // the one node, never the anchor.
+        {
+          args: [
+            "add", "nodes/keep/anchor",
+            "--type", "document",
+            "--title", "Anchor",
+            "--tags", "#plan",
+            "--body", "anchor body",
+          ],
+          stdout: ["Version: 1"],
+        },
+        {
+          args: ["archive", "nodes/approved/idea", "--reason", "stale"],
+          stdout: ["Archived nodes/approved/idea"],
+          // On disk it is status:rejected with an archived block remembering where
+          // to return to — the reversible contract, not an erasure.
+          check: (vault) => {
+            const raw = readFileSync(join(vault, "nodes", "approved", "idea.md"), "utf-8");
+            expect(raw).toContain("status: rejected");
+            expect(raw).toContain("previous_status: published");
+          },
+        },
+        // Out of the listing — only the anchor remains.
+        {
+          args: ["list", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/keep/anchor"]),
+        },
+        // Out of tag queries — the anchor still answers, the archived node does not.
+        {
+          args: ["query", "#plan"],
+          stdout: ["nodes/keep/anchor"],
+          stdoutNot: ["nodes/approved/idea"],
+        },
+        // Out of search — a word that lives only in the archived node finds nothing.
+        { args: ["search", "pineapple"], stdout: ["No results found."] },
+        // Still readable directly, and its status shows it is archived.
+        {
+          args: ["read", "nodes/approved/idea"],
+          stdout: ["Bright Idea", "pineapple", "status: rejected"],
+        },
+        // History is kept in full.
+        {
+          args: ["history", "nodes/approved/idea", "--json"],
+          json: (data) => expect(versionNumbers(data)).toEqual([1, 2]),
+        },
+      ],
+    },
+    {
+      id: "J20-03",
+      title: "An archived node refuses edits until it is unarchived",
+      actions: [
+        {
+          args: ["update", "nodes/approved/idea", "--body", "sneaky edit", "-y"],
+          status: 1,
+          stderr: ["is archived. Unarchive it first."],
+        },
+      ],
+    },
+    {
+      id: "J20-04",
+      title:
+        "Unarchive the node: it returns to its previous status and reappears in listings and retrieval",
+      actions: [
+        // Comes back in the status it was archived from (published).
+        {
+          args: ["unarchive", "nodes/approved/idea"],
+          stdout: ["Unarchived nodes/approved/idea (published)"],
+        },
+        // Back in the listing alongside the anchor.
+        {
+          args: ["list", "--json"],
+          json: (data) => expect(idsOf(data)).toEqual(["nodes/approved/idea", "nodes/keep/anchor"]),
+        },
+        // Back in tag queries.
+        { args: ["query", "#plan"], stdout: ["nodes/approved/idea", "nodes/keep/anchor"] },
+        // Back in search — the word that found nothing while archived finds it now.
+        { args: ["search", "pineapple"], stdout: ["1 result(s):", "nodes/approved/idea"] },
+      ],
+    },
+    {
+      id: "J20-05",
+      title:
+        "Guardrails: archiving an already-archived node is refused, and moving onto an occupied destination is refused — nothing is lost",
+      actions: [
+        // Archiving the anchor succeeds once...
+        { args: ["archive", "nodes/keep/anchor"], stdout: ["Archived nodes/keep/anchor"] },
+        // ...and a second archive is refused, with the node left untouched.
+        {
+          args: ["archive", "nodes/keep/anchor"],
+          status: 1,
+          stderr: ["is already archived."],
+        },
+        { args: ["read", "nodes/keep/anchor"], stdout: ["status: rejected"] },
+        // Two nodes share a basename in different folders; moving one onto the
+        // other's folder would collide.
+        { args: ["add", "nodes/x/dup", "--title", "Dup X", "--body", "x body"], stdout: ["Version: 1"] },
+        { args: ["add", "nodes/y/dup", "--title", "Dup Y", "--body", "y body"], stdout: ["Version: 1"] },
+        {
+          args: ["move", "nodes/x/dup", "y"],
+          status: 1,
+          stderr: ["already exists"],
+        },
+        // Nothing lost: both the source and the occupied destination still read.
+        { args: ["read", "nodes/x/dup"], stdout: ["Dup X"] },
+        { args: ["read", "nodes/y/dup"], stdout: ["Dup Y"] },
+      ],
+    },
+  ],
+};
+
+/**
+ * J21 — "I apply a recipe's server-side kind to my hosted nest."
+ * A recipe can carry a "kind" — the structure a hosted nest needs: edge types,
+ * edges, schedules, plugin config and steward seats. `ctx pull` lands it in the
+ * vault as a node (`nodes/kinds/<id>`); `ctx kind apply` reads it back and maps
+ * each entry onto the nest's REST API. It plans with GETs first and writes only
+ * on `--yes`, refuses an unreviewed kind, skips a plane the server turned off
+ * instead of erroring, never enables a plugin, and needs steward placeholders
+ * mapped to people by hand. This journey proves that whole careful surface.
+ *
+ * NOTE: unlike the other journeys — whose only accumulating state is an on-disk
+ * vault re-created fresh by makeSandbox — J21's mock keeps per-nest server state
+ * across its cases IN ANOTHER PROCESS (nest "main" is populated by J21-02 and
+ * J21-03 re-applies onto it to prove idempotency). That is safe because the
+ * suite runs in a fresh process with no `test.retry` (see vitest.config.ts); do
+ * not enable retry for this file, or a second in-process pass would find "main"
+ * already populated and J21-01/02's "created" assertions would flip to "updated".
+ *
+ * OFFLINE BY DESIGN: a real apply needs a hosted nest and an API key, neither
+ * available in CI. The journey stands up a loopback REST mock in its own process
+ * (startMockKindServer → mock-kind-server.mjs) that records every request to a
+ * log file and encodes each scenario in the nest id it is pointed at — a healthy
+ * nest ("main"/"jnest"/…), "flags-off" (a plane switched off), "denied" (a bad
+ * key), "ghost" (no such nest). The kind documents are written to disk exactly
+ * as `ctx pull` would land them (the `--server`/key path is the journey's
+ * subject, not the pull), and the API key is supplied through the env the way a
+ * logged-in user's would be.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J21_KIND = {
+  plugins: [{ name: "gmail", mode: "raw", settings: { label: "ops" } }],
+  edge_types: [
+    { name: "escalates-to", description: "An alert escalates to its on-call owner" },
+    { name: "routes-to", description: "A triage step routes to the next", is_flow: true },
+  ],
+  edges: [{ from: "nodes/alert", to: "nodes/oncall", type: "escalates-to" }],
+  schedules: [{ agent: "nodes/triage-agent", every_minutes: 60 }],
+  // Left as a placeholder on purpose: an un-mapped steward seat is shown in the
+  // plan but never sent, so J21-02's write set is the five workflow/plugin
+  // requests and J21-06 can prove mapping resolves it.
+  stewards: [{ scope: "nest", role: "reviewer", principal: "@owner" }],
+  runner: { handlers: ["triage"] },
+};
+// A kind document the way `ctx pull` writes it: the section as JSON inside a
+// ```yaml kind fence (JSON is valid YAML, so it reads back through the same
+// parser). `ctx kind apply` reads this straight off disk by id. This mirrors
+// renderKindBody / KIND_FENCE in packages/cli/src/pull.ts — if the on-disk kind
+// format changes there, update this to match (a real pulled kind must parse).
+const kindDocBody = (kind: unknown) =>
+  ["# Kind demo", "", "```yaml kind", JSON.stringify(kind, null, 2), "```", ""].join("\n");
+function writeKindDoc(vault: string, id: string, status: "published" | "draft"): void {
+  const dir = join(vault, "nodes", "kinds");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${id}.md`),
+    `---\ntype: document\ntitle: Kind ${id}\nstatus: ${status}\n---\n` + kindDocBody(J21_KIND),
+  );
+}
+// The mock's request log is the proof of what left the machine. Truncate it
+// before an action; read it back after to assert the exact requests sent.
+const resetKindLog = () => writeFileSync(KIND_MOCK.logPath, "");
+const readKindLog = (): Array<{ method: string; path: string; body?: unknown; auth?: string }> =>
+  readFileSync(KIND_MOCK.logPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const kindWrites = () => readKindLog().filter((r) => r.method !== "GET");
+// `--server <mock> --nest <id>`, built at run time (the base_url is only known
+// once the mock has bound a port).
+const kindApply = (kindId: string, nest: string, ...rest: string[]) => () =>
+  ["kind", "apply", kindId, "--server", KIND_MOCK.baseUrl, "--nest", nest, ...rest];
+
+const J21: Journey = {
+  id: "J21",
+  title: "Apply a recipe's server-side kind to a hosted nest",
+  // The API key reaches the CLI through the env, as a logged-in user's would;
+  // the file credentials backend keeps every run off the OS keychain on CI.
+  env: { CONTEXTNEST_API_KEY: "cnst_test", CONTEXTNEST_CREDENTIALS_BACKEND: "file" },
+  cases: [
+    {
+      id: "J21-01",
+      title: "A dry run prints the plan and sends nothing but GETs",
+      actions: [
+        { args: ["init", "--name", "kinds-vault"], stdout: ["Initialized"] },
+        {
+          // The kind lands in the vault as `ctx pull` would leave it, then the
+          // dry run reads it and plans — reaching the server only to look.
+          mutate: (v) => {
+            writeKindDoc(v, "demo", "published");
+            resetKindLog();
+          },
+          args: kindApply("demo", "main"),
+          stdout: [
+            "Kind demo →",
+            "nest main",
+            "Edge types",
+            "+ apply  escalates-to — create",
+            "routes-to (flow)",
+            "Edges",
+            "Schedules",
+            "nodes/triage-agent every 60 min",
+            "Plugins",
+            "Stewards",
+            "- skip   reviewer of nest → @owner — unresolved placeholder",
+            "Dry run — 5 request(s) planned, nothing sent. Rerun with --yes to apply.",
+          ],
+          stdoutNot: ["✓ created", "applied (of"],
+          // Proof, not the CLI's word for it: only GETs reached the server.
+          check: () => {
+            const log = readKindLog();
+            expect(log.length, "a dry run still probes the server with GETs").toBeGreaterThan(0);
+            expect(log.every((r) => r.method === "GET"), "a dry run must send no writes").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J21-02",
+      title: "Applying with --yes sends exactly the planned requests, edge types before edges",
+      actions: [
+        {
+          // Same published kind, same nest — its state is still empty (J21-01
+          // only looked), so every step is a create.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "main", "--yes"),
+          stdout: [
+            "✓ created escalates-to",
+            "✓ created routes-to (flow)",
+            "✓ created nodes/alert -[escalates-to]-> nodes/oncall",
+            "✓ created nodes/triage-agent every 60 min",
+            "5 applied (of 5 planned request(s)).",
+          ],
+          check: () => {
+            const sig = kindWrites().map((r) => `${r.method} ${r.path}`);
+            expect(sig).toEqual([
+              "POST /nests/main/edge-types",
+              "POST /nests/main/edge-types",
+              "POST /nests/main/edges",
+              "POST /nests/main/schedules",
+              "PUT /nests/main/plugins/gmail",
+            ]);
+            // The edge lands only after the type it needs is defined.
+            expect(sig.indexOf("POST /nests/main/edges")).toBeGreaterThan(
+              sig.lastIndexOf("POST /nests/main/edge-types"),
+            );
+            // The un-mapped steward seat is never sent.
+            expect(sig.some((s) => s.includes("stewards"))).toBe(false);
+            // The edge carries the nodes it connects.
+            const edge = kindWrites().find((r) => r.path.endsWith("/edges"));
+            expect(edge?.body).toMatchObject({
+              from_node: "nodes/alert",
+              to_node: "nodes/oncall",
+              type: "escalates-to",
+            });
+            // Writes to a hosted nest are authorized: the API key reaches the
+            // wire as a bearer token — a regression that dropped it would fail.
+            expect(kindWrites().every((r) => r.auth === "Bearer cnst_test")).toBe(true);
+          },
+        },
+        // The plan is also machine-readable, and `dry_run` tells apart a preview
+        // from a real apply: true without --yes…
+        {
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "jnest", "--json"),
+          json: (data) => {
+            const d = data as { kind: string; dry_run: boolean; steps: unknown[] };
+            expect(d.kind).toBe("demo");
+            expect(d.dry_run).toBe(true);
+            expect(Array.isArray(d.steps)).toBe(true);
+          },
+          check: () => expect(kindWrites(), "a --json preview sends no writes").toEqual([]),
+        },
+        // …and false once it is applied.
+        {
+          args: kindApply("demo", "jnest", "--json", "--yes"),
+          json: (data) => expect((data as { dry_run: boolean }).dry_run).toBe(false),
+        },
+      ],
+    },
+    {
+      id: "J21-03",
+      title: "Re-applying the same kind is idempotent — nothing is double-created",
+      actions: [
+        {
+          // "main" already holds everything from J21-02, so this run updates the
+          // types in place, the edge comes back 409, and the schedule is left be.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "main", "--yes"),
+          stdout: [
+            "✓ updated escalates-to — update (already defined)",
+            "already on the server (409",
+            "already scheduled every 60 min — left as is",
+            "3 applied, 1 already there (of 4 planned request(s)).",
+          ],
+          stdoutNot: ["✗ failed"],
+          check: () => {
+            // The schedule is recognized as unchanged and is not re-sent.
+            expect(kindWrites().some((r) => r.path.endsWith("/schedules"))).toBe(false);
+            // Exactly one edge re-attempt (it answers 409 → "already there").
+            expect(kindWrites().filter((r) => r.path.endsWith("/edges")).length).toBe(1);
+          },
+        },
+      ],
+    },
+    {
+      id: "J21-04",
+      title: "An unreviewed (draft) kind is refused without --allow-draft",
+      actions: [
+        {
+          // A kind a pull landed but nobody reviewed.
+          mutate: (v) => {
+            writeKindDoc(v, "draft-demo", "draft");
+            resetKindLog();
+          },
+          args: kindApply("draft-demo", "draftnest", "--yes"),
+          status: 1,
+          stderr: [
+            "is draft, not published — refusing to apply an unreviewed kind.",
+            "--allow-draft",
+          ],
+          // The refusal is decided before any request — nothing reached the server.
+          check: () => expect(readKindLog()).toEqual([]),
+        },
+        {
+          // Applied deliberately, it goes through, with the draft called out.
+          mutate: () => resetKindLog(),
+          args: kindApply("draft-demo", "draftnest", "--yes", "--allow-draft"),
+          stdout: [
+            "is draft, not published — review it before applying.",
+            "5 applied (of 5 planned request(s)).",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J21-05",
+      title: "A plane the server switched off is skipped with a reason, not failed",
+      actions: [
+        {
+          // The "flags-off" nest answers 404 for the workflow and plugins planes.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "flags-off"),
+          status: 0,
+          stdout: [
+            "- skip   escalates-to — workflow plane off",
+            "- skip   gmail (raw) — plugins off",
+            "FEATURE_WORKFLOW_PLANE=true",
+            "FEATURE_PLUGINS=true",
+            "Dry run — 0 request(s) planned, nothing sent. Rerun with --yes to apply.",
+          ],
+          stdoutNot: ["+ apply"],
+          check: () => {
+            const log = readKindLog();
+            // The planes were probed (GETs) and found off — but nothing was sent.
+            expect(log.length, "the skipped planes were still probed").toBeGreaterThan(0);
+            expect(log.every((r) => r.method === "GET"), "only GETs on a skipped dry run").toBe(true);
+          },
+        },
+      ],
+    },
+    {
+      id: "J21-06",
+      title: "Steward seats and bad inputs are guarded",
+      actions: [
+        {
+          // An un-mapped placeholder is a skip; mapping it to a person makes it a
+          // planned request, and the governance it switches on is called out.
+          mutate: () => resetKindLog(),
+          args: kindApply("demo", "stewardnest", "--steward", "@owner=lead@example.com"),
+          stdout: [
+            "+ apply  reviewer of nest → lead@example.com",
+            "Assigning a steward turns governance (stewardship) on",
+            "Dry run — 6 request(s) planned, nothing sent. Rerun with --yes to apply.",
+          ],
+        },
+        {
+          // A placeholder the kind never declares is refused outright.
+          args: kindApply("demo", "stewardnest", "--steward", "@nope=x@y.com"),
+          status: 1,
+          stderr: ['@nope is not a steward placeholder in kind "demo"', "it uses @owner"],
+        },
+        {
+          // No API key at all: a clear message, before anything is read or sent.
+          mutate: () => resetKindLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: undefined }),
+          args: kindApply("demo", "main"),
+          status: 1,
+          stderr: ["Missing API key", "CONTEXTNEST_API_KEY"],
+          check: () => expect(readKindLog(), "a keyless run reaches no server").toEqual([]),
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * J22 — "As a team member, I sync my vault with our hosted nest: pushing my
+ * nodes up to the server and pulling shared recipes back down."
+ *
+ * Two transports, one story. `ctx push` is an HTTP POST to a hosted engine, so
+ * it runs against a loopback REST mock (NEST_MOCK) whose behaviour is keyed on
+ * the nest id — a normal nest applies and is stateful (a title it has seen comes
+ * back skipped); the `gated` nest holds the push for a human and answers 202.
+ * `ctx pull` connects to a remote over stdio (an MCP server), so its half spawns
+ * the built MCP server against a seeded "team nest" vault, exactly as
+ * pull.regression.test.ts does — the remote is registered in the sandbox config
+ * dir via the `mutate` hook (which now receives it).
+ *
+ * The API key reaches the CLI through the env as a logged-in user's would; the
+ * file credentials backend keeps every run off the OS keychain on CI. Review is
+ * turned OFF so the pushed nodes are published (push sends published only).
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+
+// A recipe the "team nest" serves: one included node, pulled to nodes/handbook.
+// The ```yaml recipe fence is how a recipe node is authored (spec §3); the
+// included node must exist in the server vault.
+const J22_RECIPE_BODY = [
+  "# Starter Kit",
+  "",
+  "```yaml recipe",
+  "id: starter-kit",
+  "includes:",
+  "  - from: nodes/org/handbook",
+  "    to: nodes/handbook/handbook",
+  "```",
+  "",
+].join("\n");
+
+function writeServerNode(vault: string, id: string, frontmatter: string, body: string): void {
+  const file = join(vault, `${id}.md`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `---\n${frontmatter}\nstatus: published\n---\n\n${body}\n`, "utf-8");
+}
+
+// The "team nest" the pull half reads from: a real vault served by the built MCP
+// server over stdio. Seeded once (minimal-vault + the recipe and its node), kept
+// for the whole suite, cleaned up via `scratch`.
+let j22Server: string | undefined;
+function j22ServerVault(): string {
+  if (j22Server) return j22Server;
+  requireMcpServer();
+  const dir = mkdtempSync(join(tmpdir(), "cn-j22-server-"));
+  scratch.push(dir);
+  cpSync(join(repoRoot, "fixtures", "minimal-vault"), dir, { recursive: true });
+  writeServerNode(dir, "nodes/recipes/recipe-starter-kit", "title: Starter Kit\ntype: document", J22_RECIPE_BODY);
+  writeServerNode(
+    dir,
+    "nodes/org/handbook",
+    'title: Team Handbook\ntype: document\ntags:\n  - "#handbook"',
+    "# Team Handbook\n\nOnboarding, process, and team norms.",
+  );
+  j22Server = dir;
+  return dir;
+}
+
+// Register the team nest as a stdio remote in the sandbox config dir, so
+// `ctx pull teamnest` spawns the MCP server against the seeded vault. The local
+// pull target resolves from cwd (the journey's own vault), so only `remotes:` is
+// needed here.
+function writeRemoteConfig(cfgDir: string, serverVault: string): void {
+  const q = (s: string) => JSON.stringify(s);
+  writeFileSync(
+    join(cfgDir, "config.yaml"),
+    [
+      "version: 1",
+      "remotes:",
+      "  teamnest:",
+      "    transport: stdio",
+      `    command: ${q(process.execPath)}`,
+      "    args:",
+      `      - ${q(requireMcpServer())}`,
+      `      - ${q(serverVault)}`,
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+}
+
+// The push mock's request log is the proof of what left the machine: truncate it
+// before an action, read it back after to assert the exact requests (and that a
+// Bearer key rode along).
+const resetNestLog = () => writeFileSync(NEST_MOCK.logPath, "");
+const readNestLog = (): Array<{ method: string; url: string; auth?: string; body?: { documents?: Array<{ title: string }> } }> =>
+  readFileSync(NEST_MOCK.logPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const nestPosts = () => readNestLog().filter((r) => r.method === "POST");
+// `push --server <mock> --nest <id> …`, built at run time (base_url is only known
+// once the mock has bound a port).
+const push = (nest: string, ...rest: string[]) => () =>
+  ["push", "--server", NEST_MOCK.baseUrl, "--nest", nest, ...rest];
+
+const J22: Journey = {
+  id: "J22",
+  title: "Sync a vault with a team server (push / pull)",
+  env: { CONTEXTNEST_API_KEY: "cnst_test", CONTEXTNEST_CREDENTIALS_BACKEND: "file" },
+  cases: [
+    {
+      id: "J22-01",
+      title: "Push the vault's published nodes to a hosted nest; the server reports how many it took and lists each one",
+      actions: [
+        { args: ["init", "--name", "team-vault"], stdout: ["Initialized"] },
+        // Review off so the nodes publish on add — push sends published only.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        { args: ["add", "nodes/runbook", "--title", "Team Runbook", "--tags", "team", "-y"], stdout: ["Version: 1"] },
+        { args: ["add", "nodes/process/onboarding", "--title", "Onboarding Guide", "--tags", "team", "-y"], stdout: ["Version: 1"] },
+        {
+          mutate: () => resetNestLog(),
+          args: push("alpha", "--yes"),
+          stdout: ["Pushed 2 documents", "+ nodes/team-runbook", "+ nodes/process/onboarding-guide"],
+          // Proof the push actually went out, authorized, carrying both nodes.
+          check: () => {
+            const posts = nestPosts();
+            expect(posts).toHaveLength(1);
+            expect(posts[0].url).toBe("/nests/alpha/publish");
+            expect(posts[0].auth).toBe("Bearer cnst_test");
+            expect(posts[0].body?.documents?.map((d) => d.title).sort()).toEqual([
+              "Onboarding Guide",
+              "Team Runbook",
+            ]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J22-02",
+      title: "Push again; nodes already on the server are reported as \"already there, not overwritten\" and nothing is duplicated",
+      actions: [
+        {
+          // Same nest "alpha" — the stateful mock has both titles already, so it
+          // skips them. The real idempotency contract: a re-push adds nothing.
+          mutate: () => resetNestLog(),
+          args: push("alpha", "--yes"),
+          stdout: [
+            "Pushed 0 documents",
+            "Team Runbook (already exists, not overwritten)",
+            "Onboarding Guide (already exists, not overwritten)",
+          ],
+          stdoutNot: ["+ nodes/"],
+        },
+      ],
+    },
+    {
+      id: "J22-03",
+      title: "Push to a nest that holds pushes for a human to confirm; the CLI prints the confirmation link and, with --no-wait, exits without claiming the push landed",
+      actions: [
+        {
+          mutate: () => resetNestLog(),
+          args: push("gated", "--yes", "--no-wait"),
+          status: 0,
+          stdout: [
+            "This nest requires confirmation before the push is applied.",
+            "Confirm in the UI:",
+            "/nest/gated",
+          ],
+          // The push was parked, not applied — it must not claim it landed.
+          stdoutNot: ["Pushed"],
+          stderr: ["Submitted. Not waiting for the decision (--no-wait)."],
+        },
+      ],
+    },
+    {
+      id: "J22-04",
+      title: "A dry-run push lists what would be sent and sends nothing",
+      actions: [
+        {
+          mutate: () => resetNestLog(),
+          // --dry-run is a program-level flag, before the subcommand.
+          args: () => ["--dry-run", "push", "--server", NEST_MOCK.baseUrl, "--nest", "alpha", "--yes"],
+          status: 0,
+          // The disclosure (what would leave) and the dry-run verdict are on
+          // stderr, like the file-safety action log.
+          stderr: ["nodes/runbook", "Dry run — nothing was sent."],
+          // Nothing reached the server.
+          check: () => expect(readNestLog(), "a dry run sends no request").toEqual([]),
+        },
+      ],
+    },
+    {
+      id: "J22-05",
+      title: "Pull a shared recipe from a remote nest; its documents land locally as drafts to review and publish, not as live published nodes",
+      actions: [
+        {
+          // Register the team nest, then preview: a dry run plans a create and
+          // writes nothing.
+          mutate: (_v, cfg) => writeRemoteConfig(cfg, j22ServerVault()),
+          args: ["pull", "teamnest", "--recipe", "starter-kit", "--dry-run", "--json"],
+          json: (data) => {
+            const d = data as { dry_run: boolean; written: string[]; steps: Array<{ action: string; to: string }> };
+            expect(d.dry_run).toBe(true);
+            expect(d.written).toEqual([]);
+            expect(d.steps[0]).toMatchObject({ action: "create", to: "nodes/handbook/handbook" });
+          },
+          files: [{ path: "nodes/handbook/handbook.md", exists: false }],
+        },
+        {
+          // The real pull: the shared node lands as a draft with lineage, not live.
+          args: ["pull", "teamnest", "--recipe", "starter-kit"],
+          stdout: [
+            "Recipe starter-kit from teamnest",
+            "Wrote 1 item(s).",
+            "Pulled documents are drafts. Review them, then publish: ctx publish",
+          ],
+          files: [
+            { path: "nodes/handbook/handbook.md", exists: true, contains: "status: draft" },
+          ],
+          // Lineage records where it came from, and it is not published.
+          check: (v) => {
+            const pulled = readFileSync(join(v, "nodes", "handbook", "handbook.md"), "utf-8");
+            expect(pulled).toContain("derived_from:");
+            expect(pulled).toContain("contextnest://teamnest/nodes/org/handbook");
+            expect(pulled).not.toMatch(/^status: published/m);
+          },
+        },
+      ],
+    },
+    {
+      id: "J22-06",
+      title: "Guardrails: a push with no API key is refused before anything touches the network; a re-pull skips documents already current and only overwrites with --update",
+      actions: [
+        {
+          // No key at all: refused up front, before anything is sent.
+          mutate: () => resetNestLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: undefined }),
+          args: push("alpha", "--yes"),
+          status: 1,
+          stderr: ["Missing API key", "CONTEXTNEST_API_KEY"],
+          check: () => expect(readNestLog(), "a keyless push reaches no server").toEqual([]),
+        },
+        {
+          // A second pull leaves current documents untouched — the recipe is
+          // up to date, so nothing is written (overwriting newer upstream is the
+          // opt-in --update path).
+          args: ["pull", "teamnest", "--recipe", "starter-kit", "--json"],
+          json: (data) => {
+            const d = data as { written: string[]; steps: Array<{ action: string }> };
+            expect(d.written).toEqual([]);
+            expect(d.steps[0].action).toBe("up-to-date");
+          },
+        },
+      ],
+    },
+  ],
+};
+
+// ── J23: sign in once and reuse the key (ctx login / logout) ────────────────
+// A sandbox HOME, created once and cleaned by the suite's afterAll. `ctx login`
+// writes the encrypted key store under `<home>/.promptowl/`; overriding HOME (and
+// USERPROFILE on Windows) keeps every saved key inside the sandbox and off the
+// real machine. One home across the whole journey so a key saved by J23-01's
+// login is the same store a later push reads.
+const _j23 = { home: "" };
+const j23Home = (): string => {
+  if (!_j23.home) {
+    _j23.home = mkdtempSync(join(tmpdir(), "cn-journey-j23-home-"));
+    scratch.push(_j23.home); // cleaned by the suite's afterAll
+  }
+  return _j23.home;
+};
+// The last Authorization header the push mock recorded — proof of which key
+// actually reached the wire (saved, env, or --key).
+const lastPushAuth = (): string | undefined => {
+  const posts = nestPosts();
+  return posts.length ? posts[posts.length - 1].auth : undefined;
+};
+
+const J23: Journey = {
+  id: "J23",
+  title: "Sign in once and reuse the key (login / logout)",
+  // No CONTEXTNEST_API_KEY here (undefined unsets any ambient one): the saved
+  // login must be what authenticates. The file-backed store + a stable key keep
+  // the CLI off the OS keychain and let the encrypted store round-trip; HOME is
+  // sandboxed so the key never lands in the real home.
+  env: {
+    CONTEXTNEST_API_KEY: undefined,
+    CONTEXTNEST_CREDENTIALS_BACKEND: "file",
+    CONTEXTNEST_CREDENTIALS_KEY: "j23-store-passphrase",
+    HOME: j23Home(),
+    USERPROFILE: j23Home(),
+  },
+  cases: [
+    {
+      id: "J23-01",
+      title: "Login saves the key to the store and registers the server; `login --list` shows it, never the key",
+      actions: [
+        { args: ["init", "--name", "signin-vault"], stdout: ["Initialized"] },
+        // Review off so the node publishes on add — push (later cases) sends published only.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        { args: ["add", "nodes/doc", "--title", "Doc One", "--tags", "team", "-y"], stdout: ["Version: 1"] },
+        {
+          // --key-stdin reads the key from stdin (no browser): the one headless
+          // way to save a key. The key must never echo back.
+          args: () => ["login", NEST_MOCK.baseUrl, "--key-stdin"],
+          input: "cnst_saved\n",
+          stdout: ["Logged in to", "Key saved to encrypted file", "Registered"],
+          stdoutNot: ["cnst_saved"],
+          stderrNot: ["cnst_saved"],
+          // "encrypted file" at rest, not just absent from the terminal: the key
+          // the store wrote to <home>/.promptowl must not be the plaintext key.
+          check: () => {
+            const store = join(j23Home(), ".promptowl", "credentials.enc.json");
+            expect(existsSync(store), "login wrote the encrypted key store").toBe(true);
+            expect(readFileSync(store, "utf-8")).not.toContain("cnst_saved");
+          },
+        },
+        {
+          args: ["login", "--list"],
+          // The loopback host is stable; only the port varies (see the json case
+          // below for the exact base_url, read at run time).
+          stdout: ["http://127.0.0.1", "used by"],
+          stdoutNot: ["cnst_saved"], // the list shows servers, never the secret
+        },
+        {
+          args: ["login", "--list", "--json"],
+          json: (data) => {
+            const rows = data as Array<{ url: string; usedBy: string[] }>;
+            expect(rows).toHaveLength(1);
+            expect(rows[0].url).toBe(NEST_MOCK.baseUrl);
+            expect(rows[0].usedBy.length).toBeGreaterThan(0);
+            // The structured form carries no key either.
+            expect(JSON.stringify(rows)).not.toContain("cnst_saved");
+          },
+        },
+      ],
+    },
+    {
+      id: "J23-02",
+      title: "A later push reuses the saved key with no --key or env var",
+      actions: [
+        {
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes"),
+          stdout: ["Pushed 1 document"],
+          // The saved login — not any ambient key — is what authorized the push.
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_saved"),
+        },
+      ],
+    },
+    {
+      id: "J23-03",
+      title: "Precedence holds: --key beats CONTEXTNEST_API_KEY, which beats the saved login",
+      actions: [
+        {
+          // --key wins over the saved login.
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes", "--key", "cnst_flag"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_flag"),
+        },
+        {
+          // The env key wins over the saved login.
+          mutate: () => resetNestLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: "cnst_env" }),
+          args: push("team", "--yes"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_env"),
+        },
+        {
+          // --key wins even over the env key.
+          mutate: () => resetNestLog(),
+          env: () => ({ CONTEXTNEST_API_KEY: "cnst_env" }),
+          args: push("team", "--yes", "--key", "cnst_flag"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_flag"),
+        },
+      ],
+    },
+    {
+      id: "J23-04",
+      title: "A nest-scoped key wins over the server-wide key for that nest",
+      actions: [
+        {
+          // Save a key for one nest only (nest scope needs --key-stdin).
+          args: () => ["login", NEST_MOCK.baseUrl, "--nest", "special", "--key-stdin"],
+          input: "cnst_nest\n",
+          stdout: ["this nest only"],
+          stdoutNot: ["cnst_nest"],
+        },
+        {
+          // Working in that nest, the nest key is preferred.
+          mutate: () => resetNestLog(),
+          args: push("special", "--yes"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_nest"),
+        },
+        {
+          // Elsewhere, the server-wide key still applies.
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes"),
+          check: () => expect(lastPushAuth()).toBe("Bearer cnst_saved"),
+        },
+      ],
+    },
+    {
+      id: "J23-05",
+      title: "Logout forgets the key — the next push fails \"Missing API key\" and it drops off --list",
+      actions: [
+        {
+          args: () => ["logout", NEST_MOCK.baseUrl],
+          stdout: ["Logged out of"],
+        },
+        {
+          // No saved key, no env key: the push is refused before any request.
+          mutate: () => resetNestLog(),
+          args: push("team", "--yes"),
+          status: 1,
+          stderr: ["Missing API key"],
+          check: () => expect(readNestLog(), "a logged-out push reaches no server").toEqual([]),
+        },
+        {
+          args: ["login", "--list"],
+          stdout: ["Not logged in to any server"],
+        },
+      ],
+    },
+    {
+      id: "J23-06",
+      title: "Keys never reach stdout, and a non-loopback server is refused",
+      actions: [
+        {
+          // Nothing to log in to, and no --list: a plain usage error.
+          args: ["login"],
+          status: 1,
+          stderr: ["Name the <server>"],
+        },
+        {
+          // A plaintext, non-loopback address would leak the key over the wire —
+          // refused unless the user forces it.
+          args: ["login", "http://attacker.example", "--key-stdin"],
+          input: "cnst_leak\n",
+          status: 1,
+          stderr: ["plaintext HTTP", "--force"],
+          stdoutNot: ["cnst_leak"],
+          stderrNot: ["cnst_leak"],
+        },
+      ],
+    },
+  ],
+};
+
+// ── J24: import research papers from PubMed and enrich them ──────────────────
+// A researcher pulls open-access full texts straight into the vault as readable
+// nodes, finds them by topic, then enriches them with normalized disease/chemical
+// labels — all against a loopback NCBI stand-in (mock-ncbi-server.mjs), the same
+// E-utilities/PubTator contract the dev regression stub serves. Every run points
+// the CLI's two network bases at the mock; the base_url is only known once the
+// mock has bound a port, so it is read from NCBI_MOCK inside this closure.
+const ncbiEnv = () => ({
+  CONTEXTNEST_EUTILS_BASE: NCBI_MOCK.baseUrl,
+  CONTEXTNEST_PUBTATOR_BASE: NCBI_MOCK.baseUrl,
+});
+
+const J24: Journey = {
+  id: "J24",
+  title: "Import research papers from PubMed and enrich them",
+  cases: [
+    {
+      id: "J24-01",
+      title:
+        "Searching PubMed pulls the matching open-access papers into the vault and reports how many were found and brought in",
+      actions: [
+        { args: ["init", "--name", "papers"], env: ncbiEnv, stdout: ["Initialized"] },
+        {
+          args: ["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"],
+          env: ncbiEnv,
+          stdout: [
+            "2 match(es) in PubMed with PMC full text; fetched 2",
+            "Published 2 document(s)",
+          ],
+          files: [
+            { path: "nodes/papers/pmid-99900001.md", exists: true },
+            { path: "nodes/papers/doi-10-9999-jsg-2024-002.md", exists: true },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J24-02",
+      title:
+        "An imported paper opens as a normal, readable node with its title, authors, and source details intact",
+      actions: [
+        {
+          args: ["read", "nodes/papers/pmid-99900001"],
+          env: ncbiEnv,
+          stdout: [
+            "Fecal Microbiota Transplantation",
+            "type: reference",
+            "status: published",
+            // The byline and the source identifiers survived the import.
+            "PMID 99900001",
+            "## Abstract",
+          ],
+          files: [
+            { path: "nodes/papers/pmid-99900001.md", contains: "type: reference" },
+          ],
+        },
+      ],
+    },
+    {
+      id: "J24-03",
+      title: "Looking the papers up later by topic finds them",
+      actions: [
+        {
+          args: ["query", "#paper", "--json"],
+          env: ncbiEnv,
+          // Both imported papers carry the #paper tag and come back by it.
+          json: (data) => {
+            const ids = (data as { documents: Array<{ id: string }> }).documents
+              .map((r) => r.id)
+              .sort();
+            expect(ids).toEqual([
+              "nodes/papers/doi-10-9999-jsg-2024-002",
+              "nodes/papers/pmid-99900001",
+            ]);
+          },
+        },
+        {
+          // And a tag no paper carries returns nothing — proof the lookup
+          // actually filters, not that a two-node vault returns everything.
+          args: ["query", "#not-a-real-tag", "--json"],
+          env: ncbiEnv,
+          json: (data) => {
+            expect((data as { documents: unknown[] }).documents).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J24-04",
+      title:
+        "A licence filter imports only papers under an allowed licence and reports the rest as skipped, with the reason",
+      actions: [
+        {
+          // Narrowing to cc-by-nc leaves both papers out: the PMC licence
+          // prefilter finds no match for them, so the filter excludes them and
+          // says exactly why — nothing is imported.
+          args: ["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "--license", "cc-by-nc", "-y"],
+          env: ncbiEnv,
+          status: 0,
+          stdout: [
+            "skipped 2 for licence",
+            "licence not in cc-by-nc",
+            "Nothing to import.",
+          ],
+          stdoutNot: ["Published 2 document(s)"],
+        },
+      ],
+    },
+    {
+      id: "J24-05",
+      title:
+        "Enriching a paper adds its disease and chemical labels and surfaces the most-mentioned ones as topic tags",
+      actions: [
+        {
+          // The one paper PubTator has a record for is enriched; the other is
+          // reported (unresolved), not lost. --tag-limit 1 promotes one #mesh- tag.
+          args: ["enrich", "pubtator", "--tag-limit", "1", "-y"],
+          env: ncbiEnv,
+          stdout: [
+            "Enriched 1 document(s)",
+            "PubTator has no record for PMID 99900001",
+          ],
+          // The enriched twin gained its normalized PMID and a #mesh- topic tag.
+          check: (v) => {
+            const twin = readFileSync(
+              join(v, "nodes", "papers", "doi-10-9999-jsg-2024-002.md"),
+              "utf-8",
+            );
+            expect(twin).toContain("pmid: '30056182'");
+            expect((twin.match(/#mesh-/g) ?? []).length).toBe(1);
+          },
+        },
+      ],
+    },
+    {
+      id: "J24-06",
+      title:
+        "Running the same import again changes nothing, and a search that finds nothing ends cleanly instead of erroring",
+      actions: [
+        {
+          // Re-import: the papers are already current, so nothing is republished.
+          args: ["import", "pubmed", "--term", "fmt[Title]", "--max", "2", "-y"],
+          env: ncbiEnv,
+          stdout: ["Published 0 document(s), skipped 2"],
+          stdoutNot: ["Published 2 document(s)"],
+        },
+        {
+          // A search that matches nothing is a clean no-op, not a crash.
+          args: ["import", "pubmed", "--term", "emptyterm[Title]", "--max", "2", "-y"],
+          env: ncbiEnv,
+          status: 0,
+          stdout: [
+            "0 match(es) in PubMed with PMC full text; fetched 0",
+            "Nothing to import.",
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+/** One row of `ctx checkpoint list --json` — a nest-level snapshot. */
+type CheckpointRow = {
+  checkpoint: number;
+  triggered_by: string;
+  checkpoint_hash: string;
+  document_versions: Record<string, number>;
+  document_chain_hashes: Record<string, string>;
+};
+const checkpoints = (data: unknown) => data as CheckpointRow[];
+/** The nest-level checkpoint chain, at the vault root (NOT the per-document
+ * histories under nodes/.versions/). Deleting it is how J25-05 simulates a lost
+ * snapshot trail; rebuild regenerates it from the per-document histories. */
+const j25HistPath = (v: string) => join(v, ".versions", "context_history.yaml");
+// Bytes of the checkpoint history captured before the J25-06 guard actions run,
+// so each can prove the refuse / dry-run left the file byte-for-byte untouched.
+let j25HistBytes: string;
+
+/**
+ * J25 — "I audit the vault's snapshot trail, and rebuild it after a loss."
+ * The admin's seat on Context Nest's nest-level checkpoints (spec §6–8): every
+ * change to the vault cuts a hash-chained snapshot, and those snapshots are an
+ * audit trail that must survive even its own history file being lost. Capture a
+ * few nodes so the trail grows, list it (human + json + most-recent-N), confirm
+ * the integrity check vouches for the chain, then delete the snapshot history
+ * off disk and prove `checkpoint rebuild` regenerates it from the per-document
+ * histories — and that rebuild is guarded so it can't clobber the trail by
+ * accident.
+ *
+ * Distinct from J2: J2 audits ONE node's version history (history/reconstruct/
+ * diff); J25 audits the vault-wide checkpoint chain (checkpoint list/rebuild).
+ *
+ * The review gate is turned OFF (like J2/J13): each write should cut its own
+ * checkpoint directly, with no gate in between — so the snapshot count maps 1:1
+ * to the writes this journey makes.
+ *
+ * Case ids + titles are the ticket's verbatim lines.
+ */
+const J25: Journey = {
+  id: "J25",
+  title: "Audit the vault's snapshot trail and rebuild it after a loss (admin)",
+  cases: [
+    {
+      id: "J25-01",
+      title: "A brand-new vault has no snapshots yet",
+      actions: [
+        { args: ["init", "--name", "snapshot-trail"], stdout: ["Initialized"] },
+        // Writes should cut checkpoints directly — no review gate in between.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        // Nothing has changed yet, so the trail is empty and says so plainly.
+        { args: ["checkpoint", "list"], stdout: ["No checkpoints found."] },
+        {
+          // Quirk worth pinning: with no checkpoints, `--json` prints the SAME
+          // human line (not an empty array), so assert the string, not JSON.
+          args: ["checkpoint", "list", "--json"],
+          stdout: ["No checkpoints found."],
+        },
+      ],
+    },
+    {
+      id: "J25-02",
+      title: "Each change the vault records lands on the snapshot trail",
+      actions: [
+        {
+          args: [
+            "add", "nodes/alpha",
+            "--type", "document",
+            "--title", "Alpha",
+            "--tags", "#ops",
+            "--body", "alpha body one",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/alpha.md", exists: true }],
+        },
+        {
+          args: [
+            "add", "nodes/beta",
+            "--type", "document",
+            "--title", "Beta",
+            "--tags", "#ops",
+            "--body", "beta body one",
+            "-y",
+          ],
+          stdout: ["Version: 1"],
+          files: [{ path: "nodes/beta.md", exists: true }],
+        },
+        { args: ["update", "nodes/alpha", "--body", "alpha body two", "-y"], stdout: ["Version: 2"] },
+        // Three writes → three snapshots, newest last, the last one triggered by
+        // the node that was just edited, and each carrying its hash + per-doc
+        // versions (the audit payload).
+        {
+          args: ["checkpoint", "list", "--json"],
+          json: (data) => {
+            const cps = checkpoints(data);
+            expect(cps.map((c) => c.checkpoint)).toEqual([1, 2, 3]);
+            const last = cps[2];
+            expect(last.triggered_by).toBe("nodes/alpha");
+            expect(last.checkpoint_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+            // By the third snapshot the vault holds both nodes, alpha at v2.
+            expect(last.document_versions["nodes/alpha"]).toBe(2);
+            expect(last.document_versions["nodes/beta"]).toBe(1);
+            expect(last.document_chain_hashes["nodes/alpha"]).toMatch(/^sha256:/);
+          },
+        },
+        // Human report shows the same, including the growing document count.
+        {
+          args: ["checkpoint", "list"],
+          stdout: ["Checkpoint 3", "Triggered by: nodes/alpha", "Documents: 2"],
+        },
+      ],
+    },
+    {
+      id: "J25-03",
+      title: "Asking for only the most recent snapshots returns just those",
+      actions: [
+        {
+          // --limit keeps the N most recent (2 and 3), dropping the oldest (1).
+          args: ["checkpoint", "list", "--limit", "2", "--json"],
+          json: (data) => expect(checkpoints(data).map((c) => c.checkpoint)).toEqual([2, 3]),
+        },
+        {
+          args: ["checkpoint", "list", "--limit", "2"],
+          stdout: ["Checkpoint 3"],
+          stdoutNot: ["Checkpoint 1"],
+        },
+      ],
+    },
+    {
+      id: "J25-04",
+      title: "An integrity check reports the snapshot chain is intact",
+      actions: [
+        {
+          // Avoid the ✓ glyph (Windows stdout decoding) — the "Checkpoint chain"
+          // line is the snapshot-chain check; --json below is the structural proof.
+          args: ["verify"],
+          stdout: ["Checkpoint chain", "All integrity checks passed"],
+        },
+        {
+          args: ["verify", "--json"],
+          json: (data) => {
+            expect((data as { valid: boolean }).valid).toBe(true);
+            expect((data as { errors: unknown[] }).errors).toEqual([]);
+          },
+        },
+      ],
+    },
+    {
+      id: "J25-05",
+      title: "A lost snapshot trail is rebuilt from the per-document history",
+      actions: [
+        {
+          // Simulate the snapshot history being lost/corrupted on disk.
+          mutate: (v) => rmSync(j25HistPath(v), { force: true }),
+          args: ["checkpoint", "list"],
+          stdout: ["No checkpoints found."],
+          files: [{ path: ".versions/context_history.yaml", exists: false }],
+        },
+        {
+          // Rebuild regenerates the whole trail from the per-document histories.
+          // "Rebuilt N" is on stdout; the file-change log is on the file-safety
+          // stderr channel (like `ctx index`). The history file was deleted above,
+          // so it is CREATED (+), not modified (~) — proof it came back from nothing.
+          args: ["checkpoint", "rebuild", "--yes"],
+          stdout: ["Rebuilt 3 checkpoints"],
+          stderr: ["file(s) changed", "+ .versions/context_history.yaml"],
+          files: [{ path: ".versions/context_history.yaml", exists: true }],
+        },
+        {
+          // The three snapshots are back. (Rebuild regenerates a fresh, internally
+          // consistent chain — the snapshot HASHES may differ from the originals,
+          // which is why we assert the count + verify, not hash stability.)
+          args: ["checkpoint", "list", "--json"],
+          json: (data) => expect(checkpoints(data).map((c) => c.checkpoint)).toEqual([1, 2, 3]),
+        },
+        // And the rebuilt chain checks out clean.
+        { args: ["verify"], stdout: ["Checkpoint chain", "All integrity checks passed"] },
+      ],
+    },
+    {
+      id: "J25-06",
+      title: "Rebuild is guarded — it refuses without confirmation and previews with a dry run",
+      actions: [
+        {
+          // Snapshot the history bytes so the next two actions can prove neither
+          // touched the file.
+          mutate: (v) => {
+            j25HistBytes = readFileSync(j25HistPath(v), "utf-8");
+          },
+          // No --yes in a non-interactive session → refuse, exit 1, write nothing.
+          args: ["checkpoint", "rebuild"],
+          status: 1,
+          stderr: ["Refusing without confirmation", "Aborted — nothing was written."],
+          check: (v) =>
+            expect(readFileSync(j25HistPath(v), "utf-8"), "refuse must not touch the history").toBe(
+              j25HistBytes,
+            ),
+        },
+        {
+          // A dry run computes the rebuild ("Rebuilt 3 checkpoints") but writes
+          // nothing — the "Dry run — no files were written." line is that proof.
+          // The byte-compare is a belt-and-suspenders on the history file itself.
+          // (We deliberately don't pin the "would change" file list: the trail was
+          // already rebuilt in J25-05, so a re-rebuild is idempotent and the only
+          // flagged file is the incidental latest-pointer — not a stable contract.)
+          args: ["checkpoint", "rebuild", "--dry-run"],
+          stdout: ["Rebuilt 3 checkpoints"],
+          stderr: ["Dry run — no files were written."],
+          check: (v) =>
+            expect(readFileSync(j25HistPath(v), "utf-8"), "dry run must not touch the history").toBe(
+              j25HistBytes,
+            ),
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -3991,5 +5453,30 @@ describe("[pkg] user journeys — installed bin", () => {
   });
   it("J18 — find a node by meaning (semantic & hybrid search)", () => {
     runJourney({ installDir: INSTALL, scratch }, J18);
+  });
+  it("J19 — a bare `ctx` welcomes you and points the way", () => {
+    runJourney({ installDir: INSTALL, scratch }, J19);
+  });
+  it("J20 — reorganize and retire nodes (move, archive & unarchive)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J20);
+  });
+  it("J21 — apply a recipe's server-side kind to a hosted nest", () => {
+    runJourney({ installDir: INSTALL, scratch }, J21);
+  });
+
+  it("J22 — sync a vault with a team server (push / pull)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J22);
+  });
+
+  it("J23 — sign in once and reuse the key (login / logout)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J23);
+  });
+
+  it("J24 — import research papers from PubMed and enrich them", () => {
+    runJourney({ installDir: INSTALL, scratch }, J24);
+  });
+
+  it("J25 — audit the vault's snapshot trail and rebuild it after a loss", () => {
+    runJourney({ installDir: INSTALL, scratch }, J25);
   });
 });

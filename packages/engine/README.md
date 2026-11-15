@@ -110,6 +110,10 @@ The engine evaluates selectors against document metadata (no bodies loaded), the
 | `parseStewards` / `serializeStewards` | Canonical `stewards.yaml` marshalling (format only) |
 | `traverseWikiGraph` | Body-link seed resolution and hop traversal — follows `[[wikilinks]]` and `contextnest://` links (pinned `@N` / `#anchor` forms included) alike |
 | `extractLinkedIds` | Every node a body links to, both link forms, resolved to ids |
+| `archiveDocument` / `unarchiveDocument` | Take a node out of lists and retrieval with its history kept (spec §1.13), and put it back in the status it left |
+| `moveDocument` | Give a node a new id, carrying its version history and any PDF with it. Refuses an occupied or forgotten destination |
+| `readVersionSource` / `restoreSealedVersion` | Read a past version as stored (plus its PDF), and put a sealed version back as the live file without cutting a new one, for hosts that keep their own records beside the vault |
+| `findDanglingReferences` | Every `[[wikilink]]`, `contextnest://` link and `depends_on` that points at no document, with its document and line |
 
 Errors all carry a `code`: `InvalidSelectorError`, `CorruptHistoryError`, `VersionArtifactExistsError`, and the rest are exported from the package root.
 
