@@ -82,7 +82,7 @@ Every tool is registered through the local `tool()` helper, NOT `server.tool()`.
 
 ### Plugins (`plugins/`)
 
-**This is the `directory` branch.** The Claude plugin directory accepts command hooks only from Verified organizations, so `plugins/claude-code/` here ships no `hooks/`, `core/`, settings or `/contextnest:config`. It uses the `check-notes` and `keep-notes` skills instead. The full plugin stays on `development`. When merging `development` in, keep those deletions, and leave `core: false` in `scripts/sync-plugins.mjs`. The notes below describe the full plugin.
+If `plugins/DIRECTORY_EDITION.md` exists, you are on the hookless `directory` branch: read it first, because the notes below describe the full plugin.
 
 Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Only the Claude Code plugin is built; Codex/Gemini are README-only.
 

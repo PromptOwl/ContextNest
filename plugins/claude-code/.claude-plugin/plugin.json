@@ -4,22 +4,9 @@
   "displayName": "Context Nest",
   "version": "0.9.0",
   "description": "A shared, governed brain for Claude Code. Claude checks your team's versioned notes when a question needs them and updates them when you correct something.",
-  "author": {
-    "name": "PromptOwl"
-  },
+  "author": { "name": "PromptOwl" },
   "homepage": "https://promptowl.ai/contextnest",
   "repository": "https://github.com/promptowl/contextnest",
   "license": "AGPL-3.0",
-  "keywords": [
-    "context",
-    "context-layer",
-    "knowledge-base",
-    "team-knowledge",
-    "agent-memory",
-    "memory",
-    "rag",
-    "governance",
-    "markdown",
-    "contextnest"
-  ]
+  "keywords": ["context", "context-layer", "knowledge-base", "team-knowledge", "agent-memory", "memory", "rag", "governance", "markdown", "contextnest"]
 }

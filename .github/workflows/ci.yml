@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - development
+      - directory
   pull_request:
     branches: [main, development, directory]
   workflow_dispatch:

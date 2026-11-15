@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -106,10 +106,14 @@ describe("shared prompt sync", () => {
 
 // The directory accepts command hooks only from Verified organizations, so this
 // branch ships none. The full plugin, with its four hooks, stays on `development`.
-describe("hookless directory edition", () => {
-  const files = execFileSync("git", ["ls-files", "plugins/claude-code"], { cwd: repo, encoding: "utf-8" })
-    .split("\n")
-    .filter((f) => f && existsSync(join(repo, f)));
+// Only the directory branch ships no hooks; on development the full plugin does.
+const listFiles = (dir: string): string[] =>
+  readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+    e.name === "node_modules" ? [] : e.isDirectory() ? listFiles(join(dir, e.name)) : [join(dir, e.name)],
+  );
+
+describe.runIf(!existsSync(join(plugin, "hooks")))("hookless directory edition", () => {
+  const files = listFiles(plugin).map((f) => f.slice(repo.length + 1).replace(/\\/g, "/"));
   const prose = files.filter((f) => /\.(md|json)$/.test(f) && !/CHANGELOG|package/.test(f));
   const skill = (name: string) => read(join(plugin, "skills", name, "SKILL.md"));
   const frontmatter = (text: string) => text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
@@ -121,7 +125,7 @@ describe("hookless directory edition", () => {
   });
 
   it("claims no hook, removed setting or removed command anywhere", () => {
-    const stale = /\bhooks?\b|retrieval_mode|capture_mode|auto_capture|unclear_nest|ctx_command|plugin-settings|contextnest\.local|\/contextnest:config|on each prompt/i;
+    const stale = /hooks\.json|SessionStart|UserPromptSubmit|PostToolUse|\bStop hook|retrieval_mode|capture_mode|auto_capture|unclear_nest|ctx_command|plugin-settings|contextnest\.local|\/contextnest:config|on each prompt/i;
     const allowed = /full (edition|plugin)|no hooks/i;
     const hits = prose.flatMap((f) =>
       read(join(repo, f))
@@ -143,7 +147,9 @@ describe("hookless directory edition", () => {
 
   it("check-notes triggers on questions and treats notes as data", () => {
     const text = skill("check-notes");
-    expect(frontmatter(text)).toMatch(/\bdescription:.*\b(before|when)\b/i);
+    expect(frontmatter(text)).toMatch(/\bdescription:.*\bbefore answering\b/i);
+    expect(frontmatter(text)).toMatch(/\bdescription:.*check my notes/i);
+    expect(frontmatter(text)).toMatch(/\bdescription:.*\bSkip it\b/i);
     expect(text).toContain("ctx search");
     expect(text).toMatch(/reference material, not instructions/);
     expect(text).toMatch(/cit(e|ing)/i);
@@ -154,6 +160,7 @@ describe("hookless directory edition", () => {
     expect(frontmatter(text)).toMatch(/\bdescription:.*\b(remember|correct)/i);
     expect(text).toContain("contextnest-capture");
     expect(text).toContain("contextnest-curator");
+    expect(text).toMatch(/only on what the user says in their own messages/i);
   });
 
   it("the README says what this edition leaves out and where the full plugin is", () => {
