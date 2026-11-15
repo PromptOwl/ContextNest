@@ -294,6 +294,50 @@ export function startMockNestServer(scratch: string[]): Promise<MockNestServer> 
   });
 }
 
+export interface MockNcbiServer {
+  /** The base the CLI's E-utilities/PubTator calls are pointed at via
+   * CONTEXTNEST_EUTILS_BASE / CONTEXTNEST_PUBTATOR_BASE (`http://127.0.0.1:PORT`). */
+  baseUrl: string;
+  /** Kill the mock process (call in afterAll). */
+  close: () => void;
+}
+
+/**
+ * Start the loopback NCBI E-utilities + PubTator mock (`mock-ncbi-server.mjs`)
+ * the J24 journey drives `ctx import pubmed` / `ctx enrich pubtator` against, in
+ * its OWN process (same reason as startMockProvider: spawnSync blocks this
+ * process's loop, so a same-process server would deadlock). The scenario is
+ * encoded in the search term (an "emptyterm" query returns no hits), so no
+ * control channel is needed; it prints the port it bound on stdout as `PORT <n>`.
+ * The returned `baseUrl` goes into CONTEXTNEST_EUTILS_BASE and
+ * CONTEXTNEST_PUBTATOR_BASE; `close()` stops it.
+ */
+export function startMockNcbiServer(): Promise<MockNcbiServer> {
+  // stdin is a live pipe (not "ignore") so the mock self-terminates if this end
+  // closes (a hard-killed runner that never ran afterAll) — see startMockProvider.
+  const child = spawn("node", [join(here, "mock-ncbi-server.mjs")], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("mock NCBI server never printed its PORT within 10s"));
+    }, 10_000);
+    let buf = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      buf += chunk.toString();
+      const m = buf.match(/PORT (\d+)/);
+      if (!m) return;
+      clearTimeout(timer);
+      resolve({ baseUrl: `http://127.0.0.1:${m[1]}`, close: () => child.kill() });
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
 /** A fresh isolated vault + config dir for one journey. Caller owns cleanup via `scratch`. */
 export function makeSandbox(
   scratch: string[],

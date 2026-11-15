@@ -14,6 +14,10 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    outputs:
+      # "true" only when this run published a new @promptowl/contextnest-mcp-server
+      # to npm, which is the one case where the MCP Registry needs a new entry.
+      mcp_published: ${{ steps.changesets.outputs.published == 'true' && contains(steps.changesets.outputs.publishedPackages, '"@promptowl/contextnest-mcp-server"') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,3 +60,64 @@ jobs:
           # this, the publish runs unauthenticated and the registry masks the
           # rejection as a 404 on the PUT.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Lists the just-published MCP server on the official MCP Registry
+  # (registry.modelcontextprotocol.io). GitHub OIDC grants this workflow publish
+  # rights on io.github.PromptOwl/* (the repository owner), so no org owner has to
+  # log in and no secret is stored. server.json is already on the npm version:
+  # `pnpm version-packages` syncs it (scripts/sync-server-json.mjs).
+  mcp-registry:
+    name: Publish to MCP Registry
+    needs: release
+    if: needs.release.outputs.mcp_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.7
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for the npm version
+        # The registry rejects a server.json whose package version is not on npm
+        # yet, or whose mcpName does not match. Wait out npm propagation.
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./packages/mcp-server/package.json').name")"
+          version="$(node -p "require('./server.json').version")"
+          for _ in $(seq 1 30); do
+            got="$(npm view "$name@$version" mcpName 2>/dev/null || true)"
+            if [ "$got" = "$(node -p "require('./server.json').name")" ]; then
+              echo "npm has $name@$version with mcpName $got"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$name@$version with a matching mcpName never appeared on npm"; exit 1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download and verify mcp-publisher
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          archive="mcp-publisher_${os}_${arch}.tar.gz"
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl --fail --location --silent --show-error --output "$archive" "$base_url/$archive"
+          curl --fail --location --silent --show-error --output "$archive.sigstore.json" "$base_url/$archive.sigstore.json"
+          cosign verify-blob \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar xzf "$archive" mcp-publisher
+          rm -f "$archive" "$archive.sigstore.json"
+
+      - name: Authenticate to the MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        run: ./mcp-publisher publish
