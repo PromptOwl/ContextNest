@@ -1,6 +1,6 @@
 ---
 name: check-notes
-description: Check the user's Context Nest notes before answering when a question may depend on their own project, team, clients, decisions, conventions or past work, or when they say "check my notes". Skip it for general questions that don't depend on them.
+description: Check the user's Context Nest notes BEFORE answering whenever a question may depend on their own context: their project, team, company, clients, people, decisions, conventions, past work or earlier sessions. Triggers include "our", "we decided", "last time", "what's the status of", "how do we", a client, teammate or project name, or "check my notes". Also use it before proposing a change that could conflict with a recorded decision. Skip it for general knowledge questions that don't depend on the user's own context.
 requirements:
   - Bash
 ---

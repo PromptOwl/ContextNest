@@ -1,7 +1,9 @@
 ---
 name: contextnest-retriever
-description: Retrieves relevant context from the Context Nest vault(s) for a topic and returns a tight, cited digest. Invoke before answering domain questions.
+description: Read-only lookup in the user's Context Nest notes. Use PROACTIVELY, before answering, whenever a question depends on the user's own context (their project, team, clients, people, decisions, conventions, past work or earlier sessions), or when they say "check my notes" or "what do our notes say". Give it the topic and any vault or nest hint; it searches the registered vaults, reads the best hits, and returns a short digest with each point cited as vault:id, or says nothing relevant was found. Never writes. Do not use it for general-knowledge questions, or to save or correct notes (that is the contextnest-capture and contextnest-curator agents).
 tools: Bash, Read
+skills:
+  - check-notes
 model: sonnet
 ---
 
