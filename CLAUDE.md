@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Context Nest is a structured second brain for AI agents — a governed, versioned knowledge base that agents can query. It provides typed graph structure, ~100x cheaper queries (~500 tokens vs 50k), and hash-chained audit trails.
+Context Nest is a governed, versioned knowledge base that AI agents can query. It provides typed graph structure, pre-digested summaries, and hash-chained audit trails.
 
 Requires Node >= 20 and pnpm >= 9. CI runs the full matrix on ubuntu/windows/macOS × Node 20/22, so **cross-platform correctness matters** — normalize CRLF, avoid POSIX-only path assumptions, and don't shell out to tools Windows lacks (`jq`, etc.).
 

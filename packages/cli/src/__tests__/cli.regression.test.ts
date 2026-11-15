@@ -51,6 +51,8 @@ const ENV = {
   // nothing being supplied. Empty is falsy in buildCallClient.
   CONTEXTNEST_AGENT: "",
   CONTEXTNEST_SESSION_ID: "",
+  // …and the ambient human author, so `edited_by` defaults deterministically.
+  CONTEXTNEST_AUTHOR: "",
   // The manifest is a POC switch (off by default); the tests that need it
   // turn it on themselves.
   CONTEXTNEST_MANIFEST: "",
@@ -2862,6 +2864,71 @@ describe("[regression] publish --author / --message", () => {
     expect(latest.note).toBe("release note");
     // The human render surfaces the same author on the By: line.
     expect(runCtx(tmp, ["history", "nodes/release"])).toMatch(/By: alice@example\.com/);
+  });
+});
+
+// ─── Human author: --author / CONTEXTNEST_AUTHOR ─────────────────────────────
+// The approving human goes in `edited_by` (the `By:` line); the writing agent
+// goes in `client.agent`. Both are env-backed so a plugin sets them once per
+// session, and one version can carry both.
+
+describe("[regression] human author — --author / CONTEXTNEST_AUTHOR", () => {
+  const latest = (path: string, env: NodeJS.ProcessEnv = ENV) =>
+    JSON.parse(
+      execFileSync("node", [distPath, "history", path, "--json"], { cwd: tmp, env, encoding: "utf-8" }),
+    ).versions.at(-1);
+  const run = (args: string[], env: NodeJS.ProcessEnv) =>
+    execFileSync("node", [distPath, ...args], { cwd: tmp, env, encoding: "utf-8" });
+
+  beforeEach(() => {
+    initVault(tmp);
+  });
+
+  it("records CONTEXTNEST_AUTHOR as edited_by on `ctx update`", () => {
+    const env = { ...ENV, CONTEXTNEST_AUTHOR: "misha@promptowl.ai" };
+    run(["add", "nodes/authored", "--title", "Authored", "--body", "one"], env);
+    expect(latest("nodes/authored").edited_by).toBe("misha@promptowl.ai");
+    run(["update", "nodes/authored", "--body", "x"], env);
+    const v = latest("nodes/authored");
+    expect(v.version).toBe(2);
+    expect(v.edited_by).toBe("misha@promptowl.ai");
+    expect(runCtx(tmp, ["history", "nodes/authored"])).toMatch(/By: misha@promptowl\.ai/);
+  });
+
+  it("lets --author beat the env var, before or after the subcommand", () => {
+    const env = { ...ENV, CONTEXTNEST_AUTHOR: "env@example.com" };
+    run(["add", "nodes/flagged", "--title", "Flagged", "--body", "one", "--author", "flag@example.com"], env);
+    expect(latest("nodes/flagged").edited_by).toBe("flag@example.com");
+    run(["--author", "global@example.com", "update", "nodes/flagged", "--body", "two"], env);
+    expect(latest("nodes/flagged").edited_by).toBe("global@example.com");
+    run(["update", "nodes/flagged", "--body", "three", "--author", "after@example.com"], env);
+    expect(latest("nodes/flagged").edited_by).toBe("after@example.com");
+  });
+
+  it("keeps cli@contextnest.local when neither the flag nor the env var is set", () => {
+    runCtx(tmp, ["add", "nodes/plain", "--title", "Plain", "--body", "one"]);
+    runCtx(tmp, ["update", "nodes/plain", "--body", "two"]);
+    expect(latest("nodes/plain").edited_by).toBe("cli@contextnest.local");
+  });
+
+  it("makes the env var the default for `publish -a`, and -a still wins", () => {
+    const env = { ...ENV, CONTEXTNEST_AUTHOR: "env@example.com" };
+    runCtx(tmp, ["add", "nodes/rel", "--title", "Rel", "--body", "one"]);
+    runCtx(tmp, ["update", "nodes/rel", "--body", "two"]);
+    run(["publish", "nodes/rel"], env);
+    expect(latest("nodes/rel").edited_by).toBe("env@example.com");
+    runCtx(tmp, ["update", "nodes/rel", "--body", "three"]);
+    run(["publish", "nodes/rel", "-a", "pub@example.com"], env);
+    expect(latest("nodes/rel").edited_by).toBe("pub@example.com");
+  });
+
+  it("records the human author and the agent on the same version", () => {
+    const env = { ...ENV, CONTEXTNEST_AUTHOR: "misha@promptowl.ai", CONTEXTNEST_AGENT: "claude-code" };
+    run(["add", "nodes/both", "--title", "Both", "--body", "one"], env);
+    run(["update", "nodes/both", "--body", "two"], env);
+    const v = latest("nodes/both");
+    expect(v.edited_by).toBe("misha@promptowl.ai");
+    expect(v.client).toEqual({ agent: "claude-code" });
   });
 });
 
