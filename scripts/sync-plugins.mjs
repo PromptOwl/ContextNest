@@ -37,7 +37,7 @@ const END = "<!-- END SHARED -->";
 const TARGETS = [
   {
     plugin: "claude-code",
-    core: true,
+    core: false,
     prompts: [
       { file: "agents/contextnest-retriever.md", prompt: "retriever" },
       { file: "agents/contextnest-capture.md", prompt: "capture" },

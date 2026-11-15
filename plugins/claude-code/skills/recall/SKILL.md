@@ -1,6 +1,6 @@
 ---
 name: recall
-description: Deeply retrieve Context Nest vault context for a topic and answer with citations. Use when you need the full graph of related vault knowledge beyond what auto-retrieval injected.
+description: Deeply retrieve Context Nest vault context for a topic and answer with citations. Use when you need the full graph of related vault knowledge beyond a quick search of the notes.
 requirements:
   - Bash
   - Read

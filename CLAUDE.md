@@ -82,6 +82,8 @@ Every tool is registered through the local `tool()` helper, NOT `server.tool()`.
 
 ### Plugins (`plugins/`)
 
+If `plugins/DIRECTORY_EDITION.md` exists, you are on the hookless `directory` branch: read it first, because the notes below describe the full plugin.
+
 Makes coding agents vault-aware (auto-retrieve) and self-maintaining (deliberate capture + consistent corrections) by shelling out to `ctx`. Only the Claude Code plugin is built; Codex/Gemini are README-only.
 
 **`plugins/shared/` is the single source of truth. Never edit `plugins/claude-code/core/` — it is a vendored byte-identical copy.** Installed Claude plugins can't read files outside their own directory, so `pnpm plugins:sync` copies `shared/core/*` into each agent plugin and fills the `<!-- BEGIN SHARED -->…<!-- END SHARED -->` regions of agent/skill markdown from `shared/prompts/*.md`. `pnpm plugins:check` fails CI on drift.
