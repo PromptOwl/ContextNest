@@ -194,7 +194,7 @@ function isCheckpointSegment(segs: string[]): boolean {
     segs.length === 3 &&
     comparableSegment(segs[0]) === ".versions" &&
     segs[1] === ".checkpoints" &&
-    /^\d+\.yaml$/.test(segs[2])
+    /^\d{9}\.yaml$/.test(segs[2])
   );
 }
 

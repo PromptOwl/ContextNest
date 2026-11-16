@@ -295,6 +295,35 @@ describe("checkpoint chain — bounded segments of deltas", () => {
       expect(await checkpointErrors()).toEqual([]);
     });
 
+    it("ignores segment files that are not spelled as nine digits", async () => {
+      const copy = await readFile(join(segDir, "000000001.yaml"), "utf-8");
+      await writeFile(join(segDir, "1.yaml"), copy, "utf-8");
+      await writeFile(join(segDir, "99999999999999999999999.yaml"), "junk", "utf-8");
+
+      expect((await storage.readCheckpointHistory())?.checkpoints.map((c) => c.checkpoint)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      await revise();
+      expect(await checkpointErrors()).toEqual([]);
+    });
+
+    it("an empty chain written reads as no chain", async () => {
+      await storage.writeCheckpointHistory({ checkpoints: [] });
+      expect(await storage.readCheckpointHistory()).toBeNull();
+      expect((await storage.readCheckpointChainState()).kind).toBe("absent");
+    });
+
+    it("flags the stale segments a crashed rebuild leaves behind", async () => {
+      // A rebuild that wrote a fresh chain but died before removing segments 4 and 7.
+      const stale4 = await readFile(join(segDir, "000000004.yaml"), "utf-8");
+      const stale7 = await readFile(join(segDir, "000000007.yaml"), "utf-8");
+      const whole = (await storage.readCheckpointHistory())!;
+      await storage.writeCheckpointHistory({ checkpoints: whole.checkpoints.slice(0, 2) });
+      await writeFile(join(segDir, "000000004.yaml"), stale4, "utf-8");
+      await writeFile(join(segDir, "000000007.yaml"), stale7, "utf-8");
+
+      expect(await segments()).toEqual(["000000001.yaml", "000000004.yaml", "000000007.yaml"]);
+      expect((await checkpointErrors()).length).toBeGreaterThan(0);
+    });
+
     it("quarantines the whole chain when the newest segment is unreadable", async () => {
       await writeFile(join(segDir, "000000007.yaml"), "checkpoints:\n  - checkpoint: 7\0\0\0\n", "utf-8");
       await rm(join(root, ".versions", "context_latest.yaml"));

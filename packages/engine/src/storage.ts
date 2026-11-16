@@ -3263,8 +3263,10 @@ export class NestStorage {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw err;
     }
+    // Only the canonical spelling: anything else (`1.yaml`, a 23-digit name)
+    // would list as a segment the engine never reads or writes.
     return names
-      .filter((name) => /^\d+\.yaml$/.test(name))
+      .filter((name) => /^\d{9}\.yaml$/.test(name))
       .map((name) => Number(name.slice(0, -".yaml".length)))
       .sort((a, b) => a - b);
   }
@@ -3696,8 +3698,9 @@ export class NestStorage {
       written.add(segment[0].checkpoint);
       await this.writeFileDurable(join(dir, segmentFileName(segment[0].checkpoint)), encodeSegment(segment));
     }
-    // ponytail: a crash between here and the end leaves old segments beside the
-    // new ones; verify flags the break and a re-run of the rebuild clears it.
+    // A crash between here and the end leaves old segments beside the new
+    // ones; verify flags the break and a re-run of the rebuild clears it.
+    // An empty chain leaves an empty folder, which reads as absent (no chain).
     for (const first of await this.listCheckpointSegments()) {
       if (!written.has(first)) await unlink(join(dir, segmentFileName(first))).catch(() => {});
     }
