@@ -14,10 +14,6 @@ Command-line tool for [Context Nest](https://github.com/PromptOwl/ContextNest) �
 >
 > **New in 2.0** — `ctx` now runs on the engine's shared operation catalog, so the CLI, the MCP server and the PromptOwl cloud all execute the same code for the same action. New: `ctx info`, `ctx publish --all`, `ctx vault describe`, `ctx history --diff`, `--limit` on `list` and `search`. See [Upgrading to 2.0](#upgrading-to-20).
 
-> **New in 2.1** — no command writes to your working directory without saying so: `--dry-run` on every write command, an action log of what changed, and confirmation prompts on the destructive ones. See [File safety](#file-safety). The install also drops from 104 packages to 2.
->
-> **New in 2.0** — `ctx` now runs on the engine's shared operation catalog, so the CLI, the MCP server and the PromptOwl cloud all execute the same code for the same action. New: `ctx info`, `ctx publish --all`, `ctx vault describe`, `ctx history --diff`, `--limit` on `list` and `search`. See [Upgrading to 2.0](#upgrading-to-20).
-
 ## Install
 
 ```bash
@@ -395,7 +391,7 @@ Your hand-written content in these files is preserved — only the Context Nest 
 
 ## MCP Server
 
-For direct AI agent access via the Model Context Protocol — **44 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
+For direct AI agent access via the Model Context Protocol — **47 tools** over stdio (the canonical `context_*` operation set — read/create/update/publish/import documents, selector queries, version history, drift governance, integrity verification):
 
 ```bash
 # Run it directly, no install
@@ -414,7 +410,7 @@ Four ways into the same vault — same file format, same governed history:
 | | What it is | Get it |
 |---|---|---|
 | **CLI** (`ctx`) | Build and query the vault from the terminal (this package) | [@promptowl/contextnest-cli](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
-| **MCP server** | Agent access over the Model Context Protocol — 44 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
+| **MCP server** | Agent access over the Model Context Protocol — 47 tools | [@promptowl/contextnest-mcp-server](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [@promptowl/contextnest-engine](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
 | **PromptOwl cloud** | Hosted packs, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 
