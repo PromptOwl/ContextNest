@@ -22,7 +22,7 @@ import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { globFiles } from "./glob.js";
 import { comparableSegment } from "./structure.js";
-import { parseDocument } from "./parser.js";
+import { parseDocument, serializeDocument } from "./parser.js";
 import { parseConfig } from "./config.js";
 import {
   INTEGRITY_WARNING,
@@ -61,6 +61,7 @@ import {
   type TombstoneIndex,
 } from "./tombstones.js";
 import type {
+  Frontmatter,
   ContextNode,
   NestConfig,
   ReviewMode,
@@ -2149,6 +2150,34 @@ export class NestStorage {
       );
     }
     return join(this.root, ...segments);
+  }
+
+  /**
+   * Rewrite a document's frontmatter in place. Cuts no version, and the checksum
+   * covers the body alone, so the drift scanner sees nothing. An `undefined`
+   * value drops the key.
+   */
+  async patchFrontmatter(node: ContextNode, patch: Partial<Frontmatter>): Promise<ContextNode> {
+    const next = { ...node, frontmatter: { ...node.frontmatter, ...patch } };
+    await this.writeDocument(node.id, serializeDocument(next));
+    return next;
+  }
+
+  /** Carry a document's version artifacts to a new id. A document with none is fine. */
+  async moveHistory(from: string, to: string): Promise<void> {
+    assertNotMachineryPath(to);
+    await assertResolvesOutsideMachinery(this.root, to);
+    for (const id of [from, to]) {
+      this.historyVerdicts.delete(id);
+      this.markHistoryTouched(id);
+    }
+    const target = this.versionsDir(to);
+    await mkdir(dirname(target), { recursive: true });
+    try {
+      await rename(this.versionsDir(from), target);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
 
   /**

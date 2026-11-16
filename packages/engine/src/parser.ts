@@ -91,6 +91,11 @@ export function isRejected(node: ContextNode): boolean {
   return node.frontmatter.status === "rejected";
 }
 
+/** True while the node is archived (§1.13): rejected, and recoverable as it was. */
+export function isArchived(node: ContextNode): boolean {
+  return node.frontmatter.archived !== undefined;
+}
+
 /**
  * Predicate: document was erased by the forget protocol (§6.3.3) — the live
  * file is an empty stub and MUST NOT be treated as content. Excluded from

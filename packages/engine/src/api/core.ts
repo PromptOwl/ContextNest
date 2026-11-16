@@ -23,6 +23,7 @@ import {
   pdfMetaSchema,
   sourceMetaSchema,
   tagSchema as tag,
+  archivedMetaSchema,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { viewMetaSchema } from "../view-schema.js";
@@ -737,6 +738,65 @@ const deleteOp: OperationDescriptor = {
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["delete_document"],
+};
+
+// ─── context_archive / context_unarchive / context_move ──
+
+const archiveOp: OperationDescriptor = {
+  name: "context_archive",
+  namespace: "core",
+  description:
+    "Archive a node: out of default lists and retrieval, with its version history kept, until context_unarchive restores it (§1.13). Refused while a review is pending.",
+  input: z.object({
+    ...nodeSelectorShape,
+    reason: z.string().optional().describe("Why it was archived, recorded on the node"),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    status: z.literal("rejected"),
+    archived: archivedMetaSchema,
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "FORGOTTEN_DOCUMENT",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
+
+const unarchiveOp: OperationDescriptor = {
+  name: "context_unarchive",
+  namespace: "core",
+  description: "Bring an archived node back in the status it was archived from (§1.13).",
+  input: z.object({ ...nodeSelectorShape, ...clientField }),
+  output: z.object({ id: z.string(), status: z.string() }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI", "VAULT_LOCK_TIMEOUT"],
+};
+
+const moveOp: OperationDescriptor = {
+  name: "context_move",
+  namespace: "core",
+  description:
+    "Move a node to another folder, carrying its version history and any PDF. Its id changes; [[Title]] links keep resolving, path links do not. Refused while a review is pending.",
+  input: z.object({
+    ...nodeSelectorShape,
+    folder: z.string().describe('Destination folder under nodes/ (e.g. "gtm/deals"); "" is the nest root'),
+    ...clientField,
+  }),
+  output: z.object({ id: z.string(), previous_id: z.string() }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "DOCUMENT_ALREADY_EXISTS",
+    "FORGOTTEN_DOCUMENT",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
+    "VAULT_LOCK_TIMEOUT",
+  ],
 };
 
 // ─── context_versions ────────────────────────────────────────────────────────
@@ -1524,6 +1584,9 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   updateOp,
   publishOp,
   deleteOp,
+  archiveOp,
+  unarchiveOp,
+  moveOp,
   versionsOp,
   reconstructOp,
   verifyOp,

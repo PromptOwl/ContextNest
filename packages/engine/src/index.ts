@@ -16,6 +16,7 @@ export type {
   HashChainEventType,
   SourceMeta,
   PdfMeta,
+  ArchivedMeta,
   ViewMeta,
   ViewBlock,
   ViewRenderMode,
@@ -147,6 +148,7 @@ export type {
 // Schemas
 export {
   frontmatterSchema,
+  archivedMetaSchema,
   nestConfigSchema,
   packSchema,
   versionEntrySchema,
@@ -198,6 +200,7 @@ export {
   isApproved,
   isPublished,
   isRejected,
+  isArchived,
   isForgotten,
   isRetrievable,
   /** @deprecated returns false for all post-normalization nodes. Use isRejected. */
@@ -348,9 +351,10 @@ export {
   buildRelationships,
   buildRelationshipsWithStats,
   buildBacklinks,
+  findDanglingReferences,
   extractSection,
 } from "./inline.js";
-export type { RelationshipStats } from "./inline.js";
+export type { DanglingReference, RelationshipStats } from "./inline.js";
 
 // Selector grammar
 export { tokenize } from "./selector/lexer.js";
@@ -440,6 +444,16 @@ export type {
   BulkPublishOptions,
   BulkPublishResult,
 } from "./publish.js";
+
+// Node lifecycle — archive, move, and putting a sealed version back
+export {
+  archiveDocument,
+  unarchiveDocument,
+  moveDocument,
+  readVersionSource,
+  restoreSealedVersion,
+} from "./lifecycle.js";
+export type { ArchiveOptions, MoveOptions } from "./lifecycle.js";
 
 // Forget protocol (§6.3) — erasure that keeps verification intact
 export {

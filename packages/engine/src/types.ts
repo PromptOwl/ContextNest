@@ -227,6 +227,16 @@ export interface Frontmatter {
   zone?: string;
   /** Governance tier (zone-classification-rbac-spec §1) */
   governance?: GovernanceTier;
+  /** Archive block — present only while the node is archived (§1.13). */
+  archived?: ArchivedMeta;
+}
+
+/** Who archived a node, when, and the status it returns to on unarchive (§1.13). */
+export interface ArchivedMeta {
+  at: string;
+  by: string;
+  previous_status: Status;
+  reason?: string;
 }
 
 /**

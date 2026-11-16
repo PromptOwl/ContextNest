@@ -824,7 +824,25 @@ Reading a view resolves each block. `md`, `list` and `callout` need nothing but 
 
 ---
 
-### 1.11 Plugin Provenance (informative)
+### 1.13 Archived Nodes
+
+An archived node is out of default lists and retrieval and fully recoverable. Archiving sets `status: rejected` and adds an `archived` block; the file stays at its id and cuts no version, so its history and hash chain are untouched.
+
+```yaml
+status: rejected
+archived:
+  at: 2026-11-05T10:00:00.000Z
+  by: steward@example.com
+  previous_status: published
+  reason: Superseded by nodes/new-plan   # optional
+```
+
+- An archived node MUST NOT be edited, published or served as a skill, including from an earlier approved version. It returns only through unarchive, which restores `previous_status` and removes the block.
+- A node with a pending review MUST NOT be archived or moved until that review is resolved.
+
+---
+
+### 1.14 Plugin Provenance (informative)
 
 Nodes written by a Nest Plugin host carry a `provenance` object under `metadata`:
 
