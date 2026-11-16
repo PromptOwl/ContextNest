@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Context Nest is a structured second brain for AI agents — a governed, versioned knowledge base that agents can query. It provides typed graph structure, ~100x cheaper queries (~500 tokens vs 50k), and hash-chained audit trails.
+Context Nest is a governed, versioned knowledge base that AI agents can query. It provides typed graph structure, pre-digested summaries, and hash-chained audit trails.
 
 Requires Node >= 20 and pnpm >= 9. CI runs the full matrix on ubuntu/windows/macOS × Node 20/22, so **cross-platform correctness matters** — normalize CRLF, avoid POSIX-only path assumptions, and don't shell out to tools Windows lacks (`jq`, etc.).
 
@@ -74,7 +74,7 @@ Binaries `ctx` and `contextnest`, both from a single ~2k-line `src/index.ts` (co
 
 47 tools over stdio, in three groups:
 
-- **Catalog-driven** (27, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_embed`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`, `context_forget`, `context_forget_log`, `context_structure`. **Add new tools here, not by hand.**
+- **Catalog-driven** (27, registered by looping over `listOperations("core")` — name, description and schema all come from the engine's operation catalog, so this surface cannot drift, and a new core op appears here automatically): `context_init`, `context_nests`, `context_get`, `context_list`, `context_folders`, `context_search`, `context_embed`, `context_query`, `context_resolve`, `context_versions`, `context_reconstruct`, `context_packs`, `context_verify`, `context_create`, `context_update`, `context_publish`, `context_delete`, `context_archive`, `context_unarchive`, `context_move`, `context_import`, `context_import_pdf`, `context_skill`, `context_skill_install`, `context_forget`, `context_forget_log`, `context_structure`. **Add new tools here, not by hand.**
 - **Hand-written, still current** (9): `document_format`, `read_index`, `read_pack`, `list_checkpoints`, `stage_drift_suggestion`, `list_suggestions`, `approve_suggestion`, `reject_suggestion`, `context_review` (review gate — hand-written on purpose so hosted catalog bindings cannot toggle it).
 - **Deprecated** (11, backward-compatible for existing clients, removed in a future major): `vault_info`, `resolve`, `read_document`, `list_documents`, `search`, `verify_integrity`, `read_version`, `create_document`, `update_document`, `delete_document`, `publish_document`. Additive parity fixes are allowed here — `list_documents` takes `path` (the `folder` filter of `context_list`), `create_document`/`update_document` take `description` and accept `content` as an alias for `body` — but nothing already accepted may change meaning.
 

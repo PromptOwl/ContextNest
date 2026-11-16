@@ -12,10 +12,10 @@
  *   publishMs   publishDocument (version + checkpoint seal), mean of 5 updates
  *   indexMs     regenerateIndex after it, mean of the same 5
  *   crawlMs     one full discoverDocuments, for scale
- *   historyKB   .versions/context_history.yaml after the seed + 5 seals
+ *   historyKB   .versions/.checkpoints/ (all segments) after the seed + 5 seals
  * Numbers are from local disk; a network-backed vault pays a round trip per file read.
  */
-import { mkdtemp, mkdir, writeFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -64,7 +64,9 @@ for (const n of sizes.length ? sizes : [200, 1000, 3000]) for (const manifest of
     const t = performance.now();
     await storage.discoverDocuments({ includeRetired: true });
     const crawlMs = performance.now() - t;
-    const history = await stat(join(dir, ".versions", "context_history.yaml"));
+    const segDir = join(dir, ".versions", ".checkpoints");
+    let historyBytes = 0;
+    for (const f of await readdir(segDir)) historyBytes += (await stat(join(segDir, f))).size;
 
     console.log(JSON.stringify({
       docs: n,
@@ -72,7 +74,7 @@ for (const n of sizes.length ? sizes : [200, 1000, 3000]) for (const manifest of
       publishMs: Math.round(publishMs / UPDATES),
       indexMs: Math.round(indexMs / UPDATES),
       crawlMs: Math.round(crawlMs),
-      historyKB: Math.round(history.size / 1024),
+      historyKB: Math.round(historyBytes / 1024),
     }));
   } finally {
     await rm(dir, { recursive: true, force: true });

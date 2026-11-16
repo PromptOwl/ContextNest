@@ -413,6 +413,30 @@ describe("[regression] catalog binding — write lifecycle via canonical ops", (
     expect(versions.versions.at(-1)!.client).toEqual(meta);
   });
 
+  it("context_get and context_list (include_last_edit) name the last editor and agent (§9.5)", async () => {
+    const meta = { agent: "last-edit-agent", session_id: "sess-last-edit" };
+    const created = await callJson(client, "context_create", {
+      title: "Last Edit Over The Wire",
+      content: "body",
+      client: meta,
+    });
+    const got = await callJson(client, "context_get", { id: created.id });
+    expect(getOperation("context_get")!.output.safeParse(got).success).toBe(true);
+    expect(got.last_edit).toMatchObject({
+      version: 1,
+      edited_by: "mcp@contextnest.local",
+      client: meta,
+    });
+
+    const listed = await callJson(client, "context_list", { include_last_edit: true });
+    expect(getOperation("context_list")!.output.safeParse(listed).success).toBe(true);
+    const row = listed.documents.find((d: { id: string }) => d.id === created.id);
+    expect(row.last_edit).toMatchObject({ version: 1, client: meta });
+
+    const plain = await callJson(client, "context_list", {});
+    expect(plain.documents.find((d: { id: string }) => d.id === created.id)).not.toHaveProperty("last_edit");
+  });
+
   it("fills agent + session_id from the MCP handshake when the caller sends none", async () => {
     // Most agents will not know the field exists, and an audit trail that is
     // empty by default is not much of one. The server knows the client's name

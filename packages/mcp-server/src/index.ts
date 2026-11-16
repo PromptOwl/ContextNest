@@ -163,6 +163,9 @@ function opCtx(): OperationContext {
     versions: new VersionManager(storage),
     rbac: permissiveRbac,
     actor: "mcp@contextnest.local",
+    // Local stdio server: the caller is the vault's own user, who may see who
+    // edited what. context_get serves last_edit (spec §9.5).
+    showEditors: true,
   };
 }
 
