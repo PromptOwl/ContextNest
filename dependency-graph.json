@@ -2,7 +2,7 @@
   "packages": [
     {
       "name": "@promptowl/contextnest-cli",
-      "version": "3.7.0",
+      "version": "3.7.1",
       "required": [
         "commander"
       ],
@@ -37,7 +37,7 @@
       "bundled": [
         {
           "name": "@promptowl/contextnest-engine",
-          "version": "3.6.0",
+          "version": "3.7.0",
           "license": "AGPL-3.0",
           "depth": 1,
           "optional": false,
@@ -1177,7 +1177,7 @@
     },
     {
       "name": "@promptowl/contextnest-engine",
-      "version": "3.6.0",
+      "version": "3.7.0",
       "required": [
         "@modelcontextprotocol/sdk",
         "diff",
@@ -2349,7 +2349,7 @@
         },
         {
           "name": "@promptowl/contextnest-engine",
-          "version": "3.6.0",
+          "version": "3.7.0",
           "license": "AGPL-3.0",
           "depth": 1,
           "optional": false,
