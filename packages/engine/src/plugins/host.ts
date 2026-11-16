@@ -35,6 +35,7 @@ import type { OperationContext } from "../api/context.js";
 import { CORE_EXECUTORS, UNLOCKED_WRITE_EXECUTORS } from "../api/core-executors.js";
 import { withVaultLock } from "../vault-lock.js";
 import { assertWritableDocumentId } from "../storage.js";
+import { listReviewHolds } from "../review.js";
 import { createSafeFetch, type SafeFetchOptions } from "./safe-fetch.js";
 import { defaultProcess, defaultFolder } from "./mapper.js";
 import { SYNC_OPERATIONS } from "./ops.js";
@@ -267,7 +268,10 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
         !prev ||
         prev.plugin !== d.provenance.plugin ||
         prev.externalId !== d.provenance.externalId ||
-        editHash({ title: existing.frontmatter.title, tags: existing.frontmatter.tags, body: existing.body }) !== prev.bodyHash;
+        editHash({ title: existing.frontmatter.title, tags: existing.frontmatter.tags, body: existing.body }) !== prev.bodyHash ||
+        // A human edit held for review is not in the live file yet; writing over the
+        // published node would make it stale and unapprovable.
+        (await listReviewHolds(ctx.storage, id)).some((h) => !h.stale);
       if (humanEdited) return { id, outcome: "conflict" };
       if (prev.hash === d.provenance.hash && prev.mode === d.provenance.mode) return { id, outcome: "unchanged" };
       await UNLOCKED_WRITE_EXECUTORS.context_update(actorCtx, {

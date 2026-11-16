@@ -196,6 +196,17 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
     expect(doc.body).toContain("Human note."); // queued behind the lock, applied on top — not overwritten
   });
 
+  it("a human edit held for review is a conflict — the plugin must not publish over it and make it stale (#108 tst)", async () => {
+    const first = await run(fakePlugin([item()]));
+    const id = first.results[0].id;
+    await createEngineApi().run("context_update", { id, append: "\n\nHeld human note.", review: true }, ctx);
+    const out = await run(fakePlugin([item({ body: "upstream changed", provenance: { ...item().provenance, hash: "h9" } })]));
+    expect(out.conflicts).toEqual([{ externalId: "call-1", id }]);
+    expect(out.clean).toBe(false);
+    const { listReviewHolds } = await import("../review.js");
+    expect((await listReviewHolds(ctx.storage, id)).filter((h) => !h.stale)).toHaveLength(1);
+  });
+
   it("a title-only or tags-only human edit also counts as a human edit (review finding #1)", async () => {
     const first = await run(fakePlugin([item()]));
     const id = first.results[0].id;

@@ -465,7 +465,7 @@ export function registerPluginCommands(program: Command, deps: PluginCmdDeps): v
         return;
       }
       console.log(`${result.clean ? chalk.green("✓") : chalk.yellow("!")} ${name}: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged${result.conflicts.length ? `, ${chalk.yellow(`${result.conflicts.length} kept (local edits)`)}` : ""}${result.failed.length ? `, ${chalk.red(`${result.failed.length} failed`)}` : ""}`);
-      for (const c of result.conflicts) console.log(chalk.yellow(`  kept ${c.id} — edited locally since the last pull; delete it to let the plugin recreate it`));
+      for (const c of result.conflicts) console.log(chalk.yellow(`  kept ${c.id} — edited locally since the last pull, or an edit is held for review (ctx review list); delete it to let the plugin recreate it`));
       for (const f of result.failed) console.log(chalk.red(`  ${f.externalId}: ${f.error}`));
       if (!result.clean) console.log(chalk.dim("  cursor not advanced — the next pull retries these"));
     });
