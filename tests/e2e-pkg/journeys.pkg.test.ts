@@ -5390,6 +5390,189 @@ const J25: Journey = {
   ],
 };
 
+// ── J26: log your work on a hosted task (ctx task log) ──────────────────────
+// `ctx task log` records an activity entry on a task in a hosted (Community)
+// nest — the remote twin of the local task board (J16). It rides MCP stdio, and
+// `context_task_log` is a hosted-only op the open-source server does not serve,
+// so the "tasknest" remote is the zero-dep stub mock-task-nest.mjs (it advertises
+// context_task_log), spawned by the CLI itself over stdio. The "oldnest" remote
+// is this repo's REAL MCP server against a seeded vault — it genuinely lacks
+// context_task_log, so it proves the "server too old for tasks" guard for real.
+const J26_STUB = join(repoRoot, "tests", "e2e-pkg", "mock-task-nest.mjs");
+
+// A real vault served by the built MCP server, standing in for a nest whose
+// server predates the task log. Seeded once, kept for the suite via `scratch`.
+let j26Old: string | undefined;
+function j26OldServerVault(): string {
+  if (j26Old) return j26Old;
+  requireMcpServer();
+  const dir = mkdtempSync(join(tmpdir(), "cn-j26-old-"));
+  scratch.push(dir);
+  cpSync(join(repoRoot, "fixtures", "minimal-vault"), dir, { recursive: true });
+  j26Old = dir;
+  return dir;
+}
+
+// Register both remotes in the sandbox config dir: "tasknest" → the task stub,
+// "oldnest" → the real MCP server (no task log). The CLI spawns each over stdio,
+// so there is no server for the test to start — only this registry entry.
+function writeTaskRemotes(cfgDir: string): void {
+  const q = (s: string) => JSON.stringify(s);
+  writeFileSync(
+    join(cfgDir, "config.yaml"),
+    [
+      "version: 1",
+      "remotes:",
+      "  tasknest:",
+      "    transport: stdio",
+      `    command: ${q(process.execPath)}`,
+      "    args:",
+      `      - ${q(J26_STUB)}`,
+      "  oldnest:",
+      "    transport: stdio",
+      `    command: ${q(process.execPath)}`,
+      "    args:",
+      `      - ${q(requireMcpServer())}`,
+      `      - ${q(j26OldServerVault())}`,
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+}
+
+// `task log` against the team nest, as a function so it reads nothing at module
+// load. The leading --vault selects the remote; everything after is the command.
+// No `-y`: a task-log entry is a non-destructive write, so a non-interactive run
+// proceeds without confirmation — these cases succeeding IS that proof.
+const tlog = (...rest: string[]) => ["--vault", "tasknest", "task", "log", ...rest];
+
+const J26: Journey = {
+  id: "J26",
+  title: "Log your work on a hosted task (ctx task log)",
+  // A key is present so the remote write is authorized before the CLI connects;
+  // the stub ignores it. The agent is set per-action (default is blank → "ctx").
+  env: { CONTEXTNEST_API_KEY: "cnst_test" },
+  cases: [
+    {
+      id: "J26-01",
+      title: "Log a note on a remote task; it is recorded and read back, attributed to you (and the agent when given)",
+      actions: [
+        {
+          // Register the remotes, then log: the entry comes back attributed to
+          // the actor the server assigns (you@example.com), tool "ctx" by default.
+          mutate: (_v, cfg) => writeTaskRemotes(cfg),
+          args: tlog("nodes/tasks/free", "--note", "fixed the import, still testing"),
+          stdout: [
+            "Logged on nodes/tasks/free (remote: tasknest)",
+            "ctx on behalf of you@example.com",
+            "fixed the import, still testing",
+          ],
+        },
+        {
+          // CONTEXTNEST_AGENT names the agent on the entry (the only path that
+          // reaches it — see the --agent note in the PR).
+          env: () => ({ CONTEXTNEST_AGENT: "robo" }),
+          args: tlog("nodes/tasks/free", "--note", "still on it"),
+          stdout: ["robo on behalf of you@example.com", "still on it"],
+        },
+      ],
+    },
+    {
+      id: "J26-02",
+      title: "A status (working | done | blocked) rides onto the entry; an invalid status is rejected up front",
+      actions: [
+        {
+          args: tlog("nodes/tasks/free", "--note", "wrapping up", "--status", "done"),
+          stdout: ["on behalf of you@example.com · done", "wrapping up"],
+        },
+        {
+          // Commander rejects the bad value before anything is sent.
+          args: tlog("nodes/tasks/free", "--note", "x", "--status", "bogus"),
+          status: 1,
+          stderr: ["--status must be one of working, done, blocked"],
+        },
+      ],
+    },
+    {
+      id: "J26-03",
+      title: "--claim takes an unassigned task; on one already held it declines and names the current assignee",
+      actions: [
+        {
+          args: tlog("nodes/tasks/free", "--note", "taking this", "--claim"),
+          stdout: ["taking this", "Assigned to you (you@example.com)."],
+        },
+        {
+          // A task id the stub treats as already someone else's.
+          args: tlog("nodes/tasks/taken", "--note", "can I have it", "--claim"),
+          stdout: ["Not claimed — already assigned to lead@example.com."],
+          stdoutNot: ["Assigned to you"],
+        },
+      ],
+    },
+    {
+      id: "J26-04",
+      title: "--json returns the full structured entry (id, entry, claim, assignee)",
+      actions: [
+        {
+          env: () => ({ CONTEXTNEST_AGENT: "robo" }),
+          args: tlog("nodes/tasks/free", "--note", "json please", "--status", "working", "--json"),
+          json: (data) => {
+            const d = data as {
+              id: string;
+              entry: { actor: string; note: string; status?: string; client?: { agent?: string } };
+            };
+            expect(d.id).toBe("nodes/tasks/free");
+            expect(d.entry.actor).toBe("you@example.com");
+            expect(d.entry.note).toBe("json please");
+            expect(d.entry.status).toBe("working");
+            expect(d.entry.client?.agent).toBe("robo");
+          },
+        },
+      ],
+    },
+    {
+      id: "J26-05",
+      title: "Guardrails: refused against a local vault, and refused on a server too old for the task log (nothing written)",
+      actions: [
+        {
+          // No --vault at all → there is no remote, so it refuses before touching
+          // anything. (Runs from the journey's own non-remote cwd.)
+          args: ["task", "log", "nodes/tasks/free", "--note", "x"],
+          status: 1,
+          stderr: ["work on a Community nest", "point --vault at a remote nest"],
+        },
+        {
+          // "oldnest" is the real MCP server, which does not serve context_task_log:
+          // the capability check refuses before any write.
+          args: ["--vault", "oldnest", "task", "log", "nodes/tasks/free", "--note", "x"],
+          status: 1,
+          stderr: [
+            "does not support task fields or the task log",
+            "Upgrade the Community server",
+            "Nothing was written.",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J26-06",
+      title: "A dry run can't preview a remote write — it is refused and nothing is sent",
+      actions: [
+        {
+          // --dry-run is a program-level flag, before the subcommand. A remote
+          // write has no local sandbox to shadow, so it is refused outright.
+          args: ["--dry-run", "--vault", "tasknest", "task", "log", "nodes/tasks/free", "--note", "x"],
+          status: 1,
+          stderr: [
+            "--dry-run cannot preview a write to remote nest",
+            "the sandbox only shadows a local vault",
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -5478,5 +5661,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J25 — audit the vault's snapshot trail and rebuild it after a loss", () => {
     runJourney({ installDir: INSTALL, scratch }, J25);
+  });
+
+  it("J26 — log your work on a hosted task (ctx task log)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J26);
   });
 });
