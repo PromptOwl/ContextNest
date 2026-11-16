@@ -8,8 +8,8 @@
  * and nothing at all unless the host says its caller may see people.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { join, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { NestStorage } from "../storage.js";
 import { GraphQueryEngine } from "../graph-query-engine.js";
@@ -224,6 +224,57 @@ describe("last_edit — served from version history", () => {
       edited_by: "other@example.com",
       client: { agent: "other-agent" },
     });
+  });
+
+  it("names the edit at the served version, never a newer history entry", async () => {
+    const id = await create("Runbook");
+    await api.run(
+      "context_update",
+      { id, append: "more", client: { agent: "second-agent" } },
+      contextFor(storage, "second@example.com"),
+    );
+    // Serve v1 while history already holds v2.
+    const file = join(dir, `${id}.md`);
+    await writeFile(file, (await readFile(file, "utf-8")).replace(/^version: 2$/m, "version: 1"));
+    const doc = await api.run<{ last_edit?: LastEdit; frontmatter: { version?: number } }>(
+      "context_get",
+      { id },
+      contextFor(storage, "reader@example.com", true),
+    );
+    expect(doc.frontmatter.version).toBe(1);
+    expect(doc.last_edit).toMatchObject({ version: 1, edited_by: HUMAN });
+  });
+
+  it("serves the document without last_edit when history.yaml is corrupt", async () => {
+    const id = await create("Runbook");
+    const hist = join(dir, dirname(id), ".versions", basename(id), "history.yaml");
+    await writeFile(hist, "{{ not: [valid yaml");
+    const doc = await api.run<Record<string, unknown>>(
+      "context_get",
+      { id },
+      contextFor(storage, "reader@example.com", true),
+    );
+    expect(doc.body).toContain("Runbook body");
+    expect(doc).not.toHaveProperty("last_edit");
+  });
+
+  it("context_list with include_last_edit and full keeps bodies and adds last_edit", async () => {
+    const id = await create("Alpha");
+    const listed = await api.run<{ documents: Array<{ id: string; body?: string; last_edit?: LastEdit }> }>(
+      "context_list",
+      { include_last_edit: true, full: true },
+      contextFor(storage, "reader@example.com", true),
+    );
+    const row = listed.documents.find((d) => d.id === id)!;
+    expect(row.body).toContain("Alpha body");
+    expect(row.last_edit).toMatchObject({ edited_by: HUMAN });
+  });
+
+  it("refuses showEditors as an input — the gate is the host's, not the caller's", async () => {
+    const id = await create("Runbook");
+    await expect(
+      api.run("context_get", { id, showEditors: true }, contextFor(storage, "reader@example.com")),
+    ).rejects.toThrow();
   });
 
   it("Given the host has not allowed editors, include_last_edit returns no last_edit", async () => {
