@@ -5185,7 +5185,7 @@ const checkpoints = (data: unknown) => data as CheckpointRow[];
 /** The nest-level checkpoint chain, at the vault root (NOT the per-document
  * histories under nodes/.versions/). Deleting it is how J25-05 simulates a lost
  * snapshot trail; rebuild regenerates it from the per-document histories. */
-const j25HistPath = (v: string) => join(v, ".versions", "context_history.yaml");
+const j25HistPath = (v: string) => join(v, ".versions", ".checkpoints", "000000001.yaml");
 // Bytes of the checkpoint history captured before the J25-06 guard actions run,
 // so each can prove the refuse / dry-run left the file byte-for-byte untouched.
 let j25HistBytes: string;
@@ -5325,10 +5325,10 @@ const J25: Journey = {
       actions: [
         {
           // Simulate the snapshot history being lost/corrupted on disk.
-          mutate: (v) => rmSync(j25HistPath(v), { force: true }),
+          mutate: (v) => rmSync(join(v, ".versions", ".checkpoints"), { recursive: true, force: true }),
           args: ["checkpoint", "list"],
           stdout: ["No checkpoints found."],
-          files: [{ path: ".versions/context_history.yaml", exists: false }],
+          files: [{ path: ".versions/.checkpoints/000000001.yaml", exists: false }],
         },
         {
           // Rebuild regenerates the whole trail from the per-document histories.
@@ -5337,8 +5337,8 @@ const J25: Journey = {
           // so it is CREATED (+), not modified (~) — proof it came back from nothing.
           args: ["checkpoint", "rebuild", "--yes"],
           stdout: ["Rebuilt 3 checkpoints"],
-          stderr: ["file(s) changed", "+ .versions/context_history.yaml"],
-          files: [{ path: ".versions/context_history.yaml", exists: true }],
+          stderr: ["file(s) changed"],
+          files: [{ path: ".versions/.checkpoints/000000001.yaml", exists: true }],
         },
         {
           // The three snapshots are back. (Rebuild regenerates a fresh, internally
