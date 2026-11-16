@@ -9,12 +9,12 @@
     "subfolder": "packages/mcp-server"
   },
   "websiteUrl": "https://promptowl.ai/contextnest",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@promptowl/contextnest-mcp-server",
-      "version": "2.14.0",
+      "version": "2.15.0",
       "transport": {
         "type": "stdio"
       },
