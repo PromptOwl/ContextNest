@@ -731,8 +731,8 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 | `context_skill` | Render a `type: skill` node as a harness-ready skill file |
 | `context_skill_install` | Build the file manifest that installs a vault skill locally |
 | `context_structure` | The nest's structure rules: allowed folders, node types, name formats, templates (`folder` for one folder's rule, `report` for what breaks them) |
-| `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`) |
-| `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`) |
+| `context_get` | Read one node (`include_raw`, `verify_checksum`, `allow_rejected`); `last_edit` names who made it |
+| `context_list` | List nodes with folder / type / status / tag filters (`folder`, `recursive`, `include_retired`, `full`, `limit`, `include_last_edit`) |
 | `context_folders` | List the vault's folders and their document counts, without reading a single document (`folder`, `recursive`) |
 | `context_search` | Search published nodes, best match first. `mode`: `lexical` (stemmed BM25, default), `semantic` (embeddings), `hybrid` (RRF of both, exact title/#tag matches pinned); `rerank` re-scores the top hits. Each hit carries `score` + per-signal `scores` |
 | `context_embed` | Build/refresh the embedding index for semantic/hybrid search — published nodes only, re-embeds only new/changed versions, prunes the rest (`rebuild` to start over) |
