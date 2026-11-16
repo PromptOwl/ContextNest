@@ -34,6 +34,7 @@ import type { EngineExtension } from "../api/extension.js";
 import type { OperationContext } from "../api/context.js";
 import { CORE_EXECUTORS, UNLOCKED_WRITE_EXECUTORS } from "../api/core-executors.js";
 import { withVaultLock } from "../vault-lock.js";
+import { assertWritableDocumentId } from "../storage.js";
 import { createSafeFetch, type SafeFetchOptions } from "./safe-fetch.js";
 import { defaultProcess, defaultFolder } from "./mapper.js";
 import { SYNC_OPERATIONS } from "./ops.js";
@@ -240,6 +241,9 @@ export function createPluginHost(options: PluginHostOptions): PluginHost {
 
   const engineWriteLocked: DraftWriter = async (ctx, plugin, d, target) => {
     const id = joinPath(target.folder, d.path);
+    // Folder (caller) and path (plugin) are outside input: refuse `..` before
+    // the read below, which would otherwise open a file outside the vault.
+    assertWritableDocumentId(id);
     const author = authorFor(plugin.manifest.name);
     const actorCtx: OperationContext = { ...ctx, actor: author };
     const provenance: StoredProvenance = { ...d.provenance, bodyHash: editHash(d) };

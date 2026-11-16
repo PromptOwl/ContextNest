@@ -115,10 +115,18 @@ function trustKey(root: string, name: string): string {
   return `${real}#${name}`;
 }
 function readTrust(): Record<string, TrustEntry> {
+  let raw: string;
   try {
-    return JSON.parse(fs.readFileSync(trustPath(), "utf-8")) as Record<string, TrustEntry>;
+    raw = fs.readFileSync(trustPath(), "utf-8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw e;
+  }
+  try {
+    return JSON.parse(raw) as Record<string, TrustEntry>;
   } catch {
-    return {};
+    // Returning {} here would let the next add/remove overwrite every other vault's trust.
+    throw new Error(`${trustPath()} is not valid JSON. Fix or delete it, then re-add your plugins.`);
   }
 }
 function writeTrust(map: Record<string, TrustEntry>): void {

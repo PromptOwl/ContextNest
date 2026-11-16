@@ -254,6 +254,13 @@ describe("context_ingest — default mapper, idempotency, conflicts", () => {
     expect(out.failed[0].error).not.toMatch(/already exists/i);
   });
 
+  it("a target.folder with `..` is refused before the existing-node read, so no file outside the vault is opened (#108 review)", async () => {
+    const out = await run(fakePlugin([item()]), { target: { folder: "../../../../../../etc" } });
+    expect(out.created).toBe(0);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0].error).toMatch(/path traversal/);
+  });
+
   it("a failing item is recorded, does not stop the others, and dirties the run", async () => {
     const out = await run(fakePlugin([item({ externalId: "bad", body: "" , title: "" } as any), item({ externalId: "ok" })]));
     expect(out.failed).toHaveLength(1);
@@ -338,7 +345,7 @@ describe("isPrivateAddress", () => {
     for (const ip of ["8.8.8.8", "140.82.112.3", "2606:4700::1"]) expect(isPrivateAddress(ip), ip).toBe(false);
   });
   it("refuses IPv4-embedded IPv6 transition ranges (6to4, NAT64, Teredo, mapped) — review finding #2", () => {
-    for (const ip of ["2002:7f00:1::", "64:ff9b::7f00:1", "64:ff9b::c0a8:101", "2001:0:53aa:64c:0:0:0:1", "::ffff:7f00:1", "::ffff:10.0.0.1"]) expect(isPrivateAddress(ip), ip).toBe(true);
+    for (const ip of ["2002:7f00:1::", "64:ff9b::7f00:1", "64:ff9b::c0a8:101", "2001:0:53aa:64c:0:0:0:1", "::ffff:7f00:1", "::ffff:10.0.0.1", "::127.0.0.1", "::7f00:1", "::a9fe:a9fe"]) expect(isPrivateAddress(ip), ip).toBe(true);
   });
 });
 

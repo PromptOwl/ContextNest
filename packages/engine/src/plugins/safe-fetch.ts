@@ -81,6 +81,12 @@ export function isPrivateAddress(ip: string): boolean {
 
 /** Expand `::` shorthand into eight 16-bit groups (lower-case hex, no padding). */
 function ipv6Groups(ip: string): number[] | null {
+  // A dotted IPv4 tail (`::1.2.3.4`, which dns.lookup returns) is the last two groups.
+  const dotted = ip.match(/^(.*:)(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted.slice(2).map(Number);
+    ip = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
   const [head, tail] = ip.split("::");
   const h = head ? head.split(":") : [];
   const t = tail !== undefined ? (tail ? tail.split(":") : []) : [];
@@ -97,7 +103,7 @@ function embeddedIPv4(ip: string): string | null {
   const g = ipv6Groups(ip);
   if (!g) return null;
   const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
-  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) return v4(g[6], g[7]); // ::ffff:xxxx:xxxx
+  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && (g[5] === 0xffff || g[5] === 0)) return v4(g[6], g[7]); // ::ffff:xxxx:xxxx mapped, ::xxxx:xxxx compatible
   if (g[0] === 0x2002) return v4(g[1], g[2]); // 6to4
   if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) return v4(g[6], g[7]); // NAT64
   return null;
