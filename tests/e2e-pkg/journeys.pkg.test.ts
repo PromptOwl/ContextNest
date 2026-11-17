@@ -5573,6 +5573,156 @@ const J26: Journey = {
   ],
 };
 
+/*
+ * J27 — "I keep my ContextNest setup tidy."
+ *
+ * The three housekeeping commands no earlier journey touches: `vault rename`
+ * (which carries the default pointer), the `hints on|off` toggle and its
+ * persisted switch (<registry>/hints.json), and `welcome --no-open` which
+ * regenerates the welcome page without launching a browser. Pure local — no
+ * mock, no network. The rename cases register two vaults the J14 way (their
+ * own temp dirs via CONTEXTNEST_VAULT_PATH); the hints/welcome cases use the
+ * journey's own sandbox registry and vault.
+ */
+let _j27a: string | undefined;
+let _j27b: string | undefined;
+const j27VaultA = () => {
+  if (!_j27a) {
+    _j27a = mkdtempSync(join(tmpdir(), "cn-journey-j27-A-"));
+    scratch.push(_j27a);
+  }
+  return _j27a;
+};
+const j27VaultB = () => {
+  if (!_j27b) {
+    _j27b = mkdtempSync(join(tmpdir(), "cn-journey-j27-B-"));
+    scratch.push(_j27b);
+  }
+  return _j27b;
+};
+/** The persisted hints switch the CLI writes to <registry>/hints.json. */
+const j27Hints = (cfg: string) =>
+  JSON.parse(readFileSync(join(cfg, "hints.json"), "utf-8")) as { hints?: boolean };
+
+const J27: Journey = {
+  id: "J27",
+  title: "Tidy up the workspace — rename a vault, toggle hints, refresh the welcome page",
+  cases: [
+    {
+      id: "J27-01",
+      title: "Renaming a vault sticks and carries the default",
+      actions: [
+        // Two vaults, each in its own temp dir (cwd stays the neutral journey
+        // dir; `init` writes wherever CONTEXTNEST_VAULT_PATH points).
+        {
+          args: ["init", "--name", "Alpha"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j27VaultA() }),
+          stdout: ["Initialized"],
+        },
+        {
+          args: ["init", "--name", "Beta"],
+          env: () => ({ CONTEXTNEST_VAULT_PATH: j27VaultB() }),
+          stdout: ["Initialized"],
+        },
+        // Register both — va becomes the default.
+        { args: () => ["vault", "add", "va", j27VaultA(), "--set-default"] },
+        { args: () => ["vault", "add", "vb", j27VaultB()] },
+        // Rename the default alias; the "(default)" marker confirms the pointer rode along.
+        {
+          args: ["vault", "rename", "va", "alpha"],
+          stdout: ['Renamed "va" → "alpha" (default)'],
+        },
+        // The registry now lists alpha (still default), the old va is gone, vb untouched.
+        {
+          args: ["vault", "list", "--json"],
+          json: (d) => {
+            expect(vaultRow(d, "va"), "old alias va should be gone").toBeUndefined();
+            expect(vaultRow(d, "alpha"), "alpha should exist after rename").toBeDefined();
+            expect(vaultRow(d, "alpha")?.isDefault, "the default should follow the rename").toBe(true);
+            expect(vaultRow(d, "vb"), "vb should be untouched").toBeDefined();
+          },
+        },
+      ],
+    },
+    {
+      id: "J27-02",
+      title: "Renaming refuses a missing alias and a name that's already taken",
+      actions: [
+        {
+          args: ["vault", "rename", "nope", "x"],
+          status: 1,
+          stdout: ['No vault registered under alias "nope".'],
+        },
+        {
+          args: ["vault", "rename", "alpha", "vb"],
+          status: 1,
+          stdout: ['Alias "vb" already exists. Pick another name or remove it first.'],
+        },
+        // Nothing moved: alpha is still the default and vb is still there.
+        {
+          args: ["vault", "list", "--json"],
+          json: (d) => {
+            expect(vaultRow(d, "alpha")?.isDefault, "alpha should still be the default after the refusals").toBe(true);
+            expect(vaultRow(d, "vb"), "vb should still be present").toBeDefined();
+            expect(vaultRow(d, "x"), "the bogus rename target must never have been created").toBeUndefined();
+          },
+        },
+      ],
+    },
+    {
+      id: "J27-03",
+      title: "Hints turn off and back on, and the choice is remembered",
+      actions: [
+        {
+          args: ["hints", "off"],
+          stdout: ["Hints off.", "`ctx hints on` brings them back."],
+          check: (_v, cfg) =>
+            expect(j27Hints(cfg).hints, "hints should persist as off").toBe(false),
+        },
+        {
+          args: ["hints", "on"],
+          stdout: ["Hints on."],
+          check: (_v, cfg) =>
+            expect(j27Hints(cfg).hints, "hints should persist as on").toBe(true),
+        },
+      ],
+    },
+    {
+      id: "J27-04",
+      title: "An unknown hints choice is rejected and the setting is left alone",
+      actions: [
+        {
+          args: ["hints", "bogus"],
+          status: 1,
+          stderr: ['Say "ctx hints on" or "ctx hints off".'],
+          // J27-03 left hints ON; a rejected choice must not flip it.
+          check: (_v, cfg) =>
+            expect(j27Hints(cfg).hints, "a rejected choice must not change the saved setting").toBe(true),
+        },
+      ],
+    },
+    {
+      id: "J27-05",
+      title: "The welcome page regenerates without opening a browser",
+      actions: [
+        // Scaffold the journey's own vault (cwd) so welcome has one to describe.
+        { args: ["init", "--name", "Workspace"], stdout: ["Initialized"] },
+        // Delete the page init made, then prove `welcome --no-open` rebuilds it
+        // headlessly (CONTEXTNEST_NO_BROWSER=1 + --no-open: nothing to open in CI).
+        {
+          mutate: (vault) => rmSync(join(vault, ".context", "welcome.html"), { force: true }),
+          args: ["welcome", "--no-open"],
+          stdout: [
+            "Generated welcome page: .context/welcome.html",
+            /\d+ documents? across \d+ folders?/,
+          ],
+          files: [{ path: ".context/welcome.html", exists: true, contains: "<!DOCTYPE html>" }],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -5665,5 +5815,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J26 — log your work on a hosted task (ctx task log)", () => {
     runJourney({ installDir: INSTALL, scratch }, J26);
+  });
+
+  it("J27 — tidy up the workspace (vault rename, hints, welcome)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J27);
   });
 });
