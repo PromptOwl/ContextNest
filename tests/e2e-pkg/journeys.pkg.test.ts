@@ -5723,6 +5723,180 @@ const J27: Journey = {
   ],
 };
 
+// ── J28: install a vault-hosted skill so your agent can use it (ctx skill) ───
+// `skill install --write` lands files OUTSIDE the vault — in the home config the
+// agent reads (default `--scope user`) or the project root (`--scope project`).
+// A sandbox HOME, created once and cleaned by the suite's afterAll, keeps the
+// user-scope install off the real machine (same approach as J23); the
+// project-scope install lands under the journey's own vault dir (cwd), where the
+// harness can read it back directly.
+const _j28 = { home: "" };
+const j28Home = (): string => {
+  if (!_j28.home) {
+    _j28.home = mkdtempSync(join(tmpdir(), "cn-journey-j28-home-"));
+    scratch.push(_j28.home); // cleaned by the suite's afterAll
+  }
+  return _j28.home;
+};
+
+const J28: Journey = {
+  id: "J28",
+  title: "Install a vault-hosted skill so your agent can use it (consumer)",
+  cases: [
+    {
+      id: "J28-01",
+      title: "A fresh vault with a published skill node is ready to render and install",
+      actions: [
+        { args: ["init", "--name", "Skill Vault"], stdout: ["Initialized"] },
+        // Review off so the skill publishes on add — a published skill is what you share.
+        { args: ["config", "set", "review", "off"], stdout: ["review: off"] },
+        {
+          // A type: skill node must carry a skill.trigger; --trigger supplies it.
+          args: [
+            "add",
+            "nodes/skills/summarize-release",
+            "--type",
+            "skill",
+            "--trigger",
+            "when asked to summarize a release",
+            "--title",
+            "Summarize Release",
+            "-y",
+          ],
+          stdout: ["Created and published nodes/skills/summarize-release", "Version: 1"],
+        },
+        {
+          args: ["list", "--json"],
+          json: (d) => {
+            const row = (d as Array<{ id: string; type: string; status: string }>).find(
+              (r) => r.id === "nodes/skills/summarize-release",
+            );
+            expect(row, "the skill node should be listed").toBeDefined();
+            expect(row?.type, "it should be a skill node").toBe("skill");
+            expect(row?.status, "published and ready to share").toBe("published");
+          },
+        },
+      ],
+    },
+    {
+      id: "J28-02",
+      title: "`skill show` prints the install path and the exact content the harness receives",
+      actions: [
+        {
+          args: ["skill", "show", "nodes/skills/summarize-release"],
+          stdout: [
+            // The install location (separator-agnostic fragments of the header).
+            ".claude",
+            "SKILL.md",
+            // The harness frontmatter the agent reads, keyed to the skill's name/trigger.
+            "name: summarize-release",
+            'description: "when asked to summarize a release"',
+            // The rendered procedure itself.
+            "# Summarize Release",
+            "## Steps",
+          ],
+        },
+      ],
+    },
+    {
+      id: "J28-03",
+      title: "`skill install` lists the files it would write and leaves the disk untouched",
+      actions: [
+        {
+          args: ["skill", "install", "nodes/skills/summarize-release"],
+          stdout: [
+            ".claude",
+            "SKILL.md",
+            "name: summarize-release",
+            "Re-run with --write to install these files.",
+          ],
+          stdoutNot: ["Written to"],
+          // A preview writes nothing: no skill file lands under the project (cwd) vault.
+          check: (vault) =>
+            expect(
+              existsSync(join(vault, ".claude", "skills", "summarize-release", "SKILL.md")),
+              "a preview must not write any file",
+            ).toBe(false),
+        },
+      ],
+    },
+    {
+      id: "J28-04",
+      title: "`skill install --write` lands the files in the agent's home skills path, matching the preview",
+      actions: [
+        {
+          // Default --scope user → the agent's home config. HOME/USERPROFILE are
+          // sandboxed (J23-style) so the real install path is walked without
+          // touching the real machine.
+          args: ["skill", "install", "nodes/skills/summarize-release", "--write"],
+          env: () => ({ HOME: j28Home(), USERPROFILE: j28Home() }),
+          stdout: [
+            "Written to",
+            ".claude",
+            "SKILL.md",
+            // The post-install note tells me how my agent picks it up.
+            "Restart Claude Code",
+            "/summarize-release",
+          ],
+          check: () => {
+            const f = join(j28Home(), ".claude", "skills", "summarize-release", "SKILL.md");
+            expect(existsSync(f), "the skill installs into the agent's home skills path").toBe(true);
+            // Same content the preview showed: harness frontmatter + the loader body.
+            const body = readFileSync(f, "utf-8");
+            expect(body).toContain("name: summarize-release");
+            expect(body).toContain("This is a **loader**");
+          },
+        },
+      ],
+    },
+    {
+      id: "J28-05",
+      title: "A project-scoped install and a full (self-contained) copy write where and what they claim",
+      actions: [
+        {
+          // --scope project → the project root (cwd = this vault), so the harness
+          // reads it back directly. Default loader mode: the trigger + a fetch
+          // instruction, not the steps, so it cannot drift from the vault.
+          args: ["skill", "install", "nodes/skills/summarize-release", "--write", "--scope", "project"],
+          stdout: ["Written to"],
+          files: [
+            {
+              path: ".claude/skills/summarize-release/SKILL.md",
+              exists: true,
+              contains: "This is a **loader**",
+            },
+          ],
+        },
+        {
+          // --mode full previews a self-contained copy: it embeds the procedure
+          // (## Steps) and warns it WILL drift — the opposite trade-off to the loader.
+          args: ["skill", "install", "nodes/skills/summarize-release", "--mode", "full"],
+          stdout: ["Offline snapshot", "## Steps", "This is a full offline copy and WILL drift"],
+          stdoutNot: ["This is a **loader**"],
+        },
+      ],
+    },
+    {
+      id: "J28-06",
+      title: "A non-skill node or missing path is refused with a clear reason and a non-zero exit",
+      actions: [
+        // A plain document is not installable as a skill.
+        { args: ["add", "nodes/notes/plain", "--title", "Plain Doc", "-y"], stdout: ["Version: 1"] },
+        {
+          args: ["skill", "show", "nodes/notes/plain"],
+          status: 1,
+          stderr: ['has type "document", not "skill"'],
+        },
+        {
+          args: ["skill", "install", "nodes/nope"],
+          status: 1,
+          stderr: ["Document not found: nodes/nope"],
+        },
+      ],
+    },
+  ],
+};
+
 describe("[pkg] user journeys — installed bin", () => {
   it("J1 — capture → recall loop", () => {
     runJourney({ installDir: INSTALL, scratch }, J1);
@@ -5819,5 +5993,9 @@ describe("[pkg] user journeys — installed bin", () => {
 
   it("J27 — tidy up the workspace (vault rename, hints, welcome)", () => {
     runJourney({ installDir: INSTALL, scratch }, J27);
+  });
+
+  it("J28 — install a vault-hosted skill so your agent can use it (ctx skill)", () => {
+    runJourney({ installDir: INSTALL, scratch }, J28);
   });
 });
