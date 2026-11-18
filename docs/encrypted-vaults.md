@@ -3,7 +3,7 @@
 Vaults are plain Markdown by default, and that default is not changing. An
 **encrypted vault** is an opt-in mode for regulated or enterprise deployments:
 note content is stored encrypted at rest, and every Context Nest surface (CLI,
-MCP server, engine API) keeps working when the key is available.
+MCP server, engine API) keeps working when the key is available. 
 
 ```bash
 ctx init --encrypted            # new vault, encrypted from the first byte
