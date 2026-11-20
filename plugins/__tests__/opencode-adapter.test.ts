@@ -1,5 +1,5 @@
 /**
- * OpenCode adapter (plugins/opencode): hooks are called in the order OpenCode
+ * OpenCode adapter (plugins/shared/opencode): hooks are called in the order OpenCode
  * calls them, with a fake ctx and an in-memory ledger, so each test asserts
  * what reaches the model. The OpenCode 2 message shapes are the ones a live
  * OpenCode 2.0.32 run produced.
@@ -9,8 +9,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { hooksV1, promptText, readMessages, readSkills, setupV2, SKILLS_DIR } from "../opencode/adapter.js";
-import plugin from "../opencode/index.js";
+import { hooksV1, promptText, readMessages, readSkills, setupV2, SKILLS_DIR } from "../shared/opencode/adapter.js";
+import plugin from "../shared/opencode/index.js";
 import { MAX_LIST_SCAN } from "../shared/core/lib.js";
 
 // getConfig() reads settings files from the project dir and home dir; keep a
@@ -109,12 +109,13 @@ const SWEEP: [string, unknown][] = [
 const UPDATE = "ctx --vault eng update nodes/a --body-file -";
 
 describe("opencode 2 (setup)", () => {
-  it("registers the four skills with their frontmatter", async () => {
+  it("registers the skills with their frontmatter", async () => {
     const { skills } = await v2();
     expect(skills.map((s) => s.id).sort()).toEqual([
       "contextnest-capture",
       "contextnest-curate",
       "contextnest-recall",
+      "contextnest-setup",
       "contextnest-structure",
     ]);
     const recall = skills.find((s) => s.id === "contextnest-recall");

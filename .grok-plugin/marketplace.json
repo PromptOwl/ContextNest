@@ -6,7 +6,7 @@
     {
       "name": "contextnest",
       "description": "Context Nest skills for Grok Build, driven by the ctx CLI.",
-      "source": "./plugins/grok",
+      "source": "./plugins/shared/skills",
       "category": "productivity"
     }
   ]

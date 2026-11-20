@@ -3,12 +3,11 @@
  *
  * Agent-agnostic. Nothing here imports a Claude-specific API; every module in
  * this directory only reads stdin JSON + environment variables and shells out
- * to the `ctx` CLI. That keeps the same files reusable byte-for-byte by future
- * Codex / Gemini adapters.
+ * to the `ctx` CLI. That keeps the same files usable by every agent's adapter.
  *
- * SINGLE SOURCE OF TRUTH: this file lives at plugins/shared/core/ and is
- * vendored into each agent plugin's core/ directory by scripts/sync-plugins.mjs.
- * Edit it here, then run `pnpm plugins:sync`.
+ * SINGLE SOURCE OF TRUTH: this file lives at plugins/shared/core/. Every agent
+ * but Claude Code runs it from there; scripts/sync-plugins.mjs vendors it into
+ * plugins/claude-code/core/. Edit it here, then run `pnpm plugins:sync`.
  */
 
 import { execFileSync } from "node:child_process";

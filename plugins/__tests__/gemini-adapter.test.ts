@@ -1,5 +1,5 @@
 /**
- * Antigravity adapter (plugins/gemini/hooks/antigravity.js): the pure run() is
+ * Antigravity adapter (plugins/shared/hooks/antigravity.js): the pure run() is
  * called with a fake exec and in-memory ledger, so each test asserts what
  * actually reaches the model — not just that the hook exited 0.
  */
@@ -10,11 +10,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { run, lastRecord, readTranscript } from "../gemini/hooks/antigravity.js";
+import { run, lastRecord, readTranscript } from "../shared/hooks/antigravity.js";
 import { MAX_LIST_SCAN } from "../shared/core/lib.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const pluginDir = join(here, "..", "gemini");
+const pluginDir = join(here, "..", "shared");
 
 // getConfig() reads settings files from the project dir and home dir; keep a
 // developer's own pinned vault out of these assertions (see core.unit.test.ts).
@@ -230,13 +230,14 @@ describe("antigravity adapter", () => {
   });
 });
 
-describe("Gemini skills", () => {
+describe("skills", () => {
   // The rules' hook-directive table is how shared hook text ("/contextnest:setup",
-  // "contextnest-capture agent") reaches a Gemini skill; a typo there or in a
+  // "contextnest-capture agent") reaches a skill; a typo there or in a
   // skill's name would silently point users at nothing.
   it("every skill's frontmatter name matches its folder, and every skill the rules map to exists", () => {
     const skillsDir = join(pluginDir, "skills");
-    const names = readdirSync(skillsDir);
+    // skills/plugin.json is the Grok manifest, not a skill.
+    const names = readdirSync(skillsDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
     for (const dir of names) {
       const text = readFileSync(join(skillsDir, dir, "SKILL.md"), "utf-8");
       const front = text.split(/^---\s*$/m)[1] ?? "";

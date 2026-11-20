@@ -1,6 +1,25 @@
-# Context Nest plugin core (shared)
+# Context Nest shared plugin
 
-Agent-agnostic building blocks shared by every Context Nest coding-agent plugin (Claude Code, Codex, Gemini/Antigravity, OpenCode, Grok Build, Muse Code, Zed). **This is the single source of truth.** Edit here, then run `pnpm plugins:sync` from the repo root to vendor the result into each agent plugin.
+**This directory is the single source of truth, and it is the plugin itself for six agents.** Codex, Gemini/Antigravity, OpenCode, Grok Build, Muse Code and Zed read it in place. Each one has a manifest, a hook map or an install step that points at the same `core/`, `skills/` and `rules/`, so no agent has a copy.
+
+Claude Code is the exception. It keeps `plugins/claude-code/`, and `pnpm plugins:sync` vendors `core/` and the prompt bodies into it. Edit here, then run the sync from the repo root.
+
+## What each agent reads
+
+| Agent | Entry point | Then uses | Install steps |
+| --- | --- | --- | --- |
+| Codex | `.codex-plugin/plugin.json` | `hooks/codex-hooks.json` → `hooks/codex.js`, `core/`, `skills/`, `rules/` | [docs/codex.md](docs/codex.md) |
+| Gemini CLI & Antigravity | `plugin.json`, `hooks.json` | `hooks/antigravity.js`, `core/`, `skills/`, `rules/` | [docs/gemini.md](docs/gemini.md) |
+| OpenCode | `package.json` (`main`) | `opencode/index.js`, `opencode/adapter.js`, `core/`, `skills/`, `rules/` | [docs/opencode.md](docs/opencode.md) |
+| Grok Build | `skills/plugin.json` | `skills/`; the user copies `rules/contextnest.md` into `AGENTS.md` | [docs/grok.md](docs/grok.md) |
+| Muse Code | `muse skills install` | `skills/`; the user copies `rules/contextnest.md` into `AGENTS.md` | [docs/muse.md](docs/muse.md) |
+| Zed | The user copies the folders | `skills/`; the user copies `rules/contextnest.md` into `AGENTS.md` | [docs/zed.md](docs/zed.md) |
+
+Rules for this directory:
+
+- **Do not add a directory or a copy for an agent.** Add its manifest or adapter here, and point it at the files that exist.
+- **Do not add `hooks/hooks.json`.** Claude Code, Grok Build and Gemini CLI load that path without being told to. Name a hook map after its agent, and name it in that agent's manifest.
+- **Keep adapters out of `core/`.** The sync copies all of `core/` into the Claude Code plugin.
 
 ## Contents
 
@@ -17,9 +36,12 @@ Agent-agnostic building blocks shared by every Context Nest coding-agent plugin 
 | `prompts/capture.md` | Body of the capture agent (the capture ladder). |
 | `prompts/curate.md` | Body of the curator agent (the change and escalation ladders). |
 | `prompts/recall.md` | Body of the Claude Code manual recall skill. |
-| `prompts/structure.md` | Body of the portable structure skill. |
-| `prompts/rules.md` | Operating rules for Gemini, Codex, OpenCode, Grok, Muse and Zed (`rules/contextnest.md`, `AGENTS.md`), with the agent → skill map. |
-| `skills/<name>/SKILL.md` | Portable skill wrappers (frontmatter). The sync fills each body from a prompt and copies the skill into Gemini, Codex, OpenCode, Grok, Muse and Zed. |
+| `prompts/structure.md` | Body of the structure skill. |
+| `rules/contextnest.md` | The operating rules, with the agent → skill map. Antigravity loads the file, the Codex and OpenCode adapters inject it, and Grok, Muse and Zed users copy it into `AGENTS.md`. |
+| `skills/<name>/SKILL.md` | The skills every agent reads. The sync fills the bodies of `contextnest-recall`, `-capture`, `-curate` and `-structure` from `prompts/`; `contextnest-setup` is written by hand. |
+| `hooks/codex.js`, `hooks/antigravity.js` | Adapters from each agent's hook contract to `core/`. |
+| `opencode/` | The OpenCode in-process plugin: one engine for the OpenCode 1 and 2 APIs. |
+| `docs/` | Install steps for each agent. |
 
 ## Design contract
 

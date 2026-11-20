@@ -8,7 +8,7 @@
       "name": "contextnest",
       "source": {
         "source": "local",
-        "path": "./plugins/codex"
+        "path": "./plugins/shared"
       },
       "policy": {
         "installation": "AVAILABLE",

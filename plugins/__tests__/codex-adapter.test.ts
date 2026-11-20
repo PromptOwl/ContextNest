@@ -1,6 +1,6 @@
 /**
- * Codex adapter (plugins/codex/hooks/codex.js): the pure run() is called with
- * a fake exec and in-memory ledger; one test spawns the real hooks.json
+ * Codex adapter (plugins/shared/hooks/codex.js): the pure run() is called with
+ * a fake exec and in-memory ledger; one test spawns the real codex-hooks.json
  * command to prove the `node -e` + PLUGIN_ROOT wiring loads the adapter.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -10,11 +10,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { run, readTranscript } from "../codex/hooks/codex.js";
+import { run, readTranscript } from "../shared/hooks/codex.js";
 import { MAX_LIST_SCAN } from "../shared/core/lib.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const pluginDir = join(here, "..", "codex");
+const pluginDir = join(here, "..", "shared");
 
 // getConfig() reads settings files from the project dir and home dir; keep a
 // developer's own pinned vault out of these assertions (see core.unit.test.ts).
@@ -140,8 +140,10 @@ describe("codex adapter", () => {
     expect(readTranscript(undefined)).toEqual({ lines: [], userTurns: 0 });
   });
 
-  it("hooks.json: every command loads the adapter through PLUGIN_ROOT and exits 0", () => {
-    const hooks = JSON.parse(readFileSync(join(pluginDir, "hooks", "hooks.json"), "utf-8")).hooks;
+  it("codex-hooks.json: the manifest names it, and every command loads the adapter through PLUGIN_ROOT and exits 0", () => {
+    const manifest = JSON.parse(readFileSync(join(pluginDir, ".codex-plugin", "plugin.json"), "utf-8"));
+    expect(manifest.skills).toBe("./skills/");
+    const hooks = JSON.parse(readFileSync(join(pluginDir, manifest.hooks), "utf-8")).hooks;
     expect(Object.keys(hooks).sort()).toEqual(["PostToolUse", "SessionStart", "Stop", "UserPromptSubmit"]);
     const commands = Object.entries<any>(hooks).flatMap(([event, groups]) =>
       groups.flatMap((g: any) => g.hooks.map((h: any) => [event, h.command])),
