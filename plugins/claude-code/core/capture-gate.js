@@ -147,6 +147,35 @@ export function readTranscript(path, maxLines = 200) {
 }
 
 /**
+ * A reader for an agent whose transcript is not Claude Code's. `toClaude` maps
+ * one parsed JSONL record to the Claude-shaped record the signals read
+ * (`{type:"user", message:{role:"user", content}}` and so on), or to null to
+ * drop it. Only records it maps to `type:"user"` count as user turns.
+ *
+ * @param {(record:any) => object|null} toClaude
+ * @returns {(path:string, maxLines?:number) => {lines:string[], userTurns:number}}
+ */
+export function transcriptReader(toClaude) {
+  return (path, maxLines = 200) => {
+    if (!path) return { lines: [], userTurns: 0 };
+    try {
+      let userTurns = 0;
+      const lines = [];
+      for (const line of readFileSync(path, "utf-8").split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const mapped = toClaude(safeJson(line, null));
+        if (!mapped) continue;
+        if (mapped.type === "user") userTurns++;
+        lines.push(JSON.stringify(mapped));
+      }
+      return { lines: lines.slice(-maxLines), userTurns };
+    } catch {
+      return { lines: [], userTurns: 0 };
+    }
+  };
+}
+
+/**
  * Did anything worth capturing likely happen since the last user prompt?
  * Heuristic over the transcript tail: a tool was used, or the assistant wrote a
  * substantial answer. This is now a *necessary* condition for an ambient gate

@@ -1,4 +1,4 @@
-Something the user just said contradicts what a **Context Nest** vault records. Your job is to make the vault consistent again in the fewest edits that do the job — and to make sure the correction lands in *every* node that carries the stale fact, not just the first one you find. You drive the `ctx` CLI through the Bash tool.
+Something the user just said contradicts what a **Context Nest** vault records. Your job is to make the vault consistent again in the fewest edits that do the job — and to make sure the correction lands in *every* node that carries the stale fact, not just the first one you find. You drive the `ctx` CLI from the shell.
 
 The failure this exists to prevent: fixing one node, leaving three others asserting the old value, and reporting success.
 
@@ -8,7 +8,7 @@ You are usually dispatched with an explicit scope: a `--vault <alias>`, and ofte
 
 - **Given a scope: stay inside it.** Pass `--vault <alias>` to every command. A node cited as `<server>/<nest>:id` is edited with `--vault <server>/<nest>` — every write names its nest; a bare server alias can only be searched. If you were given node ids, touch only those nodes; your sweep confirms and fixes them, it does not expand the set.
 - **Evidence outside your scope** — the fact in another nest, or in nodes not on your list — goes in your report as one line. You do not chase it; the dispatcher owns the partition.
-- **No scope given?** Run `ctx vault list --json`, use the pinned alias if registered (stale pin → choose by `description`), and sweep that one nest fully as below.
+- **No scope given?** Run `ctx vault list --json`, use the pinned alias if registered (stale pin → choose by `description`; skip rows with `exists: false`; a working-directory vault needs no `--vault`), and sweep that one nest fully as below.
 
 ## 2. Sweep before you touch anything
 

@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 /**
- * Vendor the shared plugin core into each agent plugin.
+ * Vendor the shared plugin core into the Claude Code plugin, and render the
+ * portable skills.
  *
- * `plugins/shared/` is the single source of truth. Installed Claude plugins
- * cannot read files outside their own directory (path-traversal rule), and local
- * `--plugin-dir` only preserves in-tree symlinks — so each agent plugin keeps a
- * committed, vendored copy of the core. This script produces those copies:
+ * `plugins/shared/` is the single source of truth. It is also the plugin root
+ * for every agent except Claude Code: Codex, Gemini/Antigravity, OpenCode, Grok
+ * Build, Muse Code and Zed read it in place, through a manifest or an install
+ * step, so they need no copy. Claude Code keeps its own directory because it
+ * runs agents (not skills) and loads every skill in its plugin root. An
+ * installed Claude plugin cannot read files outside its own directory, so that
+ * plugin keeps a committed copy. This script:
  *
- *   1. Copies `plugins/shared/core/*` → `plugins/<agent>/core/*` (byte-identical).
+ *   1. Copies `plugins/shared/core/*` → `plugins/claude-code/core/*` (byte-identical).
  *   2. Fills the `<!-- BEGIN SHARED -->…<!-- END SHARED -->` region of each
- *      agent/skill markdown file from the matching `plugins/shared/prompts/*.md`.
+ *      Claude Code agent/skill markdown file from `plugins/shared/prompts/*.md`.
+ *   3. Fills the same region of each portable skill
+ *      (`plugins/shared/skills/<name>/SKILL.md`) from its prompt, in place.
  *
  * Usage:
  *   node scripts/sync-plugins.mjs           # write the vendored copies
@@ -29,11 +35,20 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SHARED_CORE = join(ROOT, "plugins", "shared", "core");
 const SHARED_PROMPTS = join(ROOT, "plugins", "shared", "prompts");
+const SHARED_SKILLS = join(ROOT, "plugins", "shared", "skills");
+
+/** Portable skill → the prompt that fills its body. */
+const SKILLS = {
+  "contextnest-recall": "retriever",
+  "contextnest-capture": "capture",
+  "contextnest-curate": "curate",
+  "contextnest-structure": "structure",
+};
 
 const BEGIN = "<!-- BEGIN SHARED -->";
 const END = "<!-- END SHARED -->";
 
-/** Which plugins consume the shared core, and which prompt fills which file. */
+/** What the sync writes: the Claude Code copy, and the skills in the shared root. */
 const TARGETS = [
   {
     plugin: "claude-code",
@@ -46,8 +61,9 @@ const TARGETS = [
     ],
   },
   {
-    plugin: "gemini",
-    core: true,
+    // Every other agent reads this directory in place. Do not add a target per agent.
+    plugin: "shared",
+    skills: true,
   },
 ];
 
@@ -93,6 +109,14 @@ for (const target of TARGETS) {
     for (const name of readdirSync(SHARED_CORE)) {
       if (!name.endsWith(".js")) continue;
       reconcile(join(destDir, name), read(join(SHARED_CORE, name)));
+    }
+  }
+
+  if (target.skills) {
+    for (const [name, prompt] of Object.entries(SKILLS)) {
+      const wrapper = read(join(SHARED_SKILLS, name, "SKILL.md"));
+      const body = read(join(SHARED_PROMPTS, `${prompt}.md`));
+      reconcile(join(pluginDir, "skills", name, "SKILL.md"), renderPromptFile(wrapper, body));
     }
   }
 

@@ -6,7 +6,7 @@ model: sonnet
 ---
 
 <!-- BEGIN SHARED -->
-You retrieve context from one or more **Context Nest** vaults and return a tight, cited digest. You drive the `ctx` CLI through the Bash tool. Never invent vault content — only report what `ctx` returns.
+You retrieve context from one or more **Context Nest** vaults and return a tight, cited digest. You drive the `ctx` CLI from the shell. Never invent vault content — only report what `ctx` returns.
 
 ## Procedure
 
@@ -14,6 +14,7 @@ You retrieve context from one or more **Context Nest** vaults and return a tight
    - If a vault is pinned (the session overview names a pinned vault, or `CONTEXTNEST_VAULT_ALIAS` is set) *and its alias is in that list*, use only that one — pass `--vault <alias>` to every command.
    - If a pinned alias is **not** in the list, the pin is stale (the vault was removed or renamed) — ignore it and choose by `description` instead.
    - Otherwise (no pin) choose the vault(s) whose `description` best matches the user's topic. Prefer one; use two only when the topic clearly spans them.
+   - Skip any vault whose `exists` is `false`; a search there only errors. A working-directory vault (the session overview names it) is used by running `ctx` with no `--vault`. If no vault is usable, say so in one line.
    - A `<server>/<nest>` row is one nest behind a server alias; the bare `<server>` row searches ALL of its nests in one call. When the topic maps to one nest, target it; when unsure, search the bare server — every hit comes back with the `vault` (`<server>/<nest>`) to cite it as.
 
 2. **Find seed nodes.** Translate the topic into a selector:

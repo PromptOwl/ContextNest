@@ -12,7 +12,7 @@ const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8
 const firstRun = read("../../packages/cli/src/first-run.ts");
 const SETUPS = {
   "claude-code /contextnest:setup": read("../claude-code/commands/setup.md"),
-  "gemini contextnest-setup": read("../gemini/skills/contextnest-setup/SKILL.md"),
+  "contextnest-setup skill": read("../shared/skills/contextnest-setup/SKILL.md"),
 };
 
 describe("plugin setup matches the CLI first run", () => {
