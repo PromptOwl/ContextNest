@@ -307,6 +307,14 @@ export const pdfMetaSchema = z.object({
   extracted_at: z.string().min(1),
 });
 
+/** Non-strict, like {@link pdfMetaSchema}: this parses documents already on disk. */
+export const archivedMetaSchema = z.object({
+  at: z.string().min(1),
+  by: z.string().min(1),
+  previous_status: z.enum(STATUSES),
+  reason: z.string().optional(),
+});
+
 export const frontmatterSchema = z
   .object({
     title: z.string().min(1).max(TITLE_MAX_LENGTH),       // Rule 2
@@ -330,6 +338,7 @@ export const frontmatterSchema = z
       .regex(ZONE_ID_PATTERN, "Zone ID must match ^[a-z][a-z0-9_-]*$")
       .optional(),
     governance: z.enum(GOVERNANCE_TIERS).optional(),
+    archived: archivedMetaSchema.optional(),
   })
   .superRefine((data, ctx) => {
     // Rule 9: source block MUST be present when type is "source"
@@ -618,6 +627,28 @@ export const checkpointSchema = z.object({
 
 export const checkpointHistorySchema = z.object({
   checkpoints: z.array(checkpointSchema),
+});
+
+/**
+ * A checkpoint stored as what changed since the one before it (§7.2, segment
+ * files). `checkpoint_hash` is still computed over the FULL maps, so a reader
+ * rebuilds them from the previous checkpoint before verifying. The keys differ
+ * from a full checkpoint's on purpose: a delta can never parse as one.
+ */
+export const checkpointDeltaSchema = z.object({
+  checkpoint: z.number().int().min(1),
+  at: z.string(),
+  triggered_by: z.string(),
+  changed_versions: z.record(z.number().positive()),
+  changed_chain_hashes: z.record(z.string()),
+  removed_versions: z.array(z.string()).optional(),
+  removed_chain_hashes: z.array(z.string()).optional(),
+  checkpoint_hash: z.string().regex(CHECKSUM_PATTERN),
+});
+
+/** One segment file of the chain: full checkpoints and deltas, in order. */
+export const checkpointSegmentSchema = z.object({
+  checkpoints: z.array(z.union([checkpointSchema, checkpointDeltaSchema])),
 });
 
 /**

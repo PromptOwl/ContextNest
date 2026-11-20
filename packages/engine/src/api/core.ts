@@ -23,6 +23,7 @@ import {
   pdfMetaSchema,
   sourceMetaSchema,
   tagSchema as tag,
+  archivedMetaSchema,
 } from "../schemas.js";
 import { HARNESSES, INSTALL_MODES, INSTALL_SCOPES } from "../skills.js";
 import { viewMetaSchema } from "../view-schema.js";
@@ -39,6 +40,31 @@ const integrityVerdict = z.object({
   status: z.literal("failed"),
   checks: z.array(z.string()),
   warning: z.string(),
+});
+
+/**
+ * Who last edited the document (spec §9.5): the newest version-history entry
+ * that is an edit, read back from §6.2. `edited_by` is the human (or service
+ * account) accountable for the write and always comes first; `client.agent` is
+ * the agent that made the call and never stands in for the human. Entries by a
+ * `system:` author (a seed snapshot, a host's auto-publish bump) are not edits
+ * and are skipped.
+ *
+ * Present only when the HOST allows its caller to see people
+ * (`OperationContext.showEditors`) — never on a caller's say-so — so a host
+ * that serves public readers leaks nothing by upgrading.
+ */
+export const lastEditSchema = z.object({
+  version: z.number().int().describe("The history entry that is the last edit"),
+  edited_by: z.string().describe("The human (or service account) accountable for the edit"),
+  edited_by_system: z
+    .string()
+    .optional()
+    .describe("Display name when edited_by is a system account. Host-supplied; the engine never sets it"),
+  edited_at: z.string().describe("ISO-8601 time of the edit"),
+  client: clientMetadataSchema
+    .optional()
+    .describe("Caller metadata the write supplied (§9.4); client.agent is the agent that made the call"),
 });
 
 /** A node as returned in list/query summaries (body optional/trimmed). */
@@ -62,6 +88,8 @@ const nodeSummary = z.object({
   // Present only for type:"pdf".
   pdf: pdfMetaSchema.optional(),
   integrity: integrityVerdict.optional(),
+  // Who last edited it (§9.5). context_list fills it with include_last_edit.
+  last_edit: lastEditSchema.optional(),
 });
 
 /** A fully-loaded document. */
@@ -69,6 +97,8 @@ const documentPayload = z.object({
   id: z.string(),
   frontmatter: frontmatterSchema,
   integrity: integrityVerdict.optional(),
+  // Who made the version served (§9.5). context_get fills it.
+  last_edit: lastEditSchema.optional(),
   body: z.string(),
   /** Exact stored bytes, frontmatter block included. Only with `include_raw`. */
   raw: z.string().optional(),
@@ -272,7 +302,8 @@ const getOp: OperationDescriptor = {
   name: "context_get",
   namespace: "core",
   description:
-    "Get the full content of a single node by contextnest:// URI, id, or title.",
+    "Get the full content of a single node by contextnest:// URI, id, or title. Where the server shows editors, " +
+    "`last_edit` names who made the version served: the human, plus the agent that made the call.",
   // Plain object, no `.refine` — see the note on nodeSelector.
   input: z.object({
     ...nodeSelectorShape,
@@ -354,6 +385,14 @@ const listOp: OperationDescriptor = {
       .optional()
       .describe(
         "Return each node's full frontmatter and body instead of a summary. For callers that go on to render or gate the documents themselves and would otherwise have to read them all again.",
+      ),
+    // Opt-in per call: one history read per row. Served only where the host
+    // lets its caller see people; elsewhere the flag is accepted and ignored.
+    include_last_edit: z
+      .boolean()
+      .optional()
+      .describe(
+        "Add `last_edit` to each row: who last edited it (the human, plus the agent that made the call) and when. Costs one history read per row. Omitted where the server does not show editors.",
       ),
     ...clientField,
   }),
@@ -737,6 +776,65 @@ const deleteOp: OperationDescriptor = {
     "VAULT_LOCK_TIMEOUT",
   ],
   aliases: ["delete_document"],
+};
+
+// ─── context_archive / context_unarchive / context_move ──
+
+const archiveOp: OperationDescriptor = {
+  name: "context_archive",
+  namespace: "core",
+  description:
+    "Archive a node: out of default lists and retrieval, with its version history kept, until context_unarchive restores it (§1.13). Refused while a review is pending.",
+  input: z.object({
+    ...nodeSelectorShape,
+    reason: z.string().optional().describe("Why it was archived, recorded on the node"),
+    ...clientField,
+  }),
+  output: z.object({
+    id: z.string(),
+    status: z.literal("rejected"),
+    archived: archivedMetaSchema,
+  }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "FORGOTTEN_DOCUMENT",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "VAULT_LOCK_TIMEOUT",
+  ],
+};
+
+const unarchiveOp: OperationDescriptor = {
+  name: "context_unarchive",
+  namespace: "core",
+  description: "Bring an archived node back in the status it was archived from (§1.13).",
+  input: z.object({ ...nodeSelectorShape, ...clientField }),
+  output: z.object({ id: z.string(), status: z.string() }),
+  errors: ["VALIDATION_FAILED", "DOCUMENT_NOT_FOUND", "INVALID_DOCUMENT_ID", "INVALID_URI", "VAULT_LOCK_TIMEOUT"],
+};
+
+const moveOp: OperationDescriptor = {
+  name: "context_move",
+  namespace: "core",
+  description:
+    "Move a node to another folder, carrying its version history and any PDF. Its id changes; [[Title]] links keep resolving, path links do not. Refused while a review is pending.",
+  input: z.object({
+    ...nodeSelectorShape,
+    folder: z.string().describe('Destination folder under nodes/ (e.g. "gtm/deals"); "" is the nest root'),
+    ...clientField,
+  }),
+  output: z.object({ id: z.string(), previous_id: z.string() }),
+  errors: [
+    "VALIDATION_FAILED",
+    "DOCUMENT_NOT_FOUND",
+    "DOCUMENT_ALREADY_EXISTS",
+    "FORGOTTEN_DOCUMENT",
+    "INVALID_DOCUMENT_ID",
+    "INVALID_URI",
+    "CONFIG_ERROR", // a structure rule (§11.1) that does not compile
+    "VAULT_LOCK_TIMEOUT",
+  ],
 };
 
 // ─── context_versions ────────────────────────────────────────────────────────
@@ -1524,6 +1622,9 @@ export const CORE_OPERATIONS: readonly OperationDescriptor[] = [
   updateOp,
   publishOp,
   deleteOp,
+  archiveOp,
+  unarchiveOp,
+  moveOp,
   versionsOp,
   reconstructOp,
   verifyOp,

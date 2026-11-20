@@ -1,14 +1,23 @@
-# Context Nest — Claude Code plugin
+# Context Nest for Claude Code
 
-Makes any Claude Code session **vault-aware** and **self-maintaining**:
+Context Nest is a context layer for Claude Code. It gives Claude a shared, governed brain: versioned markdown notes on your computer, or on a server your team shares, that Claude checks on each prompt and updates when you correct something.
 
-- **Auto-retrieval** — a `UserPromptSubmit` hook pulls relevant vault material into each prompt (effort-toggled), so Claude answers from your governed knowledge base.
-- **Deliberate capture** — a `Stop` hook queues a capture agent, but only on a real signal (you asked, or you corrected something, or the session has run on past a cooldown). By default (`explicit`) only your own asks and corrections queue it — the ambient review, a background agent run of roughly 25k tokens, is opt-in via `propose`, where the agent *proposes* in one line and writes nothing until you agree.
-- **Never in your way** — the `Stop` hook never blocks the end of a turn. It parks the job and notes it in the transcript; your next message dispatches it to a background agent that works alongside whatever you asked for next.
-- **Consistent corrections** — when you change something the nests record, the retriever scouts an occurrence map across every candidate nest and curator agents fan out in parallel over it — as many as the work needs — so the change lands everywhere, not in the first search hit. A `PostToolUse` sweep-check backstops it mechanically: after any `ctx update` it diffs the node against its previous version and reports every node, in every nest, still carrying the removed value. That check keys on the *write*, so it works no matter how the request was phrased. Nodes carry **entity tags** for the concrete values they assert, so the sweep also does exact tag-index lookups — catching nodes that paraphrase a fact, which no text search can.
-- **Session overview** — a `SessionStart` hook injects a compact list of your vaults.
+```text
+/plugin install contextnest --marketplace promptowl/contextnest
+/contextnest:setup
+```
 
-Everything runs through the existing [`ctx`](../../packages/cli) CLI internally — no MCP wiring required.
+Setup asks one question and writes your first note with you. Context Nest is open source under AGPL-3.0, and there's more at [promptowl.ai/contextnest](https://promptowl.ai/contextnest).
+
+## What it does
+
+- **Auto-retrieval:** a `UserPromptSubmit` hook pulls relevant vault material into each prompt (effort-toggled), so Claude answers from your governed knowledge base.
+- **Deliberate capture:** a `Stop` hook queues a capture agent, but only on a real signal (you asked, or you corrected something, or the session has run on past a cooldown). By default (`explicit`) only your own asks and corrections queue it, the ambient review, a background agent run of roughly 25k tokens, is opt-in via `propose`, where the agent *proposes* in one line and writes nothing until you agree.
+- **Never in your way:** the `Stop` hook never blocks the end of a turn. It parks the job and notes it in the transcript; your next message dispatches it to a background agent that works alongside whatever you asked for next.
+- **Consistent corrections:** when you change something the nests record, the retriever scouts an occurrence map across every candidate nest and curator agents fan out in parallel over it, as many as the work needs, so the change lands everywhere, not in the first search hit. A `PostToolUse` sweep-check backstops it mechanically: after any `ctx update` it diffs the node against its previous version and reports every node, in every nest, still carrying the removed value. That check keys on the *write*, so it works no matter how the request was phrased. Nodes carry **entity tags** for the concrete values they assert, so the sweep also does exact tag-index lookups, catching nodes that paraphrase a fact, which no text search can.
+- **Session overview:** a `SessionStart` hook injects a compact list of your vaults.
+
+Everything runs through the existing [`ctx`](https://github.com/PromptOwl/ContextNest/tree/development/packages/cli) CLI, so there is no MCP wiring to do.
 
 ## Setup
 
@@ -45,7 +54,13 @@ Your own install takes precedence over the bundled copy. If it is older than the
 ## Install
 
 ```text
-/plugin marketplace add promptowl/contextnest      # this repo
+/plugin install contextnest --marketplace promptowl/contextnest
+```
+
+On Claude Code older than 2.1.275, add the marketplace first:
+
+```text
+/plugin marketplace add promptowl/contextnest
 /plugin install contextnest
 ```
 
@@ -61,13 +76,15 @@ On enable you'll be prompted for the settings below (all optional):
 
 ## One server, many nests
 
-Register a Community server's all-nests endpoint once:
+Sign in to a Community server once. This registers all its nests:
 
 ```text
-ctx vault add contextnest --url https://<server>/mcp --bearer-env CONTEXTNEST_API_KEY
+ctx login https://<server> --as contextnest
 ```
 
-`ctx vault list` then shows a `contextnest/<nest>` row for every nest your key can reach, with each nest's description. Nests shared with you later appear on their own. The plugin searches `contextnest` (every nest, in one call) and cites each hit as `contextnest/<nest>:<id>`. Edits go back to that nest, and a new note goes to the nest whose description fits. When none clearly fits, the **unclear nest** setting decides: ask you (default), or use the default vault.
+A server without browser sign-in takes a pasted key instead: add `--key-stdin`.
+
+`ctx vault list` then shows a `contextnest/<nest>` row for every nest you can reach, with each nest's description. Nests shared with you later appear on their own. The plugin searches `contextnest` (every nest, in one call) and cites each hit as `contextnest/<nest>:<id>`. Edits go back to that nest, and a new note goes to the nest whose description fits. When none clearly fits, the **unclear nest** setting decides: ask you (default), or use the default vault.
 
 ## Changing settings later
 
@@ -79,9 +96,9 @@ Claude Code only prompts for the settings above once, at enable time. To view or
 /contextnest:config capture_mode off --global     # change for all projects
 ```
 
-Run bare `/contextnest:config` and it shows the current settings, then walks you through a picker — choose the setting, choose the value from its valid options (pinned vault is filled from your registered aliases), and choose the scope. No need to remember exact values; typing a `<setting> <value>` pair still works for scripting.
+Run bare `/contextnest:config` and it shows the current settings, then walks you through a picker: choose the setting, choose the value from its valid options (pinned vault is filled from your registered aliases), and choose the scope. No need to remember exact values; typing a `<setting> <value>` pair still works for scripting.
 
-Changes are written to a settings override file and take effect on the next prompt — no restart or re-enable needed. You can also edit the files directly (keys: `retrieval_mode`, `capture_mode`, `unclear_nest`, `vault`, `ctx_command`):
+Changes are written to a settings override file and take effect on the next prompt, with no restart or re-enable needed. You can also edit the files directly (keys: `retrieval_mode`, `capture_mode`, `unclear_nest`, `vault`, `ctx_command`):
 
 | Scope | File | Precedence |
 | --- | --- | --- |
@@ -94,7 +111,7 @@ A key present in an override file always beats the enable-time answer; an explic
 
 Nothing the plugin does holds up the end of a turn. The `Stop` hook decides whether the vault should be touched, writes that decision to `~/.contextnest/plugin-state/<session>.json`, and prints a one-line note. Your next prompt picks the job up and hands it to a `background: true` subagent, which runs concurrently with your new request.
 
-The cost of that: a parked job runs when you send your next message. Walk away mid-session and the capture does not happen — use `/contextnest:capture` when you want something saved right now.
+The cost of that: a parked job runs when you send your next message. Walk away mid-session and the capture does not happen, so use `/contextnest:capture` when you want something saved right now.
 
 ## How it decides to touch the vault
 
@@ -104,11 +121,25 @@ A knowledge base earns its keep by being small enough to trust, so both write pa
 
 **Correcting something.** Does the vault actually assert the old value? → Find *every* occurrence before editing, not the first hit → one node, one sentence → several nodes, changed together with the before-marker recorded → structural, which stops and asks.
 
-When the same fact turns out to live in several nodes, fixing all of them is the patch, not the cure: it will need correcting in all of them again next time. The curator says so and offers to make one node canonical with the rest linking to it — offered, never done unasked, because collapsing nodes is structural.
+When the same fact turns out to live in several nodes, fixing all of them is the patch, not the cure: it will need correcting in all of them again next time. The curator says so and offers to make one node canonical with the rest linking to it, offered, never done unasked, because collapsing nodes is structural.
 
 A change is "structural" when the vault would end up contradicting itself, when a node's title or type no longer fits its body, when the corrected term is a concept the vault is organised around (a rename, not an edit), or when a recorded decision has been reversed so the stated reasoning is now wrong. Those are presented for your approval rather than applied.
 
-The ladders are domain-free — the capture agent calibrates what counts as durable from the target vault's own `description`, so a positioning vault and a security vault are judged on their own terms.
+The ladders are domain-free: the capture agent calibrates what counts as durable from the target vault's own `description`, so a positioning vault and a security vault are judged on their own terms.
+
+## What this plugin runs and sends
+
+**What runs.** Four hooks (listed under Components) run the readable scripts in `core/` under Node. Those scripts and `bin/ctx` call the `ctx` CLI: your own install first, then the copy installed with the plugin, then `npx` at the exact version this plugin pins.
+
+**What it downloads.** When you install or update the plugin, Claude Code installs the CLI and its dependencies from `registry.npmjs.org`, at the versions in `package-lock.json`. The `npx` fallback fetches the same CLI version from there.
+
+**What stays on your computer.** With local vaults, your notes stay on your computer. What retrieval finds is added to your Claude Code conversation, like anything else you show Claude. Plugin settings and session state live in `~/.contextnest/`.
+
+**What goes to a server.** Only to servers you add yourself, with `/contextnest:setup`, `ctx login` or `ctx vault add`. With retrieval on, the text of each prompt goes to those servers as a search query. Reads, writes and sweep-check searches for their nests go there too. To stop this, set **Retrieval effort** to `off`, or pin a local vault. If you configure embeddings for a vault, its search also sends text to the provider you chose. `ctx query @org/pack` fetches a cloud pack from `api.promptowl.ai`, and only when you ask for one.
+
+**Credentials.** The plugin's own scripts never read or send a credential. `ctx login` keeps your key in the OS keyring or an encrypted file, and `ctx` sends it to the server it belongs to.
+
+**Telemetry.** Off unless a vault opts in with `telemetry: true` in `.context/config.yaml`. Then `ctx` sends usage events to `api.promptowl.ai`, never vault content, and the vault's welcome page loads Google Analytics. `DO_NOT_TRACK=1` or `CONTEXTNEST_TELEMETRY=0` turns it off whatever the file says.
 
 ## Components
 
@@ -117,7 +148,7 @@ The ladders are domain-free — the capture agent calibrates what counts as dura
 | Hook | `SessionStart` | Inject vault overview; on a new session, tell you to run setup if nothing is set up, or to update an outdated `ctx` |
 | Hook | `UserPromptSubmit` | Effort-toggled retrieval injection, and dispatches any parked job |
 | Hook | `Stop` | Decides and parks; never blocks. Fires on explicit intent, a correction, or past the cooldown |
-| Hook | `PostToolUse` (Bash, async) | After a `ctx update`: diffs against the prior version and names every node, in every nest, still carrying the removed value. Runs in the background — the turn is not held while it searches; its findings reach Claude on the next turn |
+| Hook | `PostToolUse` (Bash, async) | After a `ctx update`: diffs against the prior version and names every node, in every nest, still carrying the removed value. Runs in the background, so the turn is not held while it searches; its findings reach Claude on the next turn |
 | Agent | `contextnest-retriever` | Digest mode for questions; scout mode returns an occurrence map for writes |
 | Agent | `contextnest-capture` | Walks the capture ladder; proposes (or, in `auto`, writes) the minimum |
 | Agent | `contextnest-curator` | Fixes its assigned scope (nest, or node slice) exhaustively; fanned out in parallel |
@@ -129,7 +160,7 @@ The ladders are domain-free — the capture agent calibrates what counts as dura
 
 ## Local development
 
-The `core/` directory is **vendored** from [`plugins/shared/`](../shared) — do not edit it here. Change the source and re-sync from the repo root:
+The `core/` directory is **vendored** from [`plugins/shared/`](https://github.com/PromptOwl/ContextNest/tree/development/plugins/shared), so do not edit it here. Change the source and re-sync from the repo root:
 
 ```bash
 pnpm plugins:sync          # regenerate vendored core + agent/skill bodies

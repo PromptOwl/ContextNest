@@ -10,8 +10,10 @@ import {
   contextLinkTarget,
   extractContextLinks,
   extractWikiLinks,
+  resolveContextLink,
   resolveWikiTarget,
 } from "./wiki-graph.js";
+import { parseUri } from "./uri.js";
 
 // `extractContextLinks` lives in wiki-graph.ts (the link graph follows these
 // links too); re-exported here, its long-standing home.
@@ -171,6 +173,59 @@ const bodyLinks: LinksOf = (doc) => ({
  */
 export function buildRelationships(documents: ContextNode[]): RelationshipEdge[] {
   return buildRelationshipsWithStats(documents).edges;
+}
+
+/** A reference whose target is no document in the set. */
+export interface DanglingReference {
+  from: string;
+  /** The target as written. */
+  target: string;
+  /** 1-based line in the file; absent for a frontmatter `depends_on`. */
+  line?: number;
+}
+
+/** A `contextnest://` link to one local node: not a tag, folder or search, not another nest. */
+function isNodeLink(uri: string): boolean {
+  if (contextLinkTarget(uri).includes("://")) return false;
+  try {
+    return parseUri(uri).kind === "document";
+  } catch {
+    return false; // malformed: rule 4 reports it
+  }
+}
+
+/**
+ * Every unresolved `[[wikilink]]`, `contextnest://` node link and `depends_on`
+ * target. Resolves exactly as `buildRelationshipsWithStats` does, so what it
+ * lists are the references that index leaves without an edge.
+ */
+export function findDanglingReferences(documents: ContextNode[]): DanglingReference[] {
+  const index = buildWikiTitleIndex(documents);
+  const dangling: DanglingReference[] = [];
+
+  for (const doc of documents) {
+    const lines = splitLines(doc.body);
+    const mask = codeMask(lines);
+    // The body is the tail of the file, so this is the frontmatter's length.
+    const offset = Math.max(0, splitLines(doc.rawContent).length - lines.length);
+    lines.forEach((text, i) => {
+      if (mask[i]) return;
+      const targets = [
+        ...extractWikiLinks(text).filter(
+          (t) => !t.trim().startsWith("#") && resolveWikiTarget(t, index) === null,
+        ),
+        ...extractContextLinks(text).filter(
+          (uri) => isNodeLink(uri) && resolveContextLink(uri, index) === null,
+        ),
+      ];
+      for (const target of targets) dangling.push({ from: doc.id, target, line: offset + i + 1 });
+    });
+    for (const target of doc.frontmatter.source?.depends_on ?? []) {
+      if (resolveContextLink(target, index) === null) dangling.push({ from: doc.id, target });
+    }
+  }
+
+  return dangling;
 }
 
 /**

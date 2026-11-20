@@ -6,7 +6,7 @@
 
 [![npm](https://img.shields.io/npm/v/@promptowl/contextnest-mcp-server.svg)](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0) [![SOC 2 Type 2](https://img.shields.io/badge/SOC%202-Type%202-green.svg)](https://promptowl.ai)
 
-MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **44 tools** over stdio transport: 24 canonical `context_*` tools, 9 vault, review and drift tools, and 11 deprecated aliases.
+MCP server for [Context Nest](https://github.com/PromptOwl/ContextNest) — gives AI agents direct access to your context vault via the [Model Context Protocol](https://modelcontextprotocol.io). Every node is typed, versioned, and hash-chained, so what the agent reads is **governed and auditable, not a fuzzy memory blob**. Supports all node types — documents, source nodes, and skill nodes. Exposes **47 tools** over stdio transport: 27 canonical `context_*` tools, 9 vault, review and drift tools, and 11 deprecated aliases.
 
 > **New in 2.2.1** — `context_folders` lists the vault's folders and their
 > document counts without opening a document, and `context_list` takes a
@@ -98,8 +98,8 @@ Name, description and input schema for each of these come from the engine's oper
 | `context_skill` | Render a `type: skill` node for an agent harness (Claude Code, Cursor, Codex, raw) — trigger becomes the harness matcher |
 | `context_skill_install` | Build the file manifest that installs a vault skill. Loader mode (default) fetches at runtime and cannot drift; `full` embeds an offline copy that will |
 | `context_structure` | The nest's structure rules — allowed folders, node types, folder/file-name formats, templates and required sections/files. `folder` resolves one folder's rule with its template body; `report` lists existing content that breaks the rules. Writes that break an enforced rule are refused |
-| `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node |
-| `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit` |
+| `context_get` | Read one node. `include_raw` for the exact stored bytes, `verify_checksum` to detect drift on read, `allow_rejected` to read a retired node. Returns `last_edit`: who made the version served (the human, plus the agent that made the call) |
+| `context_list` | List nodes with folder / type / status / tag filters. Takes `folder` (a path relative to the vault root — the id prefix) and `recursive`, an array of types, `include_retired`, `full`, `limit`, and `include_last_edit` (who last edited each row) |
 | `context_folders` | List the vault's folders and their document counts, read from directory entries without opening a document. `folder` to scope it, `recursive: false` for the immediate children only |
 | `context_search` | Search published nodes, best match first. `mode`: `lexical` (stemmed BM25, default), `semantic` (embeddings), `hybrid` (RRF of both, exact title/#tag matches pinned); `rerank` re-scores the top hits. Each hit carries `score` + per-signal `scores` |
 | `context_embed` | Build/refresh the embedding index for semantic/hybrid search — published nodes only, re-embeds only new/changed versions, prunes the rest (`rebuild` to start over) |
@@ -111,6 +111,9 @@ Name, description and input schema for each of these come from the engine's oper
 | `context_verify` | Verify every hash chain in the vault and rebuild every recorded version (`version_unreconstructable` when one cannot be rebuilt). Forgotten versions verify hash-only (`tombstoned`) |
 | `context_forget` | Forget a node (spec §6.3): erase every version's content, keep the hashes so verify still passes, leave an empty `status: forgotten` stub every URI resolves to. `reason_code` is a closed set, never free text. Later republish/re-import of the content is refused |
 | `context_forget_log` | The forget audit trail: who, when, reason code, which versions. Never the content |
+| `context_archive` | Archive a node: out of lists and retrieval, history kept (spec §1.13) |
+| `context_unarchive` | Bring an archived node back in the status it left |
+| `context_move` | Move a node to another folder with its history and any PDF |
 | `context_create` | Create a node. Mint your own `id`, keep it a draft with `publish: false`, set an initial `status`, record a `note`, or supply a full `skill` block |
 | `context_update` | Update a node — rename via `title`, set `status`, stamp an explicit `version`, clear a metadata key by sending `null`. Defaults to *not* publishing when `status` names a non-published state |
 | `context_publish` | Publish a node (bump version, seal checkpoint); takes a `note`, returns the `chain_hash` |
@@ -237,7 +240,7 @@ The MCP server is one of four ways into the same vault — same file format, sam
 | **CLI** (`ctx`) | Build and query the vault from the terminal | [`@promptowl/contextnest-cli`](https://www.npmjs.com/package/@promptowl/contextnest-cli) |
 | **MCP server** | Agent access over the Model Context Protocol (this package) | [`@promptowl/contextnest-mcp-server`](https://www.npmjs.com/package/@promptowl/contextnest-mcp-server) |
 | **Engine** | Core library — parsing, storage, versioning, graph traversal | [`@promptowl/contextnest-engine`](https://www.npmjs.com/package/@promptowl/contextnest-engine) |
-| **PromptOwl cloud** | Hosted packs, marketplace, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
+| **PromptOwl cloud** | Hosted packs, SSO, approvals, role-scoped publishing | [promptowl.ai](https://promptowl.ai) |
 
 Drop the server into any MCP-capable agent — Claude Desktop, Claude Code, Cursor, Gemini CLI, Windsurf — to plug the same vault into your IDE or chat client.
 

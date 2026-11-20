@@ -136,7 +136,16 @@ export async function withVaultLock<T>(root: string, fn: () => Promise<T>): Prom
     } catch (err) {
       // Only "the lock is held" is contention. Everything else is a real
       // error the caller needs to see, with its own code, right away.
-      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // Windows answers EPERM (not EEXIST) when the lock dir is mid-removal by
+      // the previous holder (delete pending while handles close). That is
+      // contention too: retry until the deadline, then surface the real error.
+      if (code === "EPERM" && process.platform === "win32") {
+        if (Date.now() > deadline) throw err;
+        await sleep(RETRY_DELAY_MS + Math.random() * RETRY_DELAY_MS);
+        continue;
+      }
+      if (code !== "EEXIST") throw err;
 
       const age = await lockAge(lockPath);
       if (age !== null && age > STALE_MS) {
